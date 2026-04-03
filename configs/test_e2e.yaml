@@ -1,0 +1,78 @@
+# Quick end-to-end test config (2 epochs, small model)
+data:
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
+  meta_csv: "F:/med_data/Totalsegmentator_dataset_v201/meta.csv"
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+  label_values: [0, 1, 2]
+  num_classes: 3
+  mode: "2.5d"
+  num_slices_per_side: 1
+  crop_size: [256, 256]
+  intensity_min: -1024.0
+  intensity_max: 3071.0
+  normalize: "minmax"
+  split_method: "random"
+  val_ratio: 0.2
+  test_ratio: 0.0
+  split_seed: 42
+  batch_size: 4
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: 2
+  foreground_oversample_ratio: 0.5
+  cache_mode: "memory"
+
+augment:
+  enabled: true
+  random_flip_prob: 0.5
+  random_rotate_prob: 0.0
+  random_scale_prob: 0.0
+  random_brightness_prob: 0.2
+  random_contrast_prob: 0.2
+  gaussian_noise_prob: 0.1
+  gaussian_blur_prob: 0.0
+  mixup_prob: 0.0
+
+model:
+  encoder_name: "resnet"
+  decoder_name: "resnet"
+  encoder_channels: [16, 32, 64, 128]
+  encoder_blocks_per_level: [1, 1, 1, 1]
+  decoder_blocks_per_level: [1, 1, 1]
+  norm_type: "instance"
+  activation: "leakyrelu"
+  dropout: 0.0
+  deep_supervision: false
+  upsample_mode: "transpose"
+  skip_mode: "cat"
+
+loss:
+  name: "dice_ce"
+  compound_weights: [1.0, 1.0]
+
+train:
+  epochs: 2
+  optimizer: "adamw"
+  lr: 0.001
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 0
+  cosine_min_lr: 0.0001
+  grad_clip_norm: 12.0
+  use_amp: true
+  use_ema: false
+  output_dir: "outputs/test_e2e"
+  save_every: 1
+  save_best_metric: "mean_dice"
+  save_best_mode: "max"
+  early_stopping: 0
+  log_every: 5
+  val_every: 1
+  seed: 42
+
+predict:
+  patch_overlap: 0.5
+  blend_mode: "gaussian"
+  batch_size: 4

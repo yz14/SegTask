@@ -1,0 +1,186 @@
+data:
+  image_dir: F:/med_data/Totalsegmentator_dataset_v201/nii
+  label_dir: F:/med_data/Totalsegmentator_dataset_v201/body_pred
+  meta_csv: F:/med_data/Totalsegmentator_dataset_v201/meta.csv
+  image_suffix: .nii.gz
+  label_suffix: .nii.gz
+  label_prefix: ''
+  label_postfix: ''
+  label_values:
+  - 0
+  - 1
+  - 2
+  num_classes: 3
+  mode: 2.5d
+  num_slices_per_side: 1
+  aug_margin: 2
+  crop_size:
+  - 256
+  - 256
+  patch_size:
+  - 96
+  - 96
+  - 96
+  intensity_min: -1024.0
+  intensity_max: 3071.0
+  normalize: minmax
+  global_mean: 0.0
+  global_std: 1.0
+  target_spacing:
+  - 0.0
+  - 0.0
+  - 0.0
+  split_method: random
+  val_ratio: 0.2
+  test_ratio: 0.0
+  split_seed: 42
+  batch_size: 4
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: 2
+  foreground_oversample_ratio: 0.5
+  class_sample_weights: []
+  cache_mode: memory
+  cache_dir: ''
+augment:
+  enabled: true
+  random_flip_axes:
+  - 0
+  - 1
+  random_flip_prob: 0.5
+  random_rotate_prob: 0.0
+  random_rotate_range: 15.0
+  random_scale_prob: 0.0
+  random_scale_range:
+  - 0.85
+  - 1.15
+  elastic_deform_prob: 0.0
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 100.0
+  random_brightness_prob: 0.2
+  random_brightness_range:
+  - -0.1
+  - 0.1
+  random_contrast_prob: 0.2
+  random_contrast_range:
+  - 0.8
+  - 1.2
+  random_gamma_prob: 0.2
+  random_gamma_range:
+  - 0.8
+  - 1.2
+  gaussian_noise_prob: 0.1
+  gaussian_noise_std: 0.05
+  gaussian_blur_prob: 0.0
+  gaussian_blur_sigma:
+  - 0.5
+  - 1.5
+  cutout_prob: 0.0
+  cutout_num_holes: 1
+  cutout_size_ratio:
+  - 0.05
+  - 0.15
+  mixup_prob: 0.0
+  mixup_alpha: 0.2
+model:
+  encoder_name: resnet
+  decoder_name: resnet
+  spatial_dims: 2
+  in_channels: 3
+  encoder_channels:
+  - 16
+  - 32
+  - 64
+  - 128
+  encoder_blocks_per_level:
+  - 1
+  - 1
+  - 1
+  - 1
+  decoder_channels:
+  - 64
+  - 32
+  - 16
+  decoder_blocks_per_level:
+  - 1
+  - 1
+  - 1
+  bottleneck_channels: 128
+  norm_type: instance
+  norm_groups: 8
+  activation: leakyrelu
+  dropout: 0.0
+  deep_supervision: false
+  vit_patch_size: 16
+  vit_num_heads: 8
+  vit_mlp_ratio: 4.0
+  vit_qkv_bias: true
+  vit_drop_path_rate: 0.1
+  upsample_mode: transpose
+  skip_mode: cat
+loss:
+  name: dice_ce
+  compound_weights:
+  - 1.0
+  - 1.0
+  class_weights: []
+  dice_smooth: 1.0e-05
+  dice_squared: false
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  tversky_alpha: 0.3
+  tversky_beta: 0.7
+  label_smoothing: 0.0
+  spatial_weight_mode: none
+  border_weight_sigma: 5.0
+  border_weight_w0: 10.0
+  deep_supervision_weights:
+  - 1.0
+  - 0.5
+  - 0.25
+  - 0.125
+train:
+  epochs: 2
+  optimizer: adamw
+  lr: 0.001
+  weight_decay: 0.0001
+  momentum: 0.99
+  nesterov: true
+  scheduler: cosine
+  warmup_epochs: 0
+  warmup_lr: 1.0e-06
+  cosine_min_lr: 0.0001
+  poly_power: 0.9
+  step_size: 50
+  step_gamma: 0.1
+  plateau_patience: 10
+  plateau_factor: 0.5
+  grad_clip_norm: 12.0
+  grad_clip_value: 0.0
+  use_amp: true
+  amp_dtype: float16
+  use_ema: false
+  ema_decay: 0.999
+  output_dir: outputs/test_e2e
+  save_every: 1
+  save_best_metric: mean_dice
+  save_best_mode: max
+  early_stopping: 0
+  log_every: 5
+  val_every: 1
+  vis_every: 10
+  seed: 42
+  deterministic: false
+  resume: ''
+  distributed: false
+predict:
+  patch_overlap: 0.5
+  blend_mode: gaussian
+  batch_size: 4
+  tta_enabled: false
+  tta_flips: true
+  min_component_size: 0
+  fill_holes: false
+  threshold: 0.5
+  save_probabilities: false
+  output_dir: predictions

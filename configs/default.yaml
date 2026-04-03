@@ -1,0 +1,324 @@
+# ===========================================================================
+# SegTask Default Configuration
+# ===========================================================================
+# This config uses TotalSegmentator body_pred data as an example.
+# Adjust paths, label_values, and model settings for your specific task.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Data settings
+# ---------------------------------------------------------------------------
+data:
+  # Paths to image and label directories
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
+  meta_csv: "F:/med_data/Totalsegmentator_dataset_v201/meta.csv"
+
+  # File pattern matching
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+
+  # Label values in the mask (0=background, 1=body, 2=body_extremities)
+  # Leave empty to auto-detect from data
+  label_values: [0, 1, 2]
+  num_classes: 3
+
+  # Data mode: "2d", "2.5d", "3d"
+  # - 2d:   single axial slices, model uses Conv2d
+  # - 2.5d: stack of contiguous slices as multi-channel 2D input
+  # - 3d:   volumetric patches, model uses Conv3d
+  mode: "2.5d"
+
+  # 2.5D: number of context slices on each side of the center slice
+  # Total input channels = 2 * num_slices_per_side + 1
+  # e.g. num_slices_per_side=1 → 3 channels (center ± 1 slice)
+  num_slices_per_side: 1
+
+  # 2D/2.5D crop size [H, W] — all slices are cropped/padded to this size
+  # for uniform batching (volumes may have different spatial dimensions).
+  # Training: random crop (with optional foreground bias)
+  # Validation: center crop + zero-pad
+  crop_size: [256, 256]
+
+  # 3D patch size (only used when mode="3d")
+  patch_size: [96, 96, 96]
+
+  # Intensity windowing (HU range for CT)
+  intensity_min: -1024.0
+  intensity_max: 3071.0
+
+  # Normalization: "minmax" → [0,1], "zscore" → zero-mean unit-var
+  normalize: "minmax"
+
+  # Global statistics for zscore normalization
+  # (auto-computed from training set if using zscore)
+  global_mean: 0.0
+  global_std: 1.0
+
+  # Target spacing for resampling (0 = keep original)
+  target_spacing: [0.0, 0.0, 0.0]
+
+  # Train/val/test split
+  # "meta" = use split column from meta.csv
+  # "random" = random split with given ratios
+  split_method: "random"
+  val_ratio: 0.15
+  test_ratio: 0.15
+  split_seed: 42
+
+  # DataLoader
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+  # Foreground oversampling: probability that a sample contains foreground
+  # 0.0 = random sampling, 0.5 = 50% chance of foreground-biased
+  foreground_oversample_ratio: 0.5
+
+  # Per-class sampling weights (empty = uniform)
+  # e.g. [1.0, 3.0, 2.0] to oversample class 1 (body) and class 2
+  class_sample_weights: []
+
+  # Caching: "none", "memory" (RAM cache)
+  cache_mode: "none"
+
+# ---------------------------------------------------------------------------
+# Augmentation settings (applied on GPU)
+# ---------------------------------------------------------------------------
+augment:
+  enabled: true
+
+  # Spatial augmentation
+  random_flip_axes: [0, 1]       # axes to randomly flip (0=H, 1=W)
+  random_flip_prob: 0.5
+
+  random_rotate_prob: 0.3
+  random_rotate_range: 15.0      # degrees
+
+  random_scale_prob: 0.2
+  random_scale_range: [0.85, 1.15]
+
+  elastic_deform_prob: 0.0       # elastic deformation (expensive, off by default)
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 100.0
+
+  # Intensity augmentation (applied to image only)
+  random_brightness_prob: 0.3
+  random_brightness_range: [-0.1, 0.1]
+
+  random_contrast_prob: 0.3
+  random_contrast_range: [0.8, 1.2]
+
+  random_gamma_prob: 0.2
+  random_gamma_range: [0.8, 1.2]
+
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std: 0.05
+
+  gaussian_blur_prob: 0.1
+  gaussian_blur_sigma: [0.5, 1.5]
+
+  # Cutout / random erasing
+  cutout_prob: 0.0
+  cutout_num_holes: 1
+  cutout_size_ratio: [0.05, 0.15]
+
+  # Mixup (batch-level)
+  mixup_prob: 0.0
+  mixup_alpha: 0.2
+
+# ---------------------------------------------------------------------------
+# Model architecture
+# ---------------------------------------------------------------------------
+model:
+  # Encoder backbone: "vgg", "resnet", "vit"
+  encoder_name: "resnet"
+
+  # Decoder backbone: "vgg", "resnet", "vit"
+  decoder_name: "resnet"
+
+  # Spatial dimensionality (auto-set from data.mode: 2d/2.5d → 2, 3d → 3)
+  # spatial_dims: 2  # auto
+
+  # Input channels (auto-set from data.mode + num_slices_per_side)
+  # in_channels: 3  # auto
+
+  # Channel progression for each encoder level
+  # More levels = deeper network, more channels = wider network
+  encoder_channels: [32, 64, 128, 256, 512]
+
+  # Number of blocks (conv groups or residual blocks) per encoder level
+  encoder_blocks_per_level: [2, 2, 2, 2, 2]
+
+  # Decoder channels (auto-set as reverse of encoder if empty)
+  decoder_channels: []  # auto: [256, 128, 64, 32]
+
+  # Number of blocks per decoder level
+  decoder_blocks_per_level: [2, 2, 2, 2]
+
+  # Bottleneck channels (0 = same as last encoder channel)
+  bottleneck_channels: 0
+
+  # Normalization: "batch", "instance", "group"
+  # instance: works well with small batch sizes (medical imaging)
+  # batch: requires larger batch sizes
+  norm_type: "instance"
+  norm_groups: 8  # for group norm only
+
+  # Activation: "relu", "leakyrelu", "gelu", "swish"
+  activation: "leakyrelu"
+
+  # Dropout in encoder/decoder blocks
+  dropout: 0.0
+
+  # Deep supervision: multi-scale loss (better gradient flow)
+  deep_supervision: false
+
+  # ViT-specific settings (only used when encoder/decoder = "vit")
+  vit_patch_size: 2
+  vit_num_heads: 8
+  vit_mlp_ratio: 4.0
+  vit_qkv_bias: true
+  vit_drop_path_rate: 0.1
+
+  # Upsampling in decoder: "transpose" (learnable), "bilinear"/"trilinear"
+  upsample_mode: "transpose"
+
+  # Skip connection mode: "cat" (concatenate) or "add" (element-wise add)
+  skip_mode: "cat"
+
+# ---------------------------------------------------------------------------
+# Loss function
+# ---------------------------------------------------------------------------
+loss:
+  # Loss type: "dice", "ce", "dice_ce", "focal", "tversky", "dice_focal"
+  name: "dice_ce"
+
+  # Weights for compound losses (e.g. [dice_weight, ce_weight])
+  compound_weights: [1.0, 1.0]
+
+  # Per-class loss weights (empty = uniform)
+  # e.g. [0.1, 1.0, 0.5] to downweight background and upweight body
+  class_weights: []
+
+  # Dice loss settings
+  dice_smooth: 1.0e-5
+  dice_squared: false
+
+  # Focal loss settings
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+  # Tversky loss settings (alpha=FP weight, beta=FN weight)
+  tversky_alpha: 0.3
+  tversky_beta: 0.7
+
+  # Label smoothing for cross-entropy
+  label_smoothing: 0.0
+
+  # Spatial weight mode: "none", "border" (upweight boundaries)
+  spatial_weight_mode: "none"
+  border_weight_sigma: 5.0
+  border_weight_w0: 10.0
+
+  # Deep supervision loss weights (geometric decay)
+  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+
+# ---------------------------------------------------------------------------
+# Training settings
+# ---------------------------------------------------------------------------
+train:
+  epochs: 200
+
+  # Optimizer: "adam", "adamw", "sgd"
+  optimizer: "adamw"
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+
+  # SGD-specific
+  momentum: 0.99
+  nesterov: true
+
+  # LR scheduler: "cosine", "poly", "step", "plateau", "one_cycle"
+  scheduler: "cosine"
+
+  # Warmup
+  warmup_epochs: 5
+  warmup_lr: 1.0e-6
+
+  # Cosine scheduler minimum LR
+  cosine_min_lr: 1.0e-6
+
+  # Poly scheduler power
+  poly_power: 0.9
+
+  # Step scheduler
+  step_size: 50
+  step_gamma: 0.1
+
+  # ReduceOnPlateau
+  plateau_patience: 10
+  plateau_factor: 0.5
+
+  # Gradient clipping
+  grad_clip_norm: 12.0
+  grad_clip_value: 0.0  # 0 = disabled
+
+  # Mixed precision (AMP) — significant speedup on modern GPUs
+  use_amp: true
+  amp_dtype: "float16"  # "float16" or "bfloat16"
+
+  # Exponential Moving Average
+  use_ema: true
+  ema_decay: 0.999
+
+  # Checkpointing
+  output_dir: "outputs"
+  save_every: 10           # save checkpoint every N epochs
+  save_best_metric: "mean_dice"  # metric to track for best model
+  save_best_mode: "max"    # "max" (higher is better) or "min"
+
+  # Early stopping (0 = disabled)
+  early_stopping: 0
+
+  # Logging
+  log_every: 10            # log every N steps
+  val_every: 1             # validate every N epochs
+  vis_every: 10            # save visualization every N epochs
+
+  # Reproducibility
+  seed: 42
+  deterministic: false
+
+  # Resume training from checkpoint
+  resume: ""
+
+  # Multi-GPU (DDP) — not yet implemented
+  distributed: false
+
+# ---------------------------------------------------------------------------
+# Prediction / inference settings
+# ---------------------------------------------------------------------------
+predict:
+  # Sliding window overlap (0-1)
+  patch_overlap: 0.5
+
+  # Blending mode: "constant" (simple average) or "gaussian" (weighted)
+  blend_mode: "gaussian"
+
+  # Batch size for inference patches
+  batch_size: 4
+
+  # Test-Time Augmentation
+  tta_enabled: false
+  tta_flips: true
+
+  # Post-processing
+  min_component_size: 0    # minimum connected component size (0 = disabled)
+  fill_holes: false
+  threshold: 0.5
+
+  # Output
+  save_probabilities: false
+  output_dir: "predictions"
