@@ -18,12 +18,11 @@ import nibabel as nib
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
-from .config import Config
-from .data.dataset import load_nifti, preprocess_image
-from .models.unet import UNet
+from segtask.config import Config
+from segtask.data.dataset import load_nifti, preprocess_image
+from segtask.models.unet import UNet
 
 logger = logging.getLogger(__name__)
 
@@ -107,18 +106,17 @@ def sliding_window_inference_3d(
     output_sum = np.zeros((num_classes, D_pad, H_pad, W_pad), dtype=np.float32)
     count_map = np.zeros((D_pad, H_pad, W_pad), dtype=np.float32)
 
-    # Generate all patch origins
-    origins = []
-    for d0 in range(0, max(1, D_pad - pd + 1), step_d):
-        for h0 in range(0, max(1, H_pad - ph + 1), step_h):
-            for w0 in range(0, max(1, W_pad - pw + 1), step_w):
-                d0 = min(d0, D_pad - pd)
-                h0 = min(h0, H_pad - ph)
-                w0 = min(w0, W_pad - pw)
-                origins.append((d0, h0, w0))
-
-    # Remove duplicates
-    origins = list(set(origins))
+    # Generate all patch origins — grid-based, no duplicates
+    # Clamp end positions to stay within padded volume
+    max_d0 = max(1, D_pad - pd + 1)
+    max_h0 = max(1, H_pad - ph + 1)
+    max_w0 = max(1, W_pad - pw + 1)
+    origins = [
+        (d0, h0, w0)
+        for d0 in range(0, max_d0, step_d)
+        for h0 in range(0, max_h0, step_h)
+        for w0 in range(0, max_w0, step_w)
+    ]
     logger.info("Sliding window: %d patches (%dx%dx%d, overlap=%.1f)", len(origins), pd, ph, pw, overlap)
 
     # Process in batches
@@ -163,16 +161,19 @@ def slice_inference(
     num_classes: int,
     mode: str = "2d",
     num_slices_per_side: int = 1,
-    crop_size: tuple = (0, 0),
+    target_size: tuple = (0, 0),
     batch_size: int = 16,
     device: torch.device = torch.device("cpu"),
     use_amp: bool = True,
 ) -> np.ndarray:
     """Slice-by-slice inference for 2D or 2.5D models.
 
-    For 2.5D: the model outputs S*C channels (S slices × C semantic classes).
-    We reshape to (B, S, C, H, W), apply per-slice softmax, and keep only
-    the center slice's predictions — as required by the 2.5D spec.
+    Slices are RESIZED to target_size before model input, then output
+    probabilities are resized back to original spatial dimensions.
+    This works without labels — correct for real-world inference.
+
+    For 2.5D: model outputs S*C channels. We apply per-slice softmax
+    and keep only the center slice's predictions.
 
     Args:
         model: Trained model.
@@ -180,38 +181,28 @@ def slice_inference(
         num_classes: Number of semantic classes.
         mode: "2d" or "2.5d".
         num_slices_per_side: For 2.5D, number of context slices per side.
-        crop_size: (H, W) spatial size the model was trained on.
-            If (0,0), use original volume size (no padding/cropping).
+        target_size: (H, W) spatial size the model was trained on.
         batch_size: Batch size for inference.
         device: Device.
         use_amp: Use mixed precision.
 
     Returns:
-        Predicted probability map (num_classes, D, H, W).
+        Predicted probability map (num_classes, D, H, W) at original resolution.
     """
+    from segtask.data.dataset import resize_2d
+
     D, H, W = volume.shape
     output = np.zeros((num_classes, D, H, W), dtype=np.float32)
 
-    # Determine if we need to pad slices to crop_size
-    ch, cw = crop_size if (crop_size[0] > 0 and crop_size[1] > 0) else (H, W)
-    need_pad = (H != ch or W != cw)
-    # Compute center-crop origin for extracting results back
-    pad_h = max(0, ch - H)
-    pad_w = max(0, cw - W)
-    # After padding, center-crop origin
-    padded_H = H + pad_h
-    padded_W = W + pad_w
-    h0 = max(0, (padded_H - ch) // 2)
-    w0 = max(0, (padded_W - cw) // 2)
-    # Origin within padded volume for extracting original region
-    orig_h0 = max(0, (ch - H) // 2) if pad_h > 0 else h0
-    orig_w0 = max(0, (cw - W) // 2) if pad_w > 0 else w0
+    th, tw = target_size if (target_size[0] > 0 and target_size[1] > 0) else (H, W)
+    need_resize = (H != th or W != tw)
+
+    total_slices = getattr(model, 'total_slices', 1)
+    semantic_classes = getattr(model, 'semantic_classes', num_classes)
 
     model.eval()
-
-    slices_to_process = list(range(D))
     for batch_start in range(0, D, batch_size):
-        batch_indices = slices_to_process[batch_start : batch_start + batch_size]
+        batch_indices = list(range(batch_start, min(batch_start + batch_size, D)))
         batch_tensors = []
 
         for center in batch_indices:
@@ -219,29 +210,15 @@ def slice_inference(
                 img = volume[center][np.newaxis]  # (1, H, W)
             else:
                 # 2.5D: stack context slices
-                channels = []
-                pad = num_slices_per_side
-                for offset in range(-pad, pad + 1):
+                slices = []
+                for offset in range(-num_slices_per_side, num_slices_per_side + 1):
                     s = center + offset
-                    if 0 <= s < D:
-                        channels.append(volume[s])
-                    else:
-                        channels.append(np.zeros((H, W), dtype=np.float32))
-                img = np.stack(channels, axis=0)  # (C, H, W)
+                    slices.append(volume[s] if 0 <= s < D else np.zeros((H, W), dtype=np.float32))
+                img = np.stack(slices, axis=0)  # (C, H, W)
 
-            # Pad/crop to crop_size if needed
-            if need_pad:
-                img_padded = np.zeros((*img.shape[:-2], ch, cw), dtype=np.float32)
-                # Center the original slice in the padded array
-                src_h = min(H, ch)
-                src_w = min(W, cw)
-                dst_h0 = (ch - src_h) // 2
-                dst_w0 = (cw - src_w) // 2
-                src_h0 = (H - src_h) // 2
-                src_w0 = (W - src_w) // 2
-                img_padded[..., dst_h0:dst_h0+src_h, dst_w0:dst_w0+src_w] = \
-                    img[..., src_h0:src_h0+src_h, src_w0:src_w0+src_w]
-                img = img_padded
+            # Resize to model's target_size
+            if need_resize:
+                img = resize_2d(img, th, tw, is_label=False)
 
             batch_tensors.append(img)
 
@@ -253,35 +230,20 @@ def slice_inference(
                 if isinstance(pred, list):
                     pred = pred[0]
 
-                # 2.5D: reshape (B, S*C, H, W) → per-slice softmax → center slice
-                total_slices = getattr(model, 'total_slices', 1)
-                semantic_classes = getattr(model, 'semantic_classes', num_classes)
-
                 if total_slices > 1:
+                    # 2.5D: (B, S*C, H, W) → per-slice softmax → center slice only
                     B_p = pred.shape[0]
-                    pH, pW = pred.shape[2], pred.shape[3]
-                    # (B, S*C, H, W) → (B*S, C, H, W) → softmax → (B, S, C, H, W)
-                    pred_r = pred.reshape(B_p, total_slices, semantic_classes, pH, pW)
-                    pred_r = pred_r.reshape(B_p * total_slices, semantic_classes, pH, pW)
-                    prob_r = torch.softmax(pred_r, dim=1)
-                    prob_r = prob_r.reshape(B_p, total_slices, semantic_classes, pH, pW)
-                    # Keep only center slice
-                    center_idx = num_slices_per_side  # center of the stack
-                    prob = prob_r[:, center_idx].cpu().numpy()  # (B, C, H, W)
+                    pred_flat = pred.view(B_p * total_slices, semantic_classes, th, tw)
+                    prob_flat = torch.softmax(pred_flat, dim=1)
+                    prob_all = prob_flat.view(B_p, total_slices, semantic_classes, th, tw)
+                    prob = prob_all[:, num_slices_per_side].cpu().numpy()
                 else:
                     prob = torch.softmax(pred, dim=1).cpu().numpy()
 
+        # Resize output back to original spatial dimensions
         for i, center in enumerate(batch_indices):
-            if need_pad:
-                # Extract the region corresponding to the original volume
-                src_h = min(H, ch)
-                src_w = min(W, cw)
-                dst_h0_e = (ch - src_h) // 2
-                dst_w0_e = (cw - src_w) // 2
-                src_h0_e = (H - src_h) // 2
-                src_w0_e = (W - src_w) // 2
-                output[:, center, src_h0_e:src_h0_e+src_h, src_w0_e:src_w0_e+src_w] = \
-                    prob[i, :, dst_h0_e:dst_h0_e+src_h, dst_w0_e:dst_w0_e+src_w]
+            if need_resize:
+                output[:, center] = resize_2d(prob[i], H, W, is_label=False)
             else:
                 output[:, center] = prob[i]
 
@@ -324,7 +286,7 @@ def tta_inference(
                 num_classes=num_classes,
                 mode=dc.mode,
                 num_slices_per_side=dc.num_slices_per_side,
-                crop_size=tuple(dc.crop_size),
+                target_size=tuple(dc.target_size),
                 batch_size=pc.batch_size,
                 device=device,
                 use_amp=cfg.train.use_amp,

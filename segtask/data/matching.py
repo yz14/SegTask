@@ -231,8 +231,8 @@ def _split_random(
     train_idx = indices[n_test + n_val :]
 
     train = [records[i] for i in train_idx]
-    val = [records[i] for i in val_idx]
-    test = [records[i] for i in test_idx]
+    val   = [records[i] for i in val_idx]
+    test  = [records[i] for i in test_idx]
 
     for r in train:
         r.split = "train"
@@ -243,6 +243,5 @@ def _split_random(
 
     logger.info(
         "Split (random, seed=%d): train=%d, val=%d, test=%d",
-        seed, len(train), len(val), len(test),
-    )
+        seed, len(train), len(val), len(test))
     return train, val, test

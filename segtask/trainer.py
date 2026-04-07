@@ -154,10 +154,8 @@ class Trainer:
         self,
         model: UNet,
         cfg: Config,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        device: torch.device,
-    ):
+        train_loader: DataLoader, val_loader: DataLoader,
+        device: torch.device):
         self.model = model.to(device)
         self.cfg = cfg
         self.train_loader = train_loader
@@ -177,10 +175,7 @@ class Trainer:
         warmup_steps = tc.warmup_epochs * steps_per_epoch
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler,
-            warmup_steps=warmup_steps,
-            warmup_lr=tc.warmup_lr,
-            base_lr=tc.lr,
-        )
+            warmup_steps=warmup_steps, warmup_lr=tc.warmup_lr, base_lr=tc.lr)
 
         # AMP
         self.use_amp = tc.use_amp and device.type == "cuda"
@@ -200,9 +195,7 @@ class Trainer:
         # to preserve spatial consistency across slices. Reshape to 2.5D AFTER aug.
         aug_spatial_dims = 3 if self.is_25d else cfg.model.spatial_dims
         self.augmentor = GPUAugmentor(cfg.augment, spatial_dims=aug_spatial_dims)
-        self.mixup = MixupCutmix(
-            alpha=cfg.augment.mixup_alpha, prob=cfg.augment.mixup_prob
-        )
+        self.mixup = MixupCutmix(alpha=cfg.augment.mixup_alpha, prob=cfg.augment.mixup_prob)
 
         # Tracking
         self.best_metric = -float("inf") if tc.save_best_mode == "max" else float("inf")
@@ -327,7 +320,7 @@ class Trainer:
             # GPU augmentation (3D for 2.5D/3D, 2D for 2D)
             image, label = self.augmentor(image, label)
 
-            # 2.5D: after 3D augmentation, squeeze to 2D multi-channel for model
+            # 2.5D: after 3D augmentation, squeeze to 2D multi-channel for model  # TODO 这里有问题，不是squeeze而是采样连续的C=3c张切片
             # image: (B, 1, D, H, W) → (B, D, H, W)
             if self.is_25d:
                 image = image.squeeze(1)

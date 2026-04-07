@@ -87,13 +87,13 @@ def compute_sample_weights_from_labels(
         if isinstance(label, torch.Tensor):
             label = label.numpy()
 
-        # Per-class presence: fraction of pixels belonging to each class
-        presence = np.zeros(num_classes)
-        for c in range(min(num_classes, label.shape[0])):
-            n_pixels = label[c].sum()
-            class_pixel_counts[c] += n_pixels
-            presence[c] = n_pixels
-        sample_class_presence.append(presence)
+        # Per-class pixel count — vectorized sum over all spatial dims at once
+        nc = min(num_classes, label.shape[0])
+        presence = label[:nc].reshape(nc, -1).sum(axis=1)
+        class_pixel_counts[:nc] += presence
+        padded = np.zeros(num_classes)
+        padded[:nc] = presence
+        sample_class_presence.append(padded)
 
     # Compute class weights from inverse frequency if not provided
     if class_weights is None or len(class_weights) == 0:

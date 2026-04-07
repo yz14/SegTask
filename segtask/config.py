@@ -47,16 +47,19 @@ class DataConfig:
     # For prediction, only the center slice(s) are kept
     num_slices_per_side: int = 1  # total input channels = 2*num_slices_per_side+1
 
-    # 2.5D augmentation margin: extra slices on each side for spatial augmentation.
-    # These margin slices absorb boundary artifacts from rotation/scaling,
-    # then are trimmed after augmentation. Set 0 to disable.
-    aug_margin: int = 2
+    # 2.5D depth-aware resizing:
+    # - "uniform": resize all volumes to target_depth slices (depth × spatial)
+    # - "keep_depth": keep original depth, only resize spatial dimensions
+    #   → REQUIRED for 2.5D: preserving head/tail slices is essential
+    depth_resize_mode: str = "keep_depth"
+    # target_depth: only used when depth_resize_mode == "uniform"
+    # WARNING: uniform mode DESTROYS head/tail slices and degrades 3D context
+    target_depth: int = 64
 
-    # 2D/2.5D crop size [H, W] — slices are randomly cropped (train) or
-    # center-cropped+padded (val) to this size. Required for batching
-    # when volumes have different spatial dimensions.
-    # [0, 0] = auto-detect from data (use median size)
-    crop_size: List[int] = field(default_factory=lambda: [256, 256])
+    # 2D/2.5D target spatial size [H, W] — all slices are RESIZED to this
+    # size for uniform batching. Uses bilinear interpolation for images and
+    # nearest-neighbor for labels. Works at both train and test time.
+    target_size: List[int] = field(default_factory=lambda: [256, 256])
 
     # 3D patch settings
     patch_size: List[int] = field(default_factory=lambda: [96, 96, 96])

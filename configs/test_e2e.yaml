@@ -9,7 +9,7 @@ data:
   num_classes: 3
   mode: "2.5d"
   num_slices_per_side: 1
-  crop_size: [256, 256]
+  target_size: [256, 256]
   intensity_min: -1024.0
   intensity_max: 3071.0
   normalize: "minmax"

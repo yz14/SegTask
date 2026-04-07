@@ -34,11 +34,10 @@ data:
   # e.g. num_slices_per_side=1 → 3 channels (center ± 1 slice)
   num_slices_per_side: 1
 
-  # 2D/2.5D crop size [H, W] — all slices are cropped/padded to this size
-  # for uniform batching (volumes may have different spatial dimensions).
-  # Training: random crop (with optional foreground bias)
-  # Validation: center crop + zero-pad
-  crop_size: [256, 256]
+  # 2D/2.5D target spatial size [H, W] — all slices are RESIZED to this size.
+  # Uses bilinear interpolation for images, nearest-neighbor for labels.
+  # Works identically at train and test time (no labels needed).
+  target_size: [256, 256]
 
   # 3D patch size (only used when mode="3d")
   patch_size: [96, 96, 96]

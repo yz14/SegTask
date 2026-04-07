@@ -70,12 +70,8 @@ def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
 
 def preprocess_image(
     volume: np.ndarray,
-    intensity_min: float = -1024.0,
-    intensity_max: float = 3071.0,
-    normalize: str = "minmax",
-    global_mean: float = 0.0,
-    global_std: float = 1.0,
-) -> np.ndarray:
+    intensity_min: float = -1024.0, intensity_max: float = 3071.0,
+    normalize: str = "minmax", global_mean: float = 0.0, global_std: float = 1.0) -> np.ndarray:
     """Apply intensity windowing and normalization.
 
     Args:
@@ -89,7 +85,7 @@ def preprocess_image(
     vol = volume.copy()
     vol = np.clip(vol, intensity_min, intensity_max)
 
-    if normalize == "minmax":
+    if   normalize == "minmax":
         denom = intensity_max - intensity_min
         if denom > 0:
             vol = (vol - intensity_min) / denom
@@ -125,14 +121,9 @@ def preprocess_label(
 
 def load_and_preprocess(
     rec: SampleRecord,
-    img_cache: VolumeCache,
-    lbl_cache: VolumeCache,
-    intensity_min: float,
-    intensity_max: float,
-    normalize: str,
-    global_mean: float,
-    global_std: float,
-) -> Tuple[np.ndarray, np.ndarray]:
+    img_cache: VolumeCache, lbl_cache: VolumeCache,
+    intensity_min: float, intensity_max: float,
+    normalize: str, global_mean: float, global_std: float) -> Tuple[np.ndarray, np.ndarray]:
     """Load and preprocess an image-label pair with caching. Shared by all datasets."""
     img = img_cache.get(rec.image_path)
     if img is None:
@@ -155,67 +146,80 @@ def has_foreground(label_slice: np.ndarray, label_values: List[int]) -> bool:
     return bool(np.any(lbl_int != bg_val))
 
 
-def _compute_crop_origin(
-    H: int,
-    W: int,
-    crop_h: int,
-    crop_w: int,
-    is_train: bool,
-    fg_mask: Optional[np.ndarray] = None,
-    fg_ratio: float = 0.0,
-) -> Tuple[int, int]:
-    """Compute the (h0, w0) crop origin for a (H, W) spatial field.
+class SegInferenceDataset(Dataset):
+    """Inference-only dataset for 3D volumes without labels.
 
-    This is computed ONCE and shared between image and label to ensure
-    they receive the same spatial crop.
+    Loads and preprocesses raw image volumes for sliding-window inference.
+    This is the test-time counterpart of SegDataset3D — it does NOT crop
+    or pad to patch_size, because the Predictor uses sliding window inference.
+
+    Works correctly for any volume size (smaller or larger than patch_size),
+    matching how real-world data is handled at inference time.
     """
-    if H <= crop_h and W <= crop_w:
-        return 0, 0
 
-    if is_train:
-        if (
-            fg_ratio > 0
-            and fg_mask is not None
-            and np.random.random() < fg_ratio
-            and fg_mask.any()
-        ):
-            fy, fx = np.where(fg_mask)
-            idx = np.random.randint(len(fy))
-            cy, cx = fy[idx], fx[idx]
-            h0 = int(np.clip(cy - crop_h // 2, 0, max(0, H - crop_h)))
-            w0 = int(np.clip(cx - crop_w // 2, 0, max(0, W - crop_w)))
-        else:
-            h0 = np.random.randint(0, max(1, H - crop_h + 1))
-            w0 = np.random.randint(0, max(1, W - crop_w + 1))
-    else:
-        h0 = max(0, (H - crop_h) // 2)
-        w0 = max(0, (W - crop_w) // 2)
+    def __init__(
+        self,
+        image_paths: List[str],
+        intensity_min: float = -1024.0,
+        intensity_max: float = 3071.0,
+        normalize: str = "minmax",
+        global_mean: float = 0.0,
+        global_std: float = 1.0,
+        cache_enabled: bool = False,
+    ):
+        super().__init__()
+        self.image_paths = image_paths
+        self.intensity_min = intensity_min
+        self.intensity_max = intensity_max
+        self.normalize = normalize
+        self.global_mean = global_mean
+        self.global_std = global_std
+        self._img_cache = VolumeCache(cache_enabled)
 
-    return h0, w0
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        path = self.image_paths[idx]
+        img = self._load_image(path)
+        return {
+            "image": torch.from_numpy(img[np.newaxis]).float(),  # (1, D, H, W)
+            "subject_id": Path(path).stem,
+            "original_shape": torch.tensor(list(img.shape), dtype=torch.long),
+        }
+
+    def _load_image(self, path: str) -> np.ndarray:
+        cached = self._img_cache.get(path)
+        if cached is not None:
+            return cached
+        img = load_nifti(path, dtype=np.float32)
+        img = preprocess_image(
+            img, self.intensity_min, self.intensity_max,
+            self.normalize, self.global_mean, self.global_std,
+        )
+        self._img_cache.put(path, img)
+        return img
 
 
-def _apply_crop_pad(
-    arr: np.ndarray,
-    crop_h: int,
-    crop_w: int,
-    h0: int,
-    w0: int,
-) -> np.ndarray:
-    """Pad array if needed, then crop at (h0, w0) to (crop_h, crop_w).
+def resize_2d(arr: np.ndarray, target_h: int, target_w: int, is_label: bool = False) -> np.ndarray:
+    """Resize the last two dimensions (H, W) of an array to (target_h, target_w).
 
-    Args:
-        arr: Array with last two dims being (H, W).
-        crop_h, crop_w: Target spatial size.
-        h0, w0: Crop origin (from _compute_crop_origin).
+    Works for any leading dimensions: (H, W), (C, H, W), (D, H, W), etc.
+    Uses bilinear interpolation for images, nearest-neighbor for labels.
+    Works identically at train and test time — no labels needed.
     """
+    from scipy.ndimage import zoom
+
     H, W = arr.shape[-2], arr.shape[-1]
-    pad_h = max(0, crop_h - H)
-    pad_w = max(0, crop_w - W)
-    if pad_h > 0 or pad_w > 0:
-        pad_width = [(0, 0)] * (arr.ndim - 2) + [(0, pad_h), (0, pad_w)]
-        arr = np.pad(arr, pad_width, mode="constant", constant_values=0)
+    if H == target_h and W == target_w:
+        return arr
 
-    return arr[..., h0:h0 + crop_h, w0:w0 + crop_w]
+    scale_h = target_h / H
+    scale_w = target_w / W
+    # Build zoom factors: 1.0 for all leading dims, scale for last two
+    factors = [1.0] * (arr.ndim - 2) + [scale_h, scale_w]
+    order = 0 if is_label else 1  # nearest for labels, bilinear for images
+    return zoom(arr, factors, order=order).astype(arr.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -225,28 +229,24 @@ class SegDataset2D(Dataset):
     """2D slice-based dataset.
 
     Each sample is a single axial slice extracted from a 3D volume.
-    Returns (image, label) tensors of shape (1, H, W) and (num_classes, H, W).
-    Slices are cropped/padded to crop_size for uniform batching.
+    All slices are RESIZED to target_size for uniform batching.
+    This works identically at train and test time (no labels needed).
     """
 
     def __init__(
         self,
-        records: List[SampleRecord],
-        label_values: List[int],
-        crop_size: Tuple[int, int] = (256, 256),
-        intensity_min: float = -1024.0,
-        intensity_max: float = 3071.0,
+        records: List[SampleRecord], label_values: List[int],
+        target_size: Tuple[int, int] = (256, 256),
+        intensity_min: float = -1024.0, intensity_max: float = 3071.0,
         normalize: str = "minmax",
-        global_mean: float = 0.0,
-        global_std: float = 1.0,
+        global_mean: float = 0.0, global_std: float = 1.0,
         cache_enabled: bool = False,
         foreground_oversample_ratio: float = 0.0,
-        is_train: bool = True,
-    ):
+        is_train: bool = True):
         super().__init__()
         self.records = records
         self.label_values = label_values
-        self.crop_size = tuple(crop_size)
+        self.target_size = tuple(target_size)
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -258,23 +258,18 @@ class SegDataset2D(Dataset):
         self._img_cache = VolumeCache(cache_enabled)
         self._lbl_cache = VolumeCache(cache_enabled)
 
-        # Build slice index: (volume_idx, slice_idx)
         self._index: List[Tuple[int, int]] = []
-        # Track which slices have foreground
         self._fg_indices: List[int] = []
         self._bg_indices: List[int] = []
-
         self._build_index()
 
     def _load_volume(self, rec: SampleRecord) -> Tuple[np.ndarray, np.ndarray]:
         return load_and_preprocess(
             rec, self._img_cache, self._lbl_cache,
             self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std,
-        )
+            self.normalize, self.global_mean, self.global_std)
 
     def _build_index(self) -> None:
-        """Build flat index of (volume_idx, slice_idx) pairs."""
         logger.info("Building 2D slice index for %d volumes...", len(self.records))
         for vol_idx, rec in enumerate(self.records):
             _, lbl = self._load_volume(rec)
@@ -285,18 +280,15 @@ class SegDataset2D(Dataset):
                     self._fg_indices.append(flat_idx)
                 else:
                     self._bg_indices.append(flat_idx)
-
         logger.info(
             "2D index: %d slices (%d fg, %d bg) from %d volumes",
             len(self._index), len(self._fg_indices),
-            len(self._bg_indices), len(self.records),
-        )
+            len(self._bg_indices), len(self.records))
 
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # Foreground oversampling: with some probability, redirect to foreground
         if (
             self.is_train
             and self.foreground_ratio > 0
@@ -307,41 +299,43 @@ class SegDataset2D(Dataset):
 
         vol_idx, slice_idx = self._index[idx]
         rec = self.records[vol_idx]
-
         img, lbl = self._load_volume(rec)
         img_slice = img[slice_idx]  # (H, W)
         lbl_slice = lbl[slice_idx]  # (H, W)
 
-        # Build foreground mask for crop biasing
-        fg_mask = None
-        if self.is_train and self.foreground_ratio > 0:
-            lbl_int = np.round(lbl_slice).astype(np.int32)
-            fg_mask = np.zeros_like(lbl_int, dtype=bool)
-            for lv in self.label_values[1:]:
-                fg_mask |= (lbl_int == lv)
+        # Resize to uniform target_size — works at both train and test time
+        th, tw = self.target_size
+        img_slice = resize_2d(img_slice, th, tw, is_label=False)
+        lbl_slice = resize_2d(lbl_slice, th, tw, is_label=True)
 
-        # Compute crop origin ONCE, apply to both image and label
-        ch, cw = self.crop_size
-        H, W = img_slice.shape[-2], img_slice.shape[-1]
-        padded_H = max(H, ch)
-        padded_W = max(W, cw)
-        # Pad fg_mask for origin computation
-        pad_fg = fg_mask
-        if fg_mask is not None and (padded_H > H or padded_W > W):
-            pad_fg = np.pad(fg_mask, ((0, padded_H - H), (0, padded_W - W)), mode="constant")
-        h0, w0 = _compute_crop_origin(padded_H, padded_W, ch, cw, self.is_train, pad_fg, self.foreground_ratio)
-        img_slice = _apply_crop_pad(img_slice, ch, cw, h0, w0)
-        lbl_slice = _apply_crop_pad(lbl_slice, ch, cw, h0, w0)
-
-        # Convert label to multi-channel
         lbl_mc = preprocess_label(lbl_slice, self.label_values)  # (C, H, W)
 
         return {
             "image": torch.from_numpy(img_slice[np.newaxis]).float(),  # (1, H, W)
             "label": torch.from_numpy(lbl_mc).float(),  # (num_classes, H, W)
             "subject_id": rec.subject_id,
-            "slice_idx": slice_idx,
-        }
+            "slice_idx": slice_idx}
+
+
+def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_label: bool = False) -> np.ndarray:
+    """Resize the last three dimensions (D, H, W) of an array.
+
+    Works for any leading dimensions: (D, H, W), (C, D, H, W), etc.
+    Uses bilinear interpolation for images, nearest-neighbor for labels.
+    Works identically at train and test time — no labels needed.
+    """
+    from scipy.ndimage import zoom
+
+    D, H, W = arr.shape[-3:]
+    if D == target_d and H == target_h and W == target_w:
+        return arr
+
+    scale_d, scale_h, scale_w = target_d / D, target_h / H, target_w / W
+    factors = [scale_d, scale_h, scale_w]
+    if arr.ndim > 3:
+        factors = [1.0] * (arr.ndim - 3) + factors
+    order = 0 if is_label else 1
+    return zoom(arr, factors, order=order).astype(arr.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -350,25 +344,22 @@ class SegDataset2D(Dataset):
 class SegDataset3D(Dataset):
     """3D patch-based dataset.
 
-    Randomly crops 3D patches from volumes. Uses foreground oversampling
-    to ensure patches contain anatomical structures.
+    Resizes 3D volumes to patch_size for uniform batching.
+    Uses foreground oversampling to ensure patches contain anatomical structures.
+    Works identically at train and test time.
     """
 
     def __init__(
         self,
-        records: List[SampleRecord],
-        label_values: List[int],
+        records: List[SampleRecord], label_values: List[int],
         patch_size: Tuple[int, int, int] = (96, 96, 96),
-        intensity_min: float = -1024.0,
-        intensity_max: float = 3071.0,
+        intensity_min: float = -1024.0, intensity_max: float = 3071.0,
         normalize: str = "minmax",
-        global_mean: float = 0.0,
-        global_std: float = 1.0,
+        global_mean: float = 0.0, global_std: float = 1.0,
         cache_enabled: bool = False,
         foreground_oversample_ratio: float = 0.5,
         samples_per_volume: int = 4,
-        is_train: bool = True,
-    ):
+        is_train: bool = True):
         super().__init__()
         self.records = records
         self.label_values = label_values
@@ -385,114 +376,76 @@ class SegDataset3D(Dataset):
         self._img_cache = VolumeCache(cache_enabled)
         self._lbl_cache = VolumeCache(cache_enabled)
 
-        # Precompute foreground voxel locations per volume
-        self._fg_coords: List[Optional[np.ndarray]] = []
-        self._build_fg_coords()
+        self._index: List[Tuple[int, int]] = []
+        self._fg_indices: List[int] = []
+        self._bg_indices: List[int] = []
+        self._build_index()
 
     def _load_volume(self, rec: SampleRecord) -> Tuple[np.ndarray, np.ndarray]:
         return load_and_preprocess(
             rec, self._img_cache, self._lbl_cache,
             self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std,
-        )
+            self.normalize, self.global_mean, self.global_std)
 
-    def _build_fg_coords(self) -> None:
-        """Precompute foreground voxel coordinates for each volume."""
-        logger.info("Building 3D foreground coords for %d volumes...", len(self.records))
-        bg_val = self.label_values[0]
-        for rec in self.records:
+    def _build_index(self) -> None:
+        """Build per-slice index for foreground oversampling."""
+        logger.info("Building 3D slice index for %d volumes...", len(self.records))
+        for vol_idx, rec in enumerate(self.records):
             _, lbl = self._load_volume(rec)
-            # Foreground = anything not background (vectorized, no loop over classes)
-            fg_mask = np.round(lbl).astype(np.int32) != bg_val
-
-            if fg_mask.any():
-                coords = np.argwhere(fg_mask)  # (N, 3)
-                # Subsample to keep memory bounded
-                if len(coords) > 10000:
-                    rng = np.random.RandomState(42)
-                    coords = coords[rng.choice(len(coords), 10000, replace=False)]
-                self._fg_coords.append(coords)
-            else:
-                self._fg_coords.append(None)
-
-        n_with_fg = sum(1 for c in self._fg_coords if c is not None)
-        logger.info("3D fg coords: %d/%d volumes have foreground", n_with_fg, len(self.records))
-
-    def _random_crop_origin(
-        self, vol_shape: Tuple[int, ...], fg_coords: Optional[np.ndarray]
-    ) -> Tuple[int, int, int]:
-        """Compute random crop origin, optionally centered on foreground."""
-        D, H, W = vol_shape
-        pd, ph, pw = self.patch_size
-
-        if (
-            fg_coords is not None
-            and len(fg_coords) > 0
-            and np.random.random() < self.foreground_ratio
-        ):
-            # Pick a random foreground voxel and center patch there
-            idx = np.random.randint(len(fg_coords))
-            cd, ch, cw = fg_coords[idx]
-            d0 = int(np.clip(cd - pd // 2, 0, max(0, D - pd)))
-            h0 = int(np.clip(ch - ph // 2, 0, max(0, H - ph)))
-            w0 = int(np.clip(cw - pw // 2, 0, max(0, W - pw)))
-        else:
-            d0 = np.random.randint(0, max(1, D - pd + 1))
-            h0 = np.random.randint(0, max(1, H - ph + 1))
-            w0 = np.random.randint(0, max(1, W - pw + 1))
-
-        return d0, h0, w0
-
-    def _pad_if_needed(self, volume: np.ndarray) -> np.ndarray:
-        """Pad volume if smaller than patch_size."""
-        pd, ph, pw = self.patch_size
-        D, H, W = volume.shape[-3:]
-        pad_d = max(0, pd - D)
-        pad_h = max(0, ph - H)
-        pad_w = max(0, pw - W)
-        if pad_d > 0 or pad_h > 0 or pad_w > 0:
-            if volume.ndim == 3:
-                volume = np.pad(volume, ((0, pad_d), (0, pad_h), (0, pad_w)), mode="constant")
-            else:
-                # For multi-channel
-                volume = np.pad(
-                    volume,
-                    ((0, 0), (0, pad_d), (0, pad_h), (0, pad_w)),
-                    mode="constant",
-                )
-        return volume
+            D = lbl.shape[0]
+            for s in range(D):
+                flat_idx = len(self._index)
+                self._index.append((vol_idx, s))
+                if has_foreground(lbl[s], self.label_values):
+                    self._fg_indices.append(flat_idx)
+                else:
+                    self._bg_indices.append(flat_idx)
+        logger.info(
+            "3D index: %d slices (%d fg, %d bg) from %d volumes",
+            len(self._index), len(self._fg_indices),
+            len(self._bg_indices), len(self.records))
 
     def __len__(self) -> int:
-        return len(self.records) * self.samples_per_volume
+        return len(self._index) * self.samples_per_volume
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        vol_idx = idx // self.samples_per_volume
+        # Sample a slice index, with foreground oversampling
+        slice_idx = idx % len(self._index)
+        if (
+            self.is_train
+            and self.foreground_ratio > 0
+            and self._fg_indices
+            and np.random.random() < self.foreground_ratio):
+            slice_idx = self._fg_indices[np.random.randint(len(self._fg_indices))]
+
+        vol_idx, z = self._index[slice_idx]
         rec = self.records[vol_idx]
 
-        img, lbl = self._load_volume(rec)
-        img = self._pad_if_needed(img)
-        lbl = self._pad_if_needed(lbl)
-
-        if self.is_train:
-            d0, h0, w0 = self._random_crop_origin(img.shape, self._fg_coords[vol_idx])
-        else:
-            # Center crop for validation
-            D, H, W = img.shape
-            pd, ph, pw = self.patch_size
-            d0 = max(0, (D - pd) // 2)
-            h0 = max(0, (H - ph) // 2)
-            w0 = max(0, (W - pw) // 2)
-
+        img, lbl   = self._load_volume(rec)  # (D, H, W)
         pd, ph, pw = self.patch_size
-        img_patch = img[d0:d0+pd, h0:h0+ph, w0:w0+pw]  # (D, H, W)
-        lbl_patch = lbl[d0:d0+pd, h0:h0+ph, w0:w0+pw]  # (D, H, W)
 
-        # Convert label
+        # Extract 3D patch centered around the selected slice
+        half_d  = pd // 2
+        d_start = max(0, z - half_d)
+        d_end   = min(img.shape[0], z + half_d)
+        # If at boundary, adjust the other side to keep same size
+        if d_end - d_start < pd:
+            if d_start == 0:
+                d_end = min(img.shape[0], pd)
+            else:
+                d_start = max(0, d_end - pd)
+
+        img_patch = img[d_start:d_end]  # (pd, ph, pw) or smaller at boundaries
+        lbl_patch = lbl[d_start:d_end]
+        
+        # Resize entire volume to patch_size — works at both train and test time
+        img_patch = resize_3d(img_patch, pd, ph, pw, is_label=False)
+        img_patch = resize_3d(img_patch, pd, ph, pw, is_label=True)
+
         lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (C, D, H, W)
 
         return {
             "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
             "label": torch.from_numpy(lbl_mc).float(),  # (num_classes, D, H, W)
             "subject_id": rec.subject_id,
-            "crop_origin": torch.tensor([d0, h0, w0]),
-        }
+            "slice_idx": z}

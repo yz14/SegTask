@@ -41,24 +41,21 @@ def build_model(cfg: Config) -> UNet:
         norm_type=mc.norm_type,
         norm_groups=mc.norm_groups,
         activation=mc.activation,
-        dropout=mc.dropout,
-    )
+        dropout=mc.dropout)
 
     # Build encoder
     encoder_kwargs = dict(
         in_channels=mc.in_channels,
         channels=mc.encoder_channels,
         blocks_per_level=mc.encoder_blocks_per_level,
-        **common_kwargs,
-    )
+        **common_kwargs)
     if mc.encoder_name == "vit":
         encoder_kwargs.update(
             num_heads=mc.vit_num_heads,
             mlp_ratio=mc.vit_mlp_ratio,
             qkv_bias=mc.vit_qkv_bias,
             drop_path_rate=mc.vit_drop_path_rate,
-            patch_size=mc.vit_patch_size,
-        )
+            patch_size=mc.vit_patch_size)
     encoder = build_encoder(mc.encoder_name, **encoder_kwargs)
 
     # Build decoder
@@ -68,15 +65,13 @@ def build_model(cfg: Config) -> UNet:
         blocks_per_level=mc.decoder_blocks_per_level,
         upsample_mode=mc.upsample_mode,
         skip_mode=mc.skip_mode,
-        **common_kwargs,
-    )
+        **common_kwargs)
     if mc.decoder_name == "vit":
         decoder_kwargs.update(
             num_heads=mc.vit_num_heads,
             mlp_ratio=mc.vit_mlp_ratio,
             qkv_bias=mc.vit_qkv_bias,
-            drop_path_rate=mc.vit_drop_path_rate,
-        )
+            drop_path_rate=mc.vit_drop_path_rate)
     decoder = build_decoder(mc.decoder_name, **decoder_kwargs)
 
     # For 2.5D mode: model outputs predictions for ALL input slices
@@ -93,8 +88,7 @@ def build_model(cfg: Config) -> UNet:
         decoder=decoder,
         num_classes=num_classes_out,
         spatial_dims=mc.spatial_dims,
-        deep_supervision=mc.deep_supervision,
-    )
+        deep_supervision=mc.deep_supervision)
 
     # Store metadata for trainer/predictor
     model.semantic_classes = num_classes
@@ -112,7 +106,6 @@ def build_model(cfg: Config) -> UNet:
         param_count["encoder"] // 1000,
         param_count["decoder"] // 1000,
         param_count["seg_head"] // 1000,
-        param_count["total"] / 1e6,
-    )
+        param_count["total"] / 1e6)
 
     return model

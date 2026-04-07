@@ -88,17 +88,11 @@ class ConvNormAct(nn.Module):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        padding: int = 1,
+        in_channels: int, out_channels: int,
+        kernel_size: int = 3, stride: int = 1, padding: int = 1,
         spatial_dims: int = 2,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        dropout: float = 0.0,
-    ):
+        norm_type: str = "instance", norm_groups: int = 8,
+        activation: str = "leakyrelu", dropout: float = 0.0):
         super().__init__()
         Conv = get_conv(spatial_dims)
         self.conv = Conv(in_channels, out_channels, kernel_size, stride, padding, bias=False)
@@ -118,12 +112,9 @@ class Downsample(nn.Module):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
+        in_channels: int, out_channels: int,
         spatial_dims: int = 2,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-    ):
+        norm_type: str = "instance", norm_groups: int = 8):
         super().__init__()
         Conv = get_conv(spatial_dims)
         self.conv = Conv(in_channels, out_channels, kernel_size=2, stride=2, bias=False)

@@ -19,15 +19,11 @@ class VGGBlock(nn.Module):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
+        in_channels: int, out_channels: int,
         num_convs: int = 2,
         spatial_dims: int = 2,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        dropout: float = 0.0,
-    ):
+        norm_type: str = "instance", norm_groups: int = 8,
+        activation: str = "leakyrelu", dropout: float = 0.0):
         super().__init__()
         layers = []
         for i in range(num_convs):
@@ -37,12 +33,8 @@ class VGGBlock(nn.Module):
                     ch_in, out_channels,
                     kernel_size=3, padding=1,
                     spatial_dims=spatial_dims,
-                    norm_type=norm_type,
-                    norm_groups=norm_groups,
-                    activation=activation,
-                    dropout=dropout,
-                )
-            )
+                    norm_type=norm_type, norm_groups=norm_groups,
+                    activation=activation, dropout=dropout))
         self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -58,15 +50,11 @@ class VGGEncoder(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 1,
-        channels: List[int] = None,
+        in_channels: int = 1, channels: List[int] = None,
         blocks_per_level: List[int] = None,
         spatial_dims: int = 2,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        dropout: float = 0.0,
-    ):
+        norm_type: str = "instance", norm_groups: int = 8,
+        activation: str = "leakyrelu", dropout: float = 0.0):
         super().__init__()
         if channels is None:
             channels = [32, 64, 128, 256, 512]
@@ -89,18 +77,13 @@ class VGGEncoder(nn.Module):
                     ch_in, ch,
                     num_convs=n_blocks,
                     spatial_dims=spatial_dims,
-                    norm_type=norm_type,
-                    norm_groups=norm_groups,
-                    activation=activation,
-                    dropout=dropout,
-                )
-            )
+                    norm_type=norm_type, norm_groups=norm_groups,
+                    activation=activation, dropout=dropout))
             # Downsample between levels (not after the last one)
             if i < len(channels) - 1:
                 self.downsamples.append(
                     Downsample(ch, ch, spatial_dims=spatial_dims,
-                               norm_type=norm_type, norm_groups=norm_groups)
-                )
+                               norm_type=norm_type, norm_groups=norm_groups))
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Forward pass returning feature maps at each level.

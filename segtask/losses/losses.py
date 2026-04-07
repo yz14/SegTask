@@ -395,28 +395,24 @@ def build_loss(cfg: LossConfig) -> nn.Module:
     elif cfg.name == "tversky":
         base = TverskyLoss(
             alpha=cfg.tversky_alpha, beta=cfg.tversky_beta,
-            smooth=cfg.dice_smooth, class_weights=cw,
-        )
+            smooth=cfg.dice_smooth, class_weights=cw)
     elif cfg.name == "dice_ce":
         dice = DiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
         ce = CrossEntropyLoss(class_weights=cw, label_smoothing=cfg.label_smoothing)
         base = CompoundLoss(
-            [dice, ce], cfg.compound_weights[:2] if len(cfg.compound_weights) >= 2 else [1.0, 1.0]
-        )
+            [dice, ce], cfg.compound_weights[:2] if len(cfg.compound_weights) >= 2 else [1.0, 1.0])
     elif cfg.name == "dice_focal":
         dice = DiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
         focal = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma, class_weights=cw)
         base = CompoundLoss(
-            [dice, focal], cfg.compound_weights[:2] if len(cfg.compound_weights) >= 2 else [1.0, 1.0]
-        )
+            [dice, focal], cfg.compound_weights[:2] if len(cfg.compound_weights) >= 2 else [1.0, 1.0])
     else:
         raise ValueError(f"Unknown loss: {cfg.name}")
 
     # Wrap with border weighting if configured
     if cfg.spatial_weight_mode == "border":
         base = BorderWeightedLoss(
-            base, sigma=cfg.border_weight_sigma, w0=cfg.border_weight_w0,
-        )
+            base, sigma=cfg.border_weight_sigma, w0=cfg.border_weight_w0)
 
     # Wrap with deep supervision if weights are provided
     if cfg.deep_supervision_weights:

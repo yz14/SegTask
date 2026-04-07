@@ -34,53 +34,37 @@ def _detect_label_values(records: List[SampleRecord], max_samples: int = 5) -> L
     return values
 
 
-def _create_dataset(
-    records: List[SampleRecord],
-    cfg: Config,
-    is_train: bool = True,
-):
+def _create_dataset(records: List[SampleRecord], cfg: Config, is_train: bool = True):
     """Create the appropriate dataset based on config data mode."""
     dc = cfg.data
 
     common_kwargs = dict(
-        records=records,
-        label_values=dc.label_values,
-        intensity_min=dc.intensity_min,
-        intensity_max=dc.intensity_max,
+        records=records, label_values=dc.label_values,
+        intensity_min=dc.intensity_min, intensity_max=dc.intensity_max,
         normalize=dc.normalize,
-        global_mean=dc.global_mean,
-        global_std=dc.global_std,
+        global_mean=dc.global_mean, global_std=dc.global_std,
         cache_enabled=(dc.cache_mode == "memory"),
         foreground_oversample_ratio=dc.foreground_oversample_ratio if is_train else 0.0,
-        is_train=is_train,
-    )
+        is_train=is_train)
 
     # Remove is_train from common_kwargs — SegDataset3D takes it as a separate param
     kw_3d = {k: v for k, v in common_kwargs.items() if k != "is_train"}
 
     if dc.mode == "2d":
-        return SegDataset2D(crop_size=tuple(dc.crop_size), **common_kwargs)
+        return SegDataset2D(target_size=tuple(dc.target_size), **common_kwargs)  # TODO 3D数据一般不会用2D模型训练，只有2D数据，例如x-ray，才用2D模型
     elif dc.mode == "2.5d":
         # 2.5D directly reuses SegDataset3D — just set D = total_slices
         total_slices = 2 * dc.num_slices_per_side + 1
-        patch_25d = (total_slices, dc.crop_size[0], dc.crop_size[1])
+        patch_25d = (total_slices, dc.target_size[0], dc.target_size[1])
         # Estimate samples_per_volume from first record's depth for proper coverage
         first_vol = load_nifti(records[0].image_path, dtype=np.float32)
         avg_depth = first_vol.shape[0]  # after transpose: (D, H, W)
         spv = max(1, avg_depth // total_slices) if is_train else 1
-        return SegDataset3D(
-            patch_size=patch_25d,
-            samples_per_volume=spv,
-            is_train=is_train,
-            **kw_3d,
-        )
+        return SegDataset3D(patch_size=patch_25d, samples_per_volume=spv, is_train=is_train, **kw_3d)
     elif dc.mode == "3d":
         return SegDataset3D(
-            patch_size=tuple(dc.patch_size),
-            samples_per_volume=4 if is_train else 1,
-            is_train=is_train,
-            **kw_3d,
-        )
+            patch_size=tuple(dc.patch_size), samples_per_volume=4 if is_train else 1,
+            is_train=is_train, **kw_3d)
     else:
         raise ValueError(f"Unknown data mode: {dc.mode}")
 
@@ -128,14 +112,13 @@ def build_dataloaders(
         records,
         method=dc.split_method,
         meta_csv=dc.meta_csv,
-        val_ratio=dc.val_ratio,
-        test_ratio=dc.test_ratio,
+        val_ratio=dc.val_ratio, test_ratio=dc.test_ratio,
         seed=dc.split_seed)
 
     # 4. Create datasets
     train_ds = _create_dataset(train_recs, cfg, is_train=True)
-    val_ds = _create_dataset(val_recs, cfg, is_train=False)
-    test_ds = _create_dataset(test_recs, cfg, is_train=False) if test_recs else None
+    val_ds   = _create_dataset(val_recs, cfg, is_train=False)
+    test_ds  = _create_dataset(test_recs, cfg, is_train=False) if test_recs else None
 
     # 5. Sampler
     if dc.class_sample_weights:

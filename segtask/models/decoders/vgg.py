@@ -19,15 +19,11 @@ class VGGDecoderBlock(nn.Module):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
+        in_channels: int, out_channels: int,
         num_convs: int = 2,
         spatial_dims: int = 2,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        dropout: float = 0.0,
-    ):
+        norm_type: str = "instance", norm_groups: int = 8,
+        activation: str = "leakyrelu", dropout: float = 0.0):
         super().__init__()
         layers = []
         for i in range(num_convs):
@@ -37,12 +33,8 @@ class VGGDecoderBlock(nn.Module):
                     ch_in, out_channels,
                     kernel_size=3, padding=1,
                     spatial_dims=spatial_dims,
-                    norm_type=norm_type,
-                    norm_groups=norm_groups,
-                    activation=activation,
-                    dropout=dropout,
-                )
-            )
+                    norm_type=norm_type, norm_groups=norm_groups,
+                    activation=activation, dropout=dropout))
         self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -64,13 +56,9 @@ class VGGDecoder(nn.Module):
         decoder_channels: List[int] = None,
         blocks_per_level: List[int] = None,
         spatial_dims: int = 2,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        dropout: float = 0.0,
-        upsample_mode: str = "transpose",
-        skip_mode: str = "cat",
-    ):
+        norm_type: str = "instance", norm_groups: int = 8,
+        activation: str = "leakyrelu", dropout: float = 0.0,
+        upsample_mode: str = "transpose", skip_mode: str = "cat"):
         super().__init__()
         if encoder_channels is None:
             encoder_channels = [32, 64, 128, 256, 512]
@@ -88,19 +76,14 @@ class VGGDecoder(nn.Module):
 
         for i in range(self.num_levels):
             # Input from deeper level
-            if i == 0:
-                deeper_ch = encoder_channels[-1]  # bottleneck
-            else:
-                deeper_ch = decoder_channels[i - 1]
+            deeper_ch = encoder_channels[-1] if i == 0 else deeper_ch = decoder_channels[i - 1]
+            self.upsamples.append(
+                Upsample(deeper_ch, deeper_ch, spatial_dims=spatial_dims,
+                         mode=upsample_mode))
 
             # Skip connection from encoder
             # Encoder features are indexed: encoder_channels[-2], [-3], ...
             skip_ch = encoder_channels[-(i + 2)]
-
-            self.upsamples.append(
-                Upsample(deeper_ch, deeper_ch, spatial_dims=spatial_dims,
-                         mode=upsample_mode)
-            )
 
             if skip_mode == "cat":
                 block_in = deeper_ch + skip_ch
@@ -112,24 +95,17 @@ class VGGDecoder(nn.Module):
                     block_in, decoder_channels[i],
                     num_convs=blocks_per_level[i],
                     spatial_dims=spatial_dims,
-                    norm_type=norm_type,
-                    norm_groups=norm_groups,
-                    activation=activation,
-                    dropout=dropout,
-                )
-            )
+                    norm_type=norm_type, norm_groups=norm_groups,
+                    activation=activation, dropout=dropout))
 
             # 1x1 conv for channel matching when using add mode
             if skip_mode == "add" and deeper_ch != skip_ch:
                 Conv = get_conv(spatial_dims)
                 self.add_module(
                     f"skip_proj_{i}",
-                    Conv(skip_ch, deeper_ch, 1, bias=False),
-                )
+                    Conv(skip_ch, deeper_ch, 1, bias=False))
 
-    def forward(
-        self, encoder_features: List[torch.Tensor]
-    ) -> List[torch.Tensor]:
+    def forward(self, encoder_features: List[torch.Tensor]) -> List[torch.Tensor]:
         """Decode using encoder features (from high-res to low-res).
 
         Args:
