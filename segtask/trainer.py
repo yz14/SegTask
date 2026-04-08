@@ -151,9 +151,7 @@ class Trainer:
     """Full training pipeline for segmentation."""
 
     def __init__(
-        self,
-        model: UNet,
-        cfg: Config,
+        self, model: UNet, cfg: Config,
         train_loader: DataLoader, val_loader: DataLoader,
         device: torch.device):
         self.model = model.to(device)
@@ -247,8 +245,7 @@ class Trainer:
                 val_metrics.get("mean_dice", 0),
                 self.best_metric if self.best_metric > -float("inf") else 0,
                 self.best_epoch + 1,
-                timer.elapsed_str(),
-            )
+                timer.elapsed_str())
 
             # Checkpointing
             tracked = val_metrics.get(tc.save_best_metric.replace("val_", ""), 0)

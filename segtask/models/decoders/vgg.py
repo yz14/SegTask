@@ -78,8 +78,7 @@ class VGGDecoder(nn.Module):
             # Input from deeper level
             deeper_ch = encoder_channels[-1] if i == 0 else deeper_ch = decoder_channels[i - 1]
             self.upsamples.append(
-                Upsample(deeper_ch, deeper_ch, spatial_dims=spatial_dims,
-                         mode=upsample_mode))
+                Upsample(deeper_ch, deeper_ch, spatial_dims=spatial_dims, mode=upsample_mode))
 
             # Skip connection from encoder
             # Encoder features are indexed: encoder_channels[-2], [-3], ...

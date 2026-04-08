@@ -38,12 +38,7 @@ class DiceLoss(nn.Module):
     Optionally uses squared denominators for sharper gradients.
     """
 
-    def __init__(
-        self,
-        smooth: float = 1e-5,
-        squared: bool = False,
-        class_weights: Optional[List[float]] = None,
-    ):
+    def __init__(self, smooth: float = 1e-5, squared: bool = False, class_weights: Optional[List[float]] = None):
         super().__init__()
         self.smooth = smooth
         self.squared = squared

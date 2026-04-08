@@ -124,8 +124,7 @@ def build_dataloaders(
     if dc.class_sample_weights:
         # Use provided class weights for balanced sampling
         sample_weights = compute_sample_weights_from_labels(
-            train_ds, dc.num_classes, dc.class_sample_weights
-        )
+            train_ds, dc.num_classes, dc.class_sample_weights)
         train_sampler = ClassBalancedSampler(sample_weights, num_samples=len(train_ds))
     else:
         train_sampler = RandomSampler(train_ds)
@@ -137,33 +136,28 @@ def build_dataloaders(
         pin_memory=dc.pin_memory,
         prefetch_factor=dc.prefetch_factor if dc.num_workers > 0 else None,
         persistent_workers=dc.num_workers > 0,
-        drop_last=False,
-    )
+        drop_last=False)
 
     train_loader = DataLoader(
         train_ds,
         sampler=train_sampler,
         drop_last=True,
-        **{k: v for k, v in loader_kwargs.items() if k != "drop_last"},
-    )
+        **{k: v for k, v in loader_kwargs.items() if k != "drop_last"})
     val_loader = DataLoader(
         val_ds,
         sampler=SequentialSampler(val_ds),
-        **loader_kwargs,
-    )
+        **loader_kwargs)
     test_loader = None
     if test_ds is not None and len(test_ds) > 0:
         test_loader = DataLoader(
             test_ds,
             sampler=SequentialSampler(test_ds),
-            **loader_kwargs,
-        )
+            **loader_kwargs)
 
     logger.info(
         "DataLoaders: train=%d batches, val=%d batches, test=%s batches",
         len(train_loader),
         len(val_loader),
-        len(test_loader) if test_loader else "N/A",
-    )
+        len(test_loader) if test_loader else "N/A")
 
     return train_loader, val_loader, test_loader

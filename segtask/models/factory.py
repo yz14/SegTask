@@ -77,7 +77,7 @@ def build_model(cfg: Config) -> UNet:
     # For 2.5D mode: model outputs predictions for ALL input slices
     # Output channels = num_classes * total_slices
     # e.g. 3 classes × 3 slices = 9 output channels
-    total_slices = 1
+    total_slices = 1  # TODO 应该用yaml里面的配置，这里可能是9，12等等
     if cfg.data.mode == "2.5d":
         total_slices = 2 * cfg.data.num_slices_per_side + 1
     num_classes_out = num_classes * total_slices

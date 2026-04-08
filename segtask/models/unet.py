@@ -56,12 +56,10 @@ class UNet(nn.Module):
 
     def __init__(
         self,
-        encoder: nn.Module,
-        decoder: nn.Module,
+        encoder: nn.Module, decoder: nn.Module,
         num_classes: int,
         spatial_dims: int = 2,
-        deep_supervision: bool = False,
-    ):
+        deep_supervision: bool = False):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -77,12 +75,9 @@ class UNet(nn.Module):
             self.ds_heads = nn.ModuleList()
             for ch in decoder.out_channels[:-1]:
                 self.ds_heads.append(
-                    SegmentationHead(ch, num_classes, spatial_dims)
-                )
+                    SegmentationHead(ch, num_classes, spatial_dims))
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Forward pass.
 
         Args:
