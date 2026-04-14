@@ -1,14 +1,25 @@
 """Segmentation loss functions.
 
-All losses expect:
+Two output modes supported:
+  "softmax"   — standard multi-class softmax losses (pred includes background)
+  "per_class" — per-channel binary sigmoid losses (pred is foreground-only)
+
+Softmax-mode losses expect:
 - pred: (B, num_classes, *spatial) — raw logits
-- target: (B, num_classes, *spatial) — one-hot encoded labels
+- target: (B, num_classes, *spatial) — one-hot encoded labels (including bg)
+
+Per-class-mode losses expect:
+- pred: (B, num_fg_classes, *spatial) — raw logits (no background channel)
+- target: (B, num_fg_classes, *spatial) — binary masks (foreground only)
 
 Provides:
-- DiceLoss: soft Dice loss
-- CrossEntropyLoss: pixel-wise cross entropy (from logits)
-- FocalLoss: focal loss for class imbalance
-- TverskyLoss: asymmetric Dice variant (tunable FP/FN weights)
+- DiceLoss: soft Dice loss (softmax mode)
+- CrossEntropyLoss: pixel-wise cross entropy (softmax mode)
+- FocalLoss: focal loss for class imbalance (softmax mode)
+- TverskyLoss: asymmetric Dice variant (softmax mode)
+- PerClassBinaryDiceLoss: per-channel binary Dice (per_class mode)
+- PerClassBCELoss: per-channel BCE with logits (per_class mode)
+- PerClassFocalLoss: per-channel binary focal loss (per_class mode)
 - CompoundLoss: weighted combination of multiple losses
 - Deep supervision wrapper
 """
@@ -152,7 +163,9 @@ class FocalLoss(nn.Module):
         # Gather the probability of the correct class
         pt = pred_soft.gather(1, target_idx.unsqueeze(1)).squeeze(1)
 
-        focal_weight = self.alpha * (1 - pt) ** self.gamma
+        # Per-pixel alpha: alpha for foreground classes, (1-alpha) for background (class 0)
+        alpha_t = torch.where(target_idx > 0, self.alpha, 1.0 - self.alpha)
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
         loss = focal_weight * ce
 
         if self.class_weights is not None:
@@ -368,10 +381,119 @@ class BorderWeightedLoss(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Per-class binary losses (for per_class output mode)
+# ---------------------------------------------------------------------------
+class PerClassBinaryDiceLoss(nn.Module):
+    """Per-channel binary Dice loss using sigmoid.
+
+    Each channel is an independent binary segmentation problem.
+    Loss = 1 - mean(Dice_per_channel).
+    """
+
+    def __init__(self, smooth: float = 1e-5, squared: bool = False,
+                 class_weights: Optional[List[float]] = None):
+        super().__init__()
+        self.smooth = smooth
+        self.squared = squared
+        if class_weights:
+            self.register_buffer(
+                "class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_prob = torch.sigmoid(pred)
+        B, C = pred.shape[:2]
+        pred_flat = pred_prob.reshape(B, C, -1)
+        target_flat = target.reshape(B, C, -1)
+
+        intersection = (pred_flat * target_flat).sum(dim=2)
+        if self.squared:
+            denom = (pred_flat ** 2).sum(dim=2) + (target_flat ** 2).sum(dim=2)
+        else:
+            denom = pred_flat.sum(dim=2) + target_flat.sum(dim=2)
+
+        dice = (2.0 * intersection + self.smooth) / (denom + self.smooth)
+
+        if self.class_weights is not None:
+            w = self.class_weights.to(dice.device)
+            loss = 1.0 - (dice * w.unsqueeze(0)).sum(dim=1) / w.sum()
+        else:
+            loss = 1.0 - dice.mean(dim=1)
+
+        return loss.mean()
+
+
+class PerClassBCELoss(nn.Module):
+    """Per-channel binary cross-entropy loss with logits.
+
+    Each channel is an independent binary segmentation problem.
+    """
+
+    def __init__(self, class_weights: Optional[List[float]] = None):
+        super().__init__()
+        if class_weights:
+            self.register_buffer(
+                "class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.class_weights is not None:
+            w = self.class_weights.to(pred.device)
+            # (C,) → (1, C, 1, ...) for broadcasting
+            w = w.reshape(1, -1, *([1] * (pred.ndim - 2)))
+            loss = F.binary_cross_entropy_with_logits(pred, target, weight=w)
+        else:
+            loss = F.binary_cross_entropy_with_logits(pred, target)
+        return loss
+
+
+class PerClassFocalLoss(nn.Module):
+    """Per-channel binary focal loss.
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    Applied independently per channel.
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
+                 class_weights: Optional[List[float]] = None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        if class_weights:
+            self.register_buffer(
+                "class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+        pt = torch.sigmoid(pred)
+        pt = pt * target + (1 - pt) * (1 - target)  # p_t
+        focal_weight = self.alpha * (1 - pt) ** self.gamma
+        loss = focal_weight * bce
+
+        if self.class_weights is not None:
+            w = self.class_weights.to(pred.device)
+            w = w.reshape(1, -1, *([1] * (pred.ndim - 2)))
+            loss = loss * w
+
+        return loss.mean()
+
+
+# ---------------------------------------------------------------------------
 # Loss factory
 # ---------------------------------------------------------------------------
 def build_loss(cfg: LossConfig) -> nn.Module:
     """Build loss function from config.
+
+    Supports two output modes:
+    - "softmax": standard multi-class losses (DiceLoss, CrossEntropyLoss, etc.)
+    - "per_class": per-channel binary losses (PerClassBinaryDiceLoss, PerClassBCELoss, etc.)
+
+    The same loss name (e.g. "dice_ce") automatically maps to the correct
+    implementation based on output_mode.
 
     Args:
         cfg: Loss configuration.
@@ -381,6 +503,14 @@ def build_loss(cfg: LossConfig) -> nn.Module:
     """
     cw = cfg.class_weights if cfg.class_weights else None
 
+    if cfg.output_mode == "per_class":
+        return _build_per_class_loss(cfg, cw)
+    else:
+        return _build_softmax_loss(cfg, cw)
+
+
+def _build_softmax_loss(cfg: LossConfig, cw) -> nn.Module:
+    """Build softmax-mode losses."""
     if cfg.name == "dice":
         base = DiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
     elif cfg.name == "ce":
@@ -404,13 +534,42 @@ def build_loss(cfg: LossConfig) -> nn.Module:
     else:
         raise ValueError(f"Unknown loss: {cfg.name}")
 
-    # Wrap with border weighting if configured
     if cfg.spatial_weight_mode == "border":
         base = BorderWeightedLoss(
             base, sigma=cfg.border_weight_sigma, w0=cfg.border_weight_w0)
+    return base
 
-    # Wrap with deep supervision if weights are provided
-    if cfg.deep_supervision_weights:
-        return DeepSupervisionLoss(base, cfg.deep_supervision_weights)
+
+def _build_per_class_loss(cfg: LossConfig, cw) -> nn.Module:
+    """Build per-class binary losses (sigmoid mode).
+
+    Loss name mapping:
+        "dice"       → PerClassBinaryDiceLoss
+        "ce"         → PerClassBCELoss  (CE maps to BCE in binary mode)
+        "focal"      → PerClassFocalLoss
+        "tversky"    → PerClassBinaryDiceLoss (Tversky is Dice-family)
+        "dice_ce"    → PerClassBinaryDiceLoss + PerClassBCELoss
+        "dice_focal" → PerClassBinaryDiceLoss + PerClassFocalLoss
+    """
+    if cfg.name == "dice":
+        base = PerClassBinaryDiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
+    elif cfg.name == "ce":
+        base = PerClassBCELoss(class_weights=cw)
+    elif cfg.name == "focal":
+        base = PerClassFocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma, class_weights=cw)
+    elif cfg.name == "tversky":
+        base = PerClassBinaryDiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
+    elif cfg.name == "dice_ce":
+        dice = PerClassBinaryDiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
+        bce = PerClassBCELoss(class_weights=cw)
+        base = CompoundLoss(
+            [dice, bce], cfg.compound_weights[:2] if len(cfg.compound_weights) >= 2 else [1.0, 1.0])
+    elif cfg.name == "dice_focal":
+        dice = PerClassBinaryDiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
+        focal = PerClassFocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma, class_weights=cw)
+        base = CompoundLoss(
+            [dice, focal], cfg.compound_weights[:2] if len(cfg.compound_weights) >= 2 else [1.0, 1.0])
+    else:
+        raise ValueError(f"Unknown loss: {cfg.name}")
 
     return base

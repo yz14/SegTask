@@ -90,6 +90,23 @@ def save_prediction_grid(
     plt.close(fig)
 
 
+def _prob_to_label(logits: np.ndarray, is_per_class: bool, threshold: float = 0.5) -> np.ndarray:
+    """Convert (C, H, W) logits to (H, W) integer label map.
+
+    For per_class (sigmoid): threshold each channel, assign fg class+1, bg=0.
+    For softmax: softmax then argmax.
+    """
+    if is_per_class:
+        prob = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+        fg_max = prob.max(axis=0)
+        fg_argmax = prob.argmax(axis=0)
+        return np.where(fg_max > threshold, fg_argmax + 1, 0)
+    else:
+        p_exp = np.exp(logits - logits.max(axis=0, keepdims=True))
+        p_prob = p_exp / p_exp.sum(axis=0, keepdims=True)
+        return p_prob.argmax(axis=0)
+
+
 @torch.no_grad()
 def visualize_batch(
     model: torch.nn.Module,
@@ -100,6 +117,7 @@ def visualize_batch(
     semantic_classes: int,
     total_slices: int = 1,
     max_samples: int = 4,
+    output_mode: str = "softmax",
 ) -> None:
     """Generate and save visualization for a batch of samples.
 
@@ -112,13 +130,19 @@ def visualize_batch(
         epoch: Current epoch number (for filename).
         output_dir: Directory to save images.
         device: Computation device.
-        semantic_classes: Number of semantic classes.
+        semantic_classes: Number of semantic classes (including bg).
         total_slices: Total slices in 2.5D (1 for 2D/3D).
         max_samples: Maximum number of samples to visualize.
+        output_mode: "softmax" or "per_class".
     """
+    is_per_class = (output_mode == "per_class")
     model.eval()
     image = batch["image"].to(device)
     label = batch["label"].to(device)
+
+    # 2.5D: squeeze channel dim before model input
+    if total_slices > 1:
+        image = image.squeeze(1)  # (B, 1, D, H, W) → (B, D, H, W)
 
     pred = model(image)
     if isinstance(pred, list):
@@ -129,38 +153,54 @@ def visualize_batch(
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     for b in range(B):
-        # Get input image (center slice for 2.5D)
+        # Get input image as 2D slice
         img = image[b].cpu().numpy()
-        if img.shape[0] > 1:
-            # Multi-channel: take center slice
-            center = img.shape[0] // 2
-            img_2d = img[center]
+        if total_slices > 1:
+            # 2.5D: (D, H, W) — take center slice
+            img_2d = img[img.shape[0] // 2]
+        elif img.ndim == 4:
+            # 3D: (1, D, H, W) — take center D slice
+            img_2d = img[0, img.shape[1] // 2]
+        elif img.shape[0] > 1:
+            img_2d = img[img.shape[0] // 2]
         else:
+            # 2D: (1, H, W)
             img_2d = img[0]
 
-        # Get label (center slice for 2.5D multi-slice)
-        lbl = label[b].cpu().numpy()  # (S*C, H, W) or (C, H, W)
-        if total_slices > 1:
-            # Reshape: (S*C, H, W) → (S, C, H, W), take center slice
-            C = semantic_classes
-            S = total_slices
-            lbl_r = lbl.reshape(S, C, lbl.shape[-2], lbl.shape[-1])
-            center_lbl = lbl_r[S // 2]  # (C, H, W)
+        # Get label as 2D class-index map
+        lbl = label[b].cpu().numpy()  # (C, D, H, W) or (C, H, W)
+        if lbl.ndim == 4:
+            center_d = lbl.shape[1] // 2
+            lbl_2d = lbl[:, center_d]  # (C, H, W)
         else:
-            center_lbl = lbl  # (C, H, W)
-        lbl_idx = center_lbl.argmax(axis=0)  # (H, W)
+            lbl_2d = lbl  # (C, H, W)
+        if is_per_class:
+            # Fg-only channels: argmax gives 0-based fg index, +1 for display
+            fg_max = lbl_2d.max(axis=0)  # any fg present?
+            lbl_idx = np.where(fg_max > 0.5, lbl_2d.argmax(axis=0) + 1, 0)
+        else:
+            lbl_idx = lbl_2d.argmax(axis=0)  # (H, W)
 
-        # Get prediction (center slice for 2.5D multi-slice)
-        p = pred[b].cpu().numpy()  # (S*C, H, W) or (C, H, W)
+        # Get prediction as 2D class-index map
+        p = pred[b].cpu().numpy()
         if total_slices > 1:
-            p_r = p.reshape(S, C, p.shape[-2], p.shape[-1])
-            center_p = p_r[S // 2]  # (C, H, W)
+            # 2.5D: (N*S, H, W) → (N, S, H, W) → softmax over S → center slice
+            N = semantic_classes
+            S = total_slices
+            p = p.reshape(N, S, p.shape[-2], p.shape[-1])
+            p_exp = np.exp(p - p.max(axis=1, keepdims=True))
+            p_prob = p_exp / p_exp.sum(axis=1, keepdims=True)
+            center_idx = S // 2
+            p_prob = p_prob[:, center_idx]  # (N, H, W)
+            pred_idx = p_prob.argmax(axis=0)  # (H, W)
+        elif p.ndim == 4:
+            # 3D: (C, D, H, W) → center D slice
+            center_d = p.shape[1] // 2
+            p_slice = p[:, center_d]  # (C, H, W)
+            pred_idx = _prob_to_label(p_slice, is_per_class)
         else:
-            center_p = p
-        # Apply softmax (on numpy)
-        center_p_exp = np.exp(center_p - center_p.max(axis=0, keepdims=True))
-        center_p_prob = center_p_exp / center_p_exp.sum(axis=0, keepdims=True)
-        pred_idx = center_p_prob.argmax(axis=0)  # (H, W)
+            # 2D: (C, H, W)
+            pred_idx = _prob_to_label(p, is_per_class)
 
         save_path = vis_dir / f"epoch{epoch + 1:03d}_sample{b}.png"
         save_prediction_grid(

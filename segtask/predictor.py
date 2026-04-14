@@ -63,72 +63,73 @@ def sliding_window_inference_3d(
     blend_mode: str = "gaussian",
     device: torch.device = torch.device("cpu"),
     use_amp: bool = True,
+    output_mode: str = "softmax",
 ) -> np.ndarray:
     """3D sliding window inference with overlapping patches.
+
+    Training resizes H,W to patch_size[1:] while preserving D. To match this
+    at inference, the volume is first resized to (D, ph, pw), then sliding
+    window runs along D only. The output is resized back to original resolution.
 
     Args:
         model: Trained segmentation model (in eval mode).
         volume: Input volume (D, H, W), already preprocessed.
         patch_size: (pd, ph, pw).
-        num_classes: Number of output classes.
-        overlap: Fraction of overlap between patches.
+        num_classes: Number of output channels (num_classes for softmax, num_fg for per_class).
+        overlap: Fraction of overlap between patches (along D axis).
         batch_size: Number of patches per forward pass.
         blend_mode: "constant" or "gaussian".
         device: Computation device.
         use_amp: Use mixed precision.
+        output_mode: "softmax" or "per_class".
 
     Returns:
-        Predicted probability map (num_classes, D, H, W).
+        Predicted probability map (num_classes, D, H, W) at ORIGINAL resolution.
     """
-    D, H, W = volume.shape
+    from segtask.data.dataset import resize_2d
+
+    D_orig, H_orig, W_orig = volume.shape
     pd, ph, pw = patch_size
 
-    # Pad if needed
+    # Resize H,W to match training resolution (training uses resize_2d to ph,pw)
+    if H_orig != ph or W_orig != pw:
+        volume_resized = resize_2d(volume, ph, pw, is_label=False)
+    else:
+        volume_resized = volume
+    D = volume_resized.shape[0]
+
+    # Pad D if needed
     pad_d = max(0, pd - D)
-    pad_h = max(0, ph - H)
-    pad_w = max(0, pw - W)
-    if pad_d > 0 or pad_h > 0 or pad_w > 0:
-        volume = np.pad(volume, ((0, pad_d), (0, pad_h), (0, pad_w)), mode="constant")
-    D_pad, H_pad, W_pad = volume.shape
+    if pad_d > 0:
+        volume_resized = np.pad(volume_resized, ((0, pad_d), (0, 0), (0, 0)), mode="constant")
+    D_pad = volume_resized.shape[0]
 
-    # Compute step size
+    # Sliding window along D axis only (H,W already match training size)
     step_d = max(1, int(pd * (1 - overlap)))
-    step_h = max(1, int(ph * (1 - overlap)))
-    step_w = max(1, int(pw * (1 - overlap)))
 
-    # Importance map
+    # Importance map for D-axis blending
     if blend_mode == "gaussian":
         importance = _gaussian_importance_map(patch_size)
     else:
         importance = np.ones(patch_size, dtype=np.float32)
 
-    # Output accumulator
-    output_sum = np.zeros((num_classes, D_pad, H_pad, W_pad), dtype=np.float32)
-    count_map = np.zeros((D_pad, H_pad, W_pad), dtype=np.float32)
+    output_sum = np.zeros((num_classes, D_pad, ph, pw), dtype=np.float32)
+    count_map = np.zeros((D_pad, ph, pw), dtype=np.float32)
 
-    # Generate all patch origins — grid-based, no duplicates
-    # Clamp end positions to stay within padded volume
     max_d0 = max(1, D_pad - pd + 1)
-    max_h0 = max(1, H_pad - ph + 1)
-    max_w0 = max(1, W_pad - pw + 1)
-    origins = [
-        (d0, h0, w0)
-        for d0 in range(0, max_d0, step_d)
-        for h0 in range(0, max_h0, step_h)
-        for w0 in range(0, max_w0, step_w)
-    ]
-    logger.info("Sliding window: %d patches (%dx%dx%d, overlap=%.1f)", len(origins), pd, ph, pw, overlap)
+    origins = list(range(0, max_d0, step_d))
+    # Ensure last patch is included
+    if origins[-1] + pd < D_pad:
+        origins.append(max(0, D_pad - pd))
+    logger.info("Sliding window: %d D-patches (%dx%dx%d, overlap=%.1f)", len(origins), pd, ph, pw, overlap)
 
-    # Process in batches
     model.eval()
     for batch_start in range(0, len(origins), batch_size):
-        batch_origins = origins[batch_start : batch_start + batch_size]
+        batch_d0s = origins[batch_start : batch_start + batch_size]
         patches = []
-        for d0, h0, w0 in batch_origins:
-            patch = volume[d0:d0+pd, h0:h0+ph, w0:w0+pw]
-            patches.append(patch)
+        for d0 in batch_d0s:
+            patches.append(volume_resized[d0:d0 + pd])
 
-        # Stack: (B, 1, D, H, W)
         batch_tensor = torch.from_numpy(np.stack(patches)[:, np.newaxis]).float().to(device)
 
         with torch.no_grad():
@@ -136,18 +137,24 @@ def sliding_window_inference_3d(
                 pred = model(batch_tensor)
                 if isinstance(pred, list):
                     pred = pred[0]
-                prob = torch.softmax(pred, dim=1).cpu().numpy()
+                if output_mode == "per_class":
+                    prob = torch.sigmoid(pred).cpu().numpy()
+                else:
+                    prob = torch.softmax(pred, dim=1).cpu().numpy()
 
-        for i, (d0, h0, w0) in enumerate(batch_origins):
-            output_sum[:, d0:d0+pd, h0:h0+ph, w0:w0+pw] += prob[i] * importance
-            count_map[d0:d0+pd, h0:h0+ph, w0:w0+pw] += importance
+        for i, d0 in enumerate(batch_d0s):
+            output_sum[:, d0:d0 + pd] += prob[i] * importance
+            count_map[d0:d0 + pd] += importance
 
-    # Normalize
     count_map = np.maximum(count_map, 1e-8)
     output_sum /= count_map[np.newaxis]
 
-    # Crop back to original size
-    output_sum = output_sum[:, :D, :H, :W]
+    # Crop D back to original depth
+    output_sum = output_sum[:, :D]
+
+    # Resize output back to original H,W resolution
+    if H_orig != ph or W_orig != pw:
+        output_sum = resize_2d(output_sum, H_orig, W_orig, is_label=False)
 
     return output_sum
 
@@ -188,6 +195,10 @@ def slice_inference(
 
     Returns:
         Predicted probability map (num_classes, D, H, W) at original resolution.
+
+    2D mode: model outputs (B, num_classes, H, W) — standard softmax.
+    2.5D mode: model outputs (B, num_classes * C, H, W) → reshape → (B, num_classes, C, H, W)
+      softmax over C, take center slice → (B, num_classes, H, W).
     """
     from segtask.data.dataset import resize_2d
 
@@ -231,14 +242,16 @@ def slice_inference(
                     pred = pred[0]
 
                 if total_slices > 1:
-                    # 2.5D: (B, S*C, H, W) → per-slice softmax → center slice only
+                    # 2.5D: (B, num_classes*C, H, W) → (B, num_classes, C, H, W)
+                    # softmax over C → take center slice
                     B_p = pred.shape[0]
-                    pred_flat = pred.view(B_p * total_slices, semantic_classes, th, tw)
-                    prob_flat = torch.softmax(pred_flat, dim=1)
-                    prob_all = prob_flat.view(B_p, total_slices, semantic_classes, th, tw)
-                    prob = prob_all[:, num_slices_per_side].cpu().numpy()
+                    N = semantic_classes
+                    pred = pred.view(B_p, N, total_slices, th, tw)
+                    pred = torch.softmax(pred, dim=2)  # (B, N, C, H, W)
+                    center_idx = num_slices_per_side
+                    prob = pred[:, :, center_idx].cpu().numpy()  # (B, N, H, W)
                 else:
-                    prob = torch.softmax(pred, dim=1).cpu().numpy()
+                    prob = torch.softmax(pred, dim=1).cpu().numpy()  # (B, num_classes, H, W)
 
         # Resize output back to original spatial dimensions
         for i, center in enumerate(batch_indices):
@@ -267,6 +280,8 @@ def tta_inference(
     pc = cfg.predict
     dc = cfg.data
 
+    output_mode = cfg.loss.output_mode
+
     # Base prediction
     def _single_pass(vol):
         if dc.mode == "3d":
@@ -279,6 +294,7 @@ def tta_inference(
                 blend_mode=pc.blend_mode,
                 device=device,
                 use_amp=cfg.train.use_amp,
+                output_mode=output_mode,
             )
         else:
             return slice_inference(
@@ -418,27 +434,48 @@ class Predictor:
             dc.normalize, dc.global_mean, dc.global_std,
         )
 
-        num_classes = dc.num_classes
+        output_mode = self.cfg.loss.output_mode
+        if output_mode == "per_class":
+            num_out_ch = dc.num_classes - 1  # foreground channels only
+        else:
+            num_out_ch = dc.num_classes
 
         # Inference
         pred_prob = tta_inference(
-            self.model, volume, num_classes, self.cfg, self.device,
+            self.model, volume, num_out_ch, self.cfg, self.device,
         )
 
-        # Post-process
-        pred_labels = postprocess(
-            pred_prob,
-            threshold=pc.threshold,
-            min_component_size=pc.min_component_size,
-            fill_holes=pc.fill_holes,
-        )
+        # Post-process: convert probabilities to integer label map
+        if output_mode == "per_class":
+            # pred_prob: (num_fg, D, H, W), each channel is sigmoid probability
+            # Assign voxel to fg class with highest prob > threshold, else background
+            fg_max = pred_prob.max(axis=0)  # (D, H, W)
+            fg_argmax = pred_prob.argmax(axis=0)  # (D, H, W) — index into fg classes
+            pred_labels = np.where(fg_max > pc.threshold, fg_argmax + 1, 0).astype(np.int32)
+        else:
+            pred_labels = postprocess(
+                pred_prob,
+                threshold=pc.threshold,
+                min_component_size=pc.min_component_size,
+                fill_holes=pc.fill_holes,
+            )
+
+        # Connected component / hole filling for per_class too
+        if output_mode == "per_class" and (pc.min_component_size > 0 or pc.fill_holes):
+            pred_labels = postprocess(
+                pred_prob, threshold=pc.threshold,
+                min_component_size=pc.min_component_size,
+                fill_holes=pc.fill_holes,
+            )
 
         # Map back to original label values if needed
-        if label_values and len(label_values) == num_classes:
-            mapped = np.zeros_like(pred_labels)
-            for i, lv in enumerate(label_values):
-                mapped[pred_labels == i] = lv
-            pred_labels = mapped
+        if label_values:
+            num_total = dc.num_classes
+            if len(label_values) == num_total:
+                mapped = np.zeros_like(pred_labels)
+                for i, lv in enumerate(label_values):
+                    mapped[pred_labels == i] = lv
+                pred_labels = mapped
 
         return pred_prob, pred_labels, nii
 

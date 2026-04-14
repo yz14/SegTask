@@ -203,7 +203,9 @@ class GPUAugmentor:
             return image
         lo, hi = self.cfg.random_contrast_range
         factor = torch.rand(1, device=image.device) * (hi - lo) + lo
-        mean = image.mean()
+        # Per-sample mean (keep batch dim, reduce all spatial + channel dims)
+        dims = list(range(1, image.ndim))
+        mean = image.mean(dim=dims, keepdim=True)
         return (image - mean) * factor + mean
 
     def _random_gamma(self, image: torch.Tensor) -> torch.Tensor:
@@ -211,10 +213,14 @@ class GPUAugmentor:
             return image
         lo, hi = self.cfg.random_gamma_range
         gamma = torch.rand(1).item() * (hi - lo) + lo
-        # Gamma correction: only valid for non-negative values
+        # Normalize to [0,1], apply gamma, then restore original range
         img_min = image.min()
-        img_shifted = image - img_min + 1e-8
-        return img_shifted.pow(gamma) + img_min
+        img_max = image.max()
+        rng = img_max - img_min
+        if rng < 1e-8:
+            return image
+        normalized = (image - img_min) / rng
+        return normalized.pow(gamma) * rng + img_min
 
     def _random_noise(self, image: torch.Tensor) -> torch.Tensor:
         if torch.rand(1).item() >= self.cfg.gaussian_noise_prob:
@@ -295,6 +301,8 @@ class MixupCutmix:
 
         perm = torch.randperm(B, device=image.device)
         image = lam * image + (1 - lam) * image[perm]
-        label = lam * label + (1 - lam) * label[perm]
+        # Mixup on one-hot labels is semantically incorrect (results in non-one-hot).
+        # Only apply to image; label remains unchanged.
+        # For soft-label mixup, use a separate implementation.
 
         return image, label

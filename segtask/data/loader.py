@@ -38,6 +38,7 @@ def _create_dataset(records: List[SampleRecord], cfg: Config, is_train: bool = T
     """Create the appropriate dataset based on config data mode."""
     dc = cfg.data
 
+    exclude_bg = (cfg.loss.output_mode == "per_class")
     common_kwargs = dict(
         records=records, label_values=dc.label_values,
         intensity_min=dc.intensity_min, intensity_max=dc.intensity_max,
@@ -45,7 +46,8 @@ def _create_dataset(records: List[SampleRecord], cfg: Config, is_train: bool = T
         global_mean=dc.global_mean, global_std=dc.global_std,
         cache_enabled=(dc.cache_mode == "memory"),
         foreground_oversample_ratio=dc.foreground_oversample_ratio if is_train else 0.0,
-        is_train=is_train)
+        is_train=is_train,
+        exclude_background=exclude_bg)
 
     # Remove is_train from common_kwargs — SegDataset3D takes it as a separate param
     kw_3d = {k: v for k, v in common_kwargs.items() if k != "is_train"}

@@ -107,7 +107,12 @@ def build_scheduler(
 # Warmup wrapper
 # ---------------------------------------------------------------------------
 class WarmupScheduler:
-    """Linear warmup wrapper around any LR scheduler."""
+    """Linear warmup wrapper around any LR scheduler.
+
+    During warmup: LR linearly ramps from warmup_lr to base_lr.
+    After warmup: delegates to the base scheduler.
+    ReduceLROnPlateau is only stepped via step_epoch() with a metric.
+    """
 
     def __init__(
         self,
@@ -123,22 +128,37 @@ class WarmupScheduler:
         self.warmup_lr = warmup_lr
         self.base_lr = base_lr
         self.current_step = 0
+        self._is_plateau = isinstance(
+            scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+        )
 
-    def step(self, metric: Optional[float] = None) -> None:
+        # Apply warmup_lr immediately so the first training step uses it
+        if warmup_steps > 0:
+            for pg in optimizer.param_groups:
+                pg["lr"] = warmup_lr
+
+    def step(self) -> None:
+        """Per-iteration step. Do NOT pass metric here; use step_epoch() for plateau."""
         self.current_step += 1
         if self.current_step <= self.warmup_steps:
-            # Linear warmup
             alpha = self.current_step / max(self.warmup_steps, 1)
             lr = self.warmup_lr + alpha * (self.base_lr - self.warmup_lr)
             for pg in self.optimizer.param_groups:
                 pg["lr"] = lr
         else:
-            if self.scheduler is not None:
-                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    if metric is not None:
-                        self.scheduler.step(metric)
-                else:
-                    self.scheduler.step()
+            # ReduceLROnPlateau is stepped per-epoch via step_epoch()
+            if self.scheduler is not None and not self._is_plateau:
+                self.scheduler.step()
+
+    def step_epoch(self, metric: Optional[float] = None) -> None:
+        """Per-epoch step. Only needed for ReduceLROnPlateau."""
+        if (
+            self._is_plateau
+            and self.scheduler is not None
+            and self.current_step > self.warmup_steps
+            and metric is not None
+        ):
+            self.scheduler.step(metric)
 
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
@@ -161,8 +181,12 @@ class Trainer:
         self.device = device
         tc = cfg.train
 
-        # Loss
+        # Loss (wrap with deep supervision only when model uses it)
+        from .losses.losses import DeepSupervisionLoss
         self.criterion = build_loss(cfg.loss)
+        if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
+            self.criterion = DeepSupervisionLoss(
+                self.criterion, cfg.loss.deep_supervision_weights)
 
         # Optimizer
         self.optimizer = build_optimizer(model, cfg)
@@ -183,10 +207,13 @@ class Trainer:
         # EMA
         self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
 
-        # 2.5D multi-slice output metadata
+        # Output mode and class metadata
         self.total_slices = getattr(model, 'total_slices', 1)
-        self.semantic_classes = getattr(model, 'semantic_classes', cfg.data.num_classes)
-        self.is_25d = (self.total_slices > 1)
+        num_classes = cfg.data.num_classes
+        self.semantic_classes = num_classes
+        self.is_25d = (cfg.data.mode == "2.5d")
+        self.output_mode = cfg.loss.output_mode
+        self.num_fg_classes = getattr(model, 'num_fg_classes', num_classes - 1)
 
         # Augmentation (GPU)
         # For 2.5D: dataset returns 3D sub-volumes (1, D, H, W), so augment in 3D
@@ -236,6 +263,10 @@ class Trainer:
             if (epoch + 1) % tc.val_every == 0 or epoch == tc.epochs - 1:
                 val_metrics = self._validate(epoch)
 
+            # Per-epoch scheduler step (for ReduceLROnPlateau)
+            plateau_metric = val_metrics.get(tc.save_best_metric.replace("val_", ""), None)
+            self.scheduler.step_epoch(metric=plateau_metric)
+
             # Log
             lr = self.scheduler.get_lr()
             logger.info(
@@ -283,6 +314,7 @@ class Trainer:
                         device=self.device,
                         semantic_classes=self.semantic_classes,
                         total_slices=self.total_slices,
+                        output_mode=self.output_mode,
                     )
                     if self.ema is not None:
                         self.ema.restore(self.model)
@@ -317,8 +349,8 @@ class Trainer:
             # GPU augmentation (3D for 2.5D/3D, 2D for 2D)
             image, label = self.augmentor(image, label)
 
-            # 2.5D: after 3D augmentation, squeeze to 2D multi-channel for model  # TODO 这里有问题，不是squeeze而是采样连续的C=3c张切片
-            # image: (B, 1, D, H, W) → (B, D, H, W)
+            # 2.5D: after 3D augmentation, squeeze channel dim
+            # image: (B, 1, D, H, W) → (B, D, H, W) where D=total_slices as input channels
             if self.is_25d:
                 image = image.squeeze(1)
 
@@ -334,13 +366,13 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
 
-            # Gradient clipping
-            if tc.grad_clip_norm > 0:
+            # Gradient clipping (unscale once before any clipping)
+            if tc.grad_clip_norm > 0 or tc.grad_clip_value > 0:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip_norm)
-            if tc.grad_clip_value > 0:
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_value_(self.model.parameters(), tc.grad_clip_value)
+                if tc.grad_clip_norm > 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip_norm)
+                if tc.grad_clip_value > 0:
+                    nn.utils.clip_grad_value_(self.model.parameters(), tc.grad_clip_value)
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -360,8 +392,8 @@ class Trainer:
                 with torch.no_grad():
                     p = pred[0] if isinstance(pred, list) else pred
                     p_m, l_m = self._reshape_for_loss(p.detach(), label)
-                    dice = compute_dice_per_class(p_m, l_m)
-                    mean_dice = dice[1:].mean().item() if dice.shape[0] > 1 else dice.mean().item()
+                    dice = compute_dice_per_class(p_m, l_m, output_mode=self.output_mode)
+                    mean_dice = dice.mean().item()
                     dice_meter.update(mean_dice, image.shape[0])
 
                 logger.debug(
@@ -387,7 +419,7 @@ class Trainer:
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True)
 
-            # 2.5D: squeeze to 2D multi-channel for model
+            # 2.5D: squeeze channel dim before model input
             if self.is_25d:
                 image = image.squeeze(1)
 
@@ -399,23 +431,28 @@ class Trainer:
                 loss = self.criterion(pred_loss, label_loss)
 
             loss_meter.update(loss.item(), image.shape[0])
-            dice = compute_dice_per_class(pred_loss, label_loss)
+            dice = compute_dice_per_class(pred_loss, label_loss, output_mode=self.output_mode)
             all_dice.append(dice.cpu())
 
         # Restore original weights
         if self.ema is not None:
             self.ema.restore(self.model)
 
-        # Aggregate dice — use semantic_classes (not total output channels)
+        # Aggregate dice
         mean_dice_per_class = torch.stack(all_dice).mean(dim=0)
         metrics = {"val_loss": loss_meter.avg}
-        nc = self.semantic_classes
+        nc = len(mean_dice_per_class)
         for c in range(nc):
             metrics[f"dice_class_{c}"] = mean_dice_per_class[c].item()
-        if nc > 1:
-            metrics["mean_dice"] = mean_dice_per_class[1:nc].mean().item()
+
+        if self.output_mode == "per_class":
+            # All channels are foreground — mean of all
+            metrics["mean_dice"] = mean_dice_per_class.mean().item()
+        elif nc > 1:
+            # Softmax mode — exclude background (class 0)
+            metrics["mean_dice"] = mean_dice_per_class[1:].mean().item()
         else:
-            metrics["mean_dice"] = mean_dice_per_class[:nc].mean().item()
+            metrics["mean_dice"] = mean_dice_per_class[0].item()
 
         logger.info(
             "  Val: loss=%.4f, mean_dice=%.4f, per_class=%s",
@@ -428,31 +465,47 @@ class Trainer:
 
     def _reshape_for_loss(
         self, pred: torch.Tensor, label: torch.Tensor
-    ) -> tuple:
-        """Reshape for per-slice loss computation in 2.5D mode.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prepare pred and label for per-class loss in 2.5D mode.
 
         For 2.5D:
-          pred:  (B, D*C, H, W) → (B*D, C, H, W)  per-slice softmax
-          label: (B, C, D, H, W) → (B*D, C, H, W)  per-slice one-hot
+          pred:   (B, N*C, H, W) → reshape → (B, N, C, H, W)
+                  softmax over C (dim=2): each class's C slice predictions → probability
+                  then transpose → (B*C, N, H, W) for per-class Dice
+          label:  (B, N, D, H, W) → center slice → (B, N, 1, H, W)
+                  expand → (B*C, N, H, W) to match pred
 
-        For 2D/3D: returns unchanged.
+        The Dice Loss then computes per-class Dice independently (softmax over dim=1).
         """
         if not self.is_25d:
             return pred, label
 
-        S = self.total_slices
-        C = self.semantic_classes
+        C = self.total_slices
+        N = self.semantic_classes
 
-        # pred: (B, D*C, H, W) → view as (B*D, C, H, W)
+        # pred: (B, N*C, H, W) → (B, N, C, H, W)
+        pred = pred.view(-1, N, C, pred.shape[2], pred.shape[3])
+        # softmax over slice dim per class
+        pred = torch.softmax(pred, dim=2)  # (B, N, C, H, W)
+        # transpose: (B, N, C, H, W) → (B, C, N, H, W) → (B*C, N, H, W)
+        pred = pred.permute(0, 2, 1, 3, 4).contiguous()
+        pred = pred.view(-1, N, pred.shape[3], pred.shape[4])
+
+        # label: (B, N, D, H, W) → center slice → (B, N, 1, H, W)
+        D = label.shape[2]
+        center_d = D // 2
+        label_center = label[:, :, center_d:center_d + 1].contiguous()  # (B, N, 1, H, W)
+        # Expand to match pred's C dim: (B, N, 1, H, W) → (B, N, C, H, W)
+        label_expanded = label_center.expand(-1, -1, C, -1, -1)
+        # Same transpose/reshape: (B, N, C, H, W) → (B*C, N, H, W)
+        label_expanded = label_expanded.permute(0, 2, 1, 3, 4).contiguous()
+        label_expanded = label_expanded.view(-1, N, label_expanded.shape[3], label_expanded.shape[4])
+
+        # Support deep supervision
         if isinstance(pred, list):
-            pred = [p.view(-1, C, *p.shape[2:]) for p in pred]
-        else:
-            pred = pred.view(-1, C, *pred.shape[2:])
+            return pred, [label_expanded] * len(pred)
 
-        # label: (B, C, D, H, W) → transpose to (B, D, C, H, W) → view as (B*D, C, H, W)
-        label = label.transpose(1, 2).contiguous().view(-1, C, *label.shape[3:])
-
-        return pred, label
+        return pred, label_expanded
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
         """Save model checkpoint."""

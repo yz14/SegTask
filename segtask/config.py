@@ -224,7 +224,14 @@ class ModelConfig:
 class LossConfig:
     """Loss function settings."""
 
+    # Output mode:
+    #   "softmax"   — standard multi-class softmax (output includes background)
+    #   "per_class" — per-class independent sigmoid (each fg class gets its own
+    #                 binary output channel; background is implicit)
+    output_mode: str = "softmax"
+
     # Primary loss: "dice", "ce", "dice_ce", "focal", "tversky", "dice_focal"
+    # In per_class mode: "ce" becomes BCE, "focal" uses binary focal, etc.
     name: str = "dice_ce"
 
     # Weights for compound losses (e.g. dice_ce → [dice_w, ce_w])
@@ -382,16 +389,17 @@ class Config:
             self.data.num_classes = len(self.data.label_values)
 
         # Auto-set spatial_dims from data mode
+        # Note: factory.py may override these for 2.5D mode
         if self.data.mode == "3d":
             self.model.spatial_dims = 3
         else:
             self.model.spatial_dims = 2
 
-        # Auto-set in_channels for 2.5D
-        if self.data.mode == "2.5d":
-            self.model.in_channels = 2 * self.data.num_slices_per_side + 1
-        elif self.data.mode == "2d":
+        # Auto-set in_channels from data mode
+        if self.data.mode == "2d":
             self.model.in_channels = 1
+        elif self.data.mode == "2.5d":
+            self.model.in_channels = 2 * self.data.num_slices_per_side + 1
         elif self.data.mode == "3d":
             self.model.in_channels = 1
 
@@ -416,6 +424,8 @@ class Config:
             f"Invalid norm: {self.model.norm_type}"
         assert self.model.activation in ("relu", "leakyrelu", "gelu", "swish"), \
             f"Invalid activation: {self.model.activation}"
+        assert self.loss.output_mode in ("softmax", "per_class"), \
+            f"Invalid output_mode: {self.loss.output_mode}"
         assert self.loss.name in (
             "dice", "ce", "dice_ce", "focal", "tversky", "dice_focal",
         ), f"Invalid loss: {self.loss.name}"

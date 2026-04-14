@@ -101,6 +101,7 @@ def preprocess_image(
 def preprocess_label(
     volume: np.ndarray,
     label_values: List[int],
+    exclude_background: bool = False,
 ) -> np.ndarray:
     """Convert multi-value label to per-class binary masks.
 
@@ -108,14 +109,19 @@ def preprocess_label(
         volume: Integer label volume of shape (...).
         label_values: List of integer label values to include.
             label_values[0] is background.
+        exclude_background: If True, omit the background (index 0) channel.
+            Used for per_class output mode where each foreground class gets
+            its own independent binary output.
 
     Returns:
-        Binary masks of shape (num_classes, ...) where num_classes = len(label_values).
-        Each channel is 1 where the volume equals the corresponding label value.
+        Binary masks of shape (C, ...) where:
+        - C = len(label_values) if exclude_background=False (softmax mode)
+        - C = len(label_values)-1 if exclude_background=True (per_class mode)
     """
     vol = np.round(volume).astype(np.int32)
-    # Vectorized: broadcast (num_classes, 1, ...) == (1, ...) → (num_classes, ...)
-    lv_arr = np.array(label_values, dtype=np.int32).reshape(-1, *([1] * vol.ndim))
+    values = label_values[1:] if exclude_background else label_values
+    # Vectorized: broadcast (C, 1, ...) == (1, ...) → (C, ...)
+    lv_arr = np.array(values, dtype=np.int32).reshape(-1, *([1] * vol.ndim))
     return (vol[np.newaxis] == lv_arr).astype(np.float32)
 
 
@@ -242,7 +248,8 @@ class SegDataset2D(Dataset):
         global_mean: float = 0.0, global_std: float = 1.0,
         cache_enabled: bool = False,
         foreground_oversample_ratio: float = 0.0,
-        is_train: bool = True):
+        is_train: bool = True,
+        exclude_background: bool = False):
         super().__init__()
         self.records = records
         self.label_values = label_values
@@ -254,6 +261,7 @@ class SegDataset2D(Dataset):
         self.global_std = global_std
         self.foreground_ratio = foreground_oversample_ratio
         self.is_train = is_train
+        self.exclude_background = exclude_background
 
         self._img_cache = VolumeCache(cache_enabled)
         self._lbl_cache = VolumeCache(cache_enabled)
@@ -308,11 +316,11 @@ class SegDataset2D(Dataset):
         img_slice = resize_2d(img_slice, th, tw, is_label=False)
         lbl_slice = resize_2d(lbl_slice, th, tw, is_label=True)
 
-        lbl_mc = preprocess_label(lbl_slice, self.label_values)  # (C, H, W)
+        lbl_mc = preprocess_label(lbl_slice, self.label_values, self.exclude_background)
 
         return {
             "image": torch.from_numpy(img_slice[np.newaxis]).float(),  # (1, H, W)
-            "label": torch.from_numpy(lbl_mc).float(),  # (num_classes, H, W)
+            "label": torch.from_numpy(lbl_mc).float(),
             "subject_id": rec.subject_id,
             "slice_idx": slice_idx}
 
@@ -359,7 +367,8 @@ class SegDataset3D(Dataset):
         cache_enabled: bool = False,
         foreground_oversample_ratio: float = 0.5,
         samples_per_volume: int = 4,
-        is_train: bool = True):
+        is_train: bool = True,
+        exclude_background: bool = False):
         super().__init__()
         self.records = records
         self.label_values = label_values
@@ -372,6 +381,7 @@ class SegDataset3D(Dataset):
         self.foreground_ratio = foreground_oversample_ratio
         self.samples_per_volume = samples_per_volume
         self.is_train = is_train
+        self.exclude_background = exclude_background
 
         self._img_cache = VolumeCache(cache_enabled)
         self._lbl_cache = VolumeCache(cache_enabled)
@@ -411,8 +421,7 @@ class SegDataset3D(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         # Sample a slice index, with foreground oversampling
         slice_idx = idx % len(self._index)
-        if (
-            self.is_train
+        if (self.is_train
             and self.foreground_ratio > 0
             and self._fg_indices
             and np.random.random() < self.foreground_ratio):
@@ -425,24 +434,31 @@ class SegDataset3D(Dataset):
         pd, ph, pw = self.patch_size
 
         # Extract 3D patch centered around the selected slice
+        # Key: cut exactly pd slices to preserve D-axis information.
+        # If at boundary or volume < pd, PAD with zeros (never resize D).
         half_d  = pd // 2
         d_start = max(0, z - half_d)
-        d_end   = min(img.shape[0], z + half_d)
-        # If at boundary, adjust the other side to keep same size
-        if d_end - d_start < pd:
-            if d_start == 0:
-                d_end = min(img.shape[0], pd)
-            else:
-                d_start = max(0, d_end - pd)
+        d_end   = d_start + pd
+        # Clamp to volume bounds, then shift window if possible
+        if d_end > img.shape[0]:
+            d_end = img.shape[0]
+            d_start = max(0, d_end - pd)
 
-        img_patch = img[d_start:d_end]  # (pd, ph, pw) or smaller at boundaries
+        img_patch = img[d_start:d_end]  # (actual_d, H_orig, W_orig)
         lbl_patch = lbl[d_start:d_end]
-        
-        # Resize entire volume to patch_size — works at both train and test time
-        img_patch = resize_3d(img_patch, pd, ph, pw, is_label=False)
-        img_patch = resize_3d(img_patch, pd, ph, pw, is_label=True)
 
-        lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (C, D, H, W)
+        # Pad D if volume has fewer slices than pd (zero-pad, not resize)
+        actual_d = img_patch.shape[0]
+        if actual_d < pd:
+            pad_d = pd - actual_d
+            img_patch = np.pad(img_patch, ((0, pad_d), (0, 0), (0, 0)), mode='constant')
+            lbl_patch = np.pad(lbl_patch, ((0, pad_d), (0, 0), (0, 0)), mode='constant')
+
+        # Only resize H, W — preserve D resolution (core design principle)
+        img_patch = resize_2d(img_patch, ph, pw, is_label=False)
+        lbl_patch = resize_2d(lbl_patch, ph, pw, is_label=True)
+
+        lbl_mc = preprocess_label(lbl_patch, self.label_values, self.exclude_background)
 
         return {
             "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)

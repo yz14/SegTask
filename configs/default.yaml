@@ -191,7 +191,14 @@ model:
 # Loss function
 # ---------------------------------------------------------------------------
 loss:
+  # Output mode:
+  #   "softmax"   — standard multi-class softmax (output includes background)
+  #   "per_class" — per-class independent sigmoid (each fg class gets its own
+  #                 binary output channel; background is implicit)
+  output_mode: "softmax"
+
   # Loss type: "dice", "ce", "dice_ce", "focal", "tversky", "dice_focal"
+  # In per_class mode: "ce" becomes BCE, "focal" uses binary focal, etc.
   name: "dice_ce"
 
   # Weights for compound losses (e.g. [dice_weight, ce_weight])

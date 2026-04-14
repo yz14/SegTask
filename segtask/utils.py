@@ -81,17 +81,21 @@ def compute_dice_per_class(
     pred: torch.Tensor,
     target: torch.Tensor,
     smooth: float = 1e-5,
+    output_mode: str = "softmax",
 ) -> torch.Tensor:
     """Compute per-class Dice coefficient.
 
     Args:
-        pred: (B, C, *spatial) logits or probabilities.
-        target: (B, C, *spatial) one-hot labels.
+        pred: (B, C, *spatial) logits.
+        target: (B, C, *spatial) one-hot or binary labels.
+        output_mode: "softmax" → softmax activation, "per_class" → sigmoid activation.
 
     Returns:
         Tensor of shape (C,) with per-class Dice scores.
     """
-    if pred.shape[1] > 1:
+    if output_mode == "per_class":
+        pred_soft = torch.sigmoid(pred)
+    elif pred.shape[1] > 1:
         pred_soft = torch.softmax(pred, dim=1)
     else:
         pred_soft = torch.sigmoid(pred)

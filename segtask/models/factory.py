@@ -35,6 +35,9 @@ def build_model(cfg: Config) -> UNet:
             "Set data.label_values or data.num_classes in config."
         )
 
+    is_per_class = (cfg.loss.output_mode == "per_class")
+    num_fg_classes = num_classes - 1  # foreground classes (excluding background)
+
     # Common kwargs for encoder/decoder blocks
     common_kwargs = dict(
         spatial_dims=mc.spatial_dims,
@@ -74,13 +77,21 @@ def build_model(cfg: Config) -> UNet:
             drop_path_rate=mc.vit_drop_path_rate)
     decoder = build_decoder(mc.decoder_name, **decoder_kwargs)
 
-    # For 2.5D mode: model outputs predictions for ALL input slices
-    # Output channels = num_classes * total_slices
-    # e.g. 3 classes × 3 slices = 9 output channels
-    total_slices = 1  # TODO 应该用yaml里面的配置，这里可能是9，12等等
+    # Determine output classes: per_class mode outputs foreground-only channels
+    out_classes = num_fg_classes if is_per_class else num_classes
+
+    # 2.5D: 输出通道=out_classes*total_slices
     if cfg.data.mode == "2.5d":
         total_slices = 2 * cfg.data.num_slices_per_side + 1
-    num_classes_out = num_classes * total_slices
+        mc.spatial_dims = 2
+        mc.in_channels = total_slices
+        num_classes_out = out_classes * total_slices
+    elif cfg.data.mode == "3d":
+        total_slices = 1
+        num_classes_out = out_classes
+    else:
+        total_slices = 1
+        num_classes_out = out_classes
 
     # Build UNet
     model = UNet(
@@ -93,6 +104,8 @@ def build_model(cfg: Config) -> UNet:
     # Store metadata for trainer/predictor
     model.semantic_classes = num_classes
     model.total_slices = total_slices
+    model.output_mode = cfg.loss.output_mode
+    model.num_fg_classes = num_fg_classes
 
     # Log model info
     param_count = model.get_param_count()
