@@ -285,8 +285,7 @@ def build_loss(cfg: LossConfig) -> nn.Module:
     elif cfg.name == "tversky":
         return BinaryTverskyLoss(
             alpha=cfg.tversky_alpha, beta=cfg.tversky_beta,
-            smooth=cfg.dice_smooth, class_weights=cw,
-        )
+            smooth=cfg.dice_smooth, class_weights=cw)
     elif cfg.name == "dice_bce":
         dice = BinaryDiceLoss(smooth=cfg.dice_smooth, squared=cfg.dice_squared, class_weights=cw)
         bce = BCELoss(class_weights=cw)

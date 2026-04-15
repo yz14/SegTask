@@ -512,11 +512,7 @@ class TestNewAugmentation:
 class TestPredictor:
     def test_z_positions_coverage(self):
         from segtask_v1.predictor import Predictor
-        # Create a minimal predictor to test position computation
-        p = Predictor.__new__(Predictor)
-        p.patch_D = 64
-        p.z_overlap = 0.5
-        positions = p._compute_z_positions(D_orig=200, D_patch=64, stride=32)
+        positions = Predictor._compute_1d_positions(length=200, patch=64, stride=32)
         # Should cover entire volume
         assert positions[0][0] == 0
         assert positions[-1][1] >= 200
@@ -526,10 +522,7 @@ class TestPredictor:
 
     def test_z_positions_small_volume(self):
         from segtask_v1.predictor import Predictor
-        p = Predictor.__new__(Predictor)
-        p.patch_D = 64
-        p.z_overlap = 0.5
-        positions = p._compute_z_positions(D_orig=30, D_patch=64, stride=32)
+        positions = Predictor._compute_1d_positions(length=30, patch=64, stride=32)
         # Small volume: single window covering [0, 30]
         assert len(positions) == 1
         assert positions[0] == (0, 30)
@@ -567,6 +560,157 @@ class TestPredictor:
         prob = np.ones((2, 4, 4, 4), dtype=np.float32) * 0.1
         label_map = p._prob_to_label(prob)
         assert (label_map == 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Cubic patch dataset tests (New feature)
+# ---------------------------------------------------------------------------
+class TestCubicDataset:
+    def test_extract_cubic_patch_normal(self):
+        from segtask_v1.data.dataset import _extract_cubic_patch
+        vol = np.random.rand(100, 80, 80).astype(np.float32)
+        patch = _extract_cubic_patch(vol, (50, 40, 40), (32, 32, 32))
+        assert patch.shape == (32, 32, 32)
+
+    def test_extract_cubic_patch_edge_padding(self):
+        from segtask_v1.data.dataset import _extract_cubic_patch
+        vol = np.random.rand(20, 20, 20).astype(np.float32)
+        # Center near corner → requires padding
+        patch = _extract_cubic_patch(vol, (2, 2, 2), (32, 32, 32))
+        assert patch.shape == (32, 32, 32)
+        # Some values should be zero (padded region)
+        assert (patch == 0).any()
+
+    def test_extract_cubic_patch_small_volume(self):
+        from segtask_v1.data.dataset import _extract_cubic_patch
+        vol = np.ones((10, 10, 10), dtype=np.float32)
+        patch = _extract_cubic_patch(vol, (5, 5, 5), (32, 32, 32))
+        assert patch.shape == (32, 32, 32)
+
+    def test_cubic_dataset_getitem(self):
+        from segtask_v1.data.dataset import SegDataset3DCubic
+        # Create small temp volumes
+        img = np.random.rand(50, 40, 40).astype(np.float32)
+        lbl = np.zeros((50, 40, 40), dtype=np.float32)
+        lbl[20:30, 15:25, 15:25] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            ds = SegDataset3DCubic(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 16, 16),
+                samples_per_volume=2, cache_enabled=False)
+            sample = ds[0]
+            assert sample["image"].shape == (1, 16, 16, 16)
+            assert sample["label"].shape == (1, 16, 16, 16)
+
+    def test_cubic_dataset_oversample(self):
+        from segtask_v1.data.dataset import SegDataset3DCubic
+        img = np.random.rand(80, 60, 60).astype(np.float32)
+        lbl = np.zeros((80, 60, 60), dtype=np.float32)
+        lbl[30:50, 20:40, 20:40] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            ds = SegDataset3DCubic(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 16, 16),
+                aug_oversample_ratio=1.5,
+                samples_per_volume=2, cache_enabled=False)
+            sample = ds[0]
+            # With 1.5x oversample, extraction is ceil(16*1.5)=24
+            eD, eH, eW = ds.extract_size
+            assert eD == 24
+            assert sample["image"].shape == (1, eD, eH, eW)
+
+    def test_config_patch_mode_validation(self):
+        from segtask_v1.config import Config
+        cfg = Config()
+        cfg.data.label_values = [0, 1]
+        cfg.data.num_classes = 2
+        cfg.data.patch_mode = "cubic"
+        cfg.sync()
+        cfg.validate()  # should not raise
+
+        cfg.data.patch_mode = "invalid"
+        with pytest.raises(AssertionError):
+            cfg.validate()
+
+
+# ---------------------------------------------------------------------------
+# Cubic predictor tests (New feature)
+# ---------------------------------------------------------------------------
+class TestCubicPredictor:
+    def test_3d_weight_gaussian(self):
+        from segtask_v1.predictor import Predictor
+        w = Predictor._build_3d_weight(16, 16, 16, "gaussian")
+        assert w.shape == (16, 16, 16)
+        # Center should have highest weight
+        assert w[8, 8, 8] > w[0, 0, 0]
+        assert w[8, 8, 8] > w[15, 15, 15]
+        # Should be symmetric
+        assert abs(w[0, 8, 8] - w[15, 8, 8]) < 1e-10
+
+    def test_3d_weight_average(self):
+        from segtask_v1.predictor import Predictor
+        w = Predictor._build_3d_weight(8, 8, 8, "average")
+        assert w.shape == (8, 8, 8)
+        assert (w == 1.0).all()
+
+    def test_1d_positions_coverage(self):
+        from segtask_v1.predictor import Predictor
+        pos = Predictor._compute_1d_positions(200, 64, 32)
+        assert pos[0][0] == 0
+        assert pos[-1][1] >= 200
+        # No gaps
+        for i in range(len(pos) - 1):
+            assert pos[i + 1][0] < pos[i][1]
+
+    def test_1d_positions_small(self):
+        from segtask_v1.predictor import Predictor
+        pos = Predictor._compute_1d_positions(30, 64, 32)
+        assert len(pos) == 1
+        assert pos[0] == (0, 30)
+
+
+# ---------------------------------------------------------------------------
+# Trainer center-crop test (New feature)
+# ---------------------------------------------------------------------------
+class TestTrainerCenterCrop:
+    def test_center_crop(self):
+        from segtask_v1.trainer import Trainer
+        t = Trainer.__new__(Trainer)
+        t.target_patch_size = (16, 16, 16)
+        t.needs_crop = True
+        image = torch.randn(2, 1, 24, 24, 24)
+        label = torch.randn(2, 2, 24, 24, 24)
+        wmap = torch.randn(2, 1, 24, 24, 24)
+        img_c, lbl_c, wm_c = t._center_crop(image, label, wmap)
+        assert img_c.shape == (2, 1, 16, 16, 16)
+        assert lbl_c.shape == (2, 2, 16, 16, 16)
+        assert wm_c.shape == (2, 1, 16, 16, 16)
+
+    def test_center_crop_no_wmap(self):
+        from segtask_v1.trainer import Trainer
+        t = Trainer.__new__(Trainer)
+        t.target_patch_size = (32, 32, 32)
+        t.needs_crop = True
+        image = torch.randn(1, 1, 48, 48, 48)
+        label = torch.randn(1, 3, 48, 48, 48)
+        img_c, lbl_c, wm_c = t._center_crop(image, label, None)
+        assert img_c.shape == (1, 1, 32, 32, 32)
+        assert lbl_c.shape == (1, 3, 32, 32, 32)
+        assert wm_c is None
 
 
 if __name__ == "__main__":

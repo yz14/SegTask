@@ -1,19 +1,14 @@
-"""Z-axis sliding window inference for 3D segmentation.
+"""Sliding window inference for 3D segmentation.
 
-Inference strategy (matching the training z-axis patching approach):
-1. Load full volume (D_orig, H_orig, W_orig)
-2. Preprocess (intensity windowing + normalization)
-3. Slide along z-axis with configurable overlap:
-   - For each window: extract D slices, resize H,W to model input
-   - Run model forward pass (sigmoid output)
-   - Accumulate predictions with Gaussian or uniform blending weights
-4. Resize predictions back to original H,W resolution
-5. Threshold + argmax → final label map
-6. Save as NIfTI
+Two inference modes matching training patch modes:
+  - "z_axis": slide along z-axis, resize H,W to model input
+  - "cubic":  slide a 3D cube along all axes (D, H, W)
 
-Blending strategies for overlapping z-windows:
-  - "average": uniform weight in overlap regions
-  - "gaussian": Gaussian weighting along z-axis (higher weight at center)
+Both modes support:
+  - Configurable overlap ratio
+  - Gaussian or uniform blending for overlap regions
+  - Test-time augmentation (flip)
+  - NIfTI output
 """
 
 from __future__ import annotations
@@ -34,13 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 class Predictor:
-    """Z-axis sliding window predictor for 3D segmentation.
+    """Sliding window predictor for 3D segmentation.
 
-    Handles full-volume inference by:
-    1. Sliding along z-axis with overlap
-    2. Resizing each patch to model input size
-    3. Blending overlapping predictions
-    4. Restoring original resolution
+    Supports two modes:
+      - z_axis: slide along z, resize H,W
+      - cubic:  slide 3D cube along all axes
     """
 
     def __init__(
@@ -54,13 +47,14 @@ class Predictor:
         self.model.eval()
 
         pc = cfg.predict
-        self.z_overlap = pc.z_overlap
+        self.overlap = pc.z_overlap  # used for all axes in cubic mode
         self.blend_mode = pc.blend_mode
         self.batch_size = pc.batch_size
         self.tta_flip = pc.tta_flip
         self.threshold = pc.threshold
         self.save_probs = pc.save_probabilities
 
+        self.patch_mode = cfg.data.patch_mode
         self.patch_D, self.patch_H, self.patch_W = cfg.data.patch_size
         self.label_values = cfg.data.label_values
         self.num_fg = cfg.num_fg_classes
@@ -92,7 +86,10 @@ class Predictor:
             dc.normalize, dc.global_mean, dc.global_std)
 
         # Run sliding window inference
-        prob_volume = self._sliding_window_z(vol)  # (num_fg, D_orig, H_orig, W_orig)
+        if self.patch_mode == "cubic":
+            prob_volume = self._sliding_window_cubic(vol)
+        else:
+            prob_volume = self._sliding_window_z(vol)
 
         # Threshold → label map
         label_map = self._prob_to_label(prob_volume)  # (D_orig, H_orig, W_orig)
@@ -122,8 +119,8 @@ class Predictor:
         D_patch = self.patch_D
 
         # Compute z-axis window positions
-        stride = max(1, int(D_patch * (1 - self.z_overlap)))
-        z_positions = self._compute_z_positions(D_orig, D_patch, stride)
+        stride = max(1, int(D_patch * (1 - self.overlap)))
+        z_positions = self._compute_1d_positions(D_orig, D_patch, stride)
 
         logger.info("Sliding window: D_patch=%d, stride=%d, num_windows=%d, blend=%s",
                      D_patch, stride, len(z_positions), self.blend_mode)
@@ -176,23 +173,21 @@ class Predictor:
 
         return prob_volume
 
-    def _compute_z_positions(
-        self, D_orig: int, D_patch: int, stride: int) -> List[Tuple[int, int]]:
-        """Compute (z_start, z_end) for each sliding window position.
+    @staticmethod
+    def _compute_1d_positions(length: int, patch: int, stride: int) -> List[Tuple[int, int]]:
+        """Compute (start, end) positions for sliding window along one axis.
 
-        Ensures full coverage: the last window is shifted back to cover the tail.
+        Ensures full coverage: last window shifts back to cover the tail.
         """
+        if length <= patch:
+            return [(0, length)]
         positions = []
-        z = 0
-        while z + D_patch <= D_orig:
-            positions.append((z, z + D_patch))
-            z += stride
-
-        # If volume not fully covered, add a final window at the tail
-        if not positions or positions[-1][1] < D_orig:
-            z_start = max(0, D_orig - D_patch)
-            positions.append((z_start, D_orig))
-
+        pos = 0
+        while pos + patch <= length:
+            positions.append((pos, pos + patch))
+            pos += stride
+        if positions[-1][1] < length:
+            positions.append((max(0, length - patch), length))
         return positions
 
     def _build_z_weight(self, D_patch: int) -> np.ndarray:
@@ -205,15 +200,120 @@ class Predictor:
             Weight array of shape (D_patch,) float64.
         """
         if self.blend_mode == "gaussian":
-            # Gaussian centered at middle, sigma = D/4
             center = (D_patch - 1) / 2.0
             sigma = D_patch / 4.0
             z = np.arange(D_patch, dtype=np.float64)
             w = np.exp(-0.5 * ((z - center) / sigma) ** 2)
             return w
         else:
-            # Uniform weight
             return np.ones(D_patch, dtype=np.float64)
+
+    @staticmethod
+    def _build_3d_weight(pD: int, pH: int, pW: int, mode: str) -> np.ndarray:
+        """Build 3D blending weight map for cubic sliding window.
+
+        Returns:
+            Weight array of shape (pD, pH, pW) float64.
+        """
+        if mode == "gaussian":
+            def _gauss_1d(n):
+                c = (n - 1) / 2.0
+                s = n / 4.0
+                return np.exp(-0.5 * ((np.arange(n, dtype=np.float64) - c) / s) ** 2)
+            # Separable 3D Gaussian = outer product of 1D Gaussians
+            wd = _gauss_1d(pD)
+            wh = _gauss_1d(pH)
+            ww = _gauss_1d(pW)
+            return wd[:, None, None] * wh[None, :, None] * ww[None, None, :]
+        else:
+            return np.ones((pD, pH, pW), dtype=np.float64)
+
+    def _sliding_window_cubic(self, vol: np.ndarray) -> np.ndarray:
+        """3D cubic sliding window inference with overlap and blending.
+
+        Slides a (pD, pH, pW) cube along all three axes with configurable overlap.
+        Uses 3D Gaussian blending weights for smooth overlap fusion.
+
+        Args:
+            vol: Preprocessed volume (D_orig, H_orig, W_orig) float32.
+
+        Returns:
+            Probability volume (num_fg, D_orig, H_orig, W_orig) float32.
+        """
+        D_orig, H_orig, W_orig = vol.shape
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+
+        # Compute positions along each axis
+        stride_d = max(1, int(pD * (1 - self.overlap)))
+        stride_h = max(1, int(pH * (1 - self.overlap)))
+        stride_w = max(1, int(pW * (1 - self.overlap)))
+        pos_d = self._compute_1d_positions(D_orig, pD, stride_d)
+        pos_h = self._compute_1d_positions(H_orig, pH, stride_h)
+        pos_w = self._compute_1d_positions(W_orig, pW, stride_w)
+
+        total_windows = len(pos_d) * len(pos_h) * len(pos_w)
+        logger.info("Cubic sliding window: patch=(%d,%d,%d), strides=(%d,%d,%d), "
+                     "windows=%d×%d×%d=%d, blend=%s",
+                     pD, pH, pW, stride_d, stride_h, stride_w,
+                     len(pos_d), len(pos_h), len(pos_w), total_windows, self.blend_mode)
+
+        # 3D blending weight
+        weight_3d = self._build_3d_weight(pD, pH, pW, self.blend_mode)  # (pD, pH, pW)
+
+        # Accumulators
+        acc_pred = np.zeros((self.num_fg, D_orig, H_orig, W_orig), dtype=np.float64)
+        acc_weight = np.zeros((1, D_orig, H_orig, W_orig), dtype=np.float64)
+
+        # Collect patches in batches
+        patches = []
+        patch_coords = []  # (d0, d1, h0, h1, w0, w1)
+
+        for d0, d1 in pos_d:
+            for h0, h1 in pos_h:
+                for w0, w1 in pos_w:
+                    patch = vol[d0:d1, h0:h1, w0:w1]
+                    ad, ah, aw = patch.shape
+
+                    # Pad if at volume edge and smaller than patch_size
+                    if ad < pD or ah < pH or aw < pW:
+                        patch = np.pad(patch, (
+                            (0, pD - ad), (0, pH - ah), (0, pW - aw),
+                        ), mode="constant")
+
+                    patches.append(patch)
+                    patch_coords.append((d0, d1, h0, h1, w0, w1, ad, ah, aw))
+
+                    if len(patches) >= self.batch_size:
+                        self._accumulate_cubic_batch(
+                            patches, patch_coords, weight_3d, acc_pred, acc_weight)
+                        patches, patch_coords = [], []
+
+        # Process remaining
+        if patches:
+            self._accumulate_cubic_batch(
+                patches, patch_coords, weight_3d, acc_pred, acc_weight)
+
+        acc_weight = np.maximum(acc_weight, 1e-8)
+        return (acc_pred / acc_weight).astype(np.float32)
+
+    def _accumulate_cubic_batch(
+        self,
+        patches: List[np.ndarray],
+        coords: list,
+        weight_3d: np.ndarray,
+        acc_pred: np.ndarray,
+        acc_weight: np.ndarray,
+    ) -> None:
+        """Infer a batch of cubic patches and accumulate into prediction volume."""
+        batch_pred = self._infer_batch(patches)
+
+        for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw) in zip(batch_pred, coords):
+            # Trim prediction to actual (non-padded) size
+            pred_trimmed = pred[:, :ad, :ah, :aw]  # (num_fg, ad, ah, aw)
+            w_trimmed = weight_3d[:ad, :ah, :aw]    # (ad, ah, aw)
+
+            acc_pred[:, d0:d1, h0:h1, w0:w1] += pred_trimmed * w_trimmed[np.newaxis]
+            acc_weight[:, d0:d1, h0:h1, w0:w1] += w_trimmed[np.newaxis]
 
     def _infer_batch(self, patches: List[np.ndarray]) -> List[np.ndarray]:
         """Run model inference on a batch of patches.

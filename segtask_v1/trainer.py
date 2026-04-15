@@ -158,7 +158,7 @@ class Trainer:
             logger.info("Compiling model with mode='%s'", tc.compile_mode)
             self.model = torch.compile(self.model, mode=tc.compile_mode)
 
-        # Loss  # TODO 这里似乎是支持对不同类别的损失赋予不同的损失权重，但是无法对特定区域赋予不同的权重，例如B,C,D,H,W的标签体积中有1，2，3，4标签值，我想对值为1和2区域赋予更大的权重。也就是在像素点层面赋权重。
+        # Loss
         self.criterion = build_loss(cfg.loss)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
@@ -181,8 +181,14 @@ class Trainer:
         # EMA
         self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
 
-        # GPU augmentation  TODO 丰富了数据增强方法，需要验证
+        # GPU augmentation
         self.augmentor = GPUAugmentor(cfg.augment)
+
+        # Oversample center-crop: if cubic mode with oversample > 1,
+        # dataset returns larger patches; we crop to model input after augmentation.
+        self.target_patch_size = tuple(cfg.data.patch_size)  # (D, H, W)
+        self.needs_crop = (
+            cfg.data.patch_mode == "cubic" and cfg.data.aug_oversample_ratio > 1.0)
 
         # Gradient accumulation
         self.grad_accum_steps = max(tc.grad_accum_steps, 1)
@@ -305,9 +311,13 @@ class Trainer:
                 label_aug = torch.cat([label, wmap], dim=1)  # (B, C+1, D, H, W)
                 image, label_aug = self.augmentor(image, label_aug)
                 label = label_aug[:, :-1]
-                wmap = label_aug[:, -1:]
+                wmap  = label_aug[:, -1:]
             else:
                 image, label = self.augmentor(image, label)
+
+            # Center-crop oversized patches to model input size
+            if self.needs_crop:
+                image, label, wmap = self._center_crop(image, label, wmap)
 
             # Forward
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
@@ -367,6 +377,10 @@ class Trainer:
         for batch in self.val_loader:
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True)
+            
+            # Center-crop oversized patches to model input size
+            if self.needs_crop:
+                image, label, wmap = self._center_crop(image, label, wmap)
 
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 pred = self.model(image)
@@ -392,6 +406,26 @@ class Trainer:
                      metrics["val_loss"], metrics["mean_dice"],
                      [f"{d:.4f}" for d in mean_dice_per_class.tolist()])
         return metrics
+
+    def _center_crop(
+        self, image: torch.Tensor, label: torch.Tensor, wmap: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Center-crop oversized tensors to target patch_size after augmentation.
+
+        Used when aug_oversample_ratio > 1.0 in cubic mode.
+        """
+        tD, tH, tW = self.target_patch_size
+        _, _, D, H, W = image.shape
+
+        d0 = (D - tD) // 2
+        h0 = (H - tH) // 2
+        w0 = (W - tW) // 2
+
+        image = image[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]
+        label = label[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]
+        if wmap is not None:
+            wmap = wmap[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]
+
+        return image, label, wmap
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
         state = {

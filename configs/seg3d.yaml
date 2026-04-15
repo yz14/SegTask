@@ -14,6 +14,16 @@ data:
   # 3D patch size [D, H, W]
   patch_size: [64, 128, 128]
 
+  # Patch extraction mode: "z_axis" or "cubic"
+  #   z_axis: slide along z-axis, extract D slices, resize H,W
+  #   cubic:  sample center (x,y,z), extract full 3D cube
+  patch_mode: "z_axis"
+
+  # Augmentation oversample ratio (cubic mode only).
+  # Extract larger cube, augment, then center-crop to patch_size.
+  # Avoids blank edges from spatial transforms. 1.0 = disabled, 1.4 recommended.
+  aug_oversample_ratio: 1.0
+
   # Intensity windowing (CT HU range)
   intensity_min: -1024.0
   intensity_max: 1024.0

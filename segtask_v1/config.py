@@ -36,6 +36,16 @@ class DataConfig:
     # 3D patch size: [D, H, W] — model input resolution
     patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
 
+    # Patch extraction mode:
+    #   "z_axis" — slide along z-axis, extract D slices, resize H,W to target
+    #   "cubic"  — sample center (x,y,z), extract full 3D cube of patch_size
+    patch_mode: str = "z_axis"
+
+    # Augmentation oversample ratio (cubic mode only).
+    # Extract patch_size * ratio, augment on GPU, then center-crop to patch_size.
+    # This avoids blank edges from spatial transforms. 1.0 = disabled, 1.4~1.5 recommended.
+    aug_oversample_ratio: float = 1.0
+
     # Intensity windowing (HU for CT)
     intensity_min: float = -1024.0
     intensity_max: float = 3071.0
@@ -343,6 +353,10 @@ class Config:
         ), f"Invalid scheduler: {self.train.scheduler}"
         assert len(self.data.patch_size) == 3, \
             "patch_size must be [D, H, W]"
+        assert self.data.patch_mode in ("z_axis", "cubic"), \
+            f"Invalid patch_mode: {self.data.patch_mode}"
+        assert self.data.aug_oversample_ratio >= 1.0, \
+            "aug_oversample_ratio must be >= 1.0"
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)

@@ -1,12 +1,10 @@
-"""3D segmentation dataset with z-axis patching.
+"""3D segmentation datasets.
 
-Data loading flow:
-1. Load NIfTI volume (D_orig, H_orig, W_orig)
-2. Intensity windowing + normalization
-3. Z-axis patching: extract D slices centered on selected z position
-   - If volume depth < D, pad with zeros (preserve z-axis resolution)
-4. 3D resample patch to (D, H, W) via scipy.ndimage.zoom
-5. Convert label to per-class binary masks (foreground only)
+Two patch extraction modes:
+  - SegDataset3D ("z_axis"): slide along z, extract D slices, resize H,W
+  - SegDataset3DCubic ("cubic"): sample center (x,y,z), extract 3D cube
+
+Both share common I/O, preprocessing, and caching via module-level functions.
 
 Each foreground class gets its own binary channel:
   label_values = [0, 1, 2] → output has 2 channels (class 1, class 2)
@@ -294,11 +292,7 @@ class SegDataset3D(Dataset):
         return np.random.randint(0, D_vol)
 
     def _extract_z_patch(
-        self,
-        img: np.ndarray,
-        lbl: np.ndarray,
-        z_center: int,
-        D_patch: int) -> Tuple[np.ndarray, np.ndarray]:
+        self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int) -> Tuple[np.ndarray, np.ndarray]:
         """Extract D_patch slices from z-axis, centered at z_center.
 
         If volume depth < D_patch: take all slices, pad with zeros.
@@ -306,16 +300,198 @@ class SegDataset3D(Dataset):
         """
         D_vol = img.shape[0]
         half  = D_patch // 2
-        d_start = z_center - half
-        d_end   = d_start + D_patch
-        
         # Clamp to volume bounds
-        if d_start < 0:
-            d_start = 0
-        if d_end > D_vol:
-            d_end = D_vol
+        d_start = max(0, z_center - half)
+        d_end   = min(D_vol, d_start + D_patch)
 
         img_patch = img[d_start:d_end]
         lbl_patch = lbl[d_start:d_end]
 
         return img_patch.copy(), lbl_patch.copy()
+
+
+# ---------------------------------------------------------------------------
+# 3D Cubic Patch Dataset
+# ---------------------------------------------------------------------------
+def _extract_cubic_patch(
+    vol: np.ndarray, center: Tuple[int, int, int], size: Tuple[int, int, int]) -> np.ndarray:
+    """Extract a cubic patch centered at (d, h, w), with zero-padding if needed.
+
+    Args:
+        vol: (D, H, W) volume.
+        center: (d, h, w) center coordinates.
+        size: (pD, pH, pW) patch size to extract.
+
+    Returns:
+        Patch of exactly (pD, pH, pW), zero-padded where out of bounds.
+    """
+    D, H, W    = vol.shape
+    pD, pH, pW = size
+    cd, ch, cw = center
+
+    # Compute start/end for each axis
+    starts, ends, pad_before, pad_after = [], [], [], []
+    for c, p, s in [(cd, pD, D), (ch, pH, H), (cw, pW, W)]:
+        half = p // 2
+        lo = c - half
+        hi = lo + p
+        # Clamp to volume bounds and compute padding
+        src_lo = max(lo, 0)
+        src_hi = min(hi, s)
+        starts.append(src_lo)
+        ends.append(src_hi)
+        pad_before.append(max(-lo, 0))
+        pad_after.append(max(hi - s, 0))
+
+    patch = vol[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]]
+
+    # 不采用pad，而是剪裁，见后续步骤
+    # # Pad if any part was out of bounds
+    # if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
+    #     patch = np.pad(patch, list(zip(pad_before, pad_after)), mode="constant")
+
+    return patch
+
+
+class SegDataset3DCubic(Dataset):
+    """3D cubic patch dataset.
+
+    Samples a center point (d, h, w) and extracts a full 3D cube.
+    Supports augmentation oversample: extract a larger cube, then the trainer
+    center-crops to patch_size after GPU augmentation.
+
+    Each sample returns:
+      image: (1, eD, eH, eW) float32   — eD >= D if oversample > 1
+      label: (num_fg, eD, eH, eW) float32
+    """
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        label_paths: List[str],
+        label_values: List[int],
+        patch_size: Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio: float = 1.0,
+        intensity_min: float = -1024.0,
+        intensity_max: float = 3071.0,
+        normalize: str = "minmax",
+        global_mean: float = 0.0,
+        global_std: float = 1.0,
+        foreground_oversample_ratio: float = 0.5,
+        samples_per_volume: int = 8,
+        is_train: bool = True,
+        cache_enabled: bool = True,
+        region_weights: Optional[List[float]] = None):
+        super().__init__()
+        assert len(image_paths) == len(label_paths)
+        self.image_paths = image_paths
+        self.label_paths = label_paths
+        self.label_values = label_values
+        self.patch_size = tuple(patch_size)
+        self.oversample = aug_oversample_ratio
+        # Effective extraction size (may be larger than patch_size for oversample)
+        self.extract_size = tuple(
+            int(round(p * aug_oversample_ratio)) for p in patch_size)
+        self.intensity_min = intensity_min
+        self.intensity_max = intensity_max
+        self.normalize = normalize
+        self.global_mean = global_mean
+        self.global_std = global_std
+        self.fg_ratio = foreground_oversample_ratio
+        self.samples_per_volume = samples_per_volume
+        self.is_train = is_train
+        self.region_weights = region_weights
+
+        self._img_cache = VolumeCache(cache_enabled)
+        self._lbl_cache = VolumeCache(cache_enabled)
+
+        # Build 3D foreground voxel index for oversampling
+        self._vol_shapes: List[Tuple[int, int, int]] = []
+        self._vol_fg_coords: List[np.ndarray] = []  # (N, 3) fg voxel coords per volume
+        self._build_index()
+
+    def _build_index(self) -> None:
+        """Scan volumes and record foreground voxel coordinates."""
+        logger.info("Building cubic dataset index for %d volumes...", len(self.image_paths))
+        total_fg = 0
+        for i in range(len(self.image_paths)):
+            lbl = self._load_label(i)
+            self._vol_shapes.append(lbl.shape)
+            bg_val  = self.label_values[0]
+            lbl_int = np.round(lbl).astype(np.int32)
+            fg_mask = lbl_int != bg_val
+            # Store sparse fg coordinates: (N, 3) array of (d, h, w)
+            coords = np.argwhere(fg_mask)  # (N, 3)
+            # Subsample if too many (memory efficiency)
+            if len(coords) > 50000:
+                rng = np.random.RandomState(42)
+                coords = coords[rng.choice(len(coords), 50000, replace=False)]
+            self._vol_fg_coords.append(coords)
+            total_fg += len(coords)
+        logger.info("Cubic index: %d volumes, %d fg voxels sampled",
+                     len(self.image_paths), total_fg)
+
+    def _load_image(self, vol_idx: int) -> np.ndarray:
+        path = self.image_paths[vol_idx]
+        cached = self._img_cache.get(path)
+        if cached is not None:
+            return cached
+        img = load_nifti(path)
+        img = preprocess_image(
+            img, self.intensity_min, self.intensity_max,
+            self.normalize, self.global_mean, self.global_std)
+        self._img_cache.put(path, img)
+        return img
+
+    def _load_label(self, vol_idx: int) -> np.ndarray:
+        path = self.label_paths[vol_idx]
+        cached = self._lbl_cache.get(path)
+        if cached is not None:
+            return cached
+        lbl = load_nifti(path)
+        self._lbl_cache.put(path, lbl)
+        return lbl
+
+    def __len__(self) -> int:
+        return len(self.image_paths) * self.samples_per_volume
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        vol_idx = idx % len(self.image_paths)
+        img = self._load_image(vol_idx)
+        lbl = self._load_label(vol_idx)
+        D, H, W = img.shape
+
+        # Sample center point
+        center = self._sample_center(vol_idx, D, H, W)
+
+        # Extract cubic patch (may be oversized for augmentation margin)
+        eD, eH, eW = self.extract_size
+        img_patch = _extract_cubic_patch(img, center, (eD, eH, eW))
+        lbl_patch = _extract_cubic_patch(lbl, center, (eD, eH, eW))
+        
+        # 3D resample to target (D_patch, H_patch, W_patch)
+        img_patch = resize_3d(img_patch, eD, eH, eW, is_label=False)
+        lbl_patch = resize_3d(lbl_patch, eD, eH, eW, is_label=True)
+
+        # Convert label to per-fg-class binary masks
+        lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (num_fg, eD, eH, eW)
+
+        result = {
+            "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, eD, eH, eW)
+            "label": torch.from_numpy(lbl_mc).float()}                 # (num_fg, eD, eH, eW)
+
+        if self.region_weights:
+            wmap = compute_region_weight_map(lbl_patch, self.label_values, self.region_weights)
+            result["weight_map"] = torch.from_numpy(wmap).float()
+
+        return result
+
+    def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
+        """Sample a center (d, h, w) with optional foreground oversampling."""
+        fg_coords = self._vol_fg_coords[vol_idx]
+        if (self.is_train and self.fg_ratio > 0
+                and len(fg_coords) > 0
+                and np.random.random() < self.fg_ratio):
+            idx = np.random.randint(len(fg_coords))
+            return tuple(fg_coords[idx])
+        return (np.random.randint(0, D), np.random.randint(0, H), np.random.randint(0, W))

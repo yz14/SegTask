@@ -13,17 +13,13 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from ..config import Config
-from .dataset import SegDataset3D, load_nifti
+from .dataset import SegDataset3D, SegDataset3DCubic, load_nifti
 
 logger = logging.getLogger(__name__)
 
 
 def discover_samples(
-    image_dir: str,
-    label_dir: str,
-    image_suffix: str = ".nii.gz",
-    label_suffix: str = ".nii.gz",
-) -> Tuple[List[str], List[str]]:
+    image_dir: str, label_dir: str, image_suffix: str=".nii.gz", label_suffix: str=".nii.gz") -> Tuple[List[str], List[str]]:
     """Discover matched image-label pairs from directories.
 
     Returns:
@@ -112,20 +108,43 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         cache_enabled=cache,
         region_weights=rw)
 
-    train_ds = SegDataset3D(
+    train_paths = dict(
         image_paths=[image_paths[i] for i in train_idx],
-        label_paths=[label_paths[i] for i in train_idx],
-        foreground_oversample_ratio=dc.foreground_oversample_ratio,
-        samples_per_volume=dc.samples_per_volume,
-        is_train=True,
-        **common_kwargs)
-    val_ds = SegDataset3D(
+        label_paths=[label_paths[i] for i in train_idx])
+    val_paths = dict(
         image_paths=[image_paths[i] for i in val_idx],
-        label_paths=[label_paths[i] for i in val_idx],
-        foreground_oversample_ratio=0.0,
-        samples_per_volume=max(dc.samples_per_volume // 2, 1),
-        is_train=False,
-        **common_kwargs)
+        label_paths=[label_paths[i] for i in val_idx])
+
+    if dc.patch_mode == "cubic":
+        logger.info("Using CUBIC patch mode (oversample=%.2f)", dc.aug_oversample_ratio)
+        train_ds = SegDataset3DCubic(
+            **train_paths,
+            aug_oversample_ratio=dc.aug_oversample_ratio if dc.aug_oversample_ratio > 1.0 else 1.0,
+            foreground_oversample_ratio=dc.foreground_oversample_ratio,
+            samples_per_volume=dc.samples_per_volume,
+            is_train=True,
+            **common_kwargs)
+        val_ds = SegDataset3DCubic(
+            **val_paths,
+            aug_oversample_ratio=1.0,  # no oversample for validation
+            foreground_oversample_ratio=0.0,
+            samples_per_volume=max(dc.samples_per_volume // 2, 1),
+            is_train=False,
+            **common_kwargs)
+    else:
+        logger.info("Using Z_AXIS patch mode")
+        train_ds = SegDataset3D(
+            **train_paths,
+            foreground_oversample_ratio=dc.foreground_oversample_ratio,
+            samples_per_volume=dc.samples_per_volume,
+            is_train=True,
+            **common_kwargs)
+        val_ds = SegDataset3D(
+            **val_paths,
+            foreground_oversample_ratio=0.0,
+            samples_per_volume=max(dc.samples_per_volume // 2, 1),
+            is_train=False,
+            **common_kwargs)
 
     train_loader = DataLoader(
         train_ds,
