@@ -111,7 +111,7 @@ class SqueezeExcite3D(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Downsampling (strided conv)
+# Downsampling (strided conv)  # TODO 增加丰富的公认高质量Downsampling算法
 # ---------------------------------------------------------------------------
 class Downsample(nn.Module):
     """Downsample by factor 2 via strided 3D convolution."""
@@ -132,7 +132,7 @@ class Downsample(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Upsampling
+# Upsampling  # TODO 增加丰富的公认高质量Upsampling算法
 # ---------------------------------------------------------------------------
 class Upsample(nn.Module):
     """Upsample by factor 2 via transposed conv or trilinear interpolation."""

@@ -158,7 +158,7 @@ class Trainer:
             logger.info("Compiling model with mode='%s'", tc.compile_mode)
             self.model = torch.compile(self.model, mode=tc.compile_mode)
 
-        # Loss
+        # Loss  TODO 增加所有公认高质量分割损失
         self.criterion = build_loss(cfg.loss)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
@@ -375,13 +375,10 @@ class Trainer:
         all_dice = []
 
         for batch in self.val_loader:
+            # 验证集没有oversample
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True)
             
-            # Center-crop oversized patches to model input size
-            if self.needs_crop:
-                image, label, wmap = self._center_crop(image, label, wmap)
-
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 pred = self.model(image)
                 if isinstance(pred, list):
