@@ -145,8 +145,7 @@ class Trainer:
         cfg: Config,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        device: torch.device,
-    ):
+        device: torch.device):
         self.model = model.to(device)
         self.cfg = cfg
         self.train_loader = train_loader
@@ -159,30 +158,30 @@ class Trainer:
             logger.info("Compiling model with mode='%s'", tc.compile_mode)
             self.model = torch.compile(self.model, mode=tc.compile_mode)
 
-        # Loss  # TODO 这里似乎是支持对不同类别的损失赋予不同的损失权重，但是无法对特定区域赋予不同的权重，例如B,C,D,H,W的标签体积中有1，2，3，4标签值，我想对值为1和2区域赋予更大的权重。
+        # Loss  # TODO 这里似乎是支持对不同类别的损失赋予不同的损失权重，但是无法对特定区域赋予不同的权重，例如B,C,D,H,W的标签体积中有1，2，3，4标签值，我想对值为1和2区域赋予更大的权重。也就是在像素点层面赋权重。
         self.criterion = build_loss(cfg.loss)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
                 self.criterion, cfg.loss.deep_supervision_weights)
 
         # Optimizer + scheduler
-        self.optimizer = build_optimizer(model, cfg)
+        self.optimizer  = build_optimizer(model, cfg)
         steps_per_epoch = len(train_loader)
-        base_scheduler = build_scheduler(self.optimizer, cfg, steps_per_epoch)
+        base_scheduler  = build_scheduler(self.optimizer, cfg, steps_per_epoch)
         warmup_steps = tc.warmup_epochs * steps_per_epoch
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler,
             warmup_steps=warmup_steps, warmup_lr=tc.warmup_lr, base_lr=tc.lr)
 
         # AMP
-        self.use_amp = tc.use_amp and device.type == "cuda"
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.use_amp   = tc.use_amp and device.type == "cuda"
+        self.scaler    = GradScaler(enabled=self.use_amp)
         self.amp_dtype = torch.float16 if tc.amp_dtype == "float16" else torch.bfloat16
 
         # EMA
         self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
 
-        # GPU augmentation
+        # GPU augmentation  TODO 这里的数据增强过于简单化，例如没有随机旋转小角度，弹性形变，网格掩码等等丰富的方法；是对整个batch做，还是对每个样本独立的随机做？
         self.augmentor = GPUAugmentor(cfg.augment)
 
         # Gradient accumulation
@@ -245,8 +244,7 @@ class Trainer:
                 val_metrics.get("mean_dice", 0),
                 self.best_metric if self.best_metric > -float("inf") else 0,
                 self.best_epoch + 1,
-                timer.elapsed_str(),
-            )
+                timer.elapsed_str())
 
             # Checkpointing
             tracked = val_metrics.get(tc.save_best_metric, 0)

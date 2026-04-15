@@ -25,7 +25,7 @@ def _make_resnet_stage_builder(cfg: Config) -> Callable:
     """Return a callable(in_ch, out_ch) → ResNetStage."""
     mc = cfg.model
     return partial(
-        ResNetStage,
+        ResNetStage,  # 多层残差单元
         num_blocks=mc.blocks_per_level,
         norm_type=mc.norm_type,
         norm_groups=mc.norm_groups,
@@ -48,14 +48,13 @@ def _make_convnext_stage_builder(cfg: Config) -> Callable:
 
     def builder(in_ch: int, out_ch: int) -> ConvNeXtStage:
         start = block_idx[0]
-        end = start + mc.blocks_per_level
+        end   = start + mc.blocks_per_level
         rates = dp_rates[start:end]
         block_idx[0] = end
         return ConvNeXtStage(
             in_ch, out_ch,
             num_blocks=mc.blocks_per_level,
-            drop_path_rates=rates,
-        )
+            drop_path_rates=rates)
 
     return builder
 

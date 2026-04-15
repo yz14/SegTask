@@ -59,7 +59,8 @@ class GPUAugmentor:
     # Spatial augmentations
     # -----------------------------------------------------------------------
     @staticmethod
-    def _random_flip(image: torch.Tensor, label: torch.Tensor, prob: float, axes: list) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _random_flip(
+        image: torch.Tensor, label: torch.Tensor, prob: float, axes: list) -> Tuple[torch.Tensor, torch.Tensor]:
         """Random flip along specified axes. Each axis flipped independently."""
         for axis in axes:
             if torch.rand(1).item() < prob:
@@ -68,7 +69,8 @@ class GPUAugmentor:
         return image, label
 
     @staticmethod
-    def _random_rotate90(image: torch.Tensor, label: torch.Tensor, prob: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _random_rotate90(
+        image: torch.Tensor, label: torch.Tensor, prob: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """Random 90-degree rotation in the H-W plane (dims 3,4)."""
         if torch.rand(1).item() < prob:
             k = torch.randint(1, 4, (1,)).item()  # 1, 2, or 3 times
@@ -77,7 +79,8 @@ class GPUAugmentor:
         return image, label
 
     @staticmethod
-    def _random_scale(image: torch.Tensor, label: torch.Tensor, prob: float, scale_range: list) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _random_scale(
+        image: torch.Tensor, label: torch.Tensor, prob: float, scale_range: list) -> Tuple[torch.Tensor, torch.Tensor]:
         """Random isotropic scaling via trilinear interpolation."""
         if torch.rand(1).item() >= prob:
             return image, label
@@ -103,8 +106,7 @@ class GPUAugmentor:
     # -----------------------------------------------------------------------
     @staticmethod
     def _random_brightness(
-        image: torch.Tensor, prob: float, brange: list,
-    ) -> torch.Tensor:
+        image: torch.Tensor, prob: float, brange: list) -> torch.Tensor:
         """Per-sample random additive brightness shift."""
         if torch.rand(1).item() >= prob:
             return image
@@ -114,8 +116,7 @@ class GPUAugmentor:
 
     @staticmethod
     def _random_contrast(
-        image: torch.Tensor, prob: float, crange: list,
-    ) -> torch.Tensor:
+        image: torch.Tensor, prob: float, crange: list) -> torch.Tensor:
         """Per-sample random multiplicative contrast."""
         if torch.rand(1).item() >= prob:
             return image
@@ -127,8 +128,7 @@ class GPUAugmentor:
 
     @staticmethod
     def _random_gamma(
-        image: torch.Tensor, prob: float, grange: list,
-    ) -> torch.Tensor:
+        image: torch.Tensor, prob: float, grange: list) -> torch.Tensor:
         """Per-sample random gamma correction. Assumes image ∈ [0, 1]."""
         if torch.rand(1).item() >= prob:
             return image
@@ -143,8 +143,7 @@ class GPUAugmentor:
 
     @staticmethod
     def _gaussian_noise(
-        image: torch.Tensor, prob: float, std: float,
-    ) -> torch.Tensor:
+        image: torch.Tensor, prob: float, std: float) -> torch.Tensor:
         """Additive Gaussian noise."""
         if torch.rand(1).item() >= prob:
             return image
@@ -153,8 +152,7 @@ class GPUAugmentor:
 
     @staticmethod
     def _gaussian_blur(
-        image: torch.Tensor, prob: float, sigma_range: list,
-    ) -> torch.Tensor:
+        image: torch.Tensor, prob: float, sigma_range: list) -> torch.Tensor:
         """3D Gaussian blur via separable 1D convolutions."""
         if torch.rand(1).item() >= prob:
             return image
@@ -193,12 +191,7 @@ class GPUAugmentor:
 # Utility
 # ---------------------------------------------------------------------------
 def _crop_or_pad(
-    x: torch.Tensor,
-    target_d: int,
-    target_h: int,
-    target_w: int,
-    value: float = 0.0,
-) -> torch.Tensor:
+    x: torch.Tensor, target_d: int, target_h: int, target_w: int, value: float = 0.0) -> torch.Tensor:
     """Center-crop or zero-pad a 5D tensor to (B, C, target_d, target_h, target_w)."""
     _, _, D, H, W = x.shape
 

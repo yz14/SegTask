@@ -29,8 +29,7 @@ class ResNetBlock(nn.Module):
         activation: str = "leakyrelu",
         dropout: float = 0.0,
         use_se: bool = False,
-        se_reduction: int = 16,
-    ):
+        se_reduction: int = 16):
         super().__init__()
         self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False)
         self.norm1 = get_norm(norm_type, out_ch, norm_groups)
@@ -45,9 +44,8 @@ class ResNetBlock(nn.Module):
 
         # Shortcut projection if channel mismatch
         self.shortcut = (
-            nn.Sequential(
-                nn.Conv3d(in_ch, out_ch, 1, bias=False),
-                get_norm(norm_type, out_ch, norm_groups))
+            nn.Sequential(nn.Conv3d(in_ch, out_ch, 1, bias=False),
+                          get_norm(norm_type, out_ch, norm_groups))
             if in_ch != out_ch
             else nn.Identity())
 
@@ -77,8 +75,7 @@ class ResNetStage(nn.Module):
         activation: str = "leakyrelu",
         dropout: float = 0.0,
         use_se: bool = False,
-        se_reduction: int = 16,
-    ):
+        se_reduction: int = 16):
         super().__init__()
         blocks = [ResNetBlock(in_ch, out_ch, norm_type, norm_groups, activation, dropout, use_se, se_reduction)]
         for _ in range(1, num_blocks):

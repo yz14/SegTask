@@ -29,8 +29,7 @@ def discover_samples(
     Returns:
         (image_paths, label_paths) sorted by filename.
     """
-    img_dir = Path(image_dir)
-    lbl_dir = Path(label_dir)
+    img_dir, lbl_dir = Path(image_dir), Path(label_dir)
     assert img_dir.is_dir(), f"Image dir not found: {img_dir}"
     assert lbl_dir.is_dir(), f"Label dir not found: {lbl_dir}"
 
@@ -42,13 +41,12 @@ def discover_samples(
     if not common:
         raise ValueError(
             f"No matched pairs found in {img_dir} and {lbl_dir}. "
-            f"Images: {len(img_files)}, Labels: {len(lbl_files)}"
-        )
+            f"Images: {len(img_files)}, Labels: {len(lbl_files)}")
 
     image_paths = [str(img_files[n]) for n in common]
     label_paths = [str(lbl_files[n]) for n in common]
     logger.info("Found %d matched image-label pairs.", len(common))
-    return image_paths, label_paths
+    return image_paths, label_paths  # 匹配好的
 
 
 def detect_label_values(label_paths: List[str], max_scan: int = 5) -> List[int]:

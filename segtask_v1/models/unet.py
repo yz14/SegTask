@@ -38,16 +38,14 @@ class Encoder(nn.Module):
         stage_builder,
         norm_type: str = "instance",
         norm_groups: int = 8,
-        activation: str = "leakyrelu",
-    ):
+        activation: str = "leakyrelu"):
         super().__init__()
         # Stem: project input to first channel count
         self.stem = ConvNormAct(
             in_channels, stage_channels[0],
             kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
-            activation=activation,
-        )
+            activation=activation)
 
         # Encoder stages and downsampling
         self.stages = nn.ModuleList()
@@ -83,11 +81,10 @@ class DecoderLevel(nn.Module):
         out_ch: int,
         stage_builder,
         upsample_mode: str = "transpose",
-        skip_mode: str = "cat",
-    ):
+        skip_mode: str = "cat"):
         super().__init__()
         self.skip_mode = skip_mode
-        self.upsample = Upsample(in_ch, out_ch, mode=upsample_mode)
+        self.upsample  = Upsample(in_ch, out_ch, mode=upsample_mode)
 
         if skip_mode == "cat":
             fused_ch = out_ch + skip_ch
@@ -95,8 +92,7 @@ class DecoderLevel(nn.Module):
             # Project skip to match out_ch if needed
             self.skip_proj = (
                 nn.Conv3d(skip_ch, out_ch, 1, bias=False)
-                if skip_ch != out_ch else nn.Identity()
-            )
+                if skip_ch != out_ch else nn.Identity())
             fused_ch = out_ch
 
         self.stage = stage_builder(fused_ch, out_ch)
@@ -128,8 +124,7 @@ class Decoder(nn.Module):
         encoder_channels: List[int],
         stage_builder,
         upsample_mode: str = "transpose",
-        skip_mode: str = "cat",
-    ):
+        skip_mode: str = "cat"):
         super().__init__()
         self.levels = nn.ModuleList()
         n = len(encoder_channels)
@@ -143,8 +138,7 @@ class Decoder(nn.Module):
 
             self.levels.append(
                 DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
-                             upsample_mode, skip_mode)
-            )
+                             upsample_mode, skip_mode))
 
         # Output channels at each decoder level (low-res → high-res)
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
@@ -193,12 +187,11 @@ class UNet3D(nn.Module):
         encoder: Encoder,
         decoder: Decoder,
         num_fg_classes: int,
-        deep_supervision: bool = False,
-    ):
+        deep_supervision: bool = False):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.num_fg_classes = num_fg_classes
+        self.num_fg_classes   = num_fg_classes
         self.deep_supervision = deep_supervision
 
         # Main segmentation head (highest resolution decoder output)

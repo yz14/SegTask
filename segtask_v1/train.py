@@ -37,8 +37,7 @@ def setup_logging(output_dir: str, level: str = "INFO") -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format=fmt, datefmt=datefmt,
         handlers=handlers,
-        force=True,
-    )
+        force=True)
 
 
 def apply_overrides(cfg, overrides: list) -> None:

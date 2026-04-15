@@ -51,8 +51,7 @@ def preprocess_image(
     intensity_max: float,
     normalize: str,
     global_mean: float = 0.0,
-    global_std: float = 1.0,
-) -> np.ndarray:
+    global_std: float = 1.0) -> np.ndarray:
     """Intensity windowing + normalization → float32."""
     vol = np.clip(volume, intensity_min, intensity_max)
     if normalize == "minmax":
@@ -159,8 +158,7 @@ class SegDataset3D(Dataset):
         foreground_oversample_ratio: float = 0.5,
         samples_per_volume: int = 8,
         is_train: bool = True,
-        cache_enabled: bool = True,
-    ):
+        cache_enabled: bool = True):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         self.image_paths = image_paths
@@ -207,21 +205,20 @@ class SegDataset3D(Dataset):
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         """Load and preprocess image volume with caching."""
-        path = self.image_paths[vol_idx]
+        path   = self.image_paths[vol_idx]
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
         img = load_nifti(path)
-        img = preprocess_image(
+        img = preprocess_image(  # 归一化 TODO
             img, self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std,
-        )
+            self.normalize, self.global_mean, self.global_std)
         self._img_cache.put(path, img)
         return img
 
     def _load_label(self, vol_idx: int) -> np.ndarray:
         """Load raw label volume with caching."""
-        path = self.label_paths[vol_idx]
+        path   = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
             return cached
@@ -241,7 +238,7 @@ class SegDataset3D(Dataset):
         # Select center z-position, z轴中心坐标
         z = self._sample_z(vol_idx, D_vol)
 
-        # Extract D_patch slices centered at z, TODO 这里可以改为2*D_patch，然后再去中心D_patch
+        # Extract D_patch slices centered at z, TODO 这里可以改为2*D_patch，然后在训练中aug后取中间D_patch
         img_patch, lbl_patch = self._extract_z_patch(img, lbl, z, D_patch)
 
         # 3D resample to target (D_patch, H_patch, W_patch)
@@ -251,10 +248,8 @@ class SegDataset3D(Dataset):
         # Convert label to per-foreground-class binary masks  TODO 避免GPU浪费，后续将在损失计算时才提取每类mask
         lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (num_fg, D, H, W)
 
-        return {
-            "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
-            "label": torch.from_numpy(lbl_mc).float(),                # (num_fg, D, H, W)
-        }
+        return {"image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
+                "label": torch.from_numpy(lbl_mc).float()}                 # (num_fg, D, H, W)
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
         """Sample a center z-position with optional foreground oversampling."""
@@ -271,8 +266,7 @@ class SegDataset3D(Dataset):
         img: np.ndarray,
         lbl: np.ndarray,
         z_center: int,
-        D_patch: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        D_patch: int) -> Tuple[np.ndarray, np.ndarray]:
         """Extract D_patch slices from z-axis, centered at z_center.
 
         If volume depth < D_patch: take all slices, pad with zeros.
