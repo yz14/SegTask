@@ -4,6 +4,10 @@ All losses operate in per-class independent sigmoid mode:
   pred:   (B, num_fg, D, H, W) — raw logits, one channel per foreground class
   target: (B, num_fg, D, H, W) — binary masks, one channel per foreground class
 
+Optional spatial weight map:
+  weight_map: (B, 1, D, H, W) — per-voxel weight, broadcasts over channels.
+  Used to emphasize specific label regions (e.g., small structures).
+
 Each channel is an independent binary segmentation problem.
 Background is implicit (not predicted).
 
@@ -54,11 +58,19 @@ class BinaryDiceLoss(nn.Module):
         else:
             self.class_weights = None
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         pred_prob = torch.sigmoid(pred)
         B, C = pred.shape[:2]
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
+
+        if weight_map is not None:
+            # weight_map: (B, 1, D, H, W) → broadcast to (B, C, D, H, W)
+            w_spatial = weight_map.expand_as(pred)
+            p = (pred_prob * w_spatial).reshape(B, C, -1)
+            t = (target * w_spatial).reshape(B, C, -1)
+        else:
+            p = pred_prob.reshape(B, C, -1)
+            t = target.reshape(B, C, -1)
 
         intersection = (p * t).sum(dim=2)
         if self.squared:
@@ -91,12 +103,15 @@ class BCELoss(nn.Module):
         else:
             self.class_weights = None
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
+        per_voxel = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
         if self.class_weights is not None:
             w = self.class_weights.to(pred.device)
-            w = w.reshape(1, -1, *([1] * (pred.ndim - 2)))
-            return F.binary_cross_entropy_with_logits(pred, target, weight=w)
-        return F.binary_cross_entropy_with_logits(pred, target)
+            per_voxel = per_voxel * w.reshape(1, -1, *([1] * (pred.ndim - 2)))
+        if weight_map is not None:
+            per_voxel = per_voxel * weight_map
+        return per_voxel.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +138,8 @@ class BinaryFocalLoss(nn.Module):
         else:
             self.class_weights = None
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
         pt = torch.sigmoid(pred)
         pt = pt * target + (1 - pt) * (1 - target)  # p_t
@@ -132,8 +148,9 @@ class BinaryFocalLoss(nn.Module):
 
         if self.class_weights is not None:
             w = self.class_weights.to(pred.device)
-            w = w.reshape(1, -1, *([1] * (pred.ndim - 2)))
-            loss = loss * w
+            loss = loss * w.reshape(1, -1, *([1] * (pred.ndim - 2)))
+        if weight_map is not None:
+            loss = loss * weight_map
 
         return loss.mean()
 
@@ -164,11 +181,18 @@ class BinaryTverskyLoss(nn.Module):
         else:
             self.class_weights = None
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         pred_prob = torch.sigmoid(pred)
         B, C = pred.shape[:2]
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
+
+        if weight_map is not None:
+            w_spatial = weight_map.expand_as(pred)
+            p = (pred_prob * w_spatial).reshape(B, C, -1)
+            t = (target * w_spatial).reshape(B, C, -1)
+        else:
+            p = pred_prob.reshape(B, C, -1)
+            t = target.reshape(B, C, -1)
 
         tp = (p * t).sum(dim=2)
         fp = (p * (1 - t)).sum(dim=2)
@@ -197,10 +221,11 @@ class CompoundLoss(nn.Module):
         self.losses = nn.ModuleList(losses)
         self.weights = weights
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         total = torch.tensor(0.0, device=pred.device)
         for fn, w in zip(self.losses, self.weights):
-            total = total + w * fn(pred, target)
+            total = total + w * fn(pred, target, weight_map=weight_map)
         return total
 
 
@@ -223,19 +248,21 @@ class DeepSupervisionLoss(nn.Module):
         self,
         preds: Union[torch.Tensor, List[torch.Tensor]],
         target: torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(preds, torch.Tensor):
-            return self.base_loss(preds, target)
+            return self.base_loss(preds, target, weight_map=weight_map)
 
         total = torch.tensor(0.0, device=target.device)
         for i, pred in enumerate(preds):
             w = self.weights[i] if i < len(self.weights) else self.weights[-1]
+            wm_i = weight_map
             if pred.shape[2:] != target.shape[2:]:
                 pred = F.interpolate(
                     pred, size=target.shape[2:],
                     mode="trilinear", align_corners=False,
                 )
-            total = total + w * self.base_loss(pred, target)
+            total = total + w * self.base_loss(pred, target, weight_map=wm_i)
         return total
 
 

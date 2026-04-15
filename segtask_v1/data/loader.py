@@ -100,6 +100,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     logger.info("Split: %d train, %d val", len(train_idx), len(val_idx))
 
     cache = dc.cache_mode == "memory"
+    rw = cfg.loss.region_weights if cfg.loss.region_weights else None
     common_kwargs = dict(
         label_values=dc.label_values,
         patch_size=tuple(dc.patch_size),
@@ -108,7 +109,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         normalize=dc.normalize,
         global_mean=dc.global_mean,
         global_std=dc.global_std,
-        cache_enabled=cache)
+        cache_enabled=cache,
+        region_weights=rw)
 
     train_ds = SegDataset3D(
         image_paths=[image_paths[i] for i in train_idx],

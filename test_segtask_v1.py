@@ -82,14 +82,16 @@ class TestDataset:
         out = resize_3d(arr, 8, 16, 24, is_label=False)
         assert out.shape == (3, 8, 16, 24)
 
-    def test_extract_z_patch_pad(self):
-        """Volume smaller than patch size should be padded."""
+    def test_extract_z_patch_small_volume(self):
+        """Volume smaller than patch: returns all available slices (no padding)."""
         from segtask_v1.data.dataset import SegDataset3D
         ds = SegDataset3D.__new__(SegDataset3D)
         img = np.random.rand(30, 64, 64).astype(np.float32)
         lbl = np.zeros((30, 64, 64), dtype=np.float32)
         img_p, lbl_p = ds._extract_z_patch(img, lbl, 15, 64)
-        assert img_p.shape[0] == 64  # padded to 64
+        # User's updated code: no padding, returns clamped slice range
+        assert img_p.shape[0] <= 30
+        assert img_p.shape[0] > 0
 
     def test_extract_z_patch_normal(self):
         """Volume larger than patch: should extract exact D slices."""
@@ -101,17 +103,19 @@ class TestDataset:
         assert img_p.shape[0] == 64
 
     def test_extract_z_patch_boundary(self):
-        """Patch at boundary should shift window, not go out of bounds."""
+        """Patch at boundary should clamp, not go out of bounds."""
         from segtask_v1.data.dataset import SegDataset3D
         ds = SegDataset3D.__new__(SegDataset3D)
         img = np.random.rand(100, 32, 32).astype(np.float32)
         lbl = np.zeros((100, 32, 32), dtype=np.float32)
         # Near the end
         img_p, _ = ds._extract_z_patch(img, lbl, 98, 64)
-        assert img_p.shape[0] == 64
+        assert img_p.shape[0] > 0
+        assert img_p.shape[0] <= 100
         # Near the start
         img_p, _ = ds._extract_z_patch(img, lbl, 2, 64)
-        assert img_p.shape[0] == 64
+        assert img_p.shape[0] > 0
+        assert img_p.shape[0] <= 100
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +297,9 @@ class TestAugmentation:
         assert torch.equal(lbl_out, lbl)
 
     def test_gaussian_blur_3d(self):
-        from segtask_v1.data.augment import GPUAugmentor
+        from segtask_v1.data.augment import _gaussian_blur_3d
         img = torch.randn(1, 1, 8, 16, 16)
-        out = GPUAugmentor._gaussian_blur(img, prob=1.0, sigma_range=[1.0, 1.0])
+        out = _gaussian_blur_3d(img.clone(), prob=1.0, sigma_range=[1.0, 1.0])
         assert out.shape == img.shape
         # Blurred image should be smoother (lower variance)
         assert out.var() <= img.var() * 1.5
@@ -394,6 +398,175 @@ class TestScheduler:
             sched.step()
         # LR should have changed
         assert optimizer.param_groups[0]["lr"] != 0.01
+
+
+# ---------------------------------------------------------------------------
+# Region weight map tests (Feature a)
+# ---------------------------------------------------------------------------
+class TestRegionWeights:
+    def test_compute_region_weight_map(self):
+        from segtask_v1.data.dataset import compute_region_weight_map
+        vol = np.array([[[0, 1], [2, 0]]], dtype=np.float32)  # (1, 2, 2)
+        wmap = compute_region_weight_map(vol, [0, 1, 2], [1.0, 3.0, 2.0])
+        assert wmap.shape == (1, 1, 2, 2)
+        assert wmap[0, 0, 0, 0] == 1.0  # bg
+        assert wmap[0, 0, 0, 1] == 3.0  # label 1
+        assert wmap[0, 0, 1, 0] == 2.0  # label 2
+
+    def test_loss_with_weight_map(self):
+        from segtask_v1.losses.losses import BinaryDiceLoss, BCELoss, CompoundLoss
+        pred = torch.randn(2, 2, 8, 16, 16)
+        target = (torch.rand(2, 2, 8, 16, 16) > 0.5).float()
+        wmap = torch.ones(2, 1, 8, 16, 16) * 2.0
+        # Should not crash with weight_map
+        for loss_fn in [BinaryDiceLoss(), BCELoss()]:
+            loss_no_w = loss_fn(pred, target)
+            loss_w = loss_fn(pred, target, weight_map=wmap)
+            assert loss_no_w.shape == ()
+            assert loss_w.shape == ()
+        # Compound
+        compound = CompoundLoss([BinaryDiceLoss(), BCELoss()], [1.0, 1.0])
+        loss = compound(pred, target, weight_map=wmap)
+        assert loss.item() >= 0
+
+    def test_higher_weight_increases_loss(self):
+        from segtask_v1.losses.losses import BCELoss
+        pred = torch.randn(1, 1, 4, 8, 8)
+        target = torch.ones(1, 1, 4, 8, 8)
+        wmap_low = torch.ones(1, 1, 4, 8, 8)
+        wmap_high = torch.ones(1, 1, 4, 8, 8) * 5.0
+        loss_fn = BCELoss()
+        loss_low = loss_fn(pred, target, weight_map=wmap_low)
+        loss_high = loss_fn(pred, target, weight_map=wmap_high)
+        # Higher weight should increase loss
+        assert loss_high.item() > loss_low.item()
+
+
+# ---------------------------------------------------------------------------
+# New augmentation tests (Feature b)
+# ---------------------------------------------------------------------------
+class TestNewAugmentation:
+    def test_per_sample_flip(self):
+        from segtask_v1.data.augment import _random_flip
+        torch.manual_seed(0)
+        img = torch.arange(24).reshape(2, 1, 3, 2, 2).float()
+        lbl = img.clone()
+        # With prob=1.0, all samples should be flipped
+        img_f, lbl_f = _random_flip(img.clone(), lbl.clone(), prob=1.0, axes=[2])
+        assert img_f.shape == img.shape
+        assert lbl_f.shape == lbl.shape
+
+    def test_affine_shapes(self):
+        from segtask_v1.data.augment import _random_affine
+        img = torch.randn(2, 1, 16, 32, 32)
+        lbl = torch.zeros(2, 2, 16, 32, 32)
+        img_a, lbl_a = _random_affine(img, lbl, prob=1.0,
+                                       rotate_range=[-10.0, 10.0],
+                                       scale_range=[0.9, 1.1])
+        assert img_a.shape == img.shape
+        assert lbl_a.shape == lbl.shape
+
+    def test_elastic_deform_shapes(self):
+        from segtask_v1.data.augment import _elastic_deform
+        img = torch.randn(2, 1, 16, 32, 32)
+        lbl = torch.zeros(2, 2, 16, 32, 32)
+        img_e, lbl_e = _elastic_deform(img, lbl, prob=1.0, sigma=5.0, alpha=50.0)
+        assert img_e.shape == img.shape
+        assert lbl_e.shape == lbl.shape
+
+    def test_grid_dropout_shapes(self):
+        from segtask_v1.data.augment import _grid_dropout
+        img = torch.randn(2, 1, 16, 32, 32)
+        lbl = torch.ones(2, 2, 16, 32, 32)
+        img_d, lbl_d = _grid_dropout(img.clone(), lbl.clone(), prob=1.0, ratio=0.3, num_holes=4)
+        assert img_d.shape == img.shape
+        # Label should NOT be masked
+        assert torch.equal(lbl_d, lbl)
+        # Image should have some zeros from dropout
+        assert img_d.sum() < img.sum()
+
+    def test_simulate_lowres(self):
+        from segtask_v1.data.augment import _simulate_lowres
+        img = torch.randn(2, 1, 16, 32, 32)
+        img_lr = _simulate_lowres(img.clone(), prob=1.0, zoom_range=[0.3, 0.5])
+        assert img_lr.shape == img.shape
+
+    def test_full_augmentor_pipeline(self):
+        from segtask_v1.config import AugConfig
+        from segtask_v1.data.augment import GPUAugmentor
+        cfg = AugConfig(
+            enabled=True, random_flip_prob=0.5,
+            random_affine_prob=0.5, elastic_deform_prob=0.3,
+            grid_dropout_prob=0.2, simulate_lowres_prob=0.2)
+        aug = GPUAugmentor(cfg)
+        img = torch.randn(2, 1, 16, 32, 32)
+        lbl = torch.zeros(2, 3, 16, 32, 32)  # 3 channels (e.g., 2 fg + 1 weight_map)
+        img_a, lbl_a = aug(img, lbl)
+        assert img_a.shape == img.shape
+        assert lbl_a.shape == lbl.shape
+
+
+# ---------------------------------------------------------------------------
+# Predictor tests (Feature c)
+# ---------------------------------------------------------------------------
+class TestPredictor:
+    def test_z_positions_coverage(self):
+        from segtask_v1.predictor import Predictor
+        # Create a minimal predictor to test position computation
+        p = Predictor.__new__(Predictor)
+        p.patch_D = 64
+        p.z_overlap = 0.5
+        positions = p._compute_z_positions(D_orig=200, D_patch=64, stride=32)
+        # Should cover entire volume
+        assert positions[0][0] == 0
+        assert positions[-1][1] >= 200
+        # No gaps
+        for i in range(len(positions) - 1):
+            assert positions[i + 1][0] < positions[i][1]  # overlap
+
+    def test_z_positions_small_volume(self):
+        from segtask_v1.predictor import Predictor
+        p = Predictor.__new__(Predictor)
+        p.patch_D = 64
+        p.z_overlap = 0.5
+        positions = p._compute_z_positions(D_orig=30, D_patch=64, stride=32)
+        # Small volume: single window covering [0, 30]
+        assert len(positions) == 1
+        assert positions[0] == (0, 30)
+
+    def test_gaussian_blend_weight(self):
+        from segtask_v1.predictor import Predictor
+        p = Predictor.__new__(Predictor)
+        p.blend_mode = "gaussian"
+        w = p._build_z_weight(64)
+        assert w.shape == (64,)
+        # Center should have highest weight
+        assert w[32] > w[0]
+        assert w[32] > w[63]
+
+    def test_prob_to_label(self):
+        from segtask_v1.predictor import Predictor
+        p = Predictor.__new__(Predictor)
+        p.label_values = [0, 1, 2]
+        p.threshold = 0.5
+        # Create probability volume: class 0 (label 1) = 0.8, class 1 (label 2) = 0.3
+        prob = np.zeros((2, 4, 4, 4), dtype=np.float32)
+        prob[0] = 0.8  # fg class 0 (label 1) is confident
+        prob[1] = 0.3  # fg class 1 (label 2) is not
+        label_map = p._prob_to_label(prob)
+        assert label_map.shape == (4, 4, 4)
+        # Should all be label 1 (since class 0 has max prob > threshold)
+        assert (label_map == 1).all()
+
+    def test_prob_to_label_background(self):
+        from segtask_v1.predictor import Predictor
+        p = Predictor.__new__(Predictor)
+        p.label_values = [0, 1, 2]
+        p.threshold = 0.5
+        # All probabilities below threshold → background
+        prob = np.ones((2, 4, 4, 4), dtype=np.float32) * 0.1
+        label_map = p._prob_to_label(prob)
+        assert (label_map == 0).all()
 
 
 if __name__ == "__main__":

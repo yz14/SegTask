@@ -64,6 +64,28 @@ def preprocess_image(
     return vol.astype(np.float32)
 
 
+def compute_region_weight_map(
+    volume: np.ndarray,
+    label_values: List[int],
+    region_weights: List[float]) -> np.ndarray:
+    """Generate per-voxel spatial weight map from raw label and region weights.
+
+    Args:
+        volume: Integer label volume (D, H, W).
+        label_values: [bg, fg1, fg2, ...] — all label values in the mask.
+        region_weights: One weight per label value, same length as label_values.
+            E.g. label_values=[0,1,2], region_weights=[1.0, 2.0, 1.5]
+
+    Returns:
+        Weight map (1, D, H, W) float32. Voxels not matching any label get weight 1.0.
+    """
+    vol = np.round(volume).astype(np.int32)
+    wmap = np.ones_like(vol, dtype=np.float32)
+    for lv, w in zip(label_values, region_weights):
+        wmap[vol == lv] = w
+    return wmap[np.newaxis]  # (1, D, H, W)
+
+
 def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
     """Convert integer label → per-foreground-class binary masks.
 
@@ -158,7 +180,8 @@ class SegDataset3D(Dataset):
         foreground_oversample_ratio: float = 0.5,
         samples_per_volume: int = 8,
         is_train: bool = True,
-        cache_enabled: bool = True):
+        cache_enabled: bool = True,
+        region_weights: Optional[List[float]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         self.image_paths = image_paths
@@ -173,6 +196,7 @@ class SegDataset3D(Dataset):
         self.fg_ratio = foreground_oversample_ratio
         self.samples_per_volume = samples_per_volume
         self.is_train = is_train
+        self.region_weights = region_weights
 
         self._img_cache = VolumeCache(cache_enabled)
         self._lbl_cache = VolumeCache(cache_enabled)
@@ -210,7 +234,7 @@ class SegDataset3D(Dataset):
         if cached is not None:
             return cached
         img = load_nifti(path)
-        img = preprocess_image(  # 归一化 TODO
+        img = preprocess_image(  # 归一化
             img, self.intensity_min, self.intensity_max,
             self.normalize, self.global_mean, self.global_std)
         self._img_cache.put(path, img)
@@ -245,11 +269,19 @@ class SegDataset3D(Dataset):
         img_patch = resize_3d(img_patch, D_patch, H_patch, W_patch, is_label=False)
         lbl_patch = resize_3d(lbl_patch, D_patch, H_patch, W_patch, is_label=True)
 
-        # Convert label to per-foreground-class binary masks  TODO 避免GPU浪费，后续将在损失计算时才提取每类mask
+        # Convert label to per-foreground-class binary masks
         lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (num_fg, D, H, W)
 
-        return {"image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
-                "label": torch.from_numpy(lbl_mc).float()}                 # (num_fg, D, H, W)
+        result = {
+            "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
+            "label": torch.from_numpy(lbl_mc).float()}                 # (num_fg, D, H, W)
+
+        # Spatial region weight map (optional)
+        if self.region_weights:
+            wmap = compute_region_weight_map(lbl_patch, self.label_values, self.region_weights)
+            result["weight_map"] = torch.from_numpy(wmap).float()  # (1, D, H, W)
+
+        return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
         """Sample a center z-position with optional foreground oversampling."""

@@ -68,20 +68,33 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class AugConfig:
-    """GPU data augmentation settings."""
+    """GPU data augmentation settings.
+
+    All spatial transforms are per-sample independent (not batch-level).
+    """
 
     enabled: bool = True
 
-    # Spatial
+    # --- Spatial (applied to image + label jointly) ---
     random_flip_prob: float = 0.5
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
-    random_rotate90_prob: float = 0.3
-
-    random_scale_prob: float = 0.2
+    # Affine: rotation (small angles, degrees) + scale, composed into one grid_sample
+    random_affine_prob: float = 0.3
+    random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
     random_scale_range: List[float] = field(default_factory=lambda: [0.85, 1.15])
 
-    # Intensity (image only)
+    # Elastic deformation (B-spline random displacement field)
+    elastic_deform_prob: float = 0.2
+    elastic_deform_sigma: float = 5.0   # Gaussian smoothing sigma for displacement
+    elastic_deform_alpha: float = 100.0 # Displacement magnitude
+
+    # Grid dropout (mask out rectangular sub-regions)
+    grid_dropout_prob: float = 0.0
+    grid_dropout_ratio: float = 0.3  # fraction of spatial area to drop
+    grid_dropout_holes: int = 4      # number of rectangular holes
+
+    # --- Intensity (image only) ---
     random_brightness_prob: float = 0.3
     random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
@@ -96,6 +109,10 @@ class AugConfig:
 
     gaussian_blur_prob: float = 0.1
     gaussian_blur_sigma: List[float] = field(default_factory=lambda: [0.5, 1.5])
+
+    # Simulate low resolution (downsample then upsample)
+    simulate_lowres_prob: float = 0.1
+    simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +183,12 @@ class LossConfig:
 
     # Per-class loss weights (empty = uniform). Length = num_fg_classes.
     class_weights: List[float] = field(default_factory=list)
+
+    # Per-region spatial weights: one weight per label value (including bg).
+    # e.g. label_values=[0,1,2,3,4], region_weights=[1.0, 2.0, 2.0, 1.0, 1.0]
+    # means voxels with label 1 or 2 get 2x loss weight at that spatial position.
+    # Empty = disabled (uniform spatial weight).
+    region_weights: List[float] = field(default_factory=list)
 
     # Dice settings
     dice_smooth: float = 1e-5
@@ -255,6 +278,35 @@ class TrainConfig:
 
 
 # ---------------------------------------------------------------------------
+# Prediction / Inference configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class PredictConfig:
+    """Inference settings for z-axis sliding window prediction."""
+
+    # Sliding window overlap ratio along z-axis (0.0 = no overlap, 0.5 = 50%)
+    z_overlap: float = 0.5
+
+    # Blending mode for overlapping regions: "gaussian" or "average"
+    blend_mode: str = "gaussian"
+
+    # Batch size for inference patches
+    batch_size: int = 2
+
+    # Test-time augmentation: flip along axes
+    tta_flip: bool = False
+
+    # Binarization threshold for sigmoid output
+    threshold: float = 0.5
+
+    # Output directory for predictions
+    output_dir: str = "predictions"
+
+    # Save probability maps (in addition to binary masks)
+    save_probabilities: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
 @dataclass
@@ -266,6 +318,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+    predict: PredictConfig = field(default_factory=PredictConfig)
 
     def sync(self) -> None:
         """Synchronize dependent fields across sub-configs."""
@@ -309,6 +362,7 @@ _SUB_CONFIGS = {
     "model": ModelConfig,
     "loss": LossConfig,
     "train": TrainConfig,
+    "predict": PredictConfig,
 }
 
 

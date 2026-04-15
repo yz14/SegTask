@@ -1,5 +1,5 @@
 # 3D Segmentation Training Configuration
-# Usage: python -m segtask_v1.train.py --config configs/seg3d.yaml
+# Usage: python -m segtask_v1.train --config configs/seg3d.yaml
 
 data:
   image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
@@ -16,7 +16,7 @@ data:
 
   # Intensity windowing (CT HU range)
   intensity_min: -1024.0
-  intensity_max: 3071.0
+  intensity_max: 1024.0
   normalize: "minmax"
 
   # Train/val split
@@ -38,14 +38,26 @@ data:
 augment:
   enabled: true
 
-  # Spatial
+  # --- Spatial (per-sample independent) ---
   random_flip_prob: 0.5
   random_flip_axes: [2, 3, 4]
-  random_rotate90_prob: 0.3
-  random_scale_prob: 0.2
+
+  # Affine: rotation (degrees) + scale, composed into one grid_sample
+  random_affine_prob: 0.3
+  random_rotate_range: [-15.0, 15.0]
   random_scale_range: [0.85, 1.15]
 
-  # Intensity
+  # Elastic deformation
+  elastic_deform_prob: 0.2
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 100.0
+
+  # Grid dropout (mask out rectangular sub-regions)
+  grid_dropout_prob: 0.0
+  grid_dropout_ratio: 0.3
+  grid_dropout_holes: 4
+
+  # --- Intensity (per-sample independent) ---
   random_brightness_prob: 0.3
   random_brightness_range: [-0.1, 0.1]
   random_contrast_prob: 0.3
@@ -56,6 +68,8 @@ augment:
   gaussian_noise_std: 0.05
   gaussian_blur_prob: 0.1
   gaussian_blur_sigma: [0.5, 1.5]
+  simulate_lowres_prob: 0.1
+  simulate_lowres_zoom: [0.5, 1.0]
 
 model:
   # Backbone: "resnet" or "convnext"
@@ -82,7 +96,7 @@ model:
   # Deep supervision (multi-scale output)
   deep_supervision: false
 
-  # Upsampling mode
+  # Upsampling mode: transpose, 
   upsample_mode: "transpose"
 
   # Skip connection mode
@@ -96,8 +110,13 @@ loss:
   name: "dice_bce"
   compound_weights: [1.0, 1.0]
 
-  # Per-class loss weights (empty = uniform)
-  class_weights: []
+  # Per-class loss weights (empty = uniform), e.g. [1.0, 1.0]
+  class_weights: [1.0, 1.0]
+
+  # Per-region spatial weights: one weight per label value (including bg).
+  # e.g. for label_values=[0,1,2]: region_weights=[1.0, 2.0, 1.0]
+  # means voxels with label 1 get 2x loss weight. Empty = disabled.
+  region_weights: [1.0, 2.0, 1.0]
 
   # Dice settings
   dice_smooth: 1.0e-5
@@ -168,3 +187,25 @@ train:
 
   # Resume from checkpoint
   resume: ""
+
+predict:
+  # Z-axis sliding window overlap ratio (0.0 = no overlap, 0.5 = 50%)
+  z_overlap: 0.5
+
+  # Blending mode: "gaussian" or "average"
+  blend_mode: "gaussian"
+
+  # Batch size for inference
+  batch_size: 2
+
+  # Test-time augmentation (flip)
+  tta_flip: false
+
+  # Binarization threshold
+  threshold: 0.5
+
+  # Output directory
+  output_dir: "predictions"
+
+  # Save probability maps
+  save_probabilities: false

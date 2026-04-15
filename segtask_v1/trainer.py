@@ -181,7 +181,7 @@ class Trainer:
         # EMA
         self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
 
-        # GPU augmentation  TODO 这里的数据增强过于简单化，例如没有随机旋转小角度，弹性形变，网格掩码等等丰富的方法；是对整个batch做，还是对每个样本独立的随机做？
+        # GPU augmentation  TODO 丰富了数据增强方法，需要验证
         self.augmentor = GPUAugmentor(cfg.augment)
 
         # Gradient accumulation
@@ -295,14 +295,24 @@ class Trainer:
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True)
+            wmap = batch.get("weight_map")
+            if wmap is not None:
+                wmap = wmap.to(self.device, non_blocking=True)
 
-            # GPU augmentation
-            image, label = self.augmentor(image, label)
+            # GPU augmentation — cat weight_map as extra label channel so
+            # spatial transforms are applied consistently, then split back.
+            if wmap is not None:
+                label_aug = torch.cat([label, wmap], dim=1)  # (B, C+1, D, H, W)
+                image, label_aug = self.augmentor(image, label_aug)
+                label = label_aug[:, :-1]
+                wmap = label_aug[:, -1:]
+            else:
+                image, label = self.augmentor(image, label)
 
             # Forward
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 pred = self.model(image)
-                loss = self.criterion(pred, label)
+                loss = self.criterion(pred, label, weight_map=wmap)
                 # Scale loss by accumulation steps for correct gradient magnitude
                 if accum > 1:
                     loss = loss / accum
