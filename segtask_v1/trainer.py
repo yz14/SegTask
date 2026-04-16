@@ -300,8 +300,7 @@ class Trainer:
 
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
-            label = batch["label"].to(self.device, non_blocking=True)
-            print(label.shape, torch.unique(label), '11111111111111111111111111')           
+            label = batch["label"].to(self.device, non_blocking=True)         
             wmap = batch.get("weight_map")
             if wmap is not None:
                 wmap = wmap.to(self.device, non_blocking=True)
@@ -315,18 +314,17 @@ class Trainer:
                 wmap  = label_aug[:, -1:]
             else:
                 image, label = self.augmentor(image, label)
-            print(label.shape, torch.unique(label), '2222222222222222222222222222')
-            import SimpleITK as sitk
-            import os
-            debug_path = './debug0416-1'
-            os.makedirs(debug_path, exist_ok=True)
-            for jj, (img, lbl) in enumerate(zip(image, label)):
-                img, lbl = img[0].cpu().numpy(), lbl[0].cpu().numpy()
-                img = sitk.GetImageFromArray(img)
-                lbl = sitk.GetImageFromArray(lbl)
-                sitk.WriteImage(img, f'{debug_path}/{jj}.nii.gz')
-                sitk.WriteImage(lbl, f'{debug_path}/{jj}m.nii.gz')
-            raise
+            # import SimpleITK as sitk
+            # import os
+            # debug_path = './debug0416-1'
+            # os.makedirs(debug_path, exist_ok=True)
+            # for jj, (img, lbl) in enumerate(zip(image, label)):
+            #     img, lbl = img[0].cpu().numpy(), lbl[0].cpu().numpy()
+            #     img = sitk.GetImageFromArray(img)
+            #     lbl = sitk.GetImageFromArray(lbl)
+            #     sitk.WriteImage(img, f'{debug_path}/{jj}.nii.gz')
+            #     sitk.WriteImage(lbl, f'{debug_path}/{jj}m.nii.gz')
+            # raise
 
             # Center-crop oversized patches to model input size
             if self.needs_crop:

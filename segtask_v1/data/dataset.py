@@ -464,7 +464,7 @@ class SegDataset3DCubic(Dataset):
         # Sample center point
         center = self._sample_center(vol_idx, D, H, W)
 
-        # Extract cubic patch (may be oversized for augmentation margin)
+        # Extract cubic patch (may be oversized for augmentation margin)  TODO 这里可以改成多个分辨率输入，例如是self.extract_size的1.5倍和2倍，然后resize后拼接成3通道，提供不同的分辨率/感受野信息
         eD, eH, eW = self.extract_size
         img_patch = _extract_cubic_patch(img, center, (eD, eH, eW))
         lbl_patch = _extract_cubic_patch(lbl, center, (eD, eH, eW))
@@ -473,7 +473,7 @@ class SegDataset3DCubic(Dataset):
         img_patch = resize_3d(img_patch, eD, eH, eW, is_label=False)
         lbl_patch = resize_3d(lbl_patch, eD, eH, eW, is_label=True)
 
-        # Convert label to per-fg-class binary masks
+        # Convert label to per-fg-class binary masks  TODO 不同的分辨率是不同的通道后(num_分辨率, eD, eH, eW)，这步需要移到计算损失的时候做，对每个分辨率单独做
         lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (num_fg, eD, eH, eW)
 
         result = {

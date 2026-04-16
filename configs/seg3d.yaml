@@ -116,7 +116,7 @@ model:
   drop_path_rate: 0.0
 
 loss:
-  # Loss function: "dice", "bce", "dice_bce", "focal", "dice_focal", "tversky"
+  # Loss function: "dice", "bce", "dice_bce", "focal", "dice_focal", "tversky" TODO 检查和丰富
   name: "dice_bce"
   compound_weights: [1.0, 1.0]
 
