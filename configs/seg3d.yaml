@@ -9,7 +9,7 @@ data:
 
   # Label values: auto-detected if empty. [0, 1, 2] = bg + 2 fg classes.
   label_values: []
-  num_classes: 0
+  num_classes : 0
 
   # 3D patch size [D, H, W]
   patch_size: [64, 128, 128]
@@ -27,20 +27,20 @@ data:
   # Intensity windowing (CT HU range)
   intensity_min: -1024.0
   intensity_max: 1024.0
-  normalize: "minmax"
+  normalize    : "minmax"
 
   # Train/val split
-  val_ratio: 0.2
+  val_ratio : 0.2
   split_seed: 42
 
   # DataLoader
-  batch_size: 2
+  batch_size : 2
   num_workers: 4
-  pin_memory: true
+  pin_memory : true
 
   # Foreground oversampling
   foreground_oversample_ratio: 0.5
-  samples_per_volume: 8
+  samples_per_volume         : 8
 
   # Cache volumes in memory for speed
   cache_mode: "memory"
@@ -49,37 +49,37 @@ augment:
   enabled: true
 
   # --- Spatial (per-sample independent) ---
-  random_flip_prob: 0.5
+  random_flip_prob: 0.000000000000000005
   random_flip_axes: [2, 3, 4]
 
   # Affine: rotation (degrees) + scale, composed into one grid_sample
-  random_affine_prob: 0.3
+  random_affine_prob : 0.000000000000000003
   random_rotate_range: [-15.0, 15.0]
-  random_scale_range: [0.85, 1.15]
+  random_scale_range : [0.85, 1.15]
 
   # Elastic deformation
-  elastic_deform_prob: 0.2
+  elastic_deform_prob : 1.000000000000000002
   elastic_deform_sigma: 5.0
   elastic_deform_alpha: 100.0
 
   # Grid dropout (mask out rectangular sub-regions)
-  grid_dropout_prob: 0.0
+  grid_dropout_prob : 0.0
   grid_dropout_ratio: 0.3
   grid_dropout_holes: 4
 
   # --- Intensity (per-sample independent) ---
-  random_brightness_prob: 0.3
+  random_brightness_prob : 0.000000000000000003
   random_brightness_range: [-0.1, 0.1]
-  random_contrast_prob: 0.3
-  random_contrast_range: [0.8, 1.2]
-  random_gamma_prob: 0.2
-  random_gamma_range: [0.8, 1.2]
-  gaussian_noise_prob: 0.15
-  gaussian_noise_std: 0.05
-  gaussian_blur_prob: 0.1
-  gaussian_blur_sigma: [0.5, 1.5]
-  simulate_lowres_prob: 0.1
-  simulate_lowres_zoom: [0.5, 1.0]
+  random_contrast_prob   : 0.000000000000000003
+  random_contrast_range  : [0.8, 1.2]
+  random_gamma_prob      : 0.000000000000000002
+  random_gamma_range     : [0.8, 1.2]
+  gaussian_noise_prob    : 0.0000000000000000015
+  gaussian_noise_std     : 0.05
+  gaussian_blur_prob     : 0.000000000000000001
+  gaussian_blur_sigma    : [0.5, 1.5]
+  simulate_lowres_prob   : 0.000000000000000001
+  simulate_lowres_zoom   : [0.5, 1.0]
 
 model:
   # Backbone: "resnet" or "convnext"
@@ -94,13 +94,13 @@ model:
   blocks_per_level: 2
 
   # Normalization and activation
-  norm_type: "instance"
+  norm_type  : "instance"
   norm_groups: 8
-  activation: "leakyrelu"
-  dropout: 0.0
+  activation : "leakyrelu"
+  dropout    : 0.0
 
   # Squeeze-and-Excitation channel attention
-  use_se: false
+  use_se      : false
   se_reduction: 16
 
   # Deep supervision (multi-scale output)
@@ -129,7 +129,7 @@ loss:
   region_weights: [1.0, 2.0, 1.0]
 
   # Dice settings
-  dice_smooth: 1.0e-5
+  dice_smooth : 1.0e-5
   dice_squared: false
 
   # Focal loss settings
@@ -138,7 +138,7 @@ loss:
 
   # Tversky settings
   tversky_alpha: 0.3
-  tversky_beta: 0.7
+  tversky_beta : 0.7
 
   # Deep supervision weights
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
@@ -147,18 +147,18 @@ train:
   epochs: 200
 
   # Optimizer
-  optimizer: "adamw"
-  lr: 1.0e-3
+  optimizer   : "adamw"
+  lr          : 1.0e-3
   weight_decay: 1.0e-4
 
   # Scheduler: "cosine", "cosine_warm_restarts", "poly", "step", "plateau", "one_cycle"
-  scheduler: "cosine"
+  scheduler    : "cosine"
   warmup_epochs: 5
-  warmup_lr: 1.0e-6
+  warmup_lr    : 1.0e-6
   cosine_min_lr: 1.0e-6
   # Cosine warm restarts (only used when scheduler="cosine_warm_restarts")
   cosine_restart_period: 50
-  cosine_restart_mult: 2
+  cosine_restart_mult  : 2
 
   # Gradient accumulation (effective batch = batch_size * grad_accum_steps)
   grad_accum_steps: 1
@@ -167,21 +167,21 @@ train:
   grad_clip_norm: 12.0
 
   # Mixed precision
-  use_amp: true
+  use_amp  : true
   amp_dtype: "float16"
 
   # torch.compile ("none", "default", "reduce-overhead", "max-autotune")
   compile_mode: "none"
 
   # EMA
-  use_ema: true
+  use_ema  : true
   ema_decay: 0.999
 
   # Checkpointing
   output_dir: "outputs/seg3d_resnet"
   save_every: 10
   save_best_metric: "mean_dice"
-  save_best_mode: "max"
+  save_best_mode  : "max"
 
   # Early stopping (0 = disabled)
   early_stopping: 0

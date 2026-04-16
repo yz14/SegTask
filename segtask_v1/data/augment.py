@@ -87,8 +87,8 @@ def _random_flip(
         mask = torch.rand(B, device=image.device) < prob  # (B,) bool
         if mask.any():
             idx = mask.nonzero(as_tuple=True)[0]
-            image[idx] = torch.flip(image[idx], [axis - 1])  # axis in spatial dims
-            label[idx] = torch.flip(label[idx], [axis - 1])
+            image[idx] = torch.flip(image[idx], [axis])  # axis indexes into (B,C,D,H,W)
+            label[idx] = torch.flip(label[idx], [axis])
     return image, label
 
 
@@ -204,8 +204,7 @@ def _elastic_deform(
     n = idx.shape[0]
 
     # Coarse grid size (controls smoothness — smaller = smoother)
-    coarse = max(int(round(min(D, H, W) / sigma)), 4)
-    cD = max(coarse, 4)
+    cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
     cW = max(int(round(W / sigma)), 4)
 
@@ -236,8 +235,12 @@ def _elastic_deform(
 
 def _identity_grid(
     N: int, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """Create identity sampling grid in [-1, 1] for grid_sample."""
-    vecs = [torch.linspace(-1, 1, s, device=device) for s in (D, H, W)]
+    """Create identity sampling grid in [-1, 1] for grid_sample (align_corners=False).
+
+    For align_corners=False, pixel i (0-indexed) maps to coordinate (2i+1)/s - 1,
+    i.e. coordinates span [-1+1/s, 1-1/s] instead of [-1, 1].
+    """
+    vecs = [torch.linspace(-1 + 1/s, 1 - 1/s, s, device=device) for s in (D, H, W)]
     grids = torch.meshgrid(*vecs, indexing="ij")  # (D, H, W) each
     grid = torch.stack(grids[::-1], dim=-1)  # (D, H, W, 3) — order: W, H, D for grid_sample
     return grid.unsqueeze(0).expand(N, -1, -1, -1, -1)
@@ -336,9 +339,9 @@ def _gaussian_noise(
     mask = torch.rand(B, device=image.device) < prob
     if not mask.any():
         return image
-    noise = torch.randn_like(image) * std
-    noise[~mask] = 0
-    return image + noise
+    idx = mask.nonzero(as_tuple=True)[0]
+    image[idx] = image[idx] + torch.randn_like(image[idx]) * std
+    return image
 
 
 def _gaussian_blur_3d(
