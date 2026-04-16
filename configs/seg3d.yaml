@@ -49,18 +49,18 @@ augment:
   enabled: true
 
   # --- Spatial (per-sample independent) ---
-  random_flip_prob: 0.000000000000000005
+  random_flip_prob: 0.5
   random_flip_axes: [2, 3, 4]
 
   # Affine: rotation (degrees) + scale, composed into one grid_sample
-  random_affine_prob : 0.000000000000000003
+  random_affine_prob : 0.3
   random_rotate_range: [-15.0, 15.0]
   random_scale_range : [0.85, 1.15]
 
-  # Elastic deformation
-  elastic_deform_prob : 1.000000000000000002
+  # Elastic deformation, alppa推荐1到10，根据spacing不同
+  elastic_deform_prob : 0.02
   elastic_deform_sigma: 5.0
-  elastic_deform_alpha: 100.0
+  elastic_deform_alpha: 1.0
 
   # Grid dropout (mask out rectangular sub-regions)
   grid_dropout_prob : 0.0
@@ -68,17 +68,17 @@ augment:
   grid_dropout_holes: 4
 
   # --- Intensity (per-sample independent) ---
-  random_brightness_prob : 0.000000000000000003
+  random_brightness_prob : 0.3
   random_brightness_range: [-0.1, 0.1]
-  random_contrast_prob   : 0.000000000000000003
+  random_contrast_prob   : 0.3
   random_contrast_range  : [0.8, 1.2]
-  random_gamma_prob      : 0.000000000000000002
+  random_gamma_prob      : 0.2
   random_gamma_range     : [0.8, 1.2]
-  gaussian_noise_prob    : 0.0000000000000000015
+  gaussian_noise_prob    : 0.2
   gaussian_noise_std     : 0.05
-  gaussian_blur_prob     : 0.000000000000000001
+  gaussian_blur_prob     : 0.1
   gaussian_blur_sigma    : [0.5, 1.5]
-  simulate_lowres_prob   : 0.000000000000000001
+  simulate_lowres_prob   : 0.1
   simulate_lowres_zoom   : [0.5, 1.0]
 
 model:

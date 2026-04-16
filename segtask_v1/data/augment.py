@@ -188,10 +188,19 @@ def _elastic_deform(
     """Per-sample 3D elastic deformation via smooth random displacement field.
 
     Algorithm:
-    1. Generate random displacement on a coarse grid
-    2. Upsample to full resolution (equivalent to Gaussian smoothing)
-    3. Scale by alpha
-    4. Apply via grid_sample
+    1. Generate random displacement on a coarse grid (N(0,1))
+    2. Upsample to full resolution (trilinear = smooth interpolation)
+    3. Scale so that ``alpha`` controls displacement in **voxels**
+    4. Convert per-dimension to normalised grid coordinates for grid_sample
+    5. Apply via grid_sample
+
+    Args:
+        sigma: Controls the *smoothness* of the deformation field.
+            Larger → smoother (fewer coarse control points).
+            Typical range: 4–9.
+        alpha: Controls the *magnitude* of displacement in **voxels**.
+            After interpolation the displacement std ≈ alpha voxels.
+            Typical range: 3–12.  (95 % of displacements within ±2·alpha voxels.)
     """
     B, _, D, H, W = image.shape
     device = image.device
@@ -203,26 +212,41 @@ def _elastic_deform(
     idx = mask.nonzero(as_tuple=True)[0]
     n = idx.shape[0]
 
-    # Coarse grid size (controls smoothness — smaller = smoother)
+    # Coarse grid size (controls smoothness — fewer points = smoother)
     cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
     cW = max(int(round(W / sigma)), 4)
 
-    # Random displacement on coarse grid, then upsample
+    # Random displacement on coarse grid, then upsample (acts as smoothing)
     disp = torch.randn(n, 3, cD, cH, cW, device=device)
     disp = F.interpolate(disp, size=(D, H, W), mode="trilinear", align_corners=False)
-    disp = disp * (alpha / min(D, H, W))  # normalize by spatial extent
+
+    # Scale displacement to voxel-space magnitude ``alpha``, then convert
+    # each channel to normalised grid coordinates independently.
+    #
+    # After permute(0,2,3,4,1) the 3 channels map to grid axes as:
+    #   channel 0 → x (W-axis)
+    #   channel 1 → y (H-axis)
+    #   channel 2 → z (D-axis)
+    #
+    # For align_corners=False, 1 voxel = 2/N in grid coords (grid spans
+    # [-1, 1] over N pixels).  So: grid_disp = voxel_disp × (2 / N).
+    voxel_to_grid = torch.tensor(
+        [2.0 / W, 2.0 / H, 2.0 / D],
+        dtype=disp.dtype, device=device,
+    ).reshape(1, 3, 1, 1, 1)
+    disp = disp * alpha * voxel_to_grid
 
     # Build sampling grid: identity + displacement
     # grid_sample expects grid in [-1, 1], shape (N, D, H, W, 3)
     grid = _identity_grid(n, D, H, W, device)  # (n, D, H, W, 3)
-    grid = grid + disp.permute(0, 2, 3, 4, 1)  # add displacement (d, h, w) → (x, y, z)
+    grid = grid + disp.permute(0, 2, 3, 4, 1)  # add displacement
 
     # Apply to image
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
-    # Apply to label (nearest)
+    # Apply to label (nearest to preserve discrete values)
     C_lbl = label.shape[1]
     lbl_sel = label[idx].reshape(n * C_lbl, 1, D, H, W)
     grid_exp = grid.unsqueeze(1).expand(-1, C_lbl, -1, -1, -1, -1).reshape(n * C_lbl, D, H, W, 3)

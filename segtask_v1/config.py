@@ -96,8 +96,8 @@ class AugConfig:
 
     # Elastic deformation (B-spline random displacement field)
     elastic_deform_prob: float = 0.2
-    elastic_deform_sigma: float = 5.0   # Gaussian smoothing sigma for displacement
-    elastic_deform_alpha: float = 100.0 # Displacement magnitude
+    elastic_deform_sigma: float = 5.0   # Smoothness of displacement (coarse grid spacing)
+    elastic_deform_alpha: float = 7.0   # Displacement magnitude in voxels (std)
 
     # Grid dropout (mask out rectangular sub-regions)
     grid_dropout_prob: float = 0.0
