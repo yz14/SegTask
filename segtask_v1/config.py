@@ -46,6 +46,12 @@ class DataConfig:
     # This avoids blank edges from spatial transforms. 1.0 = disabled, 1.4~1.5 recommended.
     aug_oversample_ratio: float = 1.0
 
+    # Multi-resolution input (cubic mode only).
+    # Scales at which to extract patches centered at the same point.
+    # Each scale's patch is resized to extract_size and stacked as a channel.
+    # [1.0] = single-resolution (1-channel), [1.0, 1.5, 2.0] = 3-channel.
+    multi_res_scales: List[float] = field(default_factory=lambda: [1.0])
+
     # Intensity windowing (HU for CT)
     intensity_min: float = -1024.0
     intensity_max: float = 3071.0
@@ -335,6 +341,10 @@ class Config:
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
 
+        # Auto-set in_channels from multi_res_scales (always >= 1)
+        if self.data.patch_mode == "cubic":
+            self.model.in_channels = len(self.data.multi_res_scales)
+
     def validate(self) -> None:
         """Validate configuration for consistency."""
         assert self.model.backbone in ("resnet", "convnext"), \
@@ -357,6 +367,10 @@ class Config:
             f"Invalid patch_mode: {self.data.patch_mode}"
         assert self.data.aug_oversample_ratio >= 1.0, \
             "aug_oversample_ratio must be >= 1.0"
+        assert len(self.data.multi_res_scales) >= 1, \
+            "multi_res_scales must have at least one scale (e.g. [1.0])"
+        assert all(s >= 1.0 for s in self.data.multi_res_scales), \
+            "All multi_res_scales must be >= 1.0"
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)

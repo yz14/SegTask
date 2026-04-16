@@ -357,12 +357,16 @@ class SegDataset3DCubic(Dataset):
     """3D cubic patch dataset.
 
     Samples a center point (d, h, w) and extracts a full 3D cube.
-    Supports augmentation oversample: extract a larger cube, then the trainer
-    center-crops to patch_size after GPU augmentation.
 
-    Each sample returns:
-      image: (1, eD, eH, eW) float32   — eD >= D if oversample > 1
-      label: (num_fg, eD, eH, eW) float32
+    Features:
+      - Augmentation oversample: extract larger cube, trainer crops after aug.
+      - Multi-resolution input: extract multiple scales at same center,
+        resize to same size, stack as channels.
+
+    Output format depends on multi_res_scales:
+      - Disabled (empty): image (1, eD, eH, eW), label (num_fg, eD, eH, eW)
+      - Enabled:          image (C_res, eD, eH, eW), label (C_res, eD, eH, eW)
+        where label channels are RAW integer labels (preprocess_label at loss time).
     """
 
     def __init__(
@@ -372,6 +376,7 @@ class SegDataset3DCubic(Dataset):
         label_values: List[int],
         patch_size: Tuple[int, int, int] = (64, 128, 128),
         aug_oversample_ratio: float = 1.0,
+        multi_res_scales: Optional[List[float]] = None,
         intensity_min: float = -1024.0,
         intensity_max: float = 3071.0,
         normalize: str = "minmax",
@@ -392,6 +397,7 @@ class SegDataset3DCubic(Dataset):
         # Effective extraction size (may be larger than patch_size for oversample)
         self.extract_size = tuple(
             int(round(p * aug_oversample_ratio)) for p in patch_size)
+        self.multi_res_scales = multi_res_scales or []
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -456,34 +462,48 @@ class SegDataset3DCubic(Dataset):
         return len(self.image_paths) * self.samples_per_volume
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Unified multi-resolution path.
+
+        multi_res_scales is always >= 1 element ([1.0] for single-res).
+        For each scale: extract (scale * extract_size) cube → resize to extract_size.
+        Output:
+          image: (C_res, eD, eH, eW) — C_res channels, one per scale
+          label: (C_res, eD, eH, eW) — raw integer labels per scale
+          weight_map: (C_res, eD, eH, eW) — optional, per-scale region weights
+        """
         vol_idx = idx % len(self.image_paths)
         img = self._load_image(vol_idx)
         lbl = self._load_label(vol_idx)
         D, H, W = img.shape
 
-        # Sample center point
         center = self._sample_center(vol_idx, D, H, W)
-
-        # Extract cubic patch (may be oversized for augmentation margin)  TODO 这里可以改成多个分辨率输入，例如是self.extract_size的1.5倍和2倍，然后resize后拼接成3通道，提供不同的分辨率/感受野信息
         eD, eH, eW = self.extract_size
-        img_patch = _extract_cubic_patch(img, center, (eD, eH, eW))
-        lbl_patch = _extract_cubic_patch(lbl, center, (eD, eH, eW))
-        
-        # 3D resample to target (D_patch, H_patch, W_patch)
-        img_patch = resize_3d(img_patch, eD, eH, eW, is_label=False)
-        lbl_patch = resize_3d(lbl_patch, eD, eH, eW, is_label=True)
 
-        # Convert label to per-fg-class binary masks  TODO 不同的分辨率是不同的通道后(num_分辨率, eD, eH, eW)，这步需要移到计算损失的时候做，对每个分辨率单独做
-        lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (num_fg, eD, eH, eW)
+        img_channels, lbl_channels, wmap_channels = [], [], []
+        for scale in self.multi_res_scales:
+            sD = int(round(eD * scale))
+            sH = int(round(eH * scale))
+            sW = int(round(eW * scale))
+
+            img_s = _extract_cubic_patch(img, center, (sD, sH, sW))
+            lbl_s = _extract_cubic_patch(lbl, center, (sD, sH, sW))
+
+            img_s = resize_3d(img_s, eD, eH, eW, is_label=False)
+            lbl_s = resize_3d(lbl_s, eD, eH, eW, is_label=True)
+
+            img_channels.append(img_s)
+            lbl_channels.append(lbl_s)
+
+            if self.region_weights:
+                wmap_s = compute_region_weight_map(lbl_s, self.label_values, self.region_weights)
+                wmap_channels.append(wmap_s[0])  # (D, H, W), squeeze the leading 1
 
         result = {
-            "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, eD, eH, eW)
-            "label": torch.from_numpy(lbl_mc).float()}                 # (num_fg, eD, eH, eW)
-
-        if self.region_weights:
-            wmap = compute_region_weight_map(lbl_patch, self.label_values, self.region_weights)
-            result["weight_map"] = torch.from_numpy(wmap).float()
-
+            "image": torch.from_numpy(np.stack(img_channels, axis=0).astype(np.float32)),
+            "label": torch.from_numpy(np.stack(lbl_channels, axis=0).astype(np.float32))}
+        if wmap_channels:
+            result["weight_map"] = torch.from_numpy(
+                np.stack(wmap_channels, axis=0).astype(np.float32))  # (C_res, eD, eH, eW)
         return result
 
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:

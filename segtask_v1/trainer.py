@@ -27,7 +27,7 @@ from torch.utils.data import DataLoader
 
 from .config import Config
 from .data.augment import GPUAugmentor
-from .losses.losses import build_loss, DeepSupervisionLoss
+from .losses.losses import build_loss, DeepSupervisionLoss, MultiResolutionLoss
 from .models.unet import UNet3D
 from .utils import AverageMeter, ModelEMA, Timer, compute_dice_per_class
 
@@ -158,11 +158,21 @@ class Trainer:
             logger.info("Compiling model with mode='%s'", tc.compile_mode)
             self.model = torch.compile(self.model, mode=tc.compile_mode)
 
-        # Loss  TODO 增加所有公认高质量分割损失
-        self.criterion = build_loss(cfg.loss)
+        # Loss — always wrapped in MultiResolutionLoss.
+        # multi_res_scales is always >= 1 element ([1.0] = single-res).
+        # This handles label-to-binary conversion on GPU for all modes.
+        base_loss = build_loss(cfg.loss)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
-            self.criterion = DeepSupervisionLoss(
-                self.criterion, cfg.loss.deep_supervision_weights)
+            base_loss = DeepSupervisionLoss(
+                base_loss, cfg.loss.deep_supervision_weights)
+        num_res = len(cfg.data.multi_res_scales)
+        self.criterion = MultiResolutionLoss(
+            base_loss=base_loss,
+            num_fg_classes=cfg.num_fg_classes,
+            num_res=num_res,
+            label_values=cfg.data.label_values)
+        logger.info("Loss: %s, scales=%d, fg_classes=%d",
+                     cfg.loss.name, num_res, cfg.num_fg_classes)
 
         # Optimizer + scheduler
         self.optimizer  = build_optimizer(model, cfg)
@@ -300,18 +310,22 @@ class Trainer:
 
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
-            label = batch["label"].to(self.device, non_blocking=True)         
+            label = batch["label"].to(self.device, non_blocking=True)
             wmap = batch.get("weight_map")
             if wmap is not None:
                 wmap = wmap.to(self.device, non_blocking=True)
+                if wmap.shape[1] == 0:
+                    wmap = None  # guard against empty tensor from collation
 
-            # GPU augmentation — cat weight_map as extra label channel so
-            # spatial transforms are applied consistently, then split back.
+            # GPU augmentation — label and weight_map are augmented together
+            # with image so spatial transforms are consistent.
+            # label: (B, C_res, D, H, W), wmap: (B, C_res, D, H, W) or None
             if wmap is not None:
-                label_aug = torch.cat([label, wmap], dim=1)  # (B, C+1, D, H, W)
+                n_lbl = label.shape[1]
+                label_aug = torch.cat([label, wmap], dim=1)  # (B, 2*C_res, ...)
                 image, label_aug = self.augmentor(image, label_aug)
-                label = label_aug[:, :-1]
-                wmap  = label_aug[:, -1:]
+                label = label_aug[:, :n_lbl]
+                wmap = label_aug[:, n_lbl:]
             else:
                 image, label = self.augmentor(image, label)
             # import SimpleITK as sitk
@@ -366,7 +380,10 @@ class Trainer:
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
                     p = pred[0] if isinstance(pred, list) else pred
-                    dice = compute_dice_per_class(p.detach(), label)
+                    # Dice on 1x resolution: first num_fg channels
+                    p_1x = p.detach()[:, :self.num_fg]
+                    lbl_1x = self.criterion._label_to_binary(label[:, 0])
+                    dice = compute_dice_per_class(p_1x, lbl_1x)
                     mean_dice = dice.mean().item()
                     dice_meter.update(mean_dice, image.shape[0])
                 logger.debug("  [%d/%d] loss=%.4f dice=%.4f lr=%.2e",
@@ -386,10 +403,9 @@ class Trainer:
         all_dice = []
 
         for batch in self.val_loader:
-            # 验证集没有oversample
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True)
-            
+
             with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
                 pred = self.model(image)
                 if isinstance(pred, list):
@@ -397,7 +413,11 @@ class Trainer:
                 loss = self.criterion(pred, label)
 
             loss_meter.update(loss.item(), image.shape[0])
-            dice = compute_dice_per_class(pred, label)
+
+            # Dice on 1x resolution: first num_fg channels
+            pred_1x = pred[:, :self.num_fg]
+            target_1x = self.criterion._label_to_binary(label[:, 0])
+            dice = compute_dice_per_class(pred_1x, target_1x)
             all_dice.append(dice.cpu())
 
         if self.ema is not None:

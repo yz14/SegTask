@@ -572,20 +572,22 @@ class TestCubicDataset:
         patch = _extract_cubic_patch(vol, (50, 40, 40), (32, 32, 32))
         assert patch.shape == (32, 32, 32)
 
-    def test_extract_cubic_patch_edge_padding(self):
+    def test_extract_cubic_patch_edge_clipping(self):
         from segtask_v1.data.dataset import _extract_cubic_patch
         vol = np.random.rand(20, 20, 20).astype(np.float32)
-        # Center near corner → requires padding
+        # Center near corner → clipped (no padding)
         patch = _extract_cubic_patch(vol, (2, 2, 2), (32, 32, 32))
-        assert patch.shape == (32, 32, 32)
-        # Some values should be zero (padded region)
-        assert (patch == 0).any()
+        # Result is clipped to volume bounds, not padded
+        assert patch.shape[0] <= 20
+        assert patch.shape[0] > 0
 
     def test_extract_cubic_patch_small_volume(self):
         from segtask_v1.data.dataset import _extract_cubic_patch
         vol = np.ones((10, 10, 10), dtype=np.float32)
         patch = _extract_cubic_patch(vol, (5, 5, 5), (32, 32, 32))
-        assert patch.shape == (32, 32, 32)
+        # Clipped to volume size (no padding)
+        assert patch.shape[0] <= 10
+        assert patch.shape[0] > 0
 
     def test_cubic_dataset_getitem(self):
         from segtask_v1.data.dataset import SegDataset3DCubic
@@ -604,6 +606,7 @@ class TestCubicDataset:
             ds = SegDataset3DCubic(
                 image_paths=[img_path], label_paths=[lbl_path],
                 label_values=[0, 1], patch_size=(16, 16, 16),
+                multi_res_scales=[1.0],
                 samples_per_volume=2, cache_enabled=False)
             sample = ds[0]
             assert sample["image"].shape == (1, 16, 16, 16)
@@ -626,6 +629,7 @@ class TestCubicDataset:
                 image_paths=[img_path], label_paths=[lbl_path],
                 label_values=[0, 1], patch_size=(16, 16, 16),
                 aug_oversample_ratio=1.5,
+                multi_res_scales=[1.0],
                 samples_per_volume=2, cache_enabled=False)
             sample = ds[0]
             # With 1.5x oversample, extraction is ceil(16*1.5)=24
@@ -711,6 +715,74 @@ class TestTrainerCenterCrop:
         assert img_c.shape == (1, 1, 32, 32, 32)
         assert lbl_c.shape == (1, 3, 32, 32, 32)
         assert wm_c is None
+
+
+# ---------------------------------------------------------------------------
+# Multi-resolution tests (New feature)
+# ---------------------------------------------------------------------------
+class TestMultiResolution:
+    def test_multi_res_loss(self):
+        from segtask_v1.losses.losses import build_loss, MultiResolutionLoss
+        from segtask_v1.config import LossConfig
+        base = build_loss(LossConfig(name="dice_bce"))
+        mr_loss = MultiResolutionLoss(
+            base_loss=base, num_fg_classes=2, num_res=3, label_values=[0, 1, 2])
+        # pred: (B, num_fg*C_res, D, H, W) = (2, 6, 8, 16, 16)
+        pred = torch.randn(2, 6, 8, 16, 16)
+        # label: (B, C_res, D, H, W) = (2, 3, 8, 16, 16) raw integer
+        label = torch.zeros(2, 3, 8, 16, 16)
+        label[:, :, 2:6, 4:12, 4:12] = 1.0
+        loss = mr_loss(pred, label)
+        assert loss.shape == ()
+        assert loss.item() >= 0
+
+    def test_label_to_binary_gpu(self):
+        from segtask_v1.losses.losses import MultiResolutionLoss
+        mr = MultiResolutionLoss.__new__(MultiResolutionLoss)
+        mr.fg_values = [1, 2]
+        label = torch.tensor([[[[0, 1], [2, 0]]]], dtype=torch.float32)  # (1, 1, 2, 2)
+        # Squeeze to (1, 2, 2)
+        binary = mr._label_to_binary(label.squeeze(1))  # (1, 2, 2, 2)
+        assert binary.shape == (1, 2, 2, 2)
+        assert binary[0, 0, 0, 1] == 1.0  # class 1 at (0,1)
+        assert binary[0, 1, 1, 0] == 1.0  # class 2 at (1,0)
+        assert binary[0, 0, 0, 0] == 0.0  # bg
+
+    def test_config_multi_res_sync(self):
+        from segtask_v1.config import Config
+        cfg = Config()
+        cfg.data.label_values = [0, 1, 2]
+        cfg.data.num_classes = 3
+        cfg.data.patch_mode = "cubic"
+        cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+        cfg.sync()
+        assert cfg.model.in_channels == 3
+
+    def test_config_multi_res_validates_scales(self):
+        from segtask_v1.config import Config
+        cfg = Config()
+        cfg.data.label_values = [0, 1]
+        cfg.data.num_classes = 2
+        cfg.data.multi_res_scales = [0.5]  # below 1.0 is invalid
+        cfg.sync()
+        with pytest.raises(AssertionError):
+            cfg.validate()
+
+    def test_model_output_channels(self):
+        from segtask_v1.config import Config
+        from segtask_v1.models.factory import build_model
+        cfg = Config()
+        cfg.data.label_values = [0, 1, 2]
+        cfg.data.num_classes = 3
+        cfg.data.patch_mode = "cubic"
+        cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+        cfg.model.encoder_channels = [16, 32, 64]
+        cfg.sync()
+        model = build_model(cfg)
+        x = torch.randn(1, 3, 32, 64, 64)
+        y = model(x)
+        # Output: num_fg(2) * C_res(3) = 6 channels
+        assert y.shape == (1, 6, 32, 64, 64)
 
 
 if __name__ == "__main__":

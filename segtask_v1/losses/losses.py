@@ -490,6 +490,86 @@ def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
     return (ws + [1.0] * n)[:n]
 
 
+class MultiResolutionLoss(nn.Module):
+    """Wrapper that handles multi-resolution label format.
+
+    When multi-resolution input is enabled:
+      - Model output: (B, num_fg * C_res, D, H, W)
+      - Label:        (B, C_res, D, H, W) with raw integer labels per channel
+
+    This wrapper:
+      1. Splits model output into C_res groups of num_fg channels
+      2. Converts each label channel to per-fg binary masks (preprocess_label)
+      3. Computes base_loss for each resolution independently
+      4. Returns the average loss across resolutions
+
+    Args:
+        base_loss: The underlying loss function (e.g., CompoundLoss of Dice+BCE).
+        num_fg_classes: Number of foreground classes.
+        num_res: Number of resolution scales (C_res).
+        label_values: [bg, fg1, fg2, ...] for preprocess_label.
+    """
+
+    def __init__(
+        self,
+        base_loss: nn.Module,
+        num_fg_classes: int,
+        num_res: int,
+        label_values: List[int],
+    ):
+        super().__init__()
+        self.base_loss = base_loss
+        self.num_fg = num_fg_classes
+        self.num_res = num_res
+        self.label_values = label_values
+        self.fg_values = label_values[1:]  # exclude background
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        label_raw: torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute loss across all resolutions.
+
+        Args:
+            pred: (B, num_fg * C_res, D, H, W) model logits.
+            label_raw: (B, C_res, D, H, W) raw integer labels per resolution.
+            weight_map: (B, C_res, D, H, W) per-res spatial weights, or None.
+
+        Returns:
+            Scalar loss averaged over resolutions.
+        """
+        total = pred.new_zeros(())
+
+        for r in range(self.num_res):
+            pred_r = pred[:, r * self.num_fg:(r + 1) * self.num_fg]
+            lbl_r = label_raw[:, r]
+            target_r = self._label_to_binary(lbl_r)
+
+            # Per-resolution weight_map: (B, D, H, W) → (B, 1, D, H, W)
+            wm_r = None
+            if weight_map is not None:
+                wm_r = weight_map[:, r:r + 1]  # (B, 1, D, H, W)
+
+            total = total + self.base_loss(pred_r, target_r, weight_map=wm_r)
+
+        return total / self.num_res
+
+    def _label_to_binary(self, label: torch.Tensor) -> torch.Tensor:
+        """Convert integer label (B, D, H, W) to binary masks (B, num_fg, D, H, W).
+
+        Vectorized on GPU — no CPU round-trip.
+        """
+        # fg_values as tensor: (num_fg,)
+        fg = torch.tensor(self.fg_values, device=label.device, dtype=label.dtype)
+        # label: (B, D, H, W) → (B, 1, D, H, W)
+        # fg:    (num_fg,)     → (1, num_fg, 1, 1, 1)
+        label_exp = label.unsqueeze(1)
+        fg_exp = fg.reshape(1, -1, *([1] * (label.ndim - 1)))
+        return (label_exp == fg_exp).float()
+
+
 def build_loss(cfg: LossConfig) -> nn.Module:
     """Build loss function from config.
 

@@ -24,6 +24,12 @@ data:
   # Avoids blank edges from spatial transforms. 1.0 = disabled, 1.4 recommended.
   aug_oversample_ratio: 1.0
 
+  # Multi-resolution input (cubic mode only).
+  # Extract patches at multiple scales from the same center, resize to same size,
+  # stack as input channels. Each resolution gets independent supervision.
+  # [1.0] = single-res (1-channel), [1.0, 1.5, 2.0] = 3-channel multi-res.
+  multi_res_scales: [1.0]
+
   # Intensity windowing (CT HU range)
   intensity_min: -1024.0
   intensity_max: 1024.0

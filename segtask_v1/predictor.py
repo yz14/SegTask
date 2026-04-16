@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import Config
-from .data.dataset import load_nifti, preprocess_image, resize_3d
+from .data.dataset import load_nifti, preprocess_image, resize_3d, _extract_cubic_patch
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class Predictor:
         self.patch_D, self.patch_H, self.patch_W = cfg.data.patch_size
         self.label_values = cfg.data.label_values
         self.num_fg = cfg.num_fg_classes
+        self.multi_res_scales = cfg.data.multi_res_scales or []
 
     @torch.no_grad()
     def predict_volume(
@@ -266,7 +267,8 @@ class Predictor:
 
         # Collect patches in batches
         patches = []
-        patch_coords = []  # (d0, d1, h0, h1, w0, w1)
+        patch_coords = []
+        patch_centers = []  # for multi-res input construction
 
         for d0, d1 in pos_d:
             for h0, h1 in pos_h:
@@ -282,16 +284,19 @@ class Predictor:
 
                     patches.append(patch)
                     patch_coords.append((d0, d1, h0, h1, w0, w1, ad, ah, aw))
+                    patch_centers.append(((d0 + d1) // 2, (h0 + h1) // 2, (w0 + w1) // 2))
 
                     if len(patches) >= self.batch_size:
                         self._accumulate_cubic_batch(
-                            patches, patch_coords, weight_3d, acc_pred, acc_weight)
-                        patches, patch_coords = [], []
+                            patches, patch_coords, weight_3d,
+                            acc_pred, acc_weight, vol, patch_centers)
+                        patches, patch_coords, patch_centers = [], [], []
 
         # Process remaining
         if patches:
             self._accumulate_cubic_batch(
-                patches, patch_coords, weight_3d, acc_pred, acc_weight)
+                patches, patch_coords, weight_3d,
+                acc_pred, acc_weight, vol, patch_centers)
 
         acc_weight = np.maximum(acc_weight, 1e-8)
         return (acc_pred / acc_weight).astype(np.float32)
@@ -303,9 +308,11 @@ class Predictor:
         weight_3d: np.ndarray,
         acc_pred: np.ndarray,
         acc_weight: np.ndarray,
+        vol: np.ndarray = None,
+        centers: list = None,
     ) -> None:
         """Infer a batch of cubic patches and accumulate into prediction volume."""
-        batch_pred = self._infer_batch(patches)
+        batch_pred = self._infer_batch(patches, vol=vol, centers=centers)
 
         for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw) in zip(batch_pred, coords):
             # Trim prediction to actual (non-padded) size
@@ -315,24 +322,49 @@ class Predictor:
             acc_pred[:, d0:d1, h0:h1, w0:w1] += pred_trimmed * w_trimmed[np.newaxis]
             acc_weight[:, d0:d1, h0:h1, w0:w1] += w_trimmed[np.newaxis]
 
-    def _infer_batch(self, patches: List[np.ndarray]) -> List[np.ndarray]:
+    def _infer_batch(self, patches: List[np.ndarray],
+                     vol: np.ndarray = None,
+                     centers: List[Tuple[int, int, int]] = None) -> List[np.ndarray]:
         """Run model inference on a batch of patches.
 
         Args:
-            patches: List of (D_patch, H_patch, W_patch) numpy arrays.
+            patches: List of (D_patch, H_patch, W_patch) numpy arrays (1x scale).
+            vol: Full preprocessed volume (for multi-res input construction).
+            centers: Center coordinates of each patch (for multi-res extraction).
 
         Returns:
             List of (num_fg, D_patch, H_patch, W_patch) probability arrays.
         """
-        # Stack into batch tensor: (B, 1, D, H, W)
-        batch = np.stack([p[np.newaxis] for p in patches], axis=0)
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+
+        # Build multi-res input: (B, C_res, D, H, W)
+        # multi_res_scales always >= 1 element; [1.0] = single-res
+        batch_list = []
+        for patch_1x, center in zip(patches, centers):
+            channels = []
+            for scale in self.multi_res_scales:
+                if scale == 1.0:
+                    channels.append(patch_1x)
+                else:
+                    sD = int(round(pD * scale))
+                    sH = int(round(pH * scale))
+                    sW = int(round(pW * scale))
+                    patch_s = _extract_cubic_patch(vol, center, (sD, sH, sW))
+                    patch_s = resize_3d(patch_s, pD, pH, pW, is_label=False)
+                    channels.append(patch_s)
+            batch_list.append(np.stack(channels, axis=0))
+        batch = np.stack(batch_list, axis=0)  # (B, C_res, D, H, W)
+
         x = torch.from_numpy(batch).float().to(self.device)
 
         # Forward pass
         pred = self.model(x)
         if isinstance(pred, list):
             pred = pred[0]
-        prob = torch.sigmoid(pred)  # (B, num_fg, D, H, W)
+        prob = torch.sigmoid(pred)  # (B, out_ch, D, H, W)
+
+        # Extract 1x resolution predictions (first num_fg channels)
+        prob = prob[:, :self.num_fg]
 
         # Optional TTA: flip augmentation
         if self.tta_flip:

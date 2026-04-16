@@ -116,17 +116,20 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         label_paths=[label_paths[i] for i in val_idx])
 
     if dc.patch_mode == "cubic":
-        logger.info("Using CUBIC patch mode (oversample=%.2f)", dc.aug_oversample_ratio)
+        logger.info("Using CUBIC patch mode (oversample=%.2f, scales=%s)",
+                     dc.aug_oversample_ratio, dc.multi_res_scales)
         train_ds = SegDataset3DCubic(
             **train_paths,
             aug_oversample_ratio=dc.aug_oversample_ratio if dc.aug_oversample_ratio > 1.0 else 1.0,
+            multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
             **common_kwargs)
         val_ds = SegDataset3DCubic(
             **val_paths,
-            aug_oversample_ratio=1.0,  # no oversample for validation
+            aug_oversample_ratio=1.0,
+            multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,

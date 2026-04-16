@@ -72,6 +72,10 @@ def build_model(cfg: Config) -> UNet3D:
     enc_channels = list(mc.encoder_channels)
     num_fg = cfg.num_fg_classes
 
+    # Output = num_fg per resolution scale (C_res >= 1, default [1.0])
+    num_res = len(cfg.data.multi_res_scales)
+    out_classes = num_fg * num_res
+
     # Select backbone stage builder
     if   mc.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(cfg)
@@ -102,16 +106,17 @@ def build_model(cfg: Config) -> UNet3D:
     model = UNet3D(
         encoder=encoder,
         decoder=decoder,
-        num_fg_classes=num_fg,
+        num_fg_classes=out_classes,
         deep_supervision=mc.deep_supervision)
 
     # Log model info
     pc = model.param_count()
     logger.info(
         "Built UNet3D [%s]: enc=%.2fM, dec=%.2fM, total=%.2fM, "
-        "channels=%s, blocks=%d, fg_classes=%d",
+        "channels=%s, blocks=%d, out_classes=%d (fg=%d, res=%d)",
         mc.backbone,
         pc["encoder"] / 1e6, pc["decoder"] / 1e6, pc["total"] / 1e6,
-        enc_channels, mc.blocks_per_level, num_fg)
+        enc_channels, mc.blocks_per_level, out_classes, num_fg,
+        num_res if num_res > 0 else 1)
 
     return model
