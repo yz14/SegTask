@@ -17,7 +17,7 @@ data:
   # Patch extraction mode: "z_axis" or "cubic"
   #   z_axis: slide along z-axis, extract D slices, resize H,W
   #   cubic:  sample center (x,y,z), extract full 3D cube
-  patch_mode: "z_axis"
+  patch_mode: "z_axis"  # TODO 这里也要加入多分辨率输入
 
   # Augmentation oversample ratio (cubic mode only).
   # Extract larger cube, augment, then center-crop to patch_size.
@@ -112,7 +112,7 @@ model:
   # Deep supervision (multi-scale output)
   deep_supervision: false
 
-  # Upsampling mode: transpose, 
+  # Upsampling mode: transpose, TODO 增加公认高质量的上采用和下采样方法
   upsample_mode: "transpose"
 
   # Skip connection mode

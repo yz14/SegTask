@@ -1,13 +1,13 @@
 """Training pipeline for 3D segmentation.
 
 Handles:
-- Mixed precision (AMP)
-- EMA (exponential moving average)
-- Learning rate scheduling with warmup
-- Gradient clipping + gradient accumulation
-- torch.compile acceleration
-- Validation and per-class Dice tracking
-- Checkpointing (best + periodic)
+- Mixed precision (AMP, fp16 + bf16) with scaler disabled in bf16
+- EMA with context-manager-based swap (exception-safe)
+- Learning rate scheduling with warmup (step-aligned with base scheduler)
+- Gradient clipping + gradient accumulation (partial-tail corrected)
+- torch.compile acceleration (state_dict unwrapping on save / load)
+- Validation and per-class Dice tracking (DS-safe loss path)
+- Full-state checkpointing (model/ema/optimizer/scheduler/scaler/early-stop)
 - Early stopping
 - GPU data augmentation
 """
@@ -15,14 +15,15 @@ Handles:
 from __future__ import annotations
 
 import logging
+import math
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from .config import Config
@@ -32,6 +33,22 @@ from .models.unet import UNet3D
 from .utils import AverageMeter, ModelEMA, Timer, compute_dice_per_class
 
 logger = logging.getLogger(__name__)
+
+
+_AMP_DTYPES = {
+    "float16": torch.float16, "fp16": torch.float16,
+    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _unwrap_compile(m: nn.Module) -> nn.Module:
+    """Strip the `_orig_mod` wrapper added by `torch.compile` so state_dict
+    keys don't get a `_orig_mod.` prefix that breaks reloading into an
+    uncompiled model."""
+    return getattr(m, "_orig_mod", m)
 
 
 # ---------------------------------------------------------------------------
@@ -55,20 +72,31 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
 # ---------------------------------------------------------------------------
 # Scheduler factory
 # ---------------------------------------------------------------------------
-def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: Config,
+    steps_per_epoch: int,
+    post_warmup_steps: int,
+):
+    """Build the base LR scheduler that runs AFTER warmup.
+
+    `post_warmup_steps` is the number of optimizer steps the base scheduler
+    will actually see, so `T_max` / poly's horizon / step milestones are
+    aligned with the warmup-excluded segment of training.
+    """
     tc = cfg.train
-    total_steps = tc.epochs * steps_per_epoch
+    horizon = max(post_warmup_steps, 1)
 
     if tc.scheduler == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=tc.cosine_min_lr)
+            optimizer, T_max=horizon, eta_min=tc.cosine_min_lr)
     elif tc.scheduler == "poly":
         return torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            lr_lambda=lambda step: (1 - step / max(total_steps, 1)) ** tc.poly_power)
+            lr_lambda=lambda step: (1 - step / horizon) ** tc.poly_power)
     elif tc.scheduler == "step":
         milestones = list(range(
-            tc.step_size * steps_per_epoch, total_steps,
+            tc.step_size * steps_per_epoch, horizon,
             tc.step_size * steps_per_epoch))
         return torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=milestones, gamma=tc.step_gamma)
@@ -82,9 +110,12 @@ def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
             optimizer, T_0=max(T_0, 1), T_mult=tc.cosine_restart_mult,
             eta_min=tc.cosine_min_lr)
     elif tc.scheduler == "one_cycle":
+        # OneCycleLR manages its own rising segment via `pct_start`; stacking
+        # WarmupScheduler on top is rejected in Trainer.__init__.
+        total_steps = tc.epochs * steps_per_epoch
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=tc.lr, total_steps=total_steps,
-            pct_start=tc.warmup_epochs / max(tc.epochs, 1))
+            pct_start=max(tc.warmup_epochs, 1) / max(tc.epochs, 1))
     raise ValueError(f"Unknown scheduler: {tc.scheduler}")
 
 
@@ -92,15 +123,28 @@ def build_scheduler(optimizer, cfg: Config, steps_per_epoch: int):
 # Warmup wrapper
 # ---------------------------------------------------------------------------
 class WarmupScheduler:
-    """Linear warmup then delegates to base scheduler.
+    """Linear warmup, then delegate to a base scheduler.
 
-    During warmup: LR ramps linearly from warmup_lr to base_lr.
-    After warmup: base scheduler controls LR.
-    ReduceLROnPlateau is stepped per-epoch via step_epoch().
+    During warmup: LR ramps linearly from `warmup_lr` to `base_lr` over
+    `warmup_steps` optimizer steps. The base scheduler is NOT stepped here.
+    After warmup: the base scheduler drives LR. `ReduceLROnPlateau` is the
+    only base scheduler stepped per epoch (via `step_epoch`); all others are
+    stepped per optimizer step.
+
+    Because warmup consumes `warmup_steps`, the base scheduler's horizon
+    must be built with `post_warmup_steps = total_steps - warmup_steps`
+    (see `build_scheduler`), otherwise cosine / poly / step never reach
+    their full schedules.
     """
 
-    def __init__(self, optimizer, scheduler, warmup_steps: int,
-                 warmup_lr: float, base_lr: float):
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        warmup_steps: int,
+        warmup_lr: float,
+        base_lr: float,
+    ):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.warmup_steps = warmup_steps
@@ -125,12 +169,27 @@ class WarmupScheduler:
             self.scheduler.step()
 
     def step_epoch(self, metric: Optional[float] = None) -> None:
-        if (self._is_plateau and self.scheduler is not None
-                and self.current_step > self.warmup_steps and metric is not None):
+        if (self._is_plateau
+                and self.scheduler is not None
+                and self.current_step > self.warmup_steps
+                and metric is not None):
             self.scheduler.step(metric)
 
     def get_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
+
+    def state_dict(self) -> Dict:
+        return {
+            "current_step": self.current_step,
+            "base_scheduler": (self.scheduler.state_dict()
+                               if self.scheduler is not None else None),
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.current_step = int(state.get("current_step", 0))
+        base_state = state.get("base_scheduler", None)
+        if base_state is not None and self.scheduler is not None:
+            self.scheduler.load_state_dict(base_state)
 
 
 # ---------------------------------------------------------------------------
@@ -145,159 +204,245 @@ class Trainer:
         cfg: Config,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        device: torch.device):
-        self.model = model.to(device)
+        device: torch.device,
+    ):
         self.cfg = cfg
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
         tc = cfg.train
 
-        # torch.compile (PyTorch 2.0+)
+        # --- Device placement FIRST. Optimizer/EMA must bind to the already
+        #     placed parameters; `torch.compile` is applied LAST so the only
+        #     part that needs to know about the wrapper is state_dict I/O.
+        self.model = model.to(device)
+
+        # --- Loss ------------------------------------------------------
+        # `base_loss` is kept separately for validation. The training-time
+        # criterion wraps it in DeepSupervisionLoss / MultiResolutionLoss,
+        # which assume list-of-tensors pred and multi-resolution label
+        # stacks. Validation collapses both down to 1x and calls `base_loss`
+        # directly to avoid a shape-contract mismatch.
+        self.base_loss = build_loss(cfg.loss)
+        train_loss = self.base_loss
+        if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
+            train_loss = DeepSupervisionLoss(
+                train_loss, cfg.loss.deep_supervision_weights)
+        num_res = len(cfg.data.multi_res_scales)
+        self.criterion = MultiResolutionLoss(
+            base_loss=train_loss,
+            num_fg_classes=cfg.num_fg_classes,
+            num_res=num_res,
+            label_values=cfg.data.label_values,
+        )
+        # `_label_to_binary` lives on MultiResolutionLoss; access through a
+        # getattr indirection so a future rename to a public API works
+        # without touching this file.
+        self._label_to_binary_fn = getattr(
+            self.criterion, "label_to_binary",
+            getattr(self.criterion, "_label_to_binary"))
+        logger.info("Loss: %s, scales=%d, fg_classes=%d",
+                    cfg.loss.name, num_res, cfg.num_fg_classes)
+
+        # --- Optimizer + scheduler ------------------------------------
+        self.optimizer = build_optimizer(self.model, cfg)
+        steps_per_epoch = len(train_loader)
+        warmup_steps = tc.warmup_epochs * steps_per_epoch
+        total_steps = tc.epochs * steps_per_epoch
+        post_warmup = total_steps - warmup_steps
+
+        # OneCycleLR carries its own rising segment via pct_start; stacking
+        # WarmupScheduler on top produces a double warmup and mis-aligned
+        # total_steps. Refuse this combination explicitly.
+        if tc.scheduler == "one_cycle" and warmup_steps > 0:
+            raise ValueError(
+                "OneCycleLR has built-in warmup (pct_start). "
+                "Set train.warmup_epochs=0 when using scheduler='one_cycle'.")
+
+        base_scheduler = build_scheduler(
+            self.optimizer, cfg, steps_per_epoch,
+            post_warmup_steps=post_warmup)
+        self.scheduler = WarmupScheduler(
+            self.optimizer, base_scheduler,
+            warmup_steps=warmup_steps,
+            warmup_lr=tc.warmup_lr, base_lr=tc.lr)
+
+        # --- AMP -------------------------------------------------------
+        if tc.amp_dtype not in _AMP_DTYPES:
+            raise ValueError(
+                f"Unknown amp_dtype: {tc.amp_dtype!r}. "
+                f"Expected one of {sorted(_AMP_DTYPES)}.")
+        self.amp_dtype = _AMP_DTYPES[tc.amp_dtype]
+        self.use_amp = tc.use_amp and device.type == "cuda"
+        # GradScaler is only meaningful for fp16; bf16 has fp32-range
+        # mantissa-clipped values and does not require loss scaling. Leaving
+        # the scaler disabled skips a redundant unscale pass.
+        self._scaler_active = self.use_amp and self.amp_dtype == torch.float16
+        self.scaler = GradScaler("cuda", enabled=self._scaler_active)
+
+        # --- EMA (bind to placed, not-yet-compiled model) -------------
+        self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
+
+        # --- torch.compile (last) -------------------------------------
         if tc.compile_mode != "none" and hasattr(torch, "compile"):
             logger.info("Compiling model with mode='%s'", tc.compile_mode)
             self.model = torch.compile(self.model, mode=tc.compile_mode)
 
-        # Loss — always wrapped in MultiResolutionLoss.
-        # multi_res_scales is always >= 1 element ([1.0] = single-res).
-        # This handles label-to-binary conversion on GPU for all modes.
-        base_loss = build_loss(cfg.loss)
-        if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
-            base_loss = DeepSupervisionLoss(
-                base_loss, cfg.loss.deep_supervision_weights)
-        num_res = len(cfg.data.multi_res_scales)
-        self.criterion = MultiResolutionLoss(
-            base_loss=base_loss,
-            num_fg_classes=cfg.num_fg_classes,
-            num_res=num_res,
-            label_values=cfg.data.label_values)
-        logger.info("Loss: %s, scales=%d, fg_classes=%d",
-                     cfg.loss.name, num_res, cfg.num_fg_classes)
-
-        # Optimizer + scheduler
-        self.optimizer  = build_optimizer(model, cfg)
-        steps_per_epoch = len(train_loader)
-        base_scheduler  = build_scheduler(self.optimizer, cfg, steps_per_epoch)
-        warmup_steps = tc.warmup_epochs * steps_per_epoch
-        self.scheduler = WarmupScheduler(
-            self.optimizer, base_scheduler,
-            warmup_steps=warmup_steps, warmup_lr=tc.warmup_lr, base_lr=tc.lr)
-
-        # AMP
-        self.use_amp   = tc.use_amp and device.type == "cuda"
-        self.scaler    = GradScaler(enabled=self.use_amp)
-        self.amp_dtype = torch.float16 if tc.amp_dtype == "float16" else torch.bfloat16
-
-        # EMA
-        self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
-
-        # GPU augmentation
+        # --- Augmentation ---------------------------------------------
+        # The augmentor applies spatial transforms jointly to image and
+        # label tensors so alignment holds. When a weight_map is present
+        # it is concatenated onto the label along dim=1 and thus inherits
+        # the label-path interpolation (nearest-neighbour). This is the
+        # correct behaviour for segmentation masks; if weight maps ever
+        # need continuous-value resampling, the augmentor must be extended
+        # to accept per-channel interpolation modes.
         self.augmentor = GPUAugmentor(cfg.augment)
 
-        # Oversample center-crop: if cubic mode with oversample > 1,
-        # dataset returns larger patches; we crop to model input after augmentation.
+        # --- Cropping (oversampled cubic patches) ---------------------
         self.target_patch_size = tuple(cfg.data.patch_size)  # (D, H, W)
         self.needs_crop = (
-            cfg.data.patch_mode == "cubic" and cfg.data.aug_oversample_ratio > 1.0)
+            cfg.data.patch_mode == "cubic"
+            and cfg.data.aug_oversample_ratio > 1.0)
 
-        # Gradient accumulation
+        # --- Gradient accumulation ------------------------------------
         self.grad_accum_steps = max(tc.grad_accum_steps, 1)
 
-        # Tracking
+        # --- Tracking --------------------------------------------------
         self.num_fg = cfg.num_fg_classes
-        self.best_metric = -float("inf") if tc.save_best_mode == "max" else float("inf")
+        self._best_mode = tc.save_best_mode  # "max" or "min"
+        self.best_metric: float = (
+            -math.inf if self._best_mode == "max" else math.inf)
+        self.has_best = False
         self.best_epoch = 0
         self.start_epoch = 0
         self.patience_counter = 0
 
-        # Output directory
+        # --- Output directory -----------------------------------------
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Resume
+        # --- Resume ----------------------------------------------------
         if tc.resume and os.path.isfile(tc.resume):
             self._load_checkpoint(tc.resume)
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def fit(self) -> Dict[str, float]:
         """Run the full training loop. Returns best validation metrics."""
         tc = self.cfg.train
         timer = Timer()
 
+        total_params = sum(p.numel() for p in self.model.parameters()) / 1e6
         logger.info("=" * 60)
         logger.info("Training: %d epochs, device=%s", tc.epochs, self.device)
-        logger.info("Model params: %.2fM",
-                     sum(p.numel() for p in self.model.parameters()) / 1e6)
+        logger.info("Model params: %.2fM", total_params)
         logger.info("Train batches: %d, Val batches: %d",
-                     len(self.train_loader), len(self.val_loader))
-        logger.info("AMP=%s, EMA=%s (decay=%.4f)", self.use_amp, tc.use_ema, tc.ema_decay)
+                    len(self.train_loader), len(self.val_loader))
+        logger.info("AMP=%s (dtype=%s, scaler=%s), EMA=%s (decay=%.4f)",
+                    self.use_amp, tc.amp_dtype, self._scaler_active,
+                    tc.use_ema, tc.ema_decay)
         logger.info("Grad accum=%d, Effective batch=%d",
-                     self.grad_accum_steps, self.cfg.data.batch_size * self.grad_accum_steps)
-        logger.info("Foreground classes: %d, Loss: %s", self.num_fg, self.cfg.loss.name)
+                    self.grad_accum_steps,
+                    self.cfg.data.batch_size * self.grad_accum_steps)
+        logger.info("Foreground classes: %d, Loss: %s",
+                    self.num_fg, self.cfg.loss.name)
         if tc.compile_mode != "none":
             logger.info("torch.compile mode: %s", tc.compile_mode)
         logger.info("=" * 60)
 
-        best_metrics = {}
+        best_metrics: Dict[str, float] = {}
 
         for epoch in range(self.start_epoch, tc.epochs):
             train_metrics = self._train_epoch(epoch)
 
-            val_metrics = {}
+            val_metrics: Dict[str, float] = {}
             if (epoch + 1) % tc.val_every == 0 or epoch == tc.epochs - 1:
                 val_metrics = self._validate(epoch)
 
-            # Plateau scheduler step
+            # Plateau is the only base scheduler driven per-epoch.
             plateau_metric = val_metrics.get(tc.save_best_metric, None)
             self.scheduler.step_epoch(metric=plateau_metric)
 
-            # Logging
-            lr = self.scheduler.get_lr()
+            # --- Best-checkpoint decision (no magic >0 guard) ----------
+            is_best = False
+            if tc.save_best_metric in val_metrics:
+                tracked = val_metrics[tc.save_best_metric]
+                if not self.has_best:
+                    is_best = True
+                elif self._best_mode == "max":
+                    is_best = tracked > self.best_metric
+                else:
+                    is_best = tracked < self.best_metric
+
+                if is_best:
+                    self.best_metric = tracked
+                    self.best_epoch = epoch
+                    self.has_best = True
+                    self.patience_counter = 0
+                    self._save_checkpoint(epoch, is_best=True)
+                    best_metrics = val_metrics
+                    logger.info("★ New best: %s=%.4f at epoch %d",
+                                tc.save_best_metric, tracked, epoch + 1)
+                else:
+                    self.patience_counter += 1
+
+            # --- Epoch summary ----------------------------------------
+            best_str = (f"{self.best_metric:.4f} (ep{self.best_epoch + 1})"
+                        if self.has_best else "n/a")
             logger.info(
                 "Epoch %d/%d | LR=%.2e | loss=%.4f | val_dice=%.4f | "
-                "best=%.4f (ep%d) | %s",
-                epoch + 1, tc.epochs, lr,
-                train_metrics.get("loss", 0),
-                val_metrics.get("mean_dice", 0),
-                self.best_metric if self.best_metric > -float("inf") else 0,
-                self.best_epoch + 1,
-                timer.elapsed_str())
+                "best=%s | %s",
+                epoch + 1, tc.epochs, self.scheduler.get_lr(),
+                train_metrics.get("loss", 0.0),
+                val_metrics.get("mean_dice", 0.0),
+                best_str,
+                timer.elapsed_str(),
+            )
 
-            # Checkpointing
-            tracked = val_metrics.get(tc.save_best_metric, 0)
-            is_best = False
-            if tracked > 0:
-                if tc.save_best_mode == "max" and tracked > self.best_metric:
-                    is_best = True
-                elif tc.save_best_mode == "min" and tracked < self.best_metric:
-                    is_best = True
-
-            if is_best:
-                self.best_metric = tracked
-                self.best_epoch = epoch
-                self.patience_counter = 0
-                self._save_checkpoint(epoch, is_best=True)
-                best_metrics = val_metrics
-                logger.info("★ New best: %s=%.4f at epoch %d",
-                            tc.save_best_metric, tracked, epoch + 1)
-            else:
-                self.patience_counter += 1
-
+            # --- Periodic checkpoint ----------------------------------
             if (epoch + 1) % tc.save_every == 0:
                 self._save_checkpoint(epoch, is_best=False)
 
-            # Early stopping
+            # --- Early stopping ---------------------------------------
             if tc.early_stopping > 0 and self.patience_counter >= tc.early_stopping:
                 logger.info("Early stopping at epoch %d (patience=%d)",
                             epoch + 1, tc.early_stopping)
                 break
 
         logger.info("=" * 60)
-        logger.info("Training complete. Best %s=%.4f at epoch %d. Time: %s",
-                     tc.save_best_metric, self.best_metric,
-                     self.best_epoch + 1, timer.elapsed_str())
+        if self.has_best:
+            logger.info(
+                "Training complete. Best %s=%.4f at epoch %d. Time: %s",
+                tc.save_best_metric, self.best_metric,
+                self.best_epoch + 1, timer.elapsed_str())
+        else:
+            logger.info("Training complete. No validation best recorded. "
+                        "Time: %s", timer.elapsed_str())
         logger.info("=" * 60)
         return best_metrics
 
+    # ------------------------------------------------------------------
+    # EMA swap helper (exception-safe)
+    # ------------------------------------------------------------------
+    @contextmanager
+    def _ema_swapped(self) -> Iterator[None]:
+        """Temporarily swap EMA weights into the model. `try/finally`
+        guarantees the online weights are restored even if the enclosed
+        block raises — without this, an OOM during validation would leave
+        the trainer running on EMA weights for the rest of training."""
+        if self.ema is None:
+            yield
+            return
+        self.ema.apply_shadow(self.model)
+        try:
+            yield
+        finally:
+            self.ema.restore(self.model)
+
+    # ------------------------------------------------------------------
+    # Training / validation loops
+    # ------------------------------------------------------------------
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch with optional gradient accumulation."""
         self.model.train()
@@ -305,6 +450,13 @@ class Trainer:
         dice_meter = AverageMeter()
         tc = self.cfg.train
         accum = self.grad_accum_steps
+
+        total_steps = len(self.train_loader)
+        # Any steps beyond `partial_start` belong to a partial accumulation
+        # tail (len(loader) not divisible by accum). Divide those by the
+        # real tail length so the effective LR doesn't shrink on them.
+        remainder = total_steps % accum if accum > 1 else 0
+        partial_start = total_steps - remainder
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -314,164 +466,194 @@ class Trainer:
             wmap = batch.get("weight_map")
             if wmap is not None:
                 wmap = wmap.to(self.device, non_blocking=True)
-                if wmap.shape[1] == 0:
-                    wmap = None  # guard against empty tensor from collation
+                if wmap.numel() == 0 or wmap.shape[1] == 0:
+                    wmap = None  # treat empty collation sentinels as absent
 
-            # GPU augmentation — label and weight_map are augmented together
-            # with image so spatial transforms are consistent.
-            # label: (B, C_res, D, H, W), wmap: (B, C_res, D, H, W) or None
+            # --- GPU augmentation: image + (label [+ weight_map]) share
+            #     one sampled transform so spatial alignment holds.
             if wmap is not None:
                 n_lbl = label.shape[1]
-                label_aug = torch.cat([label, wmap], dim=1)  # (B, 2*C_res, ...)
+                label_aug = torch.cat([label, wmap], dim=1)
                 image, label_aug = self.augmentor(image, label_aug)
-                label = label_aug[:, :n_lbl]
-                wmap = label_aug[:, n_lbl:]
+                label, wmap = label_aug[:, :n_lbl], label_aug[:, n_lbl:]
             else:
                 image, label = self.augmentor(image, label)
-            # import SimpleITK as sitk
-            # import os
-            # debug_path = './debug0416-1'
-            # os.makedirs(debug_path, exist_ok=True)
-            # for jj, (img, lbl) in enumerate(zip(image, label)):
-            #     img, lbl = img[0].cpu().numpy(), lbl[0].cpu().numpy()
-            #     img = sitk.GetImageFromArray(img)
-            #     lbl = sitk.GetImageFromArray(lbl)
-            #     sitk.WriteImage(img, f'{debug_path}/{jj}.nii.gz')
-            #     sitk.WriteImage(lbl, f'{debug_path}/{jj}m.nii.gz')
-            # raise
 
-            # Center-crop oversized patches to model input size
+            # --- Center-crop when dataset returned oversampled patches
             if self.needs_crop:
                 image, label, wmap = self._center_crop(image, label, wmap)
 
-            # Forward
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            # --- Effective accumulation denominator for this step
+            if remainder > 0 and step >= partial_start:
+                effective_accum = remainder
+            else:
+                effective_accum = accum
+
+            # --- Forward + loss
+            with autocast(device_type="cuda", enabled=self.use_amp,
+                          dtype=self.amp_dtype):
                 pred = self.model(image)
                 loss = self.criterion(pred, label, weight_map=wmap)
-                # Scale loss by accumulation steps for correct gradient magnitude
-                if accum > 1:
-                    loss = loss / accum
+                if effective_accum > 1:
+                    loss = loss / effective_accum
 
-            # Backward (accumulate gradients)
+            # --- Backward (accumulates into .grad)
             self.scaler.scale(loss).backward()
 
-            # Step optimizer every accum steps or at end of epoch
-            if (step + 1) % accum == 0 or (step + 1) == len(self.train_loader):
-                # Gradient clipping
+            # --- Step boundary: every `accum` micro-steps, or at end of
+            #     epoch to flush the partial tail.
+            is_step_boundary = (
+                (step + 1) % accum == 0 or (step + 1) == total_steps)
+            if is_step_boundary:
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip_norm)
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(), tc.grad_clip_norm)
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
 
-                # Scheduler step (per optimizer step)
                 self.scheduler.step()
-
-                # EMA update (per optimizer step)
                 if self.ema is not None:
                     self.ema.update(self.model)
 
-            # Metrics (use unscaled loss for logging)
-            loss_val = loss.item() * accum if accum > 1 else loss.item()
+            # --- Metrics (log unscaled loss)
+            loss_val = (loss.item() * effective_accum
+                        if effective_accum > 1 else loss.item())
             loss_meter.update(loss_val, image.shape[0])
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
                     p = pred[0] if isinstance(pred, list) else pred
-                    # Dice on 1x resolution: first num_fg channels
+                    assert p.shape[1] >= self.num_fg, (
+                        f"pred channels {p.shape[1]} < num_fg {self.num_fg}")
                     p_1x = p.detach()[:, :self.num_fg]
-                    lbl_1x = self.criterion._label_to_binary(label[:, 0])
+                    lbl_1x = self._label_to_binary_fn(label[:, 0])
                     dice = compute_dice_per_class(p_1x, lbl_1x)
                     mean_dice = dice.mean().item()
                     dice_meter.update(mean_dice, image.shape[0])
                 logger.debug("  [%d/%d] loss=%.4f dice=%.4f lr=%.2e",
-                             step + 1, len(self.train_loader),
-                             loss.item(), mean_dice, self.scheduler.get_lr())
+                             step + 1, total_steps,
+                             loss_val, mean_dice, self.scheduler.get_lr())
 
         return {"loss": loss_meter.avg, "dice": dice_meter.avg}
 
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
-        """Validate on the validation set."""
-        if self.ema is not None:
-            self.ema.apply_shadow(self.model)
+        """Validate on the validation set under EMA weights (if enabled).
 
+        Evaluates only the 1x resolution head with `base_loss` (not the
+        DS/MultiRes-wrapped training criterion), whose contract assumes
+        multi-tensor pred and multi-resolution label stacks.
+        """
         self.model.eval()
         loss_meter = AverageMeter()
         all_dice = []
 
-        for batch in self.val_loader:
-            image = batch["image"].to(self.device, non_blocking=True)
-            label = batch["label"].to(self.device, non_blocking=True)
+        with self._ema_swapped():
+            for batch in self.val_loader:
+                image = batch["image"].to(self.device, non_blocking=True)
+                label = batch["label"].to(self.device, non_blocking=True)
 
-            with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                pred = self.model(image)
-                if isinstance(pred, list):
-                    pred = pred[0]
-                loss = self.criterion(pred, label)
+                with autocast(device_type="cuda", enabled=self.use_amp,
+                              dtype=self.amp_dtype):
+                    pred = self.model(image)
+                    if isinstance(pred, list):
+                        pred = pred[0]
+                    assert pred.shape[1] >= self.num_fg, (
+                        f"pred channels {pred.shape[1]} < num_fg {self.num_fg}")
+                    pred_1x = pred[:, :self.num_fg]
+                    target_1x = self._label_to_binary_fn(label[:, 0])
+                    loss = self.base_loss(pred_1x, target_1x)
 
-            loss_meter.update(loss.item(), image.shape[0])
+                loss_meter.update(loss.item(), image.shape[0])
+                dice = compute_dice_per_class(pred_1x, target_1x)
+                all_dice.append(dice.cpu())
 
-            # Dice on 1x resolution: first num_fg channels
-            pred_1x = pred[:, :self.num_fg]
-            target_1x = self.criterion._label_to_binary(label[:, 0])
-            dice = compute_dice_per_class(pred_1x, target_1x)
-            all_dice.append(dice.cpu())
+        if not all_dice:
+            logger.warning("Validation loader yielded no batches.")
+            return {"val_loss": float("nan"), "mean_dice": 0.0}
 
-        if self.ema is not None:
-            self.ema.restore(self.model)
-
-        # Aggregate
         mean_dice_per_class = torch.stack(all_dice).mean(dim=0)
-        metrics = {"val_loss": loss_meter.avg}
+        metrics: Dict[str, float] = {"val_loss": loss_meter.avg}
         for c in range(len(mean_dice_per_class)):
             metrics[f"dice_class_{c}"] = mean_dice_per_class[c].item()
         metrics["mean_dice"] = mean_dice_per_class.mean().item()
 
         logger.info("  Val: loss=%.4f, mean_dice=%.4f, per_class=%s",
-                     metrics["val_loss"], metrics["mean_dice"],
-                     [f"{d:.4f}" for d in mean_dice_per_class.tolist()])
+                    metrics["val_loss"], metrics["mean_dice"],
+                    [f"{d:.4f}" for d in mean_dice_per_class.tolist()])
         return metrics
 
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
     def _center_crop(
-        self, image: torch.Tensor, label: torch.Tensor, wmap: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Center-crop oversized tensors to target patch_size after augmentation.
-
-        Used when aug_oversample_ratio > 1.0 in cubic mode.
+        self,
+        image: torch.Tensor,
+        label: torch.Tensor,
+        wmap: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Center-crop oversized tensors to target patch_size after
+        augmentation (used when `aug_oversample_ratio > 1.0` in cubic mode).
         """
         tD, tH, tW = self.target_patch_size
         _, _, D, H, W = image.shape
-
-        d0 = (D - tD) // 2
-        h0 = (H - tH) // 2
-        w0 = (W - tW) // 2
-
+        d0, h0, w0 = (D - tD) // 2, (H - tH) // 2, (W - tW) // 2
         image = image[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]
         label = label[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]
         if wmap is not None:
             wmap = wmap[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]
-
         return image, label, wmap
 
-    def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
-        state = {
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+    def _build_state_dict(self, ema_as_primary: bool) -> Dict:
+        """Assemble a complete training state.
+
+        When `ema_as_primary` is True the saved `model_state_dict` holds EMA
+        weights (deployment-friendly) and online weights are preserved in
+        `model_online_state_dict` for correct resuming. Otherwise
+        `model_state_dict` is online and EMA lives in `ema_state_dict`.
+        """
+        bare = _unwrap_compile(self.model)
+        online_sd = bare.state_dict()
+
+        state: Dict = {
+            "epoch": 0,  # filled by caller
+            "model_state_dict": online_sd,
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "best_metric": self.best_metric,
             "best_epoch": self.best_epoch,
+            "has_best": self.has_best,
+            "patience_counter": self.patience_counter,
             "config": self.cfg,
         }
+
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
+            if ema_as_primary:
+                # Capture EMA weights as the primary state_dict. try/finally
+                # ensures the model is never left with EMA weights bound.
+                self.ema.apply_shadow(self.model)
+                try:
+                    state["model_state_dict"] = _unwrap_compile(
+                        self.model).state_dict()
+                finally:
+                    self.ema.restore(self.model)
+                state["model_online_state_dict"] = online_sd
+
+        return state
+
+    def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+        state = self._build_state_dict(ema_as_primary=is_best)
+        state["epoch"] = epoch
 
         if is_best:
-            if self.ema is not None:
-                self.ema.apply_shadow(self.model)
-                state["model_state_dict"] = self.model.state_dict()
-                self.ema.restore(self.model)
             path = self.output_dir / "best_model.pth"
             torch.save(state, path)
             logger.info("Best model saved: %s", path)
@@ -483,12 +665,31 @@ class Trainer:
     def _load_checkpoint(self, path: str) -> None:
         logger.info("Loading checkpoint: %s", path)
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+
+        # Prefer the online copy if present (best-model checkpoints store
+        # EMA as the primary state_dict, online as a sibling).
+        model_sd = ckpt.get("model_online_state_dict",
+                            ckpt["model_state_dict"])
+        _unwrap_compile(self.model).load_state_dict(model_sd)
+
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.start_epoch = ckpt.get("epoch", 0) + 1
-        self.best_metric = ckpt.get("best_metric", self.best_metric)
-        self.best_epoch = ckpt.get("best_epoch", 0)
+        if "scheduler_state_dict" in ckpt:
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         if self.ema is not None and "ema_state_dict" in ckpt:
             self.ema.load_state_dict(ckpt["ema_state_dict"])
-        logger.info("Resumed from epoch %d, best=%s=%.4f",
-                     self.start_epoch, self.cfg.train.save_best_metric, self.best_metric)
+
+        self.start_epoch = ckpt.get("epoch", -1) + 1
+        default_best = -math.inf if self._best_mode == "max" else math.inf
+        self.best_metric = ckpt.get("best_metric", default_best)
+        self.best_epoch = ckpt.get("best_epoch", 0)
+        self.has_best = ckpt.get(
+            "has_best", math.isfinite(self.best_metric))
+        self.patience_counter = ckpt.get("patience_counter", 0)
+
+        logger.info(
+            "Resumed from epoch %d, best=%s=%s (patience=%d)",
+            self.start_epoch, self.cfg.train.save_best_metric,
+            f"{self.best_metric:.4f}" if self.has_best else "n/a",
+            self.patience_counter)
