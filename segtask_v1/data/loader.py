@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from torch.utils.data import DataLoader
@@ -45,27 +45,155 @@ def discover_samples(
     return image_paths, label_paths  # 匹配好的
 
 
-def detect_label_values(label_paths: List[str], max_scan: int = 5) -> List[int]:
-    """Auto-detect unique label values from a subset of label files.
+def detect_label_values(
+    label_paths: List[str], max_scan: Optional[int] = None,
+) -> List[int]:
+    """Auto-detect unique label values from the label files.
 
-    Returns sorted list starting with background (0).
+    Scans ALL label files by default (previously only the first 5, which
+    silently missed rare classes distributed across the dataset). Pass
+    ``max_scan`` if the dataset is very large and a subset scan is
+    acceptable — results will be logged with an explicit "partial scan"
+    warning in that case.
+
+    Returns a sorted list of integer label values starting with background.
     """
+    n_total = len(label_paths)
+    if max_scan is None or max_scan >= n_total:
+        scan_paths = label_paths
+        partial = False
+    else:
+        scan_paths = label_paths[:max_scan]
+        partial = True
+
     all_labels = set()
-    for path in label_paths[:max_scan]:
+    for path in scan_paths:
         lbl = load_nifti(path)
         unique = np.unique(np.round(lbl).astype(np.int32)).tolist()
         all_labels.update(unique)
+
     result = sorted(all_labels)
-    logger.info("Auto-detected label values: %s", result)
+    if partial:
+        logger.warning(
+            "Auto-detected label values from partial scan (%d/%d files): %s. "
+            "Rare classes may be missed; pass max_scan=None to scan all.",
+            len(scan_paths), n_total, result)
+    else:
+        logger.info(
+            "Auto-detected label values (scanned %d files): %s",
+            n_total, result)
     return result
 
 
 def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
-    """Random train/val split by index."""
+    """Random (non-stratified) train/val split by index."""
     rng = np.random.RandomState(seed)
     indices = rng.permutation(n).tolist()
     n_val = max(1, int(n * val_ratio))
     return indices[n_val:], indices[:n_val]
+
+
+def _volume_primary_class(
+    label_path: str, label_values: List[int],
+) -> int:
+    """Return the label value that occupies the most voxels in the volume
+    (background counted too). Ties break on the smallest label value.
+    """
+    lbl = load_nifti(label_path)
+    lbl_int = np.round(lbl).astype(np.int32)
+    # Count voxels per requested label value; ignore stray labels.
+    counts = np.array(
+        [(lbl_int == v).sum() for v in label_values], dtype=np.int64)
+    if counts.sum() == 0:
+        return label_values[0]
+    return int(label_values[int(np.argmax(counts))])
+
+
+def stratified_train_val_split(
+    label_paths: List[str],
+    label_values: List[int],
+    val_ratio: float,
+    seed: int,
+    use_foreground_only: bool = True,
+) -> Tuple[List[int], List[int]]:
+    """Stratified split by each volume's primary label.
+
+    Each volume is assigned a stratum equal to the most-frequent foreground
+    label it contains (falling back to background for entirely-empty volumes).
+    Within each stratum, samples are shuffled and split according to
+    ``val_ratio``. When ``use_foreground_only`` is True (default), the
+    primary label is restricted to foreground — this matches the typical
+    medical-segmentation use case where the tumour / organ class distribution
+    matters far more than "how much background a volume has".
+
+    Falls back gracefully to a non-stratified split when the dataset is
+    too small to stratify (fewer than 2 samples per stratum would leave
+    some strata empty on one side).
+    """
+    n = len(label_paths)
+    rng = np.random.RandomState(seed)
+
+    # Determine which label values are used as strata keys.
+    fg_vals = label_values[1:] if use_foreground_only and len(label_values) > 1 else label_values
+    strata_vals = fg_vals if fg_vals else label_values
+
+    # Assign each volume to a stratum.
+    strata: Dict[int, List[int]] = {v: [] for v in strata_vals}
+    fallback: List[int] = []  # volumes with no voxel in any fg class
+    for idx, path in enumerate(label_paths):
+        lbl = load_nifti(path)
+        lbl_int = np.round(lbl).astype(np.int32)
+        counts = {v: int((lbl_int == v).sum()) for v in strata_vals}
+        best = max(counts.values())
+        if best == 0:
+            fallback.append(idx)
+        else:
+            primary = min(v for v, c in counts.items() if c == best)  # tie-break by smallest label
+            strata[primary].append(idx)
+
+    # Determine per-stratum split. If any stratum has < 2 samples we cannot
+    # stratify it cleanly; treat it as non-fractionable and put the entire
+    # bucket into train (preferring training coverage).
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+
+    for key, members in strata.items():
+        if not members:
+            continue
+        rng.shuffle(members)
+        if len(members) < 2:
+            train_idx.extend(members)
+            continue
+        n_val_k = max(1, int(round(len(members) * val_ratio)))
+        # Never put every member of a stratum into val
+        n_val_k = min(n_val_k, len(members) - 1)
+        val_idx.extend(members[:n_val_k])
+        train_idx.extend(members[n_val_k:])
+
+    # Empty-label volumes are distributed by the same val_ratio, untouched
+    # by stratification.
+    rng.shuffle(fallback)
+    n_val_f = int(round(len(fallback) * val_ratio))
+    val_idx.extend(fallback[:n_val_f])
+    train_idx.extend(fallback[n_val_f:])
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+
+    # Safety net: if splitting produced an empty val set (e.g., every
+    # stratum has 1 sample), fall back to random split so training can proceed.
+    if not val_idx or not train_idx:
+        logger.warning(
+            "Stratified split produced degenerate sets "
+            "(train=%d, val=%d); falling back to random split.",
+            len(train_idx), len(val_idx))
+        return train_val_split(n, val_ratio, seed)
+
+    logger.info(
+        "Stratified split: %d train, %d val (strata sizes: %s)",
+        len(train_idx), len(val_idx),
+        {str(k): len(v) for k, v in strata.items()})
+    return train_idx, val_idx
 
 
 def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
@@ -91,9 +219,15 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
-    # Split
-    train_idx, val_idx = train_val_split(len(image_paths), dc.val_ratio, dc.split_seed)
-    logger.info("Split: %d train, %d val", len(train_idx), len(val_idx))
+    # Split — stratified by primary foreground class when requested.
+    if getattr(dc, "stratified_split", True) and dc.num_classes >= 2:
+        train_idx, val_idx = stratified_train_val_split(
+            label_paths, dc.label_values, dc.val_ratio, dc.split_seed)
+    else:
+        train_idx, val_idx = train_val_split(
+            len(image_paths), dc.val_ratio, dc.split_seed)
+        logger.info("Split (random): %d train, %d val",
+                    len(train_idx), len(val_idx))
 
     cache = dc.cache_mode == "memory"
     rw = cfg.loss.region_weights if cfg.loss.region_weights else None

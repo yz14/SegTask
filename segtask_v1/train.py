@@ -1,7 +1,7 @@
 """CLI entry point for 3D segmentation training.
 
 Usage:
-    python -m segtask_v1.train.py --config configs/seg3d.yaml
+    python -m segtask_v1.train --config configs/seg3d.yaml
     python -m segtask_v1.train --config configs/seg3d.yaml --override train.epochs=50
 """
 

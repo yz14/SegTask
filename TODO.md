@@ -33,8 +33,4 @@
 
 
 # TODO  
-1. 当patch_mode是cubic时，输入做多分辨率/感受野    
-a 当前只是以(x,y,z)为中心切块去训练，只是一个单一的分辨率。增加多分辨率输入，即增加1.5和2倍输入，在通道维度拼接为3通道输入，增加了分辨率和感受野。例如图像是self.extract_size的1.5倍和2倍，然后resize后拼接成3通道，提供不同的分辨率/感受野信息，同理标签也是这样，对每个分辨率的输入都需要监督信息来学习。
-b 所以lbl_mc = preprocess_label(lbl_patch, self.label_values)就要挪到计算损失的时候再做，即输入模型的是B,C,D,H,W的图像，标签也是B,C,D,H,W的，每个通道代表一个分辨率信息，而且在标签中的任意通道的标签都是完备的而不是目前的一个通道代表一个标签值。  
-c 将该配置写入yaml里面。  
-d 注意代码质量。  
+1. D:\codes\work-projects\SegTask\segtask_v1\train.py是训练入口，请细致，严格的全面审查D:\codes\work-projects\SegTask\segtask_v1的全流程代码，是否有错误，不足的地方

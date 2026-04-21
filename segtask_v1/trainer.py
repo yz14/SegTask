@@ -23,14 +23,24 @@ from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
+# GradScaler moved from torch.cuda.amp to torch.amp in PyTorch ≥ 2.3; fall
+# back to the CUDA-namespace import on older builds (e.g. the 2.2 shipped
+# with the py310 test env).
+try:
+    from torch.amp import GradScaler, autocast  # type: ignore
+except ImportError:  # pragma: no cover - version-dependent
+    from torch.cuda.amp import GradScaler  # type: ignore
+    from torch.amp import autocast  # type: ignore
 from torch.utils.data import DataLoader
 
 from .config import Config
 from .data.augment import GPUAugmentor
 from .losses.losses import build_loss, DeepSupervisionLoss, MultiResolutionLoss
 from .models.unet import UNet3D
-from .utils import AverageMeter, ModelEMA, Timer, compute_dice_per_class
+from .utils import (
+    AverageMeter, ModelEMA, Timer,
+    compute_dice_per_class, dice_batch_stats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +111,13 @@ def build_scheduler(
         return torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=milestones, gamma=tc.step_gamma)
     elif tc.scheduler == "plateau":
+        # Plateau direction must match the best-metric direction so LR
+        # reduction fires on stagnation of the ACTUAL optimization target
+        # (previously hardcoded "max", which silently minimized loss-style
+        # metrics).
+        plateau_mode = tc.save_best_mode if tc.save_best_mode in ("max", "min") else "max"
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", patience=tc.plateau_patience,
+            optimizer, mode=plateau_mode, patience=tc.plateau_patience,
             factor=tc.plateau_factor)
     elif tc.scheduler == "cosine_warm_restarts":
         T_0 = tc.cosine_restart_period * steps_per_epoch
@@ -224,23 +239,36 @@ class Trainer:
         # stacks. Validation collapses both down to 1x and calls `base_loss`
         # directly to avoid a shape-contract mismatch.
         self.base_loss = build_loss(cfg.loss)
-        train_loss = self.base_loss
-        if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
-            train_loss = DeepSupervisionLoss(
-                train_loss, cfg.loss.deep_supervision_weights)
         num_res = len(cfg.data.multi_res_scales)
-        self.criterion = MultiResolutionLoss(
-            base_loss=train_loss,
+
+        # Composition order matters:
+        #   INNER = MultiResolutionLoss(base)  — takes a single tensor
+        #                                        pred (B, num_fg*C_res, ...)
+        #                                        and splits channel-wise
+        #                                        over the C_res axis.
+        #   OUTER = DeepSupervisionLoss(INNER) — iterates over the list of
+        #                                        per-decoder-level tensors,
+        #                                        downsamples label+weight_map
+        #                                        to each, and delegates to
+        #                                        INNER.
+        # The previous outer-MR / inner-DS ordering crashed because MR
+        # expected a tensor pred while DS produced a list.
+        inner = MultiResolutionLoss(
+            base_loss=self.base_loss,
             num_fg_classes=cfg.num_fg_classes,
             num_res=num_res,
             label_values=cfg.data.label_values,
         )
-        # `_label_to_binary` lives on MultiResolutionLoss; access through a
-        # getattr indirection so a future rename to a public API works
-        # without touching this file.
+        if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
+            self.criterion = DeepSupervisionLoss(
+                inner, cfg.loss.deep_supervision_weights)
+        else:
+            self.criterion = inner
+        # `_label_to_binary` lives on the INNER MultiResolutionLoss
+        # regardless of whether the outer criterion is DS-wrapped.
         self._label_to_binary_fn = getattr(
-            self.criterion, "label_to_binary",
-            getattr(self.criterion, "_label_to_binary"))
+            inner, "label_to_binary",
+            getattr(inner, "_label_to_binary"))
         logger.info("Loss: %s, scales=%d, fg_classes=%d",
                     cfg.loss.name, num_res, cfg.num_fg_classes)
 
@@ -543,13 +571,18 @@ class Trainer:
     def _validate(self, epoch: int) -> Dict[str, float]:
         """Validate on the validation set under EMA weights (if enabled).
 
-        Evaluates only the 1x resolution head with `base_loss` (not the
-        DS/MultiRes-wrapped training criterion), whose contract assumes
-        multi-tensor pred and multi-resolution label stacks.
+        Uses POOLED per-class dice:
+            dice[c] = 2 * Σ_batches intersection[c] / Σ_batches denom[c]
+        This matches the nnU-Net convention and avoids the negative bias of
+        averaging per-batch dice when some classes are empty in some batches.
         """
         self.model.eval()
         loss_meter = AverageMeter()
-        all_dice = []
+        inter_sum: Optional[torch.Tensor] = None  # (C,)
+        denom_sum: Optional[torch.Tensor] = None  # (C,)
+        cov_sum:   Optional[torch.Tensor] = None  # (C,) number of samples with non-empty GT per class
+
+        n_samples = 0
 
         with self._ema_swapped():
             for batch in self.val_loader:
@@ -568,22 +601,40 @@ class Trainer:
                     loss = self.base_loss(pred_1x, target_1x)
 
                 loss_meter.update(loss.item(), image.shape[0])
-                dice = compute_dice_per_class(pred_1x, target_1x)
-                all_dice.append(dice.cpu())
+                stats = dice_batch_stats(pred_1x.float(), target_1x)
+                if inter_sum is None:
+                    inter_sum = stats["inter"].clone()
+                    denom_sum = stats["denom"].clone()
+                    cov_sum   = stats["n_with_gt"].clone()
+                else:
+                    inter_sum += stats["inter"]
+                    denom_sum += stats["denom"]
+                    cov_sum   += stats["n_with_gt"]
+                n_samples += image.shape[0]
 
-        if not all_dice:
+        if inter_sum is None:
             logger.warning("Validation loader yielded no batches.")
             return {"val_loss": float("nan"), "mean_dice": 0.0}
 
-        mean_dice_per_class = torch.stack(all_dice).mean(dim=0)
-        metrics: Dict[str, float] = {"val_loss": loss_meter.avg}
-        for c in range(len(mean_dice_per_class)):
-            metrics[f"dice_class_{c}"] = mean_dice_per_class[c].item()
-        metrics["mean_dice"] = mean_dice_per_class.mean().item()
+        # Pooled dice with 1e-5 smoothing to match training loss behaviour.
+        smooth = 1e-5
+        dice_per_class = (2.0 * inter_sum + smooth) / (denom_sum + smooth)
+        dice_per_class = dice_per_class.cpu()
 
-        logger.info("  Val: loss=%.4f, mean_dice=%.4f, per_class=%s",
-                    metrics["val_loss"], metrics["mean_dice"],
-                    [f"{d:.4f}" for d in mean_dice_per_class.tolist()])
+        metrics: Dict[str, float] = {"val_loss": loss_meter.avg}
+        for c in range(len(dice_per_class)):
+            metrics[f"dice_class_{c}"] = dice_per_class[c].item()
+        metrics["mean_dice"] = dice_per_class.mean().item()
+
+        # Per-class coverage helps diagnose "val dice is low because this
+        # class barely appears in the val set" vs. genuine model failure.
+        cov = cov_sum.cpu().tolist()
+        logger.info(
+            "  Val: loss=%.4f, pooled_mean_dice=%.4f, per_class=%s, "
+            "coverage=%s/%d samples",
+            metrics["val_loss"], metrics["mean_dice"],
+            [f"{d:.4f}" for d in dice_per_class.tolist()],
+            [int(c) for c in cov], n_samples)
         return metrics
 
     # ------------------------------------------------------------------
@@ -621,6 +672,16 @@ class Trainer:
         bare = _unwrap_compile(self.model)
         online_sd = bare.state_dict()
 
+        # Snapshot RNG state for bit-exact resume. Covers torch CPU / CUDA,
+        # numpy, and Python's random — the three sources seed_everything sets.
+        rng_state = {
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": (torch.cuda.get_rng_state_all()
+                           if torch.cuda.is_available() else None),
+            "numpy": __import__("numpy").random.get_state(),
+            "python": __import__("random").getstate(),
+        }
+
         state: Dict = {
             "epoch": 0,  # filled by caller
             "model_state_dict": online_sd,
@@ -631,6 +692,7 @@ class Trainer:
             "best_epoch": self.best_epoch,
             "has_best": self.has_best,
             "patience_counter": self.patience_counter,
+            "rng_state": rng_state,
             "config": self.cfg,
         }
 
@@ -687,6 +749,25 @@ class Trainer:
         self.has_best = ckpt.get(
             "has_best", math.isfinite(self.best_metric))
         self.patience_counter = ckpt.get("patience_counter", 0)
+
+        # Restore RNG state when present. Missing keys (older checkpoints)
+        # are silently skipped — training still works, just not bit-exact.
+        rng = ckpt.get("rng_state")
+        if rng:
+            try:
+                if rng.get("torch_cpu") is not None:
+                    torch.set_rng_state(rng["torch_cpu"])
+                if rng.get("torch_cuda") is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(rng["torch_cuda"])
+                if rng.get("numpy") is not None:
+                    import numpy as _np
+                    _np.random.set_state(rng["numpy"])
+                if rng.get("python") is not None:
+                    import random as _rnd
+                    _rnd.setstate(rng["python"])
+                logger.info("Restored RNG state from checkpoint.")
+            except Exception as e:  # pragma: no cover
+                logger.warning("Failed to restore RNG state: %s", e)
 
         logger.info(
             "Resumed from epoch %d, best=%s=%s (patience=%d)",

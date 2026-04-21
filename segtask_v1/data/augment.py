@@ -127,12 +127,7 @@ def _random_affine(
         image[idx], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
 
     # Label: use nearest interpolation to preserve binary values
-    C_lbl = label.shape[1]
-    lbl_sel = label[idx].reshape(n * C_lbl, 1, D, H, W)
-    grid_exp = grid.unsqueeze(1).expand(-1, C_lbl, -1, -1, -1, -1).reshape(n * C_lbl, D, H, W, 3)
-    lbl_warped = F.grid_sample(
-        lbl_sel, grid_exp, mode="nearest", padding_mode="zeros", align_corners=False)
-    label[idx] = lbl_warped.reshape(n, C_lbl, D, H, W)
+    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="zeros", align_corners=False)
 
     return image, label
 
@@ -244,15 +239,10 @@ def _elastic_deform(
 
     # Apply to image
     image[idx] = F.grid_sample(
-        image[idx], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
 
     # Apply to label (nearest to preserve discrete values)
-    C_lbl = label.shape[1]
-    lbl_sel = label[idx].reshape(n * C_lbl, 1, D, H, W)
-    grid_exp = grid.unsqueeze(1).expand(-1, C_lbl, -1, -1, -1, -1).reshape(n * C_lbl, D, H, W, 3)
-    lbl_warped = F.grid_sample(
-        lbl_sel, grid_exp, mode="nearest", padding_mode="zeros", align_corners=False)
-    label[idx] = lbl_warped.reshape(n, C_lbl, D, H, W)
+    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
 
     return image, label
 
@@ -273,9 +263,14 @@ def _identity_grid(
 def _grid_dropout(
     image: torch.Tensor, label: torch.Tensor,
     prob: float, ratio: float, num_holes: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample grid dropout: mask out rectangular sub-regions with zeros.
+    """Grid dropout: mask out rectangular sub-regions with zeros.
 
-    Only applied to image; label is NOT masked (to preserve ground truth).
+    Vectorized: generates all B × num_holes hole positions in a single
+    batched `torch.randint` call and marks the boolean mask via advanced
+    indexing. Label is NOT masked (to preserve ground truth).
+
+    Samples not selected by the Bernoulli mask pass through unchanged
+    (their hole-mask stays all-ones via `selected` gating).
     """
     if prob <= 0 or ratio <= 0:
         return image, label
@@ -283,23 +278,48 @@ def _grid_dropout(
     B, _, D, H, W = image.shape
     device = image.device
 
-    mask_batch = torch.rand(B, device=device) < prob
-    if not mask_batch.any():
+    selected = torch.rand(B, device=device) < prob  # (B,)
+    if not selected.any():
         return image, label
 
-    for i in mask_batch.nonzero(as_tuple=True)[0]:
-        hole_mask = torch.ones(1, 1, D, H, W, device=device)
-        for _ in range(num_holes):
-            hd = max(1, int(D * (ratio / num_holes) ** (1 / 3)))
-            hh = max(1, int(H * (ratio / num_holes) ** (1 / 3)))
-            hw = max(1, int(W * (ratio / num_holes) ** (1 / 3)))
-            d0 = torch.randint(0, max(D - hd, 1), (1,)).item()
-            h0 = torch.randint(0, max(H - hh, 1), (1,)).item()
-            w0 = torch.randint(0, max(W - hw, 1), (1,)).item()
-            hole_mask[:, :, d0:d0 + hd, h0:h0 + hh, w0:w0 + hw] = 0
-        image[i:i + 1] = image[i:i + 1] * hole_mask
+    # Hole sizes are constant per call — ratio and num_holes are scalars.
+    frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
+    hd = max(1, int(D * frac))
+    hh = max(1, int(H * frac))
+    hw = max(1, int(W * frac))
 
-    return image, label
+    # Sample B × num_holes top-left corners in a single kernel launch.
+    d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)
+    h0 = torch.randint(0, max(H - hh, 1), (B, num_holes), device=device)
+    w0 = torch.randint(0, max(W - hw, 1), (B, num_holes), device=device)
+
+    # Build per-sample hole mask without per-sample Python loops.
+    hole_mask = torch.ones(B, 1, D, H, W, device=device, dtype=image.dtype)
+    # Pre-compute axis offset vectors, then broadcast-set via advanced indexing
+    # one hole at a time — keep the inner dim small (num_holes is typically < 8).
+    d_off = torch.arange(hd, device=device)  # (hd,)
+    h_off = torch.arange(hh, device=device)
+    w_off = torch.arange(hw, device=device)
+    for k in range(num_holes):
+        # (B,), per-sample start indices for this hole
+        ds = d0[:, k, None] + d_off[None, :]      # (B, hd)
+        hs = h0[:, k, None] + h_off[None, :]      # (B, hh)
+        ws = w0[:, k, None] + w_off[None, :]      # (B, hw)
+        b_idx = torch.arange(B, device=device)
+        # Fancy-index over (B, D, H, W): broadcast b_idx × ds × hs × ws
+        # to a (B, hd, hh, hw) cartesian product.
+        hole_mask[
+            b_idx[:, None, None, None], :,
+            ds[:, :, None, None],
+            hs[:, None, :, None],
+            ws[:, None, None, :],
+        ] = 0
+
+    # Only zero-out samples that were selected; un-selected keep identity mask
+    gate = selected.reshape(B, 1, 1, 1, 1).to(image.dtype)
+    # effective_mask = selected ? hole_mask : 1
+    effective = hole_mask * gate + (1.0 - gate)
+    return image * effective, label
 
 
 # ===========================================================================
@@ -336,22 +356,39 @@ def _random_contrast(
 
 def _random_gamma(
     image: torch.Tensor, prob: float, grange: list) -> torch.Tensor:
-    """Per-sample random gamma correction."""
+    """Per-sample random gamma correction, fully vectorized.
+
+    For each sample independently:
+      1. Min/max-normalize to [0, 1] per-sample (stats taken over C,D,H,W).
+      2. pow(gamma_i) with gamma_i sampled per-sample from grange.
+      3. De-normalize back to the original intensity range.
+
+    Samples not selected by the Bernoulli mask are returned unchanged
+    by setting their effective gamma to 1.0 (identity).
+    """
     if prob <= 0:
         return image
     B = image.shape[0]
-    mask = torch.rand(B, device=image.device) < prob
+    device = image.device
+    mask = torch.rand(B, device=device) < prob  # (B,)
     if not mask.any():
         return image
-    idx = mask.nonzero(as_tuple=True)[0]
-    for i in idx:
-        gamma = torch.empty(1, device=image.device).uniform_(grange[0], grange[1]).item()
-        img_i = image[i]
-        mn, mx = img_i.min(), img_i.max()
-        rng = (mx - mn).clamp(min=1e-7)
-        normed = ((img_i - mn) / rng).clamp(0, 1)
-        image[i] = normed.pow(gamma) * rng + mn
-    return image
+
+    # Per-sample min/max over non-batch dims. amin/amax with a tuple is the
+    # standard vectorised path and needs a single kernel launch per reduce.
+    reduce_dims = tuple(range(1, image.ndim))
+    mn = image.amin(dim=reduce_dims, keepdim=True)  # (B,1,1,1,1)
+    mx = image.amax(dim=reduce_dims, keepdim=True)
+    rng = (mx - mn).clamp(min=1e-7)
+    normed = ((image - mn) / rng).clamp(0.0, 1.0)
+
+    # Per-sample gamma; identity (1.0) for samples not selected.
+    gamma = torch.empty(B, device=device).uniform_(grange[0], grange[1])
+    gamma = torch.where(mask, gamma, torch.ones_like(gamma))
+    gshape = (B,) + (1,) * (image.ndim - 1)
+    gamma = gamma.reshape(gshape).to(image.dtype)
+
+    return normed.pow(gamma) * rng + mn
 
 
 def _gaussian_noise(

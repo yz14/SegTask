@@ -267,12 +267,14 @@ class SegDataset3D(Dataset):
         img_patch = resize_3d(img_patch, D_patch, H_patch, W_patch, is_label=False)
         lbl_patch = resize_3d(lbl_patch, D_patch, H_patch, W_patch, is_label=True)
 
-        # Convert label to per-foreground-class binary masks
-        lbl_mc = preprocess_label(lbl_patch, self.label_values)  # (num_fg, D, H, W)
-
+        # Return RAW integer label as a single channel — matches the cubic
+        # dataset contract (C_res, D, H, W). Binarization is performed by
+        # MultiResolutionLoss._label_to_binary at loss time, which keeps the
+        # label pipeline identical across z_axis / cubic modes and avoids
+        # the previous shape mismatch that silently zeroed-out class≥2 targets.
         result = {
             "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
-            "label": torch.from_numpy(lbl_mc).float()}                 # (num_fg, D, H, W)
+            "label": torch.from_numpy(lbl_patch[np.newaxis]).float()}  # (1, D, H, W)
 
         # Spatial region weight map (optional)
         if self.region_weights:
@@ -345,10 +347,21 @@ def _extract_cubic_patch(
 
     patch = vol[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]]
 
-    # 不采用pad，而是剪裁，见后续步骤
-    # # Pad if any part was out of bounds
-    # if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
-    #     patch = np.pad(patch, list(zip(pad_before, pad_after)), mode="constant")
+    # Pad to the exact requested `size` whenever the cube extended beyond
+    # volume bounds. Without this, an off-boundary center returns a smaller
+    # cube that downstream `resize_3d` stretches non-uniformly, producing
+    # anisotropic distortion (severely biased proportions for fg voxels
+    # located near the volume edges).
+    #
+    # `mode="edge"` replicates the nearest boundary voxel — consistent with
+    # the inference-time padding used in `predictor._sliding_window_cubic`
+    # (when `pad_value` is not configured) and avoids introducing "air"
+    # artefacts for non-zero-normalized intensities.
+    if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
+        patch = np.pad(
+            patch,
+            list(zip(pad_before, pad_after)),
+            mode="edge")
 
     return patch
 

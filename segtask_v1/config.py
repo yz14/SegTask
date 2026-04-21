@@ -63,6 +63,11 @@ class DataConfig:
     # Train/val split
     val_ratio: float = 0.2
     split_seed: int = 42
+    # Stratified split by each volume's primary foreground class.
+    # Strongly recommended when class distribution is imbalanced (typical
+    # medical imaging case). Falls back to random split if the dataset is
+    # too small to stratify cleanly.
+    stratified_split: bool = True
 
     # DataLoader
     batch_size: int = 2
@@ -371,6 +376,16 @@ class Config:
             "multi_res_scales must have at least one scale (e.g. [1.0])"
         assert all(s >= 1.0 for s in self.data.multi_res_scales), \
             "All multi_res_scales must be >= 1.0"
+        # Multi-resolution input is only supported in cubic patch mode; in
+        # z_axis mode the dataset always emits a single-channel image, so
+        # models built with `num_res > 1` would receive an input/output
+        # channel count that never matches the data.
+        if self.data.patch_mode == "z_axis":
+            assert len(self.data.multi_res_scales) == 1, (
+                "multi_res_scales must be [1.0] when patch_mode='z_axis' — "
+                "multi-resolution patches are only supported in cubic mode.")
+        assert self.train.save_best_mode in ("max", "min"), \
+            f"Invalid save_best_mode: {self.train.save_best_mode}"
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)

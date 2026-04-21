@@ -30,7 +30,13 @@ class DropPath(nn.Module):
             return x
         keep = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask = torch.bernoulli(torch.full(shape, keep, device=x.device, dtype=x.dtype))
+        # Sample the Bernoulli mask in float32 regardless of x.dtype. Under
+        # AMP (fp16/bf16) torch.bernoulli on the probability tensor has
+        # inconsistent backend support across CUDA versions — generate in
+        # fp32, then cast to x.dtype. The /keep division is fused into the
+        # cast to preserve numerical stability.
+        prob = torch.full(shape, keep, device=x.device, dtype=torch.float32)
+        mask = torch.bernoulli(prob).to(dtype=x.dtype)
         return x * mask / keep
 
 

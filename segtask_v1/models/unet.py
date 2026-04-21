@@ -197,10 +197,15 @@ class UNet3D(nn.Module):
         # Main segmentation head (highest resolution decoder output)
         self.seg_head = SegmentationHead(decoder.out_channels[-1], num_fg_classes)
 
-        # Deep supervision heads (lower resolution outputs)
+        # Deep supervision heads (lower-resolution outputs).
+        # decoder.out_channels is [low, ..., high]; we want DS outputs ordered
+        # from 2nd-highest to lowest resolution so that forward() can return
+        # [main_out, 2nd_high, 3rd_high, ..., lowest] — matching the
+        # DeepSupervisionLoss convention weights[0]=highest-res.
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
-            for ch in decoder.out_channels[:-1]:
+            # Reverse [low..2nd-high] → [2nd-high..low]
+            for ch in reversed(decoder.out_channels[:-1]):
                 self.ds_heads.append(SegmentationHead(ch, num_fg_classes))
 
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -211,7 +216,8 @@ class UNet3D(nn.Module):
 
         Returns:
             If deep_supervision=False or eval: (B, num_fg, D, H, W) logits.
-            If deep_supervision=True and training: list of multi-scale logits.
+            If deep_supervision=True and training: list of multi-scale logits
+                ordered [main_out (highest-res), 2nd_high, 3rd_high, ..., lowest].
         """
         enc_features = self.encoder(x)
         dec_features = self.decoder(enc_features)
@@ -221,9 +227,12 @@ class UNet3D(nn.Module):
         if not self.deep_supervision or not self.training:
             return main_out
 
+        # dec_features = [low, ..., high]; dec_features[-1] is already used
+        # as main_out. DS heads must consume features in decreasing resolution:
+        # dec_features[-2] (2nd-highest), dec_features[-3], ..., dec_features[0] (lowest).
         outputs = [main_out]
         for i, head in enumerate(self.ds_heads):
-            outputs.append(head(dec_features[i]))
+            outputs.append(head(dec_features[-2 - i]))
         return outputs
 
     def param_count(self) -> Dict[str, int]:
