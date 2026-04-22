@@ -13,6 +13,7 @@ Each foreground class gets its own binary channel:
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -129,18 +130,42 @@ def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_l
 # Volume cache
 # ---------------------------------------------------------------------------
 class VolumeCache:
-    """Simple in-memory cache for loaded volumes."""
+    """In-memory LRU cache for loaded volumes.
 
-    def __init__(self, enabled: bool = False):
+    When `max_volumes > 0`, entries are evicted in least-recently-used
+    order once the cache reaches capacity. `max_volumes = 0` keeps the
+    legacy unbounded behaviour (useful when the dataset is known to fit
+    fully in RAM; risky otherwise).
+
+    `enabled=False` disables caching entirely (no store, no eviction).
+    """
+
+    def __init__(self, enabled: bool = False, max_volumes: int = 0):
         self._enabled = enabled
-        self._store: Dict[str, np.ndarray] = {}
+        self._max = max(int(max_volumes), 0)
+        self._store: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
     def get(self, path: str) -> Optional[np.ndarray]:
-        return self._store.get(path) if self._enabled else None
+        if not self._enabled:
+            return None
+        data = self._store.get(path)
+        if data is not None:
+            # Mark as most-recently-used.
+            self._store.move_to_end(path)
+        return data
 
     def put(self, path: str, data: np.ndarray) -> None:
-        if self._enabled:
+        if not self._enabled:
+            return
+        if path in self._store:
+            self._store.move_to_end(path)
             self._store[path] = data
+            return
+        self._store[path] = data
+        if self._max > 0:
+            while len(self._store) > self._max:
+                # popitem(last=False) pops the LEAST-recently-used entry.
+                self._store.popitem(last=False)
 
     @property
     def size(self) -> int:
@@ -170,6 +195,7 @@ class SegDataset3D(Dataset):
         label_paths: List[str],
         label_values: List[int],
         patch_size: Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio: float = 1.0,
         intensity_min: float = -1024.0,
         intensity_max: float = 3071.0,
         normalize: str = "minmax",
@@ -179,13 +205,24 @@ class SegDataset3D(Dataset):
         samples_per_volume: int = 8,
         is_train: bool = True,
         cache_enabled: bool = True,
+        cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
+        assert aug_oversample_ratio >= 1.0, (
+            f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.label_values = label_values
         self.patch_size = tuple(patch_size)
+        self.oversample = float(aug_oversample_ratio)
+        # When oversampling, we extract a larger patch from the volume and the
+        # TRAINER center-crops back to patch_size after GPU augmentation. This
+        # symmetrises the rotation/elastic black-corner artefacts into the
+        # cropped margin. `extract_size` applies to every axis (D, H, W) to
+        # keep z-axis rotations well-behaved, mirroring the cubic mode.
+        self.extract_size = tuple(
+            int(round(p * self.oversample)) for p in self.patch_size)
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -196,8 +233,8 @@ class SegDataset3D(Dataset):
         self.is_train = is_train
         self.region_weights = region_weights
 
-        self._img_cache = VolumeCache(cache_enabled)
-        self._lbl_cache = VolumeCache(cache_enabled)
+        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
+        self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
         # Build per-slice index for foreground oversampling
         self._vol_fg_slices: List[np.ndarray] = []  # fg slice indices per volume
@@ -255,17 +292,21 @@ class SegDataset3D(Dataset):
         vol_idx  = idx % len(self.image_paths)
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
-        D_patch, H_patch, W_patch = self.patch_size
+        # Extract at the oversized shape; the trainer center-crops back to
+        # patch_size after GPU augmentation (mirrors the cubic-mode pipeline).
+        # When oversample == 1.0, eD/eH/eW == patch_size and no crop is
+        # required; behaviour is bit-identical to the previous code path.
+        eD, eH, eW = self.extract_size
 
         # Select center z-position, z轴中心坐标
         z = self._sample_z(vol_idx, D_vol)
 
-        # Extract D_patch slices centered at z, TODO 这里可以改为2*D_patch，然后在训练中aug后取中间D_patch
-        img_patch, lbl_patch = self._extract_z_patch(img, lbl, z, D_patch)
+        # Extract eD slices centered at z (shifted at volume bounds).
+        img_patch, lbl_patch = self._extract_z_patch(img, lbl, z, eD)
 
-        # 3D resample to target (D_patch, H_patch, W_patch)
-        img_patch = resize_3d(img_patch, D_patch, H_patch, W_patch, is_label=False)
-        lbl_patch = resize_3d(lbl_patch, D_patch, H_patch, W_patch, is_label=True)
+        # 3D resample to oversized target (eD, eH, eW).
+        img_patch = resize_3d(img_patch, eD, eH, eW, is_label=False)
+        lbl_patch = resize_3d(lbl_patch, eD, eH, eW, is_label=True)
 
         # Return RAW integer label as a single channel — matches the cubic
         # dataset contract (C_res, D, H, W). Binarization is performed by
@@ -399,9 +440,12 @@ class SegDataset3DCubic(Dataset):
         samples_per_volume: int = 8,
         is_train: bool = True,
         cache_enabled: bool = True,
+        cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
+        assert aug_oversample_ratio >= 1.0, (
+            f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.label_values = label_values
@@ -411,6 +455,9 @@ class SegDataset3DCubic(Dataset):
         self.extract_size = tuple(
             int(round(p * aug_oversample_ratio)) for p in patch_size)
         self.multi_res_scales = multi_res_scales or []
+        # Largest multi-res scale determines the biggest physical cube that
+        # must stay in-bounds to avoid excessive edge-replicate padding.
+        self._max_scale = max(self.multi_res_scales) if self.multi_res_scales else 1.0
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -421,8 +468,8 @@ class SegDataset3DCubic(Dataset):
         self.is_train = is_train
         self.region_weights = region_weights
 
-        self._img_cache = VolumeCache(cache_enabled)
-        self._lbl_cache = VolumeCache(cache_enabled)
+        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
+        self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
         # Build 3D foreground voxel index for oversampling
         self._vol_shapes: List[Tuple[int, int, int]] = []
@@ -519,12 +566,61 @@ class SegDataset3DCubic(Dataset):
                 np.stack(wmap_channels, axis=0).astype(np.float32))  # (C_res, eD, eH, eW)
         return result
 
+    def _safe_center_range(
+        self, D: int, H: int, W: int
+    ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+        """Return `(lo, hi)` center-coordinate bounds on each axis that keep
+        the entire largest multi-res cube inside the volume.
+
+        When the volume is smaller than the cube on an axis, we relax that
+        axis to `[half, half + 1)` (== volume centre), which reproduces the
+        legacy edge-replicate behaviour exactly where it is unavoidable.
+        Using `hi` as an *exclusive* upper bound lets callers plug straight
+        into `np.random.randint(lo, hi)` / `np.clip(..., lo, hi - 1)`.
+        """
+        eD, eH, eW = self.extract_size
+        # Physical cube size for the largest scale (rounded like the dataset).
+        sD = int(round(eD * self._max_scale))
+        sH = int(round(eH * self._max_scale))
+        sW = int(round(eW * self._max_scale))
+
+        def _axis(size: int, patch: int) -> Tuple[int, int]:
+            half = patch // 2
+            lo = half
+            # `_extract_cubic_patch` takes [c - patch//2, c - patch//2 + patch),
+            # so the exclusive upper centre bound that keeps the top slice
+            # in-bounds is `size - (patch - half)`.
+            hi = size - (patch - half)
+            if hi <= lo:
+                # Volume too small on this axis — centre it and accept padding.
+                mid = size // 2
+                return mid, mid + 1
+            return lo, hi
+
+        return _axis(D, sD), _axis(H, sH), _axis(W, sW)
+
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
-        """Sample a center (d, h, w) with optional foreground oversampling."""
+        """Sample a center (d, h, w) with optional foreground oversampling.
+
+        The sampled centre is clamped into the `_safe_center_range` box so
+        that the largest multi-res cube extracted around it sits entirely
+        within the volume. Without this clamp, sampling an fg voxel right
+        at the volume corner produced patches where >50 % of voxels came
+        from `np.pad(mode='edge')` — massively skewing training toward
+        synthetic replicated borders (BUG-D in the audit report).
+        """
+        (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
         fg_coords = self._vol_fg_coords[vol_idx]
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
                 and np.random.random() < self.fg_ratio):
             idx = np.random.randint(len(fg_coords))
-            return tuple(fg_coords[idx])
-        return (np.random.randint(0, D), np.random.randint(0, H), np.random.randint(0, W))
+            d, h, w = fg_coords[idx]
+            # `dhi - 1` because np.clip upper bound is INCLUSIVE.
+            d = int(np.clip(int(d), dlo, dhi - 1))
+            h = int(np.clip(int(h), hlo, hhi - 1))
+            w = int(np.clip(int(w), wlo, whi - 1))
+            return (d, h, w)
+        return (int(np.random.randint(dlo, dhi)),
+                int(np.random.randint(hlo, hhi)),
+                int(np.random.randint(wlo, whi)))

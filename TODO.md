@@ -29,8 +29,8 @@
 - **进行中**：如需拆分，明确告知本轮将完成什么
 - **完成后**：总结本轮成果，说明后续计划（如有）  
 
-测试环境为: **conda activate py310**  
+测试环境为: **conda activate torch27_env**  
 
 
 # TODO  
-1. D:\codes\work-projects\SegTask\segtask_v1\train.py是训练入口，请细致，严格的全面审查D:\codes\work-projects\SegTask\segtask_v1的全流程代码，是否有错误，不足的地方
+1. D:\codes\work-projects\SegTask\segtask_v1\train.py是训练入口，请细致，严格的全面审查D:\codes\work-projects\SegTask\segtask_v1的全流程代码，是否有错误，不足的地方。我设计了两种3D分割算法，一种是在z轴滑块，一种是中心点滑块（在x,y,z都滑块，支持多分辨率/感受野输入）。

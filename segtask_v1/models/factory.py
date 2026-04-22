@@ -36,8 +36,33 @@ def _make_resnet_stage_builder(cfg: Config) -> Callable:
 
 
 def _make_convnext_stage_builder(cfg: Config) -> Callable:
-    """Return a callable(in_ch, out_ch) → ConvNeXtStage."""
+    """Return a callable(in_ch, out_ch) → ConvNeXtStage.
+
+    ISSUE-N: ConvNeXt blocks hard-code LayerNorm + GELU internally (matching
+    the original paper). `cfg.model.norm_type / activation / norm_groups`
+    are therefore ignored by the ConvNeXt path. We warn explicitly when the
+    user configured anything other than the defaults so the discrepancy is
+    visible rather than silent. The stem and skip-projection paths (built
+    in `Encoder` / `Decoder`) DO still honour `norm_type/activation`, so
+    this warning is specifically about the intra-stage blocks.
+    """
     mc = cfg.model
+    non_default = []
+    if mc.norm_type != "instance":
+        non_default.append(f"norm_type={mc.norm_type!r}")
+    if mc.activation != "leakyrelu":
+        non_default.append(f"activation={mc.activation!r}")
+    if mc.use_se:
+        non_default.append("use_se=True")
+    if mc.dropout and mc.dropout > 0.0:
+        non_default.append(f"dropout={mc.dropout}")
+    if non_default:
+        logger.warning(
+            "Backbone=convnext: block-internal norm/activation are fixed to "
+            "LayerNorm+GELU and the following settings are IGNORED inside "
+            "ConvNeXt blocks: %s. (They still apply to the stem/decoder "
+            "skip projections built in Encoder/Decoder.)",
+            ", ".join(non_default))
     n_levels = len(mc.encoder_channels)
     total_blocks = n_levels * mc.blocks_per_level * 2  # encoder + decoder
     # Linearly increasing drop path rates

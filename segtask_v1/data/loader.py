@@ -214,7 +214,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     # Auto-detect labels if needed, 标签值确认
     if not dc.label_values:
         dc.label_values = detect_label_values(label_paths)
-        dc.num_classes = len(dc.label_values)
+        dc.num_classes  = len(dc.label_values)
         cfg.sync()
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
@@ -231,6 +231,10 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
 
     cache = dc.cache_mode == "memory"
     rw = cfg.loss.region_weights if cfg.loss.region_weights else None
+    # `aug_oversample_ratio` now applies to BOTH z_axis and cubic modes (BUG-B).
+    # Validation sets always use oversample=1.0 so val patches match the
+    # physical patch size verbatim; no GPU augmentation runs on val data.
+    train_oversample = max(dc.aug_oversample_ratio, 1.0)
     common_kwargs = dict(
         label_values=dc.label_values,
         patch_size=tuple(dc.patch_size),
@@ -240,6 +244,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         global_mean=dc.global_mean,
         global_std=dc.global_std,
         cache_enabled=cache,
+        cache_max_volumes=getattr(dc, "cache_max_volumes", 0),
         region_weights=rw)
 
     train_paths = dict(
@@ -251,10 +256,10 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
 
     if dc.patch_mode == "cubic":
         logger.info("Using CUBIC patch mode (oversample=%.2f, scales=%s)",
-                     dc.aug_oversample_ratio, dc.multi_res_scales)
+                     train_oversample, dc.multi_res_scales)
         train_ds = SegDataset3DCubic(
             **train_paths,
-            aug_oversample_ratio=dc.aug_oversample_ratio if dc.aug_oversample_ratio > 1.0 else 1.0,
+            aug_oversample_ratio=train_oversample,
             multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
@@ -269,15 +274,17 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             is_train=False,
             **common_kwargs)
     else:
-        logger.info("Using Z_AXIS patch mode")
+        logger.info("Using Z_AXIS patch mode (oversample=%.2f)", train_oversample)
         train_ds = SegDataset3D(
             **train_paths,
+            aug_oversample_ratio=train_oversample,
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
             **common_kwargs)
         val_ds = SegDataset3D(
             **val_paths,
+            aug_oversample_ratio=1.0,
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,

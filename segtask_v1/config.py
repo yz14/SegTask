@@ -41,9 +41,13 @@ class DataConfig:
     #   "cubic"  — sample center (x,y,z), extract full 3D cube of patch_size
     patch_mode: str = "z_axis"
 
-    # Augmentation oversample ratio (cubic mode only).
-    # Extract patch_size * ratio, augment on GPU, then center-crop to patch_size.
-    # This avoids blank edges from spatial transforms. 1.0 = disabled, 1.4~1.5 recommended.
+    # Augmentation oversample ratio (applies to BOTH z_axis and cubic modes).
+    # Dataset extracts a patch of size `round(patch_size * ratio)` on every
+    # axis, the augmentor applies spatial transforms (rotate/elastic with
+    # `zeros` padding), and the trainer center-crops back to patch_size.
+    # This removes the black-corner artefacts that grid_sample introduces
+    # at rotated edges. 1.0 = disabled (legacy behaviour), 1.4~1.5 recommended
+    # whenever `random_affine_prob` or `elastic_deform_prob` > 0.
     aug_oversample_ratio: float = 1.0
 
     # Multi-resolution input (cubic mode only).
@@ -80,8 +84,14 @@ class DataConfig:
     # Samples per volume per epoch (controls epoch length)
     samples_per_volume: int = 8
 
-    # Caching: "none" or "memory"
+    # Caching: "none" or "memory".
+    # `memory` keeps decoded volumes (image+label) in an LRU-bounded in-RAM
+    # cache. `cache_max_volumes` caps the number of cached volumes per
+    # worker — set to 0 for unbounded (matches the legacy behaviour, but
+    # risks OOM on large datasets). The recommended setting is a few times
+    # the effective prefetch horizon (= num_workers * samples_per_volume).
     cache_mode: str = "memory"
+    cache_max_volumes: int = 0  # 0 = unbounded
 
 
 # ---------------------------------------------------------------------------

@@ -30,11 +30,25 @@ from ..config import AugConfig
 
 
 class GPUAugmentor:
-    """GPU-based 3D data augmentation pipeline with per-sample transforms."""
+    """GPU-based 3D data augmentation pipeline with per-sample transforms.
 
-    def __init__(self, cfg: AugConfig):
+    Args:
+        cfg: Augmentation config.
+        max_scale: Largest multi-res scale in the input (default 1.0 for
+            single-resolution). This ONLY affects elastic deformation: the
+            displacement field is defined in *canonical* voxels shared across
+            all channels, but each channel represents a different physical
+            field-of-view; applying the same canonical displacement to
+            scale-2.0 channels results in 2x physical displacement. We
+            divide `elastic_deform_alpha` by `max_scale` so that the LARGEST
+            physical displacement matches the configured alpha \u2014 smaller
+            scales then see proportionally less warp, which is safe.
+    """
+
+    def __init__(self, cfg: AugConfig, max_scale: float = 1.0):
         self.cfg = cfg
         self.enabled = cfg.enabled
+        self.max_scale = max(float(max_scale), 1.0)
 
     def __call__(
         self, image: torch.Tensor, label: torch.Tensor,
@@ -59,8 +73,13 @@ class GPUAugmentor:
             image, label, c.random_flip_prob, c.random_flip_axes)
         image, label = _random_affine(
             image, label, c.random_affine_prob, c.random_rotate_range, c.random_scale_range)
+        # BUG-E: divide alpha by max_scale so the LARGEST physical channel
+        # receives at most `alpha` voxel-displacement. Smaller-scale channels
+        # see proportionally less warp, which is the conservative choice.
+        effective_alpha = c.elastic_deform_alpha / self.max_scale
         image, label = _elastic_deform(
-            image, label, c.elastic_deform_prob, c.elastic_deform_sigma, c.elastic_deform_alpha)
+            image, label, c.elastic_deform_prob, c.elastic_deform_sigma,
+            effective_alpha)
         image, label = _grid_dropout(
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio, c.grid_dropout_holes)
 
@@ -341,16 +360,27 @@ def _random_brightness(
 
 def _random_contrast(
     image: torch.Tensor, prob: float, crange: list) -> torch.Tensor:
-    """Per-sample random multiplicative contrast."""
+    """Per-sample random multiplicative contrast.
+
+    BUG-C fix: the mean used as the contrast pivot is computed **per-channel**
+    (over D, H, W only). The previous implementation flattened ALL channels
+    into one mean, which for multi-resolution inputs blended the intensity
+    statistics of physically different scales into a single pivot, producing
+    inconsistent contrast scaling across channels.
+    """
     if prob <= 0:
         return image
     B = image.shape[0]
     mask = torch.rand(B, device=image.device) < prob
     if not mask.any():
         return image
-    mean = image.reshape(B, -1).mean(dim=1).reshape(B, 1, 1, 1, 1)
+    # Per-sample, per-channel mean (shape (B, C, 1, 1, 1)).
+    spatial_dims = tuple(range(2, image.ndim))
+    mean = image.mean(dim=spatial_dims, keepdim=True)
     factor = torch.ones(B, 1, 1, 1, 1, device=image.device)
-    factor[mask] = torch.empty(mask.sum().item(), 1, 1, 1, 1, device=image.device).uniform_(crange[0], crange[1])
+    factor[mask] = torch.empty(
+        mask.sum().item(), 1, 1, 1, 1, device=image.device
+    ).uniform_(crange[0], crange[1])
     return (image - mean) * factor + mean
 
 
@@ -374,10 +404,12 @@ def _random_gamma(
     if not mask.any():
         return image
 
-    # Per-sample min/max over non-batch dims. amin/amax with a tuple is the
-    # standard vectorised path and needs a single kernel launch per reduce.
-    reduce_dims = tuple(range(1, image.ndim))
-    mn = image.amin(dim=reduce_dims, keepdim=True)  # (B,1,1,1,1)
+    # BUG-C fix: reduce over SPATIAL dims only, keeping channels independent.
+    # With multi-resolution inputs each channel has a different physical
+    # range; pooling the min/max across channels coupled all scales to the
+    # scale with the widest histogram, giving non-uniform gamma effects.
+    reduce_dims = tuple(range(2, image.ndim))
+    mn = image.amin(dim=reduce_dims, keepdim=True)  # (B,C,1,1,1)
     mx = image.amax(dim=reduce_dims, keepdim=True)
     rng = (mx - mn).clamp(min=1e-7)
     normed = ((image - mn) / rng).clamp(0.0, 1.0)
@@ -407,7 +439,15 @@ def _gaussian_noise(
 
 def _gaussian_blur_3d(
     image: torch.Tensor, prob: float, sigma_range: list) -> torch.Tensor:
-    """Per-sample 3D Gaussian blur via separable 1D convolutions."""
+    """Batched 3D Gaussian blur via separable 1D convolutions.
+
+    ISSUE-L: the previous implementation looped over selected samples in
+    Python, issuing 3 * n conv3d launches. We now sample ONE sigma per
+    call and apply it to all selected samples in a single pass (3 launches
+    total). The trade-off — selected samples share a common blur strength
+    inside a minibatch — is acceptable because sigma still varies across
+    calls/epochs, and per-sample diversity comes from the Bernoulli gate.
+    """
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -416,39 +456,42 @@ def _gaussian_blur_3d(
         return image
 
     idx = mask.nonzero(as_tuple=True)[0]
-    for i in idx:
-        sigma = torch.empty(1).uniform_(sigma_range[0], sigma_range[1]).item()
-        ks = int(2 * round(3 * sigma) + 1)
-        if ks < 3:
-            ks = 3
-        x = torch.arange(ks, dtype=image.dtype, device=image.device) - ks // 2
-        k1d = torch.exp(-0.5 * (x / sigma) ** 2)
-        k1d = k1d / k1d.sum()
-        pad = ks // 2
+    sigma = float(torch.empty(1).uniform_(sigma_range[0], sigma_range[1]))
+    ks = max(int(2 * round(3 * sigma) + 1), 3)
+    # Separable 1D Gaussian kernel, shared across samples/channels.
+    x = torch.arange(ks, dtype=image.dtype, device=image.device) - ks // 2
+    k1d = torch.exp(-0.5 * (x / sigma) ** 2)
+    k1d = k1d / k1d.sum()
+    pad = ks // 2
 
-        img = image[i:i + 1]  # (1, C, D, H, W)
-        C = img.shape[1]
-        img = img.reshape(C, 1, *img.shape[2:])
+    # Collapse batch+channel into the conv3d batch axis so the same 1D
+    # kernel convolves every (sample, channel) slice independently.
+    sub = image[idx]                       # (n, C, D, H, W)
+    n, C = sub.shape[:2]
+    sub = sub.reshape(n * C, 1, *sub.shape[2:])
 
-        for k_shape in [(-1, 1, 1), (1, -1, 1), (1, 1, -1)]:
-            k = k1d.reshape(1, 1, *k_shape)
-            pad_arg = [0, 0, 0, 0, 0, 0]
-            if k_shape[0] != 1:
-                pad_arg = [0, 0, 0, 0, pad, pad]
-            elif k_shape[1] != 1:
-                pad_arg = [0, 0, pad, pad, 0, 0]
-            else:
-                pad_arg = [pad, pad, 0, 0, 0, 0]
-            img = F.pad(img, pad_arg, mode="replicate")
-            img = F.conv3d(img, k)
+    for k_shape, pad_arg in (
+        ((-1, 1, 1), [0, 0, 0, 0, pad, pad]),
+        ((1, -1, 1), [0, 0, pad, pad, 0, 0]),
+        ((1, 1, -1), [pad, pad, 0, 0, 0, 0]),
+    ):
+        k = k1d.reshape(1, 1, *k_shape)
+        sub = F.pad(sub, pad_arg, mode="replicate")
+        sub = F.conv3d(sub, k)
 
-        image[i] = img.reshape(1, C, *img.shape[2:])[0]
+    image[idx] = sub.reshape(n, C, *sub.shape[2:])
     return image
 
 
 def _simulate_lowres(
     image: torch.Tensor, prob: float, zoom_range: list) -> torch.Tensor:
-    """Per-sample simulate low resolution by downsample→upsample."""
+    """Batched "simulate low resolution" by downsample→upsample.
+
+    ISSUE-L: like Gaussian blur above, we now sample ONE zoom factor per
+    call and apply it to every selected sample in a single pair of
+    `F.interpolate` calls. Per-sample diversity still comes from the
+    Bernoulli selection gate; the zoom factor itself varies across calls.
+    """
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -456,15 +499,15 @@ def _simulate_lowres(
     if not mask.any():
         return image
     _, _, D, H, W = image.shape
+    z = float(torch.empty(1).uniform_(zoom_range[0], zoom_range[1]))
+    if z >= 0.99:
+        return image
     idx = mask.nonzero(as_tuple=True)[0]
-    for i in idx:
-        z = torch.empty(1).uniform_(zoom_range[0], zoom_range[1]).item()
-        if z >= 0.99:
-            continue
-        small = F.interpolate(
-            image[i:i + 1],
-            size=(max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z))),
-            mode="trilinear", align_corners=False)
-        image[i:i + 1] = F.interpolate(
-            small, size=(D, H, W), mode="trilinear", align_corners=False)
+    sub = image[idx]
+    small = F.interpolate(
+        sub,
+        size=(max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z))),
+        mode="trilinear", align_corners=False)
+    image[idx] = F.interpolate(
+        small, size=(D, H, W), mode="trilinear", align_corners=False)
     return image

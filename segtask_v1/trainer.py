@@ -194,13 +194,43 @@ class WarmupScheduler:
         return self.optimizer.param_groups[0]["lr"]
 
     def state_dict(self) -> Dict:
+        # Persist the defining warmup parameters too, so `load_state_dict`
+        # can detect accidental config changes (e.g. `warmup_epochs` edited
+        # before resume) that would otherwise silently mis-align the LR
+        # schedule. The base scheduler's own state is kept unchanged.
         return {
             "current_step": self.current_step,
+            "warmup_steps": self.warmup_steps,
+            "warmup_lr": self.warmup_lr,
+            "base_lr": self.base_lr,
             "base_scheduler": (self.scheduler.state_dict()
                                if self.scheduler is not None else None),
         }
 
     def load_state_dict(self, state: Dict) -> None:
+        ckpt_warmup_steps = state.get("warmup_steps")
+        ckpt_warmup_lr = state.get("warmup_lr")
+        ckpt_base_lr = state.get("base_lr")
+        # Warn loudly on config drift across resume. Mismatching warmup
+        # config would slot `current_step` into a different schedule shape.
+        mismatches = []
+        if (ckpt_warmup_steps is not None
+                and int(ckpt_warmup_steps) != int(self.warmup_steps)):
+            mismatches.append(
+                f"warmup_steps: ckpt={ckpt_warmup_steps} vs cfg={self.warmup_steps}")
+        if ckpt_warmup_lr is not None and float(ckpt_warmup_lr) != float(self.warmup_lr):
+            mismatches.append(
+                f"warmup_lr: ckpt={ckpt_warmup_lr} vs cfg={self.warmup_lr}")
+        if ckpt_base_lr is not None and float(ckpt_base_lr) != float(self.base_lr):
+            mismatches.append(
+                f"base_lr: ckpt={ckpt_base_lr} vs cfg={self.base_lr}")
+        if mismatches:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Warmup config drift on resume (%s). `current_step` will be "
+                "restored but the schedule shape differs; LR trajectory "
+                "may not match the original run.", "; ".join(mismatches))
+
         self.current_step = int(state.get("current_step", 0))
         base_state = state.get("base_scheduler", None)
         if base_state is not None and self.scheduler is not None:
@@ -324,13 +354,22 @@ class Trainer:
         # correct behaviour for segmentation masks; if weight maps ever
         # need continuous-value resampling, the augmentor must be extended
         # to accept per-channel interpolation modes.
-        self.augmentor = GPUAugmentor(cfg.augment)
+        # Pass the largest multi-res scale so the augmentor can keep elastic
+        # deformation physically conservative (BUG-E). For single-resolution
+        # inputs (multi_res_scales == [1.0] or empty), max_scale==1.0 and the
+        # augmentor is bit-identical to the previous behaviour.
+        _scales = cfg.data.multi_res_scales or [1.0]
+        self.augmentor = GPUAugmentor(cfg.augment, max_scale=max(_scales))
 
-        # --- Cropping (oversampled cubic patches) ---------------------
+        # --- Cropping (oversampled patches) ---------------------------
+        # Both `z_axis` and `cubic` patch modes now honour
+        # `aug_oversample_ratio` (BUG-B): the dataset emits an oversized
+        # patch, the augmentor applies spatial transforms (whose
+        # `padding_mode="zeros"` at rotated corners would otherwise leak
+        # into the effective field-of-view), and we center-crop back to
+        # `patch_size` here after augmentation.
         self.target_patch_size = tuple(cfg.data.patch_size)  # (D, H, W)
-        self.needs_crop = (
-            cfg.data.patch_mode == "cubic"
-            and cfg.data.aug_oversample_ratio > 1.0)
+        self.needs_crop = cfg.data.aug_oversample_ratio > 1.0
 
         # --- Gradient accumulation ------------------------------------
         self.grad_accum_steps = max(tc.grad_accum_steps, 1)

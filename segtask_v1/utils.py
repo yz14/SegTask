@@ -58,6 +58,16 @@ class ModelEMA:
     live parameters) instead of building a full deep copy every validation
     cycle. For large models this removes hundreds of MB of per-validation
     allocation and eliminates a CPU-side copy stall.
+
+    Distributed training notes (ISSUE-M):
+        This implementation is designed for SINGLE-GPU / single-process
+        training. It stores a full parameter-sized shadow + backup on the
+        live model's device (~2x model memory). Under DDP it would
+        replicate shadow/backup per rank; under FSDP it would break because
+        `state_dict()` returns sharded tensors. If the project later adopts
+        DDP/FSDP, revisit with one of:
+          * shadow only on rank 0 and broadcast swapped weights, or
+          * use `torch.optim.swa_utils.AveragedModel` which handles DDP.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
