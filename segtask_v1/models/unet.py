@@ -21,7 +21,10 @@ from typing import Dict, List, Union
 import torch
 import torch.nn as nn
 
-from .blocks import ConvNormAct, Downsample, Upsample, get_norm
+import torch.nn.functional as F
+
+from .blocks import AttentionGate3D, ConvNormAct, Downsample, Upsample, get_norm
+from .stem import build_stem
 
 
 class Encoder(nn.Module):
@@ -38,12 +41,16 @@ class Encoder(nn.Module):
         stage_builder,
         norm_type: str = "instance",
         norm_groups: int = 8,
-        activation: str = "leakyrelu"):
+        activation: str = "leakyrelu",
+        downsample_mode: str = "conv",
+        stem_mode: str = "conv3"):
         super().__init__()
-        # Stem: project input to first channel count
-        self.stem = ConvNormAct(
-            in_channels, stage_channels[0],
-            kernel_size=3, stride=1, padding=1,
+        # Stem: project input to first channel count. The stem may introduce
+        # a spatial stride (``patch2``/``patch4``) — ``stem_stride`` is
+        # preserved as a property so the wrapping UNet can add a matching
+        # final upsample when necessary.
+        self.stem, self.stem_stride = build_stem(
+            stem_mode, in_channels, stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation)
 
@@ -56,8 +63,10 @@ class Encoder(nn.Module):
             self.stages.append(stage_builder(in_ch, ch))
             if i > 0:
                 self.downsamples.append(
-                    Downsample(stage_channels[i - 1], stage_channels[i - 1],
-                               norm_type, norm_groups))
+                    Downsample(
+                        stage_channels[i - 1], stage_channels[i - 1],
+                        norm_type=norm_type, norm_groups=norm_groups,
+                        mode=downsample_mode))
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Returns features from each level: [level_0, level_1, ..., level_N]."""
@@ -72,7 +81,14 @@ class Encoder(nn.Module):
 
 
 class DecoderLevel(nn.Module):
-    """Single decoder level: upsample + skip fusion + stage blocks."""
+    """Single decoder level: upsample + (optional attention-gated) skip
+    fusion + stage blocks.
+
+    Args:
+        skip_attention: if True, the skip feature is re-weighted by an
+            ``AttentionGate3D`` driven by the upsampled decoder feature
+            (Oktay et al., "Attention U-Net", MIDL 2018).
+    """
 
     def __init__(
         self,
@@ -81,7 +97,8 @@ class DecoderLevel(nn.Module):
         out_ch: int,
         stage_builder,
         upsample_mode: str = "transpose",
-        skip_mode: str = "cat"):
+        skip_mode: str = "cat",
+        skip_attention: bool = False):
         super().__init__()
         self.skip_mode = skip_mode
         self.upsample  = Upsample(in_ch, out_ch, mode=upsample_mode)
@@ -95,6 +112,10 @@ class DecoderLevel(nn.Module):
                 if skip_ch != out_ch else nn.Identity())
             fused_ch = out_ch
 
+        self.attn_gate = (
+            AttentionGate3D(x_ch=skip_ch, g_ch=out_ch)
+            if skip_attention else None
+        )
         self.stage = stage_builder(fused_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -103,6 +124,11 @@ class DecoderLevel(nn.Module):
         # Handle size mismatch (can happen due to odd input sizes)
         if x.shape[2:] != skip.shape[2:]:
             x = _match_size(x, skip.shape[2:])
+
+        if self.attn_gate is not None:
+            # Gate skip using the upsampled decoder feature as the gating
+            # signal (shapes now match after the resize above).
+            skip = self.attn_gate(skip, x)
 
         if self.skip_mode == "cat":
             x = torch.cat([x, skip], dim=1)
@@ -124,7 +150,8 @@ class Decoder(nn.Module):
         encoder_channels: List[int],
         stage_builder,
         upsample_mode: str = "transpose",
-        skip_mode: str = "cat"):
+        skip_mode: str = "cat",
+        skip_attention: bool = False):
         super().__init__()
         self.levels = nn.ModuleList()
         n = len(encoder_channels)
@@ -138,7 +165,9 @@ class Decoder(nn.Module):
 
             self.levels.append(
                 DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
-                             upsample_mode, skip_mode))
+                             upsample_mode=upsample_mode,
+                             skip_mode=skip_mode,
+                             skip_attention=skip_attention))
 
         # Output channels at each decoder level (low-res → high-res)
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
@@ -185,7 +214,7 @@ class UNet3D(nn.Module):
     def __init__(
         self,
         encoder: Encoder,
-        decoder: Decoder,
+        decoder,
         num_fg_classes: int,
         deep_supervision: bool = False):
         super().__init__()
@@ -194,7 +223,13 @@ class UNet3D(nn.Module):
         self.num_fg_classes   = num_fg_classes
         self.deep_supervision = deep_supervision
 
-        # Main segmentation head (highest resolution decoder output)
+        # Main segmentation head (highest resolution decoder output). If the
+        # encoder uses a patch-embed stem (stride > 1), the decoder's highest
+        # resolution is input/stem_stride, so the main output must be
+        # upsampled back to the original input resolution. DS heads remain
+        # at their native decoder resolutions — DeepSupervisionLoss already
+        # downsamples the target to match.
+        self.stem_stride = getattr(encoder, "stem_stride", 1)
         self.seg_head = SegmentationHead(decoder.out_channels[-1], num_fg_classes)
 
         # Deep supervision heads (lower-resolution outputs).
@@ -223,6 +258,13 @@ class UNet3D(nn.Module):
         dec_features = self.decoder(enc_features)
 
         main_out = self.seg_head(dec_features[-1])
+        if self.stem_stride > 1:
+            # Restore main output to the original input resolution. Use
+            # trilinear (bilinear equivalent) up-sampling — consistent with
+            # SegFormer/nnFormer-style patch-embed decoders.
+            main_out = F.interpolate(
+                main_out, size=x.shape[2:],
+                mode="trilinear", align_corners=False)
 
         if not self.deep_supervision or not self.training:
             return main_out

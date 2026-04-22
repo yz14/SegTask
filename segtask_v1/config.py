@@ -165,8 +165,26 @@ class ModelConfig:
         default_factory=lambda: [32, 64, 128, 256, 512]
     )
 
-    # Blocks per encoder/decoder level
+    # Blocks per encoder/decoder level (used when encoder_blocks_per_stage
+    # and decoder_blocks_per_stage are both empty — kept for back-compat).
     blocks_per_level: int = 2
+
+    # Residual block variant (see models.resnet): "basic" | "preact" | "bottleneck".
+    # ConvNeXt backbone ignores this field.
+    block_type: str = "basic"
+
+    # Asymmetric per-stage block counts (nnU-Net ResEncUNet style).
+    # Length must equal len(encoder_channels) when non-empty. Decoder length
+    # must equal len(encoder_channels) - 1 when non-empty.
+    encoder_blocks_per_stage: List[int] = field(default_factory=list)
+    decoder_blocks_per_stage: List[int] = field(default_factory=list)
+
+    # nnU-Net ResEnc preset (Isensee et al., MICCAI 2024).
+    # One of: "none" | "S" | "M" | "L" | "XL". When != "none" AND the user
+    # has not supplied explicit per-stage counts, ``sync()`` auto-populates
+    # encoder_blocks_per_stage (trimmed/extended to len(encoder_channels))
+    # and sets decoder_blocks_per_stage = [1, 1, ...].
+    resenc_preset: str = "none"
 
     # Normalization: "batch", "instance", "group"
     norm_type: str = "instance"
@@ -178,14 +196,43 @@ class ModelConfig:
     # Dropout in blocks
     dropout: float = 0.0
 
-    # Squeeze-and-Excitation attention (channel attention)
+    # Squeeze-and-Excitation attention (legacy flag; prefer attention_type).
+    # When attention_type == "none" and use_se == True, SE is enabled.
     use_se: bool = False
     se_reduction: int = 16
+
+    # In-block channel/spatial attention applied inside each ResNet/ConvNeXt
+    # block. One of: "none" | "se" | "eca" | "cbam" | "coord".
+    attention_type: str = "none"
+
+    # AttentionGate3D on skip connections (Oktay et al., MIDL 2018).
+    skip_attention: bool = False
 
     # Deep supervision: output predictions at multiple decoder levels
     deep_supervision: bool = False
 
-    # Upsampling mode: "transpose" or "trilinear"
+    # Stem / patch-embed (see models.stem.build_stem):
+    # "conv3" | "conv7" | "dual" | "patch2" | "patch4".
+    # patchN stems reduce input resolution by N; UNet3D adds a matching
+    # trilinear upsample on the main output to restore original resolution.
+    stem_mode: str = "conv3"
+
+    # Decoder topology:
+    #   "unet"   — classical symmetric UNet decoder (default).
+    #   "unetpp" — UNet++ nested dense decoder (Zhou et al., DLMIA 2018).
+    #   "unet3p" — Full-scale skip decoder (Huang et al., ICASSP 2020).
+    decoder_type: str = "unet"
+
+    # UNet3+ per-branch channel count (only used when decoder_type=="unet3p").
+    unet3p_cat_channels: int = 64
+
+    # Downsampling mode (see models.blocks.Downsample):
+    # "conv" | "maxpool" | "avgpool" | "blurpool" | "pixelunshuffle"
+    downsample_mode: str = "conv"
+
+    # Upsampling mode (see models.blocks.Upsample):
+    # "transpose" | "trilinear" | "nearest" | "pixelshuffle"
+    #   | "carafe" | "dysample"
     upsample_mode: str = "transpose"
 
     # Skip connection mode: "cat" (concatenate) or "add"
@@ -360,6 +407,43 @@ class Config:
         if self.data.patch_mode == "cubic":
             self.model.in_channels = len(self.data.multi_res_scales)
 
+        # nnU-Net ResEnc preset: populate per-stage block counts when the
+        # user has not supplied explicit lists.
+        self._apply_resenc_preset()
+
+    def _apply_resenc_preset(self) -> None:
+        """Expand ``model.resenc_preset`` into per-stage block counts."""
+        mc = self.model
+        preset = (mc.resenc_preset or "none").lower()
+        if preset == "none":
+            return
+        if mc.encoder_blocks_per_stage and mc.decoder_blocks_per_stage:
+            # User-supplied lists win over preset.
+            return
+
+        n_levels = len(mc.encoder_channels)
+        templates = {
+            "s":  [1, 2, 2, 2, 2, 2],
+            "m":  [1, 3, 4, 6, 6, 6],
+            "l":  [1, 3, 4, 6, 6, 6, 6],
+            "xl": [1, 4, 6, 8, 8, 10, 10, 10],
+        }
+        if preset not in templates:
+            return  # validate() will flag the error.
+
+        tpl = templates[preset]
+        # Trim or extend (repeating the deepest-stage count) to match n_levels.
+        if n_levels <= len(tpl):
+            enc_blocks = tpl[:n_levels]
+        else:
+            enc_blocks = tpl + [tpl[-1]] * (n_levels - len(tpl))
+
+        if not mc.encoder_blocks_per_stage:
+            mc.encoder_blocks_per_stage = enc_blocks
+        if not mc.decoder_blocks_per_stage:
+            # Lightweight decoder = 1 block / stage (ResEnc recipe).
+            mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
+
     def validate(self) -> None:
         """Validate configuration for consistency."""
         assert self.model.backbone in ("resnet", "convnext"), \
@@ -368,6 +452,45 @@ class Config:
             f"Invalid norm: {self.model.norm_type}"
         assert self.model.activation in ("relu", "leakyrelu", "gelu", "swish"), \
             f"Invalid activation: {self.model.activation}"
+        assert self.model.downsample_mode in (
+            "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
+        ), f"Invalid downsample_mode: {self.model.downsample_mode}"
+        assert self.model.upsample_mode in (
+            "transpose", "trilinear", "nearest", "pixelshuffle",
+            "carafe", "dysample",
+        ), f"Invalid upsample_mode: {self.model.upsample_mode}"
+        assert self.model.skip_mode in ("cat", "add"), \
+            f"Invalid skip_mode: {self.model.skip_mode}"
+        assert self.model.attention_type in (
+            "none", "se", "eca", "cbam", "coord",
+        ), f"Invalid attention_type: {self.model.attention_type}"
+        assert self.model.stem_mode in (
+            "conv3", "conv7", "dual", "patch2", "patch4",
+        ), f"Invalid stem_mode: {self.model.stem_mode}"
+        assert self.model.decoder_type in ("unet", "unetpp", "unet3p"), \
+            f"Invalid decoder_type: {self.model.decoder_type}"
+        assert self.model.unet3p_cat_channels > 0, \
+            "unet3p_cat_channels must be > 0"
+        assert self.model.block_type in ("basic", "preact", "bottleneck"), \
+            f"Invalid block_type: {self.model.block_type}"
+        assert self.model.resenc_preset in ("none", "S", "M", "L", "XL"), \
+            f"Invalid resenc_preset: {self.model.resenc_preset}"
+        # Per-stage block-count lengths must align with encoder depth.
+        n_levels = len(self.model.encoder_channels)
+        ebps = self.model.encoder_blocks_per_stage
+        dbps = self.model.decoder_blocks_per_stage
+        if ebps:
+            assert len(ebps) == n_levels, (
+                f"encoder_blocks_per_stage must have {n_levels} entries "
+                f"(= len(encoder_channels)); got {len(ebps)}")
+            assert all(b >= 1 for b in ebps), \
+                "encoder_blocks_per_stage entries must all be >= 1"
+        if dbps:
+            assert len(dbps) == n_levels - 1, (
+                f"decoder_blocks_per_stage must have {n_levels - 1} entries "
+                f"(= len(encoder_channels) - 1); got {len(dbps)}")
+            assert all(b >= 1 for b in dbps), \
+                "decoder_blocks_per_stage entries must all be >= 1"
         assert self.loss.name in (
             "dice", "bce", "dice_bce", "focal", "dice_focal", "tversky",
         ), f"Invalid loss: {self.loss.name}"

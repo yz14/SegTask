@@ -17,6 +17,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .blocks import make_attention
+
 
 class DropPath(nn.Module):
     """Stochastic depth (drop path) for residual blocks."""
@@ -62,7 +64,8 @@ class ConvNeXtBlock(nn.Module):
     """Single ConvNeXt block (3D version).
 
     Architecture:
-      depthwise 7x7x7 conv → LayerNorm → 1x1 expand (4x) → GELU → 1x1 project → residual
+      depthwise 7x7x7 conv → LayerNorm → 1x1 expand (4x) → GELU → 1x1 project
+      → optional attention (se/eca/cbam/coord) → residual.
     """
 
     def __init__(
@@ -70,6 +73,7 @@ class ConvNeXtBlock(nn.Module):
         dim: int,
         expand_ratio: float = 4.0,
         drop_path: float = 0.0,
+        attention_type: str = "none",
     ):
         super().__init__()
         hidden = int(dim * expand_ratio)
@@ -79,6 +83,7 @@ class ConvNeXtBlock(nn.Module):
         self.pwconv1 = nn.Conv3d(dim, hidden, kernel_size=1, bias=True)
         self.act = nn.GELU()
         self.pwconv2 = nn.Conv3d(hidden, dim, kernel_size=1, bias=True)
+        self.attn = make_attention(attention_type, dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -88,6 +93,7 @@ class ConvNeXtBlock(nn.Module):
         out = self.pwconv1(out)
         out = self.act(out)
         out = self.pwconv2(out)
+        out = self.attn(out)
         return residual + self.drop_path(out)
 
 
@@ -103,6 +109,7 @@ class ConvNeXtAdaptBlock(nn.Module):
         out_ch: int,
         expand_ratio: float = 4.0,
         drop_path: float = 0.0,
+        attention_type: str = "none",
     ):
         super().__init__()
         self.proj = (
@@ -113,7 +120,8 @@ class ConvNeXtAdaptBlock(nn.Module):
             if in_ch != out_ch
             else nn.Identity()
         )
-        self.block = ConvNeXtBlock(out_ch, expand_ratio, drop_path)
+        self.block = ConvNeXtBlock(out_ch, expand_ratio, drop_path,
+                                   attention_type=attention_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(self.proj(x))
@@ -132,14 +140,17 @@ class ConvNeXtStage(nn.Module):
         num_blocks: int = 2,
         expand_ratio: float = 4.0,
         drop_path_rates: list = None,
+        attention_type: str = "none",
     ):
         super().__init__()
         if drop_path_rates is None:
             drop_path_rates = [0.0] * num_blocks
-        blocks = [ConvNeXtAdaptBlock(in_ch, out_ch, expand_ratio, drop_path_rates[0])]
+        blocks = [ConvNeXtAdaptBlock(in_ch, out_ch, expand_ratio,
+                                     drop_path_rates[0], attention_type)]
         for i in range(1, num_blocks):
             dp = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
-            blocks.append(ConvNeXtAdaptBlock(out_ch, out_ch, expand_ratio, dp))
+            blocks.append(ConvNeXtAdaptBlock(out_ch, out_ch, expand_ratio,
+                                             dp, attention_type))
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
