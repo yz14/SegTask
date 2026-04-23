@@ -296,6 +296,40 @@ class LossConfig:
     tversky_alpha: float = 0.3  # FP weight
     tversky_beta: float = 0.7   # FN weight
 
+    # Dice / Tversky aggregation mode: batch_dice sums TP / denom across
+    # the whole batch+spatial before dividing (nnU-Net default for Dice).
+    # Affects BinaryDiceLoss, BinaryTverskyLoss, BinaryFocalTverskyLoss,
+    # GeneralizedDiceLoss (for GDL the default here is overridden to True
+    # in _build_gdl — see paper).
+    batch_dice: bool = False
+    # Per-sample mode only: exclude classes with no GT voxels in the
+    # current sample from the dice mean (prevents empty-class Dice≈1 from
+    # masking errors on other classes).
+    ignore_empty: bool = False
+
+    # ---- Generalized Dice Loss (Sudre et al., DLMIA 2017) ----
+    # Volume-based class re-weighting scheme.
+    # "square" (paper) | "simple" (w=1/Σt) | "uniform" (disabled).
+    gdl_weight_type: str = "square"
+    gdl_w_max: float = 1.0e5    # clamp 1/volume to avoid explosion on empty classes
+
+    # ---- Focal Tversky Loss (Abraham & Khan, ISBI 2019) ----
+    # Our convention: (1 - TI)^gamma with gamma ≥ 1 → focus on hard classes.
+    # Default 4/3 matches the authors' γ_paper = 0.75 recommendation.
+    focal_tversky_gamma: float = 4.0 / 3.0
+
+    # ---- Lovász-Hinge (Berman et al., CVPR 2018) ----
+    # per_sample=True → average loss over (B, C) independent sorts (default);
+    # per_sample=False → batch-level Lovász (one sort over all B samples per
+    #                    channel), smoother on tiny patches.
+    lovasz_per_sample: bool = True
+
+    # ---- Soft clDice (Shit et al., CVPR 2021) ----
+    # Skeletonisation iterations. Paper: 3 for 2D, 3–10 for 3D depending on
+    # structure thickness.
+    cldice_iter: int = 3
+    cldice_smooth: float = 1.0
+
     # Deep supervision weight decay
     deep_supervision_weights: List[float] = field(
         default_factory=lambda: [1.0, 0.5, 0.25, 0.125]
@@ -509,8 +543,24 @@ class Config:
             assert all(b >= 1 for b in dbps), \
                 "decoder_blocks_per_stage entries must all be >= 1"
         assert self.loss.name in (
-            "dice", "bce", "dice_bce", "focal", "dice_focal", "tversky",
+            # Classical single losses.
+            "dice", "bce", "focal", "tversky",
+            # High-quality single losses (Round "new losses").
+            "gdl", "focal_tversky", "lovasz", "cldice",
+            # Compounds.
+            "dice_bce", "dice_focal", "dice_tversky",
+            "focal_plus_tversky",   # legacy (Focal + Tversky summed)
+            "dice_cldice",          # Shit et al. 2021 recipe
+            "dice_focal_tversky",   # Dice + Abraham 2019 FTL
+            "dice_lovasz", "bce_lovasz",
+            "gdl_bce", "gdl_focal",
         ), f"Invalid loss: {self.loss.name}"
+        assert self.loss.gdl_weight_type in ("square", "simple", "uniform"), (
+            f"Invalid gdl_weight_type: {self.loss.gdl_weight_type}")
+        assert self.loss.focal_tversky_gamma > 0, (
+            f"focal_tversky_gamma must be > 0, got {self.loss.focal_tversky_gamma}")
+        assert self.loss.cldice_iter >= 1, (
+            f"cldice_iter must be >= 1, got {self.loss.cldice_iter}")
         assert self.train.optimizer in ("adam", "adamw", "sgd"), \
             f"Invalid optimizer: {self.train.optimizer}"
         assert self.train.scheduler in (

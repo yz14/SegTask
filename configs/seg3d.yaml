@@ -248,13 +248,31 @@ model:
 # LOSS — 损失函数
 # =====================================================================
 loss:
-  # name:
-  #   "dice"        : Soft Dice
-  #   "bce"         : Binary CE with logits（按前景类独立）
-  #   "dice_bce"    : compound = w[0] * dice + w[1] * bce
-  #   "focal"       : Focal loss (Lin et al. ICCV 2017)
-  #   "dice_focal"  : compound = w[0] * dice + w[1] * focal
-  #   "tversky"     : Tversky loss（FP/FN 非对称权重）
+  # name — 单独损失 (single):
+  #   "dice"           : Soft Dice
+  #   "bce"            : Binary CE with logits（按前景类独立）
+  #   "focal"          : Focal loss (Lin et al. ICCV 2017)
+  #   "tversky"        : Tversky loss（FP/FN 非对称权重）
+  #   "gdl"            : Generalized Dice (Sudre et al. DLMIA 2017)
+  #                      ——自动按类别体积倒数加权，强不平衡下首选。
+  #   "focal_tversky"  : Focal Tversky (Abraham & Khan ISBI 2019)
+  #                      ——小病灶/细结构友好，γ>1 聚焦难类。
+  #   "lovasz"         : Lovász-Hinge (Berman et al. CVPR 2018)
+  #                      ——IoU 直接替代梯度，与 Dice/BCE 互补。
+  #   "cldice"         : Soft clDice (Shit et al. CVPR 2021)
+  #                      ——拓扑保持（血管/气道连通性）。单用慎重，建议与 Dice 组合。
+  #
+  # name — 复合损失 (compound, 权重见 compound_weights):
+  #   "dice_bce"           : Dice + BCE（通用默认）
+  #   "dice_focal"         : Dice + Focal
+  #   "dice_tversky"       : Dice + Tversky
+  #   "focal_plus_tversky" : Focal + Tversky（= 旧版 "focal_tversky" 复合）
+  #   "dice_cldice"        : Dice + clDice（Shit 原论文推荐组合）
+  #   "dice_focal_tversky" : Dice + Focal Tversky
+  #   "dice_lovasz"        : Dice + Lovász
+  #   "bce_lovasz"         : BCE + Lovász
+  #   "gdl_bce"            : Generalized Dice + BCE
+  #   "gdl_focal"          : Generalized Dice + Focal
   name: "dice_bce"
 
   # Compound 组分权重 [loss1_w, loss2_w]（仅 dice_bce / dice_focal 使用）。
@@ -281,6 +299,37 @@ loss:
   # 对漏检敏感的任务（召回优先）：alpha<beta，如 0.3 / 0.7。
   tversky_alpha: 0.3
   tversky_beta : 0.7
+
+  # ---- Dice / Tversky 聚合模式 ----------------------------------------
+  # batch_dice: true → 先在 batch+空间维聚合 TP/denom 再求商（nnU-Net 默认，
+  #                   对稀疏前景 patch 更稳）。false → 逐 sample-class 计算
+  #                   再求平均。GDL 无论此开关均用 batch_dice=true。
+  # batch_dice: false
+  # ignore_empty: 仅 per-sample 模式生效。true → 当前样本缺失的前景类不参
+  #               与类平均（避免 dice=1 假象掩盖其它类误差）。
+  # ignore_empty: false
+
+  # ---- Generalized Dice Loss (GDL) ------------------------------------
+  # gdl_weight_type:
+  #   "square"  : w_c = 1 / (Σ t_c)^2    （Sudre et al. 原论文推荐）
+  #   "simple"  : w_c = 1 / Σ t_c
+  #   "uniform" : 禁用自动加权（≈ batch_dice 的 Dice）
+  # gdl_weight_type: "square"
+  # gdl_w_max: 1.0e5     # 1/volume 的夹紧上限，防空类爆炸
+
+  # ---- Focal Tversky (Abraham & Khan 2019) ---------------------------
+  # 本实现 (1 - TI)^gamma，gamma ≥ 1 聚焦难类；默认 4/3 对应原论文 γ=0.75。
+  # focal_tversky_gamma: 1.3333
+
+  # ---- Lovász-Hinge (Berman et al. 2018) -----------------------------
+  # per_sample=true → 每 (B, C) 独立排序取平均（默认）
+  # per_sample=false → channel 级 batch 内一次排序，对 tiny patch 更平滑
+  # lovasz_per_sample: true
+
+  # ---- Soft clDice (Shit et al. 2021) --------------------------------
+  # cldice_iter: 软骨架化迭代次数（2D 推荐 3，3D 粗血管 3~5，细血管 5~10）。
+  # cldice_iter : 3
+  # cldice_smooth: 1.0
 
   # Deep supervision 每层 loss 权重（由浅到深衰减）。
   # 需与 model.deep_supervision: true 搭配。长度 ≤ decoder 层数。
