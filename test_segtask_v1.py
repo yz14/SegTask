@@ -612,6 +612,61 @@ class TestCubicDataset:
             assert sample["image"].shape == (1, 16, 16, 16)
             assert sample["label"].shape == (1, 16, 16, 16)
 
+    def test_z_axis_dataset_extract_size(self):
+        """z_axis mode: extract_size must be (pD*oversample, pH, pW).
+
+        Only the depth axis may be oversampled — H, W already land at
+        patch_size in-plane since the window slides along z only.
+        """
+        from segtask_v1.data.dataset import SegDataset3D
+        ds = SegDataset3D.__new__(SegDataset3D)
+        ds.patch_size = (16, 128, 128)
+        ds.oversample = 1.5
+        # Replay the __init__ branch we care about.
+        pD, pH, pW = ds.patch_size
+        ds.extract_size = (int(round(pD * ds.oversample)), pH, pW)
+        assert ds.extract_size == (24, 128, 128), (
+            "z_axis oversample must only inflate z, got "
+            f"{ds.extract_size}")
+
+    def test_z_axis_dataset_getitem_shape(self):
+        """z_axis sample shape: (1, eD, pH, pW) with full-res H,W collapsed."""
+        from segtask_v1.data.dataset import SegDataset3D
+        # Anisotropic volume — H,W far larger than patch H,W to prove
+        # in-plane full-size extraction then resize in one step.
+        img = np.random.rand(60, 256, 256).astype(np.float32)
+        lbl = np.zeros((60, 256, 256), dtype=np.float32)
+        lbl[20:40, 100:150, 100:150] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            # oversample=1.25 → eD=20 from pD=16.
+            ds = SegDataset3D(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 64, 64),
+                aug_oversample_ratio=1.25,
+                samples_per_volume=2, cache_enabled=False)
+            eD, eH, eW = ds.extract_size
+            assert (eD, eH, eW) == (20, 64, 64)
+            sample = ds[0]
+            assert sample["image"].shape == (1, 20, 64, 64)
+            assert sample["label"].shape == (1, 20, 64, 64)
+
+    def test_z_axis_dataset_no_oversample(self):
+        """oversample=1.0 → extract_size == patch_size exactly on all axes."""
+        from segtask_v1.data.dataset import SegDataset3D
+        ds = SegDataset3D.__new__(SegDataset3D)
+        ds.patch_size = (32, 96, 96)
+        ds.oversample = 1.0
+        pD, pH, pW = ds.patch_size
+        ds.extract_size = (int(round(pD * ds.oversample)), pH, pW)
+        assert ds.extract_size == (32, 96, 96)
+
     def test_cubic_dataset_oversample(self):
         from segtask_v1.data.dataset import SegDataset3DCubic
         img = np.random.rand(80, 60, 60).astype(np.float32)

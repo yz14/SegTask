@@ -176,17 +176,30 @@ class VolumeCache:
 # 3D Segmentation Dataset
 # ---------------------------------------------------------------------------
 class SegDataset3D(Dataset):
-    """3D patch-based segmentation dataset.
+    """3D z-axis sliding-window segmentation dataset.
 
-    Z-axis patching strategy:
-      - Select a center z-position (with foreground oversampling)
-      - Extract D slices centered at z (shift window at boundaries)
-      - If volume depth < D: extract all slices, pad to D with zeros
-      - Resample the patch to (D, H, W) via 3D zoom
+    Z-axis patching semantics — the window slides ALONG Z ONLY; the in-plane
+    (H, W) extent is always the full volume resolution, not a sub-crop.
+
+    Pipeline per sample::
+
+        (D_vol, H_vol, W_vol)               e.g. (300, 512, 512)
+            │  sample center z, take eD slices along z axis
+            ▼
+        (eD_slices, H_vol, W_vol)           full-resolution in-plane
+            │  resize_3d to (eD, pH, pW)
+            ▼
+        (eD, pH, pW)                        trainer center-crops eD → pD
+
+    `aug_oversample_ratio` applies to the Z axis ONLY. H, W already collapse
+    to `patch_size` directly and therefore need no extra margin (the
+    augmentor's rotation / elastic artefacts in-plane are identical to what
+    the inference path sees, which also resizes H_vol → pH, pW in one step
+    — keeping train and inference distributions consistent).
 
     Each sample returns:
-      image: (1, D, H, W) float32
-      label: (num_fg, D, H, W) float32 binary masks
+      image: (1, eD, pH, pW) float32
+      label: (1, eD, pH, pW) float32 raw integer labels (binarized at loss time)
     """
 
     def __init__(
@@ -216,13 +229,15 @@ class SegDataset3D(Dataset):
         self.label_values = label_values
         self.patch_size = tuple(patch_size)
         self.oversample = float(aug_oversample_ratio)
-        # When oversampling, we extract a larger patch from the volume and the
-        # TRAINER center-crops back to patch_size after GPU augmentation. This
-        # symmetrises the rotation/elastic black-corner artefacts into the
-        # cropped margin. `extract_size` applies to every axis (D, H, W) to
-        # keep z-axis rotations well-behaved, mirroring the cubic mode.
-        self.extract_size = tuple(
-            int(round(p * self.oversample)) for p in self.patch_size)
+        # Z-axis mode: ONLY the z (depth) extent is oversampled so the trainer
+        # can center-crop rotation / elastic margin along z after GPU aug.
+        # H, W are taken at full volume resolution during extraction and
+        # resized straight to patch_size (pH, pW) — no in-plane sub-crop
+        # exists, so no oversample margin is needed or meaningful there.
+        # This also matches `predictor._sliding_window_z`, which feeds the
+        # model H_vol → pH, pW in a single resize step.
+        pD, pH, pW = self.patch_size
+        self.extract_size = (int(round(pD * self.oversample)), pH, pW)
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -292,19 +307,23 @@ class SegDataset3D(Dataset):
         vol_idx  = idx % len(self.image_paths)
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
-        # Extract at the oversized shape; the trainer center-crops back to
-        # patch_size after GPU augmentation (mirrors the cubic-mode pipeline).
-        # When oversample == 1.0, eD/eH/eW == patch_size and no crop is
-        # required; behaviour is bit-identical to the previous code path.
+        # `extract_size == (eD, pH, pW)` — only z is oversampled (the trainer
+        # later center-crops eD → pD after GPU augmentation); H, W go straight
+        # to patch_size via the resize below. When oversample == 1.0 then
+        # eD == pD and the trainer skips the z crop as well.
         eD, eH, eW = self.extract_size
 
         # Select center z-position, z轴中心坐标
         z = self._sample_z(vol_idx, D_vol)
 
-        # Extract eD slices centered at z (shifted at volume bounds).
+        # Extract up to eD slices centered at z (clamped to volume bounds),
+        # at full in-plane resolution: shape (actual_d, H_vol, W_vol).
         img_patch, lbl_patch = self._extract_z_patch(img, lbl, z, eD)
 
-        # 3D resample to oversized target (eD, eH, eW).
+        # Resize in a single 3D zoom:
+        #   (actual_d, H_vol, W_vol) → (eD, pH, pW)
+        # H_vol, W_vol collapse directly to patch_size (pH, pW) — matching
+        # the inference-time `predictor._sliding_window_z` behaviour.
         img_patch = resize_3d(img_patch, eD, eH, eW, is_label=False)
         lbl_patch = resize_3d(lbl_patch, eD, eH, eW, is_label=True)
 
@@ -567,8 +586,7 @@ class SegDataset3DCubic(Dataset):
         return result
 
     def _safe_center_range(
-        self, D: int, H: int, W: int
-    ) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+        self, D: int, H: int, W: int) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
         """Return `(lo, hi)` center-coordinate bounds on each axis that keep
         the entire largest multi-res cube inside the volume.
 

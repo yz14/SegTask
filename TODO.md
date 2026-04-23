@@ -33,4 +33,4 @@
 
 
 # TODO  
-1. D:\codes\work-projects\SegTask\segtask_v1\train.py是训练入口。我设计了两种3D分割算法，一种是在z轴滑块，一种是中心点滑块（在x,y,z都滑块，支持多分辨率/感受野输入）。请你优化模型的上采样层和下采样层，需要增加公认高质量，有效的上采样和下采样层。  
+1. D:\codes\work-projects\SegTask\segtask_v1\train.py是训练入口。我设计了两种3D分割算法，一种是在z轴滑块，一种是中心点滑块（在x,y,z都滑块，支持多分辨率/感受野输入）。z轴滑块有问题，z轴是只沿着z轴取连续若干切片作为3D，x,y轴是全尺寸而不是切块，例如300x512x512，z轴滑块后是Dx512x512，然后resize到DxHxW。  

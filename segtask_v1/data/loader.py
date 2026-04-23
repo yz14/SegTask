@@ -46,8 +46,7 @@ def discover_samples(
 
 
 def detect_label_values(
-    label_paths: List[str], max_scan: Optional[int] = None,
-) -> List[int]:
+    label_paths: List[str], max_scan: Optional[int] = None) -> List[int]:
     """Auto-detect unique label values from the label files.
 
     Scans ALL label files by default (previously only the first 5, which
@@ -68,7 +67,7 @@ def detect_label_values(
 
     all_labels = set()
     for path in scan_paths:
-        lbl = load_nifti(path)
+        lbl    = load_nifti(path)
         unique = np.unique(np.round(lbl).astype(np.int32)).tolist()
         all_labels.update(unique)
 
@@ -94,8 +93,7 @@ def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], Lis
 
 
 def _volume_primary_class(
-    label_path: str, label_values: List[int],
-) -> int:
+    label_path: str, label_values: List[int]) -> int:
     """Return the label value that occupies the most voxels in the volume
     (background counted too). Ties break on the smallest label value.
     """
@@ -114,8 +112,7 @@ def stratified_train_val_split(
     label_values: List[int],
     val_ratio: float,
     seed: int,
-    use_foreground_only: bool = True,
-) -> Tuple[List[int], List[int]]:
+    use_foreground_only: bool = True) -> Tuple[List[int], List[int]]:
     """Stratified split by each volume's primary label.
 
     Each volume is assigned a stratum equal to the most-frequent foreground
@@ -130,7 +127,7 @@ def stratified_train_val_split(
     too small to stratify (fewer than 2 samples per stratum would leave
     some strata empty on one side).
     """
-    n = len(label_paths)
+    n   = len(label_paths)
     rng = np.random.RandomState(seed)
 
     # Determine which label values are used as strata keys.
