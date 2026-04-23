@@ -30,15 +30,14 @@ from torch.amp import autocast
 from .config import Config
 from .data.dataset import (
     load_nifti, preprocess_image, resize_3d, _extract_cubic_patch,
-)
+    extract_z_patch_padded)
 
 logger = logging.getLogger(__name__)
 
 
 _AMP_DTYPES = {
     "float16": torch.float16, "fp16": torch.float16,
-    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-}
+    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16}
 
 
 class Predictor:
@@ -128,7 +127,9 @@ class Predictor:
             raw_vol, dc.intensity_min, dc.intensity_max,
             dc.normalize, dc.global_mean, dc.global_std)
 
-        if self.patch_mode == "cubic":
+        if self.patch_mode == "whole":
+            prob_volume = self._whole_volume_forward(vol)
+        elif self.patch_mode == "cubic":
             prob_volume = self._sliding_window_cubic(vol)
         else:
             prob_volume = self._sliding_window_z(vol)
@@ -148,8 +149,20 @@ class Predictor:
         """Sliding window along z-axis with overlap and blending.
 
         H and W are always resized to the model's input size (no spatial
-        windowing on those axes). Multi-resolution inputs do not apply
-        here — z-axis mode feeds the model a single-channel volume.
+        windowing on those axes).
+
+        Multi-resolution support (z-axis only):
+            For each scale s in ``multi_res_scales``, extract
+            ``round(pD * s)`` slices centered on the window's z-center
+            (edge-replicated at volume bounds), resize to ``(pD, pH, pW)``,
+            and stack as channel s. The resulting batch has shape
+            ``(B, C_res, pD, pH, pW)``, matching the training contract of
+            ``SegDataset3D`` with ``multi_res_scales``.
+
+            For a single-scale ``[1.0]`` config, the per-window tensor is
+            built identically to the legacy single-res z-axis path (tail
+            windows with ``actual_d < pD`` are still resized-stretched,
+            preserving previous behaviour).
         """
         D_orig, H_orig, W_orig = vol.shape
         pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
@@ -159,7 +172,8 @@ class Predictor:
 
         logger.info(
             "Z-axis sliding window: D_patch=%d, stride=%d, num_windows=%d, "
-            "blend=%s", pD, stride, len(z_positions), self.blend_mode)
+            "scales=%s, blend=%s",
+            pD, stride, len(z_positions), self.multi_res_scales, self.blend_mode)
 
         z_weight = self._build_1d_weight(pD)  # (pD,) float32
 
@@ -170,26 +184,25 @@ class Predictor:
                             dtype=np.float32)
         acc_weight = np.zeros((1, D_orig, 1, 1), dtype=np.float32)
 
-        patches: List[np.ndarray] = []
+        # Per-window input tensors (already stacked across scales:
+        # (C_res, pD, pH, pW)) and their source metadata for accumulation.
+        window_inputs: List[np.ndarray] = []
         patch_metas: List[Tuple[int, int, int]] = []  # (z0, z1, actual_d)
 
         n_windows = len(z_positions)
         for idx, (z0, z1) in enumerate(z_positions):
-            patch = vol[z0:z1]                 # (actual_d, H_orig, W_orig)
-            actual_d = patch.shape[0]
-            # Resize H, W to model input; keep actual z-depth. If the tail
-            # window is short (actual_d < pD), resize to pD for the model
-            # and trim the output back to actual_d when accumulating.
-            patch_resized = resize_3d(
-                patch, pD, pH, pW, is_label=False)
-            patches.append(patch_resized)
+            actual_d = z1 - z0
+            window_inputs.append(
+                self._build_z_window_input(vol, z0, z1))
             patch_metas.append((z0, z1, actual_d))
 
             is_last = idx == n_windows - 1
-            if len(patches) >= self.batch_size or is_last:
-                # z-axis mode: single-resolution, single-channel batch.
-                batch = self._build_batch_single_res(patches)  # (B,1,D,H,W)
-                probs = self._forward_batch(batch)             # (B,num_fg,D,H,W)
+            if len(window_inputs) >= self.batch_size or is_last:
+                # (B, C_res, pD, pH, pW)
+                batch = torch.from_numpy(
+                    np.stack(window_inputs, axis=0).astype(np.float32)
+                ).to(self.device, non_blocking=True)
+                probs = self._forward_batch(batch)   # (B, num_fg, pD, pH, pW)
 
                 for pred, (zs, ze, ad) in zip(probs, patch_metas):
                     # Resize prediction back: (num_fg, pD, pH, pW)
@@ -206,7 +219,7 @@ class Predictor:
                     acc_pred[:, zs:ze, :, :] += pred_orig * w_4d
                     acc_weight[:, zs:ze, :, :] += w_4d
 
-                patches.clear()
+                window_inputs.clear()
                 patch_metas.clear()
 
                 if (idx + 1) % max(1, 10 * self.batch_size) == 0 or is_last:
@@ -214,6 +227,69 @@ class Predictor:
 
         np.maximum(acc_weight, 1e-8, out=acc_weight)
         return acc_pred / acc_weight
+
+    def _build_z_window_input(
+        self, vol: np.ndarray, z0: int, z1: int) -> np.ndarray:
+        """Build the multi-scale input stack for one z-sliding window.
+
+        For scale == 1.0 the legacy path is preserved exactly:
+            take ``vol[z0:z1]`` (possibly shorter than pD at the tail)
+            and resize to ``(pD, pH, pW)``.
+
+        For scale > 1.0 we extract ``round(pD * scale)`` slices centered
+        on the window's z-center with edge-replicate padding, so the
+        physical z-FOV stays proportional to ``scale`` even when the
+        window touches the volume boundary.
+
+        Returns:
+            ``(C_res, pD, pH, pW)`` float32 — one channel per scale, in
+            the same order as ``self.multi_res_scales``.
+        """
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+        z_center = (z0 + z1) // 2
+        channels: List[np.ndarray] = []
+        for scale in self.multi_res_scales:
+            if scale == 1.0:
+                # Legacy tail-window behaviour: take actual slice, resize.
+                patch = vol[z0:z1]
+            else:
+                D_s = int(round(pD * scale))
+                patch = extract_z_patch_padded(vol, z_center, D_s)
+            # (d, H_orig, W_orig) → (pD, pH, pW)
+            patch = resize_3d(patch, pD, pH, pW, is_label=False)
+            channels.append(patch)
+        return np.stack(channels, axis=0).astype(np.float32)
+
+    # ==================================================================
+    # Whole-volume inference (no sliding window)
+    # ==================================================================
+    def _whole_volume_forward(self, vol: np.ndarray) -> np.ndarray:
+        """Run a single forward pass on the ENTIRE volume resized to
+        model input size, then resize the probabilities back to original.
+
+        No sliding window, no blending. Mirrors the training-time
+        ``SegDataset3DWhole`` data contract: 1-channel input of shape
+        ``(1, pD, pH, pW)`` (TTA still stacks per-flip variants in the
+        forward helper). Used only when ``patch_mode == "whole"``.
+        """
+        D_orig, H_orig, W_orig = vol.shape
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+
+        logger.info(
+            "Whole-volume inference: orig=(%d,%d,%d) → model=(%d,%d,%d)",
+            D_orig, H_orig, W_orig, pD, pH, pW)
+
+        vol_resized = resize_3d(vol, pD, pH, pW, is_label=False)
+        # (1, 1, pD, pH, pW) — batch and channel dims.
+        batch = torch.from_numpy(vol_resized[np.newaxis, np.newaxis]) \
+            .float().to(self.device, non_blocking=True)
+        probs = self._forward_batch(batch)       # (1, num_fg, pD, pH, pW)
+        prob_small = probs[0]                    # (num_fg, pD, pH, pW)
+
+        # Resize each class channel back to (D_orig, H_orig, W_orig).
+        # `resize_3d` handles the leading channel axis (ndim==4) natively.
+        return resize_3d(
+            prob_small, D_orig, H_orig, W_orig, is_label=False)
 
     # ==================================================================
     # Cubic sliding window
@@ -305,14 +381,6 @@ class Predictor:
     # ==================================================================
     # Batch construction
     # ==================================================================
-    def _build_batch_single_res(
-        self, patches: List[np.ndarray]
-    ) -> torch.Tensor:
-        """(B, 1, D, H, W) tensor for z-axis mode (no multi-res)."""
-        batch = np.stack(patches, axis=0)[:, np.newaxis]  # (B, 1, D, H, W)
-        return torch.from_numpy(batch).float().to(
-            self.device, non_blocking=True)
-
     def _build_batch_multi_res(
         self,
         patches: List[np.ndarray],

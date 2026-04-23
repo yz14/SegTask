@@ -64,8 +64,7 @@ def preprocess_image(
 
 
 def compute_region_weight_map(
-    volume: np.ndarray,
-    label_values: List[int],
+    volume: np.ndarray, label_values: List[int],
     region_weights: List[float]) -> np.ndarray:
     """Generate per-voxel spatial weight map from raw label and region weights.
 
@@ -181,25 +180,36 @@ class SegDataset3D(Dataset):
     Z-axis patching semantics — the window slides ALONG Z ONLY; the in-plane
     (H, W) extent is always the full volume resolution, not a sub-crop.
 
-    Pipeline per sample::
+    Pipeline per sample (per scale s in ``multi_res_scales``)::
 
         (D_vol, H_vol, W_vol)               e.g. (300, 512, 512)
-            │  sample center z, take eD slices along z axis
+            │  sample center z, take round(eD*s) slices along z axis
+            │  (edge-replicate outside volume bounds when s > 1)
             ▼
-        (eD_slices, H_vol, W_vol)           full-resolution in-plane
+        (round(eD*s), H_vol, W_vol)         full-resolution in-plane
             │  resize_3d to (eD, pH, pW)
             ▼
-        (eD, pH, pW)                        trainer center-crops eD → pD
+        (eD, pH, pW)                        stacked as channel s → (C_res, …)
 
-    `aug_oversample_ratio` applies to the Z axis ONLY. H, W already collapse
-    to `patch_size` directly and therefore need no extra margin (the
-    augmentor's rotation / elastic artefacts in-plane are identical to what
-    the inference path sees, which also resizes H_vol → pH, pW in one step
-    — keeping train and inference distributions consistent).
+    The trainer later center-crops eD → pD along the depth axis after
+    GPU augmentation (when ``aug_oversample_ratio > 1``).
 
-    Each sample returns:
-      image: (1, eD, pH, pW) float32
-      label: (1, eD, pH, pW) float32 raw integer labels (binarized at loss time)
+    ``aug_oversample_ratio`` applies to the Z axis ONLY. H, W already
+    collapse to ``patch_size`` directly and therefore need no extra
+    margin — consistent with ``predictor._sliding_window_z``.
+
+    ``multi_res_scales`` (default ``[1.0]``) controls z-axis multi-FOV
+    inputs. Each scale ``s`` gives the network a physically wider z-range
+    (same center z, ``round(eD*s)`` slices) compressed back to ``eD``.
+    ``s == 1.0`` preserves bit-identical legacy behaviour; ``s > 1.0``
+    always uses edge-replicate padding at volume bounds so the physical
+    z-FOV is preserved without stretch artefacts.
+
+    Output shape::
+      image: (C_res, eD, pH, pW) float32
+      label: (C_res, eD, pH, pW) float32 raw integer labels (binarized
+             at loss time by MultiResolutionLoss)
+      weight_map (optional): (C_res, eD, pH, pW) float32
     """
 
     def __init__(
@@ -209,6 +219,7 @@ class SegDataset3D(Dataset):
         label_values: List[int],
         patch_size: Tuple[int, int, int] = (64, 128, 128),
         aug_oversample_ratio: float = 1.0,
+        multi_res_scales: Optional[List[float]] = None,
         intensity_min: float = -1024.0,
         intensity_max: float = 3071.0,
         normalize: str = "minmax",
@@ -238,6 +249,13 @@ class SegDataset3D(Dataset):
         # model H_vol → pH, pW in a single resize step.
         pD, pH, pW = self.patch_size
         self.extract_size = (int(round(pD * self.oversample)), pH, pW)
+        # Multi-resolution input: z-axis only. `[1.0]` = single-channel
+        # (legacy). Scales > 1 extract proportionally wider z-FOVs around
+        # the same center z and resize back, giving the network multi-FOV
+        # context as extra input channels.
+        self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
+        assert all(s >= 1.0 for s in self.multi_res_scales), (
+            f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -313,34 +331,51 @@ class SegDataset3D(Dataset):
         # eD == pD and the trainer skips the z crop as well.
         eD, eH, eW = self.extract_size
 
-        # Select center z-position, z轴中心坐标
+        # Select center z-position (shared across all scales so the
+        # multi-FOV views are physically nested around the same anchor).
         z = self._sample_z(vol_idx, D_vol)
 
-        # Extract up to eD slices centered at z (clamped to volume bounds),
-        # at full in-plane resolution: shape (actual_d, H_vol, W_vol).
-        img_patch, lbl_patch = self._extract_z_patch(img, lbl, z, eD)
+        # Build per-scale channel stack. For scale=1.0 we keep the legacy
+        # clamp-then-stretch extraction (`_extract_z_patch`) for bit-exact
+        # backward compatibility with prior single-res training. For
+        # scale>1.0 we use edge-replicate padding so the physical z-FOV
+        # (= scale * eD slices around z) is preserved without stretch
+        # artefacts when z is near the volume boundary.
+        img_channels: List[np.ndarray] = []
+        lbl_channels: List[np.ndarray] = []
+        wmap_channels: List[np.ndarray] = []
+        for scale in self.multi_res_scales:
+            D_s = int(round(eD * scale))
+            if scale == 1.0:
+                img_s, lbl_s = self._extract_z_patch(img, lbl, z, D_s)
+            else:
+                img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, D_s)
 
-        # Resize in a single 3D zoom:
-        #   (actual_d, H_vol, W_vol) → (eD, pH, pW)
-        # H_vol, W_vol collapse directly to patch_size (pH, pW) — matching
-        # the inference-time `predictor._sliding_window_z` behaviour.
-        img_patch = resize_3d(img_patch, eD, eH, eW, is_label=False)
-        lbl_patch = resize_3d(lbl_patch, eD, eH, eW, is_label=True)
+            # Resize in a single 3D zoom:
+            #   (actual_d, H_vol, W_vol) → (eD, pH, pW)
+            # H_vol, W_vol collapse directly to patch_size (pH, pW) —
+            # matching `predictor._sliding_window_z`.
+            img_s = resize_3d(img_s, eD, eH, eW, is_label=False)
+            lbl_s = resize_3d(lbl_s, eD, eH, eW, is_label=True)
+            img_channels.append(img_s)
+            lbl_channels.append(lbl_s)
 
-        # Return RAW integer label as a single channel — matches the cubic
-        # dataset contract (C_res, D, H, W). Binarization is performed by
-        # MultiResolutionLoss._label_to_binary at loss time, which keeps the
-        # label pipeline identical across z_axis / cubic modes and avoids
-        # the previous shape mismatch that silently zeroed-out class≥2 targets.
+            if self.region_weights:
+                wmap_s = compute_region_weight_map(
+                    lbl_s, self.label_values, self.region_weights)
+                wmap_channels.append(wmap_s[0])  # drop the leading 1
+
+        # Stack scales as channel 0 → (C_res, eD, pH, pW). For the legacy
+        # single-res default (`multi_res_scales=[1.0]`), C_res == 1 and
+        # the shape is identical to the pre-multires z-axis output.
         result = {
-            "image": torch.from_numpy(img_patch[np.newaxis]).float(),  # (1, D, H, W)
-            "label": torch.from_numpy(lbl_patch[np.newaxis]).float()}  # (1, D, H, W)
-
-        # Spatial region weight map (optional)
-        if self.region_weights:
-            wmap = compute_region_weight_map(lbl_patch, self.label_values, self.region_weights)
-            result["weight_map"] = torch.from_numpy(wmap).float()  # (1, D, H, W)
-
+            "image": torch.from_numpy(
+                np.stack(img_channels, axis=0).astype(np.float32)),
+            "label": torch.from_numpy(
+                np.stack(lbl_channels, axis=0).astype(np.float32))}
+        if wmap_channels:
+            result["weight_map"] = torch.from_numpy(
+                np.stack(wmap_channels, axis=0).astype(np.float32))
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
@@ -370,6 +405,54 @@ class SegDataset3D(Dataset):
         lbl_patch = lbl[d_start:d_end]
 
         return img_patch.copy(), lbl_patch.copy()
+
+    def _extract_z_patch_padded(
+        self, img: np.ndarray, lbl: np.ndarray, z_center: int,
+        D_patch: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Paired image+label edge-padded extraction (see module-level
+        `extract_z_patch_padded` for semantics). Kept as a method for
+        API continuity with `_extract_z_patch`.
+        """
+        return (
+            extract_z_patch_padded(img, z_center, D_patch),
+            extract_z_patch_padded(lbl, z_center, D_patch),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level z-axis patch extractor (shared with Predictor)
+# ---------------------------------------------------------------------------
+def extract_z_patch_padded(
+    vol: np.ndarray, z_center: int, D_patch: int) -> np.ndarray:
+    """Extract EXACTLY ``D_patch`` consecutive slices from ``vol`` along
+    the z axis, centered at ``z_center`` and edge-replicate-padded when
+    the window exceeds volume bounds.
+
+    Unlike a plain slice, this preserves the physical z-FOV: the output
+    always has depth ``D_patch`` regardless of volume size / boundary
+    conditions. Required for z-axis multi-resolution (scale > 1) inputs
+    so different scales are directly comparable — without padding,
+    ``resize_3d`` would stretch a short boundary window to D_patch and
+    undo the multi-FOV effect.
+
+    In-plane (H, W) axes are left untouched (matches z-axis mode
+    semantics). Labels are safe under ``mode="edge"`` because the
+    replication is of an existing boundary slice's discrete values.
+    """
+    D_vol = vol.shape[0]
+    half  = D_patch // 2
+    lo = z_center - half
+    hi = lo + D_patch
+    src_lo = max(lo, 0)
+    src_hi = min(hi, D_vol)
+    pad_before = max(-lo, 0)
+    pad_after  = max(hi - D_vol, 0)
+
+    patch = vol[src_lo:src_hi]
+    if pad_before > 0 or pad_after > 0:
+        pad_width = [(pad_before, pad_after)] + [(0, 0)] * (vol.ndim - 1)
+        patch = np.pad(patch, pad_width, mode="edge")
+    return patch.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -642,3 +725,122 @@ class SegDataset3DCubic(Dataset):
         return (int(np.random.randint(dlo, dhi)),
                 int(np.random.randint(hlo, hhi)),
                 int(np.random.randint(wlo, whi)))
+
+
+# ---------------------------------------------------------------------------
+# 3D Whole-Volume Dataset (no sliding window, no sub-cropping)
+# ---------------------------------------------------------------------------
+class SegDataset3DWhole(Dataset):
+    """Whole-volume 3D segmentation dataset — each sample is the entire
+    volume resized to ``extract_size`` (oversampled patch_size).
+
+    Semantics:
+      - No patching, no center sampling. The full volume is loaded,
+        resized via `resize_3d` to ``(eD, eH, eW)`` = round(patch_size *
+        oversample), and returned.
+      - The trainer center-crops to ``patch_size`` after augmentation,
+        identical to the other modes — this both removes rotation/elastic
+        zero-padded corners AND finalises the model-facing input size.
+      - ``samples_per_volume`` controls how many augmentation variants per
+        epoch (no patch-location diversity to draw from).
+      - ``foreground_oversample_ratio`` is ignored (no center sampling).
+      - ``multi_res_scales`` must be ``[1.0]`` (validated in Config) —
+        scaling a whole-volume resize has no physical meaning.
+
+    Output (matches other modes for interoperability with the loss stack):
+      image: (1, eD, eH, eW) float32
+      label: (1, eD, eH, eW) float32 raw integer labels
+      weight_map (optional): (1, eD, eH, eW) float32
+    """
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        label_paths: List[str],
+        label_values: List[int],
+        patch_size: Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio: float = 1.0,
+        intensity_min: float = -1024.0,
+        intensity_max: float = 3071.0,
+        normalize: str = "minmax",
+        global_mean: float = 0.0,
+        global_std: float = 1.0,
+        samples_per_volume: int = 1,
+        is_train: bool = True,
+        cache_enabled: bool = True,
+        cache_max_volumes: int = 0,
+        region_weights: Optional[List[float]] = None):
+        super().__init__()
+        assert len(image_paths) == len(label_paths)
+        assert aug_oversample_ratio >= 1.0, (
+            f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
+        self.image_paths = image_paths
+        self.label_paths = label_paths
+        self.label_values = label_values
+        self.patch_size = tuple(patch_size)
+        self.oversample = float(aug_oversample_ratio)
+        # 3-axis oversample matches cubic mode: provides augmentation
+        # margin so rotation / elastic black corners get center-cropped
+        # away by the trainer.
+        self.extract_size = tuple(
+            int(round(p * self.oversample)) for p in self.patch_size)
+        self.intensity_min = intensity_min
+        self.intensity_max = intensity_max
+        self.normalize = normalize
+        self.global_mean = global_mean
+        self.global_std = global_std
+        self.samples_per_volume = samples_per_volume
+        self.is_train = is_train
+        self.region_weights = region_weights
+
+        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
+        self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
+
+        logger.info(
+            "Whole-volume dataset: %d volumes, extract_size=%s, "
+            "samples_per_volume=%d",
+            len(self.image_paths), self.extract_size, self.samples_per_volume)
+
+    def _load_image(self, vol_idx: int) -> np.ndarray:
+        path = self.image_paths[vol_idx]
+        cached = self._img_cache.get(path)
+        if cached is not None:
+            return cached
+        img = load_nifti(path)
+        img = preprocess_image(
+            img, self.intensity_min, self.intensity_max,
+            self.normalize, self.global_mean, self.global_std)
+        self._img_cache.put(path, img)
+        return img
+
+    def _load_label(self, vol_idx: int) -> np.ndarray:
+        path = self.label_paths[vol_idx]
+        cached = self._lbl_cache.get(path)
+        if cached is not None:
+            return cached
+        lbl = load_nifti(path)
+        self._lbl_cache.put(path, lbl)
+        return lbl
+
+    def __len__(self) -> int:
+        return len(self.image_paths) * self.samples_per_volume
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        vol_idx = idx % len(self.image_paths)
+        img = self._load_image(vol_idx)
+        lbl = self._load_label(vol_idx)
+        eD, eH, eW = self.extract_size
+
+        # Resize the entire volume in a single 3D zoom.
+        img_r = resize_3d(img, eD, eH, eW, is_label=False)
+        lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
+
+        result = {
+            "image": torch.from_numpy(img_r[np.newaxis]).float(),  # (1, eD, eH, eW)
+            "label": torch.from_numpy(lbl_r[np.newaxis]).float()}
+
+        if self.region_weights:
+            wmap = compute_region_weight_map(
+                lbl_r, self.label_values, self.region_weights)
+            result["weight_map"] = torch.from_numpy(wmap).float()  # (1, eD, eH, eW)
+        return result

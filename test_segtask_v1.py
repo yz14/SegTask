@@ -391,7 +391,11 @@ class TestScheduler:
         cfg.train.cosine_restart_mult = 2
         cfg.sync()
         optimizer = torch.optim.Adam([torch.randn(3, requires_grad=True)], lr=0.01)
-        sched = build_scheduler(optimizer, cfg, steps_per_epoch=5)
+        # `build_scheduler` takes `post_warmup_steps` explicitly since the
+        # warmup wrapper was introduced. Pass a reasonable horizon so the
+        # base scheduler has enough steps to actually advance its LR.
+        sched = build_scheduler(
+            optimizer, cfg, steps_per_epoch=5, post_warmup_steps=100)
         assert sched is not None
         # Step a few times
         for _ in range(20):
@@ -429,17 +433,39 @@ class TestRegionWeights:
         loss = compound(pred, target, weight_map=wmap)
         assert loss.item() >= 0
 
-    def test_higher_weight_increases_loss(self):
+    def test_weight_map_emphasizes_region(self):
+        """`_weighted_voxel_mean` normalises by `sum(w)` (see losses.py:
+        "loss magnitude is invariant to the total weight"), so a UNIFORM
+        scale on the weight map must leave the loss unchanged. A
+        NON-UNIFORM map that puts more weight on higher-error voxels must
+        increase the reported loss.
+        """
         from segtask_v1.losses.losses import BCELoss
-        pred = torch.randn(1, 1, 4, 8, 8)
-        target = torch.ones(1, 1, 4, 8, 8)
-        wmap_low = torch.ones(1, 1, 4, 8, 8)
-        wmap_high = torch.ones(1, 1, 4, 8, 8) * 5.0
+        torch.manual_seed(0)
+        # Two-voxel pseudo-volume: voxel A has low BCE, voxel B has high.
+        # pred logits: A very confident (low loss), B very wrong (high loss).
+        pred = torch.tensor([[[[[10.0, -10.0]]]]])         # (1,1,1,1,2)
+        target = torch.tensor([[[[[1.0, 1.0]]]]])           # both positive
         loss_fn = BCELoss()
-        loss_low = loss_fn(pred, target, weight_map=wmap_low)
-        loss_high = loss_fn(pred, target, weight_map=wmap_high)
-        # Higher weight should increase loss
-        assert loss_high.item() > loss_low.item()
+
+        # Uniform map (any scale) → identical to no-weight baseline.
+        wmap_uniform_1x = torch.ones_like(pred)
+        wmap_uniform_5x = torch.ones_like(pred) * 5.0
+        loss_base = loss_fn(pred, target).item()
+        loss_u1 = loss_fn(pred, target, weight_map=wmap_uniform_1x).item()
+        loss_u5 = loss_fn(pred, target, weight_map=wmap_uniform_5x).item()
+        assert abs(loss_u1 - loss_base) < 1e-6
+        assert abs(loss_u5 - loss_base) < 1e-6
+
+        # Non-uniform map emphasising the HIGH-ERROR voxel → loss increases.
+        wmap_emph_high = torch.tensor([[[[[1.0, 5.0]]]]])
+        loss_emph = loss_fn(pred, target, weight_map=wmap_emph_high).item()
+        assert loss_emph > loss_base
+
+        # Non-uniform map emphasising the LOW-ERROR voxel → loss decreases.
+        wmap_emph_low = torch.tensor([[[[[5.0, 1.0]]]]])
+        loss_deemph = loss_fn(pred, target, weight_map=wmap_emph_low).item()
+        assert loss_deemph < loss_base
 
 
 # ---------------------------------------------------------------------------
@@ -528,10 +554,10 @@ class TestPredictor:
         assert positions[0] == (0, 30)
 
     def test_gaussian_blend_weight(self):
+        # `_build_z_weight` was renamed to `_build_1d_weight` (static) when
+        # weight construction was unified across z_axis and cubic modes.
         from segtask_v1.predictor import Predictor
-        p = Predictor.__new__(Predictor)
-        p.blend_mode = "gaussian"
-        w = p._build_z_weight(64)
+        w = Predictor._build_1d_weight(64, mode="gaussian")
         assert w.shape == (64,)
         # Center should have highest weight
         assert w[32] > w[0]
@@ -541,6 +567,7 @@ class TestPredictor:
         from segtask_v1.predictor import Predictor
         p = Predictor.__new__(Predictor)
         p.label_values = [0, 1, 2]
+        p.num_fg = 2  # required by `_prob_to_label` (added to Predictor state)
         p.threshold = 0.5
         # Create probability volume: class 0 (label 1) = 0.8, class 1 (label 2) = 0.3
         prob = np.zeros((2, 4, 4, 4), dtype=np.float32)
@@ -555,6 +582,7 @@ class TestPredictor:
         from segtask_v1.predictor import Predictor
         p = Predictor.__new__(Predictor)
         p.label_values = [0, 1, 2]
+        p.num_fg = 2
         p.threshold = 0.5
         # All probabilities below threshold → background
         prob = np.ones((2, 4, 4, 4), dtype=np.float32) * 0.1
@@ -572,22 +600,28 @@ class TestCubicDataset:
         patch = _extract_cubic_patch(vol, (50, 40, 40), (32, 32, 32))
         assert patch.shape == (32, 32, 32)
 
-    def test_extract_cubic_patch_edge_clipping(self):
+    def test_extract_cubic_patch_edge_padding(self):
+        """`_extract_cubic_patch` now pads to the EXACT requested size using
+        edge-replication (see dataset.py docstring — avoids the anisotropic
+        stretch artefact that clip-then-resize produced at volume corners).
+        """
         from segtask_v1.data.dataset import _extract_cubic_patch
         vol = np.random.rand(20, 20, 20).astype(np.float32)
-        # Center near corner → clipped (no padding)
+        # Center near corner → padded with edge-replicated voxels.
         patch = _extract_cubic_patch(vol, (2, 2, 2), (32, 32, 32))
-        # Result is clipped to volume bounds, not padded
-        assert patch.shape[0] <= 20
-        assert patch.shape[0] > 0
+        assert patch.shape == (32, 32, 32)
 
     def test_extract_cubic_patch_small_volume(self):
+        """Volume smaller than the requested patch on every axis: output
+        must still be exactly `size`, edge-replicated outside bounds.
+        Because the input is a constant-1 volume, the padded output must
+        be all-ones as well (a strict correctness check on the pad mode).
+        """
         from segtask_v1.data.dataset import _extract_cubic_patch
         vol = np.ones((10, 10, 10), dtype=np.float32)
         patch = _extract_cubic_patch(vol, (5, 5, 5), (32, 32, 32))
-        # Clipped to volume size (no padding)
-        assert patch.shape[0] <= 10
-        assert patch.shape[0] > 0
+        assert patch.shape == (32, 32, 32)
+        assert np.all(patch == 1.0)
 
     def test_cubic_dataset_getitem(self):
         from segtask_v1.data.dataset import SegDataset3DCubic
@@ -666,6 +700,260 @@ class TestCubicDataset:
         pD, pH, pW = ds.patch_size
         ds.extract_size = (int(round(pD * ds.oversample)), pH, pW)
         assert ds.extract_size == (32, 96, 96)
+
+    def test_z_axis_multires_shape_default_is_backward_compatible(self):
+        """Default multi_res_scales=[1.0] must produce the legacy 1-channel shape."""
+        from segtask_v1.data.dataset import SegDataset3D
+        img = np.random.rand(60, 128, 128).astype(np.float32)
+        lbl = np.zeros((60, 128, 128), dtype=np.float32)
+        lbl[20:40, 40:80, 40:80] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            ds = SegDataset3D(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 64, 64),
+                samples_per_volume=1, cache_enabled=False)
+            sample = ds[0]
+            # C_res == 1 (default [1.0]) — identical to pre-multires shape.
+            assert sample["image"].shape == (1, 16, 64, 64)
+            assert sample["label"].shape == (1, 16, 64, 64)
+
+    def test_z_axis_multires_shape_three_scales(self):
+        """multi_res_scales=[1.0, 1.5, 2.0] → image/label (3, eD, pH, pW)."""
+        from segtask_v1.data.dataset import SegDataset3D
+        img = np.random.rand(80, 128, 128).astype(np.float32)
+        lbl = np.zeros((80, 128, 128), dtype=np.float32)
+        lbl[30:50, 40:80, 40:80] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            ds = SegDataset3D(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 64, 64),
+                aug_oversample_ratio=1.0,
+                multi_res_scales=[1.0, 1.5, 2.0],
+                samples_per_volume=1, cache_enabled=False)
+            sample = ds[0]
+            assert sample["image"].shape == (3, 16, 64, 64)
+            assert sample["label"].shape == (3, 16, 64, 64)
+
+    def test_z_axis_multires_edge_padded_preserves_exact_depth(self):
+        """Scale > 1 extraction at volume boundary must return EXACTLY D_patch
+        slices (edge-padded), preserving physical z-FOV vs. clamp-and-stretch.
+        """
+        from segtask_v1.data.dataset import SegDataset3D
+        ds = SegDataset3D.__new__(SegDataset3D)
+        # Small volume so scale=2 around center exceeds bounds.
+        img = np.arange(20 * 4 * 4, dtype=np.float32).reshape(20, 4, 4)
+        lbl = np.zeros((20, 4, 4), dtype=np.float32)
+
+        # z_center=1 with D_patch=16 → lo=-7, hi=9 → needs 7 slices of
+        # edge-padding BEFORE the volume start.
+        img_p, lbl_p = ds._extract_z_patch_padded(img, lbl, 1, 16)
+        assert img_p.shape == (16, 4, 4)
+        assert lbl_p.shape == (16, 4, 4)
+        # First 7 slices must all equal img[0] (edge-replicated).
+        for i in range(7):
+            np.testing.assert_array_equal(img_p[i], img[0])
+        # Slice 7 should map to img[0], slice 8 to img[1], …
+        np.testing.assert_array_equal(img_p[7], img[0])
+        np.testing.assert_array_equal(img_p[8], img[1])
+
+        # z_center near top: z=18, D_patch=16 → lo=10, hi=26 → 6 slices
+        # of edge-padding AFTER the volume.
+        img_p2, _ = ds._extract_z_patch_padded(img, lbl, 18, 16)
+        assert img_p2.shape == (16, 4, 4)
+        for i in range(6):
+            np.testing.assert_array_equal(img_p2[-1 - i], img[-1])
+
+    def test_z_axis_multires_scale1_matches_legacy(self):
+        """multi_res_scales=[1.0] must yield IDENTICAL image as the legacy
+        single-res path (confirms channel-0 bit-compatibility).
+        """
+        from segtask_v1.data.dataset import SegDataset3D
+        np.random.seed(0)
+        img = np.random.rand(50, 64, 64).astype(np.float32)
+        lbl = np.zeros((50, 64, 64), dtype=np.float32)
+        lbl[15:35, 20:40, 20:40] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            kwargs = dict(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 32, 32),
+                foreground_oversample_ratio=0.0,  # deterministic z sample
+                samples_per_volume=1, cache_enabled=False, is_train=False)
+
+            # Seed RNG before each call so `_sample_z` picks the same z.
+            np.random.seed(123)
+            ds_legacy = SegDataset3D(multi_res_scales=[1.0], **kwargs)
+            legacy = ds_legacy[0]["image"].numpy()
+
+            np.random.seed(123)
+            ds_multi = SegDataset3D(
+                multi_res_scales=[1.0, 1.5], **kwargs)
+            multi = ds_multi[0]["image"].numpy()
+
+            # Channel 0 of the multi-res output must match the legacy single-res.
+            np.testing.assert_allclose(multi[0], legacy[0], rtol=0, atol=0)
+
+    def test_predictor_build_z_window_input_single_res(self):
+        """Single-res (`[1.0]`): (1, pD, pH, pW), legacy resize path."""
+        from segtask_v1.predictor import Predictor
+        p = Predictor.__new__(Predictor)
+        p.patch_D, p.patch_H, p.patch_W = 8, 16, 16
+        p.multi_res_scales = [1.0]
+        vol = np.arange(40 * 24 * 24, dtype=np.float32).reshape(40, 24, 24)
+        # Normal window
+        out = p._build_z_window_input(vol, 10, 18)
+        assert out.shape == (1, 8, 16, 16)
+        # Tail window (short)
+        out_tail = p._build_z_window_input(vol, 36, 40)
+        assert out_tail.shape == (1, 8, 16, 16)
+
+    def test_predictor_build_z_window_input_multi_res(self):
+        """Multi-res: (C_res, pD, pH, pW); scale>1 uses edge-padded z extraction
+        centered on window center, preserving physical z-FOV at boundaries."""
+        from segtask_v1.predictor import Predictor
+        p = Predictor.__new__(Predictor)
+        p.patch_D, p.patch_H, p.patch_W = 8, 16, 16
+        p.multi_res_scales = [1.0, 1.5, 2.0]
+        vol = np.random.rand(40, 24, 24).astype(np.float32)
+
+        # Window fully inside volume
+        out = p._build_z_window_input(vol, 10, 18)
+        assert out.shape == (3, 8, 16, 16)
+
+        # Window at top boundary — scale=2 needs D_s=16 slices centered at
+        # z_center=(0+8)//2=4, so lo=-4, hi=12 → 4 slices of edge pad.
+        out_top = p._build_z_window_input(vol, 0, 8)
+        assert out_top.shape == (3, 8, 16, 16)
+
+        # Window at bottom boundary — verify no exceptions.
+        out_bot = p._build_z_window_input(vol, 32, 40)
+        assert out_bot.shape == (3, 8, 16, 16)
+
+    def test_predictor_z_window_scale1_matches_legacy(self):
+        """Channel 0 of multi-res output must be pixel-identical to the
+        scale-1.0-only path for an interior window (where boundary padding
+        doesn't enter the picture)."""
+        from segtask_v1.predictor import Predictor
+        np.random.seed(7)
+        vol = np.random.rand(40, 24, 24).astype(np.float32)
+
+        p_single = Predictor.__new__(Predictor)
+        p_single.patch_D, p_single.patch_H, p_single.patch_W = 8, 16, 16
+        p_single.multi_res_scales = [1.0]
+
+        p_multi = Predictor.__new__(Predictor)
+        p_multi.patch_D, p_multi.patch_H, p_multi.patch_W = 8, 16, 16
+        p_multi.multi_res_scales = [1.0, 1.5, 2.0]
+
+        out_single = p_single._build_z_window_input(vol, 12, 20)
+        out_multi  = p_multi._build_z_window_input(vol, 12, 20)
+        np.testing.assert_allclose(out_multi[0], out_single[0], rtol=0, atol=0)
+
+    def test_whole_dataset_shape(self):
+        """Whole-volume mode: each sample is the full volume resized to
+        extract_size (no cropping, no sliding). Output shape matches the
+        single-channel z_axis contract for interoperability.
+        """
+        from segtask_v1.data.dataset import SegDataset3DWhole
+        img = np.random.rand(70, 90, 90).astype(np.float32)
+        lbl = np.zeros((70, 90, 90), dtype=np.float32)
+        lbl[20:50, 30:60, 30:60] = 1.0
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            ds = SegDataset3DWhole(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 32, 32),
+                aug_oversample_ratio=1.0,
+                samples_per_volume=3, cache_enabled=False)
+            # __len__ = num_volumes * samples_per_volume
+            assert len(ds) == 3
+            sample = ds[0]
+            assert sample["image"].shape == (1, 16, 32, 32)
+            assert sample["label"].shape == (1, 16, 32, 32)
+
+    def test_whole_dataset_oversample(self):
+        """Oversample inflates all 3 axes so the trainer can center-crop."""
+        from segtask_v1.data.dataset import SegDataset3DWhole
+        img = np.random.rand(30, 40, 40).astype(np.float32)
+        lbl = np.zeros((30, 40, 40), dtype=np.float32)
+
+        import tempfile, os, nibabel as nib
+        with tempfile.TemporaryDirectory() as td:
+            img_path = os.path.join(td, "test.nii.gz")
+            lbl_path = os.path.join(td, "test_lbl.nii.gz")
+            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
+            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
+
+            ds = SegDataset3DWhole(
+                image_paths=[img_path], label_paths=[lbl_path],
+                label_values=[0, 1], patch_size=(16, 16, 16),
+                aug_oversample_ratio=1.5,
+                samples_per_volume=1, cache_enabled=False)
+            assert ds.extract_size == (24, 24, 24)
+            sample = ds[0]
+            assert sample["image"].shape == (1, 24, 24, 24)
+
+    def test_whole_mode_config_rejects_multires(self):
+        """Whole-volume mode must reject multi_res_scales beyond [1.0]."""
+        from segtask_v1.config import Config
+        cfg = Config()
+        cfg.data.label_values = [0, 1]
+        cfg.data.num_classes = 2
+        cfg.data.patch_mode = "whole"
+        cfg.data.multi_res_scales = [1.0, 1.5]
+        cfg.sync()
+        with pytest.raises(AssertionError, match="whole-volume"):
+            cfg.validate()
+
+    def test_whole_mode_config_single_res_passes(self):
+        """Whole-volume + default [1.0] validates cleanly."""
+        from segtask_v1.config import Config
+        cfg = Config()
+        cfg.data.label_values = [0, 1]
+        cfg.data.num_classes = 2
+        cfg.data.patch_mode = "whole"
+        cfg.sync()
+        cfg.validate()  # must not raise
+        assert cfg.model.in_channels == 1
+
+    def test_config_z_axis_multires_allowed(self):
+        """z_axis + multi_res_scales>1 should now validate and auto-sync
+        model.in_channels = len(scales)."""
+        from segtask_v1.config import Config
+        cfg = Config()
+        cfg.data.label_values = [0, 1]
+        cfg.data.num_classes = 2
+        cfg.data.patch_mode = "z_axis"
+        cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+        cfg.sync()
+        cfg.validate()  # must not raise
+        assert cfg.model.in_channels == 3
 
     def test_cubic_dataset_oversample(self):
         from segtask_v1.data.dataset import SegDataset3DCubic

@@ -37,8 +37,16 @@ class DataConfig:
     patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
 
     # Patch extraction mode:
-    #   "z_axis" — slide along z-axis, extract D slices, resize H,W to target
-    #   "cubic"  — sample center (x,y,z), extract full 3D cube of patch_size
+    #   "z_axis" — slide along z-axis, extract D slices, resize H,W to target.
+    #              Supports `multi_res_scales` (z-axis-only scaling).
+    #   "cubic"  — sample center (x,y,z), extract full 3D cube of patch_size.
+    #              Supports `multi_res_scales` (all 3 axes scale).
+    #   "whole"  — resize the ENTIRE volume to `patch_size` (no sliding
+    #              window, no sub-cropping). Simplest mode; useful when the
+    #              object of interest spans most of every volume and memory
+    #              / compute budget allows feeding the full downsampled
+    #              volume each step. `multi_res_scales` must be [1.0] here
+    #              (scaling has no physical meaning beyond the volume).
     patch_mode: str = "z_axis"
 
     # Augmentation oversample ratio (applies to BOTH z_axis and cubic modes).
@@ -50,10 +58,18 @@ class DataConfig:
     # whenever `random_affine_prob` or `elastic_deform_prob` > 0.
     aug_oversample_ratio: float = 1.0
 
-    # Multi-resolution input (cubic mode only).
-    # Scales at which to extract patches centered at the same point.
-    # Each scale's patch is resized to extract_size and stacked as a channel.
-    # [1.0] = single-resolution (1-channel), [1.0, 1.5, 2.0] = 3-channel.
+    # Multi-resolution input — supported in BOTH z_axis and cubic modes,
+    # with axis semantics matching each mode:
+    #   cubic  — scale applies on ALL three axes (D, H, W). Each scale
+    #            extracts a physically larger cube around the same center
+    #            and resizes back to extract_size.
+    #   z_axis — scale applies ON Z ONLY. Each scale extracts a wider z
+    #            range (round(eD * scale) slices) around the same z center
+    #            and resizes back to extract_size. H, W are always full
+    #            volume resolution in z_axis mode — no in-plane scaling
+    #            makes sense there.
+    # Each scale's output is stacked as an input channel: [1.0] = 1-channel
+    # (legacy), [1.0, 1.5, 2.0] = 3-channel input.
     multi_res_scales: List[float] = field(default_factory=lambda: [1.0])
 
     # Intensity windowing (HU for CT)
@@ -403,9 +419,10 @@ class Config:
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
 
-        # Auto-set in_channels from multi_res_scales (always >= 1)
-        if self.data.patch_mode == "cubic":
-            self.model.in_channels = len(self.data.multi_res_scales)
+        # Auto-set in_channels from multi_res_scales (always >= 1). Both
+        # patch modes now stack per-scale views as input channels; a single
+        # scale ([1.0]) gives the legacy 1-channel input.
+        self.model.in_channels = len(self.data.multi_res_scales)
 
         # nnU-Net ResEnc preset: populate per-stage block counts when the
         # user has not supplied explicit lists.
@@ -501,22 +518,27 @@ class Config:
         ), f"Invalid scheduler: {self.train.scheduler}"
         assert len(self.data.patch_size) == 3, \
             "patch_size must be [D, H, W]"
-        assert self.data.patch_mode in ("z_axis", "cubic"), \
+        assert self.data.patch_mode in ("z_axis", "cubic", "whole"), \
             f"Invalid patch_mode: {self.data.patch_mode}"
+        if self.data.patch_mode == "whole":
+            # Multi-resolution has no physical meaning in whole-volume mode:
+            # the input already spans the entire volume, there is nothing
+            # outside to extract a "wider FOV" view from.
+            assert len(self.data.multi_res_scales) == 1 \
+                and self.data.multi_res_scales[0] == 1.0, (
+                "whole-volume mode requires multi_res_scales=[1.0]; got "
+                f"{self.data.multi_res_scales}.")
         assert self.data.aug_oversample_ratio >= 1.0, \
             "aug_oversample_ratio must be >= 1.0"
         assert len(self.data.multi_res_scales) >= 1, \
             "multi_res_scales must have at least one scale (e.g. [1.0])"
         assert all(s >= 1.0 for s in self.data.multi_res_scales), \
             "All multi_res_scales must be >= 1.0"
-        # Multi-resolution input is only supported in cubic patch mode; in
-        # z_axis mode the dataset always emits a single-channel image, so
-        # models built with `num_res > 1` would receive an input/output
-        # channel count that never matches the data.
-        if self.data.patch_mode == "z_axis":
-            assert len(self.data.multi_res_scales) == 1, (
-                "multi_res_scales must be [1.0] when patch_mode='z_axis' — "
-                "multi-resolution patches are only supported in cubic mode.")
+        # Multi-resolution is now supported in both z_axis and cubic modes.
+        # In z_axis mode the scale factor applies to the z-axis only
+        # (see DataConfig.multi_res_scales docstring); `sync()` auto-sets
+        # `model.in_channels = len(multi_res_scales)` in both modes so the
+        # network input/output channel count matches the stacked views.
         assert self.train.save_best_mode in ("max", "min"), \
             f"Invalid save_best_mode: {self.train.save_best_mode}"
         if self.data.num_classes < 2:

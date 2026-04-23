@@ -13,7 +13,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from ..config import Config
-from .dataset import SegDataset3D, SegDataset3DCubic, load_nifti
+from .dataset import (SegDataset3D, SegDataset3DCubic, SegDataset3DWhole, load_nifti)
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +251,25 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         image_paths=[image_paths[i] for i in val_idx],
         label_paths=[label_paths[i] for i in val_idx])
 
-    if dc.patch_mode == "cubic":
+    if dc.patch_mode == "whole":
+        logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
+                    train_oversample)
+        # Whole mode ignores `foreground_oversample_ratio` and
+        # `multi_res_scales` (validated in Config). Builds a 1-channel
+        # (eD, eH, eW) resize of the full volume.
+        train_ds = SegDataset3DWhole(
+            **train_paths,
+            aug_oversample_ratio=train_oversample,
+            samples_per_volume=dc.samples_per_volume,
+            is_train=True,
+            **common_kwargs)
+        val_ds = SegDataset3DWhole(
+            **val_paths,
+            aug_oversample_ratio=1.0,
+            samples_per_volume=max(dc.samples_per_volume // 2, 1),
+            is_train=False,
+            **common_kwargs)
+    elif dc.patch_mode == "cubic":
         logger.info("Using CUBIC patch mode (oversample=%.2f, scales=%s)",
                      train_oversample, dc.multi_res_scales)
         train_ds = SegDataset3DCubic(
@@ -271,10 +289,12 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             is_train=False,
             **common_kwargs)
     else:
-        logger.info("Using Z_AXIS patch mode (oversample=%.2f)", train_oversample)
+        logger.info("Using Z_AXIS patch mode (oversample=%.2f, scales=%s)",
+                    train_oversample, dc.multi_res_scales)
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio=train_oversample,
+            multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
@@ -282,6 +302,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio=1.0,
+            multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,
