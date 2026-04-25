@@ -116,6 +116,17 @@ class Predictor:
         Returns a dict with:
           "label_map":     (D, H, W) int — predicted label map
           "probabilities": (num_fg, D, H, W) float32 — sigmoid probabilities
+
+        Patch-mode dispatch:
+          - "whole"        — single forward on the full resized volume.
+          - "cubic"        — 3D cubic sliding window with overlap.
+          - "z_axis"       — z-axis sliding window with overlap.
+          - "2_5d"         — z-axis sliding window with the SAME geometry
+                             as ``z_axis``; the per-window forward squeezes
+                             ``C_res=1`` to feed a 2D model whose output
+                             is reshaped back to ``(num_fg, D, H, W)`` so
+                             the existing accumulation/blending code works
+                             unchanged. See ``_forward_batch``.
         """
         dc = self.cfg.data
         raw_vol = load_nifti(image_path)  # (D_orig, H_orig, W_orig)
@@ -132,6 +143,8 @@ class Predictor:
         elif self.patch_mode == "cubic":
             prob_volume = self._sliding_window_cubic(vol)
         else:
+            # "z_axis" or "2_5d" — same window geometry; see _forward_batch
+            # for the 2.5D-specific squeeze + reshape.
             prob_volume = self._sliding_window_z(vol)
 
         label_map = self._prob_to_label(prob_volume)
@@ -422,9 +435,21 @@ class Predictor:
         """Run the model on a pre-assembled batch tensor and return
         (B, num_fg, D, H, W) float32 probabilities as a numpy array.
 
-        Handles: deep-supervision list output, 1x-channel slicing to
-        `num_fg`, optional flip-TTA, AMP dtype matching training.
+        Mode dispatch:
+          - 3D path  : x is (B, C_res, D, H, W); model produces
+                       (B, num_fg*C_res, D, H, W); we slice to num_fg.
+          - 2.5D path: x is still (B, 1, D, H, W) on the call boundary,
+                       but the model is planar 2D with in_channels=D.
+                       Squeeze C_res, forward, then reshape
+                       (B, num_fg*D, H, W) → (B, num_fg, D, H, W) so the
+                       accumulation code is shape-identical with 3D.
+
+        Handles: deep-supervision list output, optional flip-TTA, and
+        AMP dtype matching training.
         """
+        if self.patch_mode == "2_5d":
+            return self._forward_batch_2_5d(x)
+
         autocast_ctx = autocast(
             device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype)
         with autocast_ctx:
@@ -438,6 +463,45 @@ class Predictor:
 
             if self.tta_flip:
                 prob = self._tta_flip_ensemble(x, prob)
+
+        return prob.float().cpu().numpy()
+
+    def _forward_batch_2_5d(self, x: torch.Tensor) -> np.ndarray:
+        """2.5D forward: squeeze C_res=1, run 2D model, reshape pred.
+
+        Args:
+            x: (B, 1, D, H, W) tensor produced by ``_build_z_window_input``
+               under the single-resolution z-axis contract that 2.5D
+               training shares.
+
+        Returns:
+            (B, num_fg, D, H, W) sigmoid probabilities, matching the 3D
+            path's contract so all downstream blending stays unchanged.
+        """
+        if x.shape[1] != 1:
+            raise ValueError(
+                "2.5D inference expects single-resolution input "
+                f"(C_res=1); got x.shape={tuple(x.shape)}")
+        # (B, 1, D, H, W) → (B, D, H, W) — D becomes the input-channel axis.
+        x_2d = x.squeeze(1)
+        B, D, H, W = x_2d.shape
+        autocast_ctx = autocast(
+            device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype)
+        with autocast_ctx:
+            pred = self.model(x_2d)
+            if isinstance(pred, list):
+                pred = pred[0]
+            expected_c = self.num_fg * D
+            if pred.shape[1] != expected_c:
+                raise ValueError(
+                    f"2.5D model output channels {pred.shape[1]} != "
+                    f"num_fg*D = {self.num_fg}*{D} = {expected_c}")
+            # (B, num_fg*D, H, W) → (B, num_fg, D, H, W)
+            pred_5d = pred.reshape(B, self.num_fg, D, H, W)
+            prob = torch.sigmoid(pred_5d.float())
+
+            if self.tta_flip:
+                prob = self._tta_flip_ensemble_2_5d(x_2d, prob)
 
         return prob.float().cpu().numpy()
 
@@ -458,6 +522,45 @@ class Predictor:
                 pred_flip = pred_flip[0]
             prob_flip = torch.sigmoid(pred_flip.float())[:, :self.num_fg]
             prob_flip = torch.flip(prob_flip, flip_dims)
+            total = total + prob_flip
+            count += 1.0
+        return total / count
+
+    def _tta_flip_ensemble_2_5d(
+        self, x_2d: torch.Tensor, base_prob: torch.Tensor,
+    ) -> torch.Tensor:
+        """2.5D TTA: flip only along H/W (the model's spatial axes).
+
+        D is the model's input-channel axis (one channel per slice) and
+        is geometrically meaningful, but flipping it would reverse the
+        physical slice ordering — a distribution shift the model has
+        not seen at training time. Flipping only H/W stays within the
+        2D model's spatial symmetry group.
+
+        Args:
+            x_2d:      (B, D, H, W) input fed to the 2D model.
+            base_prob: (B, num_fg, D, H, W) un-flipped reference output.
+
+        Returns:
+            (B, num_fg, D, H, W) average over identity + 3 flip variants.
+        """
+        B, D, H, W = x_2d.shape
+        total = base_prob.clone()
+        count = 1.0
+        # x_2d axes: 2=H, 3=W; prob_5d axes: 3=H, 4=W (D inserted at 2).
+        for flip_x_dims, flip_prob_dims in (
+            ([2], [3]),       # H
+            ([3], [4]),       # W
+            ([2, 3], [3, 4])  # H + W
+        ):
+            x_flip = torch.flip(x_2d, flip_x_dims)
+            pred_flip = self.model(x_flip)
+            if isinstance(pred_flip, list):
+                pred_flip = pred_flip[0]
+            # (B, num_fg*D, H, W) → (B, num_fg, D, H, W)
+            pred_flip_5d = pred_flip.reshape(B, self.num_fg, D, H, W)
+            prob_flip = torch.sigmoid(pred_flip_5d.float())
+            prob_flip = torch.flip(prob_flip, flip_prob_dims)
             total = total + prob_flip
             count += 1.0
         return total / count

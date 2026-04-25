@@ -251,7 +251,34 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         image_paths=[image_paths[i] for i in val_idx],
         label_paths=[label_paths[i] for i in val_idx])
 
-    if dc.patch_mode == "whole":
+    if dc.patch_mode == "2_5d":
+        # 2.5D mode reuses the z_axis dataset verbatim with a single
+        # resolution (forced by Config.validate). The squeeze that turns
+        # (C_res=1, D, H, W) into a 2D (D-channel) input happens inside
+        # the trainer AFTER GPU augmentation, so the dataset itself is
+        # bit-identical to the legacy z_axis single-res path.
+        logger.info(
+            "Using 2.5D patch mode (oversample=%.2f) — z_axis dataset, "
+            "trainer squeezes C_res=1 to feed a 2D model with D=%d "
+            "input channels.",
+            train_oversample, int(dc.patch_size[0]))
+        train_ds = SegDataset3D(
+            **train_paths,
+            aug_oversample_ratio=train_oversample,
+            multi_res_scales=[1.0],
+            foreground_oversample_ratio=dc.foreground_oversample_ratio,
+            samples_per_volume=dc.samples_per_volume,
+            is_train=True,
+            **common_kwargs)
+        val_ds = SegDataset3D(
+            **val_paths,
+            aug_oversample_ratio=1.0,
+            multi_res_scales=[1.0],
+            foreground_oversample_ratio=0.0,
+            samples_per_volume=max(dc.samples_per_volume // 2, 1),
+            is_train=False,
+            **common_kwargs)
+    elif dc.patch_mode == "whole":
         logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
                     train_oversample)
         # Whole mode ignores `foreground_oversample_ratio` and

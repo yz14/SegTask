@@ -1,0 +1,219 @@
+# ============================================================================
+# 2.5D Segmentation Configuration —
+#   - 沿用 z_axis 单分辨率取片（multi_res_scales 必须为 [1.0]）
+#   - 训练时增强后将 (B,1,D,H,W) squeeze 为 (B,D,H,W) 喂给 2D 模型
+#   - 模型输出 (B, num_fg*D, H, W) 由 SliceChannelLoss 拆为
+#     num_fg 组的 D 通道二值预测
+#
+# 与 configs/seg3d.yaml 相比的关键差异：
+#   - data.patch_mode: "2_5d"
+#   - data.multi_res_scales: [1.0]   (强制)
+#   - data.patch_size:  D 较小（典型 8/12/16），H,W 可较大（典型 256/384）
+#   - model.spatial_dims: 2          (sync 自动设置；也可手写避免误解)
+#   - model.in_channels:  D          (sync 自动设置 = patch_size[0])
+#
+# 推荐用法：
+#   python -m segtask_v1.train --config configs/seg2_5d.yaml
+# ============================================================================
+
+# =====================================================================
+# DATA
+# =====================================================================
+data:
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+
+  label_values: []
+  num_classes : 0
+
+  # 2.5D patch：D = 切片数（= 模型 in_channels），H/W = 平面分辨率。
+  # 经验上 D 取 8/12/16 即可（更大 D 等价于更多通道，参数显存升）；
+  # H/W 可取较大（256/384）以利用 2D 模型的高效空间建模。
+  patch_size: [12, 256, 256]
+
+  # 必须为 "2_5d"。Config.sync() 会自动把 model.spatial_dims=2 +
+  # model.in_channels=12 同步到模型构造。
+  patch_mode: "2_5d"
+
+  # 强制校验：2.5D 必须单分辨率。
+  multi_res_scales: [1.0]
+
+  # 数据增强后的 oversample 与裁剪适用 z_axis 同样的语义（仅放大 z 轴）。
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize: "minmax"
+
+  val_ratio : 0.2
+  split_seed: 42
+  stratified_split: true
+
+  batch_size : 4
+  num_workers: 4
+  pin_memory : true
+
+  foreground_oversample_ratio: 0.5
+  samples_per_volume: 16
+
+  cache_mode: "memory"
+  cache_max_volumes: 0
+
+
+# =====================================================================
+# AUGMENT — 与 seg3d.yaml 相同；3D 增强器在 squeeze 之前作用，
+#           所以语义对 2.5D 完全一致（仍在 (B,1,D,H,W) 张量上）。
+# =====================================================================
+augment:
+  enabled: true
+
+  random_flip_prob: 0.5
+  random_flip_axes: [2, 3, 4]   # D, H, W —— D-flip 在增强阶段做，不是推理阶段
+
+  random_affine_prob : 0.3
+  random_rotate_range: [-15.0, 15.0]
+  random_scale_range : [0.85, 1.15]
+
+  elastic_deform_prob : 0.0
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 1.0
+
+  random_brightness_prob : 0.3
+  random_brightness_range: [-0.1, 0.1]
+
+  random_contrast_prob : 0.3
+  random_contrast_range: [0.8, 1.2]
+
+  random_gamma_prob : 0.2
+  random_gamma_range: [0.8, 1.2]
+
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std : 0.05
+
+  gaussian_blur_prob : 0.1
+  gaussian_blur_sigma: [0.5, 1.5]
+
+  simulate_lowres_prob: 0.1
+  simulate_lowres_zoom: [0.5, 1.0]
+
+
+# =====================================================================
+# MODEL — 2D UNet (spatial_dims=2)
+# =====================================================================
+model:
+  backbone: "resnet"
+
+  # 由 Config.sync() 自动设置；写在这里仅为可读性。
+  spatial_dims: 2
+  # 同上：sync 会强制 = data.patch_size[0]，无需手写。
+  # in_channels: 12
+
+  # 2D 模型显存友好，可加大通道数。
+  encoder_channels: [32, 64, 128, 256, 512]
+  blocks_per_level: 2
+  block_type: "basic"
+
+  norm_type  : "instance"
+  norm_groups: 8
+  activation : "leakyrelu"
+  dropout    : 0.0
+
+  use_se: false
+  attention_type: "none"
+  skip_attention: false
+
+  deep_supervision: false
+
+  stem_mode    : "conv3"
+  decoder_type : "unet"
+  downsample_mode: "conv"
+  upsample_mode  : "transpose"
+  skip_mode      : "cat"
+
+  drop_path_rate: 0.0
+
+
+# =====================================================================
+# LOSS — 2.5D 走 SliceChannelLoss 包装；底层 base_loss 在 (B*D,1,H,W) 上
+#        作为标准 2D 二值损失生效，所有 LossConfig 选项原样适用。
+# =====================================================================
+loss:
+  name: "dice_bce"
+  compound_weights: [1.0, 1.0]
+
+  # 长度 = num_fg_classes（不含背景）。
+  class_weights: [1.0, 1.0]
+
+  # 与 z_axis/cubic 一致：按 label_values 全长（含 bg）一一对应。
+  region_weights: [1.0, 2.0, 1.0]
+
+  dice_smooth : 1.0e-5
+  dice_squared: false
+
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+  tversky_alpha: 0.3
+  tversky_beta : 0.7
+
+  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+
+
+# =====================================================================
+# TRAIN
+# =====================================================================
+train:
+  epochs: 200
+
+  optimizer   : "adamw"
+  lr          : 1.0e-3
+  weight_decay: 1.0e-4
+
+  scheduler: "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 1
+  grad_clip_norm: 12.0
+
+  use_amp  : true
+  amp_dtype: "float16"
+
+  compile_mode: "none"
+
+  use_ema  : true
+  ema_decay: 0.999
+
+  output_dir: "outputs/seg2_5d_resnet"
+  save_every: 10
+  save_best_metric: "mean_dice"
+  save_best_mode: "max"
+
+  early_stopping: 0
+
+  log_every: 10
+  val_every: 1
+  vis_every: 10
+
+  seed: 42
+  deterministic: false
+
+  resume: ""
+
+
+# =====================================================================
+# PREDICT — 2.5D 推理走 z 轴滑窗，与 z_axis 几何完全一致；
+#           内部对每个窗口 squeeze + 2D forward + reshape。
+#           TTA 仅翻转 H/W（D 是 channel 轴，翻转会破坏物理 slice 顺序）。
+# =====================================================================
+predict:
+  z_overlap : 0.5
+  blend_mode: "gaussian"
+  batch_size: 4
+  tta_flip  : false
+  threshold : 0.5
+  output_dir: "predictions"
+  save_probabilities: false

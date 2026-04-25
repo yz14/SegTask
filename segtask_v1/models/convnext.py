@@ -17,7 +17,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .blocks import make_attention
+from .blocks import _CONV, make_attention
 
 
 class DropPath(nn.Module):
@@ -43,7 +43,11 @@ class DropPath(nn.Module):
 
 
 class LayerNorm3d(nn.Module):
-    """Channel-first LayerNorm for 3D data: (B, C, D, H, W)."""
+    """Channel-first LayerNorm — dim-agnostic (works for 2D and 3D inputs).
+
+    Computes per-spatial-position statistics across the channel axis.
+    Class name kept for API stability; auto-detects ndim from input.
+    """
 
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
@@ -52,7 +56,7 @@ class LayerNorm3d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, D, H, W) → compute stats over C
+        # x: (B, C, *spatial) — stats over C dimension.
         u = x.mean(dim=1, keepdim=True)
         s = (x - u).pow(2).mean(dim=1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
@@ -74,16 +78,19 @@ class ConvNeXtBlock(nn.Module):
         expand_ratio: float = 4.0,
         drop_path: float = 0.0,
         attention_type: str = "none",
+        spatial_dims: int = 3,
     ):
         super().__init__()
+        d = spatial_dims
         hidden = int(dim * expand_ratio)
 
-        self.dwconv = nn.Conv3d(dim, dim, kernel_size=7, padding=3, groups=dim, bias=True)
+        self.dwconv = _CONV[d](dim, dim, kernel_size=7, padding=3,
+                               groups=dim, bias=True)
         self.norm = LayerNorm3d(dim)
-        self.pwconv1 = nn.Conv3d(dim, hidden, kernel_size=1, bias=True)
+        self.pwconv1 = _CONV[d](dim, hidden, kernel_size=1, bias=True)
         self.act = nn.GELU()
-        self.pwconv2 = nn.Conv3d(hidden, dim, kernel_size=1, bias=True)
-        self.attn = make_attention(attention_type, dim)
+        self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
+        self.attn = make_attention(attention_type, dim, spatial_dims=d)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -110,18 +117,21 @@ class ConvNeXtAdaptBlock(nn.Module):
         expand_ratio: float = 4.0,
         drop_path: float = 0.0,
         attention_type: str = "none",
+        spatial_dims: int = 3,
     ):
         super().__init__()
+        d = spatial_dims
         self.proj = (
             nn.Sequential(
-                nn.Conv3d(in_ch, out_ch, 1, bias=False),
+                _CONV[d](in_ch, out_ch, 1, bias=False),
                 LayerNorm3d(out_ch),
             )
             if in_ch != out_ch
             else nn.Identity()
         )
         self.block = ConvNeXtBlock(out_ch, expand_ratio, drop_path,
-                                   attention_type=attention_type)
+                                   attention_type=attention_type,
+                                   spatial_dims=d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(self.proj(x))
@@ -141,16 +151,20 @@ class ConvNeXtStage(nn.Module):
         expand_ratio: float = 4.0,
         drop_path_rates: list = None,
         attention_type: str = "none",
+        spatial_dims: int = 3,
     ):
         super().__init__()
+        d = spatial_dims
         if drop_path_rates is None:
             drop_path_rates = [0.0] * num_blocks
         blocks = [ConvNeXtAdaptBlock(in_ch, out_ch, expand_ratio,
-                                     drop_path_rates[0], attention_type)]
+                                     drop_path_rates[0], attention_type,
+                                     spatial_dims=d)]
         for i in range(1, num_blocks):
             dp = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
             blocks.append(ConvNeXtAdaptBlock(out_ch, out_ch, expand_ratio,
-                                             dp, attention_type))
+                                             dp, attention_type,
+                                             spatial_dims=d))
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -23,7 +23,9 @@ import torch.nn as nn
 
 import torch.nn.functional as F
 
-from .blocks import AttentionGate3D, ConvNormAct, Downsample, Upsample, get_norm
+from .blocks import (
+    _CONV, INTERP_SMOOTH,
+    AttentionGate3D, ConvNormAct, Downsample, Upsample, get_norm)
 from .stem import build_stem
 
 
@@ -43,8 +45,10 @@ class Encoder(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         downsample_mode: str = "conv",
-        stem_mode: str = "conv3"):
+        stem_mode: str = "conv3",
+        spatial_dims: int = 3):
         super().__init__()
+        self.spatial_dims = spatial_dims
         # Stem: project input to first channel count. The stem may introduce
         # a spatial stride (``patch2``/``patch4``) — ``stem_stride`` is
         # preserved as a property so the wrapping UNet can add a matching
@@ -52,7 +56,7 @@ class Encoder(nn.Module):
         self.stem, self.stem_stride = build_stem(
             stem_mode, in_channels, stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
-            activation=activation)
+            activation=activation, spatial_dims=spatial_dims)
 
         # Encoder stages and downsampling
         self.stages = nn.ModuleList()
@@ -66,7 +70,7 @@ class Encoder(nn.Module):
                     Downsample(
                         stage_channels[i - 1], stage_channels[i - 1],
                         norm_type=norm_type, norm_groups=norm_groups,
-                        mode=downsample_mode))
+                        mode=downsample_mode, spatial_dims=spatial_dims))
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Returns features from each level: [level_0, level_1, ..., level_N]."""
@@ -98,22 +102,26 @@ class DecoderLevel(nn.Module):
         stage_builder,
         upsample_mode: str = "transpose",
         skip_mode: str = "cat",
-        skip_attention: bool = False):
+        skip_attention: bool = False,
+        spatial_dims: int = 3):
         super().__init__()
         self.skip_mode = skip_mode
-        self.upsample  = Upsample(in_ch, out_ch, mode=upsample_mode)
+        self.spatial_dims = spatial_dims
+        self.upsample  = Upsample(in_ch, out_ch, mode=upsample_mode,
+                                  spatial_dims=spatial_dims)
 
         if skip_mode == "cat":
             fused_ch = out_ch + skip_ch
         else:  # add
             # Project skip to match out_ch if needed
             self.skip_proj = (
-                nn.Conv3d(skip_ch, out_ch, 1, bias=False)
+                _CONV[spatial_dims](skip_ch, out_ch, 1, bias=False)
                 if skip_ch != out_ch else nn.Identity())
             fused_ch = out_ch
 
         self.attn_gate = (
-            AttentionGate3D(x_ch=skip_ch, g_ch=out_ch)
+            AttentionGate3D(x_ch=skip_ch, g_ch=out_ch,
+                            spatial_dims=spatial_dims)
             if skip_attention else None
         )
         self.stage = stage_builder(fused_ch, out_ch)
@@ -123,7 +131,7 @@ class DecoderLevel(nn.Module):
 
         # Handle size mismatch (can happen due to odd input sizes)
         if x.shape[2:] != skip.shape[2:]:
-            x = _match_size(x, skip.shape[2:])
+            x = _match_size(x, skip.shape[2:], self.spatial_dims)
 
         if self.attn_gate is not None:
             # Gate skip using the upsampled decoder feature as the gating
@@ -151,9 +159,11 @@ class Decoder(nn.Module):
         stage_builder,
         upsample_mode: str = "transpose",
         skip_mode: str = "cat",
-        skip_attention: bool = False):
+        skip_attention: bool = False,
+        spatial_dims: int = 3):
         super().__init__()
         self.levels = nn.ModuleList()
+        self.spatial_dims = spatial_dims
         n = len(encoder_channels)
 
         # Decoder levels: from deepest to shallowest
@@ -167,7 +177,8 @@ class Decoder(nn.Module):
                 DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
                              upsample_mode=upsample_mode,
                              skip_mode=skip_mode,
-                             skip_attention=skip_attention))
+                             skip_attention=skip_attention,
+                             spatial_dims=spatial_dims))
 
         # Output channels at each decoder level (low-res → high-res)
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
@@ -191,11 +202,12 @@ class Decoder(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """1x1x1 convolution to produce per-class logits."""
+    """1×1(×1) convolution to produce per-class logits."""
 
-    def __init__(self, in_ch: int, num_classes: int):
+    def __init__(self, in_ch: int, num_classes: int,
+                 spatial_dims: int = 3):
         super().__init__()
-        self.conv = nn.Conv3d(in_ch, num_classes, kernel_size=1)
+        self.conv = _CONV[spatial_dims](in_ch, num_classes, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
@@ -216,12 +228,14 @@ class UNet3D(nn.Module):
         encoder: Encoder,
         decoder,
         num_fg_classes: int,
-        deep_supervision: bool = False):
+        deep_supervision: bool = False,
+        spatial_dims: int = 3):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.num_fg_classes   = num_fg_classes
         self.deep_supervision = deep_supervision
+        self.spatial_dims = spatial_dims
 
         # Main segmentation head (highest resolution decoder output). If the
         # encoder uses a patch-embed stem (stride > 1), the decoder's highest
@@ -230,7 +244,9 @@ class UNet3D(nn.Module):
         # at their native decoder resolutions — DeepSupervisionLoss already
         # downsamples the target to match.
         self.stem_stride = getattr(encoder, "stem_stride", 1)
-        self.seg_head = SegmentationHead(decoder.out_channels[-1], num_fg_classes)
+        self.seg_head = SegmentationHead(
+            decoder.out_channels[-1], num_fg_classes,
+            spatial_dims=spatial_dims)
 
         # Deep supervision heads (lower-resolution outputs).
         # decoder.out_channels is [low, ..., high]; we want DS outputs ordered
@@ -241,7 +257,8 @@ class UNet3D(nn.Module):
             self.ds_heads = nn.ModuleList()
             # Reverse [low..2nd-high] → [2nd-high..low]
             for ch in reversed(decoder.out_channels[:-1]):
-                self.ds_heads.append(SegmentationHead(ch, num_fg_classes))
+                self.ds_heads.append(SegmentationHead(
+                    ch, num_fg_classes, spatial_dims=spatial_dims))
 
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Forward pass.
@@ -260,11 +277,11 @@ class UNet3D(nn.Module):
         main_out = self.seg_head(dec_features[-1])
         if self.stem_stride > 1:
             # Restore main output to the original input resolution. Use
-            # trilinear (bilinear equivalent) up-sampling — consistent with
-            # SegFormer/nnFormer-style patch-embed decoders.
+            # bilinear/trilinear up-sampling per spatial_dims — consistent
+            # with SegFormer/nnFormer-style patch-embed decoders.
             main_out = F.interpolate(
                 main_out, size=x.shape[2:],
-                mode="trilinear", align_corners=False)
+                mode=INTERP_SMOOTH[self.spatial_dims], align_corners=False)
 
         if not self.deep_supervision or not self.training:
             return main_out
@@ -285,7 +302,8 @@ class UNet3D(nn.Module):
         return {"encoder": enc, "decoder": dec, "seg_head": head, "total": total}
 
 
-def _match_size(x: torch.Tensor, target_size) -> torch.Tensor:
-    """Pad or crop x to match target spatial size."""
-    import torch.nn.functional as F
-    return F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
+def _match_size(x: torch.Tensor, target_size, spatial_dims: int = 3) -> torch.Tensor:
+    """Resize x to match target spatial size (bilinear/trilinear by dim)."""
+    return F.interpolate(
+        x, size=target_size,
+        mode=INTERP_SMOOTH[spatial_dims], align_corners=False)

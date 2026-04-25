@@ -21,7 +21,7 @@ from typing import Tuple
 
 import torch.nn as nn
 
-from .blocks import ConvNormAct, get_activation, get_norm
+from .blocks import _CONV, ConvNormAct, get_activation, get_norm
 
 
 STEM_MODES = ("conv3", "conv7", "dual", "patch2", "patch4")
@@ -37,14 +37,17 @@ class DualConvStem(nn.Module):
         norm_type: str = "instance",
         norm_groups: int = 8,
         activation: str = "leakyrelu",
+        spatial_dims: int = 3,
     ):
         super().__init__()
         self.block1 = ConvNormAct(
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
-            norm_type=norm_type, norm_groups=norm_groups, activation=activation)
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation, spatial_dims=spatial_dims)
         self.block2 = ConvNormAct(
             out_ch, out_ch, kernel_size=3, stride=1, padding=1,
-            norm_type=norm_type, norm_groups=norm_groups, activation=activation)
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation, spatial_dims=spatial_dims)
 
     def forward(self, x):
         return self.block2(self.block1(x))
@@ -65,16 +68,19 @@ class PatchEmbedStem(nn.Module):
         norm_type: str = "instance",
         norm_groups: int = 8,
         activation: str = "gelu",
+        spatial_dims: int = 3,
     ):
         super().__init__()
         if patch_size < 1:
             raise ValueError(f"patch_size must be >= 1, got {patch_size}")
         self.patch_size = patch_size
-        self.conv = nn.Conv3d(in_ch, out_ch,
-                              kernel_size=patch_size,
-                              stride=patch_size,
-                              bias=False)
-        self.norm = get_norm(norm_type, out_ch, norm_groups)
+        self.conv = _CONV[spatial_dims](
+            in_ch, out_ch,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=False)
+        self.norm = get_norm(norm_type, out_ch, norm_groups,
+                             spatial_dims=spatial_dims)
         self.act = get_activation(activation)
 
     def forward(self, x):
@@ -88,6 +94,7 @@ def build_stem(
     norm_type: str = "instance",
     norm_groups: int = 8,
     activation: str = "leakyrelu",
+    spatial_dims: int = 3,
 ) -> Tuple[nn.Module, int]:
     """Construct a stem module.
 
@@ -103,19 +110,22 @@ def build_stem(
     if mode == "conv3":
         stem = ConvNormAct(
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
-            norm_type=norm_type, norm_groups=norm_groups, activation=activation)
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
     if mode == "conv7":
         stem = ConvNormAct(
             in_ch, out_ch, kernel_size=7, stride=1, padding=3,
-            norm_type=norm_type, norm_groups=norm_groups, activation=activation)
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
     if mode == "dual":
         stem = DualConvStem(
             in_ch, out_ch,
-            norm_type=norm_type, norm_groups=norm_groups, activation=activation)
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
     # patch-embed variants
@@ -124,5 +134,6 @@ def build_stem(
     stem = PatchEmbedStem(
         in_ch, out_ch, patch_size=patch_size,
         norm_type=norm_type, norm_groups=norm_groups,
-        activation="gelu" if activation == "leakyrelu" else activation)
+        activation="gelu" if activation == "leakyrelu" else activation,
+        spatial_dims=spatial_dims)
     return stem, patch_size

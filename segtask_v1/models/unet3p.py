@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import AttentionGate3D, ConvNormAct
+from .blocks import INTERP_SMOOTH, AttentionGate3D, ConvNormAct
 
 
 class UNet3PDecoder(nn.Module):
@@ -65,6 +65,7 @@ class UNet3PDecoder(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         skip_attention: bool = False,
+        spatial_dims: int = 3,
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -74,12 +75,13 @@ class UNet3PDecoder(nn.Module):
         self.cat = cat_channels
         self.fused_ch = fused_channels if fused_channels > 0 else cat_channels * n
         self.skip_attention = skip_attention
+        self.spatial_dims = spatial_dims
 
         def _cna(in_ch: int, out_ch: int) -> ConvNormAct:
             return ConvNormAct(
                 in_ch, out_ch, kernel_size=3, stride=1, padding=1,
                 norm_type=norm_type, norm_groups=norm_groups,
-                activation=activation)
+                activation=activation, spatial_dims=spatial_dims)
 
         # For each decoder depth i ∈ [0, n-2] (0 = highest-res decoder), build
         # a list of n branch convs (one per source j ∈ [0, n-1]).
@@ -102,7 +104,9 @@ class UNet3PDecoder(nn.Module):
                 branch_convs.append(_cna(src_ch, cat_channels))
                 if skip_attention:
                     branch_gates.append(
-                        AttentionGate3D(x_ch=src_ch, g_ch=encoder_channels[i]))
+                        AttentionGate3D(
+                            x_ch=src_ch, g_ch=encoder_channels[i],
+                            spatial_dims=spatial_dims))
             self.branches.append(branch_convs)
             if skip_attention:
                 self.gates.append(branch_gates)
@@ -112,16 +116,18 @@ class UNet3PDecoder(nn.Module):
         # UNet3D expects ``out_channels`` ordered low-res → high-res.
         self.out_channels = [self.fused_ch] * (n - 1)
 
-    @staticmethod
-    def _resize_to(src: torch.Tensor, target_shape, mode: str) -> torch.Tensor:
+    def _resize_to(self, src: torch.Tensor, target_shape, mode: str) -> torch.Tensor:
         if src.shape[2:] == target_shape:
             return src
         if mode == "down":
             # Adaptive max pool handles arbitrary ratios (robust to non-2^k
             # feature maps caused by odd patch sizes).
-            return F.adaptive_max_pool3d(src, target_shape)
-        return F.interpolate(src, size=target_shape,
-                             mode="trilinear", align_corners=False)
+            if self.spatial_dims == 3:
+                return F.adaptive_max_pool3d(src, target_shape)
+            return F.adaptive_max_pool2d(src, target_shape)
+        return F.interpolate(
+            src, size=target_shape,
+            mode=INTERP_SMOOTH[self.spatial_dims], align_corners=False)
 
     def forward(self, encoder_features: List[torch.Tensor]) -> List[torch.Tensor]:
         """Compute decoder features in ``[low_res, ..., high_res]`` order."""

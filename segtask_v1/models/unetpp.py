@@ -45,7 +45,9 @@ from typing import List
 import torch
 import torch.nn as nn
 
-from .blocks import AttentionGate3D, Upsample
+import torch.nn.functional as F
+
+from .blocks import INTERP_SMOOTH, AttentionGate3D, Upsample
 
 
 class UNetPPDecoder(nn.Module):
@@ -72,6 +74,7 @@ class UNetPPDecoder(nn.Module):
         stage_builder,
         upsample_mode: str = "transpose",
         skip_attention: bool = False,
+        spatial_dims: int = 3,
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -79,6 +82,7 @@ class UNetPPDecoder(nn.Module):
             raise ValueError("UNetPPDecoder requires at least 2 encoder levels")
         self.n = n
         self.skip_attention = skip_attention
+        self.spatial_dims = spatial_dims
 
         # Nested grid: nodes[i][j] for i in [0, n-2], j in [1, n-1-i].
         # Parameter containers are keyed by "i_j" strings so PyTorch's
@@ -99,6 +103,7 @@ class UNetPPDecoder(nn.Module):
                     encoder_channels[i + 1],
                     encoder_channels[i],
                     mode=upsample_mode,
+                    spatial_dims=spatial_dims,
                 )
                 # Fused input: j previous same-depth features (enc_ch[i] each)
                 # + 1 upsampled feature (projected to enc_ch[i]) → (j+1) * enc_ch[i].
@@ -111,6 +116,7 @@ class UNetPPDecoder(nn.Module):
                     self.gates[key] = AttentionGate3D(
                         x_ch=encoder_channels[i],
                         g_ch=encoder_channels[i],
+                        spatial_dims=spatial_dims,
                     )
 
         # UNet3D-compatible decoder output channels (low-res → high-res).
@@ -143,9 +149,10 @@ class UNetPPDecoder(nn.Module):
                 up = self.upsamples[key](x[i + 1][j - 1])
                 # Resize if odd spatial dims caused a mismatch.
                 if up.shape[2:] != x[i][0].shape[2:]:
-                    up = nn.functional.interpolate(
+                    up = F.interpolate(
                         up, size=x[i][0].shape[2:],
-                        mode="trilinear", align_corners=False)
+                        mode=INTERP_SMOOTH[self.spatial_dims],
+                        align_corners=False)
                 # Optional gating: drive by X[i, 0] (raw encoder feature).
                 if self.skip_attention:
                     up = self.gates[key](up, x[i][0])

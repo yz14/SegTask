@@ -40,6 +40,12 @@ data:
   #   "whole" : 整卷直接 resize 到 patch_size，不切块不滑窗。
   #             最简单，适合病灶占据整卷大部分或算力/显存充裕时。
   #             multi_res_scales 必须为 [1.0]（强制校验）。
+  #   "2_5d"  : 2.5D 方案：沿用 z_axis 单分辨率取片（multi_res_scales 必须为
+  #             [1.0]），但训练时增强后将 (B,1,D,H,W) squeeze 为 (B,D,H,W) 喂给
+  #             2D 模型；输出 (B, num_fg*D, H, W) 由 SliceChannelLoss 拆为
+  #             num_fg 组的 D 通道二值预测。Config.sync() 会自动把
+  #             model.spatial_dims=2 与 model.in_channels=patch_size[0] 同步。
+  #             示例配置：configs/seg2_5d.yaml
   patch_mode: "z_axis"
 
   # Augmentation oversample ratio — extract larger patch, augment, then

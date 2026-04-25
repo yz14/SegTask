@@ -1,35 +1,37 @@
 """Common building blocks shared across encoder/decoder implementations.
 
+All blocks are spatial-dimension agnostic (n=2 or 3), routed via the
+``spatial_dims`` keyword (default 3 for backward compatibility). The ``*3D``
+class names are kept for API stability — they now denote ``spatial_dims=3``
+by default but can build a 2D variant via ``spatial_dims=2``.
+
 Provides:
-- Layer factories (conv, norm, activation)
+- Layer factories (conv, norm, activation, pool, dropout) per spatial_dims
 - ConvNormAct: single conv + norm + activation
 - SqueezeExcite3D: channel attention (SE block, Hu 2018)
 - ECA3D: Efficient Channel Attention (Wang et al., CVPR 2020).
-- CBAM3D: Convolutional Block Attention Module (Woo et al., ECCV 2018):
-  channel + spatial attention in sequence.
-- CoordAttention3D: Coordinate Attention (Hou et al., CVPR 2021), extended
-  from 2D H/W pooling to 3D D/H/W axis-wise pooling.
+- CBAM3D: Convolutional Block Attention Module (Woo et al., ECCV 2018).
+- CoordAttention3D: Coordinate Attention (Hou et al., CVPR 2021), generalised
+  to nD axis-wise pooling.
 - AttentionGate3D: skip-connection attention for UNet (Oktay et al.,
-  MIDL 2018 — "Attention U-Net"), the de-facto standard for 3D medical
-  segmentation.
-- make_attention(name, channels): unified factory returning a channel
-  attention block (Identity/SE/ECA/CBAM/CoordAttention).
-- BlurPool3D: anti-aliased low-pass filter for shift-invariant strided ops
-  (Zhang, "Making Convolutional Networks Shift-Invariant Again", ICML 2019).
-- PixelShuffle3D / PixelUnshuffle3D: lossless space<->depth rearrange,
-  3D extension of ESPCN sub-pixel convolution (Shi et al., CVPR 2016).
-- CARAFE3d: content-aware reassembly upsampler (Wang et al., ICCV 2019),
-  3D port with memory-aware default kernel size.
-- DySample3d: dynamic-sampling upsampler (Liu et al., ICCV 2023), 3D port.
-- Downsample: multi-mode factor-2 3D downsampling (conv / maxpool / avgpool /
+  MIDL 2018 — "Attention U-Net").
+- make_attention(name, channels, spatial_dims=3): unified factory.
+- BlurPool3d: anti-aliased low-pass filter (Zhang, ICML 2019).
+- PixelShuffle3d / PixelUnshuffle3d: lossless space<->depth (ESPCN-style),
+  generalised to nD.
+- CARAFE3d: content-aware reassembly upsampler (Wang et al., ICCV 2019).
+  3D-only.
+- DySample3d: dynamic-sampling upsampler (Liu et al., ICCV 2023). 3D-only.
+- Downsample: multi-mode factor-2 nD downsampling (conv / maxpool / avgpool /
   blurpool / pixelunshuffle).
-- Upsample: multi-mode factor-2 3D upsampling (transpose / trilinear /
-  nearest / pixelshuffle / carafe / dysample).
+- Upsample: multi-mode factor-2 nD upsampling (transpose / linear /
+  nearest / pixelshuffle / carafe / dysample). carafe & dysample are
+  3D-only.
 """
 
 from __future__ import annotations
 
-from typing import Type
+from typing import Sequence, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -37,22 +39,54 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Layer factories
+# Layer factories — spatial_dims dispatch tables
 # ---------------------------------------------------------------------------
+_CONV     = {2: nn.Conv2d,            3: nn.Conv3d}
+_CONV_T   = {2: nn.ConvTranspose2d,   3: nn.ConvTranspose3d}
+_BN       = {2: nn.BatchNorm2d,       3: nn.BatchNorm3d}
+_IN       = {2: nn.InstanceNorm2d,    3: nn.InstanceNorm3d}
+_DROP     = {2: nn.Dropout2d,         3: nn.Dropout3d}
+_MAXPOOL  = {2: nn.MaxPool2d,         3: nn.MaxPool3d}
+_AVGPOOL  = {2: nn.AvgPool2d,         3: nn.AvgPool3d}
+_AAVGPOOL = {2: nn.AdaptiveAvgPool2d, 3: nn.AdaptiveAvgPool3d}
+_AMAXPOOL = {2: nn.AdaptiveMaxPool2d, 3: nn.AdaptiveMaxPool3d}
+
+#: smooth (linear) interpolation mode for ``F.interpolate`` per spatial_dims.
+INTERP_SMOOTH = {2: "bilinear", 3: "trilinear"}
+
+
+def _check_dims(spatial_dims: int) -> int:
+    if spatial_dims not in (2, 3):
+        raise ValueError(
+            f"spatial_dims must be 2 or 3, got {spatial_dims!r}")
+    return spatial_dims
+
+
 def get_conv3d() -> Type[nn.Module]:
+    """Back-compat alias — returns ``nn.Conv3d`` unconditionally."""
     return nn.Conv3d
+
+
+def get_conv(spatial_dims: int = 3) -> Type[nn.Module]:
+    """Return the conv class (`Conv2d`/`Conv3d`) for the given dim."""
+    return _CONV[_check_dims(spatial_dims)]
 
 
 def get_norm(
     norm_type: str,
     num_channels: int,
     num_groups: int = 8,
-) -> nn.Module:
-    """Create a 3D normalization layer."""
+    spatial_dims: int = 3) -> nn.Module:
+    """Create an nD normalization layer.
+
+    ``GroupNorm`` is dim-agnostic; ``BatchNorm`` / ``InstanceNorm`` are
+    routed to the matching nD variant.
+    """
+    d = _check_dims(spatial_dims)
     if norm_type == "batch":
-        return nn.BatchNorm3d(num_channels)
+        return _BN[d](num_channels)
     elif norm_type == "instance":
-        return nn.InstanceNorm3d(num_channels, affine=True)
+        return _IN[d](num_channels, affine=True)
     elif norm_type == "group":
         while num_channels % num_groups != 0 and num_groups > 1:
             num_groups //= 2
@@ -79,7 +113,7 @@ def get_activation(name: str) -> nn.Module:
 # Conv + Norm + Activation
 # ---------------------------------------------------------------------------
 class ConvNormAct(nn.Module):
-    """3D convolution + normalization + activation."""
+    """nD convolution + normalization + activation (default 3D)."""
 
     def __init__(
         self,
@@ -92,12 +126,15 @@ class ConvNormAct(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         dropout: float = 0.0,
+        spatial_dims: int = 3,
     ):
         super().__init__()
-        self.conv = nn.Conv3d(in_ch, out_ch, kernel_size, stride, padding, bias=False)
-        self.norm = get_norm(norm_type, out_ch, norm_groups)
+        d = _check_dims(spatial_dims)
+        self.conv = _CONV[d](
+            in_ch, out_ch, kernel_size, stride, padding, bias=False)
+        self.norm = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act = get_activation(activation)
-        self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
+        self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.drop(self.act(self.norm(self.conv(x))))
@@ -107,16 +144,20 @@ class ConvNormAct(nn.Module):
 # Squeeze-and-Excitation (channel attention)
 # ---------------------------------------------------------------------------
 class SqueezeExcite3D(nn.Module):
-    """3D Squeeze-and-Excitation block (Hu et al., 2018).
+    """nD Squeeze-and-Excitation block (Hu et al., 2018).
 
     Global average pool → FC reduce → ReLU → FC expand → Sigmoid → scale.
+    Class name kept (``*3D``) for API stability — use ``spatial_dims=2`` for 2D.
     """
 
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, channels: int, reduction: int = 16,
+                 spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
         mid = max(channels // reduction, 4)
         self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
+            _AAVGPOOL[d](1),
             nn.Flatten(),
             nn.Linear(channels, mid, bias=False),
             nn.ReLU(inplace=True),
@@ -125,7 +166,9 @@ class SqueezeExcite3D(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        scale = self.fc(x).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # (B, C) -> (B, C, 1, 1[, 1])
+        scale = self.fc(x).view(x.shape[0], x.shape[1],
+                                *([1] * self.spatial_dims))
         return x * scale
 
 
@@ -137,25 +180,28 @@ class SqueezeExcite3D(nn.Module):
 # Kernel size k is adaptively chosen from C: k = |log2(C)/gamma + b/gamma|_odd.
 # ---------------------------------------------------------------------------
 class ECA3D(nn.Module):
-    """3D Efficient Channel Attention."""
+    """nD Efficient Channel Attention. Class name kept for API stability."""
 
-    def __init__(self, channels: int, k_size: int = 0, gamma: int = 2, b: int = 1):
+    def __init__(self, channels: int, k_size: int = 0, gamma: int = 2, b: int = 1,
+                 spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
         if k_size <= 0:
             # Adaptive kernel size; force odd.
             import math
             k = int(abs(math.log2(max(channels, 2)) / gamma + b / gamma))
             k_size = k if k % 2 else k + 1
-        self.avg = nn.AdaptiveAvgPool3d(1)
+        self.avg = _AAVGPOOL[d](1)
         self.conv = nn.Conv1d(1, 1, kernel_size=k_size,
                               padding=k_size // 2, bias=False)
         self.sig = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # (B, C, 1, 1, 1) -> (B, 1, C) -> conv1d -> (B, 1, C) -> (B, C, 1, 1, 1)
+        # (B, C, 1, 1[, 1]) -> (B, 1, C) -> conv1d -> (B, 1, C) -> (B, C, 1, 1[, 1])
         y = self.avg(x).flatten(1).unsqueeze(1)
         y = self.sig(self.conv(y)).squeeze(1)
-        return x * y.view(y.size(0), y.size(1), 1, 1, 1)
+        return x * y.view(y.size(0), y.size(1), *([1] * self.spatial_dims))
 
 
 # ---------------------------------------------------------------------------
@@ -164,32 +210,35 @@ class ECA3D(nn.Module):
 # spatial attention (7×7×7 conv over channel-wise avg+max concat).
 # ---------------------------------------------------------------------------
 class _CBAMChannelAttn(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, channels: int, reduction: int = 16, spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
         mid = max(channels // reduction, 4)
         self.mlp = nn.Sequential(
             nn.Linear(channels, mid, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(mid, channels, bias=False),
         )
-        self.avg = nn.AdaptiveAvgPool3d(1)
-        self.max = nn.AdaptiveMaxPool3d(1)
+        self.avg = _AAVGPOOL[d](1)
+        self.max = _AMAXPOOL[d](1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C = x.shape[:2]
         avg = self.mlp(self.avg(x).view(B, C))
         mx  = self.mlp(self.max(x).view(B, C))
-        w = torch.sigmoid(avg + mx).view(B, C, 1, 1, 1)
+        w = torch.sigmoid(avg + mx).view(B, C, *([1] * self.spatial_dims))
         return x * w
 
 
 class _CBAMSpatialAttn(nn.Module):
-    def __init__(self, kernel_size: int = 7):
+    def __init__(self, kernel_size: int = 7, spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
         if kernel_size % 2 == 0:
             raise ValueError("CBAM spatial kernel must be odd.")
-        self.conv = nn.Conv3d(2, 1, kernel_size=kernel_size,
-                              padding=kernel_size // 2, bias=False)
+        self.conv = _CONV[d](2, 1, kernel_size=kernel_size,
+                             padding=kernel_size // 2, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         avg = x.mean(dim=1, keepdim=True)
@@ -199,13 +248,18 @@ class _CBAMSpatialAttn(nn.Module):
 
 
 class CBAM3D(nn.Module):
-    """3D Convolutional Block Attention Module (channel → spatial)."""
+    """nD Convolutional Block Attention Module (channel → spatial).
+
+    Class name kept (``*3D``) for API stability.
+    """
 
     def __init__(self, channels: int, reduction: int = 16,
-                 spatial_kernel: int = 7):
+                 spatial_kernel: int = 7, spatial_dims: int = 3):
         super().__init__()
-        self.channel = _CBAMChannelAttn(channels, reduction)
-        self.spatial = _CBAMSpatialAttn(spatial_kernel)
+        self.channel = _CBAMChannelAttn(channels, reduction,
+                                        spatial_dims=spatial_dims)
+        self.spatial = _CBAMSpatialAttn(spatial_kernel,
+                                        spatial_dims=spatial_dims)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.spatial(self.channel(x))
@@ -219,71 +273,99 @@ class CBAM3D(nn.Module):
 # anatomical structures (vessels, airways, spine, …).
 # ---------------------------------------------------------------------------
 class CoordAttention3D(nn.Module):
-    """3D Coordinate Attention.
+    """nD Coordinate Attention (Hou et al., CVPR 2021).
 
-    Produces three axis-wise attention maps (along D, H, W) fused back
-    multiplicatively onto the input feature map.
+    Generalised to ``spatial_dims`` axis-wise pools + axis-wise output
+    convolutions. For 2D this is the original H/W formulation; for 3D it
+    is the D/H/W extension. Class name kept (``*3D``) for API stability.
     """
 
-    def __init__(self, channels: int, reduction: int = 32):
+    def __init__(self, channels: int, reduction: int = 32,
+                 spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
         mid = max(channels // reduction, 8)
-        # Pool along each axis to a 1D profile (other two dims collapsed).
-        self.pool_d = nn.AdaptiveAvgPool3d((None, 1, 1))
-        self.pool_h = nn.AdaptiveAvgPool3d((1, None, 1))
-        self.pool_w = nn.AdaptiveAvgPool3d((1, 1, None))
 
-        self.conv1 = nn.Conv3d(channels, mid, kernel_size=1, bias=False)
-        self.norm1 = nn.BatchNorm3d(mid)
+        # Per-axis pool: each pool keeps one spatial axis full and collapses
+        # the others to size 1. The output_size tuple has length == d.
+        self.pools = nn.ModuleList([
+            _AAVGPOOL[d](self._axis_pool_size(d, axis))
+            for axis in range(d)
+        ])
+
+        # Shared bottleneck conv (operates on a column-stacked rank-(d+2)
+        # tensor where the FIRST spatial axis is the concatenation axis).
+        self.conv1 = _CONV[d](channels, mid, kernel_size=1, bias=False)
+        self.norm1 = _BN[d](mid)
         self.act = nn.Hardswish(inplace=True)
 
-        self.conv_d = nn.Conv3d(mid, channels, kernel_size=1, bias=False)
-        self.conv_h = nn.Conv3d(mid, channels, kernel_size=1, bias=False)
-        self.conv_w = nn.Conv3d(mid, channels, kernel_size=1, bias=False)
+        # Per-axis output conv: maps mid -> channels, applied on the slice
+        # corresponding to that axis.
+        self.axis_convs = nn.ModuleList([
+            _CONV[d](mid, channels, kernel_size=1, bias=False)
+            for _ in range(d)
+        ])
+
+    @staticmethod
+    def _axis_pool_size(spatial_dims: int, keep_axis: int) -> Tuple:
+        """Pool tuple keeping ``keep_axis`` full (None) and others size 1."""
+        return tuple(None if i == keep_axis else 1 for i in range(spatial_dims))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, D, H, W = x.shape
-        # Axis-wise pooled descriptors (each shape has two of the spatial
-        # dims collapsed to 1).
-        pd = self.pool_d(x)  # (B, C, D, 1, 1)
-        ph = self.pool_h(x)  # (B, C, 1, H, 1)
-        pw = self.pool_w(x)  # (B, C, 1, 1, W)
-        # Flatten spatial axis into the D dim of a common rank-5 tensor so
-        # a shared conv1×1 can be applied.
-        y = torch.cat([
-            pd.view(B, C, D, 1, 1),
-            ph.view(B, C, H, 1, 1),
-            pw.view(B, C, W, 1, 1),
-        ], dim=2)
-        y = self.act(self.norm1(self.conv1(y)))
-        y_d, y_h, y_w = torch.split(y, [D, H, W], dim=2)
+        d = self.spatial_dims
+        B, C = x.shape[:2]
+        sizes = list(x.shape[2:])  # spatial sizes [s0, s1, ...]
 
-        a_d = torch.sigmoid(self.conv_d(y_d)).view(B, C, D, 1, 1)
-        a_h = torch.sigmoid(self.conv_h(y_h)).view(B, C, 1, H, 1)
-        a_w = torch.sigmoid(self.conv_w(y_w)).view(B, C, 1, 1, W)
-        return x * a_d * a_h * a_w
+        # Axis-wise pooled descriptors. Reshape each to put its kept axis
+        # at the FIRST spatial position, others 1, so they can be cat'd
+        # along that common axis for a shared 1x1 conv.
+        descriptors = []
+        for axis in range(d):
+            p = self.pools[axis](x)  # keeps axis full, others 1
+            # Move axis to the first spatial position.
+            new_shape = [B, C, sizes[axis]] + [1] * (d - 1)
+            descriptors.append(p.reshape(new_shape))
+        y = torch.cat(descriptors, dim=2)
+        y = self.act(self.norm1(self.conv1(y)))
+        y_axes = torch.split(y, sizes, dim=2)
+
+        out = x
+        for axis in range(d):
+            # Reshape per-axis attention back to broadcasting shape
+            # (B, C, 1, ..., size_axis, ..., 1).
+            broadcast_shape = [B, C] + [1] * d
+            broadcast_shape[2 + axis] = sizes[axis]
+            a = torch.sigmoid(self.axis_convs[axis](y_axes[axis])).reshape(
+                broadcast_shape)
+            out = out * a
+        return out
 
 
 # ---------------------------------------------------------------------------
 # Unified channel-attention factory.
 # ---------------------------------------------------------------------------
-def make_attention(name: str, channels: int, **kwargs) -> nn.Module:
+def make_attention(name: str, channels: int,
+                   spatial_dims: int = 3, **kwargs) -> nn.Module:
     """Return a channel/spatial attention block by name.
 
     Names: "none" | "se" | "eca" | "cbam" | "coord".
-    Unknown name → ValueError.
+    ``spatial_dims`` selects 2D vs 3D variant. Unknown name → ValueError.
     """
     name = (name or "none").lower()
     if name == "none":
         return nn.Identity()
     if name == "se":
-        return SqueezeExcite3D(channels, reduction=kwargs.get("reduction", 16))
+        return SqueezeExcite3D(channels, reduction=kwargs.get("reduction", 16),
+                               spatial_dims=spatial_dims)
     if name == "eca":
-        return ECA3D(channels)
+        return ECA3D(channels, spatial_dims=spatial_dims)
     if name == "cbam":
-        return CBAM3D(channels, reduction=kwargs.get("reduction", 16))
+        return CBAM3D(channels, reduction=kwargs.get("reduction", 16),
+                      spatial_dims=spatial_dims)
     if name == "coord":
-        return CoordAttention3D(channels, reduction=kwargs.get("reduction", 32))
+        return CoordAttention3D(channels, reduction=kwargs.get("reduction", 32),
+                                spatial_dims=spatial_dims)
     raise ValueError(
         f"Unknown attention type: {name!r}. "
         f"Valid: none|se|eca|cbam|coord")
@@ -302,29 +384,35 @@ ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord")
 #   g  (gate)  -- W_g 1x1 --/
 # ---------------------------------------------------------------------------
 class AttentionGate3D(nn.Module):
-    """Additive attention gate for UNet skip connections.
+    """Additive attention gate for UNet skip connections (Oktay et al., 2018).
+
+    Class name kept (``*3D``) for API stability — use ``spatial_dims=2`` for 2D.
 
     Args:
         x_ch:  channels of the skip (encoder) feature.
         g_ch:  channels of the gating (decoder) feature.
         inter: bottleneck channel count (default = x_ch // 2, min 1).
+        spatial_dims: 2 or 3.
     """
 
-    def __init__(self, x_ch: int, g_ch: int, inter: int = 0):
+    def __init__(self, x_ch: int, g_ch: int, inter: int = 0,
+                 spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
         if inter <= 0:
             inter = max(x_ch // 2, 1)
         self.W_x = nn.Sequential(
-            nn.Conv3d(x_ch, inter, kernel_size=1, bias=False),
-            nn.BatchNorm3d(inter),
+            _CONV[d](x_ch, inter, kernel_size=1, bias=False),
+            _BN[d](inter),
         )
         self.W_g = nn.Sequential(
-            nn.Conv3d(g_ch, inter, kernel_size=1, bias=False),
-            nn.BatchNorm3d(inter),
+            _CONV[d](g_ch, inter, kernel_size=1, bias=False),
+            _BN[d](inter),
         )
         self.psi = nn.Sequential(
-            nn.Conv3d(inter, 1, kernel_size=1, bias=False),
-            nn.BatchNorm3d(1),
+            _CONV[d](inter, 1, kernel_size=1, bias=False),
+            _BN[d](1),
             nn.Sigmoid(),
         )
         self.relu = nn.ReLU(inplace=True)
@@ -332,12 +420,14 @@ class AttentionGate3D(nn.Module):
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """Gate skip feature ``x`` using decoder signal ``g``.
 
-        If the spatial sizes differ, ``g`` is trilinearly resized to match
-        ``x``. The returned tensor has the same shape as ``x``.
+        If the spatial sizes differ, ``g`` is linearly resized (bilinear/
+        trilinear per spatial_dims) to match ``x``.
         """
         if g.shape[2:] != x.shape[2:]:
-            g = F.interpolate(g, size=x.shape[2:], mode="trilinear",
-                              align_corners=False)
+            g = F.interpolate(
+                g, size=x.shape[2:],
+                mode=INTERP_SMOOTH[self.spatial_dims],
+                align_corners=False)
         return x * self.psi(self.relu(self.W_x(x) + self.W_g(g)))
 
 
@@ -348,11 +438,11 @@ class AttentionGate3D(nn.Module):
 # dramatically improves shift-invariance compared to naive strided ops.
 # ---------------------------------------------------------------------------
 class BlurPool3d(nn.Module):
-    """3D anti-aliased blur + stride downsample.
+    """nD anti-aliased blur + stride downsample (class name kept for API).
 
     A fixed (non-learned), depthwise separable binomial low-pass filter is
-    applied prior to subsampling. filt_size=3 uses the classic [1,2,1]
-    binomial kernel (outer-product in 3D), filt_size=5 uses [1,4,6,4,1].
+    applied prior to subsampling. filt_size=3 uses [1,2,1]; filt_size=5
+    uses [1,4,6,4,1].
     """
 
     _BINOMIAL: dict = {
@@ -361,8 +451,11 @@ class BlurPool3d(nn.Module):
         5: (1., 4., 6., 4., 1.),
     }
 
-    def __init__(self, channels: int, stride: int = 2, filt_size: int = 3):
+    def __init__(self, channels: int, stride: int = 2, filt_size: int = 3,
+                 spatial_dims: int = 3):
         super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
         if filt_size not in self._BINOMIAL:
             raise ValueError(f"Unsupported BlurPool filt_size: {filt_size}")
         self.channels = channels
@@ -370,22 +463,27 @@ class BlurPool3d(nn.Module):
         self.pad = filt_size // 2
 
         a = torch.tensor(self._BINOMIAL[filt_size], dtype=torch.float32)
-        # 3D separable kernel via outer products.
-        kernel = a[:, None, None] * a[None, :, None] * a[None, None, :]
+        # nD separable kernel via outer products.
+        kernel = a
+        for _ in range(d - 1):
+            kernel = kernel.unsqueeze(-1) * a  # iterative outer product
         kernel = kernel / kernel.sum()
-        kernel = kernel[None, None].expand(channels, 1, *kernel.shape).contiguous()
-        # Non-learned filter, registered as buffer so it moves with .to(device).
+        # Add (out_ch=channels, in_ch_per_group=1) leading dims.
+        kernel = kernel[None, None].expand(
+            channels, 1, *kernel.shape).contiguous()
         self.register_buffer("kernel", kernel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Reflection padding preserves boundary statistics (zero-padding
-        # would bias constant regions towards 0 near the border).
+        # Replicate padding preserves boundary statistics.
         if self.pad:
-            x = F.pad(x, [self.pad] * 6, mode="replicate")
-        return F.conv3d(
+            x = F.pad(x, [self.pad] * (2 * self.spatial_dims), mode="replicate")
+        if self.spatial_dims == 3:
+            return F.conv3d(
+                x, self.kernel,
+                stride=self.stride, padding=0, groups=self.channels)
+        return F.conv2d(
             x, self.kernel,
-            stride=self.stride, padding=0, groups=self.channels,
-        )
+            stride=self.stride, padding=0, groups=self.channels)
 
 
 # ---------------------------------------------------------------------------
@@ -394,73 +492,117 @@ class BlurPool3d(nn.Module):
 # via a single reshape+permute. Both ops are lossless and parameter-free.
 # ---------------------------------------------------------------------------
 class PixelUnshuffle3d(nn.Module):
-    """Space-to-depth: (B, C, rD, rH, rW) -> (B, C*r^3, D, H, W)."""
+    """nD space-to-depth: (B, C, r*s_0, r*s_1, ...) -> (B, C*r^d, s_0, s_1, ...).
 
-    def __init__(self, r: int = 2):
+    Class name kept (``*3d``) for API stability. ``spatial_dims=2`` switches
+    to a 2D version (input rank 4).
+    """
+
+    def __init__(self, r: int = 2, spatial_dims: int = 3):
         super().__init__()
         if r < 1:
             raise ValueError(f"r must be >= 1, got {r}")
         self.r = r
+        self.spatial_dims = _check_dims(spatial_dims)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, D, H, W = x.shape
+        d = self.spatial_dims
         r = self.r
-        if D % r or H % r or W % r:
+        if x.ndim != d + 2:
             raise ValueError(
-                f"PixelUnshuffle3d(r={r}) needs spatial dims divisible by r, "
-                f"got (D,H,W)=({D},{H},{W})")
-        x = x.view(B, C, D // r, r, H // r, r, W // r, r)
-        # Bring sub-pixel axes (r,r,r) next to channel axis.
-        x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
-        return x.view(B, C * (r ** 3), D // r, H // r, W // r)
+                f"PixelUnshuffle3d(spatial_dims={d}) expects rank-{d+2} input, "
+                f"got {x.ndim}")
+        B, C = x.shape[:2]
+        spatial = list(x.shape[2:])
+        for s in spatial:
+            if s % r:
+                raise ValueError(
+                    f"PixelUnshuffle3d(r={r}) needs spatial dims divisible "
+                    f"by r, got {tuple(spatial)}")
+        # Reshape each spatial axis into (size/r, r), interleaving with axes:
+        # (B, C, s0/r, r, s1/r, r, ...).
+        view_shape = [B, C]
+        for s in spatial:
+            view_shape.extend([s // r, r])
+        y = x.view(view_shape)
+        # Permute order: keep B, C, then all r-axes (odd positions among
+        # spatial), then all size/r axes (even positions).
+        # In the original 3D ordering:
+        #   permute(0, 1, 3, 5, 7, 2, 4, 6) for d=3.
+        r_axes = [2 + 2 * i + 1 for i in range(d)]    # 3,5,7,... = r dims
+        s_axes = [2 + 2 * i     for i in range(d)]    # 2,4,6,... = size/r dims
+        y = y.permute(0, 1, *r_axes, *s_axes).contiguous()
+        return y.view(B, C * (r ** d), *(s // r for s in spatial))
 
 
 class PixelShuffle3d(nn.Module):
-    """Depth-to-space: (B, C*r^3, D, H, W) -> (B, C, rD, rH, rW)."""
+    """nD depth-to-space inverse of PixelUnshuffle3d.
 
-    def __init__(self, r: int = 2):
+    Class name kept (``*3d``) for API stability.
+    """
+
+    def __init__(self, r: int = 2, spatial_dims: int = 3):
         super().__init__()
         if r < 1:
             raise ValueError(f"r must be >= 1, got {r}")
         self.r = r
+        self.spatial_dims = _check_dims(spatial_dims)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, Cr3, D, H, W = x.shape
+        d = self.spatial_dims
         r = self.r
-        if Cr3 % (r ** 3):
+        if x.ndim != d + 2:
             raise ValueError(
-                f"PixelShuffle3d(r={r}) needs channels divisible by r^3={r**3}, "
-                f"got C={Cr3}")
-        C = Cr3 // (r ** 3)
-        x = x.view(B, C, r, r, r, D, H, W)
-        # Interleave sub-pixel axes back into spatial dims.
-        x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
-        return x.view(B, C, D * r, H * r, W * r)
+                f"PixelShuffle3d(spatial_dims={d}) expects rank-{d+2} input, "
+                f"got {x.ndim}")
+        B, Crd = x.shape[:2]
+        spatial = list(x.shape[2:])
+        rd = r ** d
+        if Crd % rd:
+            raise ValueError(
+                f"PixelShuffle3d(r={r}, spatial_dims={d}) needs channels "
+                f"divisible by r^d={rd}, got C={Crd}")
+        C = Crd // rd
+        # View: (B, C, r, r, ..., s0, s1, ...) — d r-axes followed by d size-axes.
+        view_shape = [B, C] + [r] * d + spatial
+        y = x.view(view_shape)
+        # Permute pattern (3D reference): 0, 1, 5, 2, 6, 3, 7, 4 means
+        # interleave (size_axis, r_axis) for each spatial dim.
+        # In our layout, r-axes start at index 2, size-axes at index 2+d.
+        perm = [0, 1]
+        for i in range(d):
+            perm.append(2 + d + i)   # size axis i
+            perm.append(2 + i)       # r axis i
+        y = y.permute(perm).contiguous()
+        return y.view(B, C, *(s * r for s in spatial))
 
 
-def icnr_init_(weight: torch.Tensor, upscale: int, init: Type[nn.Module] = None) -> None:
+def icnr_init_(weight: torch.Tensor, upscale: int,
+               spatial_dims: int = 3,
+               init: Type[nn.Module] = None) -> None:
     """ICNR initialisation for sub-pixel convolution weights.
 
     Reference: Aitken et al., "Checkerboard artifact free sub-pixel
-    convolution" (2017). The conv-then-shuffle composition is initialised
-    so that its effect is approximately nearest-neighbour upsampling,
-    eliminating checkerboard artefacts at the start of training.
+    convolution" (2017). Initialises conv-then-PixelShuffle so that its
+    effect is approximately nearest-neighbour upsampling.
 
     Args:
-        weight: conv weight tensor shape (out_ch*r^3, in_ch, k, k, k).
+        weight: conv weight tensor (out_ch*r^d, in_ch, k, k[, k]).
         upscale: r (upscale factor).
+        spatial_dims: 2 or 3.
     """
-    r3 = upscale ** 3
+    d = _check_dims(spatial_dims)
+    rd = upscale ** d
     out_total = weight.shape[0]
-    if out_total % r3 != 0:
-        raise ValueError("ICNR: out_ch must be divisible by r^3")
-    out_ch = out_total // r3
+    if out_total % rd != 0:
+        raise ValueError("ICNR: out_ch must be divisible by r^d")
+    out_ch = out_total // rd
     sub = torch.empty(out_ch, *weight.shape[1:], device=weight.device,
                       dtype=weight.dtype)
     nn.init.kaiming_normal_(sub)
-    # Replicate each output filter r^3 times so all sub-pixel siblings start
+    # Replicate each output filter r^d times so all sub-pixel siblings start
     # identical → PixelShuffle output equals nearest-neighbour upsampling.
-    weight.data.copy_(sub.repeat_interleave(r3, dim=0))
+    weight.data.copy_(sub.repeat_interleave(rd, dim=0))
 
 
 # ---------------------------------------------------------------------------
@@ -470,15 +612,14 @@ class Downsample(nn.Module):
     """Downsample spatial dims by factor 2 and project channels in_ch→out_ch.
 
     Modes:
-      - "conv"          : strided 2×2×2 convolution (baseline).
-      - "maxpool"       : MaxPool3d(2) + 1×1×1 conv for channel projection.
-      - "avgpool"       : AvgPool3d(2) + 1×1×1 conv. Smoother than max.
-      - "blurpool"      : binomial blur + stride 2 + 1×1×1 conv
-                          (anti-aliased; Zhang 2019).
-      - "pixelunshuffle": lossless space-to-depth (r=2) + 1×1×1 conv.
-                          Information-preserving, similar spirit to Swin
-                          patch-merging.
-    All modes are followed by a normalization layer.
+      - "conv"          : strided 2×2(×2) convolution (baseline).
+      - "maxpool"       : MaxPool(2) + 1×1 conv for channel projection.
+      - "avgpool"       : AvgPool(2) + 1×1 conv. Smoother than max.
+      - "blurpool"      : binomial blur + stride 2 + 1×1 conv (Zhang 2019).
+      - "pixelunshuffle": lossless space-to-depth (r=2) + 1×1 conv.
+
+    Use ``spatial_dims=2`` for 2D operation. All modes are followed by a
+    normalization layer.
     """
 
     VALID_MODES = ("conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle")
@@ -490,38 +631,44 @@ class Downsample(nn.Module):
         norm_type: str = "instance",
         norm_groups: int = 8,
         mode: str = "conv",
+        spatial_dims: int = 3,
     ):
         super().__init__()
+        d = _check_dims(spatial_dims)
         if mode not in self.VALID_MODES:
             raise ValueError(
                 f"Unknown downsample mode: {mode}. "
                 f"Valid: {self.VALID_MODES}")
         self.mode = mode
+        self.spatial_dims = d
 
         if mode == "conv":
-            self.op = nn.Conv3d(in_ch, out_ch, kernel_size=2, stride=2, bias=False)
+            self.op = _CONV[d](in_ch, out_ch, kernel_size=2, stride=2,
+                               bias=False)
         elif mode == "maxpool":
             self.op = nn.Sequential(
-                nn.MaxPool3d(kernel_size=2, stride=2),
-                nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False),
+                _MAXPOOL[d](kernel_size=2, stride=2),
+                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False),
             )
         elif mode == "avgpool":
             self.op = nn.Sequential(
-                nn.AvgPool3d(kernel_size=2, stride=2),
-                nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False),
+                _AVGPOOL[d](kernel_size=2, stride=2),
+                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False),
             )
         elif mode == "blurpool":
             self.op = nn.Sequential(
-                BlurPool3d(in_ch, stride=2, filt_size=3),
-                nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False),
+                BlurPool3d(in_ch, stride=2, filt_size=3, spatial_dims=d),
+                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False),
             )
         else:  # pixelunshuffle
+            channel_mult = 2 ** d  # r=2; channels grow by 2^spatial_dims
             self.op = nn.Sequential(
-                PixelUnshuffle3d(r=2),
-                nn.Conv3d(in_ch * 8, out_ch, kernel_size=1, bias=False),
+                PixelUnshuffle3d(r=2, spatial_dims=d),
+                _CONV[d](in_ch * channel_mult, out_ch,
+                         kernel_size=1, bias=False),
             )
 
-        self.norm = get_norm(norm_type, out_ch, norm_groups)
+        self.norm = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.norm(self.op(x))
@@ -717,45 +864,56 @@ class Upsample(nn.Module):
     """Upsample spatial dims by factor 2 and project channels in_ch→out_ch.
 
     Modes:
-      - "transpose"   : ConvTranspose3d(2,2). Classic but can cause
-                        checkerboard artefacts (Odena et al. 2016).
-      - "trilinear"   : trilinear interp + 3×3×3 refinement conv. Smooth.
-      - "nearest"     : nearest interp + 3×3×3 conv. Odena-style
-                        anti-checkerboard; widely used in modern UNets.
-      - "pixelshuffle": sub-pixel conv (3D ESPCN). 1×1×1 conv expands
-                        channels to out_ch * 2^3, then PixelShuffle3d(r=2)
-                        rearranges into higher resolution. Initialised
-                        with ICNR to prevent checkerboard at init.
-      - "carafe"      : 3D CARAFE — content-aware reassembly kernel
-                        (Wang ICCV 2019). k_up=3 by default for 3D.
-      - "dysample"    : 3D DySample (Liu ICCV 2023) — lightweight dynamic
-                        sampling via learned offsets + grid_sample.
+      - "transpose"   : ConvTranspose(2,2).
+      - "trilinear"   : linear interp (bilinear in 2D / trilinear in 3D)
+                        + 3×3(×3) refinement conv. Smooth.
+      - "nearest"     : nearest interp + 3×3(×3) conv (Odena-style).
+      - "pixelshuffle": sub-pixel conv (ESPCN). 1×1 conv expands channels
+                        to out_ch * 2^d, then PixelShuffle3d(r=2)
+                        rearranges into higher resolution. ICNR init.
+      - "carafe"      : CARAFE — 3D-only.
+      - "dysample"    : DySample — 3D-only.
+
+    ``spatial_dims=2`` selects the 2D variant; carafe/dysample are
+    rejected with a clear error in 2D mode.
     """
 
     VALID_MODES = ("transpose", "trilinear", "nearest", "pixelshuffle",
                    "carafe", "dysample")
+    _MODES_3D_ONLY = ("carafe", "dysample")
 
     def __init__(
         self,
         in_ch: int,
         out_ch: int,
         mode: str = "transpose",
+        spatial_dims: int = 3,
     ):
         super().__init__()
+        d = _check_dims(spatial_dims)
         if mode not in self.VALID_MODES:
             raise ValueError(
                 f"Unknown upsample mode: {mode}. Valid: {self.VALID_MODES}")
+        if d == 2 and mode in self._MODES_3D_ONLY:
+            raise ValueError(
+                f"Upsample mode {mode!r} is only supported for spatial_dims=3."
+                f" For 2D, use one of: transpose | trilinear | nearest |"
+                f" pixelshuffle.")
         self.mode = mode
+        self.spatial_dims = d
 
         if mode == "transpose":
-            self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2)
+            self.up = _CONV_T[d](in_ch, out_ch, kernel_size=2, stride=2)
         elif mode in ("trilinear", "nearest"):
-            # Parameter-free interp → 3×3×3 refinement.
-            self.up = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+            # Parameter-free interp → 3x3(x3) refinement.
+            self.up = _CONV[d](in_ch, out_ch, kernel_size=3, padding=1,
+                               bias=False)
         elif mode == "pixelshuffle":
-            self.expand = nn.Conv3d(in_ch, out_ch * 8, kernel_size=1, bias=False)
-            self.shuffle = PixelShuffle3d(r=2)
-            icnr_init_(self.expand.weight, upscale=2)
+            channel_mult = 2 ** d   # r=2; expand by 2^d
+            self.expand = _CONV[d](in_ch, out_ch * channel_mult,
+                                   kernel_size=1, bias=False)
+            self.shuffle = PixelShuffle3d(r=2, spatial_dims=d)
+            icnr_init_(self.expand.weight, upscale=2, spatial_dims=d)
         elif mode == "carafe":
             self.up = CARAFE3d(in_ch, out_ch, scale=2, k_up=3, k_enc=3, c_mid=64)
         else:  # dysample
@@ -767,15 +925,17 @@ class Upsample(nn.Module):
         if self.mode == "transpose":
             return self.up(x)
         if self.mode == "trilinear":
-            x = F.interpolate(x, scale_factor=2, mode="trilinear",
-                              align_corners=False)
+            x = F.interpolate(
+                x, scale_factor=2,
+                mode=INTERP_SMOOTH[self.spatial_dims],
+                align_corners=False)
             return self.up(x)
         if self.mode == "nearest":
             x = F.interpolate(x, scale_factor=2, mode="nearest")
             return self.up(x)
         if self.mode == "pixelshuffle":
             return self.shuffle(self.expand(x))
-        # carafe / dysample
+        # carafe / dysample (3D-only, validated in __init__)
         return self.up(x)
 
 

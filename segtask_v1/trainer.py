@@ -35,7 +35,8 @@ from torch.utils.data import DataLoader
 
 from .config import Config
 from .data.augment import GPUAugmentor
-from .losses.losses import build_loss, DeepSupervisionLoss, MultiResolutionLoss
+from .losses.losses import (
+    build_loss, DeepSupervisionLoss, MultiResolutionLoss, SliceChannelLoss)
 from .models.unet import UNet3D
 from .utils import (
     AverageMeter, ModelEMA, Timer,
@@ -269,38 +270,52 @@ class Trainer:
         # stacks. Validation collapses both down to 1x and calls `base_loss`
         # directly to avoid a shape-contract mismatch.
         self.base_loss = build_loss(cfg.loss)
-        num_res = len(cfg.data.multi_res_scales)
+        self.is_2_5d = cfg.data.patch_mode == "2_5d"
 
         # Composition order matters:
-        #   INNER = MultiResolutionLoss(base)  — takes a single tensor
-        #                                        pred (B, num_fg*C_res, ...)
-        #                                        and splits channel-wise
-        #                                        over the C_res axis.
+        #   INNER — wraps `base_loss` for the patch-mode contract:
+        #     - 3D modes: ``MultiResolutionLoss`` splits pred channels by
+        #       resolution scale (C_res). Pred:  (B, num_fg*C_res, ...).
+        #     - 2.5D mode: ``SliceChannelLoss`` splits pred channels by
+        #       foreground class (D slices per class). Pred is rank-4:
+        #       (B, num_fg*D, H, W); label is (B, D, H, W) raw.
         #   OUTER = DeepSupervisionLoss(INNER) — iterates over the list of
-        #                                        per-decoder-level tensors,
-        #                                        downsamples label+weight_map
-        #                                        to each, and delegates to
-        #                                        INNER.
-        # The previous outer-MR / inner-DS ordering crashed because MR
-        # expected a tensor pred while DS produced a list.
-        inner = MultiResolutionLoss(
-            base_loss=self.base_loss,
-            num_fg_classes=cfg.num_fg_classes,
-            num_res=num_res,
-            label_values=cfg.data.label_values,
-        )
+        #     per-decoder-level tensors, downsamples label+weight_map to
+        #     each, and delegates to INNER. DS uses nearest interpolation
+        #     in spatial dims of pred, so it works for both 3D and 2D paths.
+        if self.is_2_5d:
+            num_slices = int(cfg.data.patch_size[0])
+            inner = SliceChannelLoss(
+                base_loss=self.base_loss,
+                num_fg_classes=cfg.num_fg_classes,
+                num_slices=num_slices,
+                label_values=cfg.data.label_values,
+            )
+            num_res = 1   # for logging only; SliceChannelLoss has C_res==1
+            logger.info(
+                "Loss: %s [2.5D], num_slices=%d, fg_classes=%d",
+                cfg.loss.name, num_slices, cfg.num_fg_classes)
+        else:
+            num_res = len(cfg.data.multi_res_scales)
+            inner = MultiResolutionLoss(
+                base_loss=self.base_loss,
+                num_fg_classes=cfg.num_fg_classes,
+                num_res=num_res,
+                label_values=cfg.data.label_values,
+            )
+            logger.info(
+                "Loss: %s, scales=%d, fg_classes=%d",
+                cfg.loss.name, num_res, cfg.num_fg_classes)
+
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
                 inner, cfg.loss.deep_supervision_weights)
         else:
             self.criterion = inner
-        # `_label_to_binary` lives on the INNER MultiResolutionLoss
-        # regardless of whether the outer criterion is DS-wrapped.
-        self._label_to_binary_fn = getattr(
-            inner, "label_to_binary",
-            getattr(inner, "_label_to_binary"))
-        logger.info("Loss: %s, scales=%d, fg_classes=%d",
-                    cfg.loss.name, num_res, cfg.num_fg_classes)
+        # Keep a handle to the INNER wrapper for unified metric reshaping.
+        # Both wrappers expose ``split_for_metrics(pred, label_raw) ->
+        # (pred_per_class, target_binary)`` so trainer code is mode-agnostic.
+        self._inner_loss = inner
 
         # --- Optimizer + scheduler ------------------------------------
         self.optimizer = build_optimizer(self.model, cfg)
@@ -550,6 +565,11 @@ class Trainer:
             if self.needs_crop:
                 image, label, wmap = self._center_crop(image, label, wmap)
 
+            # --- 2.5D adaptation: collapse the C_res=1 channel so the D
+            #     axis becomes the model's input-channel dimension.
+            if self.is_2_5d:
+                image, label, wmap = self._squeeze_2_5d(image, label, wmap)
+
             # --- Effective accumulation denominator for this step
             if remainder > 0 and step >= partial_start:
                 effective_accum = remainder
@@ -593,10 +613,11 @@ class Trainer:
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
                     p = pred[0] if isinstance(pred, list) else pred
-                    assert p.shape[1] >= self.num_fg, (
-                        f"pred channels {p.shape[1]} < num_fg {self.num_fg}")
-                    p_1x = p.detach()[:, :self.num_fg]
-                    lbl_1x = self._label_to_binary_fn(label[:, 0])
+                    # Mode-agnostic via the inner wrapper's contract:
+                    #   3D : returns (B, num_fg, *spatial), (B, num_fg, *spatial)
+                    #   2.5D: returns (B*D, num_fg, H, W),  (B*D, num_fg, H, W)
+                    p_1x, lbl_1x = self._inner_loss.split_for_metrics(
+                        p.detach(), label)
                     dice = compute_dice_per_class(p_1x, lbl_1x)
                     mean_dice = dice.mean().item()
                     dice_meter.update(mean_dice, image.shape[0])
@@ -628,15 +649,18 @@ class Trainer:
                 image = batch["image"].to(self.device, non_blocking=True)
                 label = batch["label"].to(self.device, non_blocking=True)
 
+                # 2.5D: squeeze C_res=1 for both image and label before
+                # forward. (No GPU augmentation in val — directly squeeze.)
+                if self.is_2_5d:
+                    image, label, _ = self._squeeze_2_5d(image, label, None)
+
                 with autocast(device_type="cuda", enabled=self.use_amp,
                               dtype=self.amp_dtype):
                     pred = self.model(image)
                     if isinstance(pred, list):
                         pred = pred[0]
-                    assert pred.shape[1] >= self.num_fg, (
-                        f"pred channels {pred.shape[1]} < num_fg {self.num_fg}")
-                    pred_1x = pred[:, :self.num_fg]
-                    target_1x = self._label_to_binary_fn(label[:, 0])
+                    pred_1x, target_1x = self._inner_loss.split_for_metrics(
+                        pred, label)
                     loss = self.base_loss(pred_1x, target_1x)
 
                 loss_meter.update(loss.item(), image.shape[0])
@@ -679,6 +703,32 @@ class Trainer:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+    def _squeeze_2_5d(
+        self,
+        image: torch.Tensor,
+        label: torch.Tensor,
+        wmap: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Collapse the C_res=1 channel for 2.5D mode.
+
+        Input shapes (post-augment, post-crop):
+          image: (B, 1, D, H, W) → (B, D, H, W)
+          label: (B, 1, D, H, W) raw int labels → (B, D, H, W)
+          wmap : (B, 1, D, H, W) per-voxel weights or None → (B, D, H, W)
+
+        The squeezed shape is the input contract for the 2D model and for
+        ``SliceChannelLoss``: D becomes the input-channel axis of the
+        model and the slice axis of the loss.
+        """
+        assert image.shape[1] == 1 and label.shape[1] == 1, (
+            "2.5D mode expects single-resolution dataset (C_res=1); got "
+            f"image={tuple(image.shape)}, label={tuple(label.shape)}")
+        image = image.squeeze(1)
+        label = label.squeeze(1)
+        if wmap is not None:
+            wmap = wmap.squeeze(1)
+        return image, label, wmap
+
     def _center_crop(
         self,
         image: torch.Tensor,

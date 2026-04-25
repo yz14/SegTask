@@ -30,7 +30,8 @@ from typing import List
 import torch
 import torch.nn as nn
 
-from .blocks import ConvNormAct, get_norm, get_activation, make_attention
+from .blocks import (
+    _CONV, _DROP, ConvNormAct, get_activation, get_norm, make_attention)
 
 
 class ResNetBlock(nn.Module):
@@ -51,28 +52,32 @@ class ResNetBlock(nn.Module):
         dropout: float = 0.0,
         use_se: bool = False,
         se_reduction: int = 16,
-        attention_type: str = "none"):
+        attention_type: str = "none",
+        spatial_dims: int = 3):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False)
-        self.norm1 = get_norm(norm_type, out_ch, norm_groups)
+        d = spatial_dims
+        self.conv1 = _CONV[d](in_ch, out_ch, 3, padding=1, bias=False)
+        self.norm1 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act1  = get_activation(activation)
 
-        self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False)
-        self.norm2 = get_norm(norm_type, out_ch, norm_groups)
+        self.conv2 = _CONV[d](out_ch, out_ch, 3, padding=1, bias=False)
+        self.norm2 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act2  = get_activation(activation)
 
-        self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
+        self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         # Back-compat: promote legacy use_se → attention_type="se" when the
         # caller did not set attention_type explicitly.
         if attention_type == "none" and use_se:
             attention_type = "se"
-        self.attn = make_attention(attention_type, out_ch, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch,
+                                   spatial_dims=d, reduction=se_reduction)
 
         # Shortcut projection if channel mismatch
         self.shortcut = (
-            nn.Sequential(nn.Conv3d(in_ch, out_ch, 1, bias=False),
-                          get_norm(norm_type, out_ch, norm_groups))
+            nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
+                          get_norm(norm_type, out_ch, norm_groups,
+                                   spatial_dims=d))
             if in_ch != out_ch
             else nn.Identity())
 
@@ -104,27 +109,30 @@ class PreActResNetBlock(nn.Module):
         use_se: bool = False,
         se_reduction: int = 16,
         attention_type: str = "none",
+        spatial_dims: int = 3,
     ):
         super().__init__()
-        self.norm1 = get_norm(norm_type, in_ch, norm_groups)
+        d = spatial_dims
+        self.norm1 = get_norm(norm_type, in_ch, norm_groups, spatial_dims=d)
         self.act1  = get_activation(activation)
-        self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.conv1 = _CONV[d](in_ch, out_ch, 3, padding=1, bias=False)
 
-        self.norm2 = get_norm(norm_type, out_ch, norm_groups)
+        self.norm2 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act2  = get_activation(activation)
-        self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.conv2 = _CONV[d](out_ch, out_ch, 3, padding=1, bias=False)
 
-        self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
+        self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         if attention_type == "none" and use_se:
             attention_type = "se"
-        self.attn = make_attention(attention_type, out_ch, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch,
+                                   spatial_dims=d, reduction=se_reduction)
 
         # Shortcut is applied on the ORIGINAL x (no normalisation).  If the
-        # channel count changes we use a 1×1×1 projection (still in the raw
+        # channel count changes we use a 1×1(×1) projection (still in the raw
         # identity path — this follows the canonical pre-act design).
         self.shortcut = (
-            nn.Conv3d(in_ch, out_ch, 1, bias=False)
+            _CONV[d](in_ch, out_ch, 1, bias=False)
             if in_ch != out_ch else nn.Identity())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -156,31 +164,35 @@ class BottleneckBlock(nn.Module):
         use_se: bool = False,
         se_reduction: int = 16,
         attention_type: str = "none",
+        spatial_dims: int = 3,
     ):
         super().__init__()
+        d = spatial_dims
         mid = max(out_ch // expansion, 1)
 
-        self.conv1 = nn.Conv3d(in_ch, mid, 1, bias=False)
-        self.norm1 = get_norm(norm_type, mid, norm_groups)
+        self.conv1 = _CONV[d](in_ch, mid, 1, bias=False)
+        self.norm1 = get_norm(norm_type, mid, norm_groups, spatial_dims=d)
         self.act1  = get_activation(activation)
 
-        self.conv2 = nn.Conv3d(mid, mid, 3, padding=1, bias=False)
-        self.norm2 = get_norm(norm_type, mid, norm_groups)
+        self.conv2 = _CONV[d](mid, mid, 3, padding=1, bias=False)
+        self.norm2 = get_norm(norm_type, mid, norm_groups, spatial_dims=d)
         self.act2  = get_activation(activation)
 
-        self.conv3 = nn.Conv3d(mid, out_ch, 1, bias=False)
-        self.norm3 = get_norm(norm_type, out_ch, norm_groups)
+        self.conv3 = _CONV[d](mid, out_ch, 1, bias=False)
+        self.norm3 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act3  = get_activation(activation)
 
-        self.drop = nn.Dropout3d(dropout) if dropout > 0 else nn.Identity()
+        self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         if attention_type == "none" and use_se:
             attention_type = "se"
-        self.attn = make_attention(attention_type, out_ch, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch,
+                                   spatial_dims=d, reduction=se_reduction)
 
         self.shortcut = (
-            nn.Sequential(nn.Conv3d(in_ch, out_ch, 1, bias=False),
-                          get_norm(norm_type, out_ch, norm_groups))
+            nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
+                          get_norm(norm_type, out_ch, norm_groups,
+                                   spatial_dims=d))
             if in_ch != out_ch else nn.Identity())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -235,6 +247,7 @@ class ResNetStage(nn.Module):
         se_reduction: int = 16,
         attention_type: str = "none",
         block_type: str = "basic",
+        spatial_dims: int = 3,
     ):
         super().__init__()
         if num_blocks < 1:
@@ -242,7 +255,7 @@ class ResNetStage(nn.Module):
         kwargs = dict(
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,
             dropout=dropout, use_se=use_se, se_reduction=se_reduction,
-            attention_type=attention_type)
+            attention_type=attention_type, spatial_dims=spatial_dims)
         blocks = [_make_block(block_type, in_ch, out_ch, **kwargs)]
         for _ in range(1, num_blocks):
             blocks.append(_make_block(block_type, out_ch, out_ch, **kwargs))

@@ -987,6 +987,165 @@ class MultiResolutionLoss(nn.Module):
         fg_exp = fg.reshape(1, -1, *([1] * (label.ndim - 1)))
         return (label_exp == fg_exp).float()
 
+    def split_for_metrics(
+        self, pred: torch.Tensor, label_raw: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Convert (pred, multi-res raw label) into per-class binary form
+        suitable for ``compute_dice_per_class`` / ``dice_batch_stats``.
+
+        Uses only the FIRST resolution (highest fidelity) for metrics —
+        consistent with prior trainer behaviour.
+
+        Args:
+            pred:      (B, num_fg * C_res, *spatial) logits.
+            label_raw: (B, C_res, *spatial) raw integer labels.
+
+        Returns:
+            (pred_1x, target_1x): both with shape (B, num_fg, *spatial).
+        """
+        pred_1x = pred[:, :self.num_fg]
+        target_1x = self._label_to_binary(label_raw[:, 0])
+        return pred_1x, target_1x
+
+
+# ---------------------------------------------------------------------------
+# 2.5D Slice-Channel Loss Wrapper
+# ---------------------------------------------------------------------------
+class SliceChannelLoss(nn.Module):
+    """Wrapper for the 2.5D patch mode.
+
+    Tensor contracts (after the trainer squeezes ``C_res=1`` away):
+      Model output : (B, num_fg * D, H, W) logits.
+      Raw label    : (B, D, H, W) integer labels (D slices stacked as channels).
+      Weight map   : (B, D, H, W) per-voxel weights, or None.
+
+    For each foreground class ``c ∈ [0, num_fg)``:
+      pred_c   = pred[:, c*D:(c+1)*D]                  # (B, D, H, W)
+      target_c = (label_raw == fg_values[c]).float()   # (B, D, H, W)
+
+    The base 2D segmentation loss is applied per slice by reshaping these
+    to ``(B*D, 1, H, W)`` (one binary 2D problem per slice). The final
+    scalar loss is averaged across all foreground classes.
+
+    This matches the documented design: each foreground class becomes its
+    own binary segmentation problem at every slice; class_weights from
+    LossConfig still control the per-class outer mean.
+    """
+
+    def __init__(
+        self,
+        base_loss: nn.Module,
+        num_fg_classes: int,
+        num_slices: int,
+        label_values: List[int],
+    ):
+        super().__init__()
+        if num_slices < 1:
+            raise ValueError(f"num_slices must be >= 1, got {num_slices}")
+        self.base_loss = base_loss
+        self.num_fg = num_fg_classes
+        self.num_slices = num_slices
+        self.label_values = label_values
+        self.fg_values = label_values[1:]  # exclude background
+
+    # -- internal helper ------------------------------------------------
+    def _label_to_binary(self, label_raw: torch.Tensor) -> torch.Tensor:
+        """(B, D, H, W) raw labels → (B*D, num_fg, H, W) binary masks.
+
+        Vectorised on-device. The output rank is rank-4 so that the
+        underlying base loss can run as a 2D binary segmentation.
+        """
+        if label_raw.ndim != 4:
+            raise ValueError(
+                f"SliceChannelLoss expects (B, D, H, W) raw label, "
+                f"got rank-{label_raw.ndim}")
+        B, D, H, W = label_raw.shape
+        if D != self.num_slices:
+            raise ValueError(
+                f"label slice count {D} != configured num_slices "
+                f"{self.num_slices}")
+        fg = torch.tensor(self.fg_values,
+                          device=label_raw.device, dtype=label_raw.dtype)
+        flat = label_raw.reshape(B * D, H, W).unsqueeze(1)         # (B*D, 1, H, W)
+        fg_b = fg.reshape(1, -1, 1, 1)                              # (1, num_fg, 1, 1)
+        return (flat == fg_b).float()                               # (B*D, num_fg, H, W)
+
+    def _split_pred(self, pred: torch.Tensor) -> torch.Tensor:
+        """(B, num_fg*D, H, W) → (B*D, num_fg, H, W)."""
+        if pred.ndim != 4:
+            raise ValueError(
+                f"SliceChannelLoss expects (B, num_fg*D, H, W) pred, "
+                f"got rank-{pred.ndim}")
+        B, total_c, H, W = pred.shape
+        D = self.num_slices
+        if total_c != self.num_fg * D:
+            raise ValueError(
+                f"pred channel count {total_c} != num_fg*D = "
+                f"{self.num_fg}*{D} = {self.num_fg * D}")
+        # (B, num_fg, D, H, W) → (B, D, num_fg, H, W) → (B*D, num_fg, H, W)
+        return (pred.reshape(B, self.num_fg, D, H, W)
+                    .permute(0, 2, 1, 3, 4)
+                    .reshape(B * D, self.num_fg, H, W))
+
+    @staticmethod
+    def _flatten_weight_map(
+        weight_map: Optional[torch.Tensor], num_slices: int,
+    ) -> Optional[torch.Tensor]:
+        """(B, D, H, W) → (B*D, 1, H, W) for base-loss broadcasting."""
+        if weight_map is None:
+            return None
+        if weight_map.ndim != 4:
+            raise ValueError(
+                f"SliceChannelLoss expects (B, D, H, W) weight_map, "
+                f"got rank-{weight_map.ndim}")
+        B, D, H, W = weight_map.shape
+        if D != num_slices:
+            raise ValueError(
+                f"weight_map slice count {D} != num_slices {num_slices}")
+        return weight_map.reshape(B * D, 1, H, W)
+
+    # -- forward ---------------------------------------------------------
+    def forward(
+        self,
+        pred: torch.Tensor,
+        label_raw: torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the per-class averaged 2D binary loss across slices."""
+        pred_flat = self._split_pred(pred)                  # (B*D, num_fg, H, W)
+        target_flat = self._label_to_binary(label_raw)      # (B*D, num_fg, H, W)
+        wm_flat = self._flatten_weight_map(weight_map, self.num_slices)
+
+        # Per-class loop — mirrors MultiResolutionLoss but iterates over
+        # fg classes instead of resolution scales. We pass single-channel
+        # binary tensors per class so that base_loss treats each as a
+        # standalone 2D binary segmentation problem (rank-4 input).
+        total = pred.new_zeros(())
+        for c in range(self.num_fg):
+            pred_c = pred_flat[:, c:c + 1]                  # (B*D, 1, H, W)
+            target_c = target_flat[:, c:c + 1]              # (B*D, 1, H, W)
+            total = total + self.base_loss(pred_c, target_c, weight_map=wm_flat)
+        return total / self.num_fg
+
+    def split_for_metrics(
+        self, pred: torch.Tensor, label_raw: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return tensors suitable for ``compute_dice_per_class`` / \
+        ``dice_batch_stats``.
+
+        For 2.5D the per-slice dice is pooled across (B, D) by collapsing
+        them into the leading dimension so existing dice utilities work
+        unchanged.
+
+        Args:
+            pred:      (B, num_fg * D, H, W) logits.
+            label_raw: (B, D, H, W) raw integer labels.
+
+        Returns:
+            (pred_flat, target_flat): both (B*D, num_fg, H, W).
+        """
+        return self._split_pred(pred), self._label_to_binary(label_raw)
+
 
 def build_loss(cfg: LossConfig) -> nn.Module:
     """Build loss function from config.

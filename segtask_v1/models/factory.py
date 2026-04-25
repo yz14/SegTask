@@ -64,6 +64,7 @@ class _StatefulStageBuilder:
 def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
     """Return a stateful builder for the given per-stage block counts."""
     mc = cfg.model
+    spatial_dims = getattr(mc, "spatial_dims", 3)
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ResNetStage:
         return ResNetStage(
@@ -77,6 +78,7 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
             se_reduction=mc.se_reduction,
             attention_type=mc.attention_type,
             block_type=mc.block_type,
+            spatial_dims=spatial_dims,
         )
 
     return _StatefulStageBuilder(factory, counts)
@@ -94,6 +96,7 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
     this warning is specifically about the intra-stage blocks.
     """
     mc = cfg.model
+    spatial_dims = getattr(mc, "spatial_dims", 3)
     non_default = []
     if mc.norm_type != "instance":
         non_default.append(f"norm_type={mc.norm_type!r}")
@@ -126,6 +129,7 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             num_blocks=num_blocks,
             drop_path_rates=rates,
             attention_type=mc.attention_type,
+            spatial_dims=spatial_dims,
         )
 
     return _StatefulStageBuilder(factory, counts)
@@ -144,10 +148,21 @@ def build_model(cfg: Config) -> UNet3D:
     enc_channels = list(mc.encoder_channels)
     num_fg = cfg.num_fg_classes
     n_levels = len(enc_channels)
+    spatial_dims = getattr(mc, "spatial_dims", 3)
 
-    # Output = num_fg per resolution scale (C_res >= 1, default [1.0])
-    num_res = len(cfg.data.multi_res_scales)
-    out_classes = num_fg * num_res
+    # Output channel count by mode:
+    #   3D modes (z_axis / cubic / whole) — num_fg per resolution scale
+    #     (C_res >= 1; default [1.0] gives num_fg).
+    #   2.5D mode — num_fg per slice (D slices stacked as input channels);
+    #     SliceChannelLoss splits the (num_fg * D)-channel output into
+    #     per-fg-class D-slice binary masks.
+    if cfg.data.patch_mode == "2_5d":
+        num_res = 1
+        D = int(cfg.data.patch_size[0])
+        out_classes = num_fg * D
+    else:
+        num_res = len(cfg.data.multi_res_scales)
+        out_classes = num_fg * num_res
 
     # Resolve per-stage block counts.  Encoder has ``n_levels`` stages;
     # a classical UNet-style decoder has ``n_levels - 1`` stages.  For
@@ -194,7 +209,8 @@ def build_model(cfg: Config) -> UNet3D:
         norm_groups=mc.norm_groups,
         activation=mc.activation,
         downsample_mode=mc.downsample_mode,
-        stem_mode=mc.stem_mode)
+        stem_mode=mc.stem_mode,
+        spatial_dims=spatial_dims)
 
     # Build decoder — classical UNet / UNet++ / UNet3+.
     if mc.decoder_type == "unet3p":
@@ -204,27 +220,31 @@ def build_model(cfg: Config) -> UNet3D:
             norm_type=mc.norm_type,
             norm_groups=mc.norm_groups,
             activation=mc.activation,
-            skip_attention=mc.skip_attention)
+            skip_attention=mc.skip_attention,
+            spatial_dims=spatial_dims)
     elif mc.decoder_type == "unetpp":
         decoder = UNetPPDecoder(
             encoder_channels=enc_channels,
             stage_builder=dec_builder,
             upsample_mode=mc.upsample_mode,
-            skip_attention=mc.skip_attention)
+            skip_attention=mc.skip_attention,
+            spatial_dims=spatial_dims)
     else:
         decoder = Decoder(
             encoder_channels=enc_channels,
             stage_builder=dec_builder,
             upsample_mode=mc.upsample_mode,
             skip_mode=mc.skip_mode,
-            skip_attention=mc.skip_attention)
+            skip_attention=mc.skip_attention,
+            spatial_dims=spatial_dims)
 
     # Assemble UNet
     model = UNet3D(
         encoder=encoder,
         decoder=decoder,
         num_fg_classes=out_classes,
-        deep_supervision=mc.deep_supervision)
+        deep_supervision=mc.deep_supervision,
+        spatial_dims=spatial_dims)
 
     # Log model info
     pc = model.param_count()

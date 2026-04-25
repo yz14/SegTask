@@ -47,6 +47,14 @@ class DataConfig:
     #              / compute budget allows feeding the full downsampled
     #              volume each step. `multi_res_scales` must be [1.0] here
     #              (scaling has no physical meaning beyond the volume).
+    #   "2_5d"   — 2.5D mode: reuses the z_axis dataset path with
+    #              `multi_res_scales=[1.0]` (forced). The trainer squeezes
+    #              the C_res=1 axis after augmentation, treating the D
+    #              slices as input channels for a planar 2D UNet. Model
+    #              ``spatial_dims`` is auto-set to 2 and ``in_channels``
+    #              auto-set to ``patch_size[0] = D``. The model output
+    #              ``(B, num_fg*D, H, W)`` is split per fg class into
+    #              D-channel binary maps by ``SliceChannelLoss``.
     patch_mode: str = "z_axis"
 
     # Augmentation oversample ratio (applies to BOTH z_axis and cubic modes).
@@ -171,6 +179,12 @@ class ModelConfig:
 
     # Backbone: "resnet" or "convnext"
     backbone: str = "resnet"
+
+    # Spatial dimensionality of the network. 3 = volumetric 3D UNet
+    # (default, used by z_axis / cubic / whole patch modes). 2 = planar
+    # 2D UNet (used by the 2.5D patch mode where D slices are stacked
+    # as input channels). All blocks/stages/decoders honour this value.
+    spatial_dims: int = 3
 
     # Input channels (always 1 for single-modality 3D)
     in_channels: int = 1
@@ -453,10 +467,18 @@ class Config:
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
 
-        # Auto-set in_channels from multi_res_scales (always >= 1). Both
-        # patch modes now stack per-scale views as input channels; a single
-        # scale ([1.0]) gives the legacy 1-channel input.
-        self.model.in_channels = len(self.data.multi_res_scales)
+        if self.data.patch_mode == "2_5d":
+            # 2.5D mode: planar 2D backbone consuming D slices as channels.
+            # Force a single resolution and override model.in_channels to
+            # the slice count regardless of multi_res_scales (validated to
+            # be [1.0] below).
+            self.model.spatial_dims = 2
+            self.model.in_channels = int(self.data.patch_size[0])
+        else:
+            # 3D modes: in_channels follows multi_res_scales (legacy).
+            # Both z_axis and cubic stack per-scale views as input channels;
+            # a single scale ([1.0]) gives the legacy 1-channel input.
+            self.model.in_channels = len(self.data.multi_res_scales)
 
         # nnU-Net ResEnc preset: populate per-stage block counts when the
         # user has not supplied explicit lists.
@@ -499,6 +521,8 @@ class Config:
         """Validate configuration for consistency."""
         assert self.model.backbone in ("resnet", "convnext"), \
             f"Invalid backbone: {self.model.backbone}"
+        assert self.model.spatial_dims in (2, 3), \
+            f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)"
         assert self.model.norm_type in ("batch", "instance", "group"), \
             f"Invalid norm: {self.model.norm_type}"
         assert self.model.activation in ("relu", "leakyrelu", "gelu", "swish"), \
@@ -568,7 +592,7 @@ class Config:
         ), f"Invalid scheduler: {self.train.scheduler}"
         assert len(self.data.patch_size) == 3, \
             "patch_size must be [D, H, W]"
-        assert self.data.patch_mode in ("z_axis", "cubic", "whole"), \
+        assert self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"), \
             f"Invalid patch_mode: {self.data.patch_mode}"
         if self.data.patch_mode == "whole":
             # Multi-resolution has no physical meaning in whole-volume mode:
@@ -578,6 +602,20 @@ class Config:
                 and self.data.multi_res_scales[0] == 1.0, (
                 "whole-volume mode requires multi_res_scales=[1.0]; got "
                 f"{self.data.multi_res_scales}.")
+        if self.data.patch_mode == "2_5d":
+            # 2.5D mode invariants enforced by sync(); re-check here so a
+            # stale config caught after manual edit fails fast.
+            assert (len(self.data.multi_res_scales) == 1
+                    and self.data.multi_res_scales[0] == 1.0), (
+                "2.5D mode requires multi_res_scales=[1.0]; got "
+                f"{self.data.multi_res_scales}.")
+            assert self.model.spatial_dims == 2, (
+                "2.5D mode requires model.spatial_dims=2 (set automatically "
+                "by sync()).")
+            assert self.model.in_channels == int(self.data.patch_size[0]), (
+                f"2.5D mode requires model.in_channels == patch_size[0] "
+                f"(D slices); got in_channels={self.model.in_channels}, "
+                f"patch_size[0]={self.data.patch_size[0]}.")
         assert self.data.aug_oversample_ratio >= 1.0, \
             "aug_oversample_ratio must be >= 1.0"
         assert len(self.data.multi_res_scales) >= 1, \

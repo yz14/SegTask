@@ -33,4 +33,4 @@
 
 
 # TODO  
-1. 仔细分析我的训练过程，然后充分，细致的调研是否有公认高质量损失函数可以加入。
+1. 这是我写的3D分割代码，训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py，训练命令是python -m segtask_v1.train --config configs/seg3d.yaml。这里有3个方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动切块）；whole（直接输入整个图像）。请先理解全流程代码，确认无误后增加2.5D方案。2.5D方案和z轴滑块的单分辨率/感受野方案非常的相似，你可以复用整个z轴滑块的数据读取等等，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D即可。计算损失也是现有框架一致，模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。
