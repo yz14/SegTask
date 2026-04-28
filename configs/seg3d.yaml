@@ -3,8 +3,7 @@
 # ----------------------------------------------------------------------------
 # Usage:
 #   python -m segtask_v1.train --config configs/seg3d.yaml
-#   python -m segtask_v1.train --config configs/seg3d.yaml \
-#         --override train.epochs=50 model.backbone=convnext
+#   python -m segtask_v1.train --config configs/seg3d.yaml --override train.epochs=50 model.backbone=convnext
 #
 # Every field lists its valid options / typical range so this file can be
 # used as a reference manual. Fields commented out (prefixed with `#`) use
@@ -17,8 +16,8 @@
 # =====================================================================
 data:
   # Source directories for NIfTI volumes. Image / label filenames must match.
-  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
-  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
@@ -241,7 +240,7 @@ model:
   #   "pixelshuffle" : PixelShuffle / depth-to-space
   #   "carafe"       : CARAFE 轻量级内容感知上采样
   #   "dysample"     : DySample (ICCV 2023) 动态采样点
-  upsample_mode: "transpose"
+  upsample_mode: "trilinear"
 
   # skip_mode: "cat"（concat 通道）| "add"（按通道加）
   skip_mode: "cat"
@@ -290,7 +289,7 @@ loss:
   # Per-region 空间权重：按 label_values 逐值给一个权重（包含 bg）。
   # 例：label_values=[0,1,2]，region_weights=[1.0, 2.0, 1.0]
   #     => 标签值为 1 的体素在 loss 中权重 2.0。空列表 = 禁用。
-  region_weights: [1.0, 2.0, 1.0]
+  region_weights: [1.0, 2.0]
 
   # ---- Dice 设定 ------------------------------------------------------
   dice_smooth : 1.0e-5        # 防止 0/0

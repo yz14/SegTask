@@ -170,6 +170,32 @@ class VolumeCache:
     def size(self) -> int:
         return len(self._store)
 
+    # ------------------------------------------------------------------
+    # Pickling: drop the cache contents when the Dataset is shipped to a
+    # DataLoader worker. On Windows (spawn start method) the entire
+    # Dataset object is pickled through an OS pipe for every worker on
+    # every epoch; a fully populated label cache (built eagerly in
+    # ``_build_index``) easily inflates the payload past the pipe write
+    # limit, surfacing as ``OSError: [Errno 22] Invalid argument`` on the
+    # writer side and ``_pickle.UnpicklingError: pickle data was
+    # truncated`` on the reader side.
+    #
+    # Each worker process must populate its own cache anyway (no shared
+    # memory between spawned workers), so transferring the parent's
+    # cached arrays is pure overhead. We strip ``_store`` on pickle and
+    # restore an empty ``OrderedDict`` on unpickle; the LRU behaviour is
+    # preserved per-process.
+    # ------------------------------------------------------------------
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_store"] = OrderedDict()
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        if not isinstance(self._store, OrderedDict):
+            self._store = OrderedDict()
+
 
 # ---------------------------------------------------------------------------
 # 3D Segmentation Dataset

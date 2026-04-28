@@ -20,8 +20,8 @@
 # DATA
 # =====================================================================
 data:
-  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
-  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
@@ -41,7 +41,7 @@ data:
   multi_res_scales: [1.0]
 
   # 数据增强后的 oversample 与裁剪适用 z_axis 同样的语义（仅放大 z 轴）。
-  aug_oversample_ratio: 1.0
+  aug_oversample_ratio: 1.5
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -56,10 +56,10 @@ data:
   pin_memory : true
 
   foreground_oversample_ratio: 0.5
-  samples_per_volume: 16
+  samples_per_volume: 8
 
   cache_mode: "memory"
-  cache_max_volumes: 0
+  cache_max_volumes: 16
 
 
 # =====================================================================
@@ -129,7 +129,7 @@ model:
   stem_mode    : "conv3"
   decoder_type : "unet"
   downsample_mode: "conv"
-  upsample_mode  : "transpose"
+  upsample_mode  : "trilinear"
   skip_mode      : "cat"
 
   drop_path_rate: 0.0

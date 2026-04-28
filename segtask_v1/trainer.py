@@ -23,14 +23,35 @@ from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.nn as nn
-# GradScaler moved from torch.cuda.amp to torch.amp in PyTorch ≥ 2.3; fall
-# back to the CUDA-namespace import on older builds (e.g. the 2.2 shipped
-# with the py310 test env).
+# GradScaler moved from torch.cuda.amp to torch.amp in PyTorch ≥ 2.3. The
+# new constructor takes a device string as the first positional argument;
+# the legacy CUDA-namespace constructor does NOT and would silently bind
+# "cuda" to `init_scale`, producing a confusing TypeError later inside
+# `torch.full(..., self._init_scale, ...)`. Probe the signature to call
+# whichever form the installed torch supports.
+import inspect as _inspect
 try:
-    from torch.amp import GradScaler, autocast  # type: ignore
-except ImportError:  # pragma: no cover - version-dependent
-    from torch.cuda.amp import GradScaler  # type: ignore
+    from torch.amp import GradScaler as _GradScaler  # type: ignore
     from torch.amp import autocast  # type: ignore
+except ImportError:  # pragma: no cover - version-dependent
+    from torch.cuda.amp import GradScaler as _GradScaler  # type: ignore
+    from torch.amp import autocast  # type: ignore
+
+
+def GradScaler(device: str = "cuda", **kwargs):  # noqa: N802 - mimic class
+    """Version-agnostic GradScaler constructor.
+
+    Passes ``device`` only when the underlying class accepts it (PyTorch
+    ≥ 2.3). On older builds (e.g. 2.2) the legacy ``torch.cuda.amp.GradScaler``
+    is CUDA-only and rejects the argument.
+    """
+    try:
+        params = _inspect.signature(_GradScaler).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "device" in params:
+        return _GradScaler(device, **kwargs)
+    return _GradScaler(**kwargs)
 from torch.utils.data import DataLoader
 
 from .config import Config

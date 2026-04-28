@@ -31,6 +31,8 @@
 
 测试环境为: **conda activate torch27_env**  
 
+这是我写的2.5D/3D分割代码，训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py。这里有3个3D方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动切块）；whole（直接输入整个图像）。一个2.5D方案，它和z轴滑块的单分辨率/感受野方案非常的相似，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D模型。计算损失也和现有框架一致，模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。这里有一份小数据集作为测试：F:\med_data\Totalsegmentator_dataset_v201\small_data\nii，F:\med_data\Totalsegmentator_dataset_v201\small_data\mask。  
+
 
 # TODO  
-1. 这是我写的3D分割代码，训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py，训练命令是python -m segtask_v1.train --config configs/seg3d.yaml。这里有3个方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动切块）；whole（直接输入整个图像）。请先理解全流程代码，确认无误后增加2.5D方案。2.5D方案和z轴滑块的单分辨率/感受野方案非常的相似，你可以复用整个z轴滑块的数据读取等等，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D即可。计算损失也是现有框架一致，模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。
+1. 我训练2.5D模型python -m segtask_v1.train --config configs/seg2_5d.yaml都报错D:\codes\work-projects\SegTask\outputs\seg2_5d_resnet\train.log。请先仔细理解全流程，全部设计后开始修复。
