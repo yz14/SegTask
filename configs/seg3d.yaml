@@ -21,6 +21,18 @@ data:
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
+  # ---- Optional ROI bbox cropping ------------------------------------
+  # 可选：每个样本一个 NIfTI 掩码，文件名与 image 同名（后缀=bbox_suffix）。
+  # 训练侧：__init__ 阶段一次性预计算每样本 bbox（输出全数据集 mean/min/max
+  #   尺寸日志），并在 _load_image / _load_label 中加载完毕后立即裁剪到该
+  #   bbox 再走归一化与缓存 → 节省 RAM 和后续 patch 计算。
+  # 推理侧：predict.py 默认会读取本字段对每张图做 ROI 裁剪推理，输出会写回
+  #   原体积坐标系（ROI 外置零=背景），保持 NIfTI 形状/affine 不变。
+  #   命令行 --bbox 可覆盖；--bbox '' 强制禁用。
+  # 留空字符串 = 完全禁用（即原 full-volume 行为）。
+  bbox_dir   : ""
+  bbox_suffix: ".nii.gz"
+
   # Integer label values in the mask, ordered [bg, fg1, fg2, ...].
   # Empty list => auto-detect from all label files on first run.
   # Example: [0, 1, 2] for background + 2 foreground classes.

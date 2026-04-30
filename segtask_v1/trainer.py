@@ -581,6 +581,22 @@ class Trainer:
                 label, wmap = label_aug[:, :n_lbl], label_aug[:, n_lbl:]
             else:
                 image, label = self.augmentor(image, label)
+                
+                
+            import SimpleITK as sitk
+            for jj, (ii,ll,ww) in enumerate(zip(image, label, wmap)):
+                ii = ii[0].cpu().numpy()
+                aa = sitk.GetImageFromArray(ii)
+                sitk.WriteImage(aa, f'{jj}.nii.gz')
+                ll = ll[0].cpu().numpy()
+                aa = sitk.GetImageFromArray(ll)
+                sitk.WriteImage(aa, f'{jj}L.nii.gz')
+                ww = ww[0].cpu().numpy()
+                aa = sitk.GetImageFromArray(ww)
+                sitk.WriteImage(aa, f'{jj}W.nii.gz')
+            raise
+                
+                
 
             # --- Center-crop when dataset returned oversampled patches
             if self.needs_crop:

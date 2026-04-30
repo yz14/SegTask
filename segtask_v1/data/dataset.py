@@ -126,6 +126,91 @@ def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_l
 
 
 # ---------------------------------------------------------------------------
+# Bounding-box helpers (optional ROI cropping of image / label volumes)
+# ---------------------------------------------------------------------------
+# Per-sample bbox tuple convention (also used by `apply_bbox` below):
+#   ((d0, d1), (h0, h1), (w0, w1)) — half-open like Python slices.
+BBox = Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]
+
+
+def compute_bbox_from_volume(vol: np.ndarray) -> Optional[BBox]:
+    """Compute the axis-aligned bounding box of the nonzero region of a
+    (D, H, W) ROI mask.
+
+    Returns ``None`` when the mask is entirely empty (caller should
+    fall back to using the full volume).
+
+    Implementation note: we collapse the mask along two axes at a time
+    via ``np.any`` instead of ``np.argwhere``. For large CT volumes this
+    is dramatically faster (O(D*H*W) bool reductions vs. materialising
+    a (N, 3) coord array) and uses negligible memory.
+    """
+    if vol.ndim != 3:
+        raise ValueError(f"BBox volume must be 3D (D,H,W), got {vol.ndim}D")
+    mask = np.round(vol).astype(np.int32) != 0
+    if not mask.any():
+        return None
+    d_any = np.any(mask, axis=(1, 2))
+    h_any = np.any(mask, axis=(0, 2))
+    w_any = np.any(mask, axis=(0, 1))
+
+    def _span(flat: np.ndarray) -> Tuple[int, int]:
+        idx = np.where(flat)[0]
+        return int(idx[0]), int(idx[-1]) + 1  # half-open
+
+    return (_span(d_any), _span(h_any), _span(w_any))
+
+
+def apply_bbox(vol: np.ndarray, bbox: Optional[BBox]) -> np.ndarray:
+    """Crop a (D, H, W) volume to ``bbox``. ``None`` returns ``vol``
+    unchanged (used for samples whose ROI mask was empty)."""
+    if bbox is None:
+        return vol
+    (d0, d1), (h0, h1), (w0, w1) = bbox
+    return vol[d0:d1, h0:h1, w0:w1]
+
+
+def precompute_bboxes(bbox_paths: List[str]) -> List[Optional[BBox]]:
+    """Load every ROI mask once, compute its bbox, log the mean bbox
+    size across the dataset, and return the per-sample bbox list.
+
+    Empty / missing-foreground masks are kept as ``None`` (the dataset
+    will then fall back to the uncropped volume for that sample) and
+    counted separately in the log line so silent ROI failures surface
+    immediately.
+    """
+    bboxes: List[Optional[BBox]] = []
+    sizes: List[Tuple[int, int, int]] = []
+    n_empty = 0
+    for p in bbox_paths:
+        bb = compute_bbox_from_volume(load_nifti(p))
+        bboxes.append(bb)
+        if bb is None:
+            n_empty += 1
+            continue
+        (d0, d1), (h0, h1), (w0, w1) = bb
+        sizes.append((d1 - d0, h1 - h0, w1 - w0))
+
+    if sizes:
+        arr = np.asarray(sizes, dtype=np.float64)
+        mean = arr.mean(axis=0)
+        mn = arr.min(axis=0)
+        mx = arr.max(axis=0)
+        logger.info(
+            "BBox precomputed: %d/%d masks have foreground; mean (D,H,W)="
+            "(%.1f, %.1f, %.1f), min=(%d, %d, %d), max=(%d, %d, %d)",
+            len(sizes), len(bbox_paths),
+            mean[0], mean[1], mean[2],
+            int(mn[0]), int(mn[1]), int(mn[2]),
+            int(mx[0]), int(mx[1]), int(mx[2]))
+    if n_empty:
+        logger.warning(
+            "BBox: %d/%d masks were entirely empty; falling back to the "
+            "full volume for those samples.", n_empty, len(bbox_paths))
+    return bboxes
+
+
+# ---------------------------------------------------------------------------
 # Volume cache
 # ---------------------------------------------------------------------------
 class VolumeCache:
@@ -256,7 +341,8 @@ class SegDataset3D(Dataset):
         is_train: bool = True,
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
-        region_weights: Optional[List[float]] = None):
+        region_weights: Optional[List[float]] = None,
+        bbox_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -295,6 +381,19 @@ class SegDataset3D(Dataset):
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
+        # Optional ROI bbox cropping. When `bbox_paths` is supplied, we
+        # precompute one bbox per sample upfront (logging the dataset
+        # mean / min / max bbox size) and apply it inside `_load_image`
+        # / `_load_label` BEFORE caching so the cached volumes are
+        # already cropped — saving both RAM and downstream compute.
+        if bbox_paths is not None:
+            assert len(bbox_paths) == len(image_paths), (
+                f"bbox_paths length {len(bbox_paths)} != image_paths "
+                f"length {len(image_paths)}")
+        self.bbox_paths = bbox_paths
+        self._bboxes: Optional[List[Optional[BBox]]] = (
+            precompute_bboxes(bbox_paths) if bbox_paths else None)
+
         # Build per-slice index for foreground oversampling
         self._vol_fg_slices: List[np.ndarray] = []  # fg slice indices per volume
         self._vol_all_slices: List[int] = []        # total depth per volume
@@ -321,6 +420,9 @@ class SegDataset3D(Dataset):
         logger.info("Index built: %d volumes, %d/%d foreground slices",
                      len(self.image_paths), total_fg, total_slices)
 
+    def _bbox_for(self, vol_idx: int) -> Optional[BBox]:
+        return self._bboxes[vol_idx] if self._bboxes is not None else None
+
     def _load_image(self, vol_idx: int) -> np.ndarray:
         """Load and preprocess image volume with caching."""
         path   = self.image_paths[vol_idx]
@@ -328,6 +430,7 @@ class SegDataset3D(Dataset):
         if cached is not None:
             return cached
         img = load_nifti(path)
+        img = apply_bbox(img, self._bbox_for(vol_idx))
         img = preprocess_image(  # 归一化
             img, self.intensity_min, self.intensity_max,
             self.normalize, self.global_mean, self.global_std)
@@ -341,6 +444,7 @@ class SegDataset3D(Dataset):
         if cached is not None:
             return cached
         lbl = load_nifti(path)
+        lbl = apply_bbox(lbl, self._bbox_for(vol_idx))
         self._lbl_cache.put(path, lbl)
         return lbl
 
@@ -569,7 +673,8 @@ class SegDataset3DCubic(Dataset):
         is_train: bool = True,
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
-        region_weights: Optional[List[float]] = None):
+        region_weights: Optional[List[float]] = None,
+        bbox_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -599,6 +704,19 @@ class SegDataset3DCubic(Dataset):
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
+        # Optional ROI bbox cropping. When `bbox_paths` is supplied, we
+        # precompute one bbox per sample upfront (logging the dataset
+        # mean / min / max bbox size) and apply it inside `_load_image`
+        # / `_load_label` BEFORE caching so the cached volumes are
+        # already cropped — saving both RAM and downstream compute.
+        if bbox_paths is not None:
+            assert len(bbox_paths) == len(image_paths), (
+                f"bbox_paths length {len(bbox_paths)} != image_paths "
+                f"length {len(image_paths)}")
+        self.bbox_paths = bbox_paths
+        self._bboxes: Optional[List[Optional[BBox]]] = (
+            precompute_bboxes(bbox_paths) if bbox_paths else None)
+
         # Build 3D foreground voxel index for oversampling
         self._vol_shapes: List[Tuple[int, int, int]] = []
         self._vol_fg_coords: List[np.ndarray] = []  # (N, 3) fg voxel coords per volume
@@ -625,12 +743,16 @@ class SegDataset3DCubic(Dataset):
         logger.info("Cubic index: %d volumes, %d fg voxels sampled",
                      len(self.image_paths), total_fg)
 
+    def _bbox_for(self, vol_idx: int) -> Optional[BBox]:
+        return self._bboxes[vol_idx] if self._bboxes is not None else None
+
     def _load_image(self, vol_idx: int) -> np.ndarray:
         path = self.image_paths[vol_idx]
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
         img = load_nifti(path)
+        img = apply_bbox(img, self._bbox_for(vol_idx))
         img = preprocess_image(
             img, self.intensity_min, self.intensity_max,
             self.normalize, self.global_mean, self.global_std)
@@ -643,6 +765,7 @@ class SegDataset3DCubic(Dataset):
         if cached is not None:
             return cached
         lbl = load_nifti(path)
+        lbl = apply_bbox(lbl, self._bbox_for(vol_idx))
         self._lbl_cache.put(path, lbl)
         return lbl
 
@@ -795,7 +918,8 @@ class SegDataset3DWhole(Dataset):
         is_train: bool = True,
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
-        region_weights: Optional[List[float]] = None):
+        region_weights: Optional[List[float]] = None,
+        bbox_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -822,10 +946,26 @@ class SegDataset3DWhole(Dataset):
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
+        # Optional ROI bbox cropping. When `bbox_paths` is supplied, we
+        # precompute one bbox per sample upfront (logging the dataset
+        # mean / min / max bbox size) and apply it inside `_load_image`
+        # / `_load_label` BEFORE caching so the cached volumes are
+        # already cropped — saving both RAM and downstream compute.
+        if bbox_paths is not None:
+            assert len(bbox_paths) == len(image_paths), (
+                f"bbox_paths length {len(bbox_paths)} != image_paths "
+                f"length {len(image_paths)}")
+        self.bbox_paths = bbox_paths
+        self._bboxes: Optional[List[Optional[BBox]]] = (
+            precompute_bboxes(bbox_paths) if bbox_paths else None)
+
         logger.info(
             "Whole-volume dataset: %d volumes, extract_size=%s, "
             "samples_per_volume=%d",
             len(self.image_paths), self.extract_size, self.samples_per_volume)
+
+    def _bbox_for(self, vol_idx: int) -> Optional[BBox]:
+        return self._bboxes[vol_idx] if self._bboxes is not None else None
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         path = self.image_paths[vol_idx]
@@ -833,6 +973,7 @@ class SegDataset3DWhole(Dataset):
         if cached is not None:
             return cached
         img = load_nifti(path)
+        img = apply_bbox(img, self._bbox_for(vol_idx))
         img = preprocess_image(
             img, self.intensity_min, self.intensity_max,
             self.normalize, self.global_mean, self.global_std)
@@ -845,6 +986,7 @@ class SegDataset3DWhole(Dataset):
         if cached is not None:
             return cached
         lbl = load_nifti(path)
+        lbl = apply_bbox(lbl, self._bbox_for(vol_idx))
         self._lbl_cache.put(path, lbl)
         return lbl
 

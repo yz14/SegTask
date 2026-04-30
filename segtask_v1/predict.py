@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import List
 
 from .config import load_config
+from .data.loader import match_bbox_paths
 from .predictor import run_inference
 from .train import apply_overrides, setup_logging
 
@@ -53,6 +54,12 @@ def main():
                         help="A NIfTI file OR a directory containing .nii/.nii.gz")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory (overrides cfg.predict.output_dir)")
+    parser.add_argument("--bbox", type=str, default=None,
+                        help="Optional ROI bbox NIfTI mask. Either a single "
+                             "file (when --input is one file) or a directory "
+                             "matching --input by filename. When omitted, "
+                             "falls back to cfg.data.bbox_dir if set; "
+                             "pass --bbox '' to force-disable.")
     parser.add_argument("--weights", choices=["auto", "ema", "online"],
                         default="auto",
                         help="Which weights to load from checkpoint")
@@ -85,12 +92,58 @@ def main():
     logger.info("Checkpoint: %s (variant=%s)", args.checkpoint, args.weights)
     logger.info("Output dir: %s", cfg.predict.output_dir)
 
+    # Resolve bbox source priority: explicit --bbox > cfg.data.bbox_dir.
+    # Pass --bbox '' to force-disable even if cfg has bbox_dir set.
+    bbox_paths = _resolve_bbox_paths(args.bbox, image_paths, cfg)
+    if bbox_paths is not None:
+        logger.info("BBox enabled: %d masks aligned with inputs.",
+                    len(bbox_paths))
+
     run_inference(
         cfg=cfg,
         checkpoint_path=args.checkpoint,
         image_paths=image_paths,
         weight_variant=args.weights,
+        bbox_paths=bbox_paths,
     )
+
+
+def _resolve_bbox_paths(
+    cli_bbox: object, image_paths: List[str], cfg) -> object:
+    """Decide which bbox source to use and return a per-image path list
+    (or None when bbox is disabled).
+
+    Priority:
+      1. ``--bbox`` explicit override:
+         - empty string         → disable bbox (overrides cfg).
+         - a single file path   → only valid when --input is one file.
+         - a directory          → match by filename via ``match_bbox_paths``.
+      2. Otherwise, fall back to ``cfg.data.bbox_dir`` (matched by name).
+      3. If neither is set, return None (full-volume inference).
+    """
+    if cli_bbox is not None:
+        if cli_bbox == "":
+            return None
+        p = Path(cli_bbox)
+        if p.is_file():
+            if len(image_paths) != 1:
+                raise ValueError(
+                    f"--bbox is a single file but --input expanded to "
+                    f"{len(image_paths)} images; pass a directory instead.")
+            return [str(p)]
+        if not p.is_dir():
+            raise FileNotFoundError(f"--bbox path not found: {p}")
+        bbox_dir = str(p)
+    else:
+        bbox_dir = getattr(cfg.data, "bbox_dir", "") or ""
+        if not bbox_dir:
+            return None
+
+    return match_bbox_paths(
+        image_paths,
+        bbox_dir,
+        cfg.data.image_suffix,
+        getattr(cfg.data, "bbox_suffix", ".nii.gz"))
 
 
 if __name__ == "__main__":

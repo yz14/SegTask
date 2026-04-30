@@ -31,7 +31,7 @@ from torch.amp import autocast
 from .config import Config
 from .data.dataset import (
     load_nifti, preprocess_image, resize_3d, _extract_cubic_patch,
-    extract_z_patch_padded)
+    extract_z_patch_padded, compute_bbox_from_volume)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ class Predictor:
         self,
         image_path: str,
         output_dir: Optional[str] = None,
+        bbox_path: Optional[str] = None,
     ) -> Dict[str, np.ndarray]:
         """Run inference on a single NIfTI volume.
 
@@ -128,11 +129,48 @@ class Predictor:
                              is reshaped back to ``(num_fg, D, H, W)`` so
                              the existing accumulation/blending code works
                              unchanged. See ``_forward_batch``.
+
+        Optional ROI (``bbox_path``):
+            When supplied, ``bbox_path`` must point to a NIfTI mask whose
+            spatial shape matches the input image. We compute the axis-
+            aligned bbox of its nonzero voxels, crop the image to that
+            bbox, run sliding-window / whole-volume inference inside the
+            cropped sub-volume, and finally splice the prediction back
+            into a full-size (D_orig, H_orig, W_orig) canvas — voxels
+            outside the bbox stay at probability 0, which the standard
+            ``_prob_to_label`` thresholding maps to background. This both
+            preserves the source image's NIfTI affine on save and avoids
+            spending compute on uninteresting regions of large CT scans.
         """
         dc = self.cfg.data
         raw_vol = load_nifti(image_path)  # (D_orig, H_orig, W_orig)
         D_orig, H_orig, W_orig = raw_vol.shape
         logger.info("Loaded %s: shape=(%d, %d, %d)", image_path, D_orig, H_orig, W_orig)
+
+        # Optional ROI cropping. We keep the (offsets, full_shape) so the
+        # cropped prediction can be spliced back into the original volume
+        # coordinate system before saving.
+        bbox = None
+        if bbox_path is not None:
+            bbox_vol = load_nifti(bbox_path)
+            if bbox_vol.shape != raw_vol.shape:
+                raise ValueError(
+                    f"BBox shape {bbox_vol.shape} != image shape "
+                    f"{raw_vol.shape} for {image_path} (bbox={bbox_path})")
+            bbox = compute_bbox_from_volume(bbox_vol)
+            if bbox is None:
+                logger.warning(
+                    "BBox %s is empty; falling back to full-volume "
+                    "inference for %s.", bbox_path, image_path)
+            else:
+                (d0, d1), (h0, h1), (w0, w1) = bbox
+                logger.info(
+                    "BBox crop: D[%d:%d] H[%d:%d] W[%d:%d] "
+                    "(orig=(%d,%d,%d) → crop=(%d,%d,%d))",
+                    d0, d1, h0, h1, w0, w1,
+                    D_orig, H_orig, W_orig,
+                    d1 - d0, h1 - h0, w1 - w0)
+                raw_vol = raw_vol[d0:d1, h0:h1, w0:w1]
 
         vol = preprocess_image(
             raw_vol, dc.intensity_min, dc.intensity_max,
@@ -146,6 +184,16 @@ class Predictor:
             # "z_axis" or "2_5d" — same window geometry; see _forward_batch
             # for the 2.5D-specific squeeze + reshape.
             prob_volume = self._sliding_window_z(vol)
+
+        # Splice the cropped prediction back to the original volume's
+        # spatial extent so the saved NIfTI shares the source image's
+        # shape and affine. Outside-bbox voxels remain probability 0.
+        if bbox is not None:
+            (d0, d1), (h0, h1), (w0, w1) = bbox
+            full_prob = np.zeros(
+                (self.num_fg, D_orig, H_orig, W_orig), dtype=np.float32)
+            full_prob[:, d0:d1, h0:h1, w0:w1] = prob_volume
+            prob_volume = full_prob
 
         label_map = self._prob_to_label(prob_volume)
         result = {"label_map": label_map, "probabilities": prob_volume}
@@ -850,6 +898,7 @@ def run_inference(
     checkpoint_path: str,
     image_paths: List[str],
     weight_variant: str = "auto",
+    bbox_paths: Optional[List[str]] = None,
 ) -> None:
     """Run inference on a list of images using a trained model.
 
@@ -858,7 +907,16 @@ def run_inference(
         checkpoint_path: Path to model checkpoint.
         image_paths: List of NIfTI file paths.
         weight_variant: "auto" | "ema" | "online". "auto" prefers EMA.
+        bbox_paths: Optional ROI bbox NIfTI paths aligned 1:1 with
+            ``image_paths``. When supplied, each prediction is computed
+            inside the bbox and the output is written back into the full
+            volume's coordinate system. Pass ``None`` (default) to keep
+            full-volume inference.
     """
+    if bbox_paths is not None and len(bbox_paths) != len(image_paths):
+        raise ValueError(
+            f"bbox_paths length {len(bbox_paths)} != image_paths "
+            f"length {len(image_paths)}")
     from .models.factory import build_model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -893,10 +951,13 @@ def run_inference(
 
     n = len(image_paths)
     for i, path in enumerate(image_paths, 1):
-        logger.info("[%d/%d] Processing: %s", i, n, path)
+        bbox_path = bbox_paths[i - 1] if bbox_paths is not None else None
+        logger.info("[%d/%d] Processing: %s%s", i, n, path,
+                    f" (bbox={bbox_path})" if bbox_path else "")
         try:
             result = predictor.predict_volume(
-                path, output_dir=cfg.predict.output_dir)
+                path, output_dir=cfg.predict.output_dir,
+                bbox_path=bbox_path)
             logger.info("  Label map shape: %s, unique labels: %s",
                         result["label_map"].shape,
                         np.unique(result["label_map"]).tolist())

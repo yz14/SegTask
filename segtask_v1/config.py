@@ -28,6 +28,21 @@ class DataConfig:
     image_suffix: str = ".nii.gz"
     label_suffix: str = ".nii.gz"
 
+    # Optional ROI bounding-box directory. When non-empty, each sample is
+    # expected to have a matching NIfTI mask under ``bbox_dir`` (filename
+    # match against the image, suffix ``bbox_suffix``). At dataset init
+    # time we load every bbox mask once, compute its axis-aligned
+    # bounding box of nonzero voxels, log the mean (D, H, W) bbox size
+    # across the dataset, and cache the per-sample bbox tuple. Each time
+    # an image / label volume is loaded it is cropped to that bbox before
+    # any downstream preprocessing or patch extraction. This both shrinks
+    # the working volume for large CT scans where only a sub-region is
+    # of interest, and keeps the rest of the pipeline (patching, multi-
+    # resolution, augmentation, prediction) untouched. Empty string =
+    # disabled (legacy full-volume behaviour).
+    bbox_dir: str = ""
+    bbox_suffix: str = ".nii.gz"
+
     # Label mapping: integer label values in the mask (0=background).
     # e.g. [0, 1, 2] for 3-class. Empty = auto-detect from data.
     label_values: List[int] = field(default_factory=list)

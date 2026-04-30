@@ -45,6 +45,51 @@ def discover_samples(
     return image_paths, label_paths  # 匹配好的
 
 
+def match_bbox_paths(
+    image_paths: List[str],
+    bbox_dir: str,
+    image_suffix: str,
+    bbox_suffix: str) -> List[str]:
+    """Resolve a per-sample list of ROI bbox NIfTI files matched 1:1 to
+    ``image_paths`` by *base name* (i.e. filename with the image suffix
+    stripped, then `bbox_suffix` appended).
+
+    Errors out (rather than silently dropping samples) if any image
+    lacks a matching bbox file — a missing bbox means we'd fall back
+    to the whole volume for that sample, which is rarely intended and
+    biases batch statistics.
+    """
+    bdir = Path(bbox_dir)
+    assert bdir.is_dir(), f"BBox dir not found: {bdir}"
+
+    out: List[str] = []
+    missing: List[str] = []
+    for img_path in image_paths:
+        name = Path(img_path).name
+        # Strip image_suffix to get the base name; tolerate names that
+        # don't end with the suffix (use stem as fallback).
+        if name.endswith(image_suffix):
+            base = name[: -len(image_suffix)]
+        else:
+            base = Path(name).stem
+        cand = bdir / f"{base}{bbox_suffix}"
+        if not cand.is_file():
+            missing.append(str(cand))
+        else:
+            out.append(str(cand))
+
+    if missing:
+        # Show only the first few to keep the message readable.
+        head = "\n  ".join(missing[:5])
+        more = f"\n  ... ({len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise FileNotFoundError(
+            f"BBox files not found for {len(missing)}/{len(image_paths)} "
+            f"samples under {bdir}:\n  {head}{more}")
+
+    logger.info("Matched %d bbox files under %s.", len(out), bdir)
+    return out
+
+
 def detect_label_values(
     label_paths: List[str], max_scan: Optional[int] = None) -> List[int]:
     """Auto-detect unique label values from the label files.
@@ -244,12 +289,23 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         cache_max_volumes=getattr(dc, "cache_max_volumes", 0),
         region_weights=rw)
 
+    # Optional ROI bbox paths — matched 1:1 to image_paths, then split
+    # along the same train/val indices so each per-sample bbox stays
+    # aligned with its image / label after the split.
+    bbox_paths_all: Optional[List[str]] = None
+    if getattr(dc, "bbox_dir", ""):
+        bbox_paths_all = match_bbox_paths(
+            image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
+
     train_paths = dict(
         image_paths=[image_paths[i] for i in train_idx],
         label_paths=[label_paths[i] for i in train_idx])
     val_paths = dict(
         image_paths=[image_paths[i] for i in val_idx],
         label_paths=[label_paths[i] for i in val_idx])
+    if bbox_paths_all is not None:
+        train_paths["bbox_paths"] = [bbox_paths_all[i] for i in train_idx]
+        val_paths["bbox_paths"] = [bbox_paths_all[i] for i in val_idx]
 
     if dc.patch_mode == "2_5d":
         # 2.5D mode reuses the z_axis dataset verbatim with a single
