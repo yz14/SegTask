@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.amp import autocast
 
 from .config import Config
@@ -131,8 +132,7 @@ class Predictor:
         dc = self.cfg.data
         raw_vol = load_nifti(image_path)  # (D_orig, H_orig, W_orig)
         D_orig, H_orig, W_orig = raw_vol.shape
-        logger.info("Loaded %s: shape=(%d, %d, %d)",
-                    image_path, D_orig, H_orig, W_orig)
+        logger.info("Loaded %s: shape=(%d, %d, %d)", image_path, D_orig, H_orig, W_orig)
 
         vol = preprocess_image(
             raw_vol, dc.intensity_min, dc.intensity_max,
@@ -188,49 +188,85 @@ class Predictor:
             "scales=%s, blend=%s",
             pD, stride, len(z_positions), self.multi_res_scales, self.blend_mode)
 
-        z_weight = self._build_1d_weight(pD)  # (pD,) float32
+        # ----- GPU-resident pipeline ----------------------------------
+        # Hot-path bottleneck before this rewrite: each window paid for
+        #   (a) scipy.ndimage.zoom upsample of (num_fg, pD, pH, pW) →
+        #       (num_fg, ad, H_orig, W_orig) on CPU,
+        #   (b) `.cpu().numpy()` sync + numpy float32 accumulation into a
+        #       (num_fg, D_orig, H_orig, W_orig) buffer.
+        # For 512² volumes both are massively faster on CUDA. We keep the
+        # volume + accumulators on the GPU and only move the final
+        # blended probability volume back at the end.
+        vol_t = torch.from_numpy(vol).to(self.device, non_blocking=True)
 
-        # float32 accumulators: for segmentation-scale volumes float64 more
-        # than doubles memory without measurable accuracy gain (Gaussian
-        # sums stay in [0, O(n_overlap)] range).
-        acc_pred = np.zeros((self.num_fg, D_orig, H_orig, W_orig),
-                            dtype=np.float32)
-        acc_weight = np.zeros((1, D_orig, 1, 1), dtype=np.float32)
+        z_weight_t = torch.from_numpy(
+            self._build_1d_weight(pD)).to(self.device)  # (pD,)
 
-        # Per-window input tensors (already stacked across scales:
-        # (C_res, pD, pH, pW)) and their source metadata for accumulation.
-        window_inputs: List[np.ndarray] = []
+        acc_pred = torch.zeros(
+            (self.num_fg, D_orig, H_orig, W_orig),
+            dtype=torch.float32, device=self.device)
+        acc_weight = torch.zeros(
+            (1, D_orig, 1, 1), dtype=torch.float32, device=self.device)
+
+        # Multi-resolution z-axis is rare in practice (2.5D forces [1.0]).
+        # Keep the legacy CPU build path only when scales > 1.0 are present;
+        # otherwise extract directly on GPU to skip the host round-trip.
+        single_res = (len(self.multi_res_scales) == 1
+                      and self.multi_res_scales[0] == 1.0)
+
+        window_inputs: List[torch.Tensor] = []  # each (C_res, pD, pH, pW) on GPU
         patch_metas: List[Tuple[int, int, int]] = []  # (z0, z1, actual_d)
 
         n_windows = len(z_positions)
         for idx, (z0, z1) in enumerate(z_positions):
             actual_d = z1 - z0
-            window_inputs.append(
-                self._build_z_window_input(vol, z0, z1))
+            if single_res:
+                window_inputs.append(
+                    self._build_z_window_input_gpu(vol_t, z0, z1))
+            else:
+                # Fallback: legacy multi-res builder runs on CPU then
+                # ships once to GPU. Keeps multi-FOV semantics identical.
+                wi_np = self._build_z_window_input(vol, z0, z1)
+                window_inputs.append(
+                    torch.from_numpy(wi_np).to(
+                        self.device, non_blocking=True))
             patch_metas.append((z0, z1, actual_d))
 
             is_last = idx == n_windows - 1
             if len(window_inputs) >= self.batch_size or is_last:
                 # (B, C_res, pD, pH, pW)
-                batch = torch.from_numpy(
-                    np.stack(window_inputs, axis=0).astype(np.float32)
-                ).to(self.device, non_blocking=True)
-                probs = self._forward_batch(batch)   # (B, num_fg, pD, pH, pW)
+                batch = torch.stack(window_inputs, dim=0).float()
+                # (B, num_fg, pD, pH, pW) on GPU
+                probs = self._forward_batch_gpu(batch)
 
-                for pred, (zs, ze, ad) in zip(probs, patch_metas):
-                    # Resize prediction back: (num_fg, pD, pH, pW)
-                    #   → (num_fg, ad, H_orig, W_orig)
-                    pred_orig = resize_3d(
-                        pred, ad, H_orig, W_orig, is_label=False)
+                # Group by actual_d so windows that share a target depth
+                # can share one F.interpolate launch. In the common case
+                # all but possibly the last window have ad == pD, which
+                # collapses this to a single batched upsample.
+                groups: Dict[int, List[int]] = {}
+                for i, (_, _, ad) in enumerate(patch_metas):
+                    groups.setdefault(ad, []).append(i)
 
-                    # Build a weight that is symmetric on the actual depth.
-                    # For short tail windows, trimming z_weight[:ad] would
-                    # be asymmetric; rebuild a length-ad window instead.
-                    w = (z_weight if ad == pD
-                         else self._build_1d_weight(ad))
-                    w_4d = w.reshape(1, -1, 1, 1).astype(np.float32)
-                    acc_pred[:, zs:ze, :, :] += pred_orig * w_4d
-                    acc_weight[:, zs:ze, :, :] += w_4d
+                for ad, idxs in groups.items():
+                    sub = probs[idxs]  # (b, num_fg, pD, pH, pW)
+                    if (ad != pD) or (H_orig != pH) or (W_orig != pW):
+                        sub = F.interpolate(
+                            sub, size=(ad, H_orig, W_orig),
+                            mode="trilinear", align_corners=False)
+                    # Per-ad blending weight (symmetric on actual depth).
+                    if ad == pD:
+                        w = z_weight_t
+                    else:
+                        w = torch.from_numpy(
+                            self._build_1d_weight(ad)).to(self.device)
+                    w_4d = w.view(1, -1, 1, 1)
+
+                    for j, i in enumerate(idxs):
+                        zs, ze, _ = patch_metas[i]
+                        # In-place fused mul-add (one GPU kernel each).
+                        acc_pred[:, zs:ze, :, :].addcmul_(
+                            sub[j], w_4d, value=1.0)
+                        acc_weight[:, zs:ze, :, :].add_(w_4d)
 
                 window_inputs.clear()
                 patch_metas.clear()
@@ -238,8 +274,74 @@ class Predictor:
                 if (idx + 1) % max(1, 10 * self.batch_size) == 0 or is_last:
                     logger.info("  z-window %d/%d", idx + 1, n_windows)
 
-        np.maximum(acc_weight, 1e-8, out=acc_weight)
-        return acc_pred / acc_weight
+        acc_weight.clamp_(min=1e-8)
+        return (acc_pred / acc_weight).cpu().numpy()
+
+    def _build_z_window_input_gpu(
+        self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
+        """GPU equivalent of ``_build_z_window_input`` for the single-res
+        path (the only path 2.5D mode ever uses).
+
+        Mirrors the legacy CPU contract:
+          - scale=1.0 → take ``vol[z0:z1]`` as-is (possibly < pD at tails),
+            resize to ``(pD, pH, pW)``.
+        Returns (C_res=1, pD, pH, pW) float32 on the model's device.
+        """
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+        patch = vol_t[z0:z1]  # (actual_d, H_orig, W_orig)
+        ad, H, W = patch.shape
+        # F.interpolate expects (N, C, D, H, W); add batch+channel.
+        patch = patch.unsqueeze(0).unsqueeze(0).float()
+        if (ad != pD) or (H != pH) or (W != pW):
+            patch = F.interpolate(
+                patch, size=(pD, pH, pW),
+                mode="trilinear", align_corners=False)
+        return patch.squeeze(0)  # (1, pD, pH, pW)
+
+    @torch.no_grad()
+    def _forward_batch_gpu(self, x: torch.Tensor) -> torch.Tensor:
+        """GPU-tensor-returning variant of ``_forward_batch``.
+
+        Used by the GPU-resident z-axis path so prediction probabilities
+        never round-trip through host memory between forward and the
+        final blend / argmax. Behaviour is identical to ``_forward_batch``
+        otherwise (AMP, TTA, deep-supervision unwrap).
+        """
+        if self.patch_mode == "2_5d":
+            if x.shape[1] != 1:
+                raise ValueError(
+                    "2.5D inference expects single-resolution input "
+                    f"(C_res=1); got x.shape={tuple(x.shape)}")
+            x_2d = x.squeeze(1)  # (B, D, H, W)
+            B, D, H, W = x_2d.shape
+            with autocast(device_type="cuda", enabled=self.use_amp,
+                          dtype=self.amp_dtype):
+                pred = self.model(x_2d)
+                if isinstance(pred, list):
+                    pred = pred[0]
+                expected_c = self.num_fg * D
+                if pred.shape[1] != expected_c:
+                    raise ValueError(
+                        f"2.5D model output channels {pred.shape[1]} != "
+                        f"num_fg*D = {self.num_fg}*{D} = {expected_c}")
+                pred_5d = pred.reshape(B, self.num_fg, D, H, W)
+                prob = torch.sigmoid(pred_5d.float())
+                if self.tta_flip:
+                    prob = self._tta_flip_ensemble_2_5d(x_2d, prob)
+            return prob
+
+        with autocast(device_type="cuda", enabled=self.use_amp,
+                      dtype=self.amp_dtype):
+            pred = self.model(x)
+            if isinstance(pred, list):
+                pred = pred[0]
+            assert pred.shape[1] >= self.num_fg, (
+                f"Model output has {pred.shape[1]} channels; "
+                f"expected at least num_fg={self.num_fg} at 1x resolution.")
+            prob = torch.sigmoid(pred.float())[:, :self.num_fg]
+            if self.tta_flip:
+                prob = self._tta_flip_ensemble(x, prob)
+        return prob
 
     def _build_z_window_input(
         self, vol: np.ndarray, z0: int, z1: int) -> np.ndarray:
@@ -689,6 +791,26 @@ def _strip_compile_prefix(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     return sd
 
 
+def _unwrap_ema_state(ema_sd: Dict) -> Dict[str, torch.Tensor]:
+    """Unwrap ``ModelEMA.state_dict()`` into a plain model state_dict.
+
+    ``ModelEMA.state_dict`` returns ``{"shadow": {...weights...},
+    "decay": float}``. Feeding that directly to ``model.load_state_dict``
+    silently leaves every parameter at its random init (every key is
+    "missing", `shadow`/`decay` are "unexpected") — which manifests as
+    perfect train Dice but garbage predictions.
+
+    Best-model checkpoints additionally store EMA-as-primary in
+    ``model_state_dict`` (already unwrapped); this helper is only invoked
+    on ``ckpt["ema_state_dict"]`` and tolerates the unwrapped legacy form
+    too.
+    """
+    if isinstance(ema_sd, dict) and "shadow" in ema_sd and isinstance(
+            ema_sd["shadow"], dict):
+        return ema_sd["shadow"]
+    return ema_sd  # already a plain state_dict (legacy format)
+
+
 def _select_state_dict(
     ckpt: Dict, variant: str,
 ) -> Tuple[Dict[str, torch.Tensor], str]:
@@ -712,14 +834,14 @@ def _select_state_dict(
                 "online")
     if variant == "ema":
         if has_ema:
-            return ckpt["ema_state_dict"], "ema"
+            return _unwrap_ema_state(ckpt["ema_state_dict"]), "ema"
         logger.warning("EMA requested but not found in checkpoint; "
                        "using online weights.")
         return (ckpt["model_online_state_dict"] if has_online else primary,
                 "online")
     # auto
     if has_ema:
-        return ckpt["ema_state_dict"], "ema"
+        return _unwrap_ema_state(ckpt["ema_state_dict"]), "ema"
     return primary, "online"
 
 
@@ -751,6 +873,18 @@ def run_inference(
         logger.warning("Missing keys when loading checkpoint: %s", missing)
     if unexpected:
         logger.warning("Unexpected keys when loading checkpoint: %s", unexpected)
+    # Hard-fail when the checkpoint contributed essentially nothing to the
+    # model: a near-empty load means the model is still at random init and
+    # every prediction would be garbage. This is the failure mode caused by
+    # treating ModelEMA's wrapped {"shadow", "decay"} dict as a state_dict.
+    n_total = len(model.state_dict())
+    n_loaded = n_total - len(missing)
+    if n_total > 0 and n_loaded < max(1, n_total // 2):
+        raise RuntimeError(
+            f"Only {n_loaded}/{n_total} parameters loaded from "
+            f"{checkpoint_path} (variant={label}). The checkpoint key "
+            f"layout does not match the model — refusing to predict with "
+            f"random weights. Unexpected keys: {unexpected[:8]}")
 
     model = model.to(device).eval()
     logger.info("Model loaded from %s (variant=%s)", checkpoint_path, label)

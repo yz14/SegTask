@@ -597,13 +597,24 @@ class Trainer:
             else:
                 effective_accum = accum
 
-            # --- Forward + loss
+            # --- Forward (AMP) + loss (fp32)
+            #
+            # Model forward stays under autocast for the fp16 speedup, but
+            # the loss is computed in fp32. Dice / BCE compounds reduce
+            # over millions of voxels per batch (e.g. B*D*H*W ≈ 3.1M in
+            # 2.5D); the running sums in the dice numerator/denominator
+            # quickly exceed fp16's ±65504 range once the model starts
+            # confidently predicting foreground, producing inf → NaN
+            # losses and poisoning training (root cause of the epoch-20
+            # NaN explosion observed historically). Casting pred to fp32
+            # outside autocast is the standard nnU-Net-style fix.
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):
                 pred = self.model(image)
-                loss = self.criterion(pred, label, weight_map=wmap)
-                if effective_accum > 1:
-                    loss = loss / effective_accum
+            loss = self._compute_loss_fp32(
+                self.criterion, pred, label, weight_map=wmap)
+            if effective_accum > 1:
+                loss = loss / effective_accum
 
             # --- Backward (accumulates into .grad)
             self.scaler.scale(loss).backward()
@@ -682,7 +693,10 @@ class Trainer:
                         pred = pred[0]
                     pred_1x, target_1x = self._inner_loss.split_for_metrics(
                         pred, label)
-                    loss = self.base_loss(pred_1x, target_1x)
+                # Loss in fp32 — see `_train_epoch` for rationale (fp16 dice
+                # reductions overflow on large patches and produce NaN).
+                loss = self._compute_loss_fp32(
+                    self.base_loss, pred_1x, target_1x)
 
                 loss_meter.update(loss.item(), image.shape[0])
                 stats = dice_batch_stats(pred_1x.float(), target_1x)
@@ -724,6 +738,37 @@ class Trainer:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_loss_fp32(
+        loss_fn: nn.Module,
+        pred,
+        target: torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run ``loss_fn`` outside autocast with fp32 inputs.
+
+        Casts every prediction tensor (single tensor or list-of-tensors as
+        produced by deep supervision) to ``float32`` and disables autocast
+        for the loss call. The label tensor is cast to fp32 only if it is
+        a float dtype — integer label tensors must remain integer-typed
+        because some compound losses round / index them. ``weight_map``
+        is cast to fp32 when provided.
+
+        This eliminates fp16 overflow in dice / BCE reductions, which is
+        the dominant failure mode for AMP segmentation training on large
+        spatial patches.
+        """
+        if isinstance(pred, list):
+            pred_fp32 = [p.float() for p in pred]
+        else:
+            pred_fp32 = pred.float()
+        target_fp32 = target.float() if target.is_floating_point() else target
+        wmap_fp32 = weight_map.float() if weight_map is not None else None
+        with autocast(device_type="cuda", enabled=False):
+            if wmap_fp32 is None:
+                return loss_fn(pred_fp32, target_fp32)
+            return loss_fn(pred_fp32, target_fp32, weight_map=wmap_fp32)
+
     def _squeeze_2_5d(
         self,
         image: torch.Tensor,
