@@ -35,13 +35,4 @@
 
 
 # TODO  
-1. python -m segtask_v1.train --config configs/seg2_5d.yaml训练报错，都训练了十几轮后了才报错
-  File "D:\miniconda\envs\torch27_env\lib\site-packages\torch\utils\data\_utils\fetch.py", line 52, in fetch
-    data = [self.dataset[idx] for idx in possibly_batched_index] 
-  File "D:\miniconda\envs\torch27_env\lib\site-packages\torch\utils\data\_utils\fetch.py", line 52, in <listcomp>    
-    data = [self.dataset[idx] for idx in possibly_batched_index] 
-  File "D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py", line 502, in __getitem__
-    img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
-  File "D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py", line 492, in _load_label
-    lbl = load_nifti(path)
-0001AADC923080): nifti_image_load failed for file: F:\BaiduNetdiskDownload\003_Lung\lung_seg\CN010013-80626582-2447.nii.gz
+1. segtask_v1.train这里只有resume，怎么没有看到pretrain的参数和功能

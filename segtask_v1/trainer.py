@@ -426,9 +426,37 @@ class Trainer:
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # --- Resume ----------------------------------------------------
-        if tc.resume and os.path.isfile(tc.resume):
+        # --- Resume / Pretrain ----------------------------------------
+        # Semantics:
+        #   * `resume`   → full state restore (training continues exactly).
+        #   * `pretrain` → model-weights-only initialisation; epoch / optim /
+        #                  scheduler / scaler / best / RNG all stay fresh.
+        # `resume` wins when both are configured *and* the file exists.
+        resume_active = bool(tc.resume) and os.path.isfile(tc.resume)
+        pretrain_active = bool(tc.pretrain) and os.path.isfile(tc.pretrain)
+
+        if resume_active:
+            if tc.pretrain:
+                logger.warning(
+                    "Both `train.resume` and `train.pretrain` are set; "
+                    "using resume (%s). Pretrain weights from %s are ignored.",
+                    tc.resume, tc.pretrain)
             self._load_checkpoint(tc.resume)
+        elif pretrain_active:
+            self._load_pretrain(
+                tc.pretrain,
+                strict=tc.pretrain_strict,
+                load_ema=tc.pretrain_load_ema)
+        else:
+            # Surface mis-configurations early instead of silently ignoring.
+            if tc.resume and not os.path.isfile(tc.resume):
+                logger.warning(
+                    "`train.resume` is set but file not found: %s. "
+                    "Training will start from scratch.", tc.resume)
+            if tc.pretrain and not os.path.isfile(tc.pretrain):
+                logger.warning(
+                    "`train.pretrain` is set but file not found: %s. "
+                    "Training will start from scratch.", tc.pretrain)
 
     # ------------------------------------------------------------------
     # Public API
@@ -985,3 +1013,131 @@ class Trainer:
             self.start_epoch, self.cfg.train.save_best_metric,
             f"{self.best_metric:.4f}" if self.has_best else "n/a",
             self.patience_counter)
+
+    # ------------------------------------------------------------------
+    # Pretrain (weights-only initialisation)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_model_state_dict(ckpt, prefer_ema: bool):
+        """Locate the model state_dict inside a checkpoint, format-tolerant.
+
+        Supports three layouts:
+          1. Trainer's own checkpoints (dict with ``model_state_dict`` /
+             optionally ``model_online_state_dict`` / ``ema_state_dict``).
+          2. Common third-party convention: ``{"state_dict": OrderedDict}``.
+          3. Raw state_dict pickled directly (an OrderedDict of tensors).
+
+        Returns:
+            (state_dict, source_label) where ``source_label`` is a short string
+            describing which slot was picked — useful for logs.
+        """
+        # Case 3: raw state_dict
+        if not isinstance(ckpt, dict) or all(
+                isinstance(v, torch.Tensor) for v in ckpt.values()):
+            return ckpt, "raw_state_dict"
+
+        # Case 1a: prefer EMA shadow when requested and present
+        if prefer_ema and "ema_state_dict" in ckpt:
+            ema_state = ckpt["ema_state_dict"]
+            if isinstance(ema_state, dict) and "shadow" in ema_state:
+                return ema_state["shadow"], "ema_shadow"
+
+        # Case 1b: trainer-format online weights (best-model ckpts keep online
+        # in a sibling slot when EMA is the primary).
+        if "model_online_state_dict" in ckpt:
+            return ckpt["model_online_state_dict"], "model_online_state_dict"
+        if "model_state_dict" in ckpt:
+            return ckpt["model_state_dict"], "model_state_dict"
+
+        # Case 2: third-party "state_dict" wrapper
+        if "state_dict" in ckpt:
+            return ckpt["state_dict"], "state_dict"
+
+        raise KeyError(
+            "Pretrain checkpoint does not contain a recognisable model "
+            "state_dict. Expected one of: 'model_state_dict', "
+            "'model_online_state_dict', 'state_dict', or a raw OrderedDict.")
+
+    @staticmethod
+    def _strip_common_prefixes(sd):
+        """Drop ``module.`` (DDP) and ``_orig_mod.`` (torch.compile) prefixes.
+
+        Pretrain sources are often produced by DDP / compiled training; our
+        target model here is the bare unwrapped module, so unifying the
+        namespace before loading avoids spurious "missing key" floods.
+        """
+        if not isinstance(sd, dict):
+            return sd
+        prefixes = ("module.", "_orig_mod.")
+        out = {}
+        changed = False
+        for k, v in sd.items():
+            new_k = k
+            # Strip iteratively in case prefixes are nested (compile(DDP(...))).
+            while new_k.startswith(prefixes):
+                for p in prefixes:
+                    if new_k.startswith(p):
+                        new_k = new_k[len(p):]
+                        changed = True
+                        break
+            out[new_k] = v
+        return out if changed else sd
+
+    def _load_pretrain(self, path: str, strict: bool, load_ema: bool) -> None:
+        """Load model weights only — used for transfer-learning init.
+
+        Crucially distinct from ``_load_checkpoint``:
+            * Does NOT touch optimizer / scheduler / scaler / RNG.
+            * Does NOT advance ``start_epoch`` or restore best-metric tracking.
+            * Re-aligns EMA shadow to the freshly loaded weights so EMA does
+              not silently drift back toward the random init.
+        """
+        logger.info(
+            "Loading pretrain weights: %s (strict=%s, load_ema=%s)",
+            path, strict, load_ema)
+        # weights_only=False mirrors `_load_checkpoint`: trainer-format ckpts
+        # contain numpy RNG state and the Config dataclass which the safe
+        # unpickler rejects. Pretrain sources are explicitly user-provided.
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        sd, source = self._extract_model_state_dict(ckpt, prefer_ema=load_ema)
+        sd = self._strip_common_prefixes(sd)
+
+        bare = _unwrap_compile(self.model)
+        result = bare.load_state_dict(sd, strict=strict)
+        missing = list(getattr(result, "missing_keys", []) or [])
+        unexpected = list(getattr(result, "unexpected_keys", []) or [])
+
+        # Compact, actionable diagnostics. Showing the first few keys is far
+        # more useful than dumping hundreds when the head doesn't match.
+        def _preview(keys, n=8):
+            head = ", ".join(keys[:n])
+            return head + (f", ... (+{len(keys) - n} more)" if len(keys) > n else "")
+
+        if missing:
+            logger.warning(
+                "Pretrain: %d missing key(s) [%s]. These params keep their "
+                "random init.", len(missing), _preview(missing))
+        if unexpected:
+            logger.warning(
+                "Pretrain: %d unexpected key(s) [%s]. These ckpt params are "
+                "discarded.", len(unexpected), _preview(unexpected))
+        if not missing and not unexpected:
+            logger.info("Pretrain: all keys matched cleanly.")
+
+        # Re-align EMA shadow with the loaded weights. Without this, the
+        # shadow would still hold the model's *random* init from
+        # ``ModelEMA.__init__`` and EMA-based validation/checkpoints would
+        # regress toward noise for the first ~1/(1-decay) steps.
+        if self.ema is not None:
+            with torch.no_grad():
+                live_sd = bare.state_dict()
+                for k, v in live_sd.items():
+                    if k in self.ema.shadow:
+                        self.ema.shadow[k].copy_(v)
+            logger.info("Pretrain: EMA shadow re-aligned to loaded weights.")
+
+        logger.info(
+            "Pretrain loaded from `%s` slot. Training will start from "
+            "epoch 0 with fresh optimizer / scheduler / scaler / best / RNG.",
+            source)

@@ -297,8 +297,14 @@ train:
   seed: 42
   deterministic: false
 
-  # Resume training from checkpoint
+  # Resume training from checkpoint (full state)
   resume: ""
+
+  # Pretrain: model-weights-only initialisation for transfer learning.
+  # Optimizer/scheduler/epoch/RNG are NOT restored. Ignored when `resume` is set.
+  pretrain: ""
+  pretrain_strict: false
+  pretrain_load_ema: false
 
   # Multi-GPU (DDP) — not yet implemented
   distributed: false

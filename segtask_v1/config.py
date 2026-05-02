@@ -493,8 +493,22 @@ class TrainConfig:
     seed: int = 42
     deterministic: bool = False
 
-    # Resume
+    # Resume: 从训练 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
     resume: str = ""
+
+    # Pretrain: 仅加载 model 权重作为初始化（迁移学习用）。不恢复任何训练状态：
+    #   - epoch 从 0 开始，optimizer/scheduler/scaler/best_metric/patience/RNG 全部不动。
+    #   - 若启用 EMA，EMA shadow 会被加载后的 model 权重重新对齐。
+    #   - 若同时设置了 `resume` 且 resume 文件存在，则 pretrain 被忽略（resume 优先）。
+    pretrain: str = ""
+
+    # 是否对 pretrain 权重 strict 加载。默认 False 以允许 head 形状不一致（不同任务 num_classes）。
+    # 加载完成后会日志输出 missing / unexpected keys 数量与示例。
+    pretrain_strict: bool = False
+
+    # 当 pretrain checkpoint 含 EMA shadow 时，是否优先用 EMA shadow 作为初始权重
+    # （EMA 权重通常更稳定，更适合做迁移起点）。默认 False（用 online 权重）。
+    pretrain_load_ema: bool = False
 
 
 # ---------------------------------------------------------------------------

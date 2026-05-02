@@ -24,8 +24,8 @@ data:
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
   # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
-  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
-  label_dir: "F:/BaiduNetdiskDownload/003_Lung/lung_seg"
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/bone"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
@@ -34,7 +34,7 @@ data:
   # 在 _load_image/_load_label 内裁剪后再走归一化与缓存；推理侧由
   # predict.py / Predictor.predict_volume 读取后裁剪推理 → 写回原体积
   # 坐标系（ROI 外=背景）。留空 = 禁用。
-  bbox_dir   : "F:/BaiduNetdiskDownload/body_pred"
+  bbox_dir   : "F:/med_data/Totalsegmentator_dataset_v201/body_bbox"
   bbox_suffix: ".nii.gz"
 
   label_values: [0, 1]
@@ -83,7 +83,7 @@ data:
   samples_per_volume: 8
 
   cache_mode: "memory"
-  cache_max_volumes: 4
+  cache_max_volumes: 8
 
 
 # =====================================================================
@@ -227,7 +227,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir: "outputs/lung"
+  output_dir: "outputs/bone"
   save_every: 10
   save_best_metric: "mean_dice"
   save_best_mode: "max"
@@ -241,7 +241,13 @@ train:
   seed: 42
   deterministic: false
 
-  resume: "D:/codes/work-projects/SegTask/outputs/lung/best_model.pth"
+  resume: ""
+
+  # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
+  # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。
+  pretrain: ""
+  pretrain_strict: false
+  pretrain_load_ema: false
 
 
 # =====================================================================

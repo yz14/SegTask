@@ -438,6 +438,14 @@ train:
   # 从 checkpoint 继续训练（完整 state：model/optimizer/scheduler/ema/rng）。
   resume: ""
 
+  # 仅加载模型权重作为初始化（迁移学习）。不恢复 optimizer/scheduler/epoch/RNG。
+  # 与 resume 同时设置时，若 resume 文件存在则 pretrain 被忽略。
+  pretrain: ""
+  # 默认 False，允许 head 形状不一致；missing/unexpected keys 会写日志。
+  pretrain_strict: false
+  # ckpt 含 EMA 时是否优先取 EMA shadow 作为初始权重。
+  pretrain_load_ema: false
+
 
 # =====================================================================
 # PREDICT — 推理 / 滑窗 / TTA
