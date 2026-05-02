@@ -311,11 +311,13 @@ class Trainer:
                 num_fg_classes=cfg.num_fg_classes,
                 num_slices=num_slices,
                 label_values=cfg.data.label_values,
+                reduction=cfg.loss.slice_loss_reduction,
             )
             num_res = 1   # for logging only; SliceChannelLoss has C_res==1
             logger.info(
-                "Loss: %s [2.5D], num_slices=%d, fg_classes=%d",
-                cfg.loss.name, num_slices, cfg.num_fg_classes)
+                "Loss: %s [2.5D, reduction=%s], num_slices=%d, fg_classes=%d",
+                cfg.loss.name, cfg.loss.slice_loss_reduction,
+                num_slices, cfg.num_fg_classes)
         else:
             num_res = len(cfg.data.multi_res_scales)
             inner = MultiResolutionLoss(
@@ -583,20 +585,18 @@ class Trainer:
                 image, label = self.augmentor(image, label)
                 
                 
-            import SimpleITK as sitk
-            for jj, (ii,ll,ww) in enumerate(zip(image, label, wmap)):
-                ii = ii[0].cpu().numpy()
-                aa = sitk.GetImageFromArray(ii)
-                sitk.WriteImage(aa, f'{jj}.nii.gz')
-                ll = ll[0].cpu().numpy()
-                aa = sitk.GetImageFromArray(ll)
-                sitk.WriteImage(aa, f'{jj}L.nii.gz')
-                ww = ww[0].cpu().numpy()
-                aa = sitk.GetImageFromArray(ww)
-                sitk.WriteImage(aa, f'{jj}W.nii.gz')
-            raise
-                
-                
+            # import SimpleITK as sitk
+            # for jj, (ii,ll,ww) in enumerate(zip(image, label, wmap)):
+            #     ii = ii[0].cpu().numpy()
+            #     aa = sitk.GetImageFromArray(ii)
+            #     sitk.WriteImage(aa, f'{jj}.nii.gz')
+            #     ll = ll[0].cpu().numpy()
+            #     aa = sitk.GetImageFromArray(ll)
+            #     sitk.WriteImage(aa, f'{jj}L.nii.gz')
+            #     ww = ww[0].cpu().numpy()
+            #     aa = sitk.GetImageFromArray(ww)
+            #     sitk.WriteImage(aa, f'{jj}W.nii.gz')
+            # raise
 
             # --- Center-crop when dataset returned oversampled patches
             if self.needs_crop:
@@ -656,7 +656,19 @@ class Trainer:
             # --- Metrics (log unscaled loss)
             loss_val = (loss.item() * effective_accum
                         if effective_accum > 1 else loss.item())
-            loss_meter.update(loss_val, image.shape[0])
+            # Guard the running average against single-batch non-finite
+            # losses. A single NaN/Inf would otherwise poison ``sum`` and
+            # render every later ``loss_meter.avg`` NaN for the rest of the
+            # epoch (and all subsequent epochs' logs) even though training
+            # itself continues healthily via GradScaler's inf-skip path.
+            if math.isfinite(loss_val):
+                loss_meter.update(loss_val, image.shape[0])
+            else:
+                logger.warning(
+                    "Non-finite train loss (%s) at epoch %d step %d/%d; "
+                    "skipping meter update. GradScaler will skip this "
+                    "optimizer step.",
+                    loss_val, epoch + 1, step + 1, total_steps)
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
@@ -714,7 +726,13 @@ class Trainer:
                 loss = self._compute_loss_fp32(
                     self.base_loss, pred_1x, target_1x)
 
-                loss_meter.update(loss.item(), image.shape[0])
+                loss_val = loss.item()
+                if math.isfinite(loss_val):
+                    loss_meter.update(loss_val, image.shape[0])
+                else:
+                    logger.warning(
+                        "Non-finite val loss (%s) at epoch %d; skipping "
+                        "meter update.", loss_val, epoch + 1)
                 stats = dice_batch_stats(pred_1x.float(), target_1x)
                 if inter_sum is None:
                     inter_sum = stats["inter"].clone()
@@ -754,6 +772,21 @@ class Trainer:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+    # Maximum absolute logit value fed into the loss. AMP fp16 can produce
+    # ``±inf`` in the forward path (instance-norm variance underflow,
+    # saturated activations, large late-training weights). ``pred.float()``
+    # does NOT recover those: ``inf`` in fp16 stays ``inf`` in fp32. The
+    # numerically-stable BCE-with-logits kernel then evaluates
+    #     max(x,0) - x*z + log1p(exp(-|x|))
+    # which for ``x=+inf, target=1`` is ``inf - inf + 0 = NaN`` — the
+    # dominant cause of single-batch NaN losses late in training. Clamping
+    # to ±_LOGIT_CLAMP wipes that failure mode at zero cost: ``sigmoid(50)``
+    # is already indistinguishable from 1.0 in fp32 (Dice is unaffected),
+    # and BCE's gradient ``sigmoid(x) - target`` at ``|x|=50`` is 0 or 1 —
+    # the same as the unclamped limit, so healthy training (|x| << 20) sees
+    # bit-identical behaviour.
+    _LOGIT_CLAMP: float = 50.0
+
     @staticmethod
     def _compute_loss_fp32(
         loss_fn: nn.Module,
@@ -770,14 +803,15 @@ class Trainer:
         because some compound losses round / index them. ``weight_map``
         is cast to fp32 when provided.
 
-        This eliminates fp16 overflow in dice / BCE reductions, which is
-        the dominant failure mode for AMP segmentation training on large
-        spatial patches.
+        Prediction logits are additionally clamped to
+        ``[-_LOGIT_CLAMP, +_LOGIT_CLAMP]`` to defuse occasional ±inf from
+        the fp16 autocast forward path (see ``_LOGIT_CLAMP`` docstring).
         """
+        c = Trainer._LOGIT_CLAMP
         if isinstance(pred, list):
-            pred_fp32 = [p.float() for p in pred]
+            pred_fp32 = [p.float().clamp(-c, c) for p in pred]
         else:
-            pred_fp32 = pred.float()
+            pred_fp32 = pred.float().clamp(-c, c)
         target_fp32 = target.float() if target.is_floating_point() else target
         wmap_fp32 = weight_map.float() if weight_map is not None else None
         with autocast(device_type="cuda", enabled=False):
@@ -897,7 +931,13 @@ class Trainer:
 
     def _load_checkpoint(self, path: str) -> None:
         logger.info("Loading checkpoint: %s", path)
-        ckpt = torch.load(path, map_location=self.device)
+        # PyTorch 2.6+ flipped ``weights_only`` default to True, which
+        # rejects our checkpoints because they contain numpy RNG state
+        # (``numpy._core.multiarray._reconstruct``) and the ``Config``
+        # dataclass — neither is on the safe-globals allowlist. These
+        # checkpoints are written by this trainer itself (trusted source),
+        # so we opt back into full unpickling explicitly.
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
         # Prefer the online copy if present (best-model checkpoints store
         # EMA as the primary state_dict, online as a sibling).

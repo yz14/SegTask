@@ -132,6 +132,38 @@ class DataConfig:
     cache_mode: str = "memory"
     cache_max_volumes: int = 0  # 0 = unbounded
 
+    # ---- Z-axis boundary-window handling (z_axis / 2.5D modes) ----
+    # Controls how the ``scale=1.0`` channel of a z-window is built when
+    # the candidate window has fewer than ``extract_size[0]`` real slices
+    # — i.e. (a) the volume is shorter than the patch in z, or (b) the
+    # sampled center sits close enough to a volume boundary that
+    # ``[z_center - eD/2, z_center + eD/2)`` partially falls outside the
+    # volume.
+    #
+    # "stretch"  (default, backward compatible): take the in-bounds
+    #     slices verbatim and let ``resize_3d`` / ``F.interpolate``
+    #     stretch them to ``eD`` slices along z. Pitfall: in 2.5D mode
+    #     the model's input-channel index implicitly encodes a
+    #     "channel k = z_center + (k - eD/2)" physical mapping; a
+    #     stretched boundary window remaps that mapping non-linearly,
+    #     producing a train-test slice-spacing mismatch and
+    #     systematically lower quality near volume edges.
+    #
+    # "edge_pad" (recommended for 2.5D): edge-replicate-pad the
+    #     window symmetrically along z to exactly ``eD`` slices BEFORE
+    #     any resize, so every channel keeps its physical 1-slice
+    #     spacing regardless of where the window sits relative to the
+    #     volume boundary. ``scale > 1.0`` channels already use this
+    #     contract (via ``extract_z_patch_padded``) — turning the
+    #     toggle on simply makes the ``scale=1.0`` channel match.
+    #
+    # The toggle covers BOTH the training dataset (``SegDataset3D``)
+    # and the inference predictor (``Predictor._build_z_window_input``
+    # CPU/GPU paths + ``_sliding_window_z`` reverse-resize) so that
+    # train and inference geometries stay strictly consistent. Modes
+    # other than z_axis / 2.5D are unaffected.
+    z_boundary_mode: str = "stretch"
+
 
 # ---------------------------------------------------------------------------
 # Augmentation configuration
@@ -363,6 +395,37 @@ class LossConfig:
     deep_supervision_weights: List[float] = field(
         default_factory=lambda: [1.0, 0.5, 0.25, 0.125]
     )
+
+    # ---- 2.5D loss reduction (only used when data.patch_mode == "2_5d") ----
+    # Controls how ``SliceChannelLoss`` aggregates the per-class binary loss
+    # across the D slice axis (which the 2.5D model exposes as input
+    # channels and a (num_fg * D)-channel output).
+    #
+    # "per_slice"  (default, backward compatible): the loss is computed
+    #     INDEPENDENTLY on every 2D slice. Internally pred / target are
+    #     reshaped to ``(B*D, 1, H, W)`` so the base loss treats each
+    #     slice as a standalone 2D binary segmentation problem. Dice /
+    #     Tversky reduce only over (H, W).
+    #
+    #     Pitfall: a slice with no foreground gives Dice ≈
+    #     ``(0+smooth)/(0+smooth) ≈ 1`` → loss ≈ 0. With D=12 and FG
+    #     concentrated in a few slices, most slices contribute zero
+    #     gradient and dilute the useful signal. There is also no
+    #     mechanism enforcing across-slice structural coherence, which
+    #     can produce "stairstep" artefacts after Gaussian z-blending.
+    #
+    # "per_volume" (recommended for 2.5D): the loss is computed on the
+    #     full per-window volume. Internally pred is reshaped to
+    #     ``(B, num_fg, D, H, W)`` and split by class into
+    #     ``(B, 1, D, H, W)`` so Dice / Tversky reduce over (D, H, W) as
+    #     a single volumetric Dice. Empty slices no longer game the loss
+    #     because the whole-window denominator stays large; the network
+    #     is also implicitly regularised toward 3D-consistent predictions.
+    #
+    #     BCE / Focal / Lovász-style losses are mathematically equivalent
+    #     under both reductions (per-voxel mean over the same voxels);
+    #     only Dice-family aggregation is affected.
+    slice_loss_reduction: str = "per_slice"
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +663,9 @@ class Config:
             f"focal_tversky_gamma must be > 0, got {self.loss.focal_tversky_gamma}")
         assert self.loss.cldice_iter >= 1, (
             f"cldice_iter must be >= 1, got {self.loss.cldice_iter}")
+        assert self.loss.slice_loss_reduction in ("per_slice", "per_volume"), (
+            f"Invalid slice_loss_reduction: {self.loss.slice_loss_reduction!r}; "
+            "expected 'per_slice' or 'per_volume'.")
         assert self.train.optimizer in ("adam", "adamw", "sgd"), \
             f"Invalid optimizer: {self.train.optimizer}"
         assert self.train.scheduler in (
@@ -609,6 +675,9 @@ class Config:
             "patch_size must be [D, H, W]"
         assert self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"), \
             f"Invalid patch_mode: {self.data.patch_mode}"
+        assert self.data.z_boundary_mode in ("stretch", "edge_pad"), (
+            f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
+            "expected 'stretch' or 'edge_pad'.")
         if self.data.patch_mode == "whole":
             # Multi-resolution has no physical meaning in whole-volume mode:
             # the input already spans the entire volume, there is nothing

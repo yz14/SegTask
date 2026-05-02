@@ -1023,14 +1023,28 @@ class SliceChannelLoss(nn.Module):
       pred_c   = pred[:, c*D:(c+1)*D]                  # (B, D, H, W)
       target_c = (label_raw == fg_values[c]).float()   # (B, D, H, W)
 
-    The base 2D segmentation loss is applied per slice by reshaping these
-    to ``(B*D, 1, H, W)`` (one binary 2D problem per slice). The final
-    scalar loss is averaged across all foreground classes.
+    The wrapper supports two reduction regimes for the base loss
+    (``reduction`` constructor argument, mirrored from
+    ``LossConfig.slice_loss_reduction``):
 
-    This matches the documented design: each foreground class becomes its
-    own binary segmentation problem at every slice; class_weights from
-    LossConfig still control the per-class outer mean.
+    ``"per_slice"`` (default, backward compatible)
+        pred / target are reshaped to ``(B*D, 1, H, W)`` so every slice is
+        a standalone 2D binary segmentation problem. Dice / Tversky
+        reduce only over (H, W), one denominator per slice.
+
+    ``"per_volume"``
+        pred / target are reshaped to ``(B, 1, D, H, W)`` so every window
+        is a standalone 3D binary segmentation problem. Dice / Tversky
+        reduce over (D, H, W) — a single volumetric Dice per window.
+        BCE / Focal / Lovász are mathematically equivalent to per-slice
+        because they are per-voxel-mean reductions over the same voxels.
+
+    The final scalar loss is averaged across all foreground classes;
+    ``class_weights`` from LossConfig still control the per-class outer
+    mean via the underlying base loss.
     """
+
+    _VALID_REDUCTIONS = ("per_slice", "per_volume")
 
     def __init__(
         self,
@@ -1038,17 +1052,25 @@ class SliceChannelLoss(nn.Module):
         num_fg_classes: int,
         num_slices: int,
         label_values: List[int],
+        reduction: str = "per_slice",
     ):
         super().__init__()
         if num_slices < 1:
             raise ValueError(f"num_slices must be >= 1, got {num_slices}")
+        if reduction not in self._VALID_REDUCTIONS:
+            raise ValueError(
+                f"reduction must be one of {self._VALID_REDUCTIONS}, "
+                f"got {reduction!r}")
         self.base_loss = base_loss
         self.num_fg = num_fg_classes
         self.num_slices = num_slices
         self.label_values = label_values
         self.fg_values = label_values[1:]  # exclude background
+        self.reduction = reduction
 
-    # -- internal helper ------------------------------------------------
+    # ------------------------------------------------------------------
+    # Per-slice reshape helpers (rank-4 contract: (B*D, num_fg, H, W))
+    # ------------------------------------------------------------------
     def _label_to_binary(self, label_raw: torch.Tensor) -> torch.Tensor:
         """(B, D, H, W) raw labels → (B*D, num_fg, H, W) binary masks.
 
@@ -1104,14 +1126,86 @@ class SliceChannelLoss(nn.Module):
                 f"weight_map slice count {D} != num_slices {num_slices}")
         return weight_map.reshape(B * D, 1, H, W)
 
-    # -- forward ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Per-volume reshape helpers (rank-5 contract: (B, num_fg, D, H, W))
+    # ------------------------------------------------------------------
+    def _split_pred_5d(self, pred: torch.Tensor) -> torch.Tensor:
+        """(B, num_fg*D, H, W) → (B, num_fg, D, H, W)."""
+        if pred.ndim != 4:
+            raise ValueError(
+                f"SliceChannelLoss expects (B, num_fg*D, H, W) pred, "
+                f"got rank-{pred.ndim}")
+        B, total_c, H, W = pred.shape
+        D = self.num_slices
+        if total_c != self.num_fg * D:
+            raise ValueError(
+                f"pred channel count {total_c} != num_fg*D = "
+                f"{self.num_fg}*{D} = {self.num_fg * D}")
+        return pred.reshape(B, self.num_fg, D, H, W)
+
+    def _label_to_binary_5d(self, label_raw: torch.Tensor) -> torch.Tensor:
+        """(B, D, H, W) raw labels → (B, num_fg, D, H, W) binary masks."""
+        if label_raw.ndim != 4:
+            raise ValueError(
+                f"SliceChannelLoss expects (B, D, H, W) raw label, "
+                f"got rank-{label_raw.ndim}")
+        B, D, H, W = label_raw.shape
+        if D != self.num_slices:
+            raise ValueError(
+                f"label slice count {D} != configured num_slices "
+                f"{self.num_slices}")
+        fg = torch.tensor(self.fg_values,
+                          device=label_raw.device, dtype=label_raw.dtype)
+        flat = label_raw.unsqueeze(1)                               # (B, 1, D, H, W)
+        fg_b = fg.reshape(1, -1, 1, 1, 1)                            # (1, num_fg, 1, 1, 1)
+        return (flat == fg_b).float()                                # (B, num_fg, D, H, W)
+
+    @staticmethod
+    def _wmap_to_5d(
+        weight_map: Optional[torch.Tensor], num_slices: int,
+    ) -> Optional[torch.Tensor]:
+        """(B, D, H, W) → (B, 1, D, H, W) for base-loss broadcasting."""
+        if weight_map is None:
+            return None
+        if weight_map.ndim != 4:
+            raise ValueError(
+                f"SliceChannelLoss expects (B, D, H, W) weight_map, "
+                f"got rank-{weight_map.ndim}")
+        B, D, H, W = weight_map.shape
+        if D != num_slices:
+            raise ValueError(
+                f"weight_map slice count {D} != num_slices {num_slices}")
+        return weight_map.unsqueeze(1)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(
         self,
         pred: torch.Tensor,
         label_raw: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute the per-class averaged 2D binary loss across slices."""
+        """Compute the per-class averaged binary loss in the configured
+        reduction regime."""
+        if self.reduction == "per_volume":
+            pred_5d = self._split_pred_5d(pred)              # (B, num_fg, D, H, W)
+            target_5d = self._label_to_binary_5d(label_raw)  # (B, num_fg, D, H, W)
+            wm_5d = self._wmap_to_5d(weight_map, self.num_slices)
+
+            # Per-class loop in a 3D-binary-segmentation contract:
+            # Dice/Tversky now reduce over (D, H, W) so empty slices
+            # share a single window-level denominator with non-empty
+            # slices and stop "winning" at zero loss.
+            total = pred.new_zeros(())
+            for c in range(self.num_fg):
+                pred_c = pred_5d[:, c:c + 1]                 # (B, 1, D, H, W)
+                target_c = target_5d[:, c:c + 1]             # (B, 1, D, H, W)
+                total = total + self.base_loss(
+                    pred_c, target_c, weight_map=wm_5d)
+            return total / self.num_fg
+
+        # Default: per_slice (rank-4 contract, backward compatible).
         pred_flat = self._split_pred(pred)                  # (B*D, num_fg, H, W)
         target_flat = self._label_to_binary(label_raw)      # (B*D, num_fg, H, W)
         wm_flat = self._flatten_weight_map(weight_map, self.num_slices)
@@ -1131,19 +1225,24 @@ class SliceChannelLoss(nn.Module):
         self, pred: torch.Tensor, label_raw: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return tensors suitable for ``compute_dice_per_class`` / \
-        ``dice_batch_stats``.
+        ``dice_batch_stats`` AND for the validation-time direct base-loss
+        call (``trainer._compute_loss_fp32(self.base_loss, ...)``).
 
-        For 2.5D the per-slice dice is pooled across (B, D) by collapsing
-        them into the leading dimension so existing dice utilities work
-        unchanged.
+        The shape mirrors the configured ``reduction`` so that the
+        validation-time loss is computed in the same regime as training:
 
-        Args:
-            pred:      (B, num_fg * D, H, W) logits.
-            label_raw: (B, D, H, W) raw integer labels.
+          ``per_slice``  → ``(B*D, num_fg, H, W)`` (per-2D-slice base loss).
+          ``per_volume`` → ``(B, num_fg, D, H, W)`` (per-3D-window base loss).
 
-        Returns:
-            (pred_flat, target_flat): both (B*D, num_fg, H, W).
+        Both shapes are accepted by the per-class metric utilities
+        (`compute_dice_per_class`, `dice_batch_stats`) which use
+        ``reshape(B, C, -1)`` internally and are rank-agnostic; the
+        global pooled-Dice computed in ``Trainer._validate`` is the
+        same scalar regardless of regime since it sums over every voxel.
         """
+        if self.reduction == "per_volume":
+            return (self._split_pred_5d(pred),
+                    self._label_to_binary_5d(label_raw))
         return self._split_pred(pred), self._label_to_binary(label_raw)
 
 

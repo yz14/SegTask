@@ -22,8 +22,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
+import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast
@@ -76,6 +76,15 @@ class Predictor:
         # Default to single-resolution so empty config doesn't break the
         # downstream np.stack.
         self.multi_res_scales = cfg.data.multi_res_scales or [1.0]
+        # Mirror DataConfig.z_boundary_mode so train/inference geometries
+        # stay strictly consistent across the toggle. Falls back to
+        # "stretch" (legacy) on stale configs that lack the field.
+        self.z_boundary_mode = getattr(
+            cfg.data, "z_boundary_mode", "stretch")
+        if self.z_boundary_mode not in ("stretch", "edge_pad"):
+            raise ValueError(
+                f"Unknown z_boundary_mode {self.z_boundary_mode!r}; "
+                "expected 'stretch' or 'edge_pad'.")
 
         # AMP: match the training dtype so conv accumulation precision is
         # consistent between trainer and predictor. Any unknown value falls
@@ -297,7 +306,25 @@ class Predictor:
 
                 for ad, idxs in groups.items():
                     sub = probs[idxs]  # (b, num_fg, pD, pH, pW)
-                    if (ad != pD) or (H_orig != pH) or (W_orig != pW):
+
+                    # Reverse-resize to the original spatial geometry.
+                    # Two paths:
+                    #   - "edge_pad" + ad < pD: forward saw an exactly-pD
+                    #     replicate-padded input, so the prediction is also
+                    #     pD slices deep. The valid central ``ad`` slices
+                    #     (matching the original ``vol[z0:z1]`` extent)
+                    #     are sliced out — NO depth interpolation. H/W
+                    #     are still resized back to (H_orig, W_orig).
+                    #   - "stretch" (or ad == pD): legacy single-shot
+                    #     trilinear resize to (ad, H_orig, W_orig).
+                    if self.z_boundary_mode == "edge_pad" and ad < pD:
+                        pad_before = (pD - ad) // 2
+                        sub = sub[:, :, pad_before:pad_before + ad, :, :]
+                        if (H_orig != pH) or (W_orig != pW):
+                            sub = F.interpolate(
+                                sub, size=(ad, H_orig, W_orig),
+                                mode="trilinear", align_corners=False)
+                    elif (ad != pD) or (H_orig != pH) or (W_orig != pW):
                         sub = F.interpolate(
                             sub, size=(ad, H_orig, W_orig),
                             mode="trilinear", align_corners=False)
@@ -330,14 +357,42 @@ class Predictor:
         """GPU equivalent of ``_build_z_window_input`` for the single-res
         path (the only path 2.5D mode ever uses).
 
-        Mirrors the legacy CPU contract:
-          - scale=1.0 → take ``vol[z0:z1]`` as-is (possibly < pD at tails),
-            resize to ``(pD, pH, pW)``.
-        Returns (C_res=1, pD, pH, pW) float32 on the model's device.
+        Window geometry depends on ``self.z_boundary_mode``:
+
+        ``stretch`` (legacy, backward compatible)
+            Take ``vol[z0:z1]`` as-is (possibly fewer than pD slices when
+            ``D_orig < pD``) and trilinear-resize the whole tensor to
+            ``(pD, pH, pW)``. Boundary windows are stretched along z.
+
+        ``edge_pad``
+            When ``z1 - z0 < pD``, edge-replicate-pad along z symmetrically
+            up to ``pD`` slices BEFORE any resize, so every slice in the
+            output corresponds to a physical 1-slice spacing. This mirrors
+            ``extract_z_patch_padded(vol, z_center, pD)`` used by the
+            multi-resolution / training paths under the same toggle.
+
+        Returns ``(C_res=1, pD, pH, pW)`` float32 on the model's device.
         """
         pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
         patch = vol_t[z0:z1]  # (actual_d, H_orig, W_orig)
         ad, H, W = patch.shape
+
+        if self.z_boundary_mode == "edge_pad" and ad < pD:
+            # Centred replicate-pad along the z axis. The split mirrors
+            # ``extract_z_patch_padded`` so train/inference share the same
+            # symmetry contract: the centre of the output corresponds to
+            # the centre of the in-bounds slab.
+            pad_before = (pD - ad) // 2
+            pad_after = pD - ad - pad_before
+            chunks = []
+            if pad_before > 0:
+                chunks.append(patch[0:1].expand(pad_before, -1, -1))
+            chunks.append(patch)
+            if pad_after > 0:
+                chunks.append(patch[-1:].expand(pad_after, -1, -1))
+            patch = torch.cat(chunks, dim=0)  # (pD, H, W)
+            ad = pD  # depth resolved; only H/W remains for resize.
+
         # F.interpolate expects (N, C, D, H, W); add batch+channel.
         patch = patch.unsqueeze(0).unsqueeze(0).float()
         if (ad != pD) or (H != pH) or (W != pW):
@@ -395,14 +450,18 @@ class Predictor:
         self, vol: np.ndarray, z0: int, z1: int) -> np.ndarray:
         """Build the multi-scale input stack for one z-sliding window.
 
-        For scale == 1.0 the legacy path is preserved exactly:
-            take ``vol[z0:z1]`` (possibly shorter than pD at the tail)
-            and resize to ``(pD, pH, pW)``.
-
-        For scale > 1.0 we extract ``round(pD * scale)`` slices centered
-        on the window's z-center with edge-replicate padding, so the
-        physical z-FOV stays proportional to ``scale`` even when the
+        For ``scale > 1.0`` we ALWAYS extract ``round(pD * scale)`` slices
+        centred on the window's z-center with edge-replicate padding, so
+        the physical z-FOV stays proportional to ``scale`` even when the
         window touches the volume boundary.
+
+        For ``scale == 1.0`` the path depends on ``self.z_boundary_mode``:
+          * "stretch"  — legacy: take ``vol[z0:z1]`` (possibly shorter
+            than pD at the tail) and trilinear-resize to ``(pD, pH, pW)``.
+            Boundary windows are stretched along z.
+          * "edge_pad" — centred replicate-pad to exactly pD slices via
+            ``extract_z_patch_padded(vol, z_center, pD)``, matching the
+            scale > 1.0 contract.
 
         Returns:
             ``(C_res, pD, pH, pW)`` float32 — one channel per scale, in
@@ -413,8 +472,12 @@ class Predictor:
         channels: List[np.ndarray] = []
         for scale in self.multi_res_scales:
             if scale == 1.0:
-                # Legacy tail-window behaviour: take actual slice, resize.
-                patch = vol[z0:z1]
+                if self.z_boundary_mode == "edge_pad":
+                    # Same edge-replicate semantics as scale > 1.0.
+                    patch = extract_z_patch_padded(vol, z_center, pD)
+                else:
+                    # Legacy tail-window behaviour: take actual slice, resize.
+                    patch = vol[z0:z1]
             else:
                 D_s = int(round(pD * scale))
                 patch = extract_z_patch_padded(vol, z_center, D_s)
@@ -797,30 +860,40 @@ class Predictor:
         prob_volume: np.ndarray,
         output_dir: str,
     ) -> None:
-        """Save prediction results as NIfTI files.
+        """Save prediction results as NIfTI files via SimpleITK.
 
-        The transpose convention (2, 1, 0) mirrors `load_nifti`, which
-        reorients the source volume from (X, Y, Z) to (Z, Y, X) — keep
-        this inverse-consistent with the loader.
+        Spatial metadata (origin / spacing / direction) is copied from
+        the source image so the saved volumes overlay the input
+        perfectly. SimpleITK's ``GetImageFromArray`` accepts arrays in
+        ``(Z, Y, X) == (D, H, W)`` order — i.e. the same layout
+        ``load_nifti`` returns — so no transpose is needed (mirroring
+        the no-transpose-on-read contract of the loader). All outputs
+        are gzip-compressed via ``useCompression=True``.
         """
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         stem = Path(image_path).name.replace(".nii.gz", "").replace(".nii", "")
 
-        ref_nii = nib.load(image_path)
-        affine = ref_nii.affine
+        # Read just the header (no pixel decode) by reading native and
+        # discarding the array — SimpleITK still loads pixels here, but
+        # that cost is dwarfed by the inference itself. Keeping it
+        # simple via ReadImage ensures origin/spacing/direction stay
+        # exactly in sync with the loader contract.
+        ref_img = sitk.ReadImage(str(image_path))
 
-        lbl_nifti = label_map.transpose(2, 1, 0)
-        nib.save(nib.Nifti1Image(lbl_nifti, affine),
-                 str(out_dir / f"{stem}_pred.nii.gz"))
-        logger.info("Saved label map: %s", out_dir / f"{stem}_pred.nii.gz")
+        lbl_img = sitk.GetImageFromArray(label_map)
+        lbl_img.CopyInformation(ref_img)
+        lbl_path = out_dir / f"{stem}_pred.nii.gz"
+        sitk.WriteImage(lbl_img, str(lbl_path), useCompression=True)
+        logger.info("Saved label map: %s", lbl_path)
 
         if self.save_probs:
             for c in range(prob_volume.shape[0]):
-                prob_nifti = prob_volume[c].transpose(2, 1, 0).astype(np.float32)
-                fname = f"{stem}_prob_class{c}.nii.gz"
-                nib.save(nib.Nifti1Image(prob_nifti, affine),
-                         str(out_dir / fname))
+                prob_arr = prob_volume[c].astype(np.float32, copy=False)
+                prob_img = sitk.GetImageFromArray(prob_arr)
+                prob_img.CopyInformation(ref_img)
+                prob_path = out_dir / f"{stem}_prob_class{c}.nii.gz"
+                sitk.WriteImage(prob_img, str(prob_path), useCompression=True)
             logger.info("Saved probability maps: %d classes",
                         prob_volume.shape[0])
 
@@ -922,7 +995,10 @@ def run_inference(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg)
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False: checkpoint is written by our trainer (trusted)
+    # and contains non-tensor payloads (Config, numpy RNG state) that
+    # PyTorch 2.6+'s default weights_only=True refuses.
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     sd, label = _select_state_dict(ckpt, weight_variant)
     sd = _strip_compile_prefix(sd)
 

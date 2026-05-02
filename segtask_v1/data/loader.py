@@ -288,6 +288,10 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         cache_enabled=cache,
         cache_max_volumes=getattr(dc, "cache_max_volumes", 0),
         region_weights=rw)
+    # ``z_boundary_mode`` is meaningful for the z-axis-style datasets
+    # (z_axis / 2_5d) but not for cubic / whole. Inject it only there
+    # to keep the cubic / whole dataset signatures untouched.
+    z_kwargs = dict(z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"))
 
     # Optional ROI bbox paths — matched 1:1 to image_paths, then split
     # along the same train/val indices so each per-sample bbox stays
@@ -314,10 +318,11 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         # the trainer AFTER GPU augmentation, so the dataset itself is
         # bit-identical to the legacy z_axis single-res path.
         logger.info(
-            "Using 2.5D patch mode (oversample=%.2f) — z_axis dataset, "
-            "trainer squeezes C_res=1 to feed a 2D model with D=%d "
-            "input channels.",
-            train_oversample, int(dc.patch_size[0]))
+            "Using 2.5D patch mode (oversample=%.2f, z_boundary=%s) — "
+            "z_axis dataset, trainer squeezes C_res=1 to feed a 2D model "
+            "with D=%d input channels.",
+            train_oversample, z_kwargs["z_boundary_mode"],
+            int(dc.patch_size[0]))
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -325,7 +330,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
-            **common_kwargs)
+            **common_kwargs,
+            **z_kwargs)
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio=1.0,
@@ -333,7 +339,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,
-            **common_kwargs)
+            **common_kwargs,
+            **z_kwargs)
     elif dc.patch_mode == "whole":
         logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
                     train_oversample)
@@ -372,8 +379,10 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             is_train=False,
             **common_kwargs)
     else:
-        logger.info("Using Z_AXIS patch mode (oversample=%.2f, scales=%s)",
-                    train_oversample, dc.multi_res_scales)
+        logger.info("Using Z_AXIS patch mode (oversample=%.2f, scales=%s, "
+                    "z_boundary=%s)",
+                    train_oversample, dc.multi_res_scales,
+                    z_kwargs["z_boundary_mode"])
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -381,7 +390,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
-            **common_kwargs)
+            **common_kwargs,
+            **z_kwargs)
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio=1.0,
@@ -389,7 +399,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,
-            **common_kwargs)
+            **common_kwargs,
+            **z_kwargs)
 
     train_loader = DataLoader(
         train_ds,

@@ -20,10 +20,12 @@
 # DATA
 # =====================================================================
 data:
-  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
-  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
+  # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
+  # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
   # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
+  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
+  label_dir: "F:/BaiduNetdiskDownload/003_Lung/lung_seg"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
@@ -32,11 +34,11 @@ data:
   # 在 _load_image/_load_label 内裁剪后再走归一化与缓存；推理侧由
   # predict.py / Predictor.predict_volume 读取后裁剪推理 → 写回原体积
   # 坐标系（ROI 外=背景）。留空 = 禁用。
-  bbox_dir   : "F:/med_data/Totalsegmentator_dataset_v201/small_data/bbox"
+  bbox_dir   : "F:/BaiduNetdiskDownload/body_pred"
   bbox_suffix: ".nii.gz"
 
-  label_values: []
-  num_classes : 0
+  label_values: [0, 1]
+  num_classes : 2
 
   # 2.5D patch：D = 切片数（= 模型 in_channels），H/W = 平面分辨率。
   # 经验上 D 取 8/12/16 即可（更大 D 等价于更多通道，参数显存升）；
@@ -52,6 +54,18 @@ data:
 
   # 数据增强后的 oversample 与裁剪适用 z_axis 同样的语义（仅放大 z 轴）。
   aug_oversample_ratio: 1.5
+
+  # Z 边界窗口的几何处理（仅影响 scale=1.0 通道；z_axis / 2.5D 模式生效）。
+  #   "stretch"  —— 默认/旧行为：边界处 vol[z0:z1] 可能 < eD 张切片，
+  #                  随后 resize_3d / F.interpolate 沿 z 拉伸到 eD。
+  #                  缺陷：通道→z 物理映射在边界窗与中心窗不同，
+  #                  2.5D "通道=切片" 的归纳偏置被破坏。
+  #   "edge_pad" —— 推荐：在 z 轴上 edge-replicate 中心对称补到 eD 张切片，
+  #                  保证每个通道在所有窗口都对应一个真实物理切片间距。
+  #                  scale > 1.0 路径已经如此，本开关让 scale=1.0 也对齐。
+  # 该开关同步覆盖训练 (SegDataset3D) 与推理 (Predictor)，保证训练-推理
+  # 几何严格一致。其余 patch_mode（cubic / whole）忽略此参数。
+  z_boundary_mode: "stretch"
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -69,7 +83,7 @@ data:
   samples_per_volume: 8
 
   cache_mode: "memory"
-  cache_max_volumes: 16
+  cache_max_volumes: 4
 
 
 # =====================================================================
@@ -154,7 +168,7 @@ loss:
   compound_weights: [1.0, 1.0]
 
   # 长度 = num_fg_classes（不含背景）。
-  class_weights: [1.0, 1.0]
+  class_weights: [2.0]
 
   # 与 z_axis/cubic 一致：按 label_values 全长（含 bg）一一对应。
   region_weights: [1.0, 2.0]
@@ -170,12 +184,24 @@ loss:
 
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
+  # 2.5D 专用：SliceChannelLoss 的 reduction 模式。
+  #   "per_slice"  —— 默认/旧版行为：把 (B, num_fg*D, H, W) 拆为 (B*D, 1, H, W)
+  #                   后逐切片计算 Dice/Tversky，仅在 (H, W) 上求和。
+  #                   缺陷：空切片 Dice ≈ smooth/smooth ≈ 1，loss ≈ 0，
+  #                   稀释梯度；不约束跨切片结构一致性。
+  #   "per_volume" —— 推荐：把 pred 视作 (B, num_fg, D, H, W)，逐窗口做 3D
+  #                   Dice/Tversky（在 (D, H, W) 上求和）。空切片不再"白送"，
+  #                   隐式正则跨切片一致性。BCE/Focal/Lovász 数学等价不变。
+  # 切换该开关只影响 Dice 系数家族的聚合域；class_weights / region_weights /
+  # focal/tversky 超参 / deep_supervision 全部继续生效。
+  slice_loss_reduction: "per_slice"
+
 
 # =====================================================================
 # TRAIN
 # =====================================================================
 train:
-  epochs: 200
+  epochs: 100
 
   optimizer   : "adamw"
   lr          : 1.0e-3
@@ -190,19 +216,23 @@ train:
   grad_clip_norm: 12.0
 
   use_amp  : true
-  amp_dtype: "float16"
+  # bfloat16 强烈推荐：fp16 在 InstanceNorm 上偶发方差下溢导致 forward NaN
+  # （即使 loss 端 clamp 也无法恢复 NaN）。bf16 指数范围 ≈ fp32，方差不会下溢，
+  # 速度与 fp16 接近；trainer 自动对 bf16 关闭 GradScaler。
+  # Ampere 及更新架构（含 RTX 3080 Ti）原生支持。
+  amp_dtype: "bfloat16"
 
   compile_mode: "none"
 
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir: "outputs/seg2_5d_resnet"
+  output_dir: "outputs/lung"
   save_every: 10
   save_best_metric: "mean_dice"
   save_best_mode: "max"
 
-  early_stopping: 0
+  early_stopping: 15
 
   log_every: 10
   val_every: 1
@@ -211,7 +241,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: ""
+  resume: "D:/codes/work-projects/SegTask/outputs/lung/best_model.pth"
 
 
 # =====================================================================

@@ -35,4 +35,13 @@
 
 
 # TODO  
-1. 在训练和推理过程中，数据读取模块加一个bbox读取功能。这个bbox是ROI区域也是nii文件，因为CT图像有点大，有时候只需要在ROI里面预测，所以，当输入了bbox路径后，将每个样本的bbox数据读取，并计算bbox，然后缓存起来，并输出所有数据平均后的bbox大小，当读取图像和标签后，立刻都用bbox进行剪裁，然后继续后续的流程即可。测试数据集F:\med_data\Totalsegmentator_dataset_v201\small_data\nii，F:\med_data\Totalsegmentator_dataset_v201\small_data\mask，F:\med_data\Totalsegmentator_dataset_v201\small_data\bbox。
+1. python -m segtask_v1.train --config configs/seg2_5d.yaml训练报错，都训练了十几轮后了才报错
+  File "D:\miniconda\envs\torch27_env\lib\site-packages\torch\utils\data\_utils\fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index] 
+  File "D:\miniconda\envs\torch27_env\lib\site-packages\torch\utils\data\_utils\fetch.py", line 52, in <listcomp>    
+    data = [self.dataset[idx] for idx in possibly_batched_index] 
+  File "D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py", line 502, in __getitem__
+    img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
+  File "D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py", line 492, in _load_label
+    lbl = load_nifti(path)
+0001AADC923080): nifti_image_load failed for file: F:\BaiduNetdiskDownload\003_Lung\lung_seg\CN010013-80626582-2447.nii.gz

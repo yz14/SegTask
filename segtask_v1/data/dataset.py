@@ -13,12 +13,14 @@ Each foreground class gets its own binary channel:
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
+import SimpleITK as sitk
 import torch
 from scipy.ndimage import zoom
 from torch.utils.data import Dataset
@@ -29,16 +31,125 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Volume I/O
 # ---------------------------------------------------------------------------
-def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
-    """Load NIfTI file → (D, H, W) numpy array.
+# Transient NIfTI read failures (esp. on network / virtual-mount drives such
+# as 百度网盘 cached volumes) manifest as ``RuntimeError: nifti_image_load
+# failed for file: ...`` raised from ``sitk.ReadImage``. The file itself is
+# fine — re-reading the same path a moment later succeeds. We therefore wrap
+# every ReadImage with a bounded exponential-backoff retry so a single
+# DataLoader worker hiccup does not crash the whole training run after
+# many successful epochs.
+#
+# Tunables via env vars (no config-file churn):
+#   SEGTASK_NIFTI_READ_RETRIES     - max attempts (default 4, => 3 retries)
+#   SEGTASK_NIFTI_READ_BACKOFF_S   - initial backoff seconds (default 0.5)
+_NIFTI_READ_RETRIES = max(1, int(os.environ.get("SEGTASK_NIFTI_READ_RETRIES", "4")))
+_NIFTI_READ_BACKOFF_S = max(0.0, float(os.environ.get("SEGTASK_NIFTI_READ_BACKOFF_S", "0.5")))
 
-    NIfTI convention is (X, Y, Z); we transpose to (Z, Y, X) = (D, H, W)
-    so that D (axial slices) is the first axis.
+
+# Substrings in a ``RuntimeError`` message that indicate the failure is NOT
+# a transient I/O hiccup but an out-of-memory / allocation failure. Retrying
+# these is counterproductive: it wastes time, keeps partially allocated
+# buffers alive across attempts, and hides the real root cause (e.g. an
+# oversized per-worker volume cache). We surface them immediately as
+# ``MemoryError`` so DataLoader / the user can react appropriately
+# (reduce ``cache_max_volumes`` / ``num_workers`` / ``batch_size``, etc.).
+_ALLOC_ERROR_MARKERS = (
+    "bad allocation",
+    "failed to allocate memory",
+    "std::bad_alloc",
+    "cannot allocate memory",
+)
+
+
+def _is_alloc_error(exc: BaseException) -> bool:
+    if isinstance(exc, MemoryError):
+        return True
+    msg = str(exc).lower()
+    return any(m in msg for m in _ALLOC_ERROR_MARKERS)
+
+
+def _sitk_read_with_retry(read_args: tuple, path: str) -> "sitk.Image":
+    """Call ``sitk.ReadImage(*read_args)`` with bounded retries.
+
+    Retries ONLY genuine I/O transients. Allocation failures (host OOM)
+    are re-raised immediately as ``MemoryError`` — retrying them wastes
+    time and masks the real problem.
+
+    Logs a WARNING on every transient failure (including the file path so
+    the offending volume is identifiable in multi-worker logs) and raises
+    a descriptive ``RuntimeError`` if all I/O attempts fail.
     """
-    data = nib.load(path).get_fdata().astype(dtype)
-    if data.ndim == 3:
-        data = data.transpose(2, 1, 0)  # (X,Y,Z) → (D,H,W)
-    return data
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, _NIFTI_READ_RETRIES + 1):
+        try:
+            return sitk.ReadImage(*read_args)
+        except RuntimeError as exc:  # SimpleITK wraps low-level errors here
+            if _is_alloc_error(exc):
+                # Host OOM — do NOT retry. Re-raise as MemoryError so
+                # Python / DataLoader treat it as the resource failure it
+                # is instead of a recoverable I/O glitch.
+                raise MemoryError(
+                    f"NIfTI read aborted (host OOM) for {path}: {exc}") from exc
+            last_exc = exc
+            if attempt >= _NIFTI_READ_RETRIES:
+                break
+            wait = _NIFTI_READ_BACKOFF_S * (2 ** (attempt - 1))
+            logger.warning(
+                "NIfTI read failed (attempt %d/%d) for %s: %s — retrying in %.2fs",
+                attempt, _NIFTI_READ_RETRIES, path, exc, wait)
+            if wait > 0:
+                time.sleep(wait)
+    raise RuntimeError(
+        f"NIfTI read permanently failed after {_NIFTI_READ_RETRIES} attempts "
+        f"for {path}: {last_exc}") from last_exc
+
+
+def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
+    """Load NIfTI file → (D, H, W) numpy array via SimpleITK.
+
+    Implementation notes
+    --------------------
+    Switched from ``nibabel.load(...).get_fdata()`` to SimpleITK because
+    nibabel's ``_get_scaled`` promotes the decode buffer to
+    ``np.promote_types(scl_slope.dtype, dtype)``. NIfTI headers almost
+    always store ``scl_slope`` as float64 (even when its value is 1.0),
+    so requesting float32 decode still allocates a float64 transient
+    buffer — for a 512×512×349 CT volume that is 698 MiB per file, and
+    multiplied across DataLoader workers it OOMs ~16 GB-RAM machines.
+
+    SimpleITK reads pixels in the stored dtype (typically int16 for CT,
+    uint8 for masks), applies ``scl_slope`` / ``scl_inter`` natively
+    when a float pixel type is requested, and ``GetArrayFromImage``
+    already returns the array in ``(Z, Y, X) == (D, H, W)`` order — so
+    we save both memory AND the transpose pass.
+
+    Args:
+        path: NIfTI file path (.nii / .nii.gz).
+        dtype: Output numpy dtype. Default ``np.float32``. Floating
+            requests ask SimpleITK to decode directly to that float
+            type (slope/intercept applied). Integer requests read the
+            stored dtype natively and cast (used by label-pre-scan
+            helpers that round to int32 immediately afterwards).
+
+    Returns:
+        ``(D, H, W)`` numpy array of the requested dtype.
+    """
+    np_dtype = np.dtype(dtype)
+    if np.issubdtype(np_dtype, np.floating):
+        # Decode directly into the requested float precision; SimpleITK
+        # applies any scl_slope / scl_inter during the cast.
+        sitk_pixel = (sitk.sitkFloat32 if np_dtype == np.float32
+                      else sitk.sitkFloat64)
+        read_args = (str(path), sitk_pixel)
+    else:
+        # Read native stored dtype (no float promotion); cast after.
+        read_args = (str(path),)
+
+    img = _sitk_read_with_retry(read_args, path)
+    arr = sitk.GetArrayFromImage(img)  # (Z, Y, X) = (D, H, W)
+    if arr.dtype != np_dtype:
+        arr = arr.astype(np_dtype, copy=False)
+    return arr
 
 
 # ---------------------------------------------------------------------------
@@ -51,16 +162,38 @@ def preprocess_image(
     normalize: str,
     global_mean: float = 0.0,
     global_std: float = 1.0) -> np.ndarray:
-    """Intensity windowing + normalization → float32."""
-    vol = np.clip(volume, intensity_min, intensity_max)
+    """Intensity windowing + normalization → float32.
+
+    Memory-conscious implementation: we allocate **one** float32 output
+    buffer (= size of the input volume) and perform clip + affine
+    normalization strictly in-place on it. The previous version chained
+    ``np.clip`` → ``(vol - min) / denom`` → ``.astype(float32)`` and
+    transiently held ~3× the volume size as temporaries, which — combined
+    with the per-worker LRU volume cache — drove OOMs on large CT scans.
+    """
+    # Single allocation of the final float32 output buffer.
+    vol = np.asarray(volume, dtype=np.float32)
+    if vol is volume:
+        # Input was already float32; don't mutate the caller's array.
+        vol = volume.copy()
+    np.clip(vol, intensity_min, intensity_max, out=vol)
+
     if normalize == "minmax":
-        denom = intensity_max - intensity_min
-        vol = (vol - intensity_min) / denom if denom > 0 else vol * 0
+        denom = float(intensity_max - intensity_min)
+        if denom > 0:
+            vol -= float(intensity_min)
+            vol /= denom
+        else:
+            vol.fill(0.0)
     elif normalize == "zscore":
-        vol = (vol - global_mean) / global_std if global_std > 0 else vol * 0
+        if global_std > 0:
+            vol -= float(global_mean)
+            vol /= float(global_std)
+        else:
+            vol.fill(0.0)
     else:
         raise ValueError(f"Unknown normalize: {normalize}")
-    return vol.astype(np.float32)
+    return vol
 
 
 def compute_region_weight_map(
@@ -342,11 +475,16 @@ class SegDataset3D(Dataset):
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
-        bbox_paths: Optional[List[str]] = None):
+        bbox_paths: Optional[List[str]] = None,
+        z_boundary_mode: str = "stretch"):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
             f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
+        if z_boundary_mode not in ("stretch", "edge_pad"):
+            raise ValueError(
+                f"z_boundary_mode must be 'stretch' or 'edge_pad', "
+                f"got {z_boundary_mode!r}")
         self.image_paths = image_paths
         self.label_paths = label_paths
         self.label_values = label_values
@@ -377,6 +515,12 @@ class SegDataset3D(Dataset):
         self.samples_per_volume = samples_per_volume
         self.is_train = is_train
         self.region_weights = region_weights
+        # Boundary handling for the scale=1.0 z-window. ``stretch`` keeps the
+        # legacy "clamp + resize-stretch" behaviour; ``edge_pad`` switches
+        # to ``extract_z_patch_padded`` so every window has exactly eD
+        # physical-1-slice-spacing slices, matching the ``scale > 1.0``
+        # contract and the inference predictor under the same toggle.
+        self.z_boundary_mode = z_boundary_mode
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -476,10 +620,23 @@ class SegDataset3D(Dataset):
         wmap_channels: List[np.ndarray] = []
         for scale in self.multi_res_scales:
             D_s = int(round(eD * scale))
-            if scale == 1.0:
-                img_s, lbl_s = self._extract_z_patch(img, lbl, z, D_s)
-            else:
+            # Dispatch the z-extraction:
+            #   - scale > 1.0 ALWAYS uses edge-replicate padding (preserves
+            #     the requested physical z-FOV exactly).
+            #   - scale == 1.0 honours ``z_boundary_mode``:
+            #       * "stretch"  -> legacy clamp path (may return < D_s
+            #                       slices that the resize below stretches
+            #                       back to eD, producing the train/test
+            #                       physical-spacing mismatch documented
+            #                       on ``DataConfig.z_boundary_mode``);
+            #       * "edge_pad" -> same padded path as scale > 1.0 so the
+            #                       window has EXACTLY D_s physical-1-slice
+            #                       slices regardless of where ``z`` sits.
+            use_padded = (scale != 1.0) or (self.z_boundary_mode == "edge_pad")
+            if use_padded:
                 img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, D_s)
+            else:
+                img_s, lbl_s = self._extract_z_patch(img, lbl, z, D_s)
 
             # Resize in a single 3D zoom:
             #   (actual_d, H_vol, W_vol) → (eD, pH, pW)
