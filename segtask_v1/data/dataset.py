@@ -217,6 +217,21 @@ def compute_region_weight_map(
     return wmap[np.newaxis]  # (1, D, H, W)
 
 
+def load_region_weight_volume(path: str) -> np.ndarray:
+    """Load a per-sample region-weight NIfTI and apply the +1 shift.
+
+    File convention (hand-annotated): background = 0, non-background
+    voxels carry the desired weight value. We add +1 uniformly on load
+    so background voxels become weight 1.0 and annotated voxels become
+    ``w + 1`` — matching the semantics of ``compute_region_weight_map``
+    (bg=1, fg>=1) so the loss stack's voxel-wise multiplicative weight
+    behaves identically regardless of weight source.
+
+    Returns a float32 (D, H, W) array.
+    """
+    return load_nifti(path).astype(np.float32) + 1.0
+
+
 def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
     """Convert integer label → per-foreground-class binary masks.
 
@@ -476,6 +491,7 @@ class SegDataset3D(Dataset):
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
         bbox_paths: Optional[List[str]] = None,
+        region_weight_paths: Optional[List[str]] = None,
         z_boundary_mode: str = "stretch"):
         super().__init__()
         assert len(image_paths) == len(label_paths)
@@ -538,6 +554,20 @@ class SegDataset3D(Dataset):
         self._bboxes: Optional[List[Optional[BBox]]] = (
             precompute_bboxes(bbox_paths) if bbox_paths else None)
 
+        # Optional per-sample region-weight NIfTI. When supplied, takes
+        # precedence over ``region_weights`` at __getitem__ time — we load
+        # the file, apply the +1 shift (bg=1, fg=w+1), bbox-crop to match
+        # image/label, and cache. Extraction / resize paths mirror the
+        # IMAGE pipeline (continuous values, not labels) so interpolation
+        # is linear instead of nearest — preserving hand-annotated weight
+        # gradients that would otherwise be quantised.
+        if region_weight_paths is not None:
+            assert len(region_weight_paths) == len(image_paths), (
+                f"region_weight_paths length {len(region_weight_paths)} != "
+                f"image_paths length {len(image_paths)}")
+        self.region_weight_paths = region_weight_paths
+        self._rw_cache = VolumeCache(cache_enabled, cache_max_volumes)
+
         # Build per-slice index for foreground oversampling
         self._vol_fg_slices: List[np.ndarray] = []  # fg slice indices per volume
         self._vol_all_slices: List[int] = []        # total depth per volume
@@ -592,6 +622,22 @@ class SegDataset3D(Dataset):
         self._lbl_cache.put(path, lbl)
         return lbl
 
+    def _has_region_weight_file(self, vol_idx: int) -> bool:
+        return (self.region_weight_paths is not None
+                and self.region_weight_paths[vol_idx] is not None
+                and self.region_weight_paths[vol_idx] != "")
+
+    def _load_region_weight(self, vol_idx: int) -> np.ndarray:
+        """Load per-sample region-weight volume (bbox-cropped, +1 shifted)."""
+        path   = self.region_weight_paths[vol_idx]
+        cached = self._rw_cache.get(path)
+        if cached is not None:
+            return cached
+        rw = load_region_weight_volume(path)
+        rw = apply_bbox(rw, self._bbox_for(vol_idx))
+        self._rw_cache.put(path, rw)
+        return rw
+
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
 
@@ -618,6 +664,13 @@ class SegDataset3D(Dataset):
         img_channels: List[np.ndarray] = []
         lbl_channels: List[np.ndarray] = []
         wmap_channels: List[np.ndarray] = []
+        # Per-sample region-weight file takes precedence over the static
+        # ``region_weights`` mapping. We load the (already bbox-cropped,
+        # +1-shifted) volume once per __getitem__ call; the same z-window
+        # / resize is then applied per scale, so the resulting weight map
+        # stays spatially aligned with image and label channels.
+        rw_vol = (self._load_region_weight(vol_idx)
+                  if self._has_region_weight_file(vol_idx) else None)
         for scale in self.multi_res_scales:
             D_s = int(round(eD * scale))
             # Dispatch the z-extraction:
@@ -637,6 +690,8 @@ class SegDataset3D(Dataset):
                 img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, D_s)
             else:
                 img_s, lbl_s = self._extract_z_patch(img, lbl, z, D_s)
+            rw_s = (self._extract_z_single(rw_vol, z, D_s, use_padded)
+                    if rw_vol is not None else None)
 
             # Resize in a single 3D zoom:
             #   (actual_d, H_vol, W_vol) → (eD, pH, pW)
@@ -647,7 +702,13 @@ class SegDataset3D(Dataset):
             img_channels.append(img_s)
             lbl_channels.append(lbl_s)
 
-            if self.region_weights:
+            # Region-weight precedence: per-sample file > static mapping.
+            if rw_s is not None:
+                # Linear resize (continuous weights) — preserves hand-
+                # annotated gradients that nearest would quantise.
+                wmap_s = resize_3d(rw_s, eD, eH, eW, is_label=False)
+                wmap_channels.append(wmap_s)
+            elif self.region_weights:
                 wmap_s = compute_region_weight_map(
                     lbl_s, self.label_values, self.region_weights)
                 wmap_channels.append(wmap_s[0])  # drop the leading 1
@@ -704,6 +765,23 @@ class SegDataset3D(Dataset):
             extract_z_patch_padded(img, z_center, D_patch),
             extract_z_patch_padded(lbl, z_center, D_patch),
         )
+
+    def _extract_z_single(
+        self, vol: np.ndarray, z_center: int, D_patch: int,
+        use_padded: bool) -> np.ndarray:
+        """Single-volume z-patch extraction mirroring the paired helpers.
+
+        Used for the region-weight volume so it stays spatially aligned
+        with the image / label extraction at the same ``z_center`` and
+        ``D_patch`` under both z-boundary modes.
+        """
+        if use_padded:
+            return extract_z_patch_padded(vol, z_center, D_patch)
+        D_vol   = vol.shape[0]
+        half    = D_patch // 2
+        d_start = max(0, z_center - half)
+        d_end   = min(D_vol, d_start + D_patch)
+        return vol[d_start:d_end].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +909,8 @@ class SegDataset3DCubic(Dataset):
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
-        bbox_paths: Optional[List[str]] = None):
+        bbox_paths: Optional[List[str]] = None,
+        region_weight_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -873,6 +952,15 @@ class SegDataset3DCubic(Dataset):
         self.bbox_paths = bbox_paths
         self._bboxes: Optional[List[Optional[BBox]]] = (
             precompute_bboxes(bbox_paths) if bbox_paths else None)
+
+        # Optional per-sample region-weight NIfTI (see SegDataset3D for
+        # the full contract). File precedence over ``region_weights``.
+        if region_weight_paths is not None:
+            assert len(region_weight_paths) == len(image_paths), (
+                f"region_weight_paths length {len(region_weight_paths)} != "
+                f"image_paths length {len(image_paths)}")
+        self.region_weight_paths = region_weight_paths
+        self._rw_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
         # Build 3D foreground voxel index for oversampling
         self._vol_shapes: List[Tuple[int, int, int]] = []
@@ -926,6 +1014,22 @@ class SegDataset3DCubic(Dataset):
         self._lbl_cache.put(path, lbl)
         return lbl
 
+    def _has_region_weight_file(self, vol_idx: int) -> bool:
+        return (self.region_weight_paths is not None
+                and self.region_weight_paths[vol_idx] is not None
+                and self.region_weight_paths[vol_idx] != "")
+
+    def _load_region_weight(self, vol_idx: int) -> np.ndarray:
+        """Load per-sample region-weight volume (bbox-cropped, +1 shifted)."""
+        path   = self.region_weight_paths[vol_idx]
+        cached = self._rw_cache.get(path)
+        if cached is not None:
+            return cached
+        rw = load_region_weight_volume(path)
+        rw = apply_bbox(rw, self._bbox_for(vol_idx))
+        self._rw_cache.put(path, rw)
+        return rw
+
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
 
@@ -947,6 +1051,11 @@ class SegDataset3DCubic(Dataset):
         center = self._sample_center(vol_idx, D, H, W)
         eD, eH, eW = self.extract_size
 
+        # Per-sample region-weight file takes precedence over the static
+        # ``region_weights`` mapping; load once and re-extract per scale.
+        rw_vol = (self._load_region_weight(vol_idx)
+                  if self._has_region_weight_file(vol_idx) else None)
+
         img_channels, lbl_channels, wmap_channels = [], [], []
         for scale in self.multi_res_scales:
             sD = int(round(eD * scale))
@@ -955,6 +1064,8 @@ class SegDataset3DCubic(Dataset):
 
             img_s = _extract_cubic_patch(img, center, (sD, sH, sW))
             lbl_s = _extract_cubic_patch(lbl, center, (sD, sH, sW))
+            rw_s = (_extract_cubic_patch(rw_vol, center, (sD, sH, sW))
+                    if rw_vol is not None else None)
 
             img_s = resize_3d(img_s, eD, eH, eW, is_label=False)
             lbl_s = resize_3d(lbl_s, eD, eH, eW, is_label=True)
@@ -962,7 +1073,11 @@ class SegDataset3DCubic(Dataset):
             img_channels.append(img_s)
             lbl_channels.append(lbl_s)
 
-            if self.region_weights:
+            # Region-weight precedence: per-sample file > static mapping.
+            if rw_s is not None:
+                wmap_s = resize_3d(rw_s, eD, eH, eW, is_label=False)
+                wmap_channels.append(wmap_s)
+            elif self.region_weights:
                 wmap_s = compute_region_weight_map(lbl_s, self.label_values, self.region_weights)
                 wmap_channels.append(wmap_s[0])  # (D, H, W), squeeze the leading 1
 
@@ -1076,7 +1191,8 @@ class SegDataset3DWhole(Dataset):
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
-        bbox_paths: Optional[List[str]] = None):
+        bbox_paths: Optional[List[str]] = None,
+        region_weight_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -1116,6 +1232,15 @@ class SegDataset3DWhole(Dataset):
         self._bboxes: Optional[List[Optional[BBox]]] = (
             precompute_bboxes(bbox_paths) if bbox_paths else None)
 
+        # Optional per-sample region-weight NIfTI (see SegDataset3D for
+        # the full contract). File precedence over ``region_weights``.
+        if region_weight_paths is not None:
+            assert len(region_weight_paths) == len(image_paths), (
+                f"region_weight_paths length {len(region_weight_paths)} != "
+                f"image_paths length {len(image_paths)}")
+        self.region_weight_paths = region_weight_paths
+        self._rw_cache = VolumeCache(cache_enabled, cache_max_volumes)
+
         logger.info(
             "Whole-volume dataset: %d volumes, extract_size=%s, "
             "samples_per_volume=%d",
@@ -1147,6 +1272,22 @@ class SegDataset3DWhole(Dataset):
         self._lbl_cache.put(path, lbl)
         return lbl
 
+    def _has_region_weight_file(self, vol_idx: int) -> bool:
+        return (self.region_weight_paths is not None
+                and self.region_weight_paths[vol_idx] is not None
+                and self.region_weight_paths[vol_idx] != "")
+
+    def _load_region_weight(self, vol_idx: int) -> np.ndarray:
+        """Load per-sample region-weight volume (bbox-cropped, +1 shifted)."""
+        path   = self.region_weight_paths[vol_idx]
+        cached = self._rw_cache.get(path)
+        if cached is not None:
+            return cached
+        rw = load_region_weight_volume(path)
+        rw = apply_bbox(rw, self._bbox_for(vol_idx))
+        self._rw_cache.put(path, rw)
+        return rw
+
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
 
@@ -1164,7 +1305,13 @@ class SegDataset3DWhole(Dataset):
             "image": torch.from_numpy(img_r[np.newaxis]).float(),  # (1, eD, eH, eW)
             "label": torch.from_numpy(lbl_r[np.newaxis]).float()}
 
-        if self.region_weights:
+        # Region-weight precedence: per-sample file > static mapping.
+        if self._has_region_weight_file(vol_idx):
+            rw_vol = self._load_region_weight(vol_idx)
+            wmap = resize_3d(rw_vol, eD, eH, eW, is_label=False)  # (eD, eH, eW)
+            result["weight_map"] = torch.from_numpy(
+                wmap[np.newaxis]).float()  # (1, eD, eH, eW)
+        elif self.region_weights:
             wmap = compute_region_weight_map(
                 lbl_r, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(wmap).float()  # (1, eD, eH, eW)

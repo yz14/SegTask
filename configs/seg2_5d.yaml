@@ -34,8 +34,23 @@ data:
   # 在 _load_image/_load_label 内裁剪后再走归一化与缓存；推理侧由
   # predict.py / Predictor.predict_volume 读取后裁剪推理 → 写回原体积
   # 坐标系（ROI 外=背景）。留空 = 禁用。
-  bbox_dir   : "F:/med_data/Totalsegmentator_dataset_v201/body_bbox"
+  bbox_dir   : "F:/CT_data/airway_segment_data/body_bbox" # F:/med_data/Totalsegmentator_dataset_v201/body_bbox
   bbox_suffix: ".nii.gz"
+
+  # ---- Optional per-sample region-weight (loss weighting) ------------
+  # 可选：每样本一份 NIfTI 权重文件（背景=0，其余=期望权重值；加载后整体 +1
+  #   → 背景=1，标注=(w+1)），优先级高于 `loss.region_weights` 的全局
+  #   "按标签值映射"方案；缺文件即报错（强约束，对齐 bbox_dir）。
+  # 在数据增强中权重图与 image/label 共享空间变换，但用 bilinear 插值
+  #   保留连续权重梯度。留空 = 禁用文件版。
+  region_weight_dir   : ""
+  region_weight_suffix: ".nii.gz"
+
+  # 排除无法被 SimpleITK 读取的样本（非正交 direction cosines 等）。
+  # 生成方式：
+  #   python tools/scan_bad_nifti.py --config configs/seg2_5d.yaml --out tools/bad_seg2_5d
+  # 生成 `tools/bad_seg2_5d/bad_pids.txt` 后填到这里即可自动跳过。留空=不过滤。
+  exclude_list: "tools/bad_seg2_5d/bad_pids.txt"
 
   label_values: [0, 1]
   num_classes : 2
@@ -171,7 +186,7 @@ loss:
   class_weights: [2.0]
 
   # 与 z_axis/cubic 一致：按 label_values 全长（含 bg）一一对应。
-  region_weights: [1.0, 2.0]
+  region_weights: [1.0, 4.0]
 
   dice_smooth : 1.0e-5
   dice_squared: false
@@ -241,7 +256,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: ""
+  resume: "D:/codes/work-projects/SegTask/outputs/bone/best_model.pth"
 
   # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
   # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。

@@ -43,6 +43,27 @@ class DataConfig:
     bbox_dir: str = ""
     bbox_suffix: str = ".nii.gz"
 
+    # Optional per-sample region-weight NIfTI directory. When non-empty,
+    # each sample must have a matching NIfTI file under ``region_weight_dir``
+    # (filename match against the image, suffix ``region_weight_suffix``).
+    # The file is expected to be a hand-annotated continuous weight volume
+    # with background = 0 and non-background voxels set to the desired
+    # weight value; the dataset adds +1 on load so background → 1 and the
+    # annotated regions become (w + 1). Precedence:
+    #   per-sample file (if dir set)  >  ``loss.region_weights``  >  disabled.
+    # When ``region_weight_dir`` is set, every sample must have a matching
+    # file (FileNotFoundError otherwise) — mirrors the ``bbox_dir`` strong-
+    # match contract to avoid silent per-sample weight regressions.
+    region_weight_dir: str = ""
+    region_weight_suffix: str = ".nii.gz"
+
+    # 样本排除清单（文本文件路径，每行一个 pid / stem）。pid 定义为
+    # `image_path.name`（不含后缀，即 `<name>{image_suffix}` 去掉后缀的部分）。
+    # 命中的 pid 会在 `discover_samples` 之后立刻从 image/label/bbox 配对中剔除。
+    # 典型用途：跳过 SimpleITK 无法读取的非正交 direction cosines 文件
+    # （参见 `tools/scan_bad_nifti.py` 扫描脚本）。留空 = 不过滤。
+    exclude_list: str = ""
+
     # Label mapping: integer label values in the mask (0=background).
     # e.g. [0, 1, 2] for 3-class. Empty = auto-detect from data.
     label_values: List[int] = field(default_factory=list)

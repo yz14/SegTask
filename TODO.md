@@ -31,8 +31,14 @@
 
 测试环境为: **conda activate torch27_env**  
 
-这是我写的2.5D/3D分割代码，训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py。这里有3个3D方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动中心切块）；whole（直接输入整个图像）。一个2.5D方案，它和z轴滑块的单分辨率/感受野方案非常的相似，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D模型。计算损失也和现有框架一致，模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。这里有一份小数据集作为测试：F:\med_data\Totalsegmentator_dataset_v201\small_data\nii，F:\med_data\Totalsegmentator_dataset_v201\small_data\mask。  
+这是我写的2.5D/3D分割代码，训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py。这里有3个3D方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动中心切块）；whole（直接输入整个图像）。一个2.5D方案，它和z轴滑块的单分辨率/感受野方案非常的相似，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D模型。计算损失也和现有框架一致，模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。这里有一份小数据集作为测试：F:\med_data\Totalsegmentator_dataset_v201\small_data\nii，F:\med_data\Totalsegmentator_dataset_v201\small_data\mask，
+F:\med_data\Totalsegmentator_dataset_v201\small_data\bbox，
+F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。  
 
 
 # TODO  
-1. segtask_v1.train这里只有resume，怎么没有看到pretrain的参数和功能
+1. 数据读取支持region weights的文件配置，支持在训练时对不同region的像素赋予不同的权重，以平衡不同region的像素数量差异。目前支持单一的通过标签值指定权重的方式，
+   # 例：label_values=[0,1,2]，region_weights=[1.0, 2.0, 1.0]
+   #     => 标签值为 1 的体素在 loss 中权重 2.0。空列表 = 禁用。
+   region_weights: [1.0, 2.0]
+现在需要支持每个样本都有一个region weights的文件传入，有路径传入就用权重文件，否则就用region_weights配置的权重。原因是有时候同样的标签值，但是有些区域容易出错，权重也会不一样。文件是nii文件，是手工在标注nii上标记的权重文件，背景是0，其它地方是权重值，所以读取后最终需要整体+1，这样背景就是1，其它地方就是权重值。请你先分析怎么加入，加入后数据读取，训练，loss是怎么个流程，待我确认才能开始。

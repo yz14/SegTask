@@ -18,6 +18,76 @@ from .dataset import (SegDataset3D, SegDataset3DCubic, SegDataset3DWhole, load_n
 logger = logging.getLogger(__name__)
 
 
+def _load_exclude_pids(exclude_list: str) -> set:
+    """Load a set of pids / stems from a plain-text exclude list.
+
+    Format: one pid per line. Blank lines and lines starting with ``#`` are
+    ignored. A trailing ``.nii.gz`` / ``.nii`` is tolerated (and stripped)
+    so users can paste raw filenames too. Returns an empty set when the
+    path is empty or missing (with a warning in the latter case).
+    """
+    if not exclude_list:
+        return set()
+    p = Path(exclude_list)
+    if not p.is_file():
+        logger.warning("`data.exclude_list` set but file not found: %s — "
+                       "no samples will be excluded.", p)
+        return set()
+    pids = set()
+    with open(p, "r", encoding="utf-8") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            # Tolerate full filenames in the list.
+            for suf in (".nii.gz", ".nii"):
+                if s.endswith(suf):
+                    s = s[: -len(suf)]
+                    break
+            pids.add(s)
+    logger.info("Loaded %d pid(s) to exclude from %s", len(pids), p)
+    return pids
+
+
+def _filter_by_exclude(
+    image_paths: List[str],
+    label_paths: List[str],
+    image_suffix: str,
+    exclude_pids: set) -> Tuple[List[str], List[str], List[int]]:
+    """Drop pairs whose image stem is in ``exclude_pids``.
+
+    Returns the filtered ``(image_paths, label_paths, keep_idx)`` where
+    ``keep_idx`` indexes back into the *original* lists — callers use this
+    to also re-align any companion list (e.g. bbox paths built later).
+    """
+    if not exclude_pids:
+        return image_paths, label_paths, list(range(len(image_paths)))
+
+    keep_idx: List[int] = []
+    dropped: List[str] = []
+    for i, img_path in enumerate(image_paths):
+        name = Path(img_path).name
+        if name.endswith(image_suffix):
+            base = name[: -len(image_suffix)]
+        else:
+            base = Path(name).stem
+        if base in exclude_pids:
+            dropped.append(base)
+        else:
+            keep_idx.append(i)
+
+    if dropped:
+        head = ", ".join(dropped[:10])
+        more = f", ... (+{len(dropped) - 10} more)" if len(dropped) > 10 else ""
+        logger.warning(
+            "Excluded %d/%d sample(s) via `data.exclude_list`: [%s%s]",
+            len(dropped), len(image_paths), head, more)
+
+    image_paths = [image_paths[i] for i in keep_idx]
+    label_paths = [label_paths[i] for i in keep_idx]
+    return image_paths, label_paths, keep_idx
+
+
 def discover_samples(
     image_dir: str, label_dir: str, image_suffix: str=".nii.gz", label_suffix: str=".nii.gz") -> Tuple[List[str], List[str]]:
     """Discover matched image-label pairs from directories.
@@ -45,6 +115,56 @@ def discover_samples(
     return image_paths, label_paths  # 匹配好的
 
 
+def _match_per_sample_paths(
+    image_paths: List[str],
+    src_dir: str,
+    image_suffix: str,
+    out_suffix: str,
+    kind: str) -> List[str]:
+    """Generic 1:1 per-sample file matcher by *base name*.
+
+    Used by both ``match_bbox_paths`` and ``match_region_weight_paths``
+    — strips ``image_suffix`` from each image filename, appends
+    ``out_suffix``, and looks the result up under ``src_dir``. Missing
+    matches raise ``FileNotFoundError`` listing up to the first five
+    offenders (strong contract: silently dropping samples biases batch
+    statistics and hides data-layout bugs).
+
+    ``kind`` is purely an English label used in log / error messages
+    ("BBox", "RegionWeight", ...) so callers don't need to format their
+    own error strings.
+    """
+    sdir = Path(src_dir)
+    assert sdir.is_dir(), f"{kind} dir not found: {sdir}"
+
+    out: List[str] = []
+    missing: List[str] = []
+    for img_path in image_paths:
+        name = Path(img_path).name
+        # Strip image_suffix to get the base name; tolerate names that
+        # don't end with the suffix (use stem as fallback).
+        if name.endswith(image_suffix):
+            base = name[: -len(image_suffix)]
+        else:
+            base = Path(name).stem
+        cand = sdir / f"{base}{out_suffix}"
+        if not cand.is_file():
+            missing.append(str(cand))
+        else:
+            out.append(str(cand))
+
+    if missing:
+        # Show only the first few to keep the message readable.
+        head = "\n  ".join(missing[:5])
+        more = f"\n  ... ({len(missing) - 5} more)" if len(missing) > 5 else ""
+        raise FileNotFoundError(
+            f"{kind} files not found for {len(missing)}/{len(image_paths)} "
+            f"samples under {sdir}:\n  {head}{more}")
+
+    logger.info("Matched %d %s files under %s.", len(out), kind.lower(), sdir)
+    return out
+
+
 def match_bbox_paths(
     image_paths: List[str],
     bbox_dir: str,
@@ -59,35 +179,27 @@ def match_bbox_paths(
     to the whole volume for that sample, which is rarely intended and
     biases batch statistics.
     """
-    bdir = Path(bbox_dir)
-    assert bdir.is_dir(), f"BBox dir not found: {bdir}"
+    return _match_per_sample_paths(
+        image_paths, bbox_dir, image_suffix, bbox_suffix, kind="BBox")
 
-    out: List[str] = []
-    missing: List[str] = []
-    for img_path in image_paths:
-        name = Path(img_path).name
-        # Strip image_suffix to get the base name; tolerate names that
-        # don't end with the suffix (use stem as fallback).
-        if name.endswith(image_suffix):
-            base = name[: -len(image_suffix)]
-        else:
-            base = Path(name).stem
-        cand = bdir / f"{base}{bbox_suffix}"
-        if not cand.is_file():
-            missing.append(str(cand))
-        else:
-            out.append(str(cand))
 
-    if missing:
-        # Show only the first few to keep the message readable.
-        head = "\n  ".join(missing[:5])
-        more = f"\n  ... ({len(missing) - 5} more)" if len(missing) > 5 else ""
-        raise FileNotFoundError(
-            f"BBox files not found for {len(missing)}/{len(image_paths)} "
-            f"samples under {bdir}:\n  {head}{more}")
+def match_region_weight_paths(
+    image_paths: List[str],
+    region_weight_dir: str,
+    image_suffix: str,
+    region_weight_suffix: str) -> List[str]:
+    """Resolve a per-sample list of region-weight NIfTI files matched 1:1
+    to ``image_paths`` by *base name* (image suffix stripped, then
+    ``region_weight_suffix`` appended).
 
-    logger.info("Matched %d bbox files under %s.", len(out), bdir)
-    return out
+    Strong contract: every sample must have a matching file
+    (FileNotFoundError otherwise), mirroring ``match_bbox_paths``. See
+    ``DataConfig.region_weight_dir`` for the semantics of the file
+    (background=0, non-bg = weight value; dataset adds +1 on load).
+    """
+    return _match_per_sample_paths(
+        image_paths, region_weight_dir, image_suffix, region_weight_suffix,
+        kind="RegionWeight")
 
 
 def detect_label_values(
@@ -253,6 +365,14 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     image_paths, label_paths = discover_samples(
         dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
 
+    # Drop bad samples (e.g. SimpleITK-unreadable NIfTIs with non-orthonormal
+    # direction cosines) listed in `data.exclude_list`. Done BEFORE label
+    # auto-detection / stratified split so those stages never touch the
+    # offending files. `keep_idx` later re-aligns the bbox list too.
+    exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
+    image_paths, label_paths, _ = _filter_by_exclude(
+        image_paths, label_paths, dc.image_suffix, exclude_pids)
+
     # Auto-detect labels if needed, 标签值确认
     if not dc.label_values:
         dc.label_values = detect_label_values(label_paths)
@@ -301,6 +421,16 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         bbox_paths_all = match_bbox_paths(
             image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
 
+    # Optional per-sample region-weight NIfTI paths — same 1:1 matching
+    # as bbox_paths_all, strong-contract (error out on any missing file).
+    # When set, takes precedence over ``loss.region_weights`` at runtime
+    # inside the dataset (see ``SegDataset3D.__getitem__`` et al.).
+    rw_paths_all: Optional[List[str]] = None
+    if getattr(dc, "region_weight_dir", ""):
+        rw_paths_all = match_region_weight_paths(
+            image_paths, dc.region_weight_dir, dc.image_suffix,
+            getattr(dc, "region_weight_suffix", ".nii.gz"))
+
     train_paths = dict(
         image_paths=[image_paths[i] for i in train_idx],
         label_paths=[label_paths[i] for i in train_idx])
@@ -310,6 +440,9 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     if bbox_paths_all is not None:
         train_paths["bbox_paths"] = [bbox_paths_all[i] for i in train_idx]
         val_paths["bbox_paths"] = [bbox_paths_all[i] for i in val_idx]
+    if rw_paths_all is not None:
+        train_paths["region_weight_paths"] = [rw_paths_all[i] for i in train_idx]
+        val_paths["region_weight_paths"] = [rw_paths_all[i] for i in val_idx]
 
     if dc.patch_mode == "2_5d":
         # 2.5D mode reuses the z_axis dataset verbatim with a single

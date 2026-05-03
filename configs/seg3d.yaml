@@ -33,6 +33,20 @@ data:
   bbox_dir   : ""
   bbox_suffix: ".nii.gz"
 
+  # ---- Optional per-sample region-weight (loss weighting) ------------
+  # 可选：每样本一份 NIfTI 权重文件，文件名与 image 同名（后缀=region_weight_suffix）。
+  # 文件约定：背景 = 0，其余体素 = 期望权重值。dataset 加载后整体 +1
+  #   → 背景体素 = 1.0，标注体素 = (w + 1)，与 ``loss.region_weights`` 的
+  #     "bg=1, fg>=1" 语义一致，可直接用作 loss 的逐体素乘性权重。
+  # 优先级：`region_weight_dir` 配置后该样本的权重图来自文件，覆盖
+  #   `loss.region_weights` 的"按标签值映射"方案；缺文件即报错（强约束，
+  #   与 `bbox_dir` 一致，避免静默回退导致样本间不一致）。
+  # 在数据增强中：与 image/label 共享空间变换，但用 **bilinear** 插值
+  #   （而非 label 的 nearest），保留手工标注的连续权重梯度。
+  # 留空 = 禁用文件版（仍可用 `loss.region_weights` 的全局映射）。
+  region_weight_dir   : ""
+  region_weight_suffix: ".nii.gz"
+
   # Integer label values in the mask, ordered [bg, fg1, fg2, ...].
   # Empty list => auto-detect from all label files on first run.
   # Example: [0, 1, 2] for background + 2 foreground classes.

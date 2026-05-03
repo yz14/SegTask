@@ -385,13 +385,11 @@ class Trainer:
             self.model = torch.compile(self.model, mode=tc.compile_mode)
 
         # --- Augmentation ---------------------------------------------
-        # The augmentor applies spatial transforms jointly to image and
-        # label tensors so alignment holds. When a weight_map is present
-        # it is concatenated onto the label along dim=1 and thus inherits
-        # the label-path interpolation (nearest-neighbour). This is the
-        # correct behaviour for segmentation masks; if weight maps ever
-        # need continuous-value resampling, the augmentor must be extended
-        # to accept per-channel interpolation modes.
+        # The augmentor applies spatial transforms jointly to image,
+        # label, and (optionally) weight_map so alignment holds. label
+        # uses nearest-neighbour interpolation (preserves discrete
+        # values); weight_map uses bilinear (preserves continuous,
+        # hand-annotated per-voxel weight gradients).
         # Pass the largest multi-res scale so the augmentor can keep elastic
         # deformation physically conservative (BUG-E). For single-resolution
         # inputs (multi_res_scales == [1.0] or empty), max_scale==1.0 and the
@@ -602,29 +600,11 @@ class Trainer:
                 if wmap.numel() == 0 or wmap.shape[1] == 0:
                     wmap = None  # treat empty collation sentinels as absent
 
-            # --- GPU augmentation: image + (label [+ weight_map]) share
-            #     one sampled transform so spatial alignment holds.
-            if wmap is not None:
-                n_lbl = label.shape[1]
-                label_aug = torch.cat([label, wmap], dim=1)
-                image, label_aug = self.augmentor(image, label_aug)
-                label, wmap = label_aug[:, :n_lbl], label_aug[:, n_lbl:]
-            else:
-                image, label = self.augmentor(image, label)
-                
-                
-            # import SimpleITK as sitk
-            # for jj, (ii,ll,ww) in enumerate(zip(image, label, wmap)):
-            #     ii = ii[0].cpu().numpy()
-            #     aa = sitk.GetImageFromArray(ii)
-            #     sitk.WriteImage(aa, f'{jj}.nii.gz')
-            #     ll = ll[0].cpu().numpy()
-            #     aa = sitk.GetImageFromArray(ll)
-            #     sitk.WriteImage(aa, f'{jj}L.nii.gz')
-            #     ww = ww[0].cpu().numpy()
-            #     aa = sitk.GetImageFromArray(ww)
-            #     sitk.WriteImage(aa, f'{jj}W.nii.gz')
-            # raise
+            # --- GPU augmentation: image, label and (optional) weight_map
+            #     share one sampled spatial transform so alignment holds.
+            #     The augmentor uses nearest interpolation for label and
+            #     bilinear for weight_map (continuous values).
+            image, label, wmap = self.augmentor(image, label, wmap)
 
             # --- Center-crop when dataset returned oversampled patches
             if self.needs_crop:

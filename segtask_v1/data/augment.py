@@ -14,14 +14,20 @@ Intensity augmentations:
   - Brightness, contrast, gamma, noise, blur, simulate low-res
 
 Input shapes:
-  image: (B, 1, D, H, W) float32
-  label: (B, C, D, H, W) float32 binary masks (may include weight_map channel)
+  image:      (B, 1, D, H, W) float32
+  label:      (B, C, D, H, W) float32 binary or raw-integer masks
+  weight_map: (B, 1, D, H, W) float32, optional. Continuous per-voxel
+              loss weights (background = 1.0). Spatial transforms are
+              applied with the SAME parameters as image / label so they
+              stay aligned, but with **bilinear** interpolation
+              (instead of label's nearest) so hand-annotated weight
+              gradients are not quantised.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,36 +58,44 @@ class GPUAugmentor:
 
     def __call__(
         self, image: torch.Tensor, label: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        weight_map: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Apply augmentations to a batch.
 
         Args:
             image: (B, 1, D, H, W) on GPU.
-            label: (B, C, D, H, W) on GPU. May include extra channels
-                   (e.g., weight_map concatenated by trainer).
+            label: (B, C, D, H, W) on GPU.
+            weight_map: optional (B, 1, D, H, W) on GPU. Receives the
+                same spatial transforms as image/label but with bilinear
+                interpolation (vs. label's nearest) so continuous
+                per-sample weights stay un-quantised.
 
         Returns:
-            Augmented (image, label).
+            Augmented ``(image, label, weight_map)``. ``weight_map`` is
+            ``None`` iff the input was None.
         """
         if not self.enabled:
-            return image, label
+            return image, label, weight_map
 
         c = self.cfg
 
-        # --- Spatial augmentations (image + label, per-sample) ---
-        image, label = _random_flip(
-            image, label, c.random_flip_prob, c.random_flip_axes)
-        image, label = _random_affine(
-            image, label, c.random_affine_prob, c.random_rotate_range, c.random_scale_range)
+        # --- Spatial augmentations (image + label [+ weight_map], per-sample) ---
+        image, label, weight_map = _random_flip(
+            image, label, c.random_flip_prob, c.random_flip_axes,
+            weight_map=weight_map)
+        image, label, weight_map = _random_affine(
+            image, label, c.random_affine_prob, c.random_rotate_range,
+            c.random_scale_range, weight_map=weight_map)
         # BUG-E: divide alpha by max_scale so the LARGEST physical channel
         # receives at most `alpha` voxel-displacement. Smaller-scale channels
         # see proportionally less warp, which is the conservative choice.
         effective_alpha = c.elastic_deform_alpha / self.max_scale
-        image, label = _elastic_deform(
+        image, label, weight_map = _elastic_deform(
             image, label, c.elastic_deform_prob, c.elastic_deform_sigma,
-            effective_alpha)
-        image, label = _grid_dropout(
-            image, label, c.grid_dropout_prob, c.grid_dropout_ratio, c.grid_dropout_holes)
+            effective_alpha, weight_map=weight_map)
+        image, label, weight_map = _grid_dropout(
+            image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
+            c.grid_dropout_holes, weight_map=weight_map)
 
         # --- Intensity augmentations (image only, per-sample) ---
         image = _random_brightness(image, c.random_brightness_prob, c.random_brightness_range)
@@ -91,7 +105,7 @@ class GPUAugmentor:
         image = _gaussian_blur_3d(image, c.gaussian_blur_prob, c.gaussian_blur_sigma)
         image = _simulate_lowres(image, c.simulate_lowres_prob, c.simulate_lowres_zoom)
 
-        return image, label
+        return image, label, weight_map
 
 
 # ===========================================================================
@@ -99,8 +113,14 @@ class GPUAugmentor:
 # ===========================================================================
 def _random_flip(
     image: torch.Tensor, label: torch.Tensor,
-    prob: float, axes: list) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample random flip. Each sample and axis is independently random."""
+    prob: float, axes: list,
+    weight_map: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Per-sample random flip. Each sample and axis is independently random.
+
+    ``weight_map`` (if provided) is flipped on the same per-sample axes
+    so it stays voxel-aligned with image / label.
+    """
     B = image.shape[0]
     for axis in axes:
         mask = torch.rand(B, device=image.device) < prob  # (B,) bool
@@ -108,17 +128,25 @@ def _random_flip(
             idx = mask.nonzero(as_tuple=True)[0]
             image[idx] = torch.flip(image[idx], [axis])  # axis indexes into (B,C,D,H,W)
             label[idx] = torch.flip(label[idx], [axis])
-    return image, label
+            if weight_map is not None:
+                weight_map[idx] = torch.flip(weight_map[idx], [axis])
+    return image, label, weight_map
 
 
 def _random_affine(
     image: torch.Tensor, label: torch.Tensor,
-    prob: float, rotate_range: list, scale_range: list) -> Tuple[torch.Tensor, torch.Tensor]:
+    prob: float, rotate_range: list, scale_range: list,
+    weight_map: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Per-sample random 3D affine (rotation around all axes + scale).
 
     Uses F.grid_sample with a per-sample affine matrix for efficiency.
     Rotation angles are sampled uniformly in rotate_range (degrees).
     Scale is sampled uniformly in scale_range.
+
+    ``weight_map`` (if provided) is resampled with the same grid using
+    **bilinear** interpolation so continuous per-voxel weights are not
+    quantised by the label-style nearest path.
     """
     B, _, D, H, W = image.shape
     device = image.device
@@ -126,7 +154,7 @@ def _random_affine(
     # Decide which samples get augmented
     mask = torch.rand(B, device=device) < prob
     if not mask.any():
-        return image, label
+        return image, label, weight_map
 
     # Sample rotation angles (radians) and scale per sample
     n = mask.sum().item()
@@ -148,7 +176,13 @@ def _random_affine(
     # Label: use nearest interpolation to preserve binary values
     label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="zeros", align_corners=False)
 
-    return image, label
+    # Weight map (continuous): bilinear keeps hand-annotated gradients.
+    if weight_map is not None:
+        weight_map[idx] = F.grid_sample(
+            weight_map[idx], grid, mode="bilinear",
+            padding_mode="zeros", align_corners=False)
+
+    return image, label, weight_map
 
 
 def _build_rotation_matrices(
@@ -198,7 +232,9 @@ def _build_rotation_matrices(
 
 def _elastic_deform(
     image: torch.Tensor, label: torch.Tensor,
-    prob: float, sigma: float, alpha: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    prob: float, sigma: float, alpha: float,
+    weight_map: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Per-sample 3D elastic deformation via smooth random displacement field.
 
     Algorithm:
@@ -221,7 +257,7 @@ def _elastic_deform(
 
     mask = torch.rand(B, device=device) < prob
     if not mask.any():
-        return image, label
+        return image, label, weight_map
 
     idx = mask.nonzero(as_tuple=True)[0]
     n = idx.shape[0]
@@ -263,7 +299,13 @@ def _elastic_deform(
     # Apply to label (nearest to preserve discrete values)
     label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
 
-    return image, label
+    # Weight map: bilinear (continuous) — see _random_affine docstring.
+    if weight_map is not None:
+        weight_map[idx] = F.grid_sample(
+            weight_map[idx], grid, mode="bilinear",
+            padding_mode="border", align_corners=False)
+
+    return image, label, weight_map
 
 
 def _identity_grid(
@@ -281,25 +323,28 @@ def _identity_grid(
 
 def _grid_dropout(
     image: torch.Tensor, label: torch.Tensor,
-    prob: float, ratio: float, num_holes: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    prob: float, ratio: float, num_holes: int,
+    weight_map: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Grid dropout: mask out rectangular sub-regions with zeros.
 
     Vectorized: generates all B × num_holes hole positions in a single
     batched `torch.randint` call and marks the boolean mask via advanced
-    indexing. Label is NOT masked (to preserve ground truth).
+    indexing. Label and weight_map are NOT masked (preserve ground truth
+    and the original loss weighting in the dropped regions).
 
     Samples not selected by the Bernoulli mask pass through unchanged
     (their hole-mask stays all-ones via `selected` gating).
     """
     if prob <= 0 or ratio <= 0:
-        return image, label
+        return image, label, weight_map
 
     B, _, D, H, W = image.shape
     device = image.device
 
     selected = torch.rand(B, device=device) < prob  # (B,)
     if not selected.any():
-        return image, label
+        return image, label, weight_map
 
     # Hole sizes are constant per call — ratio and num_holes are scalars.
     frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
@@ -338,7 +383,7 @@ def _grid_dropout(
     gate = selected.reshape(B, 1, 1, 1, 1).to(image.dtype)
     # effective_mask = selected ? hole_mask : 1
     effective = hole_mask * gate + (1.0 - gate)
-    return image * effective, label
+    return image * effective, label, weight_map
 
 
 # ===========================================================================
