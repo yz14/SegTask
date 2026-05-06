@@ -24,8 +24,8 @@ data:
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
   # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
-  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
-  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/bone"
+  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
+  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
@@ -34,7 +34,7 @@ data:
   # 在 _load_image/_load_label 内裁剪后再走归一化与缓存；推理侧由
   # predict.py / Predictor.predict_volume 读取后裁剪推理 → 写回原体积
   # 坐标系（ROI 外=背景）。留空 = 禁用。
-  bbox_dir   : "F:/CT_data/airway_segment_data/body_bbox" # F:/med_data/Totalsegmentator_dataset_v201/body_bbox
+  bbox_dir   : "F:/CT_data/airway_segment_data/bone_bbox" # F:/BaiduNetdiskDownload/bone_bbox
   bbox_suffix: ".nii.gz"
 
   # ---- Optional per-sample region-weight (loss weighting) ------------
@@ -43,17 +43,17 @@ data:
   #   "按标签值映射"方案；缺文件即报错（强约束，对齐 bbox_dir）。
   # 在数据增强中权重图与 image/label 共享空间变换，但用 bilinear 插值
   #   保留连续权重梯度。留空 = 禁用文件版。
-  region_weight_dir   : ""
+  region_weight_dir   : "F:/BaiduNetdiskDownload/lung_weight"
   region_weight_suffix: ".nii.gz"
 
   # 排除无法被 SimpleITK 读取的样本（非正交 direction cosines 等）。
   # 生成方式：
   #   python tools/scan_bad_nifti.py --config configs/seg2_5d.yaml --out tools/bad_seg2_5d
   # 生成 `tools/bad_seg2_5d/bad_pids.txt` 后填到这里即可自动跳过。留空=不过滤。
-  exclude_list: "tools/bad_seg2_5d/bad_pids.txt"
+  # exclude_list: "tools/bad_seg2_5d/bad_pids.txt"
 
-  label_values: [0, 1]
-  num_classes : 2
+  label_values: [0, 1, 2]
+  num_classes : 3
 
   # 2.5D patch：D = 切片数（= 模型 in_channels），H/W = 平面分辨率。
   # 经验上 D 取 8/12/16 即可（更大 D 等价于更多通道，参数显存升）；
@@ -94,11 +94,11 @@ data:
   num_workers: 4
   pin_memory : true
 
-  foreground_oversample_ratio: 0.5
+  foreground_oversample_ratio: 0.3
   samples_per_volume: 8
 
   cache_mode: "memory"
-  cache_max_volumes: 8
+  cache_max_volumes: 4
 
 
 # =====================================================================
@@ -179,19 +179,19 @@ model:
 #        作为标准 2D 二值损失生效，所有 LossConfig 选项原样适用。
 # =====================================================================
 loss:
-  name: "dice_bce"
+  name: "dice_focal"
   compound_weights: [1.0, 1.0]
 
   # 长度 = num_fg_classes（不含背景）。
-  class_weights: [2.0]
+  class_weights: [1.0, 1.0]
 
   # 与 z_axis/cubic 一致：按 label_values 全长（含 bg）一一对应。
-  region_weights: [1.0, 4.0]
+  region_weights: [1.0, 4.0, 2.0]
 
   dice_smooth : 1.0e-5
   dice_squared: false
 
-  focal_alpha: 0.25
+  focal_alpha: 0.5
   focal_gamma: 2.0
 
   tversky_alpha: 0.3
@@ -209,7 +209,7 @@ loss:
   #                   隐式正则跨切片一致性。BCE/Focal/Lovász 数学等价不变。
   # 切换该开关只影响 Dice 系数家族的聚合域；class_weights / region_weights /
   # focal/tversky 超参 / deep_supervision 全部继续生效。
-  slice_loss_reduction: "per_slice"
+  slice_loss_reduction: "per_volume"
 
 
 # =====================================================================
@@ -242,7 +242,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir: "outputs/bone"
+  output_dir: "outputs/lung_bone"
   save_every: 10
   save_best_metric: "mean_dice"
   save_best_mode: "max"
@@ -256,7 +256,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: "D:/codes/work-projects/SegTask/outputs/bone/best_model.pth"
+  resume: "D:/codes/work-projects/SegTask/outputs/lung_bone/best_model.pth"
 
   # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
   # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。
