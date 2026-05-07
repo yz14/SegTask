@@ -413,6 +413,15 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     # to keep the cubic / whole dataset signatures untouched.
     z_kwargs = dict(z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"))
 
+    # ``aux_keep_native_d`` is a 2.5D-only switch (Config.validate enforces
+    # this). For non-2.5D modes the kwarg is silently False; for 2.5D
+    # modes the dataset uses it to dispatch the simplified single-cube
+    # path (see ``SegDataset3D._getitem_native_d``).
+    aux_native_kwargs = dict(
+        aux_keep_native_d=bool(getattr(dc, "aux_keep_native_d", False))
+        and dc.patch_mode == "2_5d"
+        and len(dc.multi_res_scales) > 1)
+
     # Optional ROI bbox paths — matched 1:1 to image_paths, then split
     # along the same train/val indices so each per-sample bbox stays
     # aligned with its image / label after the split.
@@ -445,23 +454,46 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         val_paths["region_weight_paths"] = [rw_paths_all[i] for i in val_idx]
 
     if dc.patch_mode == "2_5d":
-        # 2.5D mode reuses the z_axis dataset verbatim, INCLUDING its
-        # ``multi_res_scales`` multi-FOV stacking. Each scale ``s`` extracts
-        # ``round(eD * s)`` slices around the same z-center (edge-padded for
-        # s>1.0; ``z_boundary_mode`` for s==1.0) and resizes back to
-        # ``(eD, pH, pW)`` — yielding a (C_res=n_views, eD, pH, pW) channel
-        # stack. The trainer's ``_squeeze_2_5d`` then collapses (B, n_views,
-        # D, H, W) → (B, n_views * D, H, W) for the 2D model and selects
-        # view 0 as the supervision target (true geometry).
+        # 2.5D mode reuses the z_axis dataset; the channel-layout depends
+        # on ``data.aux_keep_native_d``:
+        #
+        #   False (legacy):
+        #     Each scale ``s`` extracts ``round(eD * s)`` slices around the
+        #     same z-center (edge-padded for s>1.0; ``z_boundary_mode`` for
+        #     s==1.0) and is resized back to ``(eD, pH, pW)`` — yielding a
+        #     ``(C_res=n_views, eD, pH, pW)`` channel stack. The trainer's
+        #     ``_squeeze_2_5d`` collapses ``(B, n_views, D, H, W)`` →
+        #     ``(B, n_views * D, H, W)`` for the 2D model with view 0 as
+        #     the supervision target.
+        #
+        #   True (native depth):
+        #     The dataset takes the simplified single-cube path: extract a
+        #     SINGLE max-FOV cube of depth ``round(eD * max_scale)`` around
+        #     the z-center (edge-padded), resize H,W only. Output shape
+        #     ``(1, eD * max_scale, pH, pW)`` — same arity as single-res
+        #     path. The trainer's ``_split_views_native_d`` later center-
+        #     crops per view at native depth and concatenates along the
+        #     channel axis for the model forward.
         n_views = max(len(dc.multi_res_scales), 1)
-        logger.info(
-            "Using 2.5D patch mode (oversample=%.2f, z_boundary=%s, "
-            "scales=%s, n_views=%d) — z_axis dataset; trainer reshapes "
-            "(B, %d, D=%d, H, W) → (B, %d, H, W) for the 2D model.",
-            train_oversample, z_kwargs["z_boundary_mode"],
-            dc.multi_res_scales, n_views,
-            n_views, int(dc.patch_size[0]),
-            n_views * int(dc.patch_size[0]))
+        if aux_native_kwargs["aux_keep_native_d"]:
+            max_scale = max(dc.multi_res_scales)
+            eD_max = int(round(int(dc.patch_size[0]) * max_scale))
+            logger.info(
+                "Using 2.5D patch mode + aux_keep_native_d=True "
+                "(oversample=%.2f, scales=%s, n_views=%d, max_scale=%.2f) "
+                "— SINGLE max-FOV cube extraction (depth=%d), trainer "
+                "center-crops per view at native depth before forward.",
+                train_oversample, dc.multi_res_scales, n_views,
+                max_scale, eD_max)
+        else:
+            logger.info(
+                "Using 2.5D patch mode (oversample=%.2f, z_boundary=%s, "
+                "scales=%s, n_views=%d) — z_axis dataset; trainer reshapes "
+                "(B, %d, D=%d, H, W) → (B, %d, H, W) for the 2D model.",
+                train_oversample, z_kwargs["z_boundary_mode"],
+                dc.multi_res_scales, n_views,
+                n_views, int(dc.patch_size[0]),
+                n_views * int(dc.patch_size[0]))
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -470,7 +502,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
             **common_kwargs,
-            **z_kwargs)
+            **z_kwargs,
+            **aux_native_kwargs)
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio=1.0,
@@ -479,7 +512,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,
             **common_kwargs,
-            **z_kwargs)
+            **z_kwargs,
+            **aux_native_kwargs)
     elif dc.patch_mode == "whole":
         logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
                     train_oversample)

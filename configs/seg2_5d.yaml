@@ -46,7 +46,7 @@ data:
   # 在 _load_image/_load_label 内裁剪后再走归一化与缓存；推理侧由
   # predict.py / Predictor.predict_volume 读取后裁剪推理 → 写回原体积
   # 坐标系（ROI 外=背景）。留空 = 禁用。
-  bbox_dir   : "F:/CT_data/airway_segment_data/bone_bbox" # F:/BaiduNetdiskDownload/bone_bbox
+  bbox_dir   : "F:/BaiduNetdiskDownload/bone_bbox" # F:/CT_data/airway_segment_data/bone_bbox
   bbox_suffix: ".nii.gz"
 
   # ---- Optional per-sample region-weight (loss weighting) ------------
@@ -82,7 +82,7 @@ data:
   #                       中心对称，z 轴重采样回 D 通道）。
   # 约束：multi_res_scales[0] 必须为 1.0（view 0 = 监督目标，几何与输出严格对齐）。
   # 配套 `model.context_fusion` 选择 stem 融合策略；详见文件顶部注释。
-  multi_res_scales: [1.0]
+  multi_res_scales: [1.0, 1.5, 2.0]
 
   # 数据增强后的 oversample 与裁剪适用 z_axis 同样的语义（仅放大 z 轴）。
   aug_oversample_ratio: 1.5
@@ -98,6 +98,27 @@ data:
   # 该开关同步覆盖训练 (SegDataset3D) 与推理 (Predictor)，保证训练-推理
   # 几何严格一致。其余 patch_mode（cubic / whole）忽略此参数。
   z_boundary_mode: "stretch"
+
+  # 多 z-FOV 是否保持原生深度（仅 2.5D + n_views>1 + aux_seg_supervision=true 生效）。
+  #   false（默认）—— 旧路径：每个 view k 抽 round(D*s_k) 张切片再 z 轴 resize 回 D，
+  #                    所有视图都是 D 通道，模型输入 (B, n_views*D, H, W)；
+  #                    辅助 FOV 在 z 轴上会被压缩，丢失细粒度信息。
+  #   true        —— 新路径（推荐做强引导）：dataset 一次性抽取 max_scale 对应的最大
+  #                    FOV cube（深度 = round(D*max_scale)，edge_pad），增强在单
+  #                    cube 上跑一次（视图间几何一致由构造保证），trainer 在送入
+  #                    模型前对每个 view k 中心裁出原生深度 D_k = round(D*s_k) 通
+  #                    道并按 view 顺序在通道维拼接，模型输入 (B, sum(D_k), H, W)。
+  #                    seg head：主头仍输出 (B, num_fg*D, H, W)；每个辅助头 k 独立
+  #                    预测 (B, num_fg*D_k, H, W)，对应原生深度 label 计算损失。
+  #
+  # 约束：
+  #   * 自动锁定 z_boundary_mode='edge_pad'（stretch 与本开关互斥）。
+  #   * 仅在 patch_mode='2_5d' + len(multi_res_scales)>1 + aux_seg_supervision=true 时允许。
+  #   * Plan C (hierarchical) 同时仍需满足 n_views <= len(encoder_channels) - 1。
+  #   * 推理路径（predictor.py）暂未改造为原生深度切片；如需在该模式下做推理，
+  #     请等待后续轮次（model 在 eval 模式下仍输出 (B, num_fg*D, H, W) 主头，
+  #     与 predictor 现有契约兼容；多 FOV 通道的喂入需 predictor 端配合升级）。
+  aux_keep_native_d: false
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -167,7 +188,7 @@ model:
   # in_channels: 12
 
   # 2D 模型显存友好，可加大通道数。
-  encoder_channels: [32, 64, 128, 256, 512]
+  encoder_channels: [32, 64, 128, 256, 256]
   blocks_per_level: 2
   block_type: "basic"
 
@@ -206,7 +227,7 @@ model:
   #                stride-2^k 注入位置对称）。
   #            权重由 loss.aux_supervision_weights 控制。eval/predict 阶段
   #            模型仍只输出主预测张量，predictor 行为不变。
-  aux_seg_supervision: false
+  aux_seg_supervision: true
 
   # Aux head 拓扑（仅 aux_seg_supervision=true 生效）。
   #   "linear" — 单层 1×1 conv（与 main head 等容量；推荐 Plan A）。
@@ -215,7 +236,7 @@ model:
   # 参数开销 < 网络总量 1%。
   aux_head_mode: "linear"
 
-  decoder_type : "unet"
+  decoder_type   : "unet"
   downsample_mode: "conv"
   upsample_mode  : "trilinear"
   skip_mode      : "cat"
@@ -314,7 +335,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: "D:/codes/work-projects/SegTask/outputs/lung_bone/best_model.pth"
+  resume: ""
 
   # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
   # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。

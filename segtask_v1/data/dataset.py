@@ -492,7 +492,8 @@ class SegDataset3D(Dataset):
         region_weights: Optional[List[float]] = None,
         bbox_paths: Optional[List[str]] = None,
         region_weight_paths: Optional[List[str]] = None,
-        z_boundary_mode: str = "stretch"):
+        z_boundary_mode: str = "stretch",
+        aux_keep_native_d: bool = False):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -537,6 +538,46 @@ class SegDataset3D(Dataset):
         # physical-1-slice-spacing slices, matching the ``scale > 1.0``
         # contract and the inference predictor under the same toggle.
         self.z_boundary_mode = z_boundary_mode
+
+        # ---- Native-depth multi-FOV path (2.5D + aux_seg_supervision) ----
+        # When True (validated upstream in Config.validate to be only with
+        # 2_5d + n_views > 1), __getitem__ takes a SIMPLIFIED single-cube
+        # path instead of stacking per-view resampled views:
+        #
+        #   1. Extract ONE cube of depth ``round(eD * max_scale)`` around
+        #      the sampled z-center, edge-padded — this is the largest
+        #      physical FOV needed by any view. (View 0 is the centered
+        #      ``D`` slices; view k is the centered ``D_k`` slices.)
+        #   2. Resize H, W to (eH, eW) — D axis is left at native depth.
+        #   3. Output shape ``(1, round(eD * max_scale), eH, eW)`` so the
+        #      existing GPU augmentor — which expects a (B, 1, D, H, W)
+        #      cube — runs without modification on the largest physical
+        #      FOV. The trainer center-crops per view *after* augment.
+        #
+        # Geometry: because all views share the same z-center and unit
+        # slice spacing, center-cropping ``D_k`` slices from the max-FOV
+        # cube produces THE SAME physical slice set as the per-view
+        # independent extraction in the False-path — voxel-equivalent up
+        # to numerical noise. The benefits over the False-path:
+        #   * single shared augmentation field (cross-view geometric
+        #     consistency by construction);
+        #   * no z-axis resampling for aux views (full information);
+        #   * lower memory (one max-FOV cube instead of K stacked copies).
+        self.aux_keep_native_d = bool(aux_keep_native_d)
+        if self.aux_keep_native_d:
+            assert len(self.multi_res_scales) > 1, (
+                "aux_keep_native_d=True requires len(multi_res_scales) > 1; "
+                f"got {self.multi_res_scales}")
+            assert self.multi_res_scales[0] == 1.0, (
+                "aux_keep_native_d=True requires multi_res_scales[0] == 1.0 "
+                "(view 0 is the supervision target); got "
+                f"{self.multi_res_scales}")
+            assert self.z_boundary_mode == "edge_pad", (
+                "aux_keep_native_d=True requires z_boundary_mode='edge_pad'; "
+                f"got {self.z_boundary_mode!r}.")
+            self._max_scale = float(max(self.multi_res_scales))
+        else:
+            self._max_scale = 1.0
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -655,6 +696,27 @@ class SegDataset3D(Dataset):
         # multi-FOV views are physically nested around the same anchor).
         z = self._sample_z(vol_idx, D_vol)
 
+        # Per-sample region-weight file takes precedence over the static
+        # ``region_weights`` mapping. We load the (already bbox-cropped,
+        # +1-shifted) volume once per __getitem__ call; the same z-window
+        # / resize is then applied per scale, so the resulting weight map
+        # stays spatially aligned with image and label channels.
+        rw_vol = (self._load_region_weight(vol_idx)
+                  if self._has_region_weight_file(vol_idx) else None)
+
+        # ---- Native-depth multi-FOV simplified path ---------------------
+        # Single max-FOV cube extraction; the trainer center-crops per view
+        # after GPU augmentation. Output shape ``(1, eD_max, eH, eW)`` so
+        # the existing rank-5 (B, 1, D, H, W) augmentor pipeline applies
+        # unchanged. ``eD_max = round(eD * max_scale)`` covers the largest
+        # required physical z-FOV; smaller views get center crops at native
+        # depth ``D_k = round(eD * s_k)`` which by construction (shared z
+        # center, unit slice spacing) matches the per-view independent
+        # extraction of the legacy False-path voxel-for-voxel.
+        if self.aux_keep_native_d:
+            return self._getitem_native_d(
+                vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
+
         # Build per-scale channel stack. For scale=1.0 we keep the legacy
         # clamp-then-stretch extraction (`_extract_z_patch`) for bit-exact
         # backward compatibility with prior single-res training. For
@@ -664,13 +726,6 @@ class SegDataset3D(Dataset):
         img_channels: List[np.ndarray] = []
         lbl_channels: List[np.ndarray] = []
         wmap_channels: List[np.ndarray] = []
-        # Per-sample region-weight file takes precedence over the static
-        # ``region_weights`` mapping. We load the (already bbox-cropped,
-        # +1-shifted) volume once per __getitem__ call; the same z-window
-        # / resize is then applied per scale, so the resulting weight map
-        # stays spatially aligned with image and label channels.
-        rw_vol = (self._load_region_weight(vol_idx)
-                  if self._has_region_weight_file(vol_idx) else None)
         for scale in self.multi_res_scales:
             D_s = int(round(eD * scale))
             # Dispatch the z-extraction:
@@ -724,6 +779,74 @@ class SegDataset3D(Dataset):
         if wmap_channels:
             result["weight_map"] = torch.from_numpy(
                 np.stack(wmap_channels, axis=0).astype(np.float32))
+        return result
+
+    def _getitem_native_d(
+        self,
+        vol_idx: int,
+        img: np.ndarray,
+        lbl: np.ndarray,
+        rw_vol: Optional[np.ndarray],
+        z: int,
+        eD: int,
+        eH: int,
+        eW: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Single max-FOV cube emission for the native-depth multi-FOV path.
+
+        Output is shape-equivalent to the single-resolution legacy path —
+        ``(1, eD_max, eH, eW)`` for image/label/(weight_map) — except eD
+        is replaced by ``eD_max = round(eD * max_scale)``. This keeps the
+        downstream collate / augmentor / center-crop / 2.5D-squeeze
+        contract IDENTICAL to the single-resolution case; the only
+        bespoke step happens in the trainer right before the model
+        forward, where ``_split_views_native_d`` center-crops the cube
+        per view at native depth ``D_k``.
+
+        Why a single cube instead of a per-view stack:
+          * Augmentation runs ONCE on one shared cube → views are by
+            construction warp-consistent (same affine, same elastic).
+          * No z-axis resampling for aux views (the legacy False-path
+            compresses ``round(eD * s_k) → eD`` and loses information).
+          * Lower memory than emitting K stacked copies.
+
+        Region-weight semantics: the per-sample weight volume (when
+        provided) is extracted with the SAME z-padded path and uses
+        linear resize for H, W (preserves continuous weight gradients),
+        mirroring the False-path's per-scale region-weight rule.
+        """
+        eD_max = int(round(eD * self._max_scale))
+        # Edge-padded extraction guarantees exactly eD_max physical-1-slice
+        # spacing slices regardless of where ``z`` sits relative to the
+        # volume boundary — required for ``aux_keep_native_d`` since the
+        # trainer's per-view center crop assumes uniform unit z spacing.
+        img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, eD_max)
+        rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
+                if rw_vol is not None else None)
+
+        # In-plane resize to (eH, eW); D axis preserved at eD_max.
+        img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
+        lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
+        result = {
+            # ``(1, eD_max, eH, eW)`` — leading axis kept for parity with
+            # the legacy ``(C_res, eD, eH, eW)`` output so the collate /
+            # augmentor / squeeze pipeline does NOT need to special-case
+            # this path. The "1" is the conventional C_res dim with
+            # n_views collapsed to a single physical cube.
+            "image": torch.from_numpy(img_s[None].astype(np.float32)),
+            "label": torch.from_numpy(lbl_s[None].astype(np.float32)),
+        }
+        # Region-weight precedence: per-sample file > static mapping.
+        if rw_s is not None:
+            wmap_s = resize_3d(rw_s, eD_max, eH, eW, is_label=False)
+            result["weight_map"] = torch.from_numpy(
+                wmap_s[None].astype(np.float32))
+        elif self.region_weights:
+            wmap_s = compute_region_weight_map(
+                lbl_s, self.label_values, self.region_weights)
+            # ``compute_region_weight_map`` returns (1, eD_max, eH, eW).
+            result["weight_map"] = torch.from_numpy(
+                wmap_s.astype(np.float32))
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:

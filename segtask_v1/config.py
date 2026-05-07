@@ -185,6 +185,43 @@ class DataConfig:
     # other than z_axis / 2.5D are unaffected.
     z_boundary_mode: str = "stretch"
 
+    # ---- 2.5D multi-FOV: keep auxiliary views at NATIVE depth ----
+    # When False (default, fully backward compatible):
+    #   Each scale s_k extracts ``round(eD * s_k)`` slices around the
+    #   sampled z-center and is **z-resampled back to eD slices** so that
+    #   all views share the same D channel count, producing a stacked
+    #   input ``(B, n_views * D, H, W)``. Auxiliary FOVs therefore lose
+    #   information along z (compression).
+    #
+    # When True (only valid for ``patch_mode == "2_5d"`` with
+    # ``len(multi_res_scales) > 1`` and ``model.aux_seg_supervision = True``):
+    #   The dataset extracts a SINGLE max-FOV cube of depth
+    #   ``round(eD * max_scale)`` (edge-padded at volume boundaries),
+    #   runs all 3D augmentations on that single cube — **once** — and the
+    #   trainer center-crops per view at native depth ``D_k = round(eD *
+    #   s_k)`` immediately before the model forward. Each aux head therefore
+    #   predicts ``(B, num_fg * D_k, H, W)`` against view k's native-depth
+    #   label, with no z-axis information loss for wider FOVs.
+    #
+    # Geometric equivalence
+    # ---------------------
+    # All views share the same z-center (``_sample_z`` is computed once).
+    # Center-cropping ``D_k`` slices from the max-FOV cube yields exactly
+    # the same physical slice set as the per-view independent extraction
+    # used by the False-path (slice spacing == 1 along z) — but with a
+    # SINGLE shared augmentation field, eliminating the cross-view
+    # geometric drift that ``False`` introduces by running grid_sample
+    # independently per view.
+    #
+    # Side constraints (enforced in ``validate()``)
+    # ---------------------------------------------
+    # * ``z_boundary_mode`` is forced to ``"edge_pad"`` (the max-scale path
+    #   inherently uses ``extract_z_patch_padded``; ``stretch`` would have
+    #   no consumer and would silently mislead).
+    # * Inactive in 3D modes (multi_res_scales is a channel-stack there,
+    #   D-resampling is not part of that semantics).
+    aux_keep_native_d: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Augmentation configuration
@@ -684,12 +721,38 @@ class Config:
         if self.data.patch_mode == "2_5d":
             # 2.5D mode: planar 2D backbone consuming D slices as channels.
             # Multi-FOV (multi_res_scales) extension: each extra z-FOV view
-            # contributes D additional input channels — view layout is
-            # (B, n_views * D, H, W). With the legacy [1.0] config this
-            # collapses back to in_channels = D (bit-identical behaviour).
+            # contributes additional input channels.
+            #
+            # Two channel-layouts are supported, gated by ``data.aux_keep_native_d``:
+            #
+            #   False (legacy):
+            #     Each view k is z-resampled to D channels — total
+            #     ``in_channels = D * n_views``.
+            #
+            #   True (native depth):
+            #     View k keeps its native depth ``D_k = round(D * s_k)``;
+            #     concatenation along the channel axis gives
+            #     ``in_channels = sum_k D_k``. View-0 always uses
+            #     ``s_0 == 1`` so ``D_0 == D`` (the supervision target).
             self.model.spatial_dims = 2
             n_views = max(len(self.data.multi_res_scales), 1)
-            self.model.in_channels = int(self.data.patch_size[0]) * n_views
+            D = int(self.data.patch_size[0])
+            if self.data.aux_keep_native_d and n_views > 1:
+                # Native-depth layout. Force edge_pad — the single-cube
+                # extraction always uses ``extract_z_patch_padded`` so a
+                # ``stretch`` value would dangle without effect (and worse,
+                # mislead readers). Quietly upgrade and log.
+                if self.data.z_boundary_mode != "edge_pad":
+                    logger.info(
+                        "aux_keep_native_d=True implies z_boundary_mode='edge_pad'; "
+                        "auto-upgraded from %r.", self.data.z_boundary_mode)
+                    self.data.z_boundary_mode = "edge_pad"
+                depths = [int(round(D * float(s))) for s in self.data.multi_res_scales]
+                # View 0 must equal D exactly (s_0 == 1.0 invariant).
+                depths[0] = D
+                self.model.in_channels = int(sum(depths))
+            else:
+                self.model.in_channels = D * n_views
         else:
             # 3D modes: in_channels follows multi_res_scales (legacy).
             # Both z_axis and cubic stack per-scale views as input channels;
@@ -830,6 +893,18 @@ class Config:
                 and self.data.multi_res_scales[0] == 1.0, (
                 "whole-volume mode requires multi_res_scales=[1.0]; got "
                 f"{self.data.multi_res_scales}.")
+        # ``aux_keep_native_d`` is meaningful only in 2.5D + multi-view +
+        # aux-supervision. Reject misuse early with a precise diagnostic
+        # rather than silently letting downstream surgery fire.
+        if self.data.aux_keep_native_d:
+            assert self.data.patch_mode == "2_5d", (
+                "data.aux_keep_native_d=True is only valid in patch_mode="
+                f"'2_5d'; got patch_mode={self.data.patch_mode!r}.")
+            assert len(self.data.multi_res_scales) > 1, (
+                "data.aux_keep_native_d=True requires at least one auxiliary "
+                "view (len(multi_res_scales) > 1); got "
+                f"multi_res_scales={self.data.multi_res_scales}.")
+
         if self.data.patch_mode == "2_5d":
             # 2.5D mode invariants enforced by sync(); re-check here so a
             # stale config caught after manual edit fails fast.
@@ -843,12 +918,42 @@ class Config:
                 "2.5D mode requires model.spatial_dims=2 (set automatically "
                 "by sync()).")
             n_views = len(self.data.multi_res_scales)
-            expected_in = int(self.data.patch_size[0]) * n_views
-            assert self.model.in_channels == expected_in, (
-                f"2.5D mode requires model.in_channels == "
-                f"patch_size[0] * len(multi_res_scales) = "
-                f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
-                f"got in_channels={self.model.in_channels}.")
+            if self.data.aux_keep_native_d and n_views > 1:
+                # Native-depth layout: in_channels = sum_k round(D * s_k),
+                # with s_0 == 1.0 fixing D_0 == D. This is the channel
+                # count after the trainer's per-view center-crop and
+                # cat-along-channel step before the 2D forward.
+                depths = self.aux_view_depths
+                expected_in = int(sum(depths))
+                assert self.model.in_channels == expected_in, (
+                    f"2.5D + aux_keep_native_d=True requires "
+                    f"model.in_channels == sum(round(D * s_k)) = "
+                    f"sum({depths}) = {expected_in}; got "
+                    f"in_channels={self.model.in_channels}. "
+                    f"This is normally set automatically by sync(); a "
+                    f"mismatch here means in_channels was hand-edited "
+                    f"after sync() ran.")
+                assert self.data.z_boundary_mode == "edge_pad", (
+                    "aux_keep_native_d=True requires z_boundary_mode="
+                    "'edge_pad' (set automatically by sync()); got "
+                    f"{self.data.z_boundary_mode!r}.")
+                # ON-mode is meaningful only when aux supervision is on —
+                # otherwise the wider FOVs would contribute extra channels
+                # to the model trunk but never receive a target signal,
+                # which is almost certainly a configuration error.
+                assert getattr(self.model, "aux_seg_supervision", False), (
+                    "aux_keep_native_d=True is only meaningful with "
+                    "model.aux_seg_supervision=True (each native-depth "
+                    "view k must drive an aux head predicting "
+                    "(B, num_fg * D_k, H, W)). Either enable "
+                    "aux_seg_supervision or set aux_keep_native_d=False.")
+            else:
+                expected_in = int(self.data.patch_size[0]) * n_views
+                assert self.model.in_channels == expected_in, (
+                    f"2.5D mode requires model.in_channels == "
+                    f"patch_size[0] * len(multi_res_scales) = "
+                    f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
+                    f"got in_channels={self.model.in_channels}.")
             # Plan C constraints: aux view k injects at encoder stage k,
             # so we need at least one stage per aux view + the main one.
             if self.model.context_fusion == "hierarchical" and n_views > 1:
@@ -924,6 +1029,29 @@ class Config:
     def num_fg_classes(self) -> int:
         """Number of foreground classes (excluding background)."""
         return max(self.data.num_classes - 1, 1)
+
+    @property
+    def aux_view_depths(self) -> List[int]:
+        """Per-view native depths ``D_k = round(D * s_k)`` for 2.5D mode.
+
+        Always returns a list of length ``len(data.multi_res_scales)``,
+        with element 0 fixed to ``D`` (view 0 invariant). For modes other
+        than ``2_5d`` returns an empty list.
+
+        This helper is shape-only — it does NOT depend on
+        ``data.aux_keep_native_d``. Consumers gate on the flag explicitly:
+          - flag OFF: ignore this list and use the legacy ``D * n_views``
+            channel layout.
+          - flag ON: use the list to (a) center-crop each view at its
+            native depth, (b) size per-view stems & aux heads.
+        """
+        if self.data.patch_mode != "2_5d":
+            return []
+        D = int(self.data.patch_size[0])
+        depths = [int(round(D * float(s))) for s in self.data.multi_res_scales]
+        if depths:
+            depths[0] = D  # enforce s_0 == 1.0 invariant
+        return depths
 
 
 # ---------------------------------------------------------------------------

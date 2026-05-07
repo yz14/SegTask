@@ -157,10 +157,11 @@ def build_model(cfg: Config) -> UNet3D:
     #     SliceChannelLoss splits the (num_fg * D)-channel output into
     #     per-fg-class D-slice binary masks.
     if cfg.data.patch_mode == "2_5d":
-        # 2.5D mode output is always num_fg * D — independent of how many
-        # context z-FOV views feed the stem. Multi-FOV affects ONLY the
-        # stem's input-channel count (D * n_views), not the head output:
-        # the loss / metrics consume the 1× FOV's true geometry.
+        # 2.5D mode output is num_fg * D for the MAIN head — independent
+        # of how many context z-FOV views feed the stem. Multi-FOV affects
+        # ONLY the stem's input-channel count (D * n_views legacy, or
+        # sum(D_k) when aux_keep_native_d=True), not the main head output:
+        # the main loss / metrics consume the 1× FOV's true geometry.
         num_res = 1
         D = int(cfg.data.patch_size[0])
         out_classes = num_fg * D
@@ -175,6 +176,20 @@ def build_model(cfg: Config) -> UNet3D:
         context_n_views = max(len(cfg.data.multi_res_scales), 1)
     else:
         context_n_views = 1
+
+    # Per-view input channel layout (2.5D ON path only). For OFF path /
+    # 3D modes we leave this as ``None`` so the encoder uses the legacy
+    # uniform ``in_channels // n_views`` split (bit-identical behaviour).
+    in_ch_per_view_list = None
+    aux_head_out_channels = None
+    if (cfg.data.patch_mode == "2_5d"
+            and bool(getattr(cfg.data, "aux_keep_native_d", False))
+            and context_n_views > 1):
+        depths = list(cfg.aux_view_depths)
+        # Stem consumes per-view native depths; sum equals model.in_channels.
+        in_ch_per_view_list = depths
+        # Aux head k emits ``num_fg * D_k`` channels (vs. main's num_fg*D_0).
+        aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
 
     # Resolve per-stage block counts.  Encoder has ``n_levels`` stages;
     # a classical UNet-style decoder has ``n_levels - 1`` stages.  For
@@ -224,7 +239,8 @@ def build_model(cfg: Config) -> UNet3D:
         stem_mode=mc.stem_mode,
         spatial_dims=spatial_dims,
         context_n_views=context_n_views,
-        context_fusion=getattr(mc, "context_fusion", "shared_stem"))
+        context_fusion=getattr(mc, "context_fusion", "shared_stem"),
+        in_ch_per_view_list=in_ch_per_view_list)
 
     # Build decoder — classical UNet / UNet++ / UNet3+.
     if mc.decoder_type == "unet3p":
@@ -258,6 +274,14 @@ def build_model(cfg: Config) -> UNet3D:
     # constructor disables it internally when n_views==1, but we mirror
     # the gate here so the log line tells the truth in single-FOV configs.
     aux_seg_supervision = aux_seg_supervision and context_n_views > 1
+    # Aux head per-view output channel counts: present only for the 2.5D
+    # native-depth ON path (each aux view has its own D_k); ``None`` for
+    # OFF path so UNet3D defaults each aux head to ``num_fg_classes``
+    # channels (== num_fg * D, identical to the main head — bit-identical
+    # to the legacy build).
+    aux_head_out_channels_arg = (
+        aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels)
+        else None)
     model = UNet3D(
         encoder=encoder,
         decoder=decoder,
@@ -266,6 +290,7 @@ def build_model(cfg: Config) -> UNet3D:
         spatial_dims=spatial_dims,
         aux_seg_supervision=aux_seg_supervision,
         aux_head_mode=getattr(mc, "aux_head_mode", "linear"),
+        aux_head_out_channels=aux_head_out_channels_arg,
         norm_type=mc.norm_type,
         norm_groups=mc.norm_groups,
         activation=mc.activation)

@@ -214,18 +214,43 @@ class MultiStemProj(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         spatial_dims: int = 3,
+        in_ch_per_view_list: List[int] = None,
     ):
+        """``MultiStemProj`` supports two channel-layout flavours:
+
+        * ``in_ch_per_view: int`` — every view contributes the SAME number
+          of channels (legacy / OFF path; equal D for all 2.5D views).
+        * ``in_ch_per_view_list: List[int]`` — per-view variable channel
+          counts (native-depth ON path; ``D_k = round(D * s_k)``). When
+          provided, takes precedence and ``in_ch_per_view`` is ignored.
+          Length must equal ``n_views``.
+
+        All sub-stems share the same ``mode`` and ``stem_stride`` so the
+        downstream encoder contract remains independent of the input
+        channel layout.
+        """
         super().__init__()
         if n_views < 1:
             raise ValueError(f"n_views must be >= 1, got {n_views}")
         self.n_views = n_views
-        self.in_ch_per_view = in_ch_per_view
+        if in_ch_per_view_list is not None:
+            if len(in_ch_per_view_list) != n_views:
+                raise ValueError(
+                    f"in_ch_per_view_list length ({len(in_ch_per_view_list)}) "
+                    f"must equal n_views ({n_views})")
+            self.in_ch_per_view_list: List[int] = [int(c) for c in in_ch_per_view_list]
+        else:
+            self.in_ch_per_view_list = [int(in_ch_per_view)] * n_views
+        # Kept for backward compatibility with consumers that introspect
+        # ``in_ch_per_view``; reflects the FIRST view's count when the
+        # layout is variable. Use ``in_ch_per_view_list`` for exact info.
+        self.in_ch_per_view = self.in_ch_per_view_list[0]
 
         stems: List[nn.Module] = []
         strides: List[int] = []
-        for _ in range(n_views):
+        for c_v in self.in_ch_per_view_list:
             s, stride = build_stem(
-                mode, in_ch_per_view, out_ch,
+                mode, c_v, out_ch,
                 norm_type=norm_type, norm_groups=norm_groups,
                 activation=activation, spatial_dims=spatial_dims)
             stems.append(s)
@@ -247,15 +272,19 @@ class MultiStemProj(nn.Module):
             activation=activation, spatial_dims=spatial_dims)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """``x``: (B, n_views * in_ch_per_view, *spatial)."""
-        expected_c = self.n_views * self.in_ch_per_view
+        """``x``: ``(B, sum_k in_ch_per_view_list[k], *spatial)``.
+
+        For uniform per-view widths this collapses to
+        ``(B, n_views * in_ch_per_view, *spatial)``.
+        """
+        expected_c = sum(self.in_ch_per_view_list)
         if x.shape[1] != expected_c:
             raise ValueError(
                 f"MultiStemProj expects {expected_c} input channels "
-                f"(n_views={self.n_views} * in_ch_per_view="
-                f"{self.in_ch_per_view}); got {x.shape[1]}")
-        # Channel-wise split into n_views chunks, each (B, in_ch_per_view, *).
-        chunks = torch.split(x, self.in_ch_per_view, dim=1)
+                f"(per-view={self.in_ch_per_view_list}); got {x.shape[1]}")
+        # Channel-wise split per view. ``torch.split`` accepts a list of
+        # split sizes for variable-width chunks (no copy: returns views).
+        chunks = torch.split(x, self.in_ch_per_view_list, dim=1)
         feats = [stem(c) for stem, c in zip(self.stems, chunks)]
         return self.proj(torch.cat(feats, dim=1))
 
@@ -310,7 +339,14 @@ class HierarchicalStems(nn.Module):
         activation: str = "leakyrelu",
         spatial_dims: int = 3,
         aux_channels: List[int] = None,
+        in_ch_per_view_list: List[int] = None,
     ):
+        """``HierarchicalStems`` supports both uniform and per-view input
+        channel counts (see :class:`MultiStemProj` docstring for the
+        rationale). When ``in_ch_per_view_list`` is provided, view 0
+        consumes ``in_ch_per_view_list[0]`` channels (main stem) and aux
+        stem ``k`` consumes ``in_ch_per_view_list[k]`` channels.
+        """
         super().__init__()
         if n_views < 1:
             raise ValueError(f"n_views must be >= 1, got {n_views}")
@@ -321,11 +357,21 @@ class HierarchicalStems(nn.Module):
                 f"encoder stages (one stage per aux injection level + the "
                 f"main path); got {len(stage_channels)} stages.")
         self.n_views = n_views
-        self.in_ch_per_view = in_ch_per_view
+        if in_ch_per_view_list is not None:
+            if len(in_ch_per_view_list) != n_views:
+                raise ValueError(
+                    f"in_ch_per_view_list length ({len(in_ch_per_view_list)}) "
+                    f"must equal n_views ({n_views})")
+            self.in_ch_per_view_list: List[int] = [int(c) for c in in_ch_per_view_list]
+        else:
+            self.in_ch_per_view_list = [int(in_ch_per_view)] * n_views
+        # Compatibility shim — first view's count.
+        self.in_ch_per_view = self.in_ch_per_view_list[0]
 
         # Main stem — uses the user's chosen stem mode at native stride.
+        # Consumes view 0's input channel count.
         self.main_stem, self.stem_stride = build_stem(
-            mode, in_ch_per_view, stage_channels[0],
+            mode, self.in_ch_per_view_list[0], stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
 
@@ -349,7 +395,7 @@ class HierarchicalStems(nn.Module):
             self.aux_strides.append(stride)
             self.aux_stems.append(
                 PatchEmbedStem(
-                    in_ch=in_ch_per_view,
+                    in_ch=self.in_ch_per_view_list[k],
                     out_ch=aux_channels[k - 1],
                     patch_size=stride,
                     norm_type=norm_type, norm_groups=norm_groups,
@@ -358,13 +404,12 @@ class HierarchicalStems(nn.Module):
                     spatial_dims=spatial_dims))
 
     def split_views(self, x: torch.Tensor) -> List[torch.Tensor]:
-        expected_c = self.n_views * self.in_ch_per_view
+        expected_c = sum(self.in_ch_per_view_list)
         if x.shape[1] != expected_c:
             raise ValueError(
                 f"HierarchicalStems expects {expected_c} input channels "
-                f"(n_views={self.n_views} * in_ch_per_view="
-                f"{self.in_ch_per_view}); got {x.shape[1]}")
-        return list(torch.split(x, self.in_ch_per_view, dim=1))
+                f"(per-view={self.in_ch_per_view_list}); got {x.shape[1]}")
+        return list(torch.split(x, self.in_ch_per_view_list, dim=1))
 
     def forward_main(self, x_view0: torch.Tensor) -> torch.Tensor:
         return self.main_stem(x_view0)
@@ -396,6 +441,7 @@ def build_context_stem(
     activation: str = "leakyrelu",
     spatial_dims: int = 3,
     stage_channels: List[int] = None,
+    in_ch_per_view_list: List[int] = None,
 ) -> Tuple[nn.Module, int]:
     """Build the context-fusion stem for 2.5D multi-FOV mode.
 
@@ -417,9 +463,18 @@ def build_context_stem(
     if fusion not in CONTEXT_FUSION_MODES:
         raise ValueError(
             f"Unknown context_fusion: {fusion!r}. Valid: {CONTEXT_FUSION_MODES}")
+    # Validate the per-view-list / uniform layouts agree on total channel count.
+    if in_ch_per_view_list is not None and len(in_ch_per_view_list) != n_views:
+        raise ValueError(
+            f"in_ch_per_view_list length ({len(in_ch_per_view_list)}) "
+            f"must equal n_views ({n_views})")
     if n_views == 1 or fusion == "shared_stem":
+        # Total input channel count: per-view list when given, else uniform.
+        total_in = (sum(in_ch_per_view_list)
+                    if in_ch_per_view_list is not None
+                    else n_views * in_ch_per_view)
         return build_stem(
-            mode, n_views * in_ch_per_view, out_ch,
+            mode, total_in, out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
     if fusion == "multi_stem_proj":
@@ -427,7 +482,8 @@ def build_context_stem(
             mode=mode, n_views=n_views,
             in_ch_per_view=in_ch_per_view, out_ch=out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
-            activation=activation, spatial_dims=spatial_dims)
+            activation=activation, spatial_dims=spatial_dims,
+            in_ch_per_view_list=in_ch_per_view_list)
         return msp, msp.stem_stride
     # hierarchical
     if stage_channels is None:
@@ -446,5 +502,6 @@ def build_context_stem(
         in_ch_per_view=in_ch_per_view,
         stage_channels=stage_channels,
         norm_type=norm_type, norm_groups=norm_groups,
-        activation=activation, spatial_dims=spatial_dims)
+        activation=activation, spatial_dims=spatial_dims,
+        in_ch_per_view_list=in_ch_per_view_list)
     return hier, hier.stem_stride

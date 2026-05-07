@@ -86,6 +86,40 @@ class Predictor:
                 f"Unknown z_boundary_mode {self.z_boundary_mode!r}; "
                 "expected 'stretch' or 'edge_pad'.")
 
+        # ---- Native-depth multi-FOV inference path (ON mode) ------------
+        # Mirrors ``Trainer.aux_keep_native_d`` so the inference window
+        # builder produces the SAME channel layout the model was trained on:
+        #   (B, sum_k D_k, pH, pW) where D_k = round(pD * s_k)
+        # rather than the legacy ``(B, n_views * pD, pH, pW)``. View 0
+        # occupies the leading ``D_0 == pD`` channels (centered slices of
+        # the max-FOV cube); aux views k=1..K-1 follow at native depth.
+        self.aux_keep_native_d = bool(
+            getattr(cfg.data, "aux_keep_native_d", False)
+            and self.patch_mode == "2_5d"
+            and len(self.multi_res_scales) > 1)
+        if self.aux_keep_native_d:
+            depths = [int(round(self.patch_D * float(s)))
+                      for s in self.multi_res_scales]
+            depths[0] = int(self.patch_D)  # s_0 == 1.0 invariant
+            self.aux_view_depths: List[int] = depths
+            self._eD_max: int = int(round(
+                self.patch_D * float(max(self.multi_res_scales))))
+            # Sanity-check vs. model's actual in_channels (set by sync()).
+            expect_in = sum(depths)
+            actual_in = int(getattr(cfg.model, "in_channels", expect_in))
+            if actual_in != expect_in:
+                raise ValueError(
+                    f"aux_keep_native_d=True: model.in_channels={actual_in} "
+                    f"!= sum(aux_view_depths)={expect_in}. The model was "
+                    "likely built with a stale Config — re-sync and rebuild.")
+            logger.info(
+                "Predictor aux_keep_native_d=True: per-view depths=%s, "
+                "max-FOV cube depth=%d, in_channels=%d.",
+                depths, self._eD_max, actual_in)
+        else:
+            self.aux_view_depths = []
+            self._eD_max = int(self.patch_D)
+
         # AMP: match the training dtype so conv accumulation precision is
         # consistent between trainer and predictor. Any unknown value falls
         # back to bf16 to avoid silent dtype flip.
@@ -271,13 +305,22 @@ class Predictor:
         single_res = (len(self.multi_res_scales) == 1
                       and self.multi_res_scales[0] == 1.0)
 
-        window_inputs: List[torch.Tensor] = []  # each (C_res, pD, pH, pW) on GPU
+        # ON-mode native-depth path: builder returns rank-3
+        # ``(in_channels=sum(D_k), pH, pW)`` so ``torch.stack`` produces
+        # ``(B, in_channels, pH, pW)`` directly — exactly the layout the
+        # 2D model was trained on (no reshape needed in _forward_batch_gpu).
+        # Legacy paths keep the rank-4 ``(C_res, pD, pH, pW)`` window shape.
+        window_inputs: List[torch.Tensor] = []
         patch_metas: List[Tuple[int, int, int]] = []  # (z0, z1, actual_d)
 
         n_windows = len(z_positions)
         for idx, (z0, z1) in enumerate(z_positions):
             actual_d = z1 - z0
-            if single_res:
+            if self.aux_keep_native_d:
+                # ON mode: GPU builder returns rank-3 (sum(D_k), pH, pW).
+                window_inputs.append(
+                    self._build_z_window_input_native_d_gpu(vol_t, z0, z1))
+            elif single_res:
                 window_inputs.append(
                     self._build_z_window_input_gpu(vol_t, z0, z1))
             else:
@@ -401,6 +444,75 @@ class Predictor:
                 mode="trilinear", align_corners=False)
         return patch.squeeze(0)  # (1, pD, pH, pW)
 
+    def _build_z_window_input_native_d_gpu(
+        self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
+        """ON-mode (aux_keep_native_d=True) window builder.
+
+        Mirrors :meth:`SegDataset3D._getitem_native_d` and the trainer's
+        :meth:`_split_views_native_d` so inference and training share one
+        channel layout end-to-end:
+
+          1. Extract a SINGLE max-FOV cube of depth ``self._eD_max``
+             centred on ``(z0+z1)//2``. ``edge_pad`` is unconditional —
+             aux_keep_native_d implies edge_pad (Config validates this).
+          2. In-plane resize to (pH, pW); D axis stays at ``eD_max``
+             (i.e. the native physical span of the widest FOV).
+          3. Per-view center crop along the D axis: view k takes the
+             centred ``D_k = round(pD * s_k)`` slices. View 0 takes the
+             centred ``D_0 == pD`` slices (== the legacy single-FOV view).
+          4. Concatenate views along the channel axis →
+             ``(sum_k D_k, pH, pW)`` — exactly the layout the model
+             expects after the trainer's ``_split_views_native_d`` step.
+
+        Returns rank-3 ``(in_channels, pH, pW)`` float32 on the model's
+        device. Stacking across windows yields the model's input batch
+        directly, no reshape required.
+        """
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+        eD_max = self._eD_max
+        z_center = (z0 + z1) // 2
+        D_vol = vol_t.shape[0]
+
+        # ---- Edge-padded extraction of an eD_max-deep slab ---------------
+        zlo = z_center - eD_max // 2
+        zhi = zlo + eD_max
+        # In-bounds slab; edge-replicate above / below if needed.
+        zlo_in = max(zlo, 0)
+        zhi_in = min(zhi, D_vol)
+        slab = vol_t[zlo_in:zhi_in]  # (ad, H_orig, W_orig)
+        pad_before = max(0, -zlo)
+        pad_after = max(0, zhi - D_vol)
+        if pad_before > 0 or pad_after > 0:
+            chunks: List[torch.Tensor] = []
+            if pad_before > 0:
+                chunks.append(slab[0:1].expand(pad_before, -1, -1))
+            chunks.append(slab)
+            if pad_after > 0:
+                chunks.append(slab[-1:].expand(pad_after, -1, -1))
+            slab = torch.cat(chunks, dim=0)
+        if slab.shape[0] != eD_max:
+            raise RuntimeError(
+                f"native-d builder: expected slab depth {eD_max}, got "
+                f"{slab.shape[0]} (z0={z0}, z1={z1}, eD_max={eD_max}, "
+                f"D_vol={D_vol}). This indicates a window-position "
+                "computation error.")
+
+        # ---- In-plane resize (D axis preserved at eD_max) ----------------
+        H_orig, W_orig = slab.shape[1], slab.shape[2]
+        slab = slab.unsqueeze(0).unsqueeze(0).float()  # (1,1,eD_max,H,W)
+        if H_orig != pH or W_orig != pW:
+            slab = F.interpolate(
+                slab, size=(eD_max, pH, pW),
+                mode="trilinear", align_corners=False)
+        slab = slab[0, 0]  # (eD_max, pH, pW)
+
+        # ---- Per-view center crop + concat along channel axis ------------
+        view_chunks: List[torch.Tensor] = []
+        for D_k in self.aux_view_depths:
+            d0 = (eD_max - D_k) // 2
+            view_chunks.append(slab[d0:d0 + D_k])  # (D_k, pH, pW)
+        return torch.cat(view_chunks, dim=0).contiguous()  # (sum(D_k), pH, pW)
+
     @torch.no_grad()
     def _forward_batch_gpu(self, x: torch.Tensor) -> torch.Tensor:
         """GPU-tensor-returning variant of ``_forward_batch``.
@@ -411,7 +523,21 @@ class Predictor:
         otherwise (AMP, TTA, deep-supervision unwrap).
         """
         if self.patch_mode == "2_5d":
-            x_2d = self._reshape_2_5d_input(x)  # (B, C_res*D, H, W)
+            # Two input layouts arriving here:
+            #   * Legacy / OFF path: rank-5 (B, C_res, pD, pH, pW) — needs
+            #     the C_res-collapse reshape.
+            #   * ON path (aux_keep_native_d=True): rank-4 (B, sum(D_k), H, W)
+            #     produced by ``_build_z_window_input_native_d_gpu``;
+            #     already in the model's input channel layout — pass
+            #     through.
+            if x.ndim == 5:
+                x_2d = self._reshape_2_5d_input(x)  # (B, C_res*D, H, W)
+            elif x.ndim == 4:
+                x_2d = x
+            else:
+                raise ValueError(
+                    f"2.5D forward expects rank-4 or rank-5 input; "
+                    f"got x.shape={tuple(x.shape)}")
             D = self.patch_D
             B, _, H, W = x_2d.shape
             with autocast(device_type="cuda", enabled=self.use_amp,

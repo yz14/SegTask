@@ -48,7 +48,8 @@ class Encoder(nn.Module):
         stem_mode: str = "conv3",
         spatial_dims: int = 3,
         context_n_views: int = 1,
-        context_fusion: str = "shared_stem"):
+        context_fusion: str = "shared_stem",
+        in_ch_per_view_list: List[int] = None):
         super().__init__()
         self.spatial_dims = spatial_dims
         # Stem: project input to first channel count. The stem may introduce
@@ -57,24 +58,42 @@ class Encoder(nn.Module):
         # final upsample when necessary.
         #
         # Multi-FOV context fusion (2.5D mode): when ``context_n_views > 1``
-        # the input layout is ``(B, n_views * in_ch_per_view, *spatial)``
-        # with ``in_ch_per_view = in_channels // n_views``; the dispatcher
-        # in ``build_context_stem`` selects either a single shared stem
-        # ("shared_stem") or per-view independent stems + 1×1 fusion
-        # ("multi_stem_proj"). For ``context_n_views == 1`` the behaviour
-        # is bit-identical to the legacy single-stem path.
+        # the input layout is ``(B, sum_k in_ch_per_view_list[k], *spatial)``.
+        # Two channel layouts are supported by the underlying
+        # ``build_context_stem``:
+        #   - Uniform (default): ``in_ch_per_view = in_channels // context_n_views``
+        #     — the legacy / OFF path with all views having equal D channels.
+        #   - Per-view list (``in_ch_per_view_list`` provided): each view
+        #     contributes ``in_ch_per_view_list[k]`` channels (native-depth
+        #     ON path with ``D_k = round(D * s_k)``). Length must equal
+        #     ``context_n_views`` and ``sum(...)`` must equal ``in_channels``.
         if context_n_views < 1:
             raise ValueError(
                 f"context_n_views must be >= 1, got {context_n_views}")
-        if in_channels % context_n_views != 0:
-            raise ValueError(
-                f"in_channels ({in_channels}) must be divisible by "
-                f"context_n_views ({context_n_views})")
+        if in_ch_per_view_list is not None:
+            if len(in_ch_per_view_list) != context_n_views:
+                raise ValueError(
+                    f"in_ch_per_view_list length "
+                    f"({len(in_ch_per_view_list)}) must equal "
+                    f"context_n_views ({context_n_views})")
+            if sum(in_ch_per_view_list) != in_channels:
+                raise ValueError(
+                    f"sum(in_ch_per_view_list)={sum(in_ch_per_view_list)} "
+                    f"must equal in_channels ({in_channels})")
+            in_ch_per_view = int(in_ch_per_view_list[0])
+        else:
+            if in_channels % context_n_views != 0:
+                raise ValueError(
+                    f"in_channels ({in_channels}) must be divisible by "
+                    f"context_n_views ({context_n_views})")
+            in_ch_per_view = in_channels // context_n_views
         self.context_n_views = context_n_views
         # Persist on the encoder so UNet3D can mirror the stem topology
         # when building aux seg heads (Plan A vs. Plan C symmetric layout).
         self.context_fusion = context_fusion
-        in_ch_per_view = in_channels // context_n_views
+        self.in_ch_per_view_list: List[int] = (
+            list(in_ch_per_view_list) if in_ch_per_view_list is not None
+            else [in_ch_per_view] * context_n_views)
         self.stem, self.stem_stride = build_context_stem(
             mode=stem_mode, fusion=context_fusion,
             n_views=context_n_views,
@@ -82,7 +101,8 @@ class Encoder(nn.Module):
             out_ch=stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims,
-            stage_channels=stage_channels)
+            stage_channels=stage_channels,
+            in_ch_per_view_list=in_ch_per_view_list)
 
         # Encoder stages and downsampling
         self.stages = nn.ModuleList()
@@ -398,7 +418,8 @@ class UNet3D(nn.Module):
         # aux head's norm/act stay homogeneous with the rest of the model.
         norm_type: str = "instance",
         norm_groups: int = 8,
-        activation: str = "leakyrelu"):
+        activation: str = "leakyrelu",
+        aux_head_out_channels: List[int] = None):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -464,17 +485,35 @@ class UNet3D(nn.Module):
         # stays a flat lookup (no Python branching per call).
         self.aux_feat_indices: List[int] = []
         self.aux_heads = nn.ModuleList()
+        # Per-aux-head output channel count. With the legacy / OFF path
+        # every aux head emits the SAME ``num_fg_classes`` count as the
+        # main head (``num_fg * D`` in 2.5D). With the native-depth ON
+        # path each aux head k emits ``num_fg * D_k`` channels — the
+        # caller passes ``aux_head_out_channels = [num_fg*D_1, ...,
+        # num_fg*D_{K-1}]`` (length n_views - 1).
+        n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
+        if aux_head_out_channels is None:
+            self.aux_head_out_channels: List[int] = (
+                [num_fg_classes] * n_aux_expected)
+        else:
+            if len(aux_head_out_channels) != n_aux_expected:
+                raise ValueError(
+                    f"aux_head_out_channels length "
+                    f"({len(aux_head_out_channels)}) must equal "
+                    f"n_views - 1 ({n_aux_expected}).")
+            self.aux_head_out_channels = [int(c) for c in aux_head_out_channels]
         # The head builder bakes in norm/activation only when the mode is
         # ``conv`` — for the linear case it's a 1×1 conv with no norm.
-        head_builder = lambda in_ch: _build_aux_head(  # noqa: E731
-            mode=aux_head_mode,
-            in_ch=in_ch,
-            num_classes=num_fg_classes,
-            spatial_dims=spatial_dims,
-            norm_type=norm_type,
-            norm_groups=norm_groups,
-            activation=activation,
-        )
+        def _head(in_ch: int, out_ch: int) -> nn.Module:
+            return _build_aux_head(
+                mode=aux_head_mode,
+                in_ch=in_ch,
+                num_classes=out_ch,
+                spatial_dims=spatial_dims,
+                norm_type=norm_type,
+                norm_groups=norm_groups,
+                activation=activation,
+            )
         self.aux_head_mode = aux_head_mode
         if self.aux_seg_supervision:
             n_dec = len(decoder.out_channels)
@@ -492,13 +531,15 @@ class UNet3D(nn.Module):
                     feat_idx = n_dec - 1 - k
                     self.aux_feat_indices.append(feat_idx)
                     self.aux_heads.append(
-                        head_builder(decoder.out_channels[feat_idx]))
+                        _head(decoder.out_channels[feat_idx],
+                              self.aux_head_out_channels[k - 1]))
             else:
                 # Plan A — all aux heads on the highest-res decoder feat.
                 in_ch = decoder.out_channels[-1]
-                for _ in range(1, n_views):
+                for k in range(1, n_views):
                     self.aux_feat_indices.append(n_dec - 1)
-                    self.aux_heads.append(head_builder(in_ch))
+                    self.aux_heads.append(
+                        _head(in_ch, self.aux_head_out_channels[k - 1]))
 
     def forward(
         self, x: torch.Tensor,

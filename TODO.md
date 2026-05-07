@@ -37,7 +37,7 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 
 # TODO  
-1. 目前的2.5D训练(D:\codes\work-projects\SegTask\configs\seg2_5d.yaml)肺分割感觉上下文信息能力有点弱。我想针对2.5D也加入多级感受野的输入。我实现了以下两个方案，感觉仅仅输入这些信息仍然不够，需要对模型增加更多的引导。我初步的设想是，在seghead加入对应的分割损失做强引导。例如输入是B,D,H,W时，还额外给了B,1.5D,H,W和B,2D,H,W做辅助信息，输出的分割head目前只针对B,D,H,W，为了让模型对B,1.5D,H,W和B,2D,H,W的信息做强引导，可以让seghead也预测B,1.5D,H,W和B,2D,H,W的结果，例如原本是预测B,num_fgxD,H,W，现在可以做更多的预测，预测B,num_fgx1.5D,H,W和B,num_fgx2D,H,W，只不过后者权重可以偏小，用来做辅助。方案A和C改动了stem，所以对称的seghead也需要做自动判断和修改。
+1. 目前的2.5D训练(D:\codes\work-projects\SegTask\configs\seg2_5d.yaml)肺分割感觉上下文信息能力有点弱。我想针对2.5D也加入多级感受野的输入。我实现了以下两个方案，并对应的在seghead加入对应的分割损失做强引导。例如输入是B,D,H,W时，还额外给了B,1.5D,H,W和B,2D,H,W做辅助信息，输出的分割head除了主要的B,D,H,W外，还让模型对B,1.5D,H,W和B,2D,H,W的信息做强引导，让seghead也预测B,1.5D,H,W和B,2D,H,W的结果，例如原本是预测B,num_fgxD,H,W，现在可以做更多的预测，预测B,num_fgx1.5D,H,W和B,num_fgx2D,H,W，只不过后者权重可以偏小，用来做辅助。方案A和C改动了stem，和对称的seghead。目前两个方案都是增加一个开关控制是否resize到D，并对seg head也做同样处理，是否输出对应的B,num_fgx1.5D,H,W和B,num_fgx2D,H,W。这样可以控制是否压缩D维的信息。在数据读取这里做了一个小trick，即只输出最大分辨率的图像（不做resize到target尺寸，保持最大的分辨率输出），做完数据增强后，传入模型的那一刻才截取出另外两个分辨率的图像，并决定是否resize到target尺寸。类似的3D的z-axis和cubic两种模式的多分辨率输入是不是也可以用这种高效的数据读取方式。即数据读取后输出最大分辨率的图像（保持这个尺寸不resize到target尺寸），然后等数据增强结束后，截取中心另外两个分辨率，并将三个分辨率图像统一resize到target尺寸。这样只有在输入模型的那一刻制作了多分辨率输入，其它地方都只对最大分辨率的数据在处理。
 
 方案 A：三个独立 stem → 拼接 → 卷积 → 后续 stage
 可行性：高。等价于"each-FOV 独立 patch embedding，然后 early fusion"。改造点在 Encoder.__init__：把单 stem 替换为 n_views 个 stem + 一个 1×1 / 3×3 融合卷积。in_channels 自动由 n_views * D 推导，需在 Config.sync() 增加新字段（如 data.context_z_scales）。

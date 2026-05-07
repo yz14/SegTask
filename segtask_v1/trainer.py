@@ -293,6 +293,21 @@ class Trainer:
         self.base_loss = build_loss(cfg.loss)
         self.is_2_5d = cfg.data.patch_mode == "2_5d"
 
+        # ``aux_keep_native_d`` flag is decided early so the aux loss
+        # block below can build per-view ``SliceChannelLoss`` instances
+        # (one per native D_k) instead of a single shared one.
+        # ``aux_view_depths`` and the inflated ``target_patch_size`` D
+        # axis are still finalised later in __init__ once we know
+        # ``cfg.model.in_channels`` and crop targets.
+        self.aux_keep_native_d = bool(
+            getattr(cfg.data, "aux_keep_native_d", False)
+            and self.is_2_5d
+            and len(cfg.data.multi_res_scales) > 1)
+        # Provisional — overwritten in the cropping section once we have
+        # the full cfg context. Kept here so the aux loss block can read it.
+        self.aux_view_depths: List[int] = (
+            list(cfg.aux_view_depths) if self.aux_keep_native_d else [])
+
         # Composition order matters:
         #   INNER — wraps `base_loss` for the patch-mode contract:
         #     - 3D modes: ``MultiResolutionLoss`` splits pred channels by
@@ -369,22 +384,59 @@ class Trainer:
             # Aux paths compute single-resolution per-view losses (no DS
             # for aux — DS structure is reserved for the main path's
             # multi-scale supervision). The inner SliceChannelLoss is the
-            # same shape contract as the main one: (B, num_fg*D, H, W)
-            # pred + (B, D, H, W) raw label.
-            self.aux_inner_loss = SliceChannelLoss(
-                base_loss=self.base_loss,
-                num_fg_classes=cfg.num_fg_classes,
-                num_slices=int(cfg.data.patch_size[0]),
-                label_values=cfg.data.label_values,
-                reduction=cfg.loss.slice_loss_reduction,
-            )
-            logger.info(
-                "Aux seg supervision: ENABLED, n_aux_views=%d, weights=%s, "
-                "fusion=%s",
-                n_aux, self.aux_weights, cfg.model.context_fusion)
+            # same shape contract as the main one: (B, num_fg*D_k, H, W)
+            # pred + (B, D_k, H, W) raw label.
+            #
+            # Two layouts:
+            #   - Legacy (aux_keep_native_d=False): every aux view has
+            #     ``num_slices = D`` (input is z-resampled back to D).
+            #     A single shared ``SliceChannelLoss`` handles every view.
+            #   - Native depth (aux_keep_native_d=True): aux view k has
+            #     ``num_slices = D_k = round(D * s_k)``. We build ONE
+            #     ``SliceChannelLoss`` per aux view so the slice-channel
+            #     contract is exact (the wrapper uses ``num_slices`` to
+            #     reshape (B, num_fg*D_k, H, W) → (B*num_fg, D_k, H, W)).
+            if getattr(self, "aux_keep_native_d", False):
+                # ``self.aux_view_depths`` was built earlier in __init__;
+                # validated to match ``cfg.aux_view_depths``.
+                aux_depths = self.aux_view_depths[1:]  # skip view 0
+                assert len(aux_depths) == n_aux, (
+                    f"aux_view_depths excluding view 0 has length "
+                    f"{len(aux_depths)}; expected {n_aux}.")
+                self.aux_inner_loss = None
+                self.aux_inner_losses = [
+                    SliceChannelLoss(
+                        base_loss=self.base_loss,
+                        num_fg_classes=cfg.num_fg_classes,
+                        num_slices=int(d_k),
+                        label_values=cfg.data.label_values,
+                        reduction=cfg.loss.slice_loss_reduction,
+                    )
+                    for d_k in aux_depths
+                ]
+                logger.info(
+                    "Aux seg supervision: ENABLED (native depth), "
+                    "n_aux_views=%d, per-view depths=%s, weights=%s, "
+                    "fusion=%s",
+                    n_aux, aux_depths, self.aux_weights,
+                    cfg.model.context_fusion)
+            else:
+                self.aux_inner_loss = SliceChannelLoss(
+                    base_loss=self.base_loss,
+                    num_fg_classes=cfg.num_fg_classes,
+                    num_slices=int(cfg.data.patch_size[0]),
+                    label_values=cfg.data.label_values,
+                    reduction=cfg.loss.slice_loss_reduction,
+                )
+                self.aux_inner_losses = None
+                logger.info(
+                    "Aux seg supervision: ENABLED, n_aux_views=%d, weights=%s, "
+                    "fusion=%s",
+                    n_aux, self.aux_weights, cfg.model.context_fusion)
         else:
             self.aux_weights = []
             self.aux_inner_loss = None
+            self.aux_inner_losses = None
 
         # --- Optimizer + scheduler ------------------------------------
         self.optimizer = build_optimizer(self.model, cfg)
@@ -450,7 +502,35 @@ class Trainer:
         # `padding_mode="zeros"` at rotated corners would otherwise leak
         # into the effective field-of-view), and we center-crop back to
         # `patch_size` here after augmentation.
-        self.target_patch_size = tuple(cfg.data.patch_size)  # (D, H, W)
+        #
+        # ``aux_keep_native_d`` (2.5D ONLY): the dataset emits a single
+        # max-FOV cube of depth ``round(D * max_scale)`` (× oversample
+        # margin). The post-augment center crop must therefore preserve
+        # the ENTIRE max-FOV (not just D) — view 0 takes the centered D
+        # slices in the per-view split below; aux views need wider z spans.
+        # We override the D-axis target accordingly and keep H, W at
+        # their patch_size values.
+        if self.aux_keep_native_d:
+            max_scale = max(cfg.data.multi_res_scales)
+            target_d_native = int(round(int(cfg.data.patch_size[0]) * max_scale))
+            self.target_patch_size = (target_d_native,
+                                      int(cfg.data.patch_size[1]),
+                                      int(cfg.data.patch_size[2]))
+            # Sanity-check the provisional ``aux_view_depths`` set early
+            # in __init__ now that we have the full Config view.
+            assert self.aux_view_depths[0] == int(cfg.data.patch_size[0]), (
+                "aux_view_depths[0] must equal patch_size[0]; got "
+                f"{self.aux_view_depths[0]} vs {cfg.data.patch_size[0]}.")
+            assert sum(self.aux_view_depths) == int(cfg.model.in_channels), (
+                f"sum(aux_view_depths)={sum(self.aux_view_depths)} must "
+                f"equal model.in_channels={cfg.model.in_channels}.")
+            logger.info(
+                "Trainer aux_keep_native_d=True: max-FOV crop D=%d, "
+                "per-view depths=%s, channel layout sum=%d.",
+                target_d_native, self.aux_view_depths,
+                int(cfg.model.in_channels))
+        else:
+            self.target_patch_size = tuple(cfg.data.patch_size)
         self.needs_crop = cfg.data.aug_oversample_ratio > 1.0
 
         # --- Gradient accumulation ------------------------------------
@@ -679,8 +759,22 @@ class Trainer:
             #     losses can index ``label[:, k]`` for aux head ``k``.
             label_all_views: Optional[torch.Tensor] = None
             wmap_all_views: Optional[torch.Tensor] = None
+            # ``aux_view_labels[k]`` / ``aux_view_wmaps[k]`` carry the per-
+            # view native-depth supervision targets when aux_keep_native_d
+            # is on. They are list-form because views have varying D_k —
+            # the legacy rank-5 ``label_all_views`` cannot represent that.
+            aux_view_labels: Optional[List[torch.Tensor]] = None
+            aux_view_wmaps: Optional[List[Optional[torch.Tensor]]] = None
             if self.is_2_5d:
-                if self.aux_seg_supervision:
+                if self.aux_seg_supervision and self.aux_keep_native_d:
+                    # Native-depth path: dataset emits a single max-FOV
+                    # cube; we center-crop per view BEFORE forward, with
+                    # view 0 = the standard ``D``-deep main supervision
+                    # and views 1..K = native ``D_k``-deep aux targets.
+                    (image, label, wmap,
+                     aux_view_labels, aux_view_wmaps) = (
+                        self._split_views_native_d(image, label, wmap))
+                elif self.aux_seg_supervision:
                     image, label_all_views, wmap_all_views = (
                         self._squeeze_2_5d_keep_views(image, label, wmap))
                     # ``label`` / ``wmap`` shadow view 0 so the dice metric
@@ -714,7 +808,15 @@ class Trainer:
                           dtype=self.amp_dtype):
                 pred = self.model(image)
             breakdown: Dict[str, float] = {}
-            if self.aux_seg_supervision:
+            if self.aux_seg_supervision and self.aux_keep_native_d:
+                # Native-depth aux path: ``aux_view_labels[k]`` /
+                # ``aux_view_wmaps[k]`` carry view-k targets at native
+                # depth ``D_k``. ``label`` / ``wmap`` are view 0 (D-deep).
+                loss = self._compute_loss_aux_native_d_fp32(
+                    pred, label, wmap,
+                    aux_view_labels, aux_view_wmaps,
+                    breakdown=breakdown)
+            elif self.aux_seg_supervision:
                 # Aux-aware path: pred is a dict and we route per-view
                 # supervision through ``_compute_loss_aux_fp32``. The main
                 # path inside that helper still goes through the
@@ -861,8 +963,16 @@ class Trainer:
 
                 # 2.5D: squeeze C_res=1 for both image and label before
                 # forward. (No GPU augmentation in val — directly squeeze.)
+                # In aux_keep_native_d mode the dataset emits a single
+                # max-FOV cube; we run the same per-view split as the
+                # training loop but discard aux targets (val metric only
+                # exercises view 0 = main supervision).
                 if self.is_2_5d:
-                    image, label, _ = self._squeeze_2_5d(image, label, None)
+                    if self.aux_keep_native_d:
+                        image, label, _, _, _ = (
+                            self._split_views_native_d(image, label, None))
+                    else:
+                        image, label, _ = self._squeeze_2_5d(image, label, None)
 
                 with autocast(device_type="cuda", enabled=self.use_amp,
                               dtype=self.amp_dtype):
@@ -994,6 +1104,174 @@ class Trainer:
         if isinstance(pred, list):
             pred = pred[0]
         return pred
+
+    def _split_views_native_d(
+        self,
+        image: torch.Tensor,
+        label: torch.Tensor,
+        wmap: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        List[torch.Tensor],
+        List[Optional[torch.Tensor]],
+    ]:
+        """Per-view native-depth center crop for the 2.5D simplified path.
+
+        Input contract (post-augment, post-center-crop):
+          image : ``(B, 1, eD_max, H, W)`` — single max-FOV cube emitted
+                  by ``SegDataset3D._getitem_native_d``. Here
+                  ``eD_max == round(D * max_scale) == self.target_patch_size[0]``.
+          label : ``(B, 1, eD_max, H, W)`` raw integer labels.
+          wmap  : optional ``(B, 1, eD_max, H, W)`` continuous weights.
+
+        Output:
+          image_2d : ``(B, sum_k D_k, H, W)`` — per-view native-depth
+                      slices concatenated along the channel axis. View 0
+                      occupies channels ``[0, D_0)``; view k occupies
+                      ``[Σ_{<k} D_j, Σ_{<=k} D_j)``. The 2D model consumes
+                      this directly. ``D_k = round(D * s_k)`` and view 0
+                      sits at the centered ``D_0 == D`` slices.
+          label_main : ``(B, D, H, W)`` — view-0 supervision (raw int).
+          wmap_main  : ``(B, D, H, W)`` or ``None`` — view-0 weight map.
+          aux_labels : list of ``(B, D_k, H, W)`` for k=1..K-1.
+          aux_wmaps  : list (same length) of weight maps or None per view.
+
+        Geometric note
+        --------------
+        All views share the same z-center by construction (``_sample_z``
+        runs once before extraction). Center-cropping ``D_k`` slices out
+        of ``eD_max`` reproduces, voxel-for-voxel, the per-view
+        independent extraction used by the legacy False-path — but with
+        a single shared augmentation grid_sample applied to the whole
+        cube, eliminating cross-view warp drift.
+        """
+        if not self.aux_keep_native_d:
+            raise RuntimeError(
+                "_split_views_native_d called but aux_keep_native_d=False")
+        if image.ndim != 5 or image.shape[1] != 1:
+            raise ValueError(
+                "native-d split expects (B, 1, eD_max, H, W); got "
+                f"image.shape={tuple(image.shape)}")
+        if label.shape[:2] != image.shape[:2] or label.shape[2:] != image.shape[2:]:
+            raise ValueError(
+                "image / label shape mismatch: "
+                f"image={tuple(image.shape)}, label={tuple(label.shape)}")
+        B, _, eD_max, H, W = image.shape
+        depths = self.aux_view_depths
+        D = depths[0]
+        if eD_max != int(self.target_patch_size[0]):
+            raise ValueError(
+                f"native-d split expects depth axis == target_patch_size[0]"
+                f"={self.target_patch_size[0]}; got {eD_max}. The post-"
+                "augment center crop should already have removed the "
+                "augment oversample margin.")
+        if max(depths) > eD_max:
+            raise ValueError(
+                f"max(aux_view_depths)={max(depths)} exceeds eD_max={eD_max}; "
+                "this indicates a multi_res_scales / patch_size mismatch.")
+
+        def _center_slab(t: torch.Tensor, d_k: int) -> torch.Tensor:
+            """Return the center ``d_k`` slices along axis=2 of ``t`` (B, 1, D, H, W)."""
+            d0 = (eD_max - d_k) // 2
+            return t[:, 0, d0:d0 + d_k].contiguous()  # (B, d_k, H, W)
+
+        # ---- View 0: main supervision target ---------------------------
+        # ``image_view_0 == _center_slab(image, D)`` is exactly the (B, D, H, W)
+        # tensor the legacy single-FOV / view-0 path would consume.
+        view0_img = _center_slab(image, D)
+        label_main = _center_slab(label, D)
+        wmap_main = _center_slab(wmap, D) if wmap is not None else None
+
+        # ---- Aux views ---------------------------------------------------
+        aux_imgs: List[torch.Tensor] = []
+        aux_labels: List[torch.Tensor] = []
+        aux_wmaps: List[Optional[torch.Tensor]] = []
+        for d_k in depths[1:]:
+            aux_imgs.append(_center_slab(image, d_k))
+            aux_labels.append(_center_slab(label, d_k))
+            aux_wmaps.append(_center_slab(wmap, d_k) if wmap is not None else None)
+
+        # ---- Concatenate views along the channel axis for the model -----
+        if aux_imgs:
+            image_2d = torch.cat([view0_img] + aux_imgs, dim=1).contiguous()
+        else:
+            # Defensive: aux_keep_native_d implies n_views > 1, but degrade
+            # gracefully to single-view layout if someone bypasses validate.
+            image_2d = view0_img.contiguous()
+        expected_in = sum(depths)
+        if image_2d.shape[1] != expected_in:
+            raise RuntimeError(
+                f"native-d split produced {image_2d.shape[1]} input "
+                f"channels; expected sum(depths)={expected_in}.")
+        return image_2d, label_main, wmap_main, aux_labels, aux_wmaps
+
+    def _compute_loss_aux_native_d_fp32(
+        self,
+        pred,
+        label_main: torch.Tensor,
+        wmap_main: Optional[torch.Tensor],
+        aux_labels: Optional[List[torch.Tensor]],
+        aux_wmaps: Optional[List[Optional[torch.Tensor]]],
+        breakdown: Optional[Dict[str, float]] = None,
+    ) -> torch.Tensor:
+        """Native-depth aux loss aggregator (mirror of ``_compute_loss_aux_fp32``).
+
+        Differences from the False-path counterpart:
+          * Targets arrive as PER-VIEW LIST tensors (one (B, D_k, H, W)
+            per view) instead of rank-5 ``(B, C_res, D, H, W)``, because
+            views have varying depths.
+          * Each view dispatches to its OWN ``SliceChannelLoss`` from
+            ``self.aux_inner_losses[k-1]`` (constructed with
+            ``num_slices = D_k`` so the slice/channel reshape is exact).
+
+        Loss formula and ``breakdown`` schema are bit-identical to the
+        False-path so downstream logging code (``_format_breakdown`` and
+        the per-component meters in ``_train_epoch``) need no changes.
+        """
+        if isinstance(pred, dict):
+            main_pred = pred["main"]
+            aux_preds = pred.get("aux", []) or []
+        else:
+            main_pred, aux_preds = pred, []
+
+        main_l = self._compute_loss_fp32(
+            self.criterion, main_pred, label_main, weight_map=wmap_main)
+        total = main_l
+        if breakdown is not None:
+            breakdown["L_main"] = float(main_l.detach().item())
+
+        if not aux_preds or not self.aux_inner_losses:
+            if breakdown is not None:
+                breakdown["L_total"] = float(total.detach().item())
+            return total
+        if aux_labels is None:
+            raise RuntimeError(
+                "aux_keep_native_d aux loss path requires aux_labels list "
+                "but received None — likely a missing _split_views_native_d "
+                "call upstream.")
+        if not (len(aux_preds) == len(self.aux_weights)
+                == len(self.aux_inner_losses) == len(aux_labels)):
+            raise RuntimeError(
+                "aux_keep_native_d arity mismatch: "
+                f"preds={len(aux_preds)}, weights={len(self.aux_weights)}, "
+                f"losses={len(self.aux_inner_losses)}, "
+                f"labels={len(aux_labels)}.")
+        for k_idx, (ap, w_k, loss_k, lbl_k) in enumerate(zip(
+                aux_preds, self.aux_weights, self.aux_inner_losses, aux_labels)):
+            view_k = k_idx + 1
+            wm_k = (aux_wmaps[k_idx]
+                    if aux_wmaps is not None else None)
+            aux_l = self._compute_loss_fp32(
+                loss_k, ap, lbl_k, weight_map=wm_k)
+            total = total + w_k * aux_l
+            if breakdown is not None:
+                breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())
+                breakdown[f"w_aux_{view_k}"] = float(w_k)
+        if breakdown is not None:
+            breakdown["L_total"] = float(total.detach().item())
+        return total
 
     def _squeeze_2_5d_keep_views(
         self,
