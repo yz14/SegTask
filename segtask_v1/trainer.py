@@ -833,24 +833,49 @@ class Trainer:
         label: torch.Tensor,
         wmap: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Collapse the C_res=1 channel for 2.5D mode.
+        """Collapse the C_res (multi-FOV) axis for 2.5D mode.
 
         Input shapes (post-augment, post-crop):
-          image: (B, 1, D, H, W) → (B, D, H, W)
-          label: (B, 1, D, H, W) raw int labels → (B, D, H, W)
-          wmap : (B, 1, D, H, W) per-voxel weights or None → (B, D, H, W)
+          image: (B, C_res, D, H, W) → (B, C_res * D, H, W)
+              Each FOV view contributes D channels stacked contiguously.
+              View 0 occupies channels [0, D); view i occupies
+              [i*D, (i+1)*D). The 2D model receives this layout directly;
+              ``MultiStemProj`` knows the chunk boundaries via the
+              ``in_ch_per_view`` it was built with (= D).
+          label: (B, C_res, D, H, W) raw int labels → (B, D, H, W)
+              Only view 0 (the 1× FOV, true geometry) is used for
+              supervision and metrics. Wider-FOV labels would correspond
+              to a different physical slab and have no defined alignment
+              with the 1× output.
+          wmap : (B, C_res, D, H, W) or None → (B, D, H, W)
+              Same view-0 selection rule as label, for the same reason.
 
-        The squeezed shape is the input contract for the 2D model and for
-        ``SliceChannelLoss``: D becomes the input-channel axis of the
-        model and the slice axis of the loss.
+        ``D becomes the slice axis`` of ``SliceChannelLoss`` and the
+        per-view input-channel slab of the 2D model.
+
+        With ``C_res == 1`` (legacy single-FOV) the reshape collapses to
+        the previous ``squeeze(1)`` and is bit-identical to pre-multi-FOV
+        behaviour.
         """
-        assert image.shape[1] == 1 and label.shape[1] == 1, (
-            "2.5D mode expects single-resolution dataset (C_res=1); got "
-            f"image={tuple(image.shape)}, label={tuple(label.shape)}")
-        image = image.squeeze(1)
-        label = label.squeeze(1)
+        if image.ndim != 5:
+            raise ValueError(
+                f"2.5D _squeeze expects rank-5 image (B, C_res, D, H, W); "
+                f"got shape={tuple(image.shape)}")
+        if label.shape[:2] != image.shape[:2]:
+            raise ValueError(
+                f"image / label batch+C_res mismatch: image="
+                f"{tuple(image.shape)}, label={tuple(label.shape)}")
+        B, C_res, D, H, W = image.shape
+        # (B, C_res, D, H, W) → (B, C_res*D, H, W). ``contiguous`` keeps
+        # the memory layout linear so downstream chunking (MultiStemProj
+        # uses torch.split) is a zero-copy view.
+        image = image.reshape(B, C_res * D, H, W).contiguous()
+        # Supervision uses ONLY the 1× FOV view (channel 0). Wider-FOV
+        # views feed the encoder but their resampled labels would not
+        # be voxel-aligned with the model output's slab.
+        label = label[:, 0]
         if wmap is not None:
-            wmap = wmap.squeeze(1)
+            wmap = wmap[:, 0]
         return image, label, wmap
 
     def _center_crop(

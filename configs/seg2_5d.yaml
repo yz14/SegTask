@@ -1,16 +1,28 @@
 # ============================================================================
 # 2.5D Segmentation Configuration —
-#   - 沿用 z_axis 单分辨率取片（multi_res_scales 必须为 [1.0]）
-#   - 训练时增强后将 (B,1,D,H,W) squeeze 为 (B,D,H,W) 喂给 2D 模型
+#   - 沿用 z_axis 取片；支持单 FOV 或多 z-FOV 上下文融合
+#   - 训练增强后将 (B, C_res, D, H, W) reshape 为 (B, C_res*D, H, W) 喂给 2D 模型
+#     (view 0 占前 D 通道，是真实 1× FOV，作为监督目标)
 #   - 模型输出 (B, num_fg*D, H, W) 由 SliceChannelLoss 拆为
-#     num_fg 组的 D 通道二值预测
+#     num_fg 组的 D 通道二值预测（与 view 0 几何严格对齐）
 #
 # 与 configs/seg3d.yaml 相比的关键差异：
 #   - data.patch_mode: "2_5d"
-#   - data.multi_res_scales: [1.0]   (强制)
+#   - data.multi_res_scales: [1.0]              单 FOV（legacy，等价于 1 通道 D 切片）
+#                            [1.0, 1.5, 2.0]    多 FOV：view 0 真几何，view 1..K 各
+#                                                取 round(D*s) 切片再 z 轴重采样回 D
+#                                                通道，提供更宽 z 上下文。
+#                            约束：multi_res_scales[0] 必须为 1.0（监督目标）。
 #   - data.patch_size:  D 较小（典型 8/12/16），H,W 可较大（典型 256/384）
-#   - model.spatial_dims: 2          (sync 自动设置；也可手写避免误解)
-#   - model.in_channels:  D          (sync 自动设置 = patch_size[0])
+#   - model.spatial_dims: 2                       (sync 自动设置；写出仅作可读性)
+#   - model.in_channels:  D * len(multi_res_scales) (sync 自动设置)
+#   - model.context_fusion: 多 FOV 时的 stem 融合策略
+#                            "multi_stem_proj" — 推荐（方案 A）。每个 view 独立 stem
+#                                                 + 1×1 ConvNormAct 融合回 base 通道，
+#                                                 编码器下游契约不变。
+#                            "shared_stem"     — 单 stem 跑 n_views*D 通道（更省参，
+#                                                 但物理异质通道共用一套滤波器）。
+#                            单 FOV 时该字段无效（自动退化为单 stem 路径，bit-equal）。
 #
 # 推荐用法：
 #   python -m segtask_v1.train --config configs/seg2_5d.yaml
@@ -61,10 +73,15 @@ data:
   patch_size: [12, 256, 256]
 
   # 必须为 "2_5d"。Config.sync() 会自动把 model.spatial_dims=2 +
-  # model.in_channels=12 同步到模型构造。
+  # model.in_channels = D * len(multi_res_scales) 同步到模型构造。
   patch_mode: "2_5d"
 
-  # 强制校验：2.5D 必须单分辨率。
+  # 多 z-FOV 上下文融合（方案 A）。
+  #   [1.0]            — 单 FOV，legacy 行为（等价 1 通道 D 切片）。
+  #   [1.0, 1.5, 2.0]  — 推荐：1× 真几何 + 1.5× / 2× 更宽 z 上下文（各 round(D*s) 切片
+  #                       中心对称，z 轴重采样回 D 通道）。
+  # 约束：multi_res_scales[0] 必须为 1.0（view 0 = 监督目标，几何与输出严格对齐）。
+  # 配套 `model.context_fusion` 选择 stem 融合策略；详见文件顶部注释。
   multi_res_scales: [1.0]
 
   # 数据增强后的 oversample 与裁剪适用 z_axis 同样的语义（仅放大 z 轴）。
@@ -166,6 +183,16 @@ model:
   deep_supervision: false
 
   stem_mode    : "conv3"
+
+  # 多 z-FOV 上下文融合策略（仅 patch_mode=2_5d 且 len(multi_res_scales)>1 生效）。
+  #   "multi_stem_proj" — 方案 A。每个 view 独立 stem + 1×1 融合回 base 通道（早融合）。
+  #   "hierarchical"    — 方案 C，推荐。view k 经 stride-2^k patchify stem 产出低分辨率
+  #                        特征，cat 注入到 encoder stage k 入口（粗 FOV 进深层语义）。
+  #                        约束：len(multi_res_scales) <= len(encoder_channels)，且
+  #                              patch_size[1:] 能被 2^(n_views-1) 整除。
+  #   "shared_stem"     — 单 stem 在 n_views*D 通道上跑（更省参，但物理异质共用滤波器）。
+  context_fusion: "multi_stem_proj"
+
   decoder_type : "unet"
   downsample_mode: "conv"
   upsample_mode  : "trilinear"

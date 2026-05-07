@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from .blocks import (
     _CONV, INTERP_SMOOTH,
     AttentionGate3D, ConvNormAct, Downsample, Upsample, get_norm)
-from .stem import build_stem
+from .stem import HierarchicalStems, build_context_stem, build_stem
 
 
 class Encoder(nn.Module):
@@ -46,17 +46,41 @@ class Encoder(nn.Module):
         activation: str = "leakyrelu",
         downsample_mode: str = "conv",
         stem_mode: str = "conv3",
-        spatial_dims: int = 3):
+        spatial_dims: int = 3,
+        context_n_views: int = 1,
+        context_fusion: str = "shared_stem"):
         super().__init__()
         self.spatial_dims = spatial_dims
         # Stem: project input to first channel count. The stem may introduce
         # a spatial stride (``patch2``/``patch4``) — ``stem_stride`` is
         # preserved as a property so the wrapping UNet can add a matching
         # final upsample when necessary.
-        self.stem, self.stem_stride = build_stem(
-            stem_mode, in_channels, stage_channels[0],
+        #
+        # Multi-FOV context fusion (2.5D mode): when ``context_n_views > 1``
+        # the input layout is ``(B, n_views * in_ch_per_view, *spatial)``
+        # with ``in_ch_per_view = in_channels // n_views``; the dispatcher
+        # in ``build_context_stem`` selects either a single shared stem
+        # ("shared_stem") or per-view independent stems + 1×1 fusion
+        # ("multi_stem_proj"). For ``context_n_views == 1`` the behaviour
+        # is bit-identical to the legacy single-stem path.
+        if context_n_views < 1:
+            raise ValueError(
+                f"context_n_views must be >= 1, got {context_n_views}")
+        if in_channels % context_n_views != 0:
+            raise ValueError(
+                f"in_channels ({in_channels}) must be divisible by "
+                f"context_n_views ({context_n_views})")
+        self.context_n_views = context_n_views
+        self.context_fusion = context_fusion
+        in_ch_per_view = in_channels // context_n_views
+        self.stem, self.stem_stride = build_context_stem(
+            mode=stem_mode, fusion=context_fusion,
+            n_views=context_n_views,
+            in_ch_per_view=in_ch_per_view,
+            out_ch=stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
-            activation=activation, spatial_dims=spatial_dims)
+            activation=activation, spatial_dims=spatial_dims,
+            stage_channels=stage_channels)
 
         # Encoder stages and downsampling
         self.stages = nn.ModuleList()
@@ -72,13 +96,62 @@ class Encoder(nn.Module):
                         norm_type=norm_type, norm_groups=norm_groups,
                         mode=downsample_mode, spatial_dims=spatial_dims))
 
+        # ----- Plan C: per-injection-level cat-fusion 1×1 ConvNormAct ----
+        # Built only when the stem is ``HierarchicalStems``. Each fuse
+        # consumes ``cat(main_post_downsample, aux_feat)`` at level k
+        # (channel count ``stage_channels[k-1] + aux_out_channels[k-1]``)
+        # and projects back to ``stage_channels[k-1]`` so the downstream
+        # stage block sees its expected input channel count — keeping
+        # the encoder/decoder/skip contract bit-identical to the non-
+        # hierarchical paths. ``ModuleDict`` is keyed by ``str(level)``.
+        self.aux_fuse = nn.ModuleDict()
+        if isinstance(self.stem, HierarchicalStems):
+            hs = self.stem
+            for idx, level in enumerate(hs.aux_levels):
+                main_ch = stage_channels[level - 1]
+                aux_ch = hs.aux_out_channels[idx]
+                self.aux_fuse[str(level)] = ConvNormAct(
+                    main_ch + aux_ch, main_ch,
+                    kernel_size=1, stride=1, padding=0,
+                    norm_type=norm_type, norm_groups=norm_groups,
+                    activation=activation, spatial_dims=spatial_dims)
+
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Returns features from each level: [level_0, level_1, ..., level_N]."""
-        x = self.stem(x)
-        features = []
+        """Returns features from each level: [level_0, level_1, ..., level_N].
+
+        Plan C (hierarchical fusion): when ``self.stem`` is
+        ``HierarchicalStems``, the input is split per view; view 0 drives
+        the main stem and aux views are stem-encoded into low-resolution
+        features that get cat-fused into the main path immediately after
+        the matching downsample step.
+        """
+        if isinstance(self.stem, HierarchicalStems):
+            chunks = self.stem.split_views(x)
+            x = self.stem.forward_main(chunks[0])
+            aux_feats = self.stem.forward_aux(chunks)
+        else:
+            x = self.stem(x)
+            aux_feats = {}
+
+        features: List[torch.Tensor] = []
         for i, stage in enumerate(self.stages):
             if i > 0:
                 x = self.downsamples[i - 1](x)
+                if i in aux_feats:
+                    aux = aux_feats[i]
+                    if aux.shape[2:] != x.shape[2:]:
+                        # Defensive: aux stem strides are computed to
+                        # match exactly. A mismatch implies a config /
+                        # patch_size combination that misaligns spatial
+                        # dims — fail fast with a precise diagnostic
+                        # rather than silently breaking via interpolate.
+                        raise RuntimeError(
+                            f"Plan C aux feature spatial mismatch at "
+                            f"level {i}: main={tuple(x.shape[2:])}, "
+                            f"aux={tuple(aux.shape[2:])}. Check that "
+                            f"input spatial dims are divisible by the "
+                            f"aux stem stride.")
+                    x = self.aux_fuse[str(i)](torch.cat([x, aux], dim=1))
             x = stage(x)
             features.append(x)
         return features

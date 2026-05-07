@@ -157,12 +157,24 @@ def build_model(cfg: Config) -> UNet3D:
     #     SliceChannelLoss splits the (num_fg * D)-channel output into
     #     per-fg-class D-slice binary masks.
     if cfg.data.patch_mode == "2_5d":
+        # 2.5D mode output is always num_fg * D — independent of how many
+        # context z-FOV views feed the stem. Multi-FOV affects ONLY the
+        # stem's input-channel count (D * n_views), not the head output:
+        # the loss / metrics consume the 1× FOV's true geometry.
         num_res = 1
         D = int(cfg.data.patch_size[0])
         out_classes = num_fg * D
     else:
         num_res = len(cfg.data.multi_res_scales)
         out_classes = num_fg * num_res
+
+    # Number of multi-FOV context views fed to the stem (2.5D mode only).
+    # In 3D modes the stem already consumes ``len(multi_res_scales)`` input
+    # channels directly, with no per-view stem split — so n_views stays 1.
+    if cfg.data.patch_mode == "2_5d":
+        context_n_views = max(len(cfg.data.multi_res_scales), 1)
+    else:
+        context_n_views = 1
 
     # Resolve per-stage block counts.  Encoder has ``n_levels`` stages;
     # a classical UNet-style decoder has ``n_levels - 1`` stages.  For
@@ -210,7 +222,9 @@ def build_model(cfg: Config) -> UNet3D:
         activation=mc.activation,
         downsample_mode=mc.downsample_mode,
         stem_mode=mc.stem_mode,
-        spatial_dims=spatial_dims)
+        spatial_dims=spatial_dims,
+        context_n_views=context_n_views,
+        context_fusion=getattr(mc, "context_fusion", "shared_stem"))
 
     # Build decoder — classical UNet / UNet++ / UNet3+.
     if mc.decoder_type == "unet3p":
@@ -252,7 +266,8 @@ def build_model(cfg: Config) -> UNet3D:
         "Built UNet3D [%s/%s, decoder=%s, preset=%s]: "
         "enc=%.2fM, dec=%.2fM, total=%.2fM, channels=%s, "
         "enc_blocks=%s, dec_blocks=%s, out_classes=%d (fg=%d, res=%d), "
-        "stem=%s(stride=%d), down=%s, up=%s, skip=%s, attn=%s, skip_attn=%s",
+        "stem=%s(stride=%d, n_views=%d, fusion=%s), "
+        "down=%s, up=%s, skip=%s, attn=%s, skip_attn=%s",
         mc.backbone, mc.block_type, mc.decoder_type, mc.resenc_preset,
         pc["encoder"] / 1e6, pc["decoder"] / 1e6, pc["total"] / 1e6,
         enc_channels,
@@ -260,6 +275,7 @@ def build_model(cfg: Config) -> UNet3D:
         out_classes, num_fg,
         num_res if num_res > 0 else 1,
         mc.stem_mode, encoder.stem_stride,
+        context_n_views, getattr(mc, "context_fusion", "shared_stem"),
         mc.downsample_mode, mc.upsample_mode, mc.skip_mode,
         mc.attention_type, mc.skip_attention)
 

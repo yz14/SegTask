@@ -445,21 +445,27 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         val_paths["region_weight_paths"] = [rw_paths_all[i] for i in val_idx]
 
     if dc.patch_mode == "2_5d":
-        # 2.5D mode reuses the z_axis dataset verbatim with a single
-        # resolution (forced by Config.validate). The squeeze that turns
-        # (C_res=1, D, H, W) into a 2D (D-channel) input happens inside
-        # the trainer AFTER GPU augmentation, so the dataset itself is
-        # bit-identical to the legacy z_axis single-res path.
+        # 2.5D mode reuses the z_axis dataset verbatim, INCLUDING its
+        # ``multi_res_scales`` multi-FOV stacking. Each scale ``s`` extracts
+        # ``round(eD * s)`` slices around the same z-center (edge-padded for
+        # s>1.0; ``z_boundary_mode`` for s==1.0) and resizes back to
+        # ``(eD, pH, pW)`` — yielding a (C_res=n_views, eD, pH, pW) channel
+        # stack. The trainer's ``_squeeze_2_5d`` then collapses (B, n_views,
+        # D, H, W) → (B, n_views * D, H, W) for the 2D model and selects
+        # view 0 as the supervision target (true geometry).
+        n_views = max(len(dc.multi_res_scales), 1)
         logger.info(
-            "Using 2.5D patch mode (oversample=%.2f, z_boundary=%s) — "
-            "z_axis dataset, trainer squeezes C_res=1 to feed a 2D model "
-            "with D=%d input channels.",
+            "Using 2.5D patch mode (oversample=%.2f, z_boundary=%s, "
+            "scales=%s, n_views=%d) — z_axis dataset; trainer reshapes "
+            "(B, %d, D=%d, H, W) → (B, %d, H, W) for the 2D model.",
             train_oversample, z_kwargs["z_boundary_mode"],
-            int(dc.patch_size[0]))
+            dc.multi_res_scales, n_views,
+            n_views, int(dc.patch_size[0]),
+            n_views * int(dc.patch_size[0]))
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio=train_oversample,
-            multi_res_scales=[1.0],
+            multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
@@ -468,7 +474,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio=1.0,
-            multi_res_scales=[1.0],
+            multi_res_scales=dc.multi_res_scales,
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,

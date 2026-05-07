@@ -50,22 +50,41 @@ def test_config_2_5d_sync():
     _ok("Config sync sets spatial_dims=2 + in_channels=D")
 
 
-def test_config_2_5d_rejects_multi_res():
+def test_config_2_5d_multi_fov_sync():
+    """2.5D multi-FOV: sync should set in_channels = D * n_views, validate should pass."""
     from segtask_v1.config import Config
     cfg = Config()
     cfg.data.patch_mode = "2_5d"
     cfg.data.patch_size = [12, 32, 32]
     cfg.data.label_values = [0, 1, 2]
     cfg.data.num_classes = 3
-    cfg.data.multi_res_scales = [1.0, 1.5]
+    cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+    cfg.model.context_fusion = "multi_stem_proj"
+    cfg.sync()
+    cfg.validate()
+    assert cfg.model.spatial_dims == 2
+    assert cfg.model.in_channels == 12 * 3, (
+        f"sync should set in_channels = D*n_views = 36; got {cfg.model.in_channels}")
+    _ok("Config sync: 2.5D multi-FOV in_channels = D * n_views")
+
+
+def test_config_2_5d_rejects_view0_not_1x():
+    """View 0 must be the 1× FOV (true geometry); validate should reject."""
+    from segtask_v1.config import Config
+    cfg = Config()
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.patch_size = [12, 32, 32]
+    cfg.data.label_values = [0, 1, 2]
+    cfg.data.num_classes = 3
+    cfg.data.multi_res_scales = [1.5, 2.0]  # missing the mandatory 1.0 lead
     cfg.sync()
     try:
         cfg.validate()
     except AssertionError as e:
-        assert "2.5D mode" in str(e)
-        _ok("Config validate rejects multi-res in 2.5D mode")
+        assert "view 0" in str(e) or "1.0" in str(e)
+        _ok("Config validate rejects 2.5D multi_res_scales[0] != 1.0")
         return
-    raise AssertionError("validate should reject multi_res_scales != [1.0]")
+    raise AssertionError("validate should reject multi_res_scales[0] != 1.0")
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +201,202 @@ def test_factory_2_5d_out_channels():
     assert y.shape == (1, num_fg * D, 32, 32), \
         f"expected (1, {num_fg * D}, 32, 32); got {tuple(y.shape)}"
     _ok("Factory 2.5D model: out_channels = num_fg * D")
+
+
+def test_factory_2_5d_multi_fov_multi_stem_proj():
+    """Multi-FOV (3 z-FOVs) with `multi_stem_proj` fusion.
+
+    Verifies:
+      - Encoder builds a `MultiStemProj` with 3 sub-stems.
+      - Forward consumes (B, n_views*D, H, W) and produces (B, num_fg*D, H, W)
+        — head output is independent of n_views (only view 0 supervises).
+      - Strictly more parameters than the `shared_stem` baseline (sanity:
+        per-view stems are independent weight banks).
+    """
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.models.stem import MultiStemProj
+
+    D, num_fg = 8, 2
+    encoder = (16, 32, 64)
+    n_views = 3
+
+    def _build(scales, fusion):
+        cfg = Config()
+        cfg.data.image_dir = ""
+        cfg.data.label_dir = ""
+        cfg.data.patch_mode = "2_5d"
+        cfg.data.patch_size = [D, 32, 32]
+        cfg.data.label_values = [0] + list(range(1, num_fg + 1))
+        cfg.data.num_classes = num_fg + 1
+        cfg.data.multi_res_scales = list(scales)
+        cfg.model.encoder_channels = list(encoder)
+        cfg.model.context_fusion = fusion
+        cfg.sync()
+        cfg.validate()
+        return cfg, build_model(cfg).eval()
+
+    cfg_multi, model_multi = _build([1.0, 1.5, 2.0], "multi_stem_proj")
+    assert cfg_multi.model.in_channels == D * n_views
+    # Locate the underlying Encoder regardless of UNet wrapper attr names.
+    encoder_mod = None
+    for m in model_multi.modules():
+        if hasattr(m, "stem") and hasattr(m, "context_n_views"):
+            encoder_mod = m
+            break
+    assert encoder_mod is not None, "could not locate Encoder in built model"
+    assert encoder_mod.context_n_views == n_views
+    assert isinstance(encoder_mod.stem, MultiStemProj), (
+        f"expected MultiStemProj, got {type(encoder_mod.stem).__name__}")
+    assert len(encoder_mod.stem.stems) == n_views
+    assert encoder_mod.stem.in_ch_per_view == D
+
+    x = torch.randn(1, D * n_views, 32, 32)
+    y = model_multi(x)
+    # Head output stays at num_fg * D regardless of n_views.
+    assert y.shape == (1, num_fg * D, 32, 32), (
+        f"multi-FOV head shape mismatch: {tuple(y.shape)}")
+
+    # Param-count sanity: multi_stem_proj should add ~(n_views-1) × stem
+    # params + 1×1 fusion vs. shared_stem baseline.
+    _, model_shared = _build([1.0, 1.5, 2.0], "shared_stem")
+    p_multi = sum(p.numel() for p in model_multi.parameters())
+    p_shared = sum(p.numel() for p in model_shared.parameters())
+    assert p_multi > p_shared, (
+        f"multi_stem_proj should have more params than shared_stem; "
+        f"multi={p_multi}, shared={p_shared}")
+    _ok("Factory 2.5D multi-FOV (multi_stem_proj): MultiStemProj wired, "
+        "head invariant, params > shared_stem")
+
+
+def test_factory_2_5d_multi_fov_hierarchical():
+    """Multi-FOV (3 z-FOVs) with `hierarchical` fusion (Plan C).
+
+    Verifies:
+      - Encoder builds a `HierarchicalStems` with 1 main + 2 aux stems
+        (strides 2 and 4 for stem_mode='conv3').
+      - Aux features inject after Downsample-1 / Downsample-2 with the
+        right spatial/channel match — fusion convs `aux_fuse[1]` /
+        `aux_fuse[2]` exist with the expected (in→out) shape.
+      - Forward consumes (B, n_views*D, H, W) and produces
+        (B, num_fg*D, H, W) — head invariant to fusion strategy.
+      - Validate rejects n_views > n_stages.
+      - Validate rejects H/W not divisible by deepest aux stride.
+    """
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.models.stem import HierarchicalStems
+
+    D, num_fg = 8, 2
+    n_views = 3
+    encoder_channels = [16, 32, 64]
+
+    cfg = Config()
+    cfg.data.image_dir = ""
+    cfg.data.label_dir = ""
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.patch_size = [D, 32, 32]  # 32 % 4 == 0 → OK for deepest stride 4
+    cfg.data.label_values = [0, 1, 2]
+    cfg.data.num_classes = 3
+    cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+    cfg.model.encoder_channels = list(encoder_channels)
+    cfg.model.context_fusion = "hierarchical"
+    cfg.model.stem_mode = "conv3"
+    cfg.sync()
+    cfg.validate()
+    model = build_model(cfg).eval()
+
+    encoder_mod = next(
+        m for m in model.modules()
+        if hasattr(m, "stem") and hasattr(m, "context_n_views"))
+    assert isinstance(encoder_mod.stem, HierarchicalStems)
+    assert encoder_mod.context_n_views == n_views
+    assert len(encoder_mod.stem.aux_stems) == n_views - 1
+    assert encoder_mod.stem.aux_levels == [1, 2]
+    # stem_mode='conv3' → main_stem_stride=1; aux strides = 2, 4.
+    assert encoder_mod.stem.aux_strides == [2, 4]
+    # Default aux_out_channels = stage_channels[level - 1] = [16, 32].
+    assert encoder_mod.stem.aux_out_channels == [16, 32]
+    # aux_fuse 1×1 convs must exist for both injection levels.
+    assert "1" in encoder_mod.aux_fuse and "2" in encoder_mod.aux_fuse
+
+    # Forward with deterministic input.
+    x = torch.randn(1, D * n_views, 32, 32)
+    y = model(x)
+    assert y.shape == (1, num_fg * D, 32, 32), (
+        f"hierarchical head shape mismatch: {tuple(y.shape)}")
+
+    # ----- Negative cases: validate() should reject illegal combos -----
+    cfg_bad = Config()
+    cfg_bad.data.patch_mode = "2_5d"
+    cfg_bad.data.patch_size = [D, 32, 32]
+    cfg_bad.data.label_values = [0, 1, 2]
+    cfg_bad.data.num_classes = 3
+    # 4 views but only 3 stages → should fail.
+    cfg_bad.data.multi_res_scales = [1.0, 1.25, 1.5, 2.0]
+    cfg_bad.model.encoder_channels = [16, 32, 64]
+    cfg_bad.model.context_fusion = "hierarchical"
+    cfg_bad.sync()
+    try:
+        cfg_bad.validate()
+    except AssertionError as e:
+        assert "hierarchical" in str(e) and "n_stages" in str(e)
+    else:
+        raise AssertionError("validate should reject n_views > n_stages")
+
+    # H/W not divisible by deepest stride (2^(n_views-1)=4 for 3 views).
+    cfg_bad2 = Config()
+    cfg_bad2.data.patch_mode = "2_5d"
+    cfg_bad2.data.patch_size = [D, 30, 30]  # 30 % 4 != 0
+    cfg_bad2.data.label_values = [0, 1, 2]
+    cfg_bad2.data.num_classes = 3
+    cfg_bad2.data.multi_res_scales = [1.0, 1.5, 2.0]
+    cfg_bad2.model.encoder_channels = [16, 32, 64]
+    cfg_bad2.model.context_fusion = "hierarchical"
+    cfg_bad2.sync()
+    try:
+        cfg_bad2.validate()
+    except AssertionError as e:
+        assert "divisible" in str(e)
+    else:
+        raise AssertionError(
+            "validate should reject patch_size not divisible by deepest aux stride")
+
+    _ok("Factory 2.5D multi-FOV (hierarchical): HierarchicalStems wired, "
+        "aux_fuse[1,2] built, head invariant, validate rejects bad shapes")
+
+
+def test_factory_2_5d_multi_fov_shared_stem():
+    """Multi-FOV with `shared_stem` fusion = single stem on n_views*D channels."""
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.models.stem import MultiStemProj
+
+    D, num_fg = 8, 2
+    cfg = Config()
+    cfg.data.image_dir = ""
+    cfg.data.label_dir = ""
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.patch_size = [D, 32, 32]
+    cfg.data.label_values = [0, 1, 2]
+    cfg.data.num_classes = 3
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.model.encoder_channels = [16, 32, 64]
+    cfg.model.context_fusion = "shared_stem"
+    cfg.sync()
+    cfg.validate()
+    model = build_model(cfg).eval()
+
+    encoder_mod = next(
+        m for m in model.modules()
+        if hasattr(m, "stem") and hasattr(m, "context_n_views"))
+    # shared_stem path: single stem, NOT a MultiStemProj.
+    assert not isinstance(encoder_mod.stem, MultiStemProj)
+
+    x = torch.randn(1, D * 2, 32, 32)
+    y = model(x)
+    assert y.shape == (1, num_fg * D, 32, 32)
+    _ok("Factory 2.5D multi-FOV (shared_stem): legacy single-stem path")
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +553,172 @@ def test_predictor_2_5d_inference():
         _ok("Predictor 2.5D end-to-end (no TTA)")
 
 
+def test_end_to_end_2_5d_multi_fov_one_step():
+    """End-to-end: 2.5D multi-FOV pipeline through dataset → trainer → predictor.
+
+    Exercises the full multi-FOV channel-layout contract:
+      - SegDataset3D yields (B, C_res=n_views, D, H, W) for `multi_res_scales` > [1.0].
+      - Trainer._squeeze_2_5d collapses to (B, n_views*D, H, W) for the 2D model.
+      - SliceChannelLoss receives (B, num_fg*D, H, W) head output and view-0 label.
+      - Predictor's _reshape_2_5d_input reproduces the same layout at inference.
+    """
+    from segtask_v1.config import Config
+    from segtask_v1.data.loader import build_dataloaders
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.predictor import Predictor
+    from segtask_v1.trainer import Trainer
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        img_dir, lbl_dir = _make_synthetic_dataset(
+            td, n_volumes=4, shape=(20, 64, 64), num_fg=2, seed=2)
+
+        cfg = Config()
+        cfg.data.image_dir = img_dir
+        cfg.data.label_dir = lbl_dir
+        cfg.data.patch_mode = "2_5d"
+        cfg.data.patch_size = [12, 32, 32]
+        cfg.data.label_values = [0, 1, 2]
+        cfg.data.num_classes = 3
+        # 3 z-FOV views: 1×, 1.5×, 2× — view 0 is the supervision target.
+        cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+        cfg.data.batch_size = 1
+        cfg.data.num_workers = 0
+        cfg.data.samples_per_volume = 1
+        cfg.data.foreground_oversample_ratio = 1.0
+        cfg.data.intensity_min = -200.0
+        cfg.data.intensity_max = 200.0
+        cfg.data.cache_mode = "memory"
+        cfg.model.encoder_channels = [16, 32, 64]
+        cfg.model.context_fusion = "multi_stem_proj"
+        cfg.model.deep_supervision = False
+        cfg.augment.enabled = False
+        cfg.train.epochs = 1
+        cfg.train.use_amp = False
+        cfg.train.use_ema = False
+        cfg.train.warmup_epochs = 0
+        cfg.train.compile_mode = "none"
+        cfg.train.output_dir = str(td / "out")
+        cfg.train.log_every = 1
+        cfg.train.save_every = 9999
+        cfg.train.val_every = 1
+        cfg.predict.batch_size = 1
+        cfg.predict.tta_flip = False
+        cfg.predict.z_overlap = 0.5
+        cfg.sync()
+        cfg.validate()
+
+        # ----- dataloader contract -------------------------------------
+        train_loader, val_loader = build_dataloaders(cfg)
+        sample = next(iter(train_loader))
+        # (B, C_res=n_views, eD, pH, pW)
+        assert sample["image"].shape[1] == 3, (
+            f"expected C_res=3 for 3-FOV config; got {sample['image'].shape}")
+        assert sample["image"].shape[2] == cfg.data.patch_size[0]
+
+        # ----- trainer one-epoch dry run -------------------------------
+        device = torch.device("cpu")
+        model = build_model(cfg)
+        assert cfg.model.in_channels == cfg.data.patch_size[0] * 3
+
+        trainer = Trainer(model, cfg, train_loader, val_loader, device)
+        trainer.fit()
+
+        # ----- predictor end-to-end (multi-FOV path) -------------------
+        model.eval()
+        predictor = Predictor(model, cfg, device)
+        img_paths = sorted(Path(img_dir).glob("*.nii.gz"))
+        result = predictor.predict_volume(str(img_paths[0]))
+        assert result["label_map"].shape == (20, 64, 64)
+        assert result["probabilities"].shape == (2, 20, 64, 64)
+        assert (result["probabilities"] >= 0).all()
+        assert (result["probabilities"] <= 1).all()
+        _ok("Trainer + Predictor end-to-end: 2.5D multi-FOV (3 views, "
+            "multi_stem_proj)")
+
+
+def test_end_to_end_2_5d_hierarchical_one_step():
+    """End-to-end Plan C: dataset → trainer → predictor with hierarchical fusion.
+
+    Uses 3 z-FOV views and `context_fusion='hierarchical'`. Verifies the
+    multi-FOV channel-layout contract is preserved end-to-end and that
+    aux features inject correctly through one full training step + a
+    full sliding-window predict.
+    """
+    from segtask_v1.config import Config
+    from segtask_v1.data.loader import build_dataloaders
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.models.stem import HierarchicalStems
+    from segtask_v1.predictor import Predictor
+    from segtask_v1.trainer import Trainer
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        img_dir, lbl_dir = _make_synthetic_dataset(
+            td, n_volumes=4, shape=(20, 64, 64), num_fg=2, seed=3)
+
+        cfg = Config()
+        cfg.data.image_dir = img_dir
+        cfg.data.label_dir = lbl_dir
+        cfg.data.patch_mode = "2_5d"
+        cfg.data.patch_size = [12, 32, 32]   # 32 % 4 == 0
+        cfg.data.label_values = [0, 1, 2]
+        cfg.data.num_classes = 3
+        cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
+        cfg.data.batch_size = 1
+        cfg.data.num_workers = 0
+        cfg.data.samples_per_volume = 1
+        cfg.data.foreground_oversample_ratio = 1.0
+        cfg.data.intensity_min = -200.0
+        cfg.data.intensity_max = 200.0
+        cfg.data.cache_mode = "memory"
+        cfg.model.encoder_channels = [16, 32, 64]
+        cfg.model.context_fusion = "hierarchical"
+        cfg.model.stem_mode = "conv3"
+        cfg.model.deep_supervision = False
+        cfg.augment.enabled = False
+        cfg.train.epochs = 1
+        cfg.train.use_amp = False
+        cfg.train.use_ema = False
+        cfg.train.warmup_epochs = 0
+        cfg.train.compile_mode = "none"
+        cfg.train.output_dir = str(td / "out")
+        cfg.train.log_every = 1
+        cfg.train.save_every = 9999
+        cfg.train.val_every = 1
+        cfg.predict.batch_size = 1
+        cfg.predict.tta_flip = False
+        cfg.predict.z_overlap = 0.5
+        cfg.sync()
+        cfg.validate()
+
+        train_loader, val_loader = build_dataloaders(cfg)
+        sample = next(iter(train_loader))
+        assert sample["image"].shape[1] == 3  # C_res=n_views
+
+        device = torch.device("cpu")
+        model = build_model(cfg)
+        # Sanity: the encoder really uses HierarchicalStems.
+        encoder_mod = next(
+            m for m in model.modules()
+            if hasattr(m, "stem") and hasattr(m, "context_n_views"))
+        assert isinstance(encoder_mod.stem, HierarchicalStems)
+
+        trainer = Trainer(model, cfg, train_loader, val_loader, device)
+        trainer.fit()
+
+        model.eval()
+        predictor = Predictor(model, cfg, device)
+        img_paths = sorted(Path(img_dir).glob("*.nii.gz"))
+        result = predictor.predict_volume(str(img_paths[0]))
+        assert result["label_map"].shape == (20, 64, 64)
+        assert result["probabilities"].shape == (2, 20, 64, 64)
+        assert (result["probabilities"] >= 0).all()
+        assert (result["probabilities"] <= 1).all()
+        _ok("Trainer + Predictor end-to-end: 2.5D hierarchical (3 views, "
+            "Plan C)")
+
+
 def test_predictor_2_5d_inference_tta():
     """R4: predict_volume with TTA on must produce same shape + valid range."""
     from segtask_v1.config import Config
@@ -408,14 +789,20 @@ def main():
     tests = [
         # R3 — config / loss / factory / loader / trainer
         test_config_2_5d_sync,
-        test_config_2_5d_rejects_multi_res,
+        test_config_2_5d_multi_fov_sync,
+        test_config_2_5d_rejects_view0_not_1x,
         test_slice_channel_loss_forward,
         test_slice_channel_loss_with_weight_map,
         test_slice_channel_split_for_metrics,
         test_slice_channel_loss_invalid_shapes,
         test_factory_2_5d_out_channels,
+        test_factory_2_5d_multi_fov_multi_stem_proj,
+        test_factory_2_5d_multi_fov_hierarchical,
+        test_factory_2_5d_multi_fov_shared_stem,
         test_regression_3d_factory_still_works,
         test_end_to_end_2_5d_one_step,
+        test_end_to_end_2_5d_multi_fov_one_step,
+        test_end_to_end_2_5d_hierarchical_one_step,
         # R4 — predictor
         test_predictor_2_5d_inference,
         test_predictor_2_5d_inference_tta,

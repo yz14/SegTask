@@ -16,8 +16,8 @@
 # =====================================================================
 data:
   # Source directories for NIfTI volumes. Image / label filenames must match.
-  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
-  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
+  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
+  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
@@ -30,7 +30,7 @@ data:
   #   原体积坐标系（ROI 外置零=背景），保持 NIfTI 形状/affine 不变。
   #   命令行 --bbox 可覆盖；--bbox '' 强制禁用。
   # 留空字符串 = 完全禁用（即原 full-volume 行为）。
-  bbox_dir   : ""
+  bbox_dir   : "F:/BaiduNetdiskDownload/bone_bbox"
   bbox_suffix: ".nii.gz"
 
   # ---- Optional per-sample region-weight (loss weighting) ------------
@@ -44,18 +44,18 @@ data:
   # 在数据增强中：与 image/label 共享空间变换，但用 **bilinear** 插值
   #   （而非 label 的 nearest），保留手工标注的连续权重梯度。
   # 留空 = 禁用文件版（仍可用 `loss.region_weights` 的全局映射）。
-  region_weight_dir   : ""
+  region_weight_dir   : "F:/BaiduNetdiskDownload/lung_weight"
   region_weight_suffix: ".nii.gz"
 
   # Integer label values in the mask, ordered [bg, fg1, fg2, ...].
   # Empty list => auto-detect from all label files on first run.
   # Example: [0, 1, 2] for background + 2 foreground classes.
-  label_values: []
-  num_classes : 0          # 0 => auto-set from len(label_values)
+  label_values: [0, 1, 2]
+  num_classes : 3          # 0 => auto-set from len(label_values)
 
   # ---- Patch extraction ----------------------------------------------
   # 3D patch size fed to the model: [D, H, W].
-  patch_size: [64, 128, 128]
+  patch_size: [32, 256, 256]
 
   # patch_mode — how each training sample is extracted from the volume.
   #   "z_axis": 仅沿 z 轴滑块；x,y 保持全尺寸 resize 到 (pH, pW)。
@@ -80,7 +80,7 @@ data:
   #   cubic  : 3 轴同比放大。
   #   whole  : 3 轴同比放大（整卷 resize 到 ratio 倍 patch_size 后再 crop）。
   # 建议：打开 random_affine/elastic 时设 1.3~1.5；否则保 1.0。
-  aug_oversample_ratio: 1.0
+  aug_oversample_ratio: 1.5
 
   # Multi-resolution input — stack multiple physical FOV 视图作为输入通道。
   # [1.0] 单分辨率（legacy 1 通道）；[1.0, 1.5, 2.0] 三分辨率（3 通道）。
@@ -117,7 +117,7 @@ data:
   # spatial sampling). 0.0 = 纯均匀；0.5 = 一半样本强制 fg 中心。
   # z_axis 模式：对应 z 切片前景过采样；cubic：3D 前景体素过采样；
   # whole 模式：此参数被忽略（无中心采样）。
-  foreground_oversample_ratio: 0.5
+  foreground_oversample_ratio: 0.4
 
   # Samples per volume per epoch（控制 epoch 长度）：
   #   epoch 内每卷产出多少个（位置/增广各异）的训练样本。
@@ -127,7 +127,7 @@ data:
   # cache_mode: "none" | "memory"
   #   memory: LRU 内存缓存已解码的体数据（image + label），加速 I/O。
   cache_mode: "memory"
-  # cache_max_volumes: 0  # 0 = 不限（可能 OOM）；建议 ≈ num_workers * 少量
+  cache_max_volumes: 1  # 0 = 不限（可能 OOM）；建议 ≈ num_workers * 少量
 
 
 # =====================================================================
@@ -193,14 +193,14 @@ model:
 
   # 每一层编码器通道数。列表长度即网络层数（=下采样次数+1）。
   # 5 级 = 4 次下采样。
-  encoder_channels: [32, 64, 128, 256, 512]
+  encoder_channels: [32, 64, 128, 256, 256]
 
   # 每级的 block 数（默认）。若要每级不同块数，使用
   # encoder_blocks_per_stage / decoder_blocks_per_stage。
   blocks_per_level: 2
 
   # block_type (resnet 专用)："basic" | "preact" | "bottleneck"
-  # block_type: "basic"
+  block_type: "basic"
 
   # 非对称每级 block 数（nnU-Net ResEncUNet 风格）。留空则用 blocks_per_level。
   # 长度必须 = len(encoder_channels)（decoder 为 -1）。
@@ -241,14 +241,14 @@ model:
   # ---- Stem --------------------------------------------------------------
   # 首层设计："conv3" | "conv7" | "dual" | "patch2" | "patch4"
   # patchN 会将输入分辨率降 N 倍；UNet3D 输出端会补一个匹配的 trilinear 上采样。
-  # stem_mode: "conv3"
+  stem_mode: "conv3"
 
   # ---- Decoder topology -----------------------------------------------
   # "unet"   : 经典对称 UNet（默认）
   # "unetpp" : UNet++（DLMIA 2018 Zhou et al.）nested dense
   # "unet3p" : Full-scale skip UNet 3+（ICASSP 2020 Huang et al.）
-  # decoder_type: "unet"
-  # unet3p_cat_channels: 64  # 仅 unet3p 使用
+  decoder_type: "unet"
+  unet3p_cat_channels: 64  # 仅 unet3p 使用
 
   # ---- Down / Up sampling ---------------------------------------------
   # downsample_mode:
@@ -257,7 +257,7 @@ model:
   #   "avgpool"       : 3D average pool
   #   "blurpool"      : BlurPool（抗混叠）
   #   "pixelunshuffle": PixelUnshuffle / space-to-depth
-  # downsample_mode: "conv"
+  downsample_mode: "conv"
 
   # upsample_mode:
   #   "transpose"    : 转置卷积（默认）
@@ -304,7 +304,7 @@ loss:
   #   "bce_lovasz"         : BCE + Lovász
   #   "gdl_bce"            : Generalized Dice + BCE
   #   "gdl_focal"          : Generalized Dice + Focal
-  name: "dice_bce"
+  name: "dice_focal"
 
   # Compound 组分权重 [loss1_w, loss2_w]（仅 dice_bce / dice_focal 使用）。
   compound_weights: [1.0, 1.0]
@@ -315,14 +315,14 @@ loss:
   # Per-region 空间权重：按 label_values 逐值给一个权重（包含 bg）。
   # 例：label_values=[0,1,2]，region_weights=[1.0, 2.0, 1.0]
   #     => 标签值为 1 的体素在 loss 中权重 2.0。空列表 = 禁用。
-  region_weights: [1.0, 2.0]
+  region_weights: [1.0, 2.0, 1.0]
 
   # ---- Dice 设定 ------------------------------------------------------
   dice_smooth : 1.0e-5        # 防止 0/0
   dice_squared: false         # true → Dice^2 变体（收敛更稳但梯度弱）
 
   # ---- Focal 设定 -----------------------------------------------------
-  focal_alpha: 0.25           # 正类权重
+  focal_alpha: 0.5           # 正类权重
   focal_gamma: 2.0            # 难样本指数
 
   # ---- Tversky 设定 ---------------------------------------------------
@@ -371,7 +371,7 @@ loss:
 # TRAIN — 训练循环 / 优化器 / 调度器 / 混合精度 / 检查点
 # =====================================================================
 train:
-  epochs: 200
+  epochs: 100
 
   # ---- Optimizer ------------------------------------------------------
   # optimizer: "adam" | "adamw" | "sgd"
@@ -419,7 +419,7 @@ train:
   use_amp: true
   # amp_dtype: "float16" | "fp16" | "bfloat16" | "bf16"
   #   fp16 需要 GradScaler（自动启用）；bf16 无需 scaler，数值稳定性更好。
-  amp_dtype: "float16"
+  amp_dtype: "bfloat16"
 
   # ---- torch.compile (PyTorch 2+) ------------------------------------
   # compile_mode: "none" | "default" | "reduce-overhead" | "max-autotune"
@@ -430,14 +430,14 @@ train:
   ema_decay: 0.999
 
   # ---- Checkpointing --------------------------------------------------
-  output_dir: "outputs/seg3d_resnet"
+  output_dir: "outputs/lung_bone_zaxis"
   save_every: 10                     # 每 N epochs 存一次周期性 checkpoint
   save_best_metric: "mean_dice"     # 跟踪哪个验证指标决定 best
   # save_best_mode: "max" | "min"
   save_best_mode: "max"
 
   # Early stopping（连续 N 次验证无提升就停）。0 = 禁用。
-  early_stopping: 0
+  early_stopping: 15
 
   # ---- Logging --------------------------------------------------------
   log_every: 10                     # 每 N 个 micro-step 记一次训练 loss

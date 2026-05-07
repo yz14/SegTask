@@ -411,12 +411,9 @@ class Predictor:
         otherwise (AMP, TTA, deep-supervision unwrap).
         """
         if self.patch_mode == "2_5d":
-            if x.shape[1] != 1:
-                raise ValueError(
-                    "2.5D inference expects single-resolution input "
-                    f"(C_res=1); got x.shape={tuple(x.shape)}")
-            x_2d = x.squeeze(1)  # (B, D, H, W)
-            B, D, H, W = x_2d.shape
+            x_2d = self._reshape_2_5d_input(x)  # (B, C_res*D, H, W)
+            D = self.patch_D
+            B, _, H, W = x_2d.shape
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):
                 pred = self.model(x_2d)
@@ -680,24 +677,23 @@ class Predictor:
         return prob.float().cpu().numpy()
 
     def _forward_batch_2_5d(self, x: torch.Tensor) -> np.ndarray:
-        """2.5D forward: squeeze C_res=1, run 2D model, reshape pred.
+        """2.5D forward: collapse C_res, run 2D model, reshape pred.
 
         Args:
-            x: (B, 1, D, H, W) tensor produced by ``_build_z_window_input``
-               under the single-resolution z-axis contract that 2.5D
-               training shares.
+            x: (B, C_res, D, H, W) tensor produced by
+               ``_build_z_window_input``. ``C_res >= 1`` — view 0 is the
+               1× FOV (true geometry; supervision target during training)
+               and views 1..K are wider z-FOVs each resampled back to D
+               channels (see SegDataset3D z-axis multi-res contract).
 
         Returns:
-            (B, num_fg, D, H, W) sigmoid probabilities, matching the 3D
-            path's contract so all downstream blending stays unchanged.
+            (B, num_fg, D, H, W) sigmoid probabilities at the 1× geometry,
+            matching the 3D path's contract so all downstream blending
+            stays unchanged.
         """
-        if x.shape[1] != 1:
-            raise ValueError(
-                "2.5D inference expects single-resolution input "
-                f"(C_res=1); got x.shape={tuple(x.shape)}")
-        # (B, 1, D, H, W) → (B, D, H, W) — D becomes the input-channel axis.
-        x_2d = x.squeeze(1)
-        B, D, H, W = x_2d.shape
+        x_2d = self._reshape_2_5d_input(x)  # (B, C_res*D, H, W)
+        D = self.patch_D
+        B, _, H, W = x_2d.shape
         autocast_ctx = autocast(
             device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype)
         with autocast_ctx:
@@ -717,6 +713,31 @@ class Predictor:
                 prob = self._tta_flip_ensemble_2_5d(x_2d, prob)
 
         return prob.float().cpu().numpy()
+
+    def _reshape_2_5d_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Collapse the C_res (multi-FOV) axis for the 2D model input.
+
+        Mirrors ``Trainer._squeeze_2_5d`` exactly so train and inference
+        share one channel-layout contract:
+
+          (B, C_res, D, H, W) → (B, C_res * D, H, W)
+
+        With ``C_res == 1`` this collapses to the legacy ``squeeze(1)``
+        and is bit-identical to single-FOV inference. The downstream
+        2D model's stem (``Encoder.stem``) is responsible for splitting
+        the C_res*D channels back into per-view chunks of size D when
+        ``MultiStemProj`` fusion is in use.
+        """
+        if x.ndim != 5:
+            raise ValueError(
+                "2.5D inference expects rank-5 input "
+                f"(B, C_res, D, H, W); got x.shape={tuple(x.shape)}")
+        B, C_res, D, H, W = x.shape
+        if D != self.patch_D:
+            raise ValueError(
+                f"2.5D input D-axis ({D}) != patch_D ({self.patch_D}). "
+                "Window builder produced an unexpected slice count.")
+        return x.reshape(B, C_res * D, H, W).contiguous()
 
     def _tta_flip_ensemble(
         self, x: torch.Tensor, base_prob: torch.Tensor,
@@ -751,13 +772,18 @@ class Predictor:
         2D model's spatial symmetry group.
 
         Args:
-            x_2d:      (B, D, H, W) input fed to the 2D model.
-            base_prob: (B, num_fg, D, H, W) un-flipped reference output.
+            x_2d:      (B, C_res*D, H, W) input fed to the 2D model.
+                       For multi-FOV (C_res > 1) all view slabs are
+                       flipped together — they share the same H/W spatial
+                       grid by construction.
+            base_prob: (B, num_fg, D, H, W) un-flipped reference output
+                       at the 1× geometry.
 
         Returns:
             (B, num_fg, D, H, W) average over identity + 3 flip variants.
         """
-        B, D, H, W = x_2d.shape
+        B, _, H, W = x_2d.shape
+        D = self.patch_D
         total = base_prob.clone()
         count = 1.0
         # x_2d axes: 2=H, 3=W; prob_5d axes: 3=H, 4=W (D inserted at 2).

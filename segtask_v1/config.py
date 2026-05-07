@@ -315,6 +315,38 @@ class ModelConfig:
     # trilinear upsample on the main output to restore original resolution.
     stem_mode: str = "conv3"
 
+    # ---- Multi-FOV context fusion (2.5D mode only) ----
+    # When ``data.patch_mode == "2_5d"`` AND ``len(data.multi_res_scales) > 1``,
+    # the model input is laid out as ``(B, n_views * D, H, W)`` with view 0 =
+    # the 1× FOV (real D slices) and views 1..K = wider z-FOVs each resampled
+    # back to D channels (see SegDataset3D z-axis multi-res semantics).
+    #
+    # "shared_stem"     — feed all ``n_views * D`` channels through ONE stem.
+    #                     Cheapest, but mixes physically heterogeneous
+    #                     channels (raw vs. resampled "virtual" slices)
+    #                     through a single filter bank.
+    # "multi_stem_proj" — Plan A. ``n_views`` independent stems
+    #                     (each on D channels) → cat → 1×1 ConvNormAct
+    #                     fusion back to ``encoder_channels[0]``. Strictly
+    #                     more expressive at negligible param cost; encoder
+    #                     downstream is contract-identical (early fusion
+    #                     at full resolution).
+    # "hierarchical"    — Plan C. View 0 drives the main stem; aux view
+    #                     ``k`` (k=1..n_views-1) goes through a stride-
+    #                     ``main_stem_stride * 2^k`` patchify stem and is
+    #                     cat-fused into the main path at the entrance of
+    #                     encoder stage ``k`` (post-Downsample-k). A 1×1
+    #                     ConvNormAct compresses back to the stage's
+    #                     expected channel count, so decoder/skip
+    #                     contracts are bit-identical. Coarse-FOV context
+    #                     thus enters at semantically-matched depth
+    #                     instead of being squashed at the input layer.
+    #                     Requires ``len(multi_res_scales) <= len(encoder_channels)``.
+    # When ``len(multi_res_scales) == 1`` this field is a no-op (the path
+    # collapses to the single-stem legacy behaviour and is bit-identical
+    # to pre-multi-FOV training). Ignored entirely in 3D modes.
+    context_fusion: str = "multi_stem_proj"
+
     # Decoder topology:
     #   "unet"   — classical symmetric UNet decoder (default).
     #   "unetpp" — UNet++ nested dense decoder (Zhou et al., DLMIA 2018).
@@ -582,11 +614,13 @@ class Config:
 
         if self.data.patch_mode == "2_5d":
             # 2.5D mode: planar 2D backbone consuming D slices as channels.
-            # Force a single resolution and override model.in_channels to
-            # the slice count regardless of multi_res_scales (validated to
-            # be [1.0] below).
+            # Multi-FOV (multi_res_scales) extension: each extra z-FOV view
+            # contributes D additional input channels — view layout is
+            # (B, n_views * D, H, W). With the legacy [1.0] config this
+            # collapses back to in_channels = D (bit-identical behaviour).
             self.model.spatial_dims = 2
-            self.model.in_channels = int(self.data.patch_size[0])
+            n_views = max(len(self.data.multi_res_scales), 1)
+            self.model.in_channels = int(self.data.patch_size[0]) * n_views
         else:
             # 3D modes: in_channels follows multi_res_scales (legacy).
             # Both z_axis and cubic stack per-scale views as input channels;
@@ -655,6 +689,9 @@ class Config:
         assert self.model.stem_mode in (
             "conv3", "conv7", "dual", "patch2", "patch4",
         ), f"Invalid stem_mode: {self.model.stem_mode}"
+        assert self.model.context_fusion in (
+            "shared_stem", "multi_stem_proj", "hierarchical",
+        ), f"Invalid context_fusion: {self.model.context_fusion!r}"
         assert self.model.decoder_type in ("unet", "unetpp", "unet3p"), \
             f"Invalid decoder_type: {self.model.decoder_type}"
         assert self.model.unet3p_cat_channels > 0, \
@@ -724,17 +761,47 @@ class Config:
         if self.data.patch_mode == "2_5d":
             # 2.5D mode invariants enforced by sync(); re-check here so a
             # stale config caught after manual edit fails fast.
-            assert (len(self.data.multi_res_scales) == 1
-                    and self.data.multi_res_scales[0] == 1.0), (
-                "2.5D mode requires multi_res_scales=[1.0]; got "
-                f"{self.data.multi_res_scales}.")
+            assert len(self.data.multi_res_scales) >= 1, (
+                "2.5D mode requires at least one entry in multi_res_scales.")
+            assert self.data.multi_res_scales[0] == 1.0, (
+                "2.5D mode requires multi_res_scales[0] == 1.0 — view 0 is "
+                "the true-geometry FOV used as the prediction target. "
+                f"Got multi_res_scales={self.data.multi_res_scales}.")
             assert self.model.spatial_dims == 2, (
                 "2.5D mode requires model.spatial_dims=2 (set automatically "
                 "by sync()).")
-            assert self.model.in_channels == int(self.data.patch_size[0]), (
-                f"2.5D mode requires model.in_channels == patch_size[0] "
-                f"(D slices); got in_channels={self.model.in_channels}, "
-                f"patch_size[0]={self.data.patch_size[0]}.")
+            n_views = len(self.data.multi_res_scales)
+            expected_in = int(self.data.patch_size[0]) * n_views
+            assert self.model.in_channels == expected_in, (
+                f"2.5D mode requires model.in_channels == "
+                f"patch_size[0] * len(multi_res_scales) = "
+                f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
+                f"got in_channels={self.model.in_channels}.")
+            # Plan C constraints: aux view k injects at encoder stage k,
+            # so we need at least one stage per aux view + the main one.
+            if self.model.context_fusion == "hierarchical" and n_views > 1:
+                n_stages = len(self.model.encoder_channels)
+                assert n_views <= n_stages, (
+                    f"context_fusion='hierarchical' requires "
+                    f"len(multi_res_scales) <= len(encoder_channels) so each "
+                    f"aux view k=1..n_views-1 has a matching stage k to "
+                    f"inject into; got n_views={n_views}, "
+                    f"n_stages={n_stages}.")
+                # The deepest aux stem has stride main_stem_stride * 2^(n_views-1).
+                # Validate H and W are divisible by that stride to avoid a
+                # silent spatial mismatch at fusion time.
+                stem_stride_map = {
+                    "conv3": 1, "conv7": 1, "dual": 1,
+                    "patch2": 2, "patch4": 4,
+                }
+                s0 = stem_stride_map[self.model.stem_mode]
+                deepest = s0 * (2 ** (n_views - 1))
+                pH, pW = int(self.data.patch_size[1]), int(self.data.patch_size[2])
+                assert pH % deepest == 0 and pW % deepest == 0, (
+                    f"context_fusion='hierarchical' with n_views={n_views} "
+                    f"and stem_mode={self.model.stem_mode!r} requires "
+                    f"patch_size[1] and patch_size[2] divisible by "
+                    f"{deepest}; got patch_size=({pH}, {pW}).")
         assert self.data.aug_oversample_ratio >= 1.0, \
             "aug_oversample_ratio must be >= 1.0"
         assert len(self.data.multi_res_scales) >= 1, \
