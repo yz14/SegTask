@@ -87,6 +87,27 @@ data:
   # 详细语义见 patch_mode 说明。whole 模式下必须为 [1.0]。
   multi_res_scales: [1.0]
 
+  # ---- 3D 多分辨率 lazy 单 cube 提取（z_axis / cubic）-----------------
+  # 仅在 patch_mode in {"z_axis","cubic"} 且 len(multi_res_scales) > 1 时生效。
+  #
+  # false（默认，bit-identical 旧行为）：
+  #   每个 scale 在 dataset CPU worker 中独立调用 scipy.ndimage.zoom 抽取并
+  #   resize 到 (eD, eH, eW)，沿 C_res 维堆叠输出 (C_res, eD, eH, eW)。增强
+  #   在已下采样的画布上跑 1 次共享 grid_sample；aux view 的高频细节在
+  #   增强前已损失。
+  #
+  # true（新路径）：
+  #   dataset 仅抽取 ONE max-FOV cube 并输出 (1, eD_max, *)：z_axis 仅 z 轴
+  #   按 max_scale 放大，cubic 三轴同时放大。增强 1 次跑在最大分辨率 cube
+  #   上，trainer 在 forward 前 per-view 中心裁剪到原生物理尺寸 (D_k,H_k,W_k)
+  #   并 F.interpolate 回 patch_size，最后沿 C_res 维堆叠 (B, C_res, pD, pH, pW)
+  #   —— 模型契约不变。Predictor 滑窗在 ON 时同步走 GPU 单 cube → per-view
+  #   裁剪 + 缩放路径，无 scipy 调用。约束（Config.validate 强制）：
+  #     * multi_res_scales[0] == 1.0；
+  #     * z_axis 自动锁定 z_boundary_mode='edge_pad'；
+  #     * 与 aux_keep_native_d（2.5D 专属）互斥。
+  keep_native_multi_res: false
+
   # ---- Intensity preprocessing ---------------------------------------
   # CT HU windowing (clip intensities before normalization).
   intensity_min: -1024.0

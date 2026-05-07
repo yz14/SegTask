@@ -23,6 +23,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 # GradScaler moved from torch.cuda.amp to torch.amp in PyTorch ≥ 2.3. The
 # new constructor takes a device string as the first positional argument;
 # the legacy CUDA-namespace constructor does NOT and would silently bind
@@ -308,6 +309,42 @@ class Trainer:
         self.aux_view_depths: List[int] = (
             list(cfg.aux_view_depths) if self.aux_keep_native_d else [])
 
+        # ``keep_native_multi_res`` (3D modes) is the analogue of
+        # ``aux_keep_native_d`` for z_axis / cubic. The dataset emits a
+        # single max-FOV cube; the trainer center-crops per view at
+        # native physical size and resizes each view back to
+        # ``patch_size`` immediately before the model forward, finally
+        # producing the standard ``(B, C_res, pD, pH, pW)`` 3D model
+        # input. Strict gating mirrors Config.validate so a stale flag
+        # in 2.5D / whole / single-scale modes never silently flips
+        # the trainer geometry path.
+        self.keep_native_multi_res = bool(
+            getattr(cfg.data, "keep_native_multi_res", False)
+            and not self.is_2_5d
+            and cfg.data.patch_mode in ("z_axis", "cubic")
+            and len(cfg.data.multi_res_scales) > 1)
+        if self.keep_native_multi_res:
+            # Per-view native sizes ``(D_k, H_k, W_k) = round(patch_size *
+            # s_k)``. Both 3D modes anchor on the canonical ``patch_size``;
+            # z_axis only scales D so H_k/W_k collapse to pH/pW, while
+            # cubic scales all three axes. Pre-computed once so the split
+            # helper has nothing to compute on the hot path.
+            pD, pH, pW = (int(x) for x in cfg.data.patch_size)
+            self._mr_native_sizes: List[Tuple[int, int, int]] = []
+            for s in cfg.data.multi_res_scales:
+                D_k = int(round(pD * float(s)))
+                if cfg.data.patch_mode == "z_axis":
+                    H_k, W_k = pH, pW
+                else:  # cubic
+                    H_k = int(round(pH * float(s)))
+                    W_k = int(round(pW * float(s)))
+                self._mr_native_sizes.append((D_k, H_k, W_k))
+            # View 0 invariant (s_0 == 1.0) — ground these to patch_size
+            # exactly to defend against floating-point drift in round().
+            self._mr_native_sizes[0] = (pD, pH, pW)
+        else:
+            self._mr_native_sizes = []
+
         # Composition order matters:
         #   INNER — wraps `base_loss` for the patch-mode contract:
         #     - 3D modes: ``MultiResolutionLoss`` splits pred channels by
@@ -529,6 +566,41 @@ class Trainer:
                 "per-view depths=%s, channel layout sum=%d.",
                 target_d_native, self.aux_view_depths,
                 int(cfg.model.in_channels))
+        elif self.keep_native_multi_res:
+            # 3D lazy-extraction path: dataset emits a max-FOV cube
+            # (× oversample margin). The post-augment center crop must
+            # therefore drop the augment oversample but PRESERVE the
+            # full max-FOV physical size — the per-view split below
+            # then center-crops per scale and resizes each view to the
+            # canonical patch_size. For z_axis the FOV expansion is
+            # z-only (matches the dataset emission shape ``(1, eD*max,
+            # pH, pW)``); for cubic all three axes scale.
+            max_scale = max(cfg.data.multi_res_scales)
+            pD, pH, pW = (int(x) for x in cfg.data.patch_size)
+            if cfg.data.patch_mode == "z_axis":
+                self.target_patch_size = (
+                    int(round(pD * max_scale)), pH, pW)
+            else:  # cubic
+                self.target_patch_size = (
+                    int(round(pD * max_scale)),
+                    int(round(pH * max_scale)),
+                    int(round(pW * max_scale)))
+            # Cross-check: per-view native sizes must all fit inside the
+            # max-FOV target along every axis. (Round-trip rounding is
+            # safe because s_max defines the target axis-by-axis.)
+            for k, (D_k, H_k, W_k) in enumerate(self._mr_native_sizes):
+                tD, tH, tW = self.target_patch_size
+                if D_k > tD or H_k > tH or W_k > tW:
+                    raise ValueError(
+                        f"keep_native_multi_res: view {k} native size "
+                        f"({D_k},{H_k},{W_k}) exceeds max-FOV target "
+                        f"{self.target_patch_size}. Check multi_res_scales / "
+                        "patch_size for floating-point drift.")
+            logger.info(
+                "Trainer keep_native_multi_res=True (%s): max-FOV crop "
+                "target=%s, per-view native sizes=%s, n_views=%d.",
+                cfg.data.patch_mode, self.target_patch_size,
+                self._mr_native_sizes, len(cfg.data.multi_res_scales))
         else:
             self.target_patch_size = tuple(cfg.data.patch_size)
         self.needs_crop = cfg.data.aug_oversample_ratio > 1.0
@@ -752,6 +824,15 @@ class Trainer:
             if self.needs_crop:
                 image, label, wmap = self._center_crop(image, label, wmap)
 
+            # --- 3D lazy multi-res: rebuild the per-view C_res stack
+            #     from the single max-FOV cube. After this step the
+            #     contract is bit-identical to the legacy False-path
+            #     3D dataset emission ((B, C_res, pD, pH, pW)), so the
+            #     downstream forward / loss / metrics path is unchanged.
+            if self.keep_native_multi_res:
+                image, label, wmap = self._split_views_native_3d(
+                    image, label, wmap)
+
             # --- 2.5D adaptation: collapse the C_res=1 channel so the D
             #     axis becomes the model's input-channel dimension.
             #     With aux seg supervision active the label/wmap tensors
@@ -973,6 +1054,15 @@ class Trainer:
                             self._split_views_native_d(image, label, None))
                     else:
                         image, label, _ = self._squeeze_2_5d(image, label, None)
+                elif self.keep_native_multi_res:
+                    # 3D lazy-multi-res path: dataset emits a single
+                    # max-FOV cube; rebuild the per-view C_res stack
+                    # so the model sees the standard input contract.
+                    # Val skips augment/oversample-crop (no augmentor
+                    # called), so the cube already arrives at the
+                    # max-FOV target_patch_size — split directly.
+                    image, label, _ = self._split_views_native_3d(
+                        image, label, None)
 
                 with autocast(device_type="cuda", enabled=self.use_amp,
                               dtype=self.amp_dtype):
@@ -1104,6 +1194,125 @@ class Trainer:
         if isinstance(pred, list):
             pred = pred[0]
         return pred
+
+    def _split_views_native_3d(
+        self,
+        image: torch.Tensor,
+        label: torch.Tensor,
+        wmap: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Per-view native crop + resize for the 3D lazy-extraction path.
+
+        Input contract (post-augment, post-center-crop):
+          image : ``(B, 1, eD_max, eH_max, eW_max)`` — single max-FOV cube
+                  emitted by ``SegDataset3D._getitem_native_multi_res_z``
+                  (z_axis: eH_max=pH, eW_max=pW) or
+                  ``SegDataset3DCubic._getitem_native_multi_res_cubic``
+                  (cubic: all three axes scaled by ``max_scale``).
+                  ``(eD_max, eH_max, eW_max) == self.target_patch_size``.
+          label : ``(B, 1, eD_max, eH_max, eW_max)`` raw integer labels.
+          wmap  : optional ``(B, 1, eD_max, eH_max, eW_max)`` continuous
+                  weights.
+
+        Output (matches the legacy False-path 3D dataset emission):
+          image_3d : ``(B, C_res, pD, pH, pW)`` — view k centered native
+                      crop ``(D_k, H_k, W_k)`` resized trilinearly to
+                      ``(pD, pH, pW)``, stacked along the new C_res axis.
+          label_3d : ``(B, C_res, pD, pH, pW)`` raw integer labels —
+                      same crop, but resized with ``mode="nearest"`` to
+                      preserve discrete label values.
+          wmap_3d  : ``(B, C_res, pD, pH, pW)`` or ``None`` — same crop,
+                      trilinear resize (continuous weights).
+
+        Geometric note
+        --------------
+        All views share the same physical centre by construction (the
+        dataset extracted ONE max-FOV cube around a single sampled
+        centre). Center-cropping each view's native size from this cube
+        and resizing to canonical ``patch_size`` reproduces voxel-for-
+        voxel the per-view independent extraction used by the
+        False-path — modulo a single torch ``F.interpolate`` pass per
+        view instead of two (one ``scipy.ndimage.zoom`` in the dataset +
+        one shared augment grid_sample). The augment grid_sample now
+        operates on the full max-FOV cube so all views receive the SAME
+        warp at their native physical resolution; pre-resize information
+        loss for aux views (False-path's ``round(eD*s) → eD`` zoom
+        before augment) is eliminated.
+        """
+        if not self.keep_native_multi_res:
+            raise RuntimeError(
+                "_split_views_native_3d called but "
+                "keep_native_multi_res=False")
+        if image.ndim != 5 or image.shape[1] != 1:
+            raise ValueError(
+                "native-3d split expects (B, 1, eD_max, eH_max, eW_max); "
+                f"got image.shape={tuple(image.shape)}")
+        if (label.shape[:2] != image.shape[:2]
+                or label.shape[2:] != image.shape[2:]):
+            raise ValueError(
+                "image / label shape mismatch: "
+                f"image={tuple(image.shape)}, label={tuple(label.shape)}")
+        B, _, tD, tH, tW = image.shape
+        if (tD, tH, tW) != tuple(self.target_patch_size):
+            raise ValueError(
+                f"native-3d split expects spatial dims == target_patch_size"
+                f"={self.target_patch_size}; got {(tD, tH, tW)}. The "
+                "post-augment center crop should already have removed "
+                "the augment oversample margin.")
+
+        pD, pH, pW = (int(x) for x in self.cfg.data.patch_size)
+
+        def _center_crop_3d(t: torch.Tensor, sizes: Tuple[int, int, int]
+                             ) -> torch.Tensor:
+            """Return the center ``(d_k, h_k, w_k)`` crop along axes 2/3/4
+            of a ``(B, 1, D, H, W)`` tensor."""
+            d_k, h_k, w_k = sizes
+            d0 = (tD - d_k) // 2
+            h0 = (tH - h_k) // 2
+            w0 = (tW - w_k) // 2
+            return t[:, :, d0:d0 + d_k, h0:h0 + h_k, w0:w0 + w_k]
+
+        img_views: List[torch.Tensor] = []
+        lbl_views: List[torch.Tensor] = []
+        wmap_views: List[torch.Tensor] = []
+        for k, sizes in enumerate(self._mr_native_sizes):
+            img_k = _center_crop_3d(image, sizes)
+            lbl_k = _center_crop_3d(label, sizes)
+            wmap_k = (_center_crop_3d(wmap, sizes)
+                      if wmap is not None else None)
+
+            # Resize per-view native crop back to canonical ``patch_size``
+            # so all views can be stacked along the C_res axis. Skip the
+            # F.interpolate call when sizes already match (true for view 0
+            # and any view where ``round(p_axis * s_k) == p_axis``).
+            if sizes != (pD, pH, pW):
+                img_k = F.interpolate(
+                    img_k, size=(pD, pH, pW),
+                    mode="trilinear", align_corners=False)
+                # Labels: nearest preserves discrete integer values
+                # (mirrors ``resize_3d(..., is_label=True)`` in the
+                # OFF-path dataset).
+                lbl_k = F.interpolate(lbl_k, size=(pD, pH, pW), mode="nearest")
+                if wmap_k is not None:
+                    wmap_k = F.interpolate(
+                        wmap_k, size=(pD, pH, pW),
+                        mode="trilinear", align_corners=False)
+
+            # Each view contributes ONE channel to the C_res axis. Strip
+            # the existing leading "1" via ``squeeze(1)`` so ``stack(dim=1)``
+            # produces ``(B, C_res, pD, pH, pW)`` — bit-equivalent shape
+            # to the legacy False-path 3D dataset emission.
+            img_views.append(img_k.squeeze(1))
+            lbl_views.append(lbl_k.squeeze(1))
+            if wmap_k is not None:
+                wmap_views.append(wmap_k.squeeze(1))
+
+        image_out = torch.stack(img_views, dim=1).contiguous()
+        label_out = torch.stack(lbl_views, dim=1).contiguous()
+        wmap_out: Optional[torch.Tensor] = None
+        if wmap_views:
+            wmap_out = torch.stack(wmap_views, dim=1).contiguous()
+        return image_out, label_out, wmap_out
 
     def _split_views_native_d(
         self,

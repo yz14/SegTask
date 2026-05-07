@@ -493,7 +493,8 @@ class SegDataset3D(Dataset):
         bbox_paths: Optional[List[str]] = None,
         region_weight_paths: Optional[List[str]] = None,
         z_boundary_mode: str = "stretch",
-        aux_keep_native_d: bool = False):
+        aux_keep_native_d: bool = False,
+        keep_native_multi_res: bool = False):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -578,6 +579,34 @@ class SegDataset3D(Dataset):
             self._max_scale = float(max(self.multi_res_scales))
         else:
             self._max_scale = 1.0
+
+        # ---- 3D z_axis lazy single-max-FOV-cube path ------------------
+        # When True (validated upstream), ``__getitem__`` emits ONE
+        # max-FOV cube of depth ``round(eD * max_scale)`` (edge-padded)
+        # at full canonical H/W, shape ``(1, eD_max, eH, eW)``. The
+        # trainer (R2) center-crops per view at native physical depth
+        # ``D_k = round(eD * s_k)`` and resizes each view back to ``eD``
+        # immediately before forward, finally producing the standard
+        # ``(B, C_res, eD, eH, eW)`` 3D model input.
+        #
+        # Mutually exclusive with ``aux_keep_native_d`` (2.5D analogue).
+        # Both flags share the same ``_max_scale`` book-keeping; we
+        # therefore consolidate the OR of the two when setting it.
+        self.keep_native_multi_res = bool(keep_native_multi_res)
+        if self.keep_native_multi_res:
+            assert not self.aux_keep_native_d, (
+                "keep_native_multi_res and aux_keep_native_d are mutually "
+                "exclusive (3D vs 2.5D analogues).")
+            assert len(self.multi_res_scales) > 1, (
+                "keep_native_multi_res=True requires len(multi_res_scales) > 1; "
+                f"got {self.multi_res_scales}")
+            assert self.multi_res_scales[0] == 1.0, (
+                "keep_native_multi_res=True requires multi_res_scales[0] == 1.0 "
+                f"(canonical view); got {self.multi_res_scales}")
+            assert self.z_boundary_mode == "edge_pad", (
+                "keep_native_multi_res=True (z_axis) requires "
+                f"z_boundary_mode='edge_pad'; got {self.z_boundary_mode!r}.")
+            self._max_scale = float(max(self.multi_res_scales))
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -717,6 +746,22 @@ class SegDataset3D(Dataset):
             return self._getitem_native_d(
                 vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
 
+        # ---- 3D lazy single-max-FOV-cube path (z_axis) -----------------
+        # Same emission shape contract as the legacy multi-res output
+        # except the leading ``C_res`` axis is collapsed to 1 and the
+        # depth axis carries ``eD_max = round(eD * max_scale)`` slices
+        # at native physical resolution. The trainer's per-view crop+
+        # resize step (R2) reproduces the legacy ``(B, C_res, eD, eH,
+        # eW)`` model input exactly — center-cropping ``D_k`` slices
+        # from ``eD_max`` then resizing each view back to ``eD`` is
+        # voxel-equivalent to the per-view independent extraction
+        # done by the False-path (modulo ONE interpolation pass instead
+        # of two: the dataset zoom is gone, the augment grid_sample is
+        # the only resampling stage).
+        if self.keep_native_multi_res:
+            return self._getitem_native_multi_res_z(
+                vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
+
         # Build per-scale channel stack. For scale=1.0 we keep the legacy
         # clamp-then-stretch extraction (`_extract_z_patch`) for bit-exact
         # backward compatibility with prior single-res training. For
@@ -845,6 +890,82 @@ class SegDataset3D(Dataset):
             wmap_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             # ``compute_region_weight_map`` returns (1, eD_max, eH, eW).
+            result["weight_map"] = torch.from_numpy(
+                wmap_s.astype(np.float32))
+        return result
+
+    def _getitem_native_multi_res_z(
+        self,
+        vol_idx: int,
+        img: np.ndarray,
+        lbl: np.ndarray,
+        rw_vol: Optional[np.ndarray],
+        z: int,
+        eD: int,
+        eH: int,
+        eW: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Single max-FOV cube emission for the 3D z_axis lazy path.
+
+        Output shape: ``(1, eD_max, eH, eW)`` for image/label/(weight_map)
+        with ``eD_max = round(eD * max_scale)``. The leading "1" stands in
+        for the legacy ``C_res`` axis (collapsed: views are reconstructed
+        downstream by the trainer instead of stacked here).
+
+        Geometric contract
+        ------------------
+        * z-axis: ``extract_z_patch_padded`` always (regardless of
+          boundary), so the cube has EXACTLY ``eD_max`` physical-1-slice
+          spacing slices centered on the sampled z. Required so the
+          trainer can center-crop arbitrary ``D_k <= eD_max`` slices
+          and trust uniform z spacing across views.
+        * H, W: full canonical resize to (eH, eW) — same as the
+          False-path, so post-augment the in-plane geometry is
+          identical (the False-path also resizes H,W per view to (eH,
+          eW); since z_axis multi-res only scales z, the per-view
+          in-plane targets are all (eH, eW), making the lazy path
+          numerically equivalent on H, W).
+
+        Equivalence with the False-path
+        -------------------------------
+        For view k with native depth ``D_k = round(eD * s_k) <= eD_max``,
+        center-cropping ``D_k`` slices from this cube and z-resizing
+        them to ``eD`` reproduces the False-path's per-view extraction
+        ``extract_z_patch_padded(img, z, D_k) → resize_3d(..., eD, eH,
+        eW)`` voxel-for-voxel — both paths share the same z-center and
+        the same edge-padding rule. The R2 trainer step does exactly
+        this crop+resize on the GPU (one ``F.interpolate`` per view).
+
+        Region weights are extracted with the same z-padded path and
+        linearly resized in-plane to (eH, eW), mirroring the
+        False-path's per-scale region-weight rule.
+        """
+        eD_max = int(round(eD * self._max_scale))
+        # Always edge-padded — uniform 1-slice z spacing is a hard
+        # requirement for the trainer's per-view center-crop.
+        img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, eD_max)
+        rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
+                if rw_vol is not None else None)
+
+        # In-plane resize to (eH, eW); D axis preserved at eD_max.
+        img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
+        lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
+
+        result = {
+            # Leading "1" = collapsed C_res. Trainer (R2) splits along
+            # depth and resizes back to ``(B, C_res, eD, eH, eW)``.
+            "image": torch.from_numpy(img_s[None].astype(np.float32)),
+            "label": torch.from_numpy(lbl_s[None].astype(np.float32)),
+        }
+        # Region-weight precedence: per-sample file > static mapping.
+        if rw_s is not None:
+            wmap_s = resize_3d(rw_s, eD_max, eH, eW, is_label=False)
+            result["weight_map"] = torch.from_numpy(
+                wmap_s[None].astype(np.float32))
+        elif self.region_weights:
+            wmap_s = compute_region_weight_map(
+                lbl_s, self.label_values, self.region_weights)
+            # ``compute_region_weight_map`` returns shape (1, eD_max, eH, eW).
             result["weight_map"] = torch.from_numpy(
                 wmap_s.astype(np.float32))
         return result
@@ -1033,7 +1154,8 @@ class SegDataset3DCubic(Dataset):
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
         bbox_paths: Optional[List[str]] = None,
-        region_weight_paths: Optional[List[str]] = None):
+        region_weight_paths: Optional[List[str]] = None,
+        keep_native_multi_res: bool = False):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -1050,6 +1172,29 @@ class SegDataset3DCubic(Dataset):
         # Largest multi-res scale determines the biggest physical cube that
         # must stay in-bounds to avoid excessive edge-replicate padding.
         self._max_scale = max(self.multi_res_scales) if self.multi_res_scales else 1.0
+
+        # ---- 3D cubic lazy single-max-FOV-cube path -------------------
+        # When True (validated upstream in Config.validate), __getitem__
+        # emits ONE max-FOV cube of size ``round(extract_size *
+        # max_scale)`` around the sampled centre, shape ``(1, eD_max,
+        # eH_max, eW_max)``. The trainer (R2) center-crops per view at
+        # native physical size ``round(extract_size * s_k)`` and resizes
+        # each view back to ``extract_size`` immediately before forward,
+        # producing the standard ``(B, C_res, eD, eH, eW)`` 3D model
+        # input.
+        #
+        # Compared to the legacy multi-res path, this saves K-1 per-view
+        # ``scipy.ndimage.zoom`` calls in the CPU dataset workers and
+        # gives augmentation a single shared grid_sample over the full
+        # max-FOV cube (cross-view warp consistency by construction).
+        self.keep_native_multi_res = bool(keep_native_multi_res)
+        if self.keep_native_multi_res:
+            assert len(self.multi_res_scales) > 1, (
+                "keep_native_multi_res=True requires len(multi_res_scales) > 1; "
+                f"got {self.multi_res_scales}")
+            assert self.multi_res_scales[0] == 1.0, (
+                "keep_native_multi_res=True requires multi_res_scales[0] == 1.0 "
+                f"(canonical view); got {self.multi_res_scales}")
         self.intensity_min = intensity_min
         self.intensity_max = intensity_max
         self.normalize = normalize
@@ -1179,6 +1324,20 @@ class SegDataset3DCubic(Dataset):
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
 
+        # ---- 3D cubic lazy single-max-FOV-cube path -------------------
+        # Emit ONE cube of size ``round(extract_size * max_scale)``
+        # (edge-padded) at native resolution. The trainer's per-view
+        # crop+resize step (R2) reproduces the legacy
+        # ``(B, C_res, eD, eH, eW)`` model input — center-cropping to
+        # ``round(extract_size * s_k)`` and resizing each view back to
+        # ``extract_size`` is voxel-equivalent to the False-path's
+        # per-view ``_extract_cubic_patch + resize_3d`` (modulo a
+        # single shared interpolation pass instead of K independent
+        # ones).
+        if self.keep_native_multi_res:
+            return self._getitem_native_multi_res_cubic(
+                center, img, lbl, rw_vol, eD, eH, eW)
+
         img_channels, lbl_channels, wmap_channels = [], [], []
         for scale in self.multi_res_scales:
             sD = int(round(eD * scale))
@@ -1210,6 +1369,76 @@ class SegDataset3DCubic(Dataset):
         if wmap_channels:
             result["weight_map"] = torch.from_numpy(
                 np.stack(wmap_channels, axis=0).astype(np.float32))  # (C_res, eD, eH, eW)
+        return result
+
+    def _getitem_native_multi_res_cubic(
+        self,
+        center: Tuple[int, int, int],
+        img: np.ndarray,
+        lbl: np.ndarray,
+        rw_vol: Optional[np.ndarray],
+        eD: int,
+        eH: int,
+        eW: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Single max-FOV cube emission for the 3D cubic lazy path.
+
+        Output shape: ``(1, eD_max, eH_max, eW_max)`` for image / label /
+        (weight_map) with ``(eD_max, eH_max, eW_max) = round(extract_size
+        * max_scale)``. The leading "1" stands in for the legacy
+        ``C_res`` axis (collapsed: views are reconstructed by the
+        trainer instead of stacked here).
+
+        Geometric contract
+        ------------------
+        ``_safe_center_range`` already accounts for the max-scale cube
+        when sampling ``center``, so the largest cube fits in-bounds (or
+        the volume is degenerately small along an axis, in which case
+        ``_extract_cubic_patch`` edge-pads — same fallback as the
+        False-path).
+
+        Equivalence with the False-path
+        -------------------------------
+        For view k with native size ``S_k = round(extract_size * s_k)``,
+        center-cropping ``S_k`` voxels around the cube centre and
+        resizing the crop back to ``extract_size`` reproduces the
+        False-path's per-view extraction
+        ``_extract_cubic_patch(...,(S_k,...)) → resize_3d(..., eD, eH,
+        eW)`` voxel-for-voxel — both paths share the same ``center``
+        and the same edge-pad rule. The R2 trainer step does this
+        crop+resize on the GPU (one ``F.interpolate`` per view).
+
+        Region weights are extracted with the same cubic edge-padded
+        path; downstream linear resize preserves continuous gradients.
+        """
+        eD_max = int(round(eD * self._max_scale))
+        eH_max = int(round(eH * self._max_scale))
+        eW_max = int(round(eW * self._max_scale))
+        size_max = (eD_max, eH_max, eW_max)
+
+        img_s = _extract_cubic_patch(img, center, size_max)
+        lbl_s = _extract_cubic_patch(lbl, center, size_max)
+        rw_s = (_extract_cubic_patch(rw_vol, center, size_max)
+                if rw_vol is not None else None)
+
+        result = {
+            # Leading "1" = collapsed C_res. Trainer (R2) splits along
+            # all 3 spatial axes and resizes back to ``(B, C_res, eD,
+            # eH, eW)``.
+            "image": torch.from_numpy(img_s[None].astype(np.float32)),
+            "label": torch.from_numpy(lbl_s[None].astype(np.float32)),
+        }
+        # Region-weight precedence: per-sample file > static mapping.
+        if rw_s is not None:
+            result["weight_map"] = torch.from_numpy(
+                rw_s[None].astype(np.float32))
+        elif self.region_weights:
+            wmap_s = compute_region_weight_map(
+                lbl_s, self.label_values, self.region_weights)
+            # ``compute_region_weight_map`` returns shape (1, eD_max,
+            # eH_max, eW_max).
+            result["weight_map"] = torch.from_numpy(
+                wmap_s.astype(np.float32))
         return result
 
     def _safe_center_range(

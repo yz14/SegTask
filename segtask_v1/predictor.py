@@ -120,6 +120,51 @@ class Predictor:
             self.aux_view_depths = []
             self._eD_max = int(self.patch_D)
 
+        # ---- 3D lazy single-max-FOV-cube path (R3, ON mode) ------------
+        # Mirrors ``Trainer.keep_native_multi_res`` so the inference
+        # window builder produces the SAME ``(B, C_res, pD, pH, pW)``
+        # input contract the model was trained on, but extracts ONE
+        # max-FOV cube around the window centre and crop+resizes per
+        # view on the GPU instead of running K independent CPU zooms.
+        # Strict gating (3D modes only with n_views > 1); 2.5D uses
+        # ``aux_keep_native_d`` instead (built above).
+        self.keep_native_multi_res = bool(
+            getattr(cfg.data, "keep_native_multi_res", False)
+            and self.patch_mode in ("z_axis", "cubic")
+            and len(self.multi_res_scales) > 1)
+        if self.keep_native_multi_res:
+            sizes: List[Tuple[int, int, int]] = []
+            for s in self.multi_res_scales:
+                D_k = int(round(self.patch_D * float(s)))
+                if self.patch_mode == "z_axis":
+                    H_k, W_k = int(self.patch_H), int(self.patch_W)
+                else:  # cubic
+                    H_k = int(round(self.patch_H * float(s)))
+                    W_k = int(round(self.patch_W * float(s)))
+                sizes.append((D_k, H_k, W_k))
+            sizes[0] = (int(self.patch_D), int(self.patch_H), int(self.patch_W))
+            self._mr_native_sizes: List[Tuple[int, int, int]] = sizes
+            ms = float(max(self.multi_res_scales))
+            if self.patch_mode == "z_axis":
+                self._mr_target_shape: Tuple[int, int, int] = (
+                    int(round(self.patch_D * ms)),
+                    int(self.patch_H),
+                    int(self.patch_W))
+            else:
+                self._mr_target_shape = (
+                    int(round(self.patch_D * ms)),
+                    int(round(self.patch_H * ms)),
+                    int(round(self.patch_W * ms)))
+            logger.info(
+                "Predictor keep_native_multi_res=True (%s): per-view "
+                "native sizes=%s, max-FOV target=%s, n_views=%d.",
+                self.patch_mode, sizes, self._mr_target_shape,
+                len(self.multi_res_scales))
+        else:
+            self._mr_native_sizes = []
+            self._mr_target_shape = (
+                int(self.patch_D), int(self.patch_H), int(self.patch_W))
+
         # AMP: match the training dtype so conv accumulation precision is
         # consistent between trainer and predictor. Any unknown value falls
         # back to bf16 to avoid silent dtype flip.
@@ -304,6 +349,13 @@ class Predictor:
         # otherwise extract directly on GPU to skip the host round-trip.
         single_res = (len(self.multi_res_scales) == 1
                       and self.multi_res_scales[0] == 1.0)
+        # 3D ON path: GPU builder returns (C_res, pD, pH, pW) ready to
+        # stack into (B, C_res, pD, pH, pW) — same layout as legacy
+        # multi-res z_axis, so downstream forward / blending paths are
+        # bit-identical. Mutually exclusive with ``aux_keep_native_d``
+        # (2.5D analogue).
+        keep_native_3d = bool(self.keep_native_multi_res
+                              and self.patch_mode == "z_axis")
 
         # ON-mode native-depth path: builder returns rank-3
         # ``(in_channels=sum(D_k), pH, pW)`` so ``torch.stack`` produces
@@ -317,9 +369,16 @@ class Predictor:
         for idx, (z0, z1) in enumerate(z_positions):
             actual_d = z1 - z0
             if self.aux_keep_native_d:
-                # ON mode: GPU builder returns rank-3 (sum(D_k), pH, pW).
+                # 2.5D ON mode: rank-3 (sum(D_k), pH, pW).
                 window_inputs.append(
                     self._build_z_window_input_native_d_gpu(vol_t, z0, z1))
+            elif keep_native_3d:
+                # 3D ON mode: rank-4 (C_res, pD, pH, pW), same layout
+                # as the legacy multi-res builder — drop into the same
+                # ``torch.stack`` collate at the bottom of the loop.
+                window_inputs.append(
+                    self._build_z_window_input_native_multi_res_gpu(
+                        vol_t, z0, z1))
             elif single_res:
                 window_inputs.append(
                     self._build_z_window_input_gpu(vol_t, z0, z1))
@@ -443,6 +502,79 @@ class Predictor:
                 patch, size=(pD, pH, pW),
                 mode="trilinear", align_corners=False)
         return patch.squeeze(0)  # (1, pD, pH, pW)
+
+    def _build_z_window_input_native_multi_res_gpu(
+        self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
+        """3D z_axis ON-mode (``keep_native_multi_res=True``) window builder.
+
+        Mirrors :meth:`SegDataset3D._getitem_native_multi_res_z` and the
+        trainer's :meth:`_split_views_native_3d` so inference and training
+        share one geometry contract end-to-end:
+
+          1. Extract a SINGLE max-FOV cube of depth ``self._mr_target_shape[0]``
+             centred on ``(z0+z1)//2`` (edge-replicate padded along z).
+          2. In-plane resize to (pH, pW); D axis stays at the max-FOV depth.
+          3. For each view k=0..K-1: center-crop ``D_k = round(pD*s_k)``
+             slices and ``F.interpolate`` (trilinear) the D axis back to
+             ``pD``. View 0 takes the centred ``pD`` slices with no resize.
+          4. Stack views along the channel axis →
+             ``(C_res, pD, pH, pW)`` — exactly the legacy 3D z_axis
+             multi-res contract that the model expects.
+
+        Returns rank-4 ``(C_res, pD, pH, pW)`` float32 on the model's
+        device. Stacking across windows yields the model's input batch
+        directly, no further reshape required.
+        """
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+        eD_max, eH_max, eW_max = self._mr_target_shape   # eH_max=pH, eW_max=pW
+        z_center = (z0 + z1) // 2
+        D_vol = vol_t.shape[0]
+
+        # ---- Edge-padded extraction of an eD_max-deep slab --------------
+        zlo = z_center - eD_max // 2
+        zhi = zlo + eD_max
+        zlo_in = max(zlo, 0)
+        zhi_in = min(zhi, D_vol)
+        slab = vol_t[zlo_in:zhi_in]  # (ad, H_orig, W_orig)
+        pad_before = max(0, -zlo)
+        pad_after = max(0, zhi - D_vol)
+        if pad_before > 0 or pad_after > 0:
+            chunks: List[torch.Tensor] = []
+            if pad_before > 0:
+                chunks.append(slab[0:1].expand(pad_before, -1, -1))
+            chunks.append(slab)
+            if pad_after > 0:
+                chunks.append(slab[-1:].expand(pad_after, -1, -1))
+            slab = torch.cat(chunks, dim=0)
+        if slab.shape[0] != eD_max:
+            raise RuntimeError(
+                f"native-multi-res z builder: expected slab depth "
+                f"{eD_max}, got {slab.shape[0]} (z0={z0}, z1={z1}, "
+                f"D_vol={D_vol}).")
+
+        # ---- In-plane resize (D axis preserved at eD_max) ---------------
+        H_orig, W_orig = slab.shape[1], slab.shape[2]
+        slab = slab.unsqueeze(0).unsqueeze(0).float()  # (1,1,eD_max,H,W)
+        if H_orig != pH or W_orig != pW:
+            slab = F.interpolate(
+                slab, size=(eD_max, pH, pW),
+                mode="trilinear", align_corners=False)
+        # slab now (1, 1, eD_max, pH, pW)
+
+        # ---- Per-view crop + D-axis resize, stack as C_res channels ----
+        view_chunks: List[torch.Tensor] = []
+        for D_k, _, _ in self._mr_native_sizes:
+            d0 = (eD_max - D_k) // 2
+            crop = slab[:, :, d0:d0 + D_k, :, :]  # (1, 1, D_k, pH, pW)
+            if D_k != pD:
+                crop = F.interpolate(
+                    crop, size=(pD, pH, pW),
+                    mode="trilinear", align_corners=False)
+            view_chunks.append(crop[0])  # (1, pD, pH, pW)
+        # stack(dim=0) of K (1, pD, pH, pW) → (K, 1, pD, pH, pW)? No —
+        # we want one channel per view, so squeeze the singleton C
+        # before stacking on dim=0.
+        return torch.cat(view_chunks, dim=0).contiguous()  # (C_res, pD, pH, pW)
 
     def _build_z_window_input_native_d_gpu(
         self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
@@ -668,6 +800,16 @@ class Predictor:
                             dtype=np.float32)
         acc_weight = np.zeros((1, D_orig, H_orig, W_orig), dtype=np.float32)
 
+        # 3D cubic ON path: ship the volume to GPU once and let the
+        # builder do max-FOV extraction + per-view crop+resize entirely
+        # on-device (one F.interpolate per view, zero scipy.ndimage.zoom
+        # calls). OFF path keeps the legacy CPU pipeline.
+        keep_native_3d = bool(self.keep_native_multi_res
+                              and self.patch_mode == "cubic")
+        vol_t: Optional[torch.Tensor] = (
+            torch.from_numpy(vol).float().to(self.device, non_blocking=True)
+            if keep_native_3d else None)
+
         patches: List[np.ndarray] = []
         coords: List[Tuple[int, int, int, int, int, int, int, int, int]] = []
         centers: List[Tuple[int, int, int]] = []
@@ -677,7 +819,11 @@ class Predictor:
             nonlocal processed
             if not patches:
                 return
-            batch = self._build_batch_multi_res(patches, centers, vol)
+            if keep_native_3d:
+                batch = self._build_batch_native_multi_res_cubic_gpu(
+                    centers, vol_t)
+            else:
+                batch = self._build_batch_multi_res(patches, centers, vol)
             probs = self._forward_batch(batch)   # (B, num_fg, pD, pH, pW)
             for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw) in zip(probs, coords):
                 # Trim prediction to actual (non-padded) size in each axis
@@ -730,6 +876,113 @@ class Predictor:
     # ==================================================================
     # Batch construction
     # ==================================================================
+    def _build_batch_native_multi_res_cubic_gpu(
+        self,
+        centers: List[Tuple[int, int, int]],
+        vol_t: torch.Tensor,
+    ) -> torch.Tensor:
+        """3D cubic ON-mode (``keep_native_multi_res=True``) batch builder.
+
+        Mirrors :meth:`SegDataset3DCubic._getitem_native_multi_res_cubic`
+        and the trainer's :meth:`_split_views_native_3d` so inference and
+        training share one geometry contract end-to-end:
+
+          1. For each window centre, extract ONE max-FOV cube of size
+             ``self._mr_target_shape`` (= round(patch_size * max_scale))
+             with edge-replicate padding on every axis.
+          2. Per view k=0..K-1: center-crop the native size
+             ``(D_k, H_k, W_k) = round(patch_size * s_k)`` and trilinear-
+             ``F.interpolate`` the crop back to ``(pD, pH, pW)``. View 0
+             takes the centred ``patch_size`` crop with no resize.
+          3. Stack views along the channel axis →
+             ``(B, C_res, pD, pH, pW)`` — exactly the legacy 3D cubic
+             multi-res contract that the model expects.
+
+        Differences from the OFF-path :meth:`_build_batch_multi_res`:
+          * Single max-FOV cube extraction per centre instead of K
+            independent ``_extract_cubic_patch`` calls.
+          * Resampling done once on GPU via ``F.interpolate`` instead of
+            K ``scipy.ndimage.zoom`` calls on CPU.
+          * Edge replication everywhere — uniform with the training-side
+            extractor under the same flag.
+
+        Returns ``(B, C_res, pD, pH, pW)`` float32 on the model's device.
+        """
+        pD, pH, pW = self.patch_D, self.patch_H, self.patch_W
+        tD, tH, tW = self._mr_target_shape
+        D_vol, H_vol, W_vol = vol_t.shape
+
+        def _edge_pad_axis(t: torch.Tensor, axis: int,
+                            pad_before: int, pad_after: int
+                            ) -> torch.Tensor:
+            """Replicate-pad ``t`` along ``axis`` (zero-copy via expand).
+
+            ``narrow(axis, 0, 1)`` keeps the size-1 boundary slice; we
+            then ``expand`` along that axis to the requested width and
+            ``cat`` everything together. ``cat`` is the only allocation.
+            """
+            if pad_before == 0 and pad_after == 0:
+                return t
+            chunks: List[torch.Tensor] = []
+            base_shape = list(t.shape)
+            if pad_before > 0:
+                first = t.narrow(axis, 0, 1)
+                shape = list(base_shape)
+                shape[axis] = pad_before
+                chunks.append(first.expand(shape))
+            chunks.append(t)
+            if pad_after > 0:
+                last = t.narrow(axis, t.shape[axis] - 1, 1)
+                shape = list(base_shape)
+                shape[axis] = pad_after
+                chunks.append(last.expand(shape))
+            return torch.cat(chunks, dim=axis)
+
+        cubes: List[torch.Tensor] = []
+        for (cd, ch, cw) in centers:
+            # Edge-padded extraction, axis-by-axis to avoid materialising
+            # the full padded slab when only one axis needs padding.
+            d_lo = cd - tD // 2
+            d_hi = d_lo + tD
+            h_lo = ch - tH // 2
+            h_hi = h_lo + tH
+            w_lo = cw - tW // 2
+            w_hi = w_lo + tW
+
+            d_lo_in, d_hi_in = max(d_lo, 0), min(d_hi, D_vol)
+            h_lo_in, h_hi_in = max(h_lo, 0), min(h_hi, H_vol)
+            w_lo_in, w_hi_in = max(w_lo, 0), min(w_hi, W_vol)
+            slab = vol_t[d_lo_in:d_hi_in, h_lo_in:h_hi_in,
+                          w_lo_in:w_hi_in]
+            slab = _edge_pad_axis(
+                slab, 0, max(0, -d_lo), max(0, d_hi - D_vol))
+            slab = _edge_pad_axis(
+                slab, 1, max(0, -h_lo), max(0, h_hi - H_vol))
+            slab = _edge_pad_axis(
+                slab, 2, max(0, -w_lo), max(0, w_hi - W_vol))
+            if slab.shape != (tD, tH, tW):
+                raise RuntimeError(
+                    f"native-multi-res cubic builder: slab shape "
+                    f"{tuple(slab.shape)} != target {self._mr_target_shape}")
+
+            # ---- Per-view crop + resize, stack as C_res channels --------
+            cube = slab.unsqueeze(0).unsqueeze(0).float()  # (1,1,tD,tH,tW)
+            view_chunks: List[torch.Tensor] = []
+            for (D_k, H_k, W_k) in self._mr_native_sizes:
+                d0 = (tD - D_k) // 2
+                h0 = (tH - H_k) // 2
+                w0 = (tW - W_k) // 2
+                crop = cube[:, :, d0:d0 + D_k, h0:h0 + H_k, w0:w0 + W_k]
+                if (D_k, H_k, W_k) != (pD, pH, pW):
+                    crop = F.interpolate(
+                        crop, size=(pD, pH, pW),
+                        mode="trilinear", align_corners=False)
+                view_chunks.append(crop[0])  # (1, pD, pH, pW)
+            # cat along channel axis → (C_res, pD, pH, pW)
+            cubes.append(torch.cat(view_chunks, dim=0))
+
+        return torch.stack(cubes, dim=0).contiguous()  # (B, C_res, pD, pH, pW)
+
     def _build_batch_multi_res(
         self,
         patches: List[np.ndarray],

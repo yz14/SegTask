@@ -422,6 +422,22 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         and dc.patch_mode == "2_5d"
         and len(dc.multi_res_scales) > 1)
 
+    # ``keep_native_multi_res`` is the 3D analogue of
+    # ``aux_keep_native_d`` — the dataset emits a single max-FOV cube
+    # at native physical resolution and the trainer (R2) crops+resizes
+    # per view before the model forward. Config.validate enforces the
+    # patch_mode / multi_res_scales preconditions; we still gate
+    # defensively so a stale flag in 2_5d / whole modes never affects
+    # the dataset emission contract.
+    keep_native_kwargs_z = dict(
+        keep_native_multi_res=bool(getattr(dc, "keep_native_multi_res", False))
+        and dc.patch_mode == "z_axis"
+        and len(dc.multi_res_scales) > 1)
+    keep_native_kwargs_cubic = dict(
+        keep_native_multi_res=bool(getattr(dc, "keep_native_multi_res", False))
+        and dc.patch_mode == "cubic"
+        and len(dc.multi_res_scales) > 1)
+
     # Optional ROI bbox paths — matched 1:1 to image_paths, then split
     # along the same train/val indices so each per-sample bbox stays
     # aligned with its image / label after the split.
@@ -533,8 +549,18 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             is_train=False,
             **common_kwargs)
     elif dc.patch_mode == "cubic":
-        logger.info("Using CUBIC patch mode (oversample=%.2f, scales=%s)",
-                     train_oversample, dc.multi_res_scales)
+        if keep_native_kwargs_cubic["keep_native_multi_res"]:
+            logger.info(
+                "Using CUBIC patch mode + keep_native_multi_res=True "
+                "(oversample=%.2f, scales=%s, max_scale=%.2f) — SINGLE "
+                "max-FOV cube extraction; trainer crops+resizes per "
+                "view before the 3D forward.",
+                train_oversample, dc.multi_res_scales,
+                max(dc.multi_res_scales))
+        else:
+            logger.info(
+                "Using CUBIC patch mode (oversample=%.2f, scales=%s)",
+                train_oversample, dc.multi_res_scales)
         train_ds = SegDataset3DCubic(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -542,7 +568,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio=dc.foreground_oversample_ratio,
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
-            **common_kwargs)
+            **common_kwargs,
+            **keep_native_kwargs_cubic)
         val_ds = SegDataset3DCubic(
             **val_paths,
             aug_oversample_ratio=1.0,
@@ -550,12 +577,22 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio=0.0,
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,
-            **common_kwargs)
+            **common_kwargs,
+            **keep_native_kwargs_cubic)
     else:
-        logger.info("Using Z_AXIS patch mode (oversample=%.2f, scales=%s, "
-                    "z_boundary=%s)",
-                    train_oversample, dc.multi_res_scales,
-                    z_kwargs["z_boundary_mode"])
+        if keep_native_kwargs_z["keep_native_multi_res"]:
+            logger.info(
+                "Using Z_AXIS patch mode + keep_native_multi_res=True "
+                "(oversample=%.2f, scales=%s, max_scale=%.2f, "
+                "z_boundary=%s) — SINGLE max-FOV z-cube extraction; "
+                "trainer crops+resizes per view before the 3D forward.",
+                train_oversample, dc.multi_res_scales,
+                max(dc.multi_res_scales), z_kwargs["z_boundary_mode"])
+        else:
+            logger.info("Using Z_AXIS patch mode (oversample=%.2f, scales=%s, "
+                        "z_boundary=%s)",
+                        train_oversample, dc.multi_res_scales,
+                        z_kwargs["z_boundary_mode"])
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -564,7 +601,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             samples_per_volume=dc.samples_per_volume,
             is_train=True,
             **common_kwargs,
-            **z_kwargs)
+            **z_kwargs,
+            **keep_native_kwargs_z)
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio=1.0,
@@ -573,7 +611,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             samples_per_volume=max(dc.samples_per_volume // 2, 1),
             is_train=False,
             **common_kwargs,
-            **z_kwargs)
+            **z_kwargs,
+            **keep_native_kwargs_z)
 
     train_loader = DataLoader(
         train_ds,

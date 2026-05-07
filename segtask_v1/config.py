@@ -222,6 +222,68 @@ class DataConfig:
     #   D-resampling is not part of that semantics).
     aux_keep_native_d: bool = False
 
+    # ---- 3D multi-FOV: lazy single-cube extraction (z_axis / cubic) ----
+    # When False (default, fully backward compatible):
+    #   For each scale s_k in ``multi_res_scales`` the dataset extracts a
+    #   physical cube of size ``round(extract_size * s_k)`` around the
+    #   sampled centre (z-only for ``z_axis``; all three axes for
+    #   ``cubic``), resizes it to ``extract_size`` (one ``scipy.ndimage.
+    #   zoom`` call per view), and stacks all views as the leading
+    #   ``C_res`` axis → ``(C_res, eD, eH, eW)``. Augmentation then runs
+    #   ONCE on the canonical-resolution stack with a SHARED grid_sample,
+    #   which means: (a) each view's high-frequency content is already
+    #   attenuated by the per-view zoom BEFORE augment, and (b) the K
+    #   per-view zooms run on every CPU worker.
+    #
+    # When True (only valid for ``patch_mode in {"z_axis", "cubic"}``,
+    # ``len(multi_res_scales) > 1`` and ``multi_res_scales[0] == 1.0``):
+    #   The dataset extracts a SINGLE max-FOV cube at the largest
+    #   physical resolution and emits it as ``(1, eD_max, eH_max, eW_max)``
+    #   (raw integer labels, continuous weights). All 3D augmentations
+    #   then run on this single cube with one shared grid_sample call.
+    #   The trainer (R2 — see ``_split_views_native_3d``) center-crops
+    #   per view at native physical size ``round(extract_size * s_k)`` and
+    #   resizes each view back to ``extract_size`` immediately before the
+    #   3D forward, finally producing the standard ``(B, C_res, eD, eH,
+    #   eW)`` model input.
+    #
+    # Geometric equivalence
+    # ---------------------
+    # All views share the same centre by construction (centre sampling
+    # runs once on the max-FOV cube). Center-cropping the per-view sub-
+    # cube and resizing to canonical size produces the SAME physical
+    # voxel set as the per-view independent extraction in the False-path
+    # (modulo a single linear/nearest interpolation pass instead of two:
+    # one in dataset + one inside grid_sample). The benefits over False
+    # are: (a) one shared aug field (cross-view warp consistency by
+    # construction); (b) aux views are not pre-downsampled before aug,
+    # preserving high-frequency detail; (c) no per-view scipy zoom in
+    # the CPU dataset workers.
+    #
+    # Side constraints (enforced in ``validate()``)
+    # ---------------------------------------------
+    # * ``z_boundary_mode`` is forced to ``"edge_pad"`` in z_axis mode
+    #   (the max-scale path always uses ``extract_z_patch_padded``;
+    #   ``stretch`` would have no consumer and silently mislead).
+    # * Mutually exclusive with ``aux_keep_native_d`` (which is the
+    #   2.5D analogue; that flag has fundamentally different semantics
+    #   — no per-view resize at all, since the 2D model consumes the
+    #   per-view depth as input channels directly).
+    # * Inactive in ``2_5d`` (use ``aux_keep_native_d``) and ``whole``
+    #   (multi-res has no physical meaning there).
+    # * ``multi_res_scales[0]`` must be ``1.0`` (view 0 = canonical
+    #   geometry; same invariant as the False-path and as 2.5D).
+    #
+    # Predictor / inference
+    # ---------------------
+    # Inference path (predict.py / Predictor) is NOT wired in this
+    # release — train-only switch. Enable only for training experiments
+    # until the inference codepath ships. Setting True together with
+    # ``train.resume`` of a False-path checkpoint is fine — only the
+    # data emission contract changes; model weights / shapes are
+    # identical.
+    keep_native_multi_res: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Augmentation configuration
@@ -757,7 +819,28 @@ class Config:
             # 3D modes: in_channels follows multi_res_scales (legacy).
             # Both z_axis and cubic stack per-scale views as input channels;
             # a single scale ([1.0]) gives the legacy 1-channel input.
+            #
+            # ``data.keep_native_multi_res`` does NOT change the channel
+            # count: even though the dataset emits a ``(1, eD_max, ...)``
+            # single-cube tensor, the trainer (R2) splits it back to
+            # ``(B, C_res, eD, eH, eW)`` before forward — model contract
+            # is bit-identical. The flag here only affects the
+            # dataset/trainer geometry path; the model construction
+            # below is untouched.
             self.model.in_channels = len(self.data.multi_res_scales)
+            # Auto-upgrade z_boundary_mode for the lazy-extraction path
+            # (z_axis only — cubic doesn't use this knob). Mirrors the
+            # 2.5D ``aux_keep_native_d`` behaviour: ``stretch`` would
+            # have no consumer in the single-max-FOV-cube path.
+            if (self.data.keep_native_multi_res
+                    and self.data.patch_mode == "z_axis"
+                    and len(self.data.multi_res_scales) > 1
+                    and self.data.z_boundary_mode != "edge_pad"):
+                logger.info(
+                    "keep_native_multi_res=True implies z_boundary_mode="
+                    "'edge_pad'; auto-upgraded from %r.",
+                    self.data.z_boundary_mode)
+                self.data.z_boundary_mode = "edge_pad"
 
         # nnU-Net ResEnc preset: populate per-stage block counts when the
         # user has not supplied explicit lists.
@@ -904,6 +987,35 @@ class Config:
                 "data.aux_keep_native_d=True requires at least one auxiliary "
                 "view (len(multi_res_scales) > 1); got "
                 f"multi_res_scales={self.data.multi_res_scales}.")
+
+        # ``keep_native_multi_res`` is the 3D analogue of
+        # ``aux_keep_native_d``: lazy single-max-FOV-cube extraction
+        # in the dataset, with per-view crop+resize deferred to the
+        # trainer (R2). Strict gating early so a misuse never silently
+        # downgrades the data emission contract.
+        if self.data.keep_native_multi_res:
+            assert self.data.patch_mode in ("z_axis", "cubic"), (
+                "data.keep_native_multi_res=True is only valid in 3D "
+                "patch_mode in {'z_axis', 'cubic'}; got patch_mode="
+                f"{self.data.patch_mode!r}. Use data.aux_keep_native_d "
+                "for the 2.5D analogue.")
+            assert len(self.data.multi_res_scales) > 1, (
+                "data.keep_native_multi_res=True requires at least one "
+                "auxiliary view (len(multi_res_scales) > 1); got "
+                f"multi_res_scales={self.data.multi_res_scales}. "
+                "With a single scale the lazy path has nothing to defer.")
+            assert float(self.data.multi_res_scales[0]) == 1.0, (
+                "data.keep_native_multi_res=True requires "
+                "multi_res_scales[0] == 1.0 (view 0 = canonical "
+                f"geometry); got multi_res_scales={self.data.multi_res_scales}.")
+            assert not self.data.aux_keep_native_d, (
+                "data.keep_native_multi_res and data.aux_keep_native_d "
+                "are mutually exclusive (3D vs 2.5D analogues). Pick one.")
+            if self.data.patch_mode == "z_axis":
+                assert self.data.z_boundary_mode == "edge_pad", (
+                    "keep_native_multi_res=True (z_axis) requires "
+                    "z_boundary_mode='edge_pad' (set automatically by "
+                    f"sync()); got {self.data.z_boundary_mode!r}.")
 
         if self.data.patch_mode == "2_5d":
             # 2.5D mode invariants enforced by sync(); re-check here so a
