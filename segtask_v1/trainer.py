@@ -19,7 +19,7 @@ import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -340,6 +340,52 @@ class Trainer:
         # (pred_per_class, target_binary)`` so trainer code is mode-agnostic.
         self._inner_loss = inner
 
+        # ---- Multi-FOV aux segmentation supervision (2.5D mode) -----
+        # Active only when (1) we're in 2.5D mode, (2) the user opted in via
+        # ``model.aux_seg_supervision``, AND (3) there is at least one aux
+        # FOV view (n_views>1). Otherwise the aux path is fully bypassed
+        # (no extra modules built, no behaviour change).
+        n_views_data = len(cfg.data.multi_res_scales)
+        self.aux_seg_supervision = bool(
+            getattr(cfg.model, "aux_seg_supervision", False)
+            and self.is_2_5d
+            and n_views_data > 1)
+        if self.aux_seg_supervision:
+            n_aux = n_views_data - 1
+            user_w = list(getattr(cfg.loss, "aux_supervision_weights", []))
+            if not user_w:
+                # Geometric decay default — wider FOVs (less precise pixel
+                # alignment with view 0's true geometry) get smaller weight.
+                # Same convention as deep_supervision_weights.
+                user_w = [0.5 ** (k + 1) for k in range(n_aux)]
+            elif len(user_w) != n_aux:
+                # Defensive — Config.validate() already guards this, but
+                # repeat the check so a hand-crafted Config dict still
+                # fails fast if it bypasses YAML loading.
+                raise ValueError(
+                    f"loss.aux_supervision_weights length ({len(user_w)}) "
+                    f"must equal n_views-1 ({n_aux}); got {user_w}.")
+            self.aux_weights = [float(w) for w in user_w]
+            # Aux paths compute single-resolution per-view losses (no DS
+            # for aux — DS structure is reserved for the main path's
+            # multi-scale supervision). The inner SliceChannelLoss is the
+            # same shape contract as the main one: (B, num_fg*D, H, W)
+            # pred + (B, D, H, W) raw label.
+            self.aux_inner_loss = SliceChannelLoss(
+                base_loss=self.base_loss,
+                num_fg_classes=cfg.num_fg_classes,
+                num_slices=int(cfg.data.patch_size[0]),
+                label_values=cfg.data.label_values,
+                reduction=cfg.loss.slice_loss_reduction,
+            )
+            logger.info(
+                "Aux seg supervision: ENABLED, n_aux_views=%d, weights=%s, "
+                "fusion=%s",
+                n_aux, self.aux_weights, cfg.model.context_fusion)
+        else:
+            self.aux_weights = []
+            self.aux_inner_loss = None
+
         # --- Optimizer + scheduler ------------------------------------
         self.optimizer = build_optimizer(self.model, cfg)
         steps_per_epoch = len(train_loader)
@@ -521,14 +567,24 @@ class Trainer:
             # --- Epoch summary ----------------------------------------
             best_str = (f"{self.best_metric:.4f} (ep{self.best_epoch + 1})"
                         if self.has_best else "n/a")
+            # Aggregate the aux component averages into a compact suffix
+            # using the same renderer as the per-step debug line. Empty
+            # for non-aux runs → epoch line is bit-identical to legacy.
+            aux_summary_dict = {
+                k: v for k, v in train_metrics.items()
+                if k.startswith("L_main") or k.startswith("L_aux_")
+                or k.startswith("w_aux_")
+            }
+            aux_msg = self._format_breakdown(aux_summary_dict)
             logger.info(
                 "Epoch %d/%d | LR=%.2e | loss=%.4f | val_dice=%.4f | "
-                "best=%s | %s",
+                "best=%s | %s%s",
                 epoch + 1, tc.epochs, self.scheduler.get_lr(),
                 train_metrics.get("loss", 0.0),
                 val_metrics.get("mean_dice", 0.0),
                 best_str,
                 timer.elapsed_str(),
+                aux_msg,
             )
 
             # --- Periodic checkpoint ----------------------------------
@@ -579,6 +635,12 @@ class Trainer:
         self.model.train()
         loss_meter = AverageMeter()
         dice_meter = AverageMeter()
+        # Per-component meters for the multi-FOV aux supervision diagnostic
+        # log. Populated lazily on the first batch (we don't know the aux
+        # view names until ``_compute_loss_aux_fp32`` runs once); from then
+        # on each component is averaged across the epoch independently.
+        # Keys: "L_main", "L_aux_1", "L_aux_2", ...
+        component_meters: Dict[str, AverageMeter] = {}
         tc = self.cfg.train
         accum = self.grad_accum_steps
 
@@ -612,8 +674,24 @@ class Trainer:
 
             # --- 2.5D adaptation: collapse the C_res=1 channel so the D
             #     axis becomes the model's input-channel dimension.
+            #     With aux seg supervision active the label/wmap tensors
+            #     are kept at rank-5 ``(B, C_res, D, H, W)`` so per-view
+            #     losses can index ``label[:, k]`` for aux head ``k``.
+            label_all_views: Optional[torch.Tensor] = None
+            wmap_all_views: Optional[torch.Tensor] = None
             if self.is_2_5d:
-                image, label, wmap = self._squeeze_2_5d(image, label, wmap)
+                if self.aux_seg_supervision:
+                    image, label_all_views, wmap_all_views = (
+                        self._squeeze_2_5d_keep_views(image, label, wmap))
+                    # ``label`` / ``wmap`` shadow view 0 so the dice metric
+                    # block below — which is shared with the no-aux path —
+                    # operates on the same supervision target as the main
+                    # head (bit-equivalent metric definition).
+                    label = label_all_views[:, 0]
+                    wmap = (wmap_all_views[:, 0]
+                            if wmap_all_views is not None else None)
+                else:
+                    image, label, wmap = self._squeeze_2_5d(image, label, wmap)
 
             # --- Effective accumulation denominator for this step
             if remainder > 0 and step >= partial_start:
@@ -635,8 +713,21 @@ class Trainer:
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):
                 pred = self.model(image)
-            loss = self._compute_loss_fp32(
-                self.criterion, pred, label, weight_map=wmap)
+            breakdown: Dict[str, float] = {}
+            if self.aux_seg_supervision:
+                # Aux-aware path: pred is a dict and we route per-view
+                # supervision through ``_compute_loss_aux_fp32``. The main
+                # path inside that helper still goes through the
+                # DS-wrapped criterion, so deep_supervision composes with
+                # aux supervision orthogonally. The ``breakdown`` dict is
+                # filled in-place with detached scalars per component
+                # (L_main, L_aux_k, w_aux_k, L_total) for diagnostic logs.
+                loss = self._compute_loss_aux_fp32(
+                    pred, label_all_views, wmap_all_views,
+                    breakdown=breakdown)
+            else:
+                loss = self._compute_loss_fp32(
+                    self.criterion, pred, label, weight_map=wmap)
             if effective_accum > 1:
                 loss = loss / effective_accum
 
@@ -671,6 +762,14 @@ class Trainer:
             # itself continues healthily via GradScaler's inf-skip path.
             if math.isfinite(loss_val):
                 loss_meter.update(loss_val, image.shape[0])
+                # Aux breakdown averaging — only update meters with finite
+                # scalars to mirror the main loss meter's NaN guard.
+                for name, val in breakdown.items():
+                    if not math.isfinite(val):
+                        continue
+                    if name not in component_meters:
+                        component_meters[name] = AverageMeter()
+                    component_meters[name].update(val, image.shape[0])
             else:
                 logger.warning(
                     "Non-finite train loss (%s) at epoch %d step %d/%d; "
@@ -680,7 +779,10 @@ class Trainer:
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
-                    p = pred[0] if isinstance(pred, list) else pred
+                    # Unify dict / list / tensor outputs to the main full-
+                    # res tensor before metric splitting. ``label`` is
+                    # already view 0 in both aux and no-aux paths above.
+                    p = self._extract_main_pred(pred)
                     # Mode-agnostic via the inner wrapper's contract:
                     #   3D : returns (B, num_fg, *spatial), (B, num_fg, *spatial)
                     #   2.5D: returns (B*D, num_fg, H, W),  (B*D, num_fg, H, W)
@@ -689,11 +791,51 @@ class Trainer:
                     dice = compute_dice_per_class(p_1x, lbl_1x)
                     mean_dice = dice.mean().item()
                     dice_meter.update(mean_dice, image.shape[0])
-                logger.debug("  [%d/%d] loss=%.4f dice=%.4f lr=%.2e",
-                             step + 1, total_steps,
-                             loss_val, mean_dice, self.scheduler.get_lr())
+                # Compact diagnostic line: when aux supervision is on, append
+                # "L_main / L_aux_k=val(w=...)" so the user can immediately
+                # see whether each aux head is contributing meaningful
+                # gradient (similar magnitude to L_main scaled by w_k).
+                aux_msg = self._format_breakdown(breakdown)
+                logger.debug(
+                    "  [%d/%d] loss=%.4f dice=%.4f lr=%.2e%s",
+                    step + 1, total_steps,
+                    loss_val, mean_dice, self.scheduler.get_lr(),
+                    aux_msg)
 
-        return {"loss": loss_meter.avg, "dice": dice_meter.avg}
+        # Surface the epoch-mean of each aux component alongside the
+        # standard loss/dice metrics. ``fit()`` formats them into the
+        # epoch summary line so the user sees aux contributions at a
+        # cadence that matches the main metric log.
+        out: Dict[str, float] = {"loss": loss_meter.avg, "dice": dice_meter.avg}
+        for name, meter in component_meters.items():
+            out[name] = meter.avg
+        return out
+
+    @staticmethod
+    def _format_breakdown(breakdown: Dict[str, float]) -> str:
+        """Render a compact " | L_main=... L_aux_1=...(w=...) ..." string.
+
+        Returns "" when the breakdown is empty (single-FOV or aux disabled),
+        keeping legacy log lines bit-identical for non-aux runs.
+        """
+        if not breakdown:
+            return ""
+        parts: List[str] = []
+        # Stable ordering: L_main first, then L_aux_k in ascending k.
+        if "L_main" in breakdown:
+            parts.append(f"L_main={breakdown['L_main']:.4f}")
+        aux_keys = sorted(
+            (k for k in breakdown if k.startswith("L_aux_")),
+            key=lambda k: int(k.split("_")[-1]))
+        for k in aux_keys:
+            view_k = k.split("_")[-1]
+            w_key = f"w_aux_{view_k}"
+            if w_key in breakdown:
+                parts.append(
+                    f"{k}={breakdown[k]:.4f}(w={breakdown[w_key]:.3g})")
+            else:
+                parts.append(f"{k}={breakdown[k]:.4f}")
+        return " | " + " ".join(parts)
 
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
@@ -725,8 +867,11 @@ class Trainer:
                 with autocast(device_type="cuda", enabled=self.use_amp,
                               dtype=self.amp_dtype):
                     pred = self.model(image)
-                    if isinstance(pred, list):
-                        pred = pred[0]
+                    # ``_extract_main_pred`` is dict/list/tensor-safe.
+                    # In eval mode UNet3D returns a tensor (aux gated by
+                    # ``self.training``), but the helper keeps the val
+                    # contract robust if a future change relaxes that.
+                    pred = self._extract_main_pred(pred)
                     pred_1x, target_1x = self._inner_loss.split_for_metrics(
                         pred, label)
                 # Loss in fp32 — see `_train_epoch` for rationale (fp16 dice
@@ -826,6 +971,135 @@ class Trainer:
             if wmap_fp32 is None:
                 return loss_fn(pred_fp32, target_fp32)
             return loss_fn(pred_fp32, target_fp32, weight_map=wmap_fp32)
+
+    # ------------------------------------------------------------------
+    # Aux-aware helpers (multi-FOV deep supervision in 2.5D mode)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_main_pred(pred):
+        """Unwrap the model output to its main-path tensor.
+
+        Accepts:
+          - dict {"main": tensor|list, "aux": [...]} → returns tensor
+            (DS list is collapsed to its head, the main full-res output).
+          - list [main_out, ds_2nd, ...] → returns list[0].
+          - tensor → returns as-is.
+
+        Mirrors how ``_train_epoch`` historically picked the main scale
+        before the aux-supervision dict contract was added; centralising
+        the logic here keeps the metric / log path branch-free.
+        """
+        if isinstance(pred, dict):
+            pred = pred["main"]
+        if isinstance(pred, list):
+            pred = pred[0]
+        return pred
+
+    def _squeeze_2_5d_keep_views(
+        self,
+        image: torch.Tensor,
+        label: torch.Tensor,
+        wmap: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Aux-supervision variant of :meth:`_squeeze_2_5d`.
+
+        The image is reshaped exactly as in the legacy single-view path —
+        ``(B, C_res, D, H, W) → (B, C_res*D, H, W)`` — but ``label`` and
+        ``wmap`` are returned UNCHANGED at rank-5 ``(B, C_res, D, H, W)``.
+        The training loop then slices view 0 for the main supervision and
+        view k for the k-th auxiliary head, ensuring every view's
+        physically-resampled label can drive its corresponding output.
+        """
+        if image.ndim != 5:
+            raise ValueError(
+                f"2.5D _squeeze_keep_views expects rank-5 image "
+                f"(B, C_res, D, H, W); got shape={tuple(image.shape)}")
+        if label.shape[:2] != image.shape[:2]:
+            raise ValueError(
+                f"image / label batch+C_res mismatch: image="
+                f"{tuple(image.shape)}, label={tuple(label.shape)}")
+        B, C_res, D, H, W = image.shape
+        image_2d = image.reshape(B, C_res * D, H, W).contiguous()
+        return image_2d, label, wmap
+
+    def _compute_loss_aux_fp32(
+        self,
+        pred,
+        label_all: torch.Tensor,
+        wmap_all: Optional[torch.Tensor],
+        breakdown: Optional[Dict[str, float]] = None,
+    ) -> torch.Tensor:
+        """Aux-aware loss aggregator for the 2.5D multi-FOV training step.
+
+        Layout
+        ------
+        ``pred`` is normally a dict ``{"main": ..., "aux": [...]}`` produced
+        by :class:`UNet3D` when aux supervision is active. As a defensive
+        fallback we accept the legacy tensor / list form too — in that
+        case only the main loss is computed (zero aux contribution), so
+        a configuration drift can never silently inflate the loss.
+
+        ``label_all`` is rank-5 ``(B, C_res, D, H, W)``: view 0 supervises
+        the main head, view ``k`` supervises aux head ``k``. ``wmap_all``
+        carries the per-view loss weight maps (or None).
+
+        Loss formula
+        ------------
+            L = L_main(view_0) + Σ_{k=1..K} w_k * L_aux(view_k)
+
+        where ``L_main`` is the full DS+SliceChannel pipeline and each
+        ``L_aux`` is a single-resolution :class:`SliceChannelLoss` on the
+        view-k label. Weights ``w_k`` come from ``self.aux_weights``.
+        """
+        # ---- Slice the supervision tensors per view --------------------
+        label_main = label_all[:, 0]
+        wmap_main = wmap_all[:, 0] if wmap_all is not None else None
+
+        if isinstance(pred, dict):
+            main_pred = pred["main"]
+            aux_preds = pred.get("aux", []) or []
+        else:
+            # Defensive: model didn't produce aux outputs (e.g. eval mode
+            # leakage or aux disabled at the model side). Compute main-only.
+            main_pred, aux_preds = pred, []
+
+        # Main path uses the full criterion (DS-wrapped if enabled). The
+        # outer ``_compute_loss_fp32`` handles fp32 cast + logit clamp.
+        main_l = self._compute_loss_fp32(
+            self.criterion, main_pred, label_main, weight_map=wmap_main)
+        total = main_l
+        if breakdown is not None:
+            # Detach to avoid keeping an extra autograd reference; ``.item``
+            # synchronises but is acceptable at log_every cadence (and we
+            # already do the same for the main loss meter).
+            breakdown["L_main"] = float(main_l.detach().item())
+
+        # Aux paths — each contributes ``w_k * L_aux(view_k)``.
+        if not aux_preds or self.aux_inner_loss is None:
+            if breakdown is not None:
+                breakdown["L_total"] = float(total.detach().item())
+            return total
+        if len(aux_preds) != len(self.aux_weights):
+            raise RuntimeError(
+                f"Number of aux predictions ({len(aux_preds)}) does not "
+                f"match number of aux weights ({len(self.aux_weights)}). "
+                f"This indicates a model/config divergence.")
+        for k_idx, (ap, w_k) in enumerate(zip(aux_preds, self.aux_weights)):
+            view_k = k_idx + 1   # k=1..n_views-1 in label channel space
+            lbl_k = label_all[:, view_k]
+            wm_k = wmap_all[:, view_k] if wmap_all is not None else None
+            aux_l = self._compute_loss_fp32(
+                self.aux_inner_loss, ap, lbl_k, weight_map=wm_k)
+            total = total + w_k * aux_l
+            if breakdown is not None:
+                # Log the RAW aux loss (un-weighted) so the user can see
+                # whether the aux head is actually being learnt; the
+                # contribution to the optimiser is ``w_k * L_aux``.
+                breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())
+                breakdown[f"w_aux_{view_k}"] = float(w_k)
+        if breakdown is not None:
+            breakdown["L_total"] = float(total.detach().item())
+        return total
 
     def _squeeze_2_5d(
         self,

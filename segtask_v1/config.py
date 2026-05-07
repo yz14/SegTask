@@ -309,6 +309,59 @@ class ModelConfig:
     # Deep supervision: output predictions at multiple decoder levels
     deep_supervision: bool = False
 
+    # ---- Multi-FOV auxiliary segmentation supervision (2.5D mode only) ----
+    # When True AND ``data.patch_mode == "2_5d"`` AND
+    # ``len(data.multi_res_scales) > 1``, the seg head is mirrored across
+    # views: in addition to the main view-0 prediction, the model emits
+    # one auxiliary prediction per aux view k=1..n_views-1 (each shaped
+    # ``(B, num_fg * D, H, W)`` — same contract as the main head).
+    #
+    # Geometric symmetry with the stem fusion choice (auto-detected from
+    # ``context_fusion``):
+    #   - "shared_stem"  / "multi_stem_proj" (Plan A): aux heads are
+    #       mounted in PARALLEL on the highest-resolution decoder feature
+    #       (``dec_features[-1]``), each with its own 1×1 conv. Mirrors the
+    #       early-fusion stem layout — every view shares the full encoder/
+    #       decoder pyramid and only differs in its final classifier.
+    #   - "hierarchical" (Plan C): aux head k reads
+    #       ``dec_features[-1-k]`` (the decoder feature at the same
+    #       semantic depth as the encoder stage where view k was injected)
+    #       then 1×1-conv + interpolate back to (H, W). Mirrors the
+    #       hierarchical injection point — coarse-FOV supervision lands
+    #       at the matching low-resolution decoder feature.
+    #
+    # Loss-side wiring lives in ``loss.aux_supervision_weights``: per-aux-
+    # view scalar weights (length ``n_views-1``). Empty → defaults to
+    # geometric decay ``0.5^k``. Set ``aux_seg_supervision=False`` to
+    # disable entirely (bit-identical to legacy path; no extra heads built).
+    #
+    # Always inactive when ``len(multi_res_scales) == 1`` (no aux views to
+    # supervise) or in 3D modes (multi-FOV is fed as scale channels there,
+    # not as views). The forward call keeps emitting a single tensor at
+    # eval time — predictor.py is unchanged.
+    aux_seg_supervision: bool = False
+
+    # ---- Aux seg head topology (only when aux_seg_supervision==True) ----
+    # Controls the per-aux-view classifier shape:
+    #   "linear" — single ``Conv1×1(out_ch=num_fg*D)`` (default; minimal
+    #              cost, equal capacity to the main head). Recommended for
+    #              Plan A (multi_stem_proj / shared_stem) where every aux
+    #              head shares the highest-resolution decoder feature with
+    #              the main head — extra capacity is unlikely to help.
+    #   "conv"   — ``ConvNormAct(3×3) → Conv1×1`` (≈2 layers). Recommended
+    #              for Plan C (hierarchical) because aux head ``k`` reads
+    #              the LOW-RESOLUTION decoder feature at level ``k`` (i.e.
+    #              ``input/(stem_stride * 2^k)``), where the spatial
+    #              context aggregation per output cell is closer to the
+    #              decoder's stage block than to the main head's full-res
+    #              feature; a 3×3 conv lets the head re-aggregate before
+    #              the linear classifier (closer to "main head + a stage
+    #              block" capacity). Adds <1% params at typical sizes.
+    # The mode is applied uniformly to all aux heads of a build; no per-k
+    # override is exposed (we observed no benefit in preliminary checks
+    # and the extra config surface would obscure intent).
+    aux_head_mode: str = "linear"
+
     # Stem / patch-embed (see models.stem.build_stem):
     # "conv3" | "conv7" | "dual" | "patch2" | "patch4".
     # patchN stems reduce input resolution by N; UNet3D adds a matching
@@ -479,6 +532,22 @@ class LossConfig:
     #     under both reductions (per-voxel mean over the same voxels);
     #     only Dice-family aggregation is affected.
     slice_loss_reduction: str = "per_slice"
+
+    # ---- Multi-FOV aux segmentation supervision weights (2.5D mode) ----
+    # Used only when ``model.aux_seg_supervision == True``. One weight per
+    # aux view (k = 1..n_views-1, where n_views = len(data.multi_res_scales)).
+    # The total training loss is::
+    #
+    #     L_total = L_main(view_0) + Σ_{k=1..n_views-1} w_k * L_aux(view_k)
+    #
+    # ``L_main`` runs through the full DS+SliceChannel pipeline as before;
+    # each ``L_aux`` is a SliceChannelLoss on view k's resampled label at
+    # the model's native (H, W) resolution (no DS for aux paths).
+    #
+    # Empty list → trainer auto-fills with geometric decay ``0.5 ** k``
+    # (e.g. n_views=3 → weights=[0.5, 0.25]). Length must equal
+    # n_views - 1 when explicitly provided.
+    aux_supervision_weights: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +761,9 @@ class Config:
         assert self.model.context_fusion in (
             "shared_stem", "multi_stem_proj", "hierarchical",
         ), f"Invalid context_fusion: {self.model.context_fusion!r}"
+        assert getattr(self.model, "aux_head_mode", "linear") in (
+            "linear", "conv",
+        ), f"Invalid aux_head_mode: {self.model.aux_head_mode!r}"
         assert self.model.decoder_type in ("unet", "unetpp", "unet3p"), \
             f"Invalid decoder_type: {self.model.decoder_type}"
         assert self.model.unet3p_cat_channels > 0, \
@@ -802,6 +874,35 @@ class Config:
                     f"and stem_mode={self.model.stem_mode!r} requires "
                     f"patch_size[1] and patch_size[2] divisible by "
                     f"{deepest}; got patch_size=({pH}, {pW}).")
+            # Aux seg supervision constraints — only meaningful when
+            # there is at least one aux view (n_views > 1).
+            if getattr(self.model, "aux_seg_supervision", False):
+                assert n_views > 1, (
+                    "model.aux_seg_supervision=True requires "
+                    "len(multi_res_scales) > 1 (at least one aux FOV "
+                    "to supervise); got n_views=1.")
+                aw = list(getattr(self.loss, "aux_supervision_weights", []))
+                if aw:
+                    assert len(aw) == n_views - 1, (
+                        f"loss.aux_supervision_weights length ({len(aw)}) "
+                        f"must equal n_views-1 ({n_views - 1}); got {aw}.")
+                    assert all(w >= 0 for w in aw), (
+                        f"loss.aux_supervision_weights must be non-negative; "
+                        f"got {aw}.")
+                # Plan C requires len(decoder)>=n_views to give each aux
+                # view a unique decoder feature index. ``unet`` decoder
+                # produces n_levels-1 features and we mount aux head k on
+                # dec_features[-1-k] for k=1..n_views-1 → need n_views-1
+                # < n_levels-1, i.e. n_views < n_levels. Plan A (parallel)
+                # has no such constraint.
+                if self.model.context_fusion == "hierarchical":
+                    n_levels = len(self.model.encoder_channels)
+                    assert n_views < n_levels, (
+                        f"aux_seg_supervision with context_fusion="
+                        f"'hierarchical' requires n_views < "
+                        f"len(encoder_channels) (one decoder feature per "
+                        f"aux view + the main one); got n_views={n_views}, "
+                        f"n_levels={n_levels}.")
         assert self.data.aug_oversample_ratio >= 1.0, \
             "aug_oversample_ratio must be >= 1.0"
         assert len(self.data.multi_res_scales) >= 1, \

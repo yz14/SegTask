@@ -16,7 +16,7 @@ Supports:
 
 from __future__ import annotations
 
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Union
 
 import torch
 import torch.nn as nn
@@ -71,6 +71,8 @@ class Encoder(nn.Module):
                 f"in_channels ({in_channels}) must be divisible by "
                 f"context_n_views ({context_n_views})")
         self.context_n_views = context_n_views
+        # Persist on the encoder so UNet3D can mirror the stem topology
+        # when building aux seg heads (Plan A vs. Plan C symmetric layout).
         self.context_fusion = context_fusion
         in_ch_per_view = in_channels // context_n_views
         self.stem, self.stem_stride = build_context_stem(
@@ -286,6 +288,69 @@ class SegmentationHead(nn.Module):
         return self.conv(x)
 
 
+class ConvSegmentationHead(nn.Module):
+    """3×3 ConvNormAct → 1×1 logits.
+
+    Drop-in replacement for :class:`SegmentationHead` that adds a single
+    ConvNormAct stage of capacity matching the decoder's per-level
+    operators. Designed for Plan C aux heads which read a low-resolution
+    decoder feature: the extra 3×3 conv lets the head re-aggregate
+    spatial context before the linear classifier — closer to the
+    "main head + 1 decoder block" capacity of the main path.
+
+    Param overhead vs. the linear head is ``9 * in_ch^2`` (3D: 27) plus
+    norm/bias — at typical decoder widths (32–256) this is well under
+    1% of the total network.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        num_classes: int,
+        spatial_dims: int = 3,
+        norm_type: str = "instance",
+        norm_groups: int = 8,
+        activation: str = "leakyrelu",
+    ):
+        super().__init__()
+        self.conv = ConvNormAct(
+            in_ch, in_ch, kernel_size=3, stride=1, padding=1,
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation, spatial_dims=spatial_dims)
+        self.classifier = _CONV[spatial_dims](in_ch, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.conv(x))
+
+
+def _build_aux_head(
+    mode: str,
+    in_ch: int,
+    num_classes: int,
+    spatial_dims: int,
+    norm_type: str = "instance",
+    norm_groups: int = 8,
+    activation: str = "leakyrelu",
+) -> nn.Module:
+    """Dispatch the aux seg head topology.
+
+    ``mode`` is one of:
+      - ``"linear"`` → :class:`SegmentationHead` (1×1).
+      - ``"conv"``   → :class:`ConvSegmentationHead` (3×3 + 1×1).
+
+    See ``ModelConfig.aux_head_mode`` for the rationale per fusion mode.
+    """
+    if mode == "linear":
+        return SegmentationHead(in_ch, num_classes, spatial_dims=spatial_dims)
+    if mode == "conv":
+        return ConvSegmentationHead(
+            in_ch, num_classes, spatial_dims=spatial_dims,
+            norm_type=norm_type, norm_groups=norm_groups,
+            activation=activation)
+    raise ValueError(
+        f"Unknown aux_head_mode: {mode!r}. Valid: 'linear' | 'conv'.")
+
+
 class UNet3D(nn.Module):
     """Generic 3D UNet with pluggable encoder/decoder stages.
 
@@ -294,6 +359,29 @@ class UNet3D(nn.Module):
         decoder: Decoder module.
         num_fg_classes: Number of foreground classes (output channels).
         deep_supervision: Output at multiple decoder levels during training.
+        aux_seg_supervision: Build per-aux-FOV seg heads symmetric to the
+            encoder's stem fusion topology. Active only when
+            ``encoder.context_n_views > 1`` (2.5D multi-FOV mode); silently
+            ignored otherwise (no extra parameters built).
+
+    Forward returns:
+        - eval mode (``self.training=False``)::
+              tensor (B, num_fg, *spatial)            — single scale.
+              list  [main_out, 2nd_high, ..., lowest] — when DS heads
+                                                          existed at construction
+                                                          (kept for backward
+                                                          compatibility).
+        - training mode without aux supervision: same as above.
+        - training mode with aux supervision active::
+              dict { "main": tensor | list,                 — main path
+                                                              (DS list when
+                                                              deep_supervision=True,
+                                                              tensor otherwise)
+                     "aux":  [aux_view_1, aux_view_2, ...]} — one tensor per
+                                                              aux view at the
+                                                              SAME (H, W) as
+                                                              main_out.
+        Predictor / val paths only exercise eval mode → contract preserved.
     """
 
     def __init__(
@@ -302,7 +390,15 @@ class UNet3D(nn.Module):
         decoder,
         num_fg_classes: int,
         deep_supervision: bool = False,
-        spatial_dims: int = 3):
+        spatial_dims: int = 3,
+        aux_seg_supervision: bool = False,
+        aux_head_mode: str = "linear",
+        # Norm / activation are propagated to ``ConvSegmentationHead`` when
+        # ``aux_head_mode == "conv"``; mirror the encoder defaults so the
+        # aux head's norm/act stay homogeneous with the rest of the model.
+        norm_type: str = "instance",
+        norm_groups: int = 8,
+        activation: str = "leakyrelu"):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -333,39 +429,129 @@ class UNet3D(nn.Module):
                 self.ds_heads.append(SegmentationHead(
                     ch, num_fg_classes, spatial_dims=spatial_dims))
 
-    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
+        # ----- Multi-FOV auxiliary segmentation heads (2.5D mode) ---------
+        # Mirror the encoder's stem fusion topology so each aux supervision
+        # signal lands at the matching depth:
+        #
+        #   shared_stem / multi_stem_proj (Plan A — early fusion at full res):
+        #     all views funnel into ONE encoder pyramid, so aux heads sit
+        #     in PARALLEL on the highest-resolution decoder feature
+        #     (``dec_features[-1]``). Each head has its own 1×1 conv but
+        #     shares the upstream representation; the loss forces the shared
+        #     trunk to retain enough cross-view information that every view
+        #     can be reconstructed by a per-view classifier. This matches
+        #     standard multi-task heads on a shared backbone.
+        #
+        #   hierarchical (Plan C — per-FOV stems at stride-aligned strides):
+        #     aux view k is injected at encoder stage k. The symmetric
+        #     decoder feature at the same semantic depth is ``dec_features
+        #     [-1-k]`` (decoder features run [low_res, ..., high_res], so
+        #     index -1 is the highest-res mirroring stage 0, -1-k mirrors
+        #     stage k). Aux head k reads ``dec_features[-1-k]``, applies a
+        #     1×1 conv, then is interpolated back to (H, W) so the loss
+        #     can be computed against view k's resampled D-slice label
+        #     (which lives at full (H, W) per the dataset contract).
+        #
+        # When ``encoder.context_n_views == 1`` (single FOV) or
+        # ``aux_seg_supervision == False`` the construction below is a
+        # no-op and the path is bit-identical to the legacy build.
+        n_views = int(getattr(encoder, "context_n_views", 1))
+        fusion = str(getattr(encoder, "context_fusion", "shared_stem"))
+        self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
+        self.aux_n_views = n_views
+        # ``self.aux_feat_indices[k-1]`` = decoder feature index that aux
+        # head ``k`` (k=1..n_views-1) reads from. Persisted so forward()
+        # stays a flat lookup (no Python branching per call).
+        self.aux_feat_indices: List[int] = []
+        self.aux_heads = nn.ModuleList()
+        # The head builder bakes in norm/activation only when the mode is
+        # ``conv`` — for the linear case it's a 1×1 conv with no norm.
+        head_builder = lambda in_ch: _build_aux_head(  # noqa: E731
+            mode=aux_head_mode,
+            in_ch=in_ch,
+            num_classes=num_fg_classes,
+            spatial_dims=spatial_dims,
+            norm_type=norm_type,
+            norm_groups=norm_groups,
+            activation=activation,
+        )
+        self.aux_head_mode = aux_head_mode
+        if self.aux_seg_supervision:
+            n_dec = len(decoder.out_channels)
+            if fusion == "hierarchical":
+                # dec_features ordering: [-1] = highest res (stage 0), [-2]
+                # = next-deeper (stage 1), ... so aux view k → index -1-k.
+                # Need n_dec >= n_views so aux view (n_views-1) gets a
+                # valid feature; validated upstream in Config.validate().
+                if n_views > n_dec:
+                    raise ValueError(
+                        f"aux_seg_supervision (hierarchical) requires "
+                        f"len(decoder.out_channels) >= n_views; got "
+                        f"n_dec={n_dec}, n_views={n_views}.")
+                for k in range(1, n_views):
+                    feat_idx = n_dec - 1 - k
+                    self.aux_feat_indices.append(feat_idx)
+                    self.aux_heads.append(
+                        head_builder(decoder.out_channels[feat_idx]))
+            else:
+                # Plan A — all aux heads on the highest-res decoder feat.
+                in_ch = decoder.out_channels[-1]
+                for _ in range(1, n_views):
+                    self.aux_feat_indices.append(n_dec - 1)
+                    self.aux_heads.append(head_builder(in_ch))
+
+    def forward(
+        self, x: torch.Tensor,
+    ) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
         """Forward pass.
 
         Args:
-            x: (B, 1, D, H, W) input.
+            x: (B, in_channels, *spatial) input. For 2.5D multi-FOV the
+               channel layout is (B, n_views * D, H, W).
 
         Returns:
-            If deep_supervision=False or eval: (B, num_fg, D, H, W) logits.
-            If deep_supervision=True and training: list of multi-scale logits
-                ordered [main_out (highest-res), 2nd_high, 3rd_high, ..., lowest].
+            See class docstring "Forward returns" for the contract matrix.
         """
         enc_features = self.encoder(x)
         dec_features = self.decoder(enc_features)
+        target_size = x.shape[2:]
 
         main_out = self.seg_head(dec_features[-1])
-        if self.stem_stride > 1:
+        if main_out.shape[2:] != target_size:
             # Restore main output to the original input resolution. Use
             # bilinear/trilinear up-sampling per spatial_dims — consistent
             # with SegFormer/nnFormer-style patch-embed decoders.
             main_out = F.interpolate(
-                main_out, size=x.shape[2:],
+                main_out, size=target_size,
                 mode=INTERP_SMOOTH[self.spatial_dims], align_corners=False)
 
-        if not self.deep_supervision or not self.training:
-            return main_out
+        # ----- Build the aux heads' outputs (training only) ---------------
+        # Gating on ``self.training`` keeps eval / inference paths bit-
+        # identical to the legacy contract (predictor.py never sees a dict).
+        aux_outs: List[torch.Tensor] = []
+        if self.aux_seg_supervision and self.training:
+            for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
+                ao = head(dec_features[feat_idx])
+                if ao.shape[2:] != target_size:
+                    ao = F.interpolate(
+                        ao, size=target_size,
+                        mode=INTERP_SMOOTH[self.spatial_dims],
+                        align_corners=False)
+                aux_outs.append(ao)
 
-        # dec_features = [low, ..., high]; dec_features[-1] is already used
-        # as main_out. DS heads must consume features in decreasing resolution:
-        # dec_features[-2] (2nd-highest), dec_features[-3], ..., dec_features[0] (lowest).
-        outputs = [main_out]
-        for i, head in enumerate(self.ds_heads):
-            outputs.append(head(dec_features[-2 - i]))
-        return outputs
+        # ----- Assemble main path ----------------------------------------
+        if self.deep_supervision and self.training:
+            # dec_features = [low, ..., high]; dec_features[-1] is already
+            # used as main_out. DS heads consume in decreasing resolution.
+            main_path: Union[torch.Tensor, List[torch.Tensor]] = [main_out]
+            for i, head in enumerate(self.ds_heads):
+                main_path.append(head(dec_features[-2 - i]))
+        else:
+            main_path = main_out
+
+        if aux_outs:
+            return {"main": main_path, "aux": aux_outs}
+        return main_path
 
     def param_count(self) -> Dict[str, int]:
         enc = sum(p.numel() for p in self.encoder.parameters())

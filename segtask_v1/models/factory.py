@@ -253,12 +253,22 @@ def build_model(cfg: Config) -> UNet3D:
             spatial_dims=spatial_dims)
 
     # Assemble UNet
+    aux_seg_supervision = bool(getattr(mc, "aux_seg_supervision", False))
+    # Aux supervision is only meaningful with multi-FOV views; UNet3D's
+    # constructor disables it internally when n_views==1, but we mirror
+    # the gate here so the log line tells the truth in single-FOV configs.
+    aux_seg_supervision = aux_seg_supervision and context_n_views > 1
     model = UNet3D(
         encoder=encoder,
         decoder=decoder,
         num_fg_classes=out_classes,
         deep_supervision=mc.deep_supervision,
-        spatial_dims=spatial_dims)
+        spatial_dims=spatial_dims,
+        aux_seg_supervision=aux_seg_supervision,
+        aux_head_mode=getattr(mc, "aux_head_mode", "linear"),
+        norm_type=mc.norm_type,
+        norm_groups=mc.norm_groups,
+        activation=mc.activation)
 
     # Log model info
     pc = model.param_count()
@@ -267,7 +277,8 @@ def build_model(cfg: Config) -> UNet3D:
         "enc=%.2fM, dec=%.2fM, total=%.2fM, channels=%s, "
         "enc_blocks=%s, dec_blocks=%s, out_classes=%d (fg=%d, res=%d), "
         "stem=%s(stride=%d, n_views=%d, fusion=%s), "
-        "down=%s, up=%s, skip=%s, attn=%s, skip_attn=%s",
+        "down=%s, up=%s, skip=%s, attn=%s, skip_attn=%s, "
+        "ds=%s, aux_seg=%s(n_aux_heads=%d, mode=%s)",
         mc.backbone, mc.block_type, mc.decoder_type, mc.resenc_preset,
         pc["encoder"] / 1e6, pc["decoder"] / 1e6, pc["total"] / 1e6,
         enc_channels,
@@ -277,6 +288,8 @@ def build_model(cfg: Config) -> UNet3D:
         mc.stem_mode, encoder.stem_stride,
         context_n_views, getattr(mc, "context_fusion", "shared_stem"),
         mc.downsample_mode, mc.upsample_mode, mc.skip_mode,
-        mc.attention_type, mc.skip_attention)
+        mc.attention_type, mc.skip_attention,
+        mc.deep_supervision, aux_seg_supervision, len(model.aux_heads),
+        getattr(mc, "aux_head_mode", "linear"))
 
     return model

@@ -193,6 +193,28 @@ model:
   #   "shared_stem"     — 单 stem 在 n_views*D 通道上跑（更省参，但物理异质共用滤波器）。
   context_fusion: "multi_stem_proj"
 
+  # 多 z-FOV 辅助分割监督（仅 2.5D 且 len(multi_res_scales)>1 生效）。
+  #   false  — 默认/旧行为：seghead 仅对 view 0（1× FOV）做预测，aux 视野
+  #            仅作为 stem 输入辅助上下文（无显式监督）。
+  #   true   — 强引导：seghead 额外为每个 aux view k=1..n_views-1 输出一份
+  #            (B, num_fg*D, H, W) 预测，对应 dataset 里 view k 重采样回 D
+  #            通道的 label 做监督。aux head 拓扑依据 context_fusion 自动选择：
+  #              * multi_stem_proj / shared_stem (Plan A)：所有 aux head
+  #                并联挂在最高分辨率的 decoder 特征上（与 stem 早融合对称）。
+  #              * hierarchical (Plan C)：aux head k 挂在 dec_features[-1-k]，
+  #                即与 encoder stage k 同语义深度的 decoder 特征上（与 stem
+  #                stride-2^k 注入位置对称）。
+  #            权重由 loss.aux_supervision_weights 控制。eval/predict 阶段
+  #            模型仍只输出主预测张量，predictor 行为不变。
+  aux_seg_supervision: false
+
+  # Aux head 拓扑（仅 aux_seg_supervision=true 生效）。
+  #   "linear" — 单层 1×1 conv（与 main head 等容量；推荐 Plan A）。
+  #   "conv"   — 3×3 ConvNormAct + 1×1（推荐 Plan C：低分辨率特征处加一层
+  #              空间聚合，更接近 "main head + decoder block" 的容量）。
+  # 参数开销 < 网络总量 1%。
+  aux_head_mode: "linear"
+
   decoder_type : "unet"
   downsample_mode: "conv"
   upsample_mode  : "trilinear"
@@ -237,6 +259,15 @@ loss:
   # 切换该开关只影响 Dice 系数家族的聚合域；class_weights / region_weights /
   # focal/tversky 超参 / deep_supervision 全部继续生效。
   slice_loss_reduction: "per_volume"
+
+  # 多 z-FOV 辅助监督权重（仅 model.aux_seg_supervision=true 生效）。
+  # 长度 = n_views - 1（即 aux view 数）。空列表 → 自动用 0.5^k 几何衰减
+  # （n_views=3 → [0.5, 0.25]，n_views=4 → [0.5, 0.25, 0.125]）。
+  # 训练总损失：
+  #   L = L_main(view_0) + Σ_{k=1..K} w_k * L_aux(view_k)
+  # 其中 L_aux 为同款 SliceChannelLoss（不走 deep supervision），与主损失
+  # 共享 base_loss（dice_focal 等）与 slice_loss_reduction 设置。
+  aux_supervision_weights: []
 
 
 # =====================================================================

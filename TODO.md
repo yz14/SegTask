@@ -37,7 +37,7 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 
 # TODO  
-1. 目前的2.5D训练(D:\codes\work-projects\SegTask\configs\seg2_5d.yaml)肺分割感觉上下文信息能力有点弱。我想针对2.5D也加入多级感受野的输入，我初步设想是这样的，假设当前模型输入为B,D,H,W，那么增加B,1.5D,H,W和B,2D,H,W输入，给原始的B,D,H,W输入提供更多的信息。一种做法是对三个输入分别用3个stem处理，然后拼接，再卷积，再下一个stage。另一个做法是将B,1.5D,H,W和B,2D,H,W重采样到B,D,H,W然后用相同的stem，然后拼接，然后卷积，再后续的stage。还有一种做法是将B,1.5D,H,W和B,2D,H,W分别重采样到B,D,H/2,W/2和B,D,H/4,W/4，然后用相同的stem，然后B,D,H/2,W/2经过stem的特征拼接到B,D,H,W第一个stage下采样后的特征上，B,D,H/4,W/4经过stem的特征拼接到B,D,H,W第二个stage下采样后的特征上。这些做法可能需要对encoder的input_channel做适当修改（自动化判断和修改）。请你先评估这几个方案的可行性和可靠性，然后理解我这么设计的意义，最后给出一个最佳解决方案。
+1. 目前的2.5D训练(D:\codes\work-projects\SegTask\configs\seg2_5d.yaml)肺分割感觉上下文信息能力有点弱。我想针对2.5D也加入多级感受野的输入。我实现了以下两个方案，感觉仅仅输入这些信息仍然不够，需要对模型增加更多的引导。我初步的设想是，在seghead加入对应的分割损失做强引导。例如输入是B,D,H,W时，还额外给了B,1.5D,H,W和B,2D,H,W做辅助信息，输出的分割head目前只针对B,D,H,W，为了让模型对B,1.5D,H,W和B,2D,H,W的信息做强引导，可以让seghead也预测B,1.5D,H,W和B,2D,H,W的结果，例如原本是预测B,num_fgxD,H,W，现在可以做更多的预测，预测B,num_fgx1.5D,H,W和B,num_fgx2D,H,W，只不过后者权重可以偏小，用来做辅助。方案A和C改动了stem，所以对称的seghead也需要做自动判断和修改。
 
 方案 A：三个独立 stem → 拼接 → 卷积 → 后续 stage
 可行性：高。等价于"each-FOV 独立 patch embedding，然后 early fusion"。改造点在 Encoder.__init__：把单 stem 替换为 n_views 个 stem + 一个 1×1 / 3×3 融合卷积。in_channels 自动由 n_views * D 推导，需在 Config.sync() 增加新字段（如 data.context_z_scales）。
