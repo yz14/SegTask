@@ -152,6 +152,84 @@ def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
     return arr
 
 
+def load_nifti_cropped(
+    path: str,
+    bbox: "Optional[BBox]" = None,
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    """Load NIfTI and (optionally) bbox-crop in a single pass.
+
+    Memory-vs-``load_nifti + apply_bbox(...).copy()``
+    -------------------------------------------------
+    The legacy path materialised the FULL volume TWICE at peak —
+    once inside the SimpleITK image buffer, and once more in the
+    numpy copy produced by ``GetArrayFromImage``. For a 512x512x700
+    CT decoded as float32 that is ~1.4 GiB transient per load; with
+    ``num_workers=4`` each loading image + label + region_weight
+    concurrently, it trivially exceeds host RAM and surfaces as
+    ``SimpleITK bad allocation`` (host OOM).
+    This helper instead uses ``GetArrayViewFromImage`` (zero-copy
+    view into the sitk buffer), slices the view by ``bbox``, and
+    materialises ONLY the cropped ROI as an owned, C-contiguous
+    numpy buffer. The sitk image is released immediately after.
+    Peak memory therefore drops from
+        ``2 x full_volume_bytes``
+    to
+        ``1 x full_volume_bytes + 1 x cropped_bytes``
+    which, for typical CT + tight thoracic ROI bbox, is ~1.5-2x
+    smaller — the single most impactful change available without
+    touching the caching / prefetch contract upstream.
+
+    Args:
+        path:  NIfTI file path (.nii / .nii.gz).
+        bbox:  Optional ROI bbox (see ``BBox`` typedef). ``None``
+               returns the full volume (still as an owned buffer).
+        dtype: Output numpy dtype. Floating requests ask SimpleITK
+               to decode directly to that float type (``scl_slope`` /
+               ``scl_inter`` applied natively); integer requests read
+               the stored dtype and cast after.
+
+    Returns:
+        ``(D', H', W')`` C-contiguous numpy array of ``dtype``, where
+        the primed dims are the bbox extents (or full volume dims
+        when ``bbox is None``). The returned buffer is independent
+        of any sitk storage — safe to mutate, cache, or hand off to
+        DataLoader workers.
+    """
+    np_dtype = np.dtype(dtype)
+    if np.issubdtype(np_dtype, np.floating):
+        sitk_pixel = (sitk.sitkFloat32 if np_dtype == np.float32
+                      else sitk.sitkFloat64)
+        read_args = (str(path), sitk_pixel)
+    else:
+        read_args = (str(path),)
+
+    img = _sitk_read_with_retry(read_args, path)
+    # ``GetArrayViewFromImage`` returns a numpy array sharing memory
+    # with the sitk image buffer — no copy. We MUST copy (into an
+    # owned buffer) before dropping ``img`` or the view becomes
+    # dangling memory.
+    view = sitk.GetArrayViewFromImage(img)  # (Z, Y, X)
+    if bbox is not None:
+        (d0, d1), (h0, h1), (w0, w1) = bbox
+        view = view[d0:d1, h0:h1, w0:w1]
+    # Force an explicit owned copy in the requested dtype / C order.
+    # We deliberately avoid ``np.ascontiguousarray`` here: it is a
+    # no-op when the input is already contiguous in the same dtype
+    # (which happens when ``bbox is None`` and dtype already matches),
+    # returning a view that would dangle the moment ``img`` is freed.
+    # ``np.array(..., copy=True)`` materialises a fresh buffer every
+    # call; a subsequent ``astype(copy=False)`` is free when dtypes
+    # already match, so the cost is a single owned allocation.
+    arr = np.array(view, copy=True, order="C")
+    if arr.dtype != np_dtype:
+        arr = arr.astype(np_dtype, copy=False)
+    # Drop the sitk image buffer as early as possible.
+    del view
+    del img
+    return arr
+
+
 # ---------------------------------------------------------------------------
 # Preprocessing
 # ---------------------------------------------------------------------------
@@ -161,7 +239,8 @@ def preprocess_image(
     intensity_max: float,
     normalize: str,
     global_mean: float = 0.0,
-    global_std: float = 1.0) -> np.ndarray:
+    global_std: float = 1.0,
+    inplace: bool = False) -> np.ndarray:
     """Intensity windowing + normalization → float32.
 
     Memory-conscious implementation: we allocate **one** float32 output
@@ -170,11 +249,20 @@ def preprocess_image(
     ``np.clip`` → ``(vol - min) / denom`` → ``.astype(float32)`` and
     transiently held ~3× the volume size as temporaries, which — combined
     with the per-worker LRU volume cache — drove OOMs on large CT scans.
+
+    Args:
+        inplace: When True AND the input is already ``float32``, reuse the
+            input buffer (saves one full-volume copy). Callers that own the
+            input array — e.g. ``SegDataset3D._load_image``, which always
+            passes a freshly-loaded buffer from ``load_nifti`` — should
+            enable this. Default False preserves the legacy defensive-copy
+            behaviour for callers that share arrays (tests, ``predictor``).
     """
     # Single allocation of the final float32 output buffer.
     vol = np.asarray(volume, dtype=np.float32)
-    if vol is volume:
-        # Input was already float32; don't mutate the caller's array.
+    if vol is volume and not inplace:
+        # Input was already float32 and caller hasn't explicitly opted
+        # into in-place mutation; protect their array.
         vol = volume.copy()
     np.clip(vol, intensity_min, intensity_max, out=vol)
 
@@ -217,7 +305,8 @@ def compute_region_weight_map(
     return wmap[np.newaxis]  # (1, D, H, W)
 
 
-def load_region_weight_volume(path: str) -> np.ndarray:
+def load_region_weight_volume(
+    path: str, bbox: "Optional[BBox]" = None) -> np.ndarray:
     """Load a per-sample region-weight NIfTI and apply the +1 shift.
 
     File convention (hand-annotated): background = 0, non-background
@@ -227,9 +316,21 @@ def load_region_weight_volume(path: str) -> np.ndarray:
     (bg=1, fg>=1) so the loss stack's voxel-wise multiplicative weight
     behaves identically regardless of weight source.
 
-    Returns a float32 (D, H, W) array.
+    When ``bbox`` is supplied, the crop is materialised BEFORE the +1
+    shift (via ``load_nifti_cropped``) so the arithmetic runs on the
+    small ROI buffer rather than a full-volume float32 temporary —
+    crucial for Host-OOM reduction when per-worker cache misses
+    coincide with large CT volumes.
+
+    Returns a float32 (D', H', W') array where the primed dims are the
+    bbox extents (or the full volume dims when ``bbox is None``).
     """
-    return load_nifti(path).astype(np.float32) + 1.0
+    # Cropped decode avoids the legacy ``full-volume float32 decode +
+    # full-volume ascontiguousarray crop copy'' sequence which peaked
+    # at ``2x + crop''. See ``load_nifti_cropped'' docstring.
+    rw = load_nifti_cropped(path, bbox=bbox, dtype=np.float32)
+    rw += 1.0
+    return rw
 
 
 def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
@@ -246,7 +347,7 @@ def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
     fg_values = label_values[1:]  # exclude background
     # Vectorized: (C, 1, 1, 1) == (D, H, W) → (C, D, H, W)
     lv = np.array(fg_values, dtype=np.int32).reshape(-1, *([1] * vol.ndim))
-    return (vol[np.newaxis] == lv).astype(np.float32)
+    return (vol[np.newaxis] == lv).astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +371,11 @@ def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_l
     else:
         raise ValueError(f"Expected 3D or 4D array, got {arr.ndim}D")
     order = 0 if is_label else 1
-    return zoom(arr, factors, order=order).astype(arr.dtype)
+    # ``scipy.ndimage.zoom`` already returns the output in the input
+    # dtype; the trailing cast is a defensive pre-condition but
+    # ``copy=False`` skips the redundant buffer allocation when dtypes
+    # already match (the common case).
+    return zoom(arr, factors, order=order).astype(arr.dtype, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +436,10 @@ def precompute_bboxes(bbox_paths: List[str]) -> List[Optional[BBox]]:
     sizes: List[Tuple[int, int, int]] = []
     n_empty = 0
     for p in bbox_paths:
-        bb = compute_bbox_from_volume(load_nifti(p))
+        # BBox masks are binary/small-int — int16 decode is 4× cheaper
+        # than the default float32 and ``compute_bbox_from_volume`` does
+        # ``np.round().astype(int32) != 0`` which is a no-op on ints.
+        bb = compute_bbox_from_volume(load_nifti(p, dtype=np.int16))
         bboxes.append(bb)
         if bb is None:
             n_empty += 1
@@ -673,22 +781,44 @@ class SegDataset3D(Dataset):
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
-        img = load_nifti(path)
-        img = apply_bbox(img, self._bbox_for(vol_idx))
-        img = preprocess_image(  # 归一化
+        bb = self._bbox_for(vol_idx)
+        # ``load_nifti_cropped`` fuses decode + bbox crop into a single
+        # owned-buffer allocation, halving peak RAM per load compared
+        # with the legacy ``load_nifti → apply_bbox → ascontiguousarray``
+        # path (which transiently held 2x full-volume float32 buffers
+        # — the main driver of the ``SimpleITK bad allocation'' host
+        # OOM on large CT scans).
+        img = load_nifti_cropped(path, bbox=bb, dtype=np.float32)
+        img = preprocess_image(  # 归一化 (in-place on the owned buffer)
             img, self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std)
+            self.normalize, self.global_mean, self.global_std,
+            inplace=True)
         self._img_cache.put(path, img)
         return img
 
     def _load_label(self, vol_idx: int) -> np.ndarray:
-        """Load raw label volume with caching."""
+        """Load raw label volume with caching.
+
+        Labels are decoded as ``int16`` (not ``float32``) — they are small
+        integer class indices, storing them as float32 wasted 4× RAM in
+        the per-worker volume cache and 4× CPU→GPU bandwidth for every
+        batch. Every downstream op is dtype-agnostic (``np.round`` is a
+        no-op on int arrays; ``resize_3d(..., is_label=True)`` uses
+        nearest interpolation which preserves dtype; the final per-sample
+        stack casts to float32 exactly once at tensor-emission time).
+        """
         path   = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
             return cached
-        lbl = load_nifti(path)
-        lbl = apply_bbox(lbl, self._bbox_for(vol_idx))
+        # Fused decode + bbox crop. The previous ``load_nifti + apply_bbox``
+        # stored a VIEW (``arr.base`` pointing to the full int16 buffer)
+        # in the cache, silently retaining the full volume's RAM for the
+        # lifetime of the cache entry. ``load_nifti_cropped`` always
+        # returns an owned, C-contiguous buffer — the cached footprint
+        # now matches the logged estimate.
+        lbl = load_nifti_cropped(
+            path, bbox=self._bbox_for(vol_idx), dtype=np.int16)
         self._lbl_cache.put(path, lbl)
         return lbl
 
@@ -703,8 +833,11 @@ class SegDataset3D(Dataset):
         cached = self._rw_cache.get(path)
         if cached is not None:
             return cached
-        rw = load_region_weight_volume(path)
-        rw = apply_bbox(rw, self._bbox_for(vol_idx))
+        # Bbox-aware load: the +1 shift is applied on the ROI buffer
+        # (not the full volume) — avoids a transient full-volume
+        # float32 arithmetic temporary.
+        rw = load_region_weight_volume(
+            path, bbox=self._bbox_for(vol_idx))
         self._rw_cache.put(path, rw)
         return rw
 
@@ -743,8 +876,7 @@ class SegDataset3D(Dataset):
         # center, unit slice spacing) matches the per-view independent
         # extraction of the legacy False-path voxel-for-voxel.
         if self.aux_keep_native_d:
-            return self._getitem_native_d(
-                vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
+            return self._getitem_native_d(vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
 
         # ---- 3D lazy single-max-FOV-cube path (z_axis) -----------------
         # Same emission shape contract as the legacy multi-res output
@@ -759,8 +891,7 @@ class SegDataset3D(Dataset):
         # of two: the dataset zoom is gone, the augment grid_sample is
         # the only resampling stage).
         if self.keep_native_multi_res:
-            return self._getitem_native_multi_res_z(
-                vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
+            return self._getitem_native_multi_res_z(vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
 
         # Build per-scale channel stack. For scale=1.0 we keep the legacy
         # clamp-then-stretch extraction (`_extract_z_patch`) for bit-exact
@@ -816,14 +947,19 @@ class SegDataset3D(Dataset):
         # Stack scales as channel 0 → (C_res, eD, pH, pW). For the legacy
         # single-res default (`multi_res_scales=[1.0]`), C_res == 1 and
         # the shape is identical to the pre-multires z-axis output.
+        # P8: label stays int16 through CPU→GPU transfer (half the PCIe
+        # bandwidth vs float32). The trainer casts to float on the GPU
+        # right after ``.to(device)``. Image / weight_map remain float32
+        # because (a) autocast needs a float input and (b) they carry
+        # continuous values where int quantisation is lossy.
         result = {
             "image": torch.from_numpy(
-                np.stack(img_channels, axis=0).astype(np.float32)),
+                np.stack(img_channels, axis=0).astype(np.float32, copy=False)),
             "label": torch.from_numpy(
-                np.stack(lbl_channels, axis=0).astype(np.float32))}
+                np.ascontiguousarray(np.stack(lbl_channels, axis=0)))}
         if wmap_channels:
             result["weight_map"] = torch.from_numpy(
-                np.stack(wmap_channels, axis=0).astype(np.float32))
+                np.stack(wmap_channels, axis=0).astype(np.float32, copy=False))
         return result
 
     def _getitem_native_d(
@@ -878,20 +1014,21 @@ class SegDataset3D(Dataset):
             # augmentor / squeeze pipeline does NOT need to special-case
             # this path. The "1" is the conventional C_res dim with
             # n_views collapsed to a single physical cube.
-            "image": torch.from_numpy(img_s[None].astype(np.float32)),
-            "label": torch.from_numpy(lbl_s[None].astype(np.float32)),
+            "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
+            # P8: int16 label (see __getitem__ for rationale).
+            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
         }
         # Region-weight precedence: per-sample file > static mapping.
         if rw_s is not None:
             wmap_s = resize_3d(rw_s, eD_max, eH, eW, is_label=False)
             result["weight_map"] = torch.from_numpy(
-                wmap_s[None].astype(np.float32))
+                wmap_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
             wmap_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             # ``compute_region_weight_map`` returns (1, eD_max, eH, eW).
             result["weight_map"] = torch.from_numpy(
-                wmap_s.astype(np.float32))
+                wmap_s.astype(np.float32, copy=False))
         return result
 
     def _getitem_native_multi_res_z(
@@ -954,20 +1091,21 @@ class SegDataset3D(Dataset):
         result = {
             # Leading "1" = collapsed C_res. Trainer (R2) splits along
             # depth and resizes back to ``(B, C_res, eD, eH, eW)``.
-            "image": torch.from_numpy(img_s[None].astype(np.float32)),
-            "label": torch.from_numpy(lbl_s[None].astype(np.float32)),
+            "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
+            # P8: int16 label (see __getitem__ for rationale).
+            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
         }
         # Region-weight precedence: per-sample file > static mapping.
         if rw_s is not None:
             wmap_s = resize_3d(rw_s, eD_max, eH, eW, is_label=False)
             result["weight_map"] = torch.from_numpy(
-                wmap_s[None].astype(np.float32))
+                wmap_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
             wmap_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             # ``compute_region_weight_map`` returns shape (1, eD_max, eH, eW).
             result["weight_map"] = torch.from_numpy(
-                wmap_s.astype(np.float32))
+                wmap_s.astype(np.float32, copy=False))
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
@@ -1264,21 +1402,28 @@ class SegDataset3DCubic(Dataset):
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
-        img = load_nifti(path)
-        img = apply_bbox(img, self._bbox_for(vol_idx))
+        # Fused decode + bbox crop — see ``SegDataset3D._load_image''
+        # for the host-OOM rationale.
+        img = load_nifti_cropped(
+            path, bbox=self._bbox_for(vol_idx), dtype=np.float32)
         img = preprocess_image(
             img, self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std)
+            self.normalize, self.global_mean, self.global_std,
+            inplace=True)
         self._img_cache.put(path, img)
         return img
 
     def _load_label(self, vol_idx: int) -> np.ndarray:
+        """Load raw label volume with caching (int16 for RAM savings).
+
+        See ``SegDataset3D._load_label`` for the dtype rationale.
+        """
         path = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
             return cached
-        lbl = load_nifti(path)
-        lbl = apply_bbox(lbl, self._bbox_for(vol_idx))
+        lbl = load_nifti_cropped(
+            path, bbox=self._bbox_for(vol_idx), dtype=np.int16)
         self._lbl_cache.put(path, lbl)
         return lbl
 
@@ -1293,8 +1438,8 @@ class SegDataset3DCubic(Dataset):
         cached = self._rw_cache.get(path)
         if cached is not None:
             return cached
-        rw = load_region_weight_volume(path)
-        rw = apply_bbox(rw, self._bbox_for(vol_idx))
+        rw = load_region_weight_volume(
+            path, bbox=self._bbox_for(vol_idx))
         self._rw_cache.put(path, rw)
         return rw
 
@@ -1363,12 +1508,13 @@ class SegDataset3DCubic(Dataset):
                 wmap_s = compute_region_weight_map(lbl_s, self.label_values, self.region_weights)
                 wmap_channels.append(wmap_s[0])  # (D, H, W), squeeze the leading 1
 
+        # P8: label stays int16 (see SegDataset3D.__getitem__ for rationale).
         result = {
-            "image": torch.from_numpy(np.stack(img_channels, axis=0).astype(np.float32)),
-            "label": torch.from_numpy(np.stack(lbl_channels, axis=0).astype(np.float32))}
+            "image": torch.from_numpy(np.stack(img_channels, axis=0).astype(np.float32, copy=False)),
+            "label": torch.from_numpy(np.ascontiguousarray(np.stack(lbl_channels, axis=0)))}
         if wmap_channels:
             result["weight_map"] = torch.from_numpy(
-                np.stack(wmap_channels, axis=0).astype(np.float32))  # (C_res, eD, eH, eW)
+                np.stack(wmap_channels, axis=0).astype(np.float32, copy=False))  # (C_res, eD, eH, eW)
         return result
 
     def _getitem_native_multi_res_cubic(
@@ -1425,20 +1571,21 @@ class SegDataset3DCubic(Dataset):
             # Leading "1" = collapsed C_res. Trainer (R2) splits along
             # all 3 spatial axes and resizes back to ``(B, C_res, eD,
             # eH, eW)``.
-            "image": torch.from_numpy(img_s[None].astype(np.float32)),
-            "label": torch.from_numpy(lbl_s[None].astype(np.float32)),
+            "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
+            # P8: int16 label (see SegDataset3D.__getitem__ for rationale).
+            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
         }
         # Region-weight precedence: per-sample file > static mapping.
         if rw_s is not None:
             result["weight_map"] = torch.from_numpy(
-                rw_s[None].astype(np.float32))
+                rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
             wmap_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             # ``compute_region_weight_map`` returns shape (1, eD_max,
             # eH_max, eW_max).
             result["weight_map"] = torch.from_numpy(
-                wmap_s.astype(np.float32))
+                wmap_s.astype(np.float32, copy=False))
         return result
 
     def _safe_center_range(
@@ -1606,21 +1753,28 @@ class SegDataset3DWhole(Dataset):
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
-        img = load_nifti(path)
-        img = apply_bbox(img, self._bbox_for(vol_idx))
+        # Fused decode + bbox crop — see ``SegDataset3D._load_image''
+        # for the host-OOM rationale.
+        img = load_nifti_cropped(
+            path, bbox=self._bbox_for(vol_idx), dtype=np.float32)
         img = preprocess_image(
             img, self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std)
+            self.normalize, self.global_mean, self.global_std,
+            inplace=True)
         self._img_cache.put(path, img)
         return img
 
     def _load_label(self, vol_idx: int) -> np.ndarray:
+        """Load raw label volume with caching (int16 for RAM savings).
+
+        See ``SegDataset3D._load_label`` for the dtype rationale.
+        """
         path = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
             return cached
-        lbl = load_nifti(path)
-        lbl = apply_bbox(lbl, self._bbox_for(vol_idx))
+        lbl = load_nifti_cropped(
+            path, bbox=self._bbox_for(vol_idx), dtype=np.int16)
         self._lbl_cache.put(path, lbl)
         return lbl
 
@@ -1635,8 +1789,8 @@ class SegDataset3DWhole(Dataset):
         cached = self._rw_cache.get(path)
         if cached is not None:
             return cached
-        rw = load_region_weight_volume(path)
-        rw = apply_bbox(rw, self._bbox_for(vol_idx))
+        rw = load_region_weight_volume(
+            path, bbox=self._bbox_for(vol_idx))
         self._rw_cache.put(path, rw)
         return rw
 
@@ -1653,9 +1807,11 @@ class SegDataset3DWhole(Dataset):
         img_r = resize_3d(img, eD, eH, eW, is_label=False)
         lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
 
+        # P8: int16 label emitted as-is. Image forced to float32 for the
+        # autocast forward path.
         result = {
             "image": torch.from_numpy(img_r[np.newaxis]).float(),  # (1, eD, eH, eW)
-            "label": torch.from_numpy(lbl_r[np.newaxis]).float()}
+            "label": torch.from_numpy(np.ascontiguousarray(lbl_r[np.newaxis]))}
 
         # Region-weight precedence: per-sample file > static mapping.
         if self._has_region_weight_file(vol_idx):

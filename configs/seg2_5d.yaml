@@ -38,24 +38,11 @@ data:
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
   image_dir: "F:/BaiduNetdiskDownload/lung_nii"
   label_dir: "F:/BaiduNetdiskDownload/lung_bone"
+  bbox_dir : "F:/BaiduNetdiskDownload/bone_bbox"  # F:/CT_data/airway_segment_data/bone_bbox
+  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
-
-  # ---- Optional ROI bbox cropping ------------------------------------
-  # 同 seg3d.yaml：每样本一个 NIfTI 掩码（文件名与 image 同名），训练侧
-  # 在 _load_image/_load_label 内裁剪后再走归一化与缓存；推理侧由
-  # predict.py / Predictor.predict_volume 读取后裁剪推理 → 写回原体积
-  # 坐标系（ROI 外=背景）。留空 = 禁用。
-  bbox_dir   : "F:/BaiduNetdiskDownload/bone_bbox" # F:/CT_data/airway_segment_data/bone_bbox
-  bbox_suffix: ".nii.gz"
-
-  # ---- Optional per-sample region-weight (loss weighting) ------------
-  # 可选：每样本一份 NIfTI 权重文件（背景=0，其余=期望权重值；加载后整体 +1
-  #   → 背景=1，标注=(w+1)），优先级高于 `loss.region_weights` 的全局
-  #   "按标签值映射"方案；缺文件即报错（强约束，对齐 bbox_dir）。
-  # 在数据增强中权重图与 image/label 共享空间变换，但用 bilinear 插值
-  #   保留连续权重梯度。留空 = 禁用文件版。
-  region_weight_dir   : "F:/BaiduNetdiskDownload/lung_weight"
+  bbox_suffix : ".nii.gz"
   region_weight_suffix: ".nii.gz"
 
   # 排除无法被 SimpleITK 读取的样本（非正交 direction cosines 等）。
@@ -115,14 +102,11 @@ data:
   #   * 自动锁定 z_boundary_mode='edge_pad'（stretch 与本开关互斥）。
   #   * 仅在 patch_mode='2_5d' + len(multi_res_scales)>1 + aux_seg_supervision=true 时允许。
   #   * Plan C (hierarchical) 同时仍需满足 n_views <= len(encoder_channels) - 1。
-  #   * 推理路径（predictor.py）暂未改造为原生深度切片；如需在该模式下做推理，
-  #     请等待后续轮次（model 在 eval 模式下仍输出 (B, num_fg*D, H, W) 主头，
-  #     与 predictor 现有契约兼容；多 FOV 通道的喂入需 predictor 端配合升级）。
-  aux_keep_native_d: false
+  aux_keep_native_d: true
 
   intensity_min: -1024.0
   intensity_max: 1024.0
-  normalize: "minmax"
+  normalize    : "minmax"
 
   val_ratio : 0.2
   split_seed: 42
@@ -136,7 +120,7 @@ data:
   samples_per_volume: 8
 
   cache_mode: "memory"
-  cache_max_volumes: 4
+  cache_max_volumes: 2
 
 
 # =====================================================================
@@ -184,8 +168,6 @@ model:
 
   # 由 Config.sync() 自动设置；写在这里仅为可读性。
   spatial_dims: 2
-  # 同上：sync 会强制 = data.patch_size[0]，无需手写。
-  # in_channels: 12
 
   # 2D 模型显存友好，可加大通道数。
   encoder_channels: [32, 64, 128, 256, 256]
@@ -197,7 +179,7 @@ model:
   activation : "leakyrelu"
   dropout    : 0.0
 
-  use_se: false
+  use_se: true
   attention_type: "none"
   skip_attention: false
 
@@ -314,7 +296,7 @@ train:
   # （即使 loss 端 clamp 也无法恢复 NaN）。bf16 指数范围 ≈ fp32，方差不会下溢，
   # 速度与 fp16 接近；trainer 自动对 bf16 关闭 GradScaler。
   # Ampere 及更新架构（含 RTX 3080 Ti）原生支持。
-  amp_dtype: "bfloat16"
+  amp_dtype: "auto"
 
   compile_mode: "none"
 
@@ -357,8 +339,3 @@ predict:
   threshold : 0.5
   output_dir: "predictions"
   save_probabilities: false
-# 请你先仔细，认真的理解D:\codes\A0_dev\MedImgView全部的代码，然后出两份文档：
-# 1. 架构/模块文档，这份文档是方便开发人员快速的理解和掌握工具，需要让开发人员阅读后清晰的知道整个架构和各个模块的内容，然后可以清晰的理解后续可能的增加功能，修改功能，发现不足，甚至重构代码等等  
-# 2. 可能的缺失/缺点/优化地方文档，这份文档是为后续开发制定方向和计划，让开发人员清晰的知道后续应该优化哪些地方，如何优化，技术选型等等，最好能在最后定制职责分离，模块化，可拆解的按步执行的实施计划
-
-# 为了保证高质量完成，需要花时间认真，细致的理解和掌握该工具的所有代码；同时为了保证后续能对工具提质，需要充分，彻底的调研高质量项目（不仅仅是医学，所有相关的项目，能借鉴的项目都需要调研），最终的文档质量需要高，不要马虎，模糊的完成

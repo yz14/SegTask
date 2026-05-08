@@ -84,6 +84,30 @@ def _unwrap_compile(m: nn.Module) -> nn.Module:
     return getattr(m, "_orig_mod", m)
 
 
+def _cuda_supports_bf16() -> bool:
+    """Return True when the current CUDA device can run bf16 autocast
+    efficiently (native tensor-core path).
+
+    Uses ``torch.cuda.is_bf16_supported`` when available (PyTorch ≥ 1.10
+    on CUDA, also handles ROCm); falls back to a compute-capability check
+    (``>= (8, 0)`` = Ampere+) for older builds. Returns False when no
+    CUDA device is visible so CPU-only runs stay on fp16 trivially.
+    """
+    if not torch.cuda.is_available():
+        return False
+    is_bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+    if callable(is_bf16_supported):
+        try:
+            return bool(is_bf16_supported())
+        except Exception:  # pragma: no cover - defensive
+            pass
+    try:
+        major, _minor = torch.cuda.get_device_capability()
+        return major >= 8
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Optimizer factory
 # ---------------------------------------------------------------------------
@@ -499,11 +523,22 @@ class Trainer:
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
 
         # --- AMP -------------------------------------------------------
-        if tc.amp_dtype not in _AMP_DTYPES:
+        # Resolve the "auto" sentinel first: pick bf16 iff the current
+        # CUDA device supports it (Ampere+ on SM 8.0, plus a few older
+        # ROCm configs). Falls back to fp16 otherwise so behaviour on
+        # Volta / Turing is bit-identical to the legacy default.
+        amp_dtype_cfg = tc.amp_dtype
+        if amp_dtype_cfg == "auto":
+            amp_dtype_cfg = self._resolve_auto_amp_dtype(device)
+            logger.info(
+                "amp_dtype='auto' resolved to %r (device=%s).",
+                amp_dtype_cfg, device)
+        if amp_dtype_cfg not in _AMP_DTYPES:
             raise ValueError(
                 f"Unknown amp_dtype: {tc.amp_dtype!r}. "
-                f"Expected one of {sorted(_AMP_DTYPES)}.")
-        self.amp_dtype = _AMP_DTYPES[tc.amp_dtype]
+                f"Expected one of {sorted(_AMP_DTYPES) + ['auto']}.")
+        self.amp_dtype = _AMP_DTYPES[amp_dtype_cfg]
+        self._amp_dtype_name = amp_dtype_cfg
         self.use_amp = tc.use_amp and device.type == "cuda"
         # GradScaler is only meaningful for fp16; bf16 has fp32-range
         # mantissa-clipped values and does not require loss scaling. Leaving
@@ -655,6 +690,22 @@ class Trainer:
                     "Training will start from scratch.", tc.pretrain)
 
     # ------------------------------------------------------------------
+    # AMP helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_auto_amp_dtype(device: torch.device) -> str:
+        """Map ``amp_dtype="auto"`` to a concrete dtype name.
+
+        Chooses ``"bfloat16"`` when the CUDA device supports it natively
+        (Ampere+ / MI100+ / SM 8.0+), else ``"float16"``. On CPU/MPS this
+        returns ``"float16"`` — autocast is disabled anyway because
+        ``use_amp`` is gated on ``device.type == "cuda"``.
+        """
+        if device.type == "cuda" and _cuda_supports_bf16():
+            return "bfloat16"
+        return "float16"
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def fit(self) -> Dict[str, float]:
@@ -668,9 +719,10 @@ class Trainer:
         logger.info("Model params: %.2fM", total_params)
         logger.info("Train batches: %d, Val batches: %d",
                     len(self.train_loader), len(self.val_loader))
-        logger.info("AMP=%s (dtype=%s, scaler=%s), EMA=%s (decay=%.4f)",
-                    self.use_amp, tc.amp_dtype, self._scaler_active,
-                    tc.use_ema, tc.ema_decay)
+        logger.info("AMP=%s (dtype=%s, resolved=%s, scaler=%s), "
+                    "EMA=%s (decay=%.4f)",
+                    self.use_amp, tc.amp_dtype, self._amp_dtype_name,
+                    self._scaler_active, tc.use_ema, tc.ema_decay)
         logger.info("Grad accum=%d, Effective batch=%d",
                     self.grad_accum_steps,
                     self.cfg.data.batch_size * self.grad_accum_steps)
@@ -807,7 +859,15 @@ class Trainer:
 
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
-            label = batch["label"].to(self.device, non_blocking=True)
+            # P8: the dataset emits ``label`` as int16 to halve CPU→GPU
+            # bandwidth. Cast to float32 on the GPU immediately so the
+            # augmentor (``F.grid_sample`` requires float input) and the
+            # loss stack (``SliceChannelLoss`` / ``MultiResolutionLoss``)
+            # see the same float32 tensor they have always seen. The
+            # ``.float()`` op is a no-op / identity-return on tensors
+            # already in float32, so this is forward-compatible with
+            # configs that pin label dtype upstream.
+            label = batch["label"].to(self.device, non_blocking=True).float()
             wmap = batch.get("weight_map")
             if wmap is not None:
                 wmap = wmap.to(self.device, non_blocking=True)
@@ -1040,7 +1100,9 @@ class Trainer:
         with self._ema_swapped():
             for batch in self.val_loader:
                 image = batch["image"].to(self.device, non_blocking=True)
-                label = batch["label"].to(self.device, non_blocking=True)
+                # P8: match train-loop cast so loss / metric see float32
+                # labels regardless of the dataset emission dtype.
+                label = batch["label"].to(self.device, non_blocking=True).float()
 
                 # 2.5D: squeeze C_res=1 for both image and label before
                 # forward. (No GPU augmentation in val — directly squeeze.)

@@ -137,6 +137,17 @@ class DataConfig:
     batch_size: int = 2
     num_workers: int = 4
     pin_memory: bool = True
+    # Keep worker processes alive across epochs. On Windows (spawn start
+    # method) and macOS this avoids re-pickling the whole Dataset and
+    # re-warming every per-worker volume cache at the start of every
+    # epoch — usually the single biggest source of "epoch start stall"
+    # on non-Linux hosts. Only consulted when ``num_workers > 0``.
+    persistent_workers: bool = True
+    # How many batches each worker prefetches ahead of consumption. The
+    # PyTorch default is 2; raising to 4 hides sitk decode + preprocessing
+    # latency behind GPU compute more effectively. Only consulted when
+    # ``num_workers > 0``.
+    prefetch_factor: int = 4
 
     # Foreground oversampling: probability of centering patch on foreground
     foreground_oversample_ratio: float = 0.5
@@ -686,6 +697,18 @@ class TrainConfig:
     grad_clip_norm: float = 12.0
 
     # Mixed precision (AMP)
+    #   amp_dtype:
+    #     - "float16" / "fp16": legacy default; requires GradScaler; tends
+    #        to overflow on large dice/BCE reductions (handled in-trainer
+    #        via fp32 loss cast + logit clamp).
+    #     - "bfloat16" / "bf16": Ampere+ only (RTX 30/40, A100, H100...).
+    #        Same fp32 dynamic range (no ±inf / NaN from overflow), no
+    #        loss scaler needed — skips the unscale pass on every step.
+    #     - "auto": resolved at Trainer-build time to "bfloat16" iff the
+    #        current CUDA device reports bf16 support (``cuda_capability
+    #        >= (8, 0)`` or ``torch.cuda.is_bf16_supported()``), else
+    #        falls back to "float16". Recommended default for mixed
+    #        fleets; bit-identical to "float16" on pre-Ampere GPUs.
     use_amp: bool = True
     amp_dtype: str = "float16"
 

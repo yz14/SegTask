@@ -224,8 +224,11 @@ def detect_label_values(
 
     all_labels = set()
     for path in scan_paths:
-        lbl    = load_nifti(path)
-        unique = np.unique(np.round(lbl).astype(np.int32)).tolist()
+        # Labels are small integer class indices — decoding as int16
+        # (vs. default float32) cuts peak RAM of this startup scan 4×
+        # with no downstream change (``np.round`` is a no-op on ints).
+        lbl    = load_nifti(path, dtype=np.int16)
+        unique = np.unique(lbl.astype(np.int32, copy=False)).tolist()
         all_labels.update(unique)
 
     result = sorted(all_labels)
@@ -254,8 +257,8 @@ def _volume_primary_class(
     """Return the label value that occupies the most voxels in the volume
     (background counted too). Ties break on the smallest label value.
     """
-    lbl = load_nifti(label_path)
-    lbl_int = np.round(lbl).astype(np.int32)
+    lbl = load_nifti(label_path, dtype=np.int16)
+    lbl_int = lbl.astype(np.int32, copy=False)
     # Count voxels per requested label value; ignore stray labels.
     counts = np.array(
         [(lbl_int == v).sum() for v in label_values], dtype=np.int64)
@@ -295,8 +298,9 @@ def stratified_train_val_split(
     strata: Dict[int, List[int]] = {v: [] for v in strata_vals}
     fallback: List[int] = []  # volumes with no voxel in any fg class
     for idx, path in enumerate(label_paths):
-        lbl = load_nifti(path)
-        lbl_int = np.round(lbl).astype(np.int32)
+        # int16 decode — see ``detect_label_values`` for rationale.
+        lbl = load_nifti(path, dtype=np.int16)
+        lbl_int = lbl.astype(np.int32, copy=False)
         counts = {v: int((lbl_int == v).sum()) for v in strata_vals}
         best = max(counts.values())
         if best == 0:
@@ -614,19 +618,111 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             **z_kwargs,
             **keep_native_kwargs_z)
 
+    # Only pass ``persistent_workers`` / ``prefetch_factor`` when workers
+    # are actually spawned — PyTorch raises ValueError if either is set
+    # with ``num_workers == 0``.
+    loader_kwargs: Dict[str, object] = {}
+    if dc.num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(
+            getattr(dc, "persistent_workers", True))
+        loader_kwargs["prefetch_factor"] = int(
+            getattr(dc, "prefetch_factor", 4))
+
     train_loader = DataLoader(
         train_ds,
         batch_size=dc.batch_size,
         shuffle=True,
         num_workers=dc.num_workers,
         pin_memory=dc.pin_memory,
-        drop_last=True)
+        drop_last=True,
+        **loader_kwargs)
     val_loader = DataLoader(
         val_ds,
         batch_size=dc.batch_size,
         shuffle=False,
         num_workers=dc.num_workers,
         pin_memory=dc.pin_memory,
-        drop_last=False)
+        drop_last=False,
+        **loader_kwargs)
+
+    logger.info(
+        "DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, "
+        "persistent_workers=%s, prefetch_factor=%s",
+        dc.batch_size, dc.num_workers, dc.pin_memory,
+        loader_kwargs.get("persistent_workers", "n/a"),
+        loader_kwargs.get("prefetch_factor", "n/a"))
+
+    # --- Memory-cache diagnostics -------------------------------------
+    # The per-worker ``VolumeCache`` is a classic OOM source: with
+    # ``cache_mode="memory"`` and ``cache_max_volumes=0`` (the legacy
+    # unbounded default), every worker eventually keeps every volume it
+    # has touched in RAM. On N workers that's N independent copies.
+    # Sample one real volume to estimate the realistic footprint, then
+    # emit an actionable recommendation. This is purely diagnostic — it
+    # never changes behaviour on its own.
+    if dc.cache_mode == "memory":
+        try:
+            # Use the TRAIN dataset's precomputed bboxes (when present) to
+            # estimate the realistic post-crop cached footprint — the
+            # legacy estimator read a full-volume sample which massively
+            # over-counted for ROI-cropped pipelines AND ignored the
+            # region-weight cache, producing a misleading "safe" number
+            # on the way to the actual Host-OOM.
+            bboxes = getattr(train_ds, "_bboxes", None)
+            def _cached_voxels(i: int) -> int:
+                """Voxel count per cached volume for sample i (bbox-cropped
+                when a bbox is available, full volume otherwise)."""
+                bb = bboxes[i] if bboxes and i < len(bboxes) else None
+                if bb is not None:
+                    (d0, d1), (h0, h1), (w0, w1) = bb
+                    return (d1 - d0) * (h1 - h0) * (w1 - w0)
+                # Fallback: decode a single header-only-ish scan.
+                sample = load_nifti(image_paths[i])
+                return int(sample.size)
+            sample_voxels = _cached_voxels(0)
+            # image cached as float32 (4B/voxel), label as int16 (2B/voxel).
+            bytes_per_img = sample_voxels * 4
+            bytes_per_lbl = sample_voxels * 2
+            # Region-weight cache (float32) is allocated per-worker
+            # alongside image+label whenever ``region_weight_dir`` is set.
+            bytes_per_rw = (sample_voxels * 4
+                            if getattr(dc, "region_weight_dir", "")
+                            else 0)
+            per_vol_bytes = bytes_per_img + bytes_per_lbl + bytes_per_rw
+            n_train_vols = len(train_idx)
+            cap = int(dc.cache_max_volumes)
+            # Effective cap: 0 means unbounded → assume worst case (all).
+            eff_cap = cap if cap > 0 else n_train_vols
+            eff_cap = min(eff_cap, n_train_vols)
+            workers = max(dc.num_workers, 1)
+            total_gb = per_vol_bytes * eff_cap * workers / (1024 ** 3)
+            logger.info(
+                "Volume cache estimate: ~%.2f MiB per volume "
+                "(image fp32 + label int16%s, bbox-cropped); effective "
+                "cap=%d, num_workers=%d => up to ~%.2f GiB RAM (all "
+                "workers, caches only; transient decode peaks add "
+                "~%.2f MiB/worker).",
+                per_vol_bytes / (1024 ** 2),
+                " + region_weight fp32" if bytes_per_rw else "",
+                eff_cap, workers, total_gb,
+                bytes_per_img / (1024 ** 2))
+            if cap == 0 and n_train_vols * workers >= 16:
+                # Heuristic: 8 GiB is a generous ceiling for most dev
+                # machines; recommend a cap that stays under that bound.
+                budget_gb = 8.0
+                rec = max(
+                    1,
+                    int(budget_gb * (1024 ** 3)
+                        / max(per_vol_bytes, 1) / workers))
+                logger.warning(
+                    "cache_max_volumes=0 (unbounded) with %d volumes and "
+                    "%d workers is the likely OOM culprit on large "
+                    "datasets. Consider setting "
+                    "`data.cache_max_volumes: %d` (≈%.1f GiB budget) "
+                    "or `data.cache_mode: \"none\"` to rely on the OS "
+                    "page cache (shared across workers).",
+                    n_train_vols, workers, rec, budget_gb)
+        except Exception as exc:  # pragma: no cover — diagnostic only
+            logger.debug("Could not estimate volume cache size: %s", exc)
 
     return train_loader, val_loader

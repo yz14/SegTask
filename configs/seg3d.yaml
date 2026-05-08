@@ -18,33 +18,11 @@ data:
   # Source directories for NIfTI volumes. Image / label filenames must match.
   image_dir: "F:/BaiduNetdiskDownload/lung_nii"
   label_dir: "F:/BaiduNetdiskDownload/lung_bone"
+  bbox_dir : "F:/BaiduNetdiskDownload/bone_bbox"            # 可选：每样本一个nii掩码，与 image 同名
+  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"  # 可选：每样本一个nii权重，与 image 同名
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
-
-  # ---- Optional ROI bbox cropping ------------------------------------
-  # 可选：每个样本一个 NIfTI 掩码，文件名与 image 同名（后缀=bbox_suffix）。
-  # 训练侧：__init__ 阶段一次性预计算每样本 bbox（输出全数据集 mean/min/max
-  #   尺寸日志），并在 _load_image / _load_label 中加载完毕后立即裁剪到该
-  #   bbox 再走归一化与缓存 → 节省 RAM 和后续 patch 计算。
-  # 推理侧：predict.py 默认会读取本字段对每张图做 ROI 裁剪推理，输出会写回
-  #   原体积坐标系（ROI 外置零=背景），保持 NIfTI 形状/affine 不变。
-  #   命令行 --bbox 可覆盖；--bbox '' 强制禁用。
-  # 留空字符串 = 完全禁用（即原 full-volume 行为）。
-  bbox_dir   : "F:/BaiduNetdiskDownload/bone_bbox"
-  bbox_suffix: ".nii.gz"
-
-  # ---- Optional per-sample region-weight (loss weighting) ------------
-  # 可选：每样本一份 NIfTI 权重文件，文件名与 image 同名（后缀=region_weight_suffix）。
-  # 文件约定：背景 = 0，其余体素 = 期望权重值。dataset 加载后整体 +1
-  #   → 背景体素 = 1.0，标注体素 = (w + 1)，与 ``loss.region_weights`` 的
-  #     "bg=1, fg>=1" 语义一致，可直接用作 loss 的逐体素乘性权重。
-  # 优先级：`region_weight_dir` 配置后该样本的权重图来自文件，覆盖
-  #   `loss.region_weights` 的"按标签值映射"方案；缺文件即报错（强约束，
-  #   与 `bbox_dir` 一致，避免静默回退导致样本间不一致）。
-  # 在数据增强中：与 image/label 共享空间变换，但用 **bilinear** 插值
-  #   （而非 label 的 nearest），保留手工标注的连续权重梯度。
-  # 留空 = 禁用文件版（仍可用 `loss.region_weights` 的全局映射）。
-  region_weight_dir   : "F:/BaiduNetdiskDownload/lung_weight"
+  bbox_suffix : ".nii.gz"
   region_weight_suffix: ".nii.gz"
 
   # Integer label values in the mask, ordered [bg, fg1, fg2, ...].
