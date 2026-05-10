@@ -317,6 +317,16 @@ class Trainer:
         # directly to avoid a shape-contract mismatch.
         self.base_loss = build_loss(cfg.loss)
         self.is_2_5d = cfg.data.patch_mode == "2_5d"
+        # Plan A "lift" — when set, the 2.5D pipeline is routed through a
+        # 3D-shape-contract loss / forward path (D stays a real spatial
+        # axis, model is a true 3D UNet, output is (B, num_fg, D, H, W)).
+        # Validated upstream by Config.validate(): must be 2.5D mode and
+        # mutually exclusive with aux_keep_native_d. Composes with
+        # aux_seg_supervision (each aux head emits rank-5 (B, num_fg, D,
+        # H, W) and the per-view aux loss runs through MultiResolutionLoss
+        # (num_res=1) — see the aux_inner_loss lift branch below).
+        self.lift_2_5d_to_3d = bool(
+            getattr(cfg.model, "lift_2_5d_to_3d", False) and self.is_2_5d)
 
         # ``aux_keep_native_d`` flag is decided early so the aux loss
         # block below can build per-view ``SliceChannelLoss`` instances
@@ -380,7 +390,7 @@ class Trainer:
         #     per-decoder-level tensors, downsamples label+weight_map to
         #     each, and delegates to INNER. DS uses nearest interpolation
         #     in spatial dims of pred, so it works for both 3D and 2D paths.
-        if self.is_2_5d:
+        if self.is_2_5d and not self.lift_2_5d_to_3d:
             num_slices = int(cfg.data.patch_size[0])
             inner = SliceChannelLoss(
                 base_loss=self.base_loss,
@@ -395,7 +405,15 @@ class Trainer:
                 cfg.loss.name, cfg.loss.slice_loss_reduction,
                 num_slices, cfg.num_fg_classes)
         else:
-            num_res = len(cfg.data.multi_res_scales)
+            # 3D modes OR lifted-2.5D — both share the same shape contract
+            # ``pred=(B, num_fg*C_res, D, H, W)``, ``label=(B, C_res, D, H, W)``.
+            # Lift forces ``num_res=1`` since aux views are not supervision
+            # targets in lift mode (only view 0 = 1× FOV is). 3D modes
+            # follow ``len(multi_res_scales)`` as before.
+            if self.lift_2_5d_to_3d:
+                num_res = 1
+            else:
+                num_res = len(cfg.data.multi_res_scales)
             inner = MultiResolutionLoss(
                 base_loss=self.base_loss,
                 num_fg_classes=cfg.num_fg_classes,
@@ -403,8 +421,9 @@ class Trainer:
                 label_values=cfg.data.label_values,
             )
             logger.info(
-                "Loss: %s, scales=%d, fg_classes=%d",
-                cfg.loss.name, num_res, cfg.num_fg_classes)
+                "Loss: %s, scales=%d, fg_classes=%d%s",
+                cfg.loss.name, num_res, cfg.num_fg_classes,
+                " [2.5D LIFTED to 3D]" if self.lift_2_5d_to_3d else "")
 
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
@@ -422,6 +441,10 @@ class Trainer:
         # FOV view (n_views>1). Otherwise the aux path is fully bypassed
         # (no extra modules built, no behaviour change).
         n_views_data = len(cfg.data.multi_res_scales)
+        # lift mode now composes with aux_seg_supervision (each aux head
+        # emits a 3D ``(B, num_fg, D, H, W)`` prediction and the per-view
+        # aux loss runs through MultiResolutionLoss(num_res=1) — see the
+        # branch in the aux_inner_loss construction below).
         self.aux_seg_supervision = bool(
             getattr(cfg.model, "aux_seg_supervision", False)
             and self.is_2_5d
@@ -457,7 +480,27 @@ class Trainer:
             #     ``SliceChannelLoss`` per aux view so the slice-channel
             #     contract is exact (the wrapper uses ``num_slices`` to
             #     reshape (B, num_fg*D_k, H, W) → (B*num_fg, D_k, H, W)).
-            if getattr(self, "aux_keep_native_d", False):
+            if self.lift_2_5d_to_3d:
+                # Lift+aux: aux heads emit ``(B, num_fg, D, H, W)`` (3D
+                # 1×1×1 conv via ``spatial_dims=3``); the per-view aux
+                # label is the rank-5 slice ``label_all[:, k:k+1]``
+                # (``(B, 1, D, H, W)``) z-resampled by the dataset. Aux
+                # loss mirrors the main path's contract — single-
+                # resolution MultiResolutionLoss with ``num_res=1`` — and
+                # bypasses SliceChannelLoss entirely. Mutually exclusive
+                # with aux_keep_native_d (validate() rejects).
+                self.aux_inner_loss = MultiResolutionLoss(
+                    base_loss=self.base_loss,
+                    num_fg_classes=cfg.num_fg_classes,
+                    num_res=1,
+                    label_values=cfg.data.label_values,
+                )
+                self.aux_inner_losses = None
+                logger.info(
+                    "Aux seg supervision: ENABLED [LIFT], n_aux_views=%d, "
+                    "weights=%s, fusion=%s",
+                    n_aux, self.aux_weights, cfg.model.context_fusion)
+            elif getattr(self, "aux_keep_native_d", False):
                 # ``self.aux_view_depths`` was built earlier in __init__;
                 # validated to match ``cfg.aux_view_depths``.
                 aux_depths = self.aux_view_depths[1:]  # skip view 0
@@ -790,6 +833,16 @@ class Trainer:
                 timer.elapsed_str(),
                 aux_msg,
             )
+            # Per-epoch peak GPU memory. Logged on a SEPARATE line so the
+            # legacy "Epoch X/Y | ..." log regex stays bit-compatible with
+            # downstream parsers; new aggregators (e.g. lift_a) can pick
+            # this up to compare displays across runs. Reset the peak each
+            # epoch so the value is per-epoch, not cumulative — the run-
+            # level peak is then ``max`` across all epoch lines.
+            if self.device.type == "cuda":
+                peak_mib = torch.cuda.max_memory_allocated(self.device) / (1 << 20)
+                logger.info("  GPU peak (epoch %d): %.1f MiB", epoch + 1, peak_mib)
+                torch.cuda.reset_peak_memory_stats(self.device)
 
             # --- Periodic checkpoint ----------------------------------
             if (epoch + 1) % tc.save_every == 0:
@@ -907,7 +960,32 @@ class Trainer:
             aux_view_labels: Optional[List[torch.Tensor]] = None
             aux_view_wmaps: Optional[List[Optional[torch.Tensor]]] = None
             if self.is_2_5d:
-                if self.aux_seg_supervision and self.aux_keep_native_d:
+                if self.lift_2_5d_to_3d and self.aux_seg_supervision:
+                    # Lift+aux: image stays rank-5 ``(B, n_views, D, H, W)``
+                    # (no squeeze; D is a spatial axis). Label/wmap stay
+                    # rank-5 ``(B, C_res, D, H, W)`` so per-view aux
+                    # supervision can index ``label[:, k:k+1]``. ``label`` /
+                    # ``wmap`` are shadowed to view 0 (kept rank-5 via
+                    # ``[:, :1]`` to match the lift main path's
+                    # MultiResolutionLoss(num_res=1) contract — both the
+                    # _compute_loss_aux_fp32 helper and the metric block
+                    # ``self._inner_loss.split_for_metrics`` expect rank-5
+                    # ``(B, 1, D, H, W)`` here).
+                    label_all_views = label
+                    wmap_all_views = wmap
+                    label = label_all_views[:, :1].contiguous()
+                    wmap = (wmap_all_views[:, :1].contiguous()
+                            if wmap_all_views is not None else None)
+                elif self.lift_2_5d_to_3d:
+                    # Lift mode: D stays a real spatial axis. Image flows
+                    # through unchanged — ``(B, n_views, D, H, W)``. The
+                    # supervision target is view 0 only (``label[:, :1]``
+                    # keeps the C_res axis at length 1 so the
+                    # MultiResolutionLoss(num_res=1) contract is matched).
+                    label = label[:, :1].contiguous()
+                    if wmap is not None:
+                        wmap = wmap[:, :1].contiguous()
+                elif self.aux_seg_supervision and self.aux_keep_native_d:
                     # Native-depth path: dataset emits a single max-FOV
                     # cube; we center-crop per view BEFORE forward, with
                     # view 0 = the standard ``D``-deep main supervision
@@ -1111,7 +1189,11 @@ class Trainer:
                 # training loop but discard aux targets (val metric only
                 # exercises view 0 = main supervision).
                 if self.is_2_5d:
-                    if self.aux_keep_native_d:
+                    if self.lift_2_5d_to_3d:
+                        # Lift mode (val): keep image at (B, n_views, D, H, W);
+                        # supervise on view 0 only (matches train loop).
+                        label = label[:, :1].contiguous()
+                    elif self.aux_keep_native_d:
                         image, label, _, _, _ = (
                             self._split_views_native_d(image, label, None))
                     else:
@@ -1601,8 +1683,18 @@ class Trainer:
         view-k label. Weights ``w_k`` come from ``self.aux_weights``.
         """
         # ---- Slice the supervision tensors per view --------------------
-        label_main = label_all[:, 0]
-        wmap_main = wmap_all[:, 0] if wmap_all is not None else None
+        # Folded 2.5D : SliceChannelLoss wants raw rank-4 ``(B, D, H, W)``.
+        # Lift (3D)   : MultiResolutionLoss wants rank-5 ``(B, 1, D, H, W)``
+        #               (the C_res axis is the resolution stack; num_res=1
+        #               preserves it at length 1). Slicing as
+        #               ``[:, k:k+1]`` instead of ``[:, k]`` keeps that
+        #               axis intact for the lift contract.
+        if self.lift_2_5d_to_3d:
+            label_main = label_all[:, :1]
+            wmap_main = wmap_all[:, :1] if wmap_all is not None else None
+        else:
+            label_main = label_all[:, 0]
+            wmap_main = wmap_all[:, 0] if wmap_all is not None else None
 
         if isinstance(pred, dict):
             main_pred = pred["main"]
@@ -1635,8 +1727,14 @@ class Trainer:
                 f"This indicates a model/config divergence.")
         for k_idx, (ap, w_k) in enumerate(zip(aux_preds, self.aux_weights)):
             view_k = k_idx + 1   # k=1..n_views-1 in label channel space
-            lbl_k = label_all[:, view_k]
-            wm_k = wmap_all[:, view_k] if wmap_all is not None else None
+            # Same rank-4 / rank-5 dichotomy as the main slice above.
+            if self.lift_2_5d_to_3d:
+                lbl_k = label_all[:, view_k:view_k + 1]
+                wm_k = (wmap_all[:, view_k:view_k + 1]
+                        if wmap_all is not None else None)
+            else:
+                lbl_k = label_all[:, view_k]
+                wm_k = wmap_all[:, view_k] if wmap_all is not None else None
             aux_l = self._compute_loss_fp32(
                 self.aux_inner_loss, ap, lbl_k, weight_map=wm_k)
             total = total + w_k * aux_l

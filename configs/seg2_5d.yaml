@@ -174,7 +174,46 @@ model:
   # 2D 模型显存友好，可加大通道数。
   encoder_channels: [32, 64, 128, 256, 256]
   blocks_per_level: 2
+  # 2.5D 折叠模式合法值："basic" | "preact" | "bottleneck"。
+  # ``r2plus1d``（方案 A，因子化 (2+1)D 残差块）需要 spatial_dims=3，即 D
+  # 仍是真实空间轴。要在 2.5D 数据流上启用方案 A，请同时打开下面的
+  # ``lift_2_5d_to_3d``（Plan A 升维开关）。否则只有 basic/preact/bottleneck
+  # 合法。
   block_type: "basic"
+
+  # ---- Plan A "升维"开关 ----
+  # 默认 false（经典 2.5D 折叠路径，D 折入通道维，2D UNet + SliceChannelLoss）。
+  # 设为 true 时：
+  #   * trainer 跳过 (B, C_res, D, H, W) → (B, C_res*D, H, W) 的 squeeze；
+  #     图像保持 (B, n_views, D, H, W) 进入真 3D UNet（spatial_dims 自动改为 3）。
+  #   * 模型输入通道 = n_views = len(multi_res_scales)，每个 FOV 视图算一通道；
+  #     输出 (B, num_fg, D, H, W)（单分辨率真 3D 分割）。
+  #   * 损失走 MultiResolutionLoss(num_res=1) 而不是 SliceChannelLoss；
+  #     ``loss.slice_loss_reduction`` 在 lift 模式下被忽略。
+  #   * 仅 view 0（1× FOV）作为监督目标；wider FOV 仍作为输入通道喂给 stem
+  #     （``context_fusion`` 仍生效），但不参与监督。
+  # 推荐与 ``block_type: "r2plus1d"`` 配合，让 (2+1)D 因子化卷积获得真实
+  # 的 z 方向上下文。
+  # 限制：
+  #   1. 与 data.aux_keep_native_d 互斥（folded-D 通道槽位 vs. 真 D 空间轴
+  #      在物理布局上不兼容；Config.validate() 会显式拒绝）。
+  #   2. 几何约束：``patch_size[0]`` (D) 必须能被 ``2**(len(encoder_channels)-1)``
+  #      整除。Downsample 在每层把 D 也减半，5 stages 需 D≥16；4 stages 需 D≥8。
+  #      经典 2.5D 折叠路径不受此约束（D 折入通道维），开 lift 时则会受。
+  #      违反时 validate() 立即报错并给出具体修复建议。
+  #
+  # 与 ``aux_seg_supervision`` 正交支持（v2 起）：每个 aux head 输出
+  # ``(B, num_fg, D, H, W)``（spatial_dims=3 自动产生 3D 1×1×1 conv），
+  # 每视图 aux 损失走 MultiResolutionLoss(num_res=1) 而非 SliceChannelLoss。
+  # 与 ``deep_supervision`` 也正交（DS 仅作用于主路径）。
+  #
+  # 推荐组合（典型起点）：
+  #   patch_size: [16, 256, 256]
+  #   encoder_channels: [32, 64, 128, 256, 256]
+  #   block_type: "r2plus1d"
+  #   lift_2_5d_to_3d: true
+  #   aux_seg_supervision: true   # 可选：让 wider FOV 也被监督
+  lift_2_5d_to_3d: false
 
   norm_type  : "instance"
   norm_groups: 8

@@ -198,7 +198,17 @@ model:
   # encoder_blocks_per_stage / decoder_blocks_per_stage。
   blocks_per_level: 2
 
-  # block_type (resnet 专用)："basic" | "preact" | "bottleneck"
+  # block_type (resnet 专用)："basic" | "preact" | "bottleneck" | "r2plus1d"
+  #   "basic"      — 经典 post-act ResNet（默认）。
+  #   "preact"     — 预激活 ResNet（深度 encoder 推荐）。
+  #   "bottleneck" — 1×1×1/3×3×3/1×1×1 倒残差（nnU-Net ResEnc-XL）。
+  #   "r2plus1d"   — 因子化 (2+1)D 残差块（方案 A）：
+  #                    每个 3×3×3 conv 被拆为 (1,3,3) 空间 conv + 中间非线性
+  #                    + (3,1,1) 时间 conv，专门给 thin-slab z_axis / cubic
+  #                    几何加 z 方向上下文。参数比 basic 略高、显著低于纯 3D
+  #                    isotropic（≈24·C² vs 54·C²/块）。
+  #                    要求 spatial_dims=3（即非 2.5D）；2.5D 模式会被 validate()
+  #                    显式拒绝。下游 stem / downsample / decoder 契约不变。
   block_type: "basic"
 
   # 非对称每级 block 数（nnU-Net ResEncUNet 风格）。留空则用 blocks_per_level。

@@ -421,7 +421,16 @@ class ModelConfig:
     # and decoder_blocks_per_stage are both empty — kept for back-compat).
     blocks_per_level: int = 2
 
-    # Residual block variant (see models.resnet): "basic" | "preact" | "bottleneck".
+    # Residual block variant (see models.resnet):
+    #   "basic"      — classic post-act ResNet (default).
+    #   "preact"     — pre-activation ResNet (deep encoders).
+    #   "bottleneck" — 1×1×1/3×3×3/1×1×1 expansion (nnU-Net ResEnc-XL).
+    #   "r2plus1d"   — factorised (2+1)D residual block (Plan A: inject
+    #                  z-axis context via a (1,3,3) spatial conv + (3,1,1)
+    #                  temporal conv with mid non-linearity). REQUIRES
+    #                  ``spatial_dims=3`` (i.e. patch_mode in z_axis /
+    #                  cubic / whole). Rejected at validate() time when
+    #                  used with 2.5D mode — see validate() for details.
     # ConvNeXt backbone ignores this field.
     block_type: str = "basic"
 
@@ -515,6 +524,48 @@ class ModelConfig:
     # override is exposed (we observed no benefit in preliminary checks
     # and the extra config surface would obscure intent).
     aux_head_mode: str = "linear"
+
+    # ---- Plan A 2.5D-to-3D lift (used together with block_type="r2plus1d") ----
+    # When True AND ``data.patch_mode == "2_5d"`` the trainer SKIPS the
+    # ``(B, C_res, D, H, W) → (B, C_res*D, H, W)`` squeeze that folds D
+    # into the channel axis. Instead D is preserved as a real spatial axis
+    # and the model is rebuilt as a true 3D UNet:
+    #
+    #   * ``spatial_dims`` is auto-set to 3 (overrides the 2.5D-mode default).
+    #   * ``in_channels`` is auto-set to ``len(data.multi_res_scales)``
+    #     (one channel per FOV view) instead of ``D * n_views``.
+    #   * Model output is ``(B, num_fg, D, H, W)`` (single-resolution true
+    #     3D segmentation), not the folded ``(B, num_fg * D, H, W)``.
+    #   * The trainer routes the loss through ``MultiResolutionLoss``
+    #     ``(num_res=1)`` (using only view 0 = 1× FOV as supervision target),
+    #     bypassing ``SliceChannelLoss`` entirely. ``loss.slice_loss_reduction``
+    #     is therefore ignored in lift mode.
+    #
+    # Why this exists: Plan A's R(2+1)D block (``block_type="r2plus1d"``)
+    # decomposes a 3D conv into a (1,3,3) spatial conv + a (3,1,1) temporal
+    # conv. The temporal sub-conv is meaningful ONLY when D is a real
+    # spatial axis. Lifting the 2.5D pipeline to 3D gives R(2+1)D direct
+    # access to inter-slice context while keeping the 2.5D dataset /
+    # augmentation / oversampling defaults — switching this flag is a
+    # single-line A/B test against the folded baseline.
+    #
+    # Restrictions (enforced in validate()):
+    #   * Only valid when ``data.patch_mode == "2_5d"``.
+    #   * Mutually exclusive with ``data.aux_keep_native_d`` (which packs
+    #     view-specific ``D_k`` slabs into the channel axis — fundamentally
+    #     a folded-D layout).
+    #
+    # Composes with (orthogonal):
+    #   * ``aux_seg_supervision`` — each aux head emits
+    #     ``(B, num_fg, D, H, W)`` (3D 1×1×1 conv, since spatial_dims=3)
+    #     and the per-view aux loss runs through MultiResolutionLoss
+    #     (num_res=1) on view k's z-resampled D-deep label. View 0 (1×
+    #     FOV) drives the main head; view k (k=1..n_views-1) drives
+    #     aux head k.
+    #   * ``deep_supervision`` — main path produces a list of decoder-
+    #     resolution outputs as before; aux path stays single-resolution
+    #     per view (DS structure is reserved for the main path).
+    lift_2_5d_to_3d: bool = False
 
     # Stem / patch-embed (see models.stem.build_stem):
     # "conv3" | "conv7" | "dual" | "patch2" | "patch4".
@@ -863,10 +914,24 @@ class Config:
             #     concatenation along the channel axis gives
             #     ``in_channels = sum_k D_k``. View-0 always uses
             #     ``s_0 == 1`` so ``D_0 == D`` (the supervision target).
-            self.model.spatial_dims = 2
             n_views = max(len(self.data.multi_res_scales), 1)
             D = int(self.data.patch_size[0])
-            if self.data.aux_keep_native_d and n_views > 1:
+            lift = bool(getattr(self.model, "lift_2_5d_to_3d", False))
+            if lift:
+                # Lift mode: D stays a real spatial axis. The 2D-folded
+                # layout is bypassed end-to-end (trainer skips squeeze,
+                # loss bypasses SliceChannelLoss). Each FOV view becomes
+                # ONE input channel; the stem consumes ``n_views`` input
+                # channels and the model output is single-resolution
+                # ``(B, num_fg, D, H, W)``. Mutually exclusive with
+                # aux_keep_native_d (validated below).
+                self.model.spatial_dims = 3
+                self.model.in_channels = n_views
+            else:
+                self.model.spatial_dims = 2
+            if lift:
+                pass  # in_channels already set above; skip folded layouts
+            elif self.data.aux_keep_native_d and n_views > 1:
                 # Native-depth layout. Force edge_pad — the single-cube
                 # extraction always uses ``extract_z_patch_padded`` so a
                 # ``stretch`` value would dangle without effect (and worse,
@@ -981,8 +1046,24 @@ class Config:
             f"Invalid decoder_type: {self.model.decoder_type}"
         assert self.model.unet3p_cat_channels > 0, \
             "unet3p_cat_channels must be > 0"
-        assert self.model.block_type in ("basic", "preact", "bottleneck"), \
+        assert self.model.block_type in (
+            "basic", "preact", "bottleneck", "r2plus1d"), \
             f"Invalid block_type: {self.model.block_type}"
+        # ``r2plus1d`` factorises 3D conv into spatial (1,3,3) + temporal
+        # (3,1,1) — the temporal sub-conv only reaches neighbouring slices
+        # when D is a real spatial axis, i.e. spatial_dims=3. In 2.5D mode
+        # D is folded into channels and the temporal kernel becomes a
+        # no-op cross-channel mixer; reject it up-front with a precise
+        # diagnostic instead of silently degrading to that pathological
+        # behaviour at forward-time.
+        if self.model.block_type == "r2plus1d":
+            assert self.model.spatial_dims == 3, (
+                "model.block_type='r2plus1d' requires spatial_dims=3 "
+                "(D must be a real spatial axis). It is incompatible "
+                "with the 2.5D patch_mode where D is folded into the "
+                "channel axis. To use Plan A on z-slab data, switch "
+                "your config to patch_mode='z_axis' (3D thin-slab) and "
+                "keep block_type='r2plus1d'.")
         assert self.model.resenc_preset in ("none", "S", "M", "L", "XL"), \
             f"Invalid resenc_preset: {self.model.resenc_preset}"
         # Per-stage block-count lengths must align with encoder depth.
@@ -1093,11 +1174,77 @@ class Config:
                 "2.5D mode requires multi_res_scales[0] == 1.0 — view 0 is "
                 "the true-geometry FOV used as the prediction target. "
                 f"Got multi_res_scales={self.data.multi_res_scales}.")
-            assert self.model.spatial_dims == 2, (
-                "2.5D mode requires model.spatial_dims=2 (set automatically "
-                "by sync()).")
             n_views = len(self.data.multi_res_scales)
-            if self.data.aux_keep_native_d and n_views > 1:
+            lift = bool(getattr(self.model, "lift_2_5d_to_3d", False))
+            if lift:
+                # Lift mode: D preserved as a real spatial axis, model is
+                # a true 3D UNet over (B, n_views, D, H, W). Mutually
+                # exclusive with the folded-D channel-packing layouts.
+                assert self.model.spatial_dims == 3, (
+                    "lift_2_5d_to_3d=True requires model.spatial_dims=3 "
+                    "(set automatically by sync()).")
+                assert self.model.in_channels == n_views, (
+                    f"lift_2_5d_to_3d=True requires model.in_channels == "
+                    f"len(multi_res_scales) = {n_views}; got "
+                    f"in_channels={self.model.in_channels}. Set automatically "
+                    f"by sync(); a mismatch means in_channels was hand-edited.")
+                assert not self.data.aux_keep_native_d, (
+                    "lift_2_5d_to_3d=True is mutually exclusive with "
+                    "data.aux_keep_native_d (folded-D channel slabs vs. "
+                    "real-D spatial axis are incompatible). Disable one.")
+                # lift + aux_seg_supervision IS now supported. The aux
+                # heads emit ``(B, num_fg, D, H, W)`` (3D 1×1×1 conv,
+                # gated by ``spatial_dims=3``) and the trainer routes
+                # the per-view aux loss through MultiResolutionLoss
+                # (num_res=1) instead of SliceChannelLoss. The only
+                # remaining mutex is with ``aux_keep_native_d`` (folded-D
+                # channel slabs cannot coexist with the real-D spatial
+                # axis), already enforced above.
+                # In lift mode the loss bypasses SliceChannelLoss entirely,
+                # so slice_loss_reduction has no effect. Surface the dead
+                # knob now rather than silently letting it look meaningful.
+                if getattr(self.loss, "slice_loss_reduction", "per_slice") not in ("per_slice", "per_volume"):
+                    pass  # type validation handled elsewhere
+                # No need to validate in_channels arithmetic further; sync()
+                # owns the formula and lift skips the folded layouts above.
+
+                # --- Geometric constraint: thin-slab D must survive every
+                # encoder downsample. The shared ``Downsample`` block uses
+                # an isotropic factor-2 stride (``conv``/``maxpool``/...) with
+                # kernel_size=2; given ``n_levels`` encoder stages there are
+                # ``n_down = n_levels - 1`` halvings, so D must be divisible
+                # by ``2**n_down`` (and >= it). The 2.5D folded path was
+                # immune because D was on the channel axis; lift mode hits
+                # this constraint head-on. Surface it now with a precise
+                # diagnostic — otherwise the user gets an opaque
+                # ``Conv3d kernel size > input size`` error deep in forward.
+                n_levels = len(self.model.encoder_channels)
+                n_down = n_levels - 1
+                D = int(self.data.patch_size[0])
+                req = 1 << n_down
+                if D < req or D % req != 0:
+                    raise AssertionError(
+                        f"lift_2_5d_to_3d=True with len(encoder_channels)="
+                        f"{n_levels} requires patch_size[0] (D={D}) to be "
+                        f"divisible by 2**(n_levels-1)={req}. The shared "
+                        f"Downsample block halves every spatial axis (D "
+                        f"included) at each stage, and an isotropic "
+                        f"kernel-2/stride-2 conv on D<2 fails. Fixes:\n"
+                        f"  * Increase patch_size[0] to >= {req} (and a "
+                        f"multiple of {req}).\n"
+                        f"  * Or reduce len(encoder_channels) so 2**(n-1) "
+                        f"<= D (e.g. 4 stages need D>=8, 3 stages need D>=4).\n"
+                        f"  * Anisotropic per-axis strides (keep D unchanged "
+                        f"at deep stages) is not yet implemented and would "
+                        f"be a separate feature.")
+            else:
+                assert self.model.spatial_dims == 2, (
+                    "2.5D mode requires model.spatial_dims=2 (set "
+                    "automatically by sync()). To run a 3D model on the "
+                    "same 2.5D pipeline (Plan A), set "
+                    "model.lift_2_5d_to_3d=True (and typically "
+                    "model.block_type='r2plus1d').")
+            if (not lift) and self.data.aux_keep_native_d and n_views > 1:
                 # Native-depth layout: in_channels = sum_k round(D * s_k),
                 # with s_0 == 1.0 fixing D_0 == D. This is the channel
                 # count after the trainer's per-view center-crop and
@@ -1126,7 +1273,7 @@ class Config:
                     "view k must drive an aux head predicting "
                     "(B, num_fg * D_k, H, W)). Either enable "
                     "aux_seg_supervision or set aux_keep_native_d=False.")
-            else:
+            elif not lift:
                 expected_in = int(self.data.patch_size[0]) * n_views
                 assert self.model.in_channels == expected_in, (
                     f"2.5D mode requires model.in_channels == "

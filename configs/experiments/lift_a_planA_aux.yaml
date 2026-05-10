@@ -1,0 +1,141 @@
+# ============================================================================
+# Plan A 升维收益对照（扩展） — 组 4：lift + R(2+1)D + aux 监督
+#
+# 角色：在 lift_a_planA.yaml 基础上启用 aux_seg_supervision。每个 aux head
+#       输出 (B, num_fg, D, H, W)（spatial_dims=3 → 3D 1×1×1 conv），
+#       per-view aux 损失走 MultiResolutionLoss(num_res=1)。
+# 期望：相比 lift_a_planA（仅 view 0 监督），wider FOV 上的显式监督会让
+#       encoder 的多视图融合学到更对齐的 cross-FOV 表征。
+# ============================================================================
+
+data:
+  image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
+  label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
+  bbox_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/bbox"
+  region_weight_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/region_weight"
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+  bbox_suffix: ".nii.gz"
+  region_weight_suffix: ".nii.gz"
+
+  label_values: [0, 1, 2]
+  num_classes: 3
+
+  patch_size: [16, 256, 256]
+  patch_mode: "2_5d"
+  multi_res_scales: [1.0, 1.5, 2.0]
+  aug_oversample_ratio: 1.5
+  z_boundary_mode: "edge_pad"
+  aux_keep_native_d: false   # 必须 false（与 lift 互斥）
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize: "minmax"
+
+  val_ratio: 0.25
+  split_seed: 42
+  stratified_split: true
+
+  batch_size: 2
+  num_workers: 2
+  pin_memory: true
+
+  foreground_oversample_ratio: 0.3
+  samples_per_volume: 4
+  cache_mode: "memory"
+  cache_max_volumes: 12
+
+augment:
+  enabled: true
+  random_flip_prob: 0.5
+  random_flip_axes: [2, 3, 4]
+  random_affine_prob: 0.3
+  random_rotate_range: [-15.0, 15.0]
+  random_scale_range: [0.85, 1.15]
+  random_brightness_prob: 0.3
+  random_brightness_range: [-0.1, 0.1]
+  random_contrast_prob: 0.3
+  random_contrast_range: [0.8, 1.2]
+  random_gamma_prob: 0.2
+  random_gamma_range: [0.8, 1.2]
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std: 0.05
+
+model:
+  backbone: "resnet"
+  spatial_dims: 2          # sync 自动改 3
+  encoder_channels: [32, 64, 128, 256, 256]
+  blocks_per_level: 2
+
+  block_type: "r2plus1d"
+  lift_2_5d_to_3d: true
+
+  norm_type: "instance"
+  norm_groups: 8
+  activation: "leakyrelu"
+  dropout: 0.0
+  use_se: false
+  attention_type: "none"
+  skip_attention: false
+  deep_supervision: false
+  stem_mode: "conv3"
+  context_fusion: "multi_stem_proj"
+  # === 关键变量 vs lift_a_planA：开启 aux 监督 ===
+  aux_seg_supervision: true
+  aux_head_mode: "linear"
+  decoder_type: "unet"
+  downsample_mode: "conv"
+  upsample_mode: "trilinear"
+  skip_mode: "cat"
+  drop_path_rate: 0.0
+
+loss:
+  name: "dice_focal"
+  compound_weights: [1.0, 1.0]
+  class_weights: [1.0, 1.0]
+  region_weights: [1.0, 4.0, 2.0]
+  dice_smooth: 1.0e-5
+  focal_alpha: 0.5
+  focal_gamma: 2.0
+  slice_loss_reduction: "per_volume"   # lift 模式下被忽略
+  # 长度 = n_views - 1 = 2；空列表用 0.5^k 默认 [0.5, 0.25]。
+  aux_supervision_weights: []
+
+train:
+  epochs: 30
+  optimizer: "adamw"
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 2
+  warmup_lr: 1.0e-6
+  cosine_min_lr: 1.0e-6
+  grad_accum_steps: 1
+  grad_clip_norm: 12.0
+  use_amp: true
+  amp_dtype: "bfloat16"
+  compile_mode: "none"
+  use_ema: true
+  ema_decay: 0.999
+
+  output_dir: "outputs/lift_a/planA_lift_r2plus1d_aux"
+  save_every: 30
+  save_best_metric: "mean_dice"
+  save_best_mode: "max"
+  early_stopping: 0
+  log_every: 5
+  val_every: 1
+  vis_every: 30
+  seed: 42
+  deterministic: false
+  resume: ""
+  pretrain: ""
+
+predict:
+  z_overlap: 0.5
+  blend_mode: "gaussian"
+  batch_size: 2
+  tta_flip: false
+  threshold: 0.5
+  output_dir: "predictions"
+  save_probabilities: false

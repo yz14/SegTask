@@ -93,10 +93,31 @@ class Predictor:
         # rather than the legacy ``(B, n_views * pD, pH, pW)``. View 0
         # occupies the leading ``D_0 == pD`` channels (centered slices of
         # the max-FOV cube); aux views k=1..K-1 follow at native depth.
+        # Plan A "lift" — 2.5D pipeline routed through a true-3D model.
+        # When True the per-window forward SKIPS the C_res * D channel
+        # collapse: the rank-5 ``(B, n_views, pD, pH, pW)`` window is fed
+        # straight into the 3D UNet, whose output is ``(B, num_fg, pD,
+        # pH, pW)`` — already in the contract shared with the 3D path.
+        # Validated upstream by Config.validate(): only legal for
+        # patch_mode=="2_5d" and mutually exclusive with aux_keep_native_d.
+        self.lift_2_5d_to_3d = bool(
+            getattr(cfg.model, "lift_2_5d_to_3d", False)
+            and self.patch_mode == "2_5d")
+        if self.lift_2_5d_to_3d:
+            logger.info(
+                "Predictor lift_2_5d_to_3d=True: 2.5D windows fed straight "
+                "to a true-3D UNet (n_views=%d, in_channels=%d, output "
+                "shape (B, num_fg=%d, pD=%d, pH=%d, pW=%d)).",
+                len(self.multi_res_scales),
+                int(getattr(cfg.model, "in_channels", -1)),
+                int(self.num_fg), int(self.patch_D),
+                int(self.patch_H), int(self.patch_W))
+
         self.aux_keep_native_d = bool(
             getattr(cfg.data, "aux_keep_native_d", False)
             and self.patch_mode == "2_5d"
-            and len(self.multi_res_scales) > 1)
+            and len(self.multi_res_scales) > 1
+            and not self.lift_2_5d_to_3d)  # defensive; validate also rejects
         if self.aux_keep_native_d:
             depths = [int(round(self.patch_D * float(s)))
                       for s in self.multi_res_scales]
@@ -655,6 +676,33 @@ class Predictor:
         otherwise (AMP, TTA, deep-supervision unwrap).
         """
         if self.patch_mode == "2_5d":
+            # Plan A lift: feed the rank-5 ``(B, n_views, pD, pH, pW)``
+            # window straight into the 3D UNet. Output is already
+            # ``(B, num_fg, pD, pH, pW)`` — shape contract identical to
+            # the 3D path below, so reshape-on-collapse is unnecessary.
+            # TTA reuses the 3D ensemble (D is now a real spatial axis
+            # so flipping it is geometrically valid; the model has seen
+            # D-flips at training time via random_flip_axes=[2,3,4]).
+            if self.lift_2_5d_to_3d:
+                if x.ndim != 5:
+                    raise ValueError(
+                        "lift_2_5d_to_3d=True expects rank-5 input "
+                        f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
+                with autocast(device_type="cuda", enabled=self.use_amp,
+                              dtype=self.amp_dtype):
+                    pred = self.model(x)
+                    if isinstance(pred, list):
+                        pred = pred[0]
+                    if pred.shape[1] < self.num_fg:
+                        raise ValueError(
+                            f"Lift-mode model output has {pred.shape[1]} "
+                            f"channels at dim 1; expected at least "
+                            f"num_fg={self.num_fg}.")
+                    prob = torch.sigmoid(pred.float())[:, :self.num_fg]
+                    if self.tta_flip:
+                        prob = self._tta_flip_ensemble(x, prob)
+                return prob
+
             # Two input layouts arriving here:
             #   * Legacy / OFF path: rank-5 (B, C_res, pD, pH, pW) — needs
             #     the C_res-collapse reshape.
@@ -1070,6 +1118,33 @@ class Predictor:
             matching the 3D path's contract so all downstream blending
             stays unchanged.
         """
+        # Plan A lift (CPU-returning variant): same logic as the GPU
+        # branch in ``_forward_batch_gpu`` — skip the C_res*D collapse
+        # and feed the rank-5 input straight to the 3D model. Output
+        # shape ``(B, num_fg, D, H, W)`` already matches the contract
+        # required by the caller.
+        if self.lift_2_5d_to_3d:
+            if x.ndim != 5:
+                raise ValueError(
+                    "lift_2_5d_to_3d=True expects rank-5 input "
+                    f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
+            autocast_ctx = autocast(
+                device_type="cuda", enabled=self.use_amp,
+                dtype=self.amp_dtype)
+            with autocast_ctx:
+                pred = self.model(x)
+                if isinstance(pred, list):
+                    pred = pred[0]
+                if pred.shape[1] < self.num_fg:
+                    raise ValueError(
+                        f"Lift-mode model output has {pred.shape[1]} "
+                        f"channels at dim 1; expected at least "
+                        f"num_fg={self.num_fg}.")
+                prob = torch.sigmoid(pred.float())[:, :self.num_fg]
+                if self.tta_flip:
+                    prob = self._tta_flip_ensemble(x, prob)
+            return prob.float().cpu().numpy()
+
         x_2d = self._reshape_2_5d_input(x)  # (B, C_res*D, H, W)
         D = self.patch_D
         B, _, H, W = x_2d.shape

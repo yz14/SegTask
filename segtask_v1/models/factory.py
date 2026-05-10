@@ -153,11 +153,17 @@ def build_model(cfg: Config) -> UNet3D:
     # Output channel count by mode:
     #   3D modes (z_axis / cubic / whole) — num_fg per resolution scale
     #     (C_res >= 1; default [1.0] gives num_fg).
-    #   2.5D mode — num_fg per slice (D slices stacked as input channels);
-    #     SliceChannelLoss splits the (num_fg * D)-channel output into
-    #     per-fg-class D-slice binary masks.
-    if cfg.data.patch_mode == "2_5d":
-        # 2.5D mode output is num_fg * D for the MAIN head — independent
+    #   2.5D mode (folded) — num_fg per slice (D slices stacked as input
+    #     channels); SliceChannelLoss splits the (num_fg * D)-channel
+    #     output into per-fg-class D-slice binary masks.
+    #   2.5D mode + lift_2_5d_to_3d — D preserved as a real spatial axis.
+    #     The model is built as a true 3D UNet with ``out_classes=num_fg``
+    #     (single-resolution) and the trainer routes the loss through
+    #     MultiResolutionLoss(num_res=1). Bit-equivalent to the single-
+    #     scale 3D mode shape contract.
+    lift = bool(getattr(mc, "lift_2_5d_to_3d", False))
+    if cfg.data.patch_mode == "2_5d" and not lift:
+        # Folded 2.5D: output is num_fg * D for the MAIN head — independent
         # of how many context z-FOV views feed the stem. Multi-FOV affects
         # ONLY the stem's input-channel count (D * n_views legacy, or
         # sum(D_k) when aux_keep_native_d=True), not the main head output:
@@ -165,6 +171,13 @@ def build_model(cfg: Config) -> UNet3D:
         num_res = 1
         D = int(cfg.data.patch_size[0])
         out_classes = num_fg * D
+    elif cfg.data.patch_mode == "2_5d" and lift:
+        # Lifted 2.5D: model is single-resolution 3D over (B, n_views, D, H, W).
+        # Aux views still feed the stem as extra input channels (multi-FOV
+        # context fusion remains active via ``context_fusion``); only the
+        # main supervision target (view 0 = 1× FOV) drives the loss.
+        num_res = 1
+        out_classes = num_fg
     else:
         num_res = len(cfg.data.multi_res_scales)
         out_classes = num_fg * num_res
@@ -172,6 +185,10 @@ def build_model(cfg: Config) -> UNet3D:
     # Number of multi-FOV context views fed to the stem (2.5D mode only).
     # In 3D modes the stem already consumes ``len(multi_res_scales)`` input
     # channels directly, with no per-view stem split — so n_views stays 1.
+    # Lift mode reuses the 2.5D stem-fusion topology (each view = 1 input
+    # channel) so multi_stem_proj / hierarchical context fusion still
+    # apply; the only difference vs. folded 2.5D is that ``in_ch_per_view``
+    # is 1 (a single channel per view) instead of D.
     if cfg.data.patch_mode == "2_5d":
         context_n_views = max(len(cfg.data.multi_res_scales), 1)
     else:
