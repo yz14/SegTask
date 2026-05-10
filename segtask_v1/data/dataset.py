@@ -68,8 +68,16 @@ def _is_alloc_error(exc: BaseException) -> bool:
     return any(m in msg for m in _ALLOC_ERROR_MARKERS)
 
 
-def _sitk_read_with_retry(read_args: tuple, path: str) -> "sitk.Image":
-    """Call ``sitk.ReadImage(*read_args)`` with bounded retries.
+def _sitk_read_with_retry(read_callable, path: str) -> "sitk.Image":
+    """Invoke ``read_callable()`` (a zero-arg sitk read closure) with
+    bounded retries.
+
+    The callable is supplied by the caller so we can wrap arbitrary sitk
+    read paths — ``sitk.ReadImage(...)`` for the legacy whole-volume
+    reader, or an ``sitk.ImageFileReader`` configured with
+    ``SetExtractIndex/SetExtractSize`` for the streamed sub-region path
+    used by ``load_nifti_cropped``. The retry / OOM-detection contract is
+    identical regardless of which closure is passed.
 
     Retries ONLY genuine I/O transients. Allocation failures (host OOM)
     are re-raised immediately as ``MemoryError`` — retrying them wastes
@@ -82,7 +90,7 @@ def _sitk_read_with_retry(read_args: tuple, path: str) -> "sitk.Image":
     last_exc: Optional[BaseException] = None
     for attempt in range(1, _NIFTI_READ_RETRIES + 1):
         try:
-            return sitk.ReadImage(*read_args)
+            return read_callable()
         except RuntimeError as exc:  # SimpleITK wraps low-level errors here
             if _is_alloc_error(exc):
                 # Host OOM — do NOT retry. Re-raise as MemoryError so
@@ -145,7 +153,7 @@ def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
         # Read native stored dtype (no float promotion); cast after.
         read_args = (str(path),)
 
-    img = _sitk_read_with_retry(read_args, path)
+    img = _sitk_read_with_retry(lambda: sitk.ReadImage(*read_args), path)
     arr = sitk.GetArrayFromImage(img)  # (Z, Y, X) = (D, H, W)
     if arr.dtype != np_dtype:
         arr = arr.astype(np_dtype, copy=False)
@@ -159,26 +167,44 @@ def load_nifti_cropped(
 ) -> np.ndarray:
     """Load NIfTI and (optionally) bbox-crop in a single pass.
 
-    Memory-vs-``load_nifti + apply_bbox(...).copy()``
-    -------------------------------------------------
-    The legacy path materialised the FULL volume TWICE at peak —
-    once inside the SimpleITK image buffer, and once more in the
-    numpy copy produced by ``GetArrayFromImage``. For a 512x512x700
-    CT decoded as float32 that is ~1.4 GiB transient per load; with
-    ``num_workers=4`` each loading image + label + region_weight
-    concurrently, it trivially exceeds host RAM and surfaces as
-    ``SimpleITK bad allocation`` (host OOM).
-    This helper instead uses ``GetArrayViewFromImage`` (zero-copy
-    view into the sitk buffer), slices the view by ``bbox``, and
-    materialises ONLY the cropped ROI as an owned, C-contiguous
-    numpy buffer. The sitk image is released immediately after.
-    Peak memory therefore drops from
-        ``2 x full_volume_bytes``
-    to
-        ``1 x full_volume_bytes + 1 x cropped_bytes``
-    which, for typical CT + tight thoracic ROI bbox, is ~1.5-2x
-    smaller — the single most impactful change available without
-    touching the caching / prefetch contract upstream.
+    Memory profile (the whole point of this helper)
+    ------------------------------------------------
+    Two earlier iterations existed:
+
+      1. ``load_nifti(...) + apply_bbox(...).copy()`` materialised the
+         FULL volume TWICE at peak — once inside the SimpleITK image
+         buffer, and once more in the numpy copy produced by
+         ``GetArrayFromImage``.
+      2. ``sitk.ReadImage(path, sitkFloat32) → GetArrayViewFromImage →
+         slice → np.array(copy=True)`` halved that to ``1x full_volume +
+         1x cropped`` by deferring the owned copy to the cropped view.
+
+    Both still kept the FULL volume in fp32 alive in our process heap
+    until the function returned. For ``num_workers=4`` validating with
+    cache misses on every new volume — image + label + region_weight
+    all forced to fp32 by the loader contract — the per-worker
+    transient peaks into multi-GiB territory and trivially OOMs a
+    16-GiB host. The validation log shows exactly this:
+    ``RuntimeError: bad allocation`` on the third (region_weight)
+    concurrent load.
+
+    The current implementation drops the full-volume retained buffer
+    entirely: it uses ``sitk.ImageFileReader.SetExtractIndex /
+    SetExtractSize`` so SimpleITK returns ONLY the bbox ROI as a
+    sitk.Image, with ``SetOutputPixelType`` taking care of
+    ``scl_slope`` / ``scl_inter`` exactly as the whole-volume
+    ``ReadImage(path, sitkFloat32)`` path did. Peak per-load drops
+    from ``1x full_volume_bytes`` (in our heap, retained until
+    function return) to ``1x cropped_bytes`` (≈ 14x smaller for a
+    typical thoracic-CT-with-tight-ROI workload).
+
+    Note on ``.nii.gz`` files: the gzip stream is not seekable, so
+    ITK's NiftiImageIO must still decompress the full file inside
+    ``Execute()``. That decompression buffer lives entirely inside
+    ITK and is freed the instant ``Execute()`` returns — it never
+    enters our ``sitk.Image`` Python object. Net effect: the
+    decompression is a brief peak (one buffer in native dtype, ~2x
+    smaller than fp32), not a sustained one.
 
     Args:
         path:  NIfTI file path (.nii / .nii.gz).
@@ -197,27 +223,59 @@ def load_nifti_cropped(
         DataLoader workers.
     """
     np_dtype = np.dtype(dtype)
-    if np.issubdtype(np_dtype, np.floating):
-        sitk_pixel = (sitk.sitkFloat32 if np_dtype == np.float32
-                      else sitk.sitkFloat64)
-        read_args = (str(path), sitk_pixel)
-    else:
-        read_args = (str(path),)
+    floating = np.issubdtype(np_dtype, np.floating)
+    sitk_pixel = (
+        sitk.sitkFloat32 if (floating and np_dtype == np.float32)
+        else sitk.sitkFloat64 if floating
+        else None)
 
-    img = _sitk_read_with_retry(read_args, path)
+    def _read() -> "sitk.Image":
+        # Build a fresh reader inside the closure so that retried
+        # attempts don't reuse stale internal IORegion state from
+        # a partially-failed Execute() call.
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(str(path))
+        # Header-only pass: cheap, gives us GetSize() so we can clamp
+        # the bbox defensively. NiftiImageIO reads ~352 bytes here.
+        reader.ReadImageInformation()
+        if bbox is not None:
+            # SimpleITK uses (X, Y, Z) ordering — the OPPOSITE of numpy
+            # / our BBox tuple. Translate carefully.
+            full_w, full_h, full_d = reader.GetSize()
+            (d0, d1), (h0, h1), (w0, w1) = bbox
+            # Defensive clamping: a bbox that pokes past the file
+            # bounds (e.g. mismatched ROI mask spacing) would otherwise
+            # raise a cryptic ITK ``RequestedRegion is outside the
+            # LargestPossibleRegion`` error inside Execute().
+            d0c = max(0, min(d0, full_d))
+            d1c = max(d0c, min(d1, full_d))
+            h0c = max(0, min(h0, full_h))
+            h1c = max(h0c, min(h1, full_h))
+            w0c = max(0, min(w0, full_w))
+            w1c = max(w0c, min(w1, full_w))
+            if d1c > d0c and h1c > h0c and w1c > w0c:
+                reader.SetExtractIndex([w0c, h0c, d0c])
+                reader.SetExtractSize([w1c - w0c, h1c - h0c, d1c - d0c])
+            # Else: empty bbox — fall through to a full-volume read.
+            # The caller already handled None-bbox semantics; this
+            # branch only fires on degenerate ROI inputs and is left
+            # explicit so the decode still produces SOMETHING for
+            # downstream code to error on with a clear message.
+        if sitk_pixel is not None:
+            # Force fp32/fp64 output; sitk applies scl_slope/scl_inter
+            # during the cast — same semantics as
+            # ``sitk.ReadImage(path, sitkFloat32)`` but on the
+            # extracted sub-region only.
+            reader.SetOutputPixelType(sitk_pixel)
+        return reader.Execute()
+
+    img = _sitk_read_with_retry(_read, path)
     # ``GetArrayViewFromImage`` returns a numpy array sharing memory
     # with the sitk image buffer — no copy. We MUST copy (into an
     # owned buffer) before dropping ``img`` or the view becomes
     # dangling memory.
-    view = sitk.GetArrayViewFromImage(img)  # (Z, Y, X)
-    if bbox is not None:
-        (d0, d1), (h0, h1), (w0, w1) = bbox
-        view = view[d0:d1, h0:h1, w0:w1]
+    view = sitk.GetArrayViewFromImage(img)  # (Z, Y, X) = (D', H', W')
     # Force an explicit owned copy in the requested dtype / C order.
-    # We deliberately avoid ``np.ascontiguousarray`` here: it is a
-    # no-op when the input is already contiguous in the same dtype
-    # (which happens when ``bbox is None`` and dtype already matches),
-    # returning a view that would dangle the moment ``img`` is freed.
     # ``np.array(..., copy=True)`` materialises a fresh buffer every
     # call; a subsequent ``astype(copy=False)`` is free when dtypes
     # already match, so the cost is a single owned allocation.
@@ -228,6 +286,147 @@ def load_nifti_cropped(
     del view
     del img
     return arr
+
+
+# ---------------------------------------------------------------------------
+# NPZ pre-computed package I/O
+# ---------------------------------------------------------------------------
+# When ``DataConfig.npz_dir`` is configured, the dataset reads bbox-
+# cropped image / label / region_weight plus pre-computed foreground
+# indices directly from ``<pid>.npz`` (produced by
+# ``segtask_v1.data.make_data``). The arrays inside are stored as raw
+# uncompressed ``.npy`` payloads inside the zip (``ZIP_STORED``), so
+# ``np.load(...)`` reads each array verbatim with NO gzip decompress
+# step — the gzip peak that triggers ``bad allocation`` on the legacy
+# NIfTI path on multi-worker concurrent decode is eliminated. Combined
+# with bbox pre-cropping (~14× smaller working set on the lung CT
+# example) and pre-computed foreground indices (no startup label
+# scan), this makes the runtime data path dramatically more memory-
+# stable. Note: numpy ignores ``mmap_mode`` for ``.npz`` archives
+# (only ``.npy`` files support memmapped views) — each worker still
+# materialises its own owned ndarray copy. The OS page cache shares
+# the raw zip bytes across workers (only relevant after the first
+# read of each volume).
+#
+# Contract (set by ``make_data``):
+#   image       int16    (D', H', W')   raw HU, bbox-cropped
+#   label       int16    (D', H', W')   raw labels, bbox-cropped
+#   rw          float32  (D', H', W')   +1 shifted (optional key)
+#   fg_slices   int32    (M,)
+#   fg_coords   int32    (N, 3)         seed=42, capped at 50000
+#   meta        object 0-d dict         provenance
+
+
+def _open_npz(path: str) -> "np.lib.npyio.NpzFile":
+    """Open ``path`` as an ``NpzFile`` (zip directory parsed; arrays
+    NOT yet read).
+
+    ``allow_pickle=True`` is required to deserialise the ``meta``
+    dict; the rest of the arrays are plain numeric tensors. Note
+    that numpy silently ignores ``mmap_mode`` on ``.npz``, so
+    ``f['key']`` always returns an owned ndarray (the zip is
+    ``ZIP_STORED`` here, so the read is a verbatim byte copy from
+    the disk-resident zip into a fresh ndarray buffer — no gzip
+    decompress, no transient peak).
+    """
+    return np.load(path, allow_pickle=True)
+
+
+def load_npz_image(
+    path: str,
+    intensity_min: float,
+    intensity_max: float,
+    normalize: str,
+    global_mean: float = 0.0,
+    global_std: float = 1.0) -> np.ndarray:
+    """Read ``image`` from a make_data npz, then run the regular
+    ``preprocess_image`` pipeline.
+
+    The npz stores the image as raw int16 HU (= uncalibrated NIfTI
+    pixel values) so windowing parameters remain a runtime hyper-
+    parameter. ``preprocess_image`` allocates a fresh fp32 buffer
+    when fed an int16 input (the dtype mismatch path in
+    ``np.asarray``), so the int16 buffer is held only briefly during
+    the cast and is dropped on return — cache footprint matches the
+    legacy NIfTI path (one owned fp32 ROI buffer per cached volume).
+    """
+    f = _open_npz(path)
+    img_int16 = f["image"]   # owned int16 (zip-stored, no decompress)
+    img = preprocess_image(
+        img_int16, intensity_min, intensity_max,
+        normalize, global_mean, global_std,
+        inplace=False)       # returns owned fp32
+    return img
+
+
+def load_npz_label(path: str) -> np.ndarray:
+    """Return the ``label`` array as an owned int16 ndarray.
+
+    The npz read is a verbatim byte copy from the zip's
+    ``ZIP_STORED`` entry into a fresh int16 buffer (no gzip
+    decompress, no float promotion). Cache footprint matches the
+    legacy NIfTI int16 cache exactly.
+    """
+    f = _open_npz(path)
+    return f["label"]
+
+
+def load_npz_region_weight(path: str) -> Optional[np.ndarray]:
+    """Return the ``rw`` array as an owned float32 ndarray, or
+    ``None`` if the npz does not include a region-weight payload.
+
+    The +1 shift is already applied at make_data time, so the
+    returned array is value-identical to
+    ``load_region_weight_volume(rw_nifti_path, bbox=bbox)``.
+
+    Storage dtype dispatch:
+      * Newer npz packages store ``rw`` as ``int16`` (hand-
+        annotated integer weights — 4× smaller on disk).
+      * Older / fallback packages store ``rw`` as ``float32``
+        (non-integer or out-of-int16-range sources).
+    Both paths cast to ``float32`` here so the cache and the
+    downstream loss multiplier stay uniformly fp32 — bit-equivalent
+    to the legacy NIfTI ``load_region_weight_volume`` contract.
+    """
+    f = _open_npz(path)
+    if "rw" not in f.files:
+        return None
+    rw = f["rw"]
+    if rw.dtype != np.float32:
+        rw = rw.astype(np.float32, copy=False)
+    return rw
+
+
+def npz_has_rw(path: str) -> bool:
+    """Cheap presence test for the ``rw`` key (no array payload
+    decoded). Used by the dataset's ``_has_region_weight_file``
+    override in npz mode to honour the per-sample-file > static-
+    mapping precedence rule."""
+    f = _open_npz(path)
+    return "rw" in f.files
+
+
+def load_npz_fg_slices(path: str) -> np.ndarray:
+    """Pre-computed per-z foreground index list (cropped frame)."""
+    f = _open_npz(path)
+    return np.asarray(f["fg_slices"], dtype=np.int32)
+
+
+def load_npz_fg_coords(path: str) -> np.ndarray:
+    """Pre-computed (N, 3) foreground voxel coords (cropped frame)."""
+    f = _open_npz(path)
+    return np.asarray(f["fg_coords"], dtype=np.int32)
+
+
+def load_npz_label_for_split(path: str) -> np.ndarray:
+    """Owned int16 copy of ``label`` — used by stratified-split /
+    label-value detection helpers in ``loader.py``. We force an
+    owned copy here because the helpers run BEFORE workers fork
+    and we don't want the parent process to keep an open mmap
+    handle per sample for the entire pre-flight scan.
+    """
+    f = _open_npz(path)
+    return np.array(f["label"])
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +801,8 @@ class SegDataset3D(Dataset):
         region_weight_paths: Optional[List[str]] = None,
         z_boundary_mode: str = "stretch",
         aux_keep_native_d: bool = False,
-        keep_native_multi_res: bool = False):
+        keep_native_multi_res: bool = False,
+        npz_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -746,6 +946,28 @@ class SegDataset3D(Dataset):
         self.region_weight_paths = region_weight_paths
         self._rw_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
+        # ---- NPZ pre-computed package mode ---------------------------
+        # When ``npz_paths`` is supplied (1:1 with image_paths), every
+        # ``_load_*`` and ``_build_index`` path dispatches to the npz
+        # readers. Bbox is ALREADY applied inside the npz; any
+        # ``bbox_paths`` argument is ignored with a warning. The
+        # per-sample rw key-presence is cached here lazily so
+        # ``_has_region_weight_file`` (which is hit per-__getitem__)
+        # does not reopen the zip on every call.
+        self._npz_paths: Optional[List[str]] = (
+            list(npz_paths) if npz_paths is not None else None)
+        if self._npz_paths is not None:
+            assert len(self._npz_paths) == len(image_paths), (
+                f"npz_paths length {len(self._npz_paths)} != image_paths "
+                f"length {len(image_paths)}")
+            if self._bboxes is not None:
+                logger.warning(
+                    "npz mode: ignoring supplied bbox_paths (bbox is "
+                    "already pre-applied inside the npz packages).")
+                self._bboxes = None
+                self.bbox_paths = None
+        self._npz_has_rw_cache: Dict[int, bool] = {}
+
         # Build per-slice index for foreground oversampling
         self._vol_fg_slices: List[np.ndarray] = []  # fg slice indices per volume
         self._vol_all_slices: List[int] = []        # total depth per volume
@@ -753,6 +975,9 @@ class SegDataset3D(Dataset):
 
     def _build_index(self) -> None:
         """Scan all volumes and record which slices have foreground."""
+        if self._npz_paths is not None:
+            self._build_index_from_npz()
+            return
         logger.info("Building dataset index for %d volumes...", len(self.image_paths))
         total_fg = 0
         total_slices = 0
@@ -772,11 +997,43 @@ class SegDataset3D(Dataset):
         logger.info("Index built: %d volumes, %d/%d foreground slices",
                      len(self.image_paths), total_fg, total_slices)
 
+    def _build_index_from_npz(self) -> None:
+        """NPZ-mode index: read ``fg_slices`` directly from each
+        package and use the stored ``image`` array shape for the
+        per-volume depth — no label scan, no bbox decode.
+        """
+        logger.info(
+            "Loading pre-computed fg indices from %d npz packages...",
+            len(self._npz_paths))
+        total_fg = 0
+        total_slices = 0
+        for path in self._npz_paths:
+            f = _open_npz(path)
+            fg = np.asarray(f["fg_slices"], dtype=np.int32)
+            D = int(f["image"].shape[0])
+            self._vol_fg_slices.append(fg)
+            self._vol_all_slices.append(D)
+            total_fg += len(fg)
+            total_slices += D
+        logger.info(
+            "NPZ index built: %d volumes, %d/%d foreground slices",
+            len(self._npz_paths), total_fg, total_slices)
+
     def _bbox_for(self, vol_idx: int) -> Optional[BBox]:
         return self._bboxes[vol_idx] if self._bboxes is not None else None
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         """Load and preprocess image volume with caching."""
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._img_cache.get(path)
+            if cached is not None:
+                return cached
+            img = load_npz_image(
+                path, self.intensity_min, self.intensity_max,
+                self.normalize, self.global_mean, self.global_std)
+            self._img_cache.put(path, img)
+            return img
         path   = self.image_paths[vol_idx]
         cached = self._img_cache.get(path)
         if cached is not None:
@@ -807,6 +1064,14 @@ class SegDataset3D(Dataset):
         nearest interpolation which preserves dtype; the final per-sample
         stack casts to float32 exactly once at tensor-emission time).
         """
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._lbl_cache.get(path)
+            if cached is not None:
+                return cached
+            lbl = load_npz_label(path)
+            self._lbl_cache.put(path, lbl)
+            return lbl
         path   = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
@@ -823,12 +1088,29 @@ class SegDataset3D(Dataset):
         return lbl
 
     def _has_region_weight_file(self, vol_idx: int) -> bool:
+        if self._npz_paths is not None:
+            cached = self._npz_has_rw_cache.get(vol_idx)
+            if cached is None:
+                cached = npz_has_rw(self._npz_paths[vol_idx])
+                self._npz_has_rw_cache[vol_idx] = cached
+            return cached
         return (self.region_weight_paths is not None
                 and self.region_weight_paths[vol_idx] is not None
                 and self.region_weight_paths[vol_idx] != "")
 
     def _load_region_weight(self, vol_idx: int) -> np.ndarray:
         """Load per-sample region-weight volume (bbox-cropped, +1 shifted)."""
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._rw_cache.get(path)
+            if cached is not None:
+                return cached
+            rw = load_npz_region_weight(path)
+            # Caller guards with ``_has_region_weight_file``; rw
+            # should always be non-None here, but stay defensive.
+            if rw is not None:
+                self._rw_cache.put(path, rw)
+            return rw
         path   = self.region_weight_paths[vol_idx]
         cached = self._rw_cache.get(path)
         if cached is not None:
@@ -1293,7 +1575,8 @@ class SegDataset3DCubic(Dataset):
         region_weights: Optional[List[float]] = None,
         bbox_paths: Optional[List[str]] = None,
         region_weight_paths: Optional[List[str]] = None,
-        keep_native_multi_res: bool = False):
+        keep_native_multi_res: bool = False,
+        npz_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -1368,6 +1651,21 @@ class SegDataset3DCubic(Dataset):
         self.region_weight_paths = region_weight_paths
         self._rw_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
+        # ---- NPZ pre-computed package mode (see SegDataset3D) -------
+        self._npz_paths: Optional[List[str]] = (
+            list(npz_paths) if npz_paths is not None else None)
+        if self._npz_paths is not None:
+            assert len(self._npz_paths) == len(image_paths), (
+                f"npz_paths length {len(self._npz_paths)} != image_paths "
+                f"length {len(image_paths)}")
+            if self._bboxes is not None:
+                logger.warning(
+                    "npz mode: ignoring supplied bbox_paths (bbox is "
+                    "already pre-applied inside the npz packages).")
+                self._bboxes = None
+                self.bbox_paths = None
+        self._npz_has_rw_cache: Dict[int, bool] = {}
+
         # Build 3D foreground voxel index for oversampling
         self._vol_shapes: List[Tuple[int, int, int]] = []
         self._vol_fg_coords: List[np.ndarray] = []  # (N, 3) fg voxel coords per volume
@@ -1375,6 +1673,9 @@ class SegDataset3DCubic(Dataset):
 
     def _build_index(self) -> None:
         """Scan volumes and record foreground voxel coordinates."""
+        if self._npz_paths is not None:
+            self._build_index_from_npz()
+            return
         logger.info("Building cubic dataset index for %d volumes...", len(self.image_paths))
         total_fg = 0
         for i in range(len(self.image_paths)):
@@ -1394,10 +1695,42 @@ class SegDataset3DCubic(Dataset):
         logger.info("Cubic index: %d volumes, %d fg voxels sampled",
                      len(self.image_paths), total_fg)
 
+    def _build_index_from_npz(self) -> None:
+        """NPZ-mode index: read ``fg_coords`` and stored shape from
+        each npz package directly. Sub-sampling has already been
+        applied by ``make_data`` (seed=42, cap=50000) so the cubic
+        center sampler is bit-equivalent to the legacy on-the-fly
+        path.
+        """
+        logger.info(
+            "Loading pre-computed fg coords from %d npz packages...",
+            len(self._npz_paths))
+        total_fg = 0
+        for path in self._npz_paths:
+            f = _open_npz(path)
+            coords = np.asarray(f["fg_coords"], dtype=np.int32)
+            shape = tuple(int(s) for s in f["image"].shape)
+            self._vol_shapes.append(shape)
+            self._vol_fg_coords.append(coords)
+            total_fg += len(coords)
+        logger.info(
+            "NPZ cubic index: %d volumes, %d fg voxels sampled",
+            len(self._npz_paths), total_fg)
+
     def _bbox_for(self, vol_idx: int) -> Optional[BBox]:
         return self._bboxes[vol_idx] if self._bboxes is not None else None
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._img_cache.get(path)
+            if cached is not None:
+                return cached
+            img = load_npz_image(
+                path, self.intensity_min, self.intensity_max,
+                self.normalize, self.global_mean, self.global_std)
+            self._img_cache.put(path, img)
+            return img
         path = self.image_paths[vol_idx]
         cached = self._img_cache.get(path)
         if cached is not None:
@@ -1418,6 +1751,14 @@ class SegDataset3DCubic(Dataset):
 
         See ``SegDataset3D._load_label`` for the dtype rationale.
         """
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._lbl_cache.get(path)
+            if cached is not None:
+                return cached
+            lbl = load_npz_label(path)
+            self._lbl_cache.put(path, lbl)
+            return lbl
         path = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
@@ -1428,12 +1769,27 @@ class SegDataset3DCubic(Dataset):
         return lbl
 
     def _has_region_weight_file(self, vol_idx: int) -> bool:
+        if self._npz_paths is not None:
+            cached = self._npz_has_rw_cache.get(vol_idx)
+            if cached is None:
+                cached = npz_has_rw(self._npz_paths[vol_idx])
+                self._npz_has_rw_cache[vol_idx] = cached
+            return cached
         return (self.region_weight_paths is not None
                 and self.region_weight_paths[vol_idx] is not None
                 and self.region_weight_paths[vol_idx] != "")
 
     def _load_region_weight(self, vol_idx: int) -> np.ndarray:
         """Load per-sample region-weight volume (bbox-cropped, +1 shifted)."""
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._rw_cache.get(path)
+            if cached is not None:
+                return cached
+            rw = load_npz_region_weight(path)
+            if rw is not None:
+                self._rw_cache.put(path, rw)
+            return rw
         path   = self.region_weight_paths[vol_idx]
         cached = self._rw_cache.get(path)
         if cached is not None:
@@ -1691,7 +2047,8 @@ class SegDataset3DWhole(Dataset):
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
         bbox_paths: Optional[List[str]] = None,
-        region_weight_paths: Optional[List[str]] = None):
+        region_weight_paths: Optional[List[str]] = None,
+        npz_paths: Optional[List[str]] = None):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -1740,15 +2097,41 @@ class SegDataset3DWhole(Dataset):
         self.region_weight_paths = region_weight_paths
         self._rw_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
+        # ---- NPZ pre-computed package mode (see SegDataset3D) -------
+        self._npz_paths: Optional[List[str]] = (
+            list(npz_paths) if npz_paths is not None else None)
+        if self._npz_paths is not None:
+            assert len(self._npz_paths) == len(image_paths), (
+                f"npz_paths length {len(self._npz_paths)} != image_paths "
+                f"length {len(image_paths)}")
+            if self._bboxes is not None:
+                logger.warning(
+                    "npz mode: ignoring supplied bbox_paths (bbox is "
+                    "already pre-applied inside the npz packages).")
+                self._bboxes = None
+                self.bbox_paths = None
+        self._npz_has_rw_cache: Dict[int, bool] = {}
+
         logger.info(
             "Whole-volume dataset: %d volumes, extract_size=%s, "
-            "samples_per_volume=%d",
-            len(self.image_paths), self.extract_size, self.samples_per_volume)
+            "samples_per_volume=%d%s",
+            len(self.image_paths), self.extract_size, self.samples_per_volume,
+            " [npz mode]" if self._npz_paths is not None else "")
 
     def _bbox_for(self, vol_idx: int) -> Optional[BBox]:
         return self._bboxes[vol_idx] if self._bboxes is not None else None
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._img_cache.get(path)
+            if cached is not None:
+                return cached
+            img = load_npz_image(
+                path, self.intensity_min, self.intensity_max,
+                self.normalize, self.global_mean, self.global_std)
+            self._img_cache.put(path, img)
+            return img
         path = self.image_paths[vol_idx]
         cached = self._img_cache.get(path)
         if cached is not None:
@@ -1769,6 +2152,14 @@ class SegDataset3DWhole(Dataset):
 
         See ``SegDataset3D._load_label`` for the dtype rationale.
         """
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._lbl_cache.get(path)
+            if cached is not None:
+                return cached
+            lbl = load_npz_label(path)
+            self._lbl_cache.put(path, lbl)
+            return lbl
         path = self.label_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
@@ -1779,12 +2170,27 @@ class SegDataset3DWhole(Dataset):
         return lbl
 
     def _has_region_weight_file(self, vol_idx: int) -> bool:
+        if self._npz_paths is not None:
+            cached = self._npz_has_rw_cache.get(vol_idx)
+            if cached is None:
+                cached = npz_has_rw(self._npz_paths[vol_idx])
+                self._npz_has_rw_cache[vol_idx] = cached
+            return cached
         return (self.region_weight_paths is not None
                 and self.region_weight_paths[vol_idx] is not None
                 and self.region_weight_paths[vol_idx] != "")
 
     def _load_region_weight(self, vol_idx: int) -> np.ndarray:
         """Load per-sample region-weight volume (bbox-cropped, +1 shifted)."""
+        if self._npz_paths is not None:
+            path = self._npz_paths[vol_idx]
+            cached = self._rw_cache.get(path)
+            if cached is not None:
+                return cached
+            rw = load_npz_region_weight(path)
+            if rw is not None:
+                self._rw_cache.put(path, rw)
+            return rw
         path   = self.region_weight_paths[vol_idx]
         cached = self._rw_cache.get(path)
         if cached is not None:

@@ -57,6 +57,50 @@ class DataConfig:
     region_weight_dir: str = ""
     region_weight_suffix: str = ".nii.gz"
 
+    # ---- Pre-computed npz pipeline ---------------------------------
+    # Optional pre-computed npz package directory (output of
+    # ``segtask_v1.data.make_data``). When non-empty, the trainer's
+    # data loader reads bbox-cropped image / label / region_weight
+    # plus pre-computed foreground indices straight from
+    # ``<npz_dir>/<pid>.npz`` and IGNORES ``image_dir`` /
+    # ``label_dir`` / ``bbox_dir`` / ``region_weight_dir`` at runtime.
+    # The npz files store:
+    #   image      int16  (D', H', W')  raw HU, bbox-cropped
+    #   label      int16  (D', H', W')  raw labels, bbox-cropped
+    #   rw         float32 (D', H', W')  +1 shifted, optional
+    #   fg_slices  int32  (M,)          per-z fg index in cropped frame
+    #   fg_coords  int32  (N, 3)        sub-sampled (seed=42, N<=50000)
+    #   meta       object dict          provenance
+    # Benefits: (1) eliminates the SimpleITK gzip-decompress peak that
+    # OOMs ``num_workers >= 4`` with concurrent image+label+rw reads;
+    # (2) lets DataLoader workers ``mmap`` arrays out of the OS page
+    # cache (shared across workers); (3) skips the dataset's startup
+    # ``precompute_bboxes`` + ``_build_index`` scans (fg indices are
+    # baked in). Strong contract: every sample expected from
+    # discovery (or every pid in ``<npz_dir>/_manifest.json``) must
+    # have a matching npz file. Empty string = legacy NIfTI pipeline.
+    #
+    # Companion field ``npz_suffix`` lets users co-locate npz files
+    # with non-standard extensions (e.g. when sharded across folders);
+    # default ``.npz`` matches make_data's output verbatim.
+    npz_dir: str = ""
+    npz_suffix: str = ".npz"
+
+    # When True (default) and ``npz_dir`` points at a missing or
+    # empty directory at trainer startup, ``build_dataloaders``
+    # calls ``segtask_v1.data.make_data.prepare_dataset`` inline
+    # before constructing the loaders — turning the npz pipeline
+    # into a one-shot "just set npz_dir and run train" UX. Set to
+    # False to require an explicit ``python -m segtask_v1.data.
+    # make_data ...`` invocation (recommended for cluster runs
+    # where the build step should be a separate scheduled job).
+    # This switch only fires when the directory is empty; a
+    # partially-populated directory (e.g. resume after a crashed
+    # build) is treated as authoritative — re-run make_data
+    # manually with ``--overwrite`` or wipe the directory to force
+    # a rebuild.
+    npz_auto_build: bool = True
+
     # 样本排除清单（文本文件路径，每行一个 pid / stem）。pid 定义为
     # `image_path.name`（不含后缀，即 `<name>{image_suffix}` 去掉后缀的部分）。
     # 命中的 pid 会在 `discover_samples` 之后立刻从 image/label/bbox 配对中剔除。
