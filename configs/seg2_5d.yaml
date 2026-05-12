@@ -122,7 +122,7 @@ data:
   samples_per_volume: 8
 
   cache_mode: "memory"
-  cache_max_volumes: 4
+  cache_max_volumes: 2
 
 
 # =====================================================================
@@ -153,7 +153,7 @@ augment:
   random_gamma_range: [0.8, 1.2]
 
   gaussian_noise_prob: 0.2
-  gaussian_noise_std : 0.05
+  gaussian_noise_std : 0.09
 
   gaussian_blur_prob : 0.1
   gaussian_blur_sigma: [0.5, 1.5]

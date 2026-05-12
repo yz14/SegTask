@@ -593,9 +593,33 @@ class Trainer:
         self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
 
         # --- torch.compile (last) -------------------------------------
+        # torch.compile's Inductor CUDA backend requires Triton. Triton has
+        # no official Windows wheel, so on most Windows + CUDA setups the
+        # `torch.compile(...)` call itself succeeds but the FIRST forward
+        # raises `torch._inductor.exc.TritonMissing` ~1 minute into training.
+        # Probe up-front and gracefully fall back to eager so the user gets
+        # an actionable warning at startup instead of a deep dynamo trace.
+        self._compile_enabled = False
         if tc.compile_mode != "none" and hasattr(torch, "compile"):
-            logger.info("Compiling model with mode='%s'", tc.compile_mode)
-            self.model = torch.compile(self.model, mode=tc.compile_mode)
+            triton_ok = True
+            if device.type == "cuda":
+                import importlib.util
+                if importlib.util.find_spec("triton") is None:
+                    triton_ok = False
+                    logger.warning(
+                        "torch.compile requested (mode='%s') but Triton is "
+                        "not installed; CUDA Inductor backend cannot run "
+                        "without it (common on Windows). Falling back to "
+                        "eager execution. To enable compile: install a "
+                        "Triton build compatible with your torch/CUDA, or "
+                        "set train.compile_mode='none' in the config to "
+                        "silence this warning.",
+                        tc.compile_mode,
+                    )
+            if triton_ok:
+                logger.info("Compiling model with mode='%s'", tc.compile_mode)
+                self.model = torch.compile(self.model, mode=tc.compile_mode)
+                self._compile_enabled = True
 
         # --- Augmentation ---------------------------------------------
         # The augmentor applies spatial transforms jointly to image,
@@ -772,7 +796,10 @@ class Trainer:
         logger.info("Foreground classes: %d, Loss: %s",
                     self.num_fg, self.cfg.loss.name)
         if tc.compile_mode != "none":
-            logger.info("torch.compile mode: %s", tc.compile_mode)
+            logger.info(
+                "torch.compile mode: %s (active=%s)",
+                tc.compile_mode, self._compile_enabled,
+            )
         logger.info("=" * 60)
 
         best_metrics: Dict[str, float] = {}
