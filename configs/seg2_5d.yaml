@@ -358,7 +358,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: ""
+  resume: "D:/codes/work-projects/SegTask/outputs/lung_bone/best_model.pth"
 
   # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
   # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。

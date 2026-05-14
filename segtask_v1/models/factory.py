@@ -14,7 +14,7 @@ import numpy as np
 
 from ..config import Config
 from .blocks import Downsample, Upsample
-from .convnext import ConvNeXtStage
+from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .resnet import ResNetStage
 from .unet import Encoder, Decoder, UNet3D
 from .unet3p import UNet3PDecoder
@@ -118,6 +118,10 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
     total_blocks = sum(counts)
     dp_rates = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
     rate_idx = [0]
+    # LayerScale init value (Touvron et al.); <=0 disables. Default 1e-6
+    # matches the official ConvNeXt block and is essential for stable
+    # training of deep ConvNeXt-style networks.
+    ls_init = float(getattr(mc, "convnext_layer_scale_init", 1e-6))
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
         start = rate_idx[0]
@@ -130,9 +134,27 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             drop_path_rates=rates,
             attention_type=mc.attention_type,
             spatial_dims=spatial_dims,
+            layer_scale_init_value=ls_init,
         )
 
     return _StatefulStageBuilder(factory, counts)
+
+
+def _make_convnext_downsample_builder(
+    cfg: Config) -> Callable[[int, int], ConvNeXtDownsample]:
+    """Return a builder ``(in_ch, out_ch) -> ConvNeXtDownsample``.
+
+    Used to inject the paper-faithful ``LayerNorm → Conv(s=2)`` topology
+    into ``Encoder`` when ``backbone == "convnext"`` and
+    ``convnext_downsample_lnfirst`` is enabled. See
+    :class:`ConvNeXtDownsample` for the rationale.
+    """
+    spatial_dims = getattr(cfg.model, "spatial_dims", 3)
+
+    def build(in_ch: int, out_ch: int) -> ConvNeXtDownsample:
+        return ConvNeXtDownsample(in_ch, out_ch, spatial_dims=spatial_dims)
+
+    return build
 
 
 def build_model(cfg: Config) -> UNet3D:
@@ -235,12 +257,17 @@ def build_model(cfg: Config) -> UNet3D:
 
     # Select backbone stage builder (separate instances for enc/dec — each
     # owns its own call counter).
+    downsample_builder = None
     if mc.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(cfg, enc_counts)
         dec_builder = _make_resnet_stage_builder(cfg, dec_counts)
     elif mc.backbone == "convnext":
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)
+        # Paper-faithful LN-first inter-stage downsample. The toggle lets
+        # users fall back to the generic Downsample for ablation.
+        if bool(getattr(mc, "convnext_downsample_lnfirst", True)):
+            downsample_builder = _make_convnext_downsample_builder(cfg)
     else:
         raise ValueError(f"Unknown backbone: {mc.backbone}")
 
@@ -257,7 +284,8 @@ def build_model(cfg: Config) -> UNet3D:
         spatial_dims=spatial_dims,
         context_n_views=context_n_views,
         context_fusion=getattr(mc, "context_fusion", "shared_stem"),
-        in_ch_per_view_list=in_ch_per_view_list)
+        in_ch_per_view_list=in_ch_per_view_list,
+        downsample_builder=downsample_builder)
 
     # Build decoder — classical UNet / UNet++ / UNet3+.
     if mc.decoder_type == "unet3p":

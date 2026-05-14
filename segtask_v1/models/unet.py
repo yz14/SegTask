@@ -16,7 +16,7 @@ Supports:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,8 @@ class Encoder(nn.Module):
         spatial_dims: int = 3,
         context_n_views: int = 1,
         context_fusion: str = "shared_stem",
-        in_ch_per_view_list: List[int] = None):
+        in_ch_per_view_list: List[int] = None,
+        downsample_builder: Optional[Callable[[int, int], nn.Module]] = None):
         super().__init__()
         self.spatial_dims = spatial_dims
         # Stem: project input to first channel count. The stem may introduce
@@ -112,11 +113,23 @@ class Encoder(nn.Module):
             in_ch = stage_channels[i - 1] if i > 0 else stage_channels[0]
             self.stages.append(stage_builder(in_ch, ch))
             if i > 0:
-                self.downsamples.append(
-                    Downsample(
-                        stage_channels[i - 1], stage_channels[i - 1],
-                        norm_type=norm_type, norm_groups=norm_groups,
-                        mode=downsample_mode, spatial_dims=spatial_dims))
+                # Inter-stage downsample. Layout convention: in_ch == out_ch
+                # (channel growth is handled inside the next stage's first
+                # block). ``downsample_builder``, when provided by the
+                # factory, overrides the generic ``Downsample`` so backbone-
+                # specific topologies (e.g. ConvNeXt's LN-first
+                # ``LayerNorm → Conv(s=2)``) can be injected without
+                # polluting the generic Downsample contract.
+                ds_in = stage_channels[i - 1]
+                ds_out = stage_channels[i - 1]
+                if downsample_builder is not None:
+                    self.downsamples.append(downsample_builder(ds_in, ds_out))
+                else:
+                    self.downsamples.append(
+                        Downsample(
+                            ds_in, ds_out,
+                            norm_type=norm_type, norm_groups=norm_groups,
+                            mode=downsample_mode, spatial_dims=spatial_dims))
 
         # ----- Plan C: per-injection-level cat-fusion 1×1 ConvNormAct ----
         # Built only when the stem is ``HierarchicalStems``. Each fuse

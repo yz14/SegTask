@@ -629,6 +629,23 @@ class ModelConfig:
     # Stochastic depth (drop path) rate — ConvNext only
     drop_path_rate: float = 0.0
 
+    # ConvNeXt LayerScale (Touvron et al.) initial value — only used when
+    # ``backbone == "convnext"``. Initialises a learnable per-channel scale
+    # ``gamma = layer_scale_init * ones(C)`` applied to the block branch
+    # before residual addition, making each block start near-identity. This
+    # matches official ConvNeXt and is essential for stable training of
+    # deep networks combined with stochastic depth. Set to ``0.0`` (or
+    # negative) to DISABLE LayerScale and recover the legacy behaviour.
+    convnext_layer_scale_init: float = 1e-6
+
+    # ConvNeXt paper-faithful downsample topology. When True (default) and
+    # ``backbone == "convnext"``, inter-stage downsamples use
+    # ``LayerNorm → Conv(k=2, s=2)`` (norm-first, LN specifically) instead
+    # of the generic ``Downsample`` (which would otherwise pick up
+    # ``downsample_mode`` + ``norm_type``). Set to False to fall back to the
+    # generic Downsample path (legacy behaviour) for ablation purposes.
+    convnext_downsample_lnfirst: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Loss configuration
