@@ -895,6 +895,42 @@ class PredictConfig:
     # Save probability maps (in addition to binary masks)
     save_probabilities: bool = False
 
+    # ---- Z-axis interleaved multi-stream prediction (2.5D only) ----
+    # Splits the input volume into ``k`` interleaved sub-volumes along z
+    # (slices ``i, i+k, i+2k, ...`` for ``i = 0..k-1``), runs the
+    # standard 2.5D z-sliding-window inference on each sub-volume
+    # independently, then weaves the per-stream probabilities back into
+    # the original z indices (``out[:, i::k] = stream_i_prob``). Streams
+    # cover disjoint slice sets so the recombination is exact — no
+    # cross-stream blending required.
+    #
+    # Rationale: the 2.5D model sees ``patch_D`` "pseudo-adjacent"
+    # channel-slices. Sampling every k-th slice makes each window span
+    # ``k * patch_D * z_spacing`` mm physically, widening the effective
+    # z receptive field without retraining. Most useful on thin-slice
+    # scans where adjacent slices are highly redundant.
+    #
+    # Distribution-shift caveat: inputs become an apparent-spacing of
+    # ``k * z_spacing``. Recommend an A/B vs. k=1 on held-out data
+    # before relying on this in production.
+    #
+    # Disabled by default to preserve legacy behaviour bit-exactly.
+    z_interleave_enabled: bool = False
+
+    # Per-volume k is chosen by physical z spacing (mm). With sorted
+    # ``z_interleave_thresholds = [t_1, t_2, ..., t_n]`` (ascending) and
+    # ``z_interleave_factors = [f_1, f_2, ..., f_n, f_fallback]``
+    # (length n+1), the rule is:
+    #   z_spacing <= t_1 → k = f_1
+    #   t_1 < z_spacing <= t_2 → k = f_2
+    #   ...
+    #   z_spacing > t_n → k = f_fallback
+    # Defaults follow TODO 1: ≤1.0 mm → k=3; (1.0, 1.5] → k=2; >1.5 → k=1.
+    z_interleave_thresholds: List[float] = field(
+        default_factory=lambda: [1.0, 1.5])
+    z_interleave_factors: List[int] = field(
+        default_factory=lambda: [3, 2, 1])
+
 
 # ---------------------------------------------------------------------------
 # Top-level configuration
@@ -1364,6 +1400,41 @@ class Config:
         # network input/output channel count matches the stacked views.
         assert self.train.save_best_mode in ("max", "min"), \
             f"Invalid save_best_mode: {self.train.save_best_mode}"
+        # ---- z-interleaved 2.5D inference: shape & monotonicity checks ----
+        # Off by default; only validated when the flag is on, so legacy
+        # configs without these fields remain bit-exactly accepted.
+        if self.predict.z_interleave_enabled:
+            assert self.data.patch_mode == "2_5d", (
+                "predict.z_interleave_enabled=True is only valid for "
+                f"patch_mode='2_5d'; got {self.data.patch_mode!r}. The "
+                "interleaved scheme widens the z receptive field of the "
+                "2D-folded D-channel input — it has no effect on true-3D "
+                "patch modes (z_axis/cubic/whole).")
+            thr = self.predict.z_interleave_thresholds
+            fac = self.predict.z_interleave_factors
+            assert len(fac) == len(thr) + 1, (
+                "predict.z_interleave_factors must have exactly "
+                "len(z_interleave_thresholds)+1 entries (one per spacing "
+                f"bucket + a fallback for >max-threshold); got "
+                f"thresholds={thr}, factors={fac}.")
+            assert all(t > 0 for t in thr), (
+                f"predict.z_interleave_thresholds must all be > 0; got {thr}.")
+            assert thr == sorted(thr), (
+                f"predict.z_interleave_thresholds must be ascending; got {thr}.")
+            assert all(int(f) >= 1 for f in fac), (
+                f"predict.z_interleave_factors must all be >= 1; got {fac}.")
+            # edge_pad keeps short sub-streams geometrically faithful; the
+            # 'stretch' legacy behaviour would rescale a (D//k)-slice
+            # tail-stream up to patch_D and partially defeat the
+            # interleaving's whole point. Warn rather than hard-fail so
+            # an existing 'stretch' config can still opt-in for a probe.
+            if self.data.z_boundary_mode != "edge_pad":
+                logger.warning(
+                    "predict.z_interleave_enabled=True with "
+                    "z_boundary_mode=%r: short sub-streams will be "
+                    "stretched along z when their length < patch_D, "
+                    "which dilutes the interleave effect. Prefer "
+                    "'edge_pad'.", self.data.z_boundary_mode)
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)

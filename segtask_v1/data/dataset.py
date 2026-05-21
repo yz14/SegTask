@@ -160,6 +160,41 @@ def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
     return arr
 
 
+def load_nifti_with_spacing(
+    path: str, dtype: np.dtype = np.float32,
+) -> "Tuple[np.ndarray, float]":
+    """Load NIfTI → ``(volume, z_spacing_mm)``.
+
+    The returned ``volume`` follows the same ``(D, H, W)`` layout as
+    :func:`load_nifti` (SimpleITK already emits ``(Z, Y, X)`` order).
+    ``z_spacing`` is the physical voxel size along that depth axis in
+    millimetres, read from ``sitk.Image.GetSpacing()[2]`` (SimpleITK
+    reports spacing in (X, Y, Z) order). Falls back to ``1.0`` if the
+    file is missing valid Z-spacing metadata.
+
+    Kept separate from :func:`load_nifti` so the (heavily reused)
+    training data path stays untouched — only the inference-time
+    z-interleave wrapper (``Predictor._sliding_window_z_interleaved``)
+    needs physical spacing.
+    """
+    np_dtype = np.dtype(dtype)
+    if np.issubdtype(np_dtype, np.floating):
+        sitk_pixel = (sitk.sitkFloat32 if np_dtype == np.float32
+                      else sitk.sitkFloat64)
+        read_args = (str(path), sitk_pixel)
+    else:
+        read_args = (str(path),)
+    img = _sitk_read_with_retry(lambda: sitk.ReadImage(*read_args), path)
+    arr = sitk.GetArrayFromImage(img)
+    if arr.dtype != np_dtype:
+        arr = arr.astype(np_dtype, copy=False)
+    spacing = img.GetSpacing()  # (sx, sy, sz)
+    z_spacing = float(spacing[2]) if len(spacing) >= 3 else 1.0
+    if not np.isfinite(z_spacing) or z_spacing <= 0.0:
+        z_spacing = 1.0
+    return arr, z_spacing
+
+
 def load_nifti_cropped(
     path: str,
     bbox: "Optional[BBox]" = None,

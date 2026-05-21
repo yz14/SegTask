@@ -600,6 +600,12 @@ class Trainer:
         # Probe up-front and gracefully fall back to eager so the user gets
         # an actionable warning at startup instead of a deep dynamo trace.
         self._compile_enabled = False
+        # One-shot diagnostic: log the actual GPU memory peak after the
+        # first complete forward + backward + optimizer step cycle. Set to
+        # True by ``_train_epoch`` after the first optimizer step boundary,
+        # so the message fires once per ``Trainer.fit()`` call regardless
+        # of grad_accum_steps. CUDA-only (CPU/MPS skip the log).
+        self._first_step_mem_logged = False
         if tc.compile_mode != "none" and hasattr(torch, "compile"):
             triton_ok = True
             if device.type == "cuda":
@@ -773,6 +779,84 @@ class Trainer:
         return "float16"
 
     # ------------------------------------------------------------------
+    # Memory accounting
+    # ------------------------------------------------------------------
+    def _estimate_train_memory(self) -> Dict[str, float]:
+        """Static estimate of persistent training-side GPU memory (MiB).
+
+        Components accounted for:
+          * Model parameters (training storage dtype, typically fp32 even
+            under autocast — autocast casts on the fly and does NOT
+            change the master copy).
+          * Gradients (allocated lazily during the first backward(); same
+            dtype as params).
+          * Optimizer state. Multiplier per param is introspected from the
+            optimizer class:
+              - Adam / AdamW / RAdam / NAdam / Adamax: 2 fp32 tensors
+                per trainable param (exp_avg + exp_avg_sq).
+              - SGD: 1 fp32 tensor if any param group sets momentum>0,
+                else 0.
+              - Lion: 1 fp32 tensor per trainable param.
+              - Unknown adaptive optimizer: conservative 2x default.
+          * EMA shadow: full state_dict() clone (params + buffers, native
+            dtypes) when ``use_ema=true``.
+
+        Excluded (cannot be known without running forward):
+          * Activations / autograd saved tensors — depend on input shape,
+            patch size, AMP dtype, and checkpointing.
+          * cuDNN / cuBLAS workspace and allocator fragmentation.
+          * Dataloader staging tensors (host→device prefetch).
+
+        For the actual end-to-end peak (which includes everything above),
+        see the per-epoch ``GPU peak (epoch N): X MiB`` line emitted in
+        ``fit()``.
+        """
+        MIB = 1 << 20
+        params = list(self.model.parameters())
+
+        # Param storage — sum of numel*element_size to honor mixed dtypes
+        # (e.g. some buffers in fp16, BN in fp32 etc).
+        param_bytes = sum(p.numel() * p.element_size() for p in params)
+
+        # Gradients only allocated for trainable params; same dtype.
+        grad_bytes = sum(p.numel() * p.element_size()
+                         for p in params if p.requires_grad)
+
+        # Optimizer state introspection.
+        optim_name = type(self.optimizer).__name__
+        n_train = sum(p.numel() for p in params if p.requires_grad)
+        adam_family = {"Adam", "AdamW", "RAdam", "NAdam", "Adamax"}
+        if optim_name in adam_family:
+            optim_mult = 2
+        elif optim_name == "SGD":
+            has_momentum = any(g.get("momentum", 0) > 0
+                               for g in self.optimizer.param_groups)
+            optim_mult = 1 if has_momentum else 0
+        elif optim_name == "Lion":
+            optim_mult = 1
+        else:
+            optim_mult = 2  # conservative default
+        # Optimizer states are fp32 in PyTorch's default implementations.
+        optim_bytes = optim_mult * n_train * 4
+
+        # EMA shadow: state_dict() clone (covers params + buffers).
+        ema_bytes = 0
+        if self.ema is not None:
+            ema_bytes = sum(t.numel() * t.element_size()
+                            for t in self.ema.shadow.values())
+
+        persistent = param_bytes + grad_bytes + optim_bytes + ema_bytes
+        return {
+            "param_mib": param_bytes / MIB,
+            "grad_mib": grad_bytes / MIB,
+            "optim_mib": optim_bytes / MIB,
+            "optim_mult": optim_mult,
+            "optim_name": optim_name,
+            "ema_mib": ema_bytes / MIB,
+            "persistent_mib": persistent / MIB,
+        }
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def fit(self) -> Dict[str, float]:
@@ -784,6 +868,26 @@ class Trainer:
         logger.info("=" * 60)
         logger.info("Training: %d epochs, device=%s", tc.epochs, self.device)
         logger.info("Model params: %.2fM", total_params)
+        mem = self._estimate_train_memory()
+        ema_part = (f" + ema={mem['ema_mib']:.1f}"
+                    if mem["ema_mib"] > 0 else "")
+        logger.info(
+            "Static GPU mem (persistent, excl. activations): "
+            "param=%.1f + grad=%.1f + optim(%s,%dx)=%.1f%s "
+            "= %.1f MiB (real peak reported per-epoch as 'GPU peak')",
+            mem["param_mib"], mem["grad_mib"],
+            mem["optim_name"], mem["optim_mult"], mem["optim_mib"],
+            ema_part, mem["persistent_mib"],
+        )
+        if self.device.type == "cuda":
+            cur_alloc = torch.cuda.memory_allocated(self.device) / (1 << 20)
+            cur_reserv = torch.cuda.memory_reserved(self.device) / (1 << 20)
+            logger.info(
+                "CUDA mem at training start: allocated=%.1f MiB, "
+                "reserved=%.1f MiB (model already on device; "
+                "activations/workspace will add on top during forward).",
+                cur_alloc, cur_reserv,
+            )
         logger.info("Train batches: %d, Val batches: %d",
                     len(self.train_loader), len(self.val_loader))
         logger.info("AMP=%s (dtype=%s, resolved=%s, scaler=%s), "
@@ -1099,6 +1203,32 @@ class Trainer:
                 self.scheduler.step()
                 if self.ema is not None:
                     self.ema.update(self.model)
+
+                # One-shot real-memory diagnostic: after the FIRST complete
+                # optimizer-step cycle (i.e. ``accum`` micro-batches of
+                # forward+backward + 1 optimizer.step + EMA update), report
+                # the actual CUDA memory peak observed since the start of
+                # this epoch. This includes activations / autograd saved
+                # tensors / cuDNN+cuBLAS workspace / optimizer state — i.e.
+                # everything the static estimate explicitly excludes. Fires
+                # exactly once per ``Trainer.fit()`` call, before the user
+                # has to wait for the full epoch to finish to see the
+                # ``GPU peak (epoch N)`` line.
+                if (not self._first_step_mem_logged
+                        and self.device.type == "cuda"):
+                    one_step_peak = (
+                        torch.cuda.max_memory_allocated(self.device)
+                        / (1 << 20))
+                    logger.info(
+                        "Actual one-step GPU peak: %.1f MiB "
+                        "(forward + backward + optimizer.step + EMA "
+                        "update; accum=%d micro-batches). Steady-state "
+                        "training peak should stay close to this; the "
+                        "full-epoch peak is reported separately at end "
+                        "of each epoch as 'GPU peak (epoch N)'.",
+                        one_step_peak, accum,
+                    )
+                    self._first_step_mem_logged = True
 
             # --- Metrics (log unscaled loss)
             loss_val = (loss.item() * effective_accum

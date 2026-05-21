@@ -2,7 +2,7 @@
 
 Usage:
     # Predict every .nii / .nii.gz file under a folder (recursive):
-    python -m segtask_v1.predict --config configs/seg2_5d.yaml --checkpoint outputs/body/best_model.pth --input F:/BaiduNetdiskDownload/lung_nii --output F:/BaiduNetdiskDownload/body_pred
+    python -m segtask_v1.predict --config configs/seg2_5d.yaml --checkpoint outputs/lung_bone_convnext/best_model.pth --input F:/CT_data/airway_segment_data/nii --output F:/CT_data/airway_segment_data/lung_bone_pred
 
     # Predict a single file:
     python -m segtask_v1.predict --config configs/seg2_5d.yaml \

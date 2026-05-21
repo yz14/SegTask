@@ -18,12 +18,13 @@ data:
   # Source directories for NIfTI volumes. Image / label filenames must match.
   image_dir: "F:/BaiduNetdiskDownload/lung_nii"
   label_dir: "F:/BaiduNetdiskDownload/lung_bone"
-  bbox_dir : "F:/BaiduNetdiskDownload/bone_bbox"            # 可选：每样本一个nii掩码，与 image 同名
-  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"  # 可选：每样本一个nii权重，与 image 同名
+  bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"            # F:/BaiduNetdiskDownload/bone_bbox
+  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"  # 
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
   bbox_suffix : ".nii.gz"
   region_weight_suffix: ".nii.gz"
+  npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
 
   # Integer label values in the mask, ordered [bg, fg1, fg2, ...].
   # Empty list => auto-detect from all label files on first run.
@@ -116,7 +117,7 @@ data:
   # spatial sampling). 0.0 = 纯均匀；0.5 = 一半样本强制 fg 中心。
   # z_axis 模式：对应 z 切片前景过采样；cubic：3D 前景体素过采样；
   # whole 模式：此参数被忽略（无中心采样）。
-  foreground_oversample_ratio: 0.4
+  foreground_oversample_ratio: 0.3
 
   # Samples per volume per epoch（控制 epoch 长度）：
   #   epoch 内每卷产出多少个（位置/增广各异）的训练样本。
@@ -144,8 +145,8 @@ augment:
 
   # Affine = 旋转 + 缩放，合成在一次 grid_sample 中。
   random_affine_prob : 0.3
-  random_rotate_range: [-15.0, 15.0]     # 角度（degrees）
-  random_scale_range : [0.85, 1.15]      # 各向同性缩放因子
+  random_rotate_range: [-30.0, 30.0]     # 角度（degrees）
+  random_scale_range : [0.65, 1.25]      # 各向同性缩放因子
 
   # Elastic deformation（B-spline 随机位移场）
   # - sigma : 位移场的平滑度（粗网格间距）。推荐 3~7。
@@ -170,7 +171,7 @@ augment:
   random_gamma_range: [0.8, 1.2]        # gamma 校正指数
 
   gaussian_noise_prob: 0.2
-  gaussian_noise_std : 0.05
+  gaussian_noise_std : 0.1
 
   gaussian_blur_prob : 0.1
   gaussian_blur_sigma: [0.5, 1.5]       # 高斯核 sigma 随机范围
@@ -380,7 +381,7 @@ loss:
 # TRAIN — 训练循环 / 优化器 / 调度器 / 混合精度 / 检查点
 # =====================================================================
 train:
-  epochs: 100
+  epochs: 50
 
   # ---- Optimizer ------------------------------------------------------
   # optimizer: "adam" | "adamw" | "sgd"

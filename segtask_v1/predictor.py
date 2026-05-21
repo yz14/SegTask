@@ -30,8 +30,8 @@ from torch.amp import autocast
 
 from .config import Config
 from .data.dataset import (
-    load_nifti, preprocess_image, resize_3d, _extract_cubic_patch,
-    extract_z_patch_padded, compute_bbox_from_volume)
+    load_nifti, load_nifti_with_spacing, preprocess_image, resize_3d,
+    _extract_cubic_patch, extract_z_patch_padded, compute_bbox_from_volume)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,29 @@ class Predictor:
         self.tta_flip = pc.tta_flip
         self.threshold = pc.threshold
         self.save_probs = pc.save_probabilities
+
+        # ---- Z-axis interleaved 2.5D inference (TODO 1) ----------------
+        # Wraps the standard 2.5D z-sliding-window path: split the volume
+        # along z into ``k`` interleaved sub-volumes (stride k starting at
+        # offsets 0..k-1), run the existing ``_sliding_window_z`` on each
+        # independently, then weave the per-stream probabilities back into
+        # the original z indices. ``k`` is selected per volume from the
+        # physical z spacing (see ``_choose_interleave_factor``).
+        #
+        # Only activates for ``patch_mode == "2_5d"``; validated in
+        # ``Config.validate``. Defaults to a no-op for legacy configs.
+        self.z_interleave_enabled = bool(
+            getattr(pc, "z_interleave_enabled", False)
+            and cfg.data.patch_mode == "2_5d")
+        self.z_interleave_thresholds: List[float] = list(
+            getattr(pc, "z_interleave_thresholds", [1.0, 1.5]))
+        self.z_interleave_factors: List[int] = [
+            int(f) for f in getattr(pc, "z_interleave_factors", [3, 2, 1])]
+        if self.z_interleave_enabled:
+            logger.info(
+                "Predictor z_interleave_enabled=True (2.5D only): "
+                "thresholds=%s mm, factors=%s",
+                self.z_interleave_thresholds, self.z_interleave_factors)
 
         self.patch_mode = cfg.data.patch_mode
         self.patch_D, self.patch_H, self.patch_W = cfg.data.patch_size
@@ -252,9 +275,22 @@ class Predictor:
             spending compute on uninteresting regions of large CT scans.
         """
         dc = self.cfg.data
-        raw_vol = load_nifti(image_path)  # (D_orig, H_orig, W_orig)
+        # Only the z-interleave path needs physical z spacing; everywhere
+        # else we keep the long-standing ``load_nifti`` call so the legacy
+        # numerics are bit-identical.
+        if self.z_interleave_enabled:
+            raw_vol, z_spacing = load_nifti_with_spacing(image_path)
+        else:
+            raw_vol = load_nifti(image_path)
+            z_spacing = None
         D_orig, H_orig, W_orig = raw_vol.shape
-        logger.info("Loaded %s: shape=(%d, %d, %d)", image_path, D_orig, H_orig, W_orig)
+        if z_spacing is not None:
+            logger.info(
+                "Loaded %s: shape=(%d, %d, %d), z_spacing=%.4f mm",
+                image_path, D_orig, H_orig, W_orig, z_spacing)
+        else:
+            logger.info("Loaded %s: shape=(%d, %d, %d)",
+                        image_path, D_orig, H_orig, W_orig)
 
         # Optional ROI cropping. We keep the (offsets, full_shape) so the
         # cropped prediction can be spliced back into the original volume
@@ -289,6 +325,12 @@ class Predictor:
             prob_volume = self._whole_volume_forward(vol)
         elif self.patch_mode == "cubic":
             prob_volume = self._sliding_window_cubic(vol)
+        elif self.z_interleave_enabled:
+            # 2.5D z-interleaved path (TODO 1). ``z_spacing`` is set
+            # above for this branch; falls through to a normal k=1
+            # ``_sliding_window_z`` when the spacing rule selects k<=1.
+            prob_volume = self._sliding_window_z_interleaved(
+                vol, float(z_spacing))
         else:
             # "z_axis" or "2_5d" — same window geometry; see _forward_batch
             # for the 2.5D-specific squeeze + reshape.
@@ -311,6 +353,87 @@ class Predictor:
             self._save_predictions(image_path, label_map, prob_volume,
                                    output_dir)
         return result
+
+    # ==================================================================
+    # Z-axis sliding window — interleaved (TODO 1) wrapper
+    # ==================================================================
+    def _choose_interleave_factor(self, z_spacing: float) -> int:
+        """Pick interleave factor ``k`` from physical z spacing (mm).
+
+        The rule, parameterised by config:
+            ``z_interleave_thresholds = [t_1, ..., t_n]`` (ascending) and
+            ``z_interleave_factors = [f_1, ..., f_n, f_fallback]``
+            (length n+1) yields ``f_j`` for the first ``j`` with
+            ``z_spacing <= t_j``, else ``f_fallback``.
+
+        Returns ``k >= 1``. ``k == 1`` is the no-op fallback (caller is
+        expected to short-circuit straight into ``_sliding_window_z``).
+        """
+        thresholds = self.z_interleave_thresholds
+        factors = self.z_interleave_factors
+        for t, f in zip(thresholds, factors):
+            if z_spacing <= float(t):
+                return max(1, int(f))
+        return max(1, int(factors[-1]))
+
+    def _sliding_window_z_interleaved(
+        self, vol: np.ndarray, z_spacing: float,
+    ) -> np.ndarray:
+        """2.5D z-interleaved inference (TODO 1).
+
+        Splits ``vol`` (shape ``(D, H, W)``) into ``k`` disjoint
+        sub-volumes by stride-k slicing — ``vol[i::k]`` for
+        ``i = 0..k-1`` — runs the standard 2.5D z-sliding-window
+        inference on each, then weaves the per-stream
+        ``(num_fg, D_i, H, W)`` probabilities back into a single
+        ``(num_fg, D, H, W)`` output via ``out[:, i::k] = stream_i``.
+
+        Streams cover the full slice index set partition (∪_i
+        {i, i+k, i+2k, ...} = {0..D-1}, pairwise disjoint), so the
+        recombination is exact — no cross-stream weighting needed.
+
+        When the spacing-driven ``k == 1`` the call short-circuits to
+        the legacy single-stream path. This keeps a single dispatch
+        point in ``predict_volume`` without polluting hot paths with
+        the ``k == 1`` no-op overhead.
+        """
+        k = self._choose_interleave_factor(z_spacing)
+        if k <= 1:
+            logger.info(
+                "z-interleave: z_spacing=%.4f mm → k=1 (no split); "
+                "falling through to standard 2.5D z-sliding window.",
+                z_spacing)
+            return self._sliding_window_z(vol)
+
+        D, H, W = vol.shape
+        logger.info(
+            "z-interleave: z_spacing=%.4f mm → k=%d. Splitting volume "
+            "(D=%d) into %d disjoint stride-%d sub-streams; per-stream "
+            "depths=%s.",
+            z_spacing, k, D, k, k,
+            [int(np.ceil((D - i) / k)) for i in range(k)])
+
+        out = np.zeros((self.num_fg, D, H, W), dtype=np.float32)
+        for i in range(k):
+            # ``vol[i::k]`` is a view; copy to keep the rest of the
+            # pipeline (which expects a contiguous (D_i, H, W) array)
+            # safe against downstream in-place ops.
+            sub_vol = np.ascontiguousarray(vol[i::k])
+            sub_D = sub_vol.shape[0]
+            logger.info(
+                "  z-interleave stream %d/%d: indices=%d::%d, sub_D=%d",
+                i + 1, k, i, k, sub_D)
+            sub_prob = self._sliding_window_z(sub_vol)
+            # Strict shape check: defensive, helps catch any future
+            # change in ``_sliding_window_z`` that breaks the
+            # "output depth == input depth" contract.
+            if sub_prob.shape != (self.num_fg, sub_D, H, W):
+                raise RuntimeError(
+                    f"z-interleave stream {i}: expected sub-prob shape "
+                    f"({self.num_fg}, {sub_D}, {H}, {W}), got "
+                    f"{tuple(sub_prob.shape)}")
+            out[:, i::k, :, :] = sub_prob
+        return out
 
     # ==================================================================
     # Z-axis sliding window

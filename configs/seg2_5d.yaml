@@ -32,18 +32,25 @@
 # DATA
 # =====================================================================
 data:
-  # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
-  # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
-  # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
-  # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
-  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
-  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
-  bbox_dir : "F:/BaiduNetdiskDownload/bone_bbox"  # F:/CT_data/airway_segment_data/bone_bbox
-  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
   bbox_suffix : ".nii.gz"
   region_weight_suffix: ".nii.gz"
+  #### Just for test ####
+  # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
+  # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
+  # bbox_dir : "F:/med_data/Totalsegmentator_dataset_v201/small_data/bbox"
+  # region_weight_dir : "F:/med_data/Totalsegmentator_dataset_v201/small_data/region_weight"
+  # npz_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/npz"
+  #### Total Segmentator ####
+  # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
+  # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/lung"
+  # bbox_dir : "F:/med_data/Totalsegmentator_dataset_v201/bone"
+  #### Lung ####
+  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
+  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
+  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"
+  bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"  # F:/BaiduNetdiskDownload/bone_bbox
   npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
 
   # 排除无法被 SimpleITK 读取的样本（非正交 direction cosines 等）。
@@ -166,14 +173,15 @@ augment:
 # MODEL — 2D UNet (spatial_dims=2)
 # =====================================================================
 model:
-  backbone: "resnet"
+  backbone: "convnext"
 
   # 由 Config.sync() 自动设置；写在这里仅为可读性。
   spatial_dims: 2
 
   # 2D 模型显存友好，可加大通道数。
   encoder_channels: [32, 64, 128, 256, 256]
-  blocks_per_level: 2
+  encoder_blocks_per_stage: [3, 3, 9, 3, 3]    # 必须 == len(encoder_channels)
+  decoder_blocks_per_stage: [2, 2, 2, 2]       # 必须 == len(encoder_channels) - 1
   # 2.5D 折叠模式合法值："basic" | "preact" | "bottleneck"。
   # ``r2plus1d``（方案 A，因子化 (2+1)D 残差块）需要 spatial_dims=3，即 D
   # 仍是真实空间轴。要在 2.5D 数据流上启用方案 A，请同时打开下面的
@@ -344,7 +352,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir: "outputs/lung_bone"
+  output_dir: "outputs/lung_bone_convnext"
   save_every: 10
   save_best_metric: "mean_dice"
   save_best_mode: "max"
@@ -358,7 +366,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: "D:/codes/work-projects/SegTask/outputs/lung_bone/best_model.pth"
+  resume: "D:/codes/work-projects/SegTask/outputs/lung_bone_convnext/best_model.pth"
 
   # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
   # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。
@@ -373,6 +381,10 @@ train:
 #           TTA 仅翻转 H/W（D 是 channel 轴，翻转会破坏物理 slice 顺序）。
 # =====================================================================
 predict:
+  z_interleave_enabled: true
+  # 可选：覆盖默认阈值/因子
+  z_interleave_thresholds: [1.0, 1.5]
+  z_interleave_factors: [3, 2, 1]
   z_overlap : 0.5
   blend_mode: "gaussian"
   batch_size: 4

@@ -1039,9 +1039,27 @@ class SliceChannelLoss(nn.Module):
         BCE / Focal / Lovász are mathematically equivalent to per-slice
         because they are per-voxel-mean reductions over the same voxels.
 
-    The final scalar loss is averaged across all foreground classes;
-    ``class_weights`` from LossConfig still control the per-class outer
-    mean via the underlying base loss.
+    The final scalar loss is averaged across all foreground classes.
+
+    ``class_weights`` semantics
+    ---------------------------
+    The wrapper iterates per-class and feeds ``base_loss`` ONE channel at
+    a time (``pred_c``, ``target_c`` both with C=1). In that single-channel
+    regime the base loss's internal ``class_weights`` reduces to a no-op
+    (the cw factor cancels in numerator and denominator of the normalised
+    weighted mean), so a user-supplied ``cfg.loss.class_weights`` would
+    silently fail to take effect.
+
+    To honour the user's intent, the wrapper re-reads the SAME cw buffer
+    from ``base_loss`` at the wrapper level and combines the per-class
+    losses as a normalised weighted mean::
+
+        if cw is None: L = mean_c(L_c)              # = old behaviour
+        else:          L = sum_c(cw[c] * L_c) / sum(cw)
+
+    With ``cw == [1.0, 1.0]`` (the current shipped default) the weighted
+    formula collapses to the simple mean, so this fix is bit-equivalent to
+    the previous implementation in that case (regression-safe).
     """
 
     _VALID_REDUCTIONS = ("per_slice", "per_volume")
@@ -1067,6 +1085,21 @@ class SliceChannelLoss(nn.Module):
         self.label_values = label_values
         self.fg_values = label_values[1:]  # exclude background
         self.reduction = reduction
+
+        # ---- class_weights guard --------------------------------------
+        # The wrapper-level aggregator pulls ``class_weights`` from
+        # ``base_loss.class_weights`` at forward time (so device-moves
+        # follow the base loss naturally; no buffer duplication). Validate
+        # length here at construction so misconfigurations fail fast
+        # instead of silently producing wrong gradients.
+        cw_buf = getattr(base_loss, "class_weights", None)
+        if cw_buf is not None and cw_buf.numel() != num_fg_classes:
+            raise ValueError(
+                f"SliceChannelLoss: base_loss.class_weights has "
+                f"{cw_buf.numel()} entries but num_fg_classes="
+                f"{num_fg_classes}. Provide ``cfg.loss.class_weights`` "
+                f"with exactly num_fg_classes entries (one per foreground "
+                f"class).")
 
     # ------------------------------------------------------------------
     # Per-slice reshape helpers (rank-4 contract: (B*D, num_fg, H, W))
@@ -1180,6 +1213,32 @@ class SliceChannelLoss(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+    def _aggregate_per_class(
+        self, terms: List[torch.Tensor]) -> torch.Tensor:
+        """Combine the per-class scalar losses into the final scalar.
+
+        With ``base_loss.class_weights == None`` (or unset): simple mean
+        across classes — bit-identical to the legacy ``total / num_fg``.
+
+        With ``base_loss.class_weights = [w_0, ..., w_{C-1}]``: normalised
+        weighted mean ``Σ w_c · L_c / Σ w_c``. The denominator keeps the
+        loss magnitude comparable across cw choices (e.g. switching from
+        [1, 1] to [1, 2] does not double the loss scale, only redistributes
+        the per-class contributions).
+        """
+        if not terms:
+            # num_fg == 0 is rejected by Config.validate, but keep this
+            # branch so a degenerate construction returns a finite zero
+            # instead of crashing inside torch.stack on an empty list.
+            raise RuntimeError(
+                "SliceChannelLoss._aggregate_per_class got 0 terms")
+        stacked = torch.stack(terms)  # (num_fg,)
+        cw_buf = getattr(self.base_loss, "class_weights", None)
+        if cw_buf is None:
+            return stacked.mean()
+        cw = cw_buf.to(stacked.device).to(stacked.dtype)
+        return (stacked * cw).sum() / cw.sum().clamp(min=EPS)
+
     def forward(
         self,
         pred: torch.Tensor,
@@ -1197,13 +1256,13 @@ class SliceChannelLoss(nn.Module):
             # Dice/Tversky now reduce over (D, H, W) so empty slices
             # share a single window-level denominator with non-empty
             # slices and stop "winning" at zero loss.
-            total = pred.new_zeros(())
+            terms: List[torch.Tensor] = []
             for c in range(self.num_fg):
                 pred_c = pred_5d[:, c:c + 1]                 # (B, 1, D, H, W)
                 target_c = target_5d[:, c:c + 1]             # (B, 1, D, H, W)
-                total = total + self.base_loss(
-                    pred_c, target_c, weight_map=wm_5d)
-            return total / self.num_fg
+                terms.append(self.base_loss(
+                    pred_c, target_c, weight_map=wm_5d))
+            return self._aggregate_per_class(terms)
 
         # Default: per_slice (rank-4 contract, backward compatible).
         pred_flat = self._split_pred(pred)                  # (B*D, num_fg, H, W)
@@ -1214,12 +1273,13 @@ class SliceChannelLoss(nn.Module):
         # fg classes instead of resolution scales. We pass single-channel
         # binary tensors per class so that base_loss treats each as a
         # standalone 2D binary segmentation problem (rank-4 input).
-        total = pred.new_zeros(())
+        terms = []
         for c in range(self.num_fg):
             pred_c = pred_flat[:, c:c + 1]                  # (B*D, 1, H, W)
             target_c = target_flat[:, c:c + 1]              # (B*D, 1, H, W)
-            total = total + self.base_loss(pred_c, target_c, weight_map=wm_flat)
-        return total / self.num_fg
+            terms.append(
+                self.base_loss(pred_c, target_c, weight_map=wm_flat))
+        return self._aggregate_per_class(terms)
 
     def split_for_metrics(
         self, pred: torch.Tensor, label_raw: torch.Tensor,
