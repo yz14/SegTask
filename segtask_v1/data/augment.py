@@ -16,12 +16,15 @@ Intensity augmentations:
 Input shapes:
   image:      (B, 1, D, H, W) float32
   label:      (B, C, D, H, W) float32 binary or raw-integer masks
-  weight_map: (B, 1, D, H, W) float32, optional. Continuous per-voxel
-              loss weights (background = 1.0). Spatial transforms are
-              applied with the SAME parameters as image / label so they
-              stay aligned, but with **bilinear** interpolation
-              (instead of label's nearest) so hand-annotated weight
-              gradients are not quantised.
+  weight_map: (B, 1, D, H, W) float32, optional. Per-voxel loss weights
+              (background = 1.0). Spatial transforms are applied with the
+              SAME parameters as image / label so they stay aligned. The
+              interpolation mode for wmap is controlled by
+              ``AugConfig.wmap_interp_mode`` ("nearest" by default to
+              preserve discrete fg/bg integer weights — e.g. bg=1, fg=4 —
+              produced by ``compute_region_weight_map``; switch to
+              "bilinear" only when ``region_weight_dir`` ships continuous
+              hand-annotated gradients).
 """
 
 from __future__ import annotations
@@ -55,6 +58,19 @@ class GPUAugmentor:
         self.cfg = cfg
         self.enabled = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
+        # Resolve wmap interpolation mode once at construction.
+        # Only ``_random_affine`` and ``_elastic_deform`` actually touch
+        # wmap with an interpolation kernel; flips are exact, dropout
+        # / intensity transforms never operate on wmap. See
+        # ``AugConfig.wmap_interp_mode`` for the rationale behind the
+        # "nearest" default (preserves discrete fg/bg integer weights
+        # produced by ``compute_region_weight_map``).
+        wmode = getattr(cfg, "wmap_interp_mode", "nearest")
+        if wmode not in ("nearest", "bilinear"):
+            raise ValueError(
+                f"AugConfig.wmap_interp_mode={wmode!r}; expected "
+                "'nearest' or 'bilinear'.")
+        self.wmap_interp_mode = wmode
 
     def __call__(
         self, image: torch.Tensor, label: torch.Tensor,
@@ -85,14 +101,16 @@ class GPUAugmentor:
             weight_map=weight_map)
         image, label, weight_map = _random_affine(
             image, label, c.random_affine_prob, c.random_rotate_range,
-            c.random_scale_range, weight_map=weight_map)
+            c.random_scale_range, weight_map=weight_map,
+            wmap_mode=self.wmap_interp_mode)
         # BUG-E: divide alpha by max_scale so the LARGEST physical channel
         # receives at most `alpha` voxel-displacement. Smaller-scale channels
         # see proportionally less warp, which is the conservative choice.
         effective_alpha = c.elastic_deform_alpha / self.max_scale
         image, label, weight_map = _elastic_deform(
             image, label, c.elastic_deform_prob, c.elastic_deform_sigma,
-            effective_alpha, weight_map=weight_map)
+            effective_alpha, weight_map=weight_map,
+            wmap_mode=self.wmap_interp_mode)
         image, label, weight_map = _grid_dropout(
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
             c.grid_dropout_holes, weight_map=weight_map)
@@ -137,6 +155,7 @@ def _random_affine(
     image: torch.Tensor, label: torch.Tensor,
     prob: float, rotate_range: list, scale_range: list,
     weight_map: Optional[torch.Tensor] = None,
+    wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Per-sample random 3D affine (rotation around all axes + scale).
 
@@ -147,6 +166,24 @@ def _random_affine(
     ``weight_map`` (if provided) is resampled with the same grid using
     **bilinear** interpolation so continuous per-voxel weights are not
     quantised by the label-style nearest path.
+
+    Padding policy (BUG-1 fix): all three streams use
+    ``padding_mode="border"`` — replicate the boundary voxel for
+    out-of-bounds samples. Rationale:
+      * weight_map carries the +1 shift contract from the dataset
+        (bg=1.0, fg=w+1, see ``load_region_weight_volume``). Padding
+        with zeros silently ignored the loss in those voxels (weight=0)
+        — a hidden mask on the supervision signal that did NOT exist in
+        the un-augmented path. ``border`` preserves bg=1 in oversample
+        slack regions, matching the original loss weighting.
+      * Image/label staying on ``border`` keeps this transform internally
+        consistent with ``_elastic_deform`` (which has always used
+        border) so the two spatial transforms produce the same kind of
+        boundary artefact instead of two different ones.
+      * The ``aug_oversample_ratio`` cushion (typically 1.3–1.5) means
+        the model never trains on extrapolated tissue that touches the
+        center-cropped patch in the common case; border replication
+        only fills the to-be-cropped slack.
     """
     B, _, D, H, W = image.shape
     device = image.device
@@ -171,16 +208,20 @@ def _random_affine(
     # Apply to selected samples
     idx = mask.nonzero(as_tuple=True)[0]
     image[idx] = F.grid_sample(
-        image[idx], grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+        image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
 
     # Label: use nearest interpolation to preserve binary values
-    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="zeros", align_corners=False)
+    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
 
-    # Weight map (continuous): bilinear keeps hand-annotated gradients.
+    # Weight map: ``wmap_mode`` controls quantisation behaviour.
+    #   "nearest"  — preserves discrete fg/bg integer weights produced
+    #                by ``compute_region_weight_map`` (default).
+    #   "bilinear" — smooth resample for hand-annotated continuous
+    #                weights from ``region_weight_dir``.
     if weight_map is not None:
         weight_map[idx] = F.grid_sample(
-            weight_map[idx], grid, mode="bilinear",
-            padding_mode="zeros", align_corners=False)
+            weight_map[idx], grid, mode=wmap_mode,
+            padding_mode="border", align_corners=False)
 
     return image, label, weight_map
 
@@ -234,6 +275,7 @@ def _elastic_deform(
     image: torch.Tensor, label: torch.Tensor,
     prob: float, sigma: float, alpha: float,
     weight_map: Optional[torch.Tensor] = None,
+    wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Per-sample 3D elastic deformation via smooth random displacement field.
 
@@ -299,10 +341,10 @@ def _elastic_deform(
     # Apply to label (nearest to preserve discrete values)
     label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
 
-    # Weight map: bilinear (continuous) — see _random_affine docstring.
+    # Weight map: ``wmap_mode`` controls quantisation. See _random_affine.
     if weight_map is not None:
         weight_map[idx] = F.grid_sample(
-            weight_map[idx], grid, mode="bilinear",
+            weight_map[idx], grid, mode=wmap_mode,
             padding_mode="border", align_corners=False)
 
     return image, label, weight_map

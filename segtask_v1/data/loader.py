@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+SuffixSpec = Union[str, Sequence[str]]
 
 import numpy as np
 from torch.utils.data import DataLoader
@@ -58,7 +60,7 @@ def _load_exclude_pids(exclude_list: str) -> set:
 def _filter_by_exclude(
     image_paths: List[str],
     label_paths: List[str],
-    image_suffix: str,
+    image_suffix: SuffixSpec,
     exclude_pids: set) -> Tuple[List[str], List[str], List[int]]:
     """Drop pairs whose image stem is in ``exclude_pids``.
 
@@ -69,13 +71,13 @@ def _filter_by_exclude(
     if not exclude_pids:
         return image_paths, label_paths, list(range(len(image_paths)))
 
+    image_suffixes = _normalize_suffixes(image_suffix)
     keep_idx: List[int] = []
     dropped: List[str] = []
     for i, img_path in enumerate(image_paths):
         name = Path(img_path).name
-        if name.endswith(image_suffix):
-            base = name[: -len(image_suffix)]
-        else:
+        base = _strip_suffix(name, image_suffixes)
+        if base is None:
             base = Path(name).stem
         if base in exclude_pids:
             dropped.append(base)
@@ -94,47 +96,144 @@ def _filter_by_exclude(
     return image_paths, label_paths, keep_idx
 
 
+def _normalize_suffixes(suffix: SuffixSpec) -> List[str]:
+    """Normalize a suffix spec into a list of candidate suffixes.
+
+    Accepts either a single string (legacy contract) or a Sequence of
+    strings (relaxed matching). Empty entries are dropped; duplicates are
+    de-duplicated while preserving order so callers can express precedence
+    via the list order (first match wins downstream).
+    """
+    if isinstance(suffix, str):
+        items = [suffix]
+    else:
+        items = list(suffix)
+    out: List[str] = []
+    seen = set()
+    for s in items:
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    if not out:
+        raise ValueError(
+            "Suffix spec is empty; expected at least one non-empty string.")
+    return out
+
+
+def _strip_suffix(name: str, suffixes: Sequence[str]) -> Optional[str]:
+    """Return the base name with the first matching suffix removed, or
+    ``None`` if none of the candidate suffixes are present. Suffixes are
+    tested in the order given so callers control precedence."""
+    for sfx in suffixes:
+        if name.endswith(sfx):
+            return name[: -len(sfx)]
+    return None
+
+
 def discover_samples(
-    image_dir: str, label_dir: str, image_suffix: str=".nii.gz", label_suffix: str=".nii.gz") -> Tuple[List[str], List[str]]:
+    image_dir: str, label_dir: str,
+    image_suffix: SuffixSpec = ".nii.gz",
+    label_suffix: SuffixSpec = ".nii.gz",
+) -> Tuple[List[str], List[str]]:
     """Discover matched image-label pairs from directories.
 
+    Matching is done by *base name* (filename with the suffix stripped),
+    NOT by full filename. This relaxes the legacy strict-equality rule so
+    images and labels can use different naming conventions, e.g.
+    ``case01.nii.gz`` paired with ``case01-seg.nii.gz`` or
+    ``case01_pred.nii.gz`` simply by setting ``label_suffix`` to a list
+    such as ``[".nii.gz", "-seg.nii.gz", "_pred.nii.gz"]`` (first match
+    in list order wins per base name).
+
+    Both ``image_suffix`` and ``label_suffix`` accept either a single
+    string (legacy contract) or a sequence of strings. Backwards-
+    compatible: when both are single strings equal to one another the
+    behaviour matches the old by-filename intersection.
+
     Returns:
-        (image_paths, label_paths) sorted by filename.
+        (image_paths, label_paths) sorted by base name.
     """
     img_dir, lbl_dir = Path(image_dir), Path(label_dir)
     assert img_dir.is_dir(), f"Image dir not found: {img_dir}"
     assert lbl_dir.is_dir(), f"Label dir not found: {lbl_dir}"
 
-    img_files = {p.name: p for p in sorted(img_dir.glob(f"*{image_suffix}"))}
-    lbl_files = {p.name: p for p in sorted(lbl_dir.glob(f"*{label_suffix}"))}
+    image_suffixes = _normalize_suffixes(image_suffix)
+    label_suffixes = _normalize_suffixes(label_suffix)
 
-    # Match by filename
-    common = sorted(set(img_files.keys()) & set(lbl_files.keys()))
-    if not common:
+    # Enumerate images by any of the accepted image suffixes. When two
+    # files map to the same base, the earlier suffix in the list wins
+    # (matches `_strip_suffix`'s first-match-wins contract).
+    img_by_base: Dict[str, Path] = {}
+    for sfx in image_suffixes:
+        for p in sorted(img_dir.glob(f"*{sfx}")):
+            base = _strip_suffix(p.name, [sfx])
+            if base is None:
+                continue
+            img_by_base.setdefault(base, p)
+
+    # For each image base, take the first label candidate whose
+    # ``<base><suffix>`` file exists under lbl_dir, in suffix list order.
+    image_paths: List[str] = []
+    label_paths: List[str] = []
+    missing_bases: List[str] = []
+    for base in sorted(img_by_base.keys()):
+        chosen: Optional[Path] = None
+        for sfx in label_suffixes:
+            cand = lbl_dir / f"{base}{sfx}"
+            if cand.is_file():
+                chosen = cand
+                break
+        if chosen is None:
+            missing_bases.append(base)
+            continue
+        image_paths.append(str(img_by_base[base]))
+        label_paths.append(str(chosen))
+
+    if not image_paths:
         raise ValueError(
             f"No matched pairs found in {img_dir} and {lbl_dir}. "
-            f"Images: {len(img_files)}, Labels: {len(lbl_files)}")
+            f"Images: {len(img_by_base)} (suffixes={image_suffixes}), "
+            f"label_suffixes tried={label_suffixes}.")
 
-    image_paths = [str(img_files[n]) for n in common]
-    label_paths = [str(lbl_files[n]) for n in common]
-    logger.info("Found %d matched image-label pairs.", len(common))
+    if missing_bases:
+        head = ", ".join(missing_bases[:5])
+        more = f" ... (+{len(missing_bases) - 5} more)" \
+            if len(missing_bases) > 5 else ""
+        logger.warning(
+            "discover_samples: %d/%d image bases have no matching label "
+            "under %s for any of %s; dropping them. Missing bases: %s%s",
+            len(missing_bases), len(img_by_base), lbl_dir,
+            label_suffixes, head, more)
+
+    logger.info(
+        "Found %d matched image-label pairs (image_suffixes=%s, "
+        "label_suffixes=%s).",
+        len(image_paths), image_suffixes, label_suffixes)
     return image_paths, label_paths  # 匹配好的
 
 
 def _match_per_sample_paths(
     image_paths: List[str],
     src_dir: str,
-    image_suffix: str,
-    out_suffix: str,
+    image_suffix: SuffixSpec,
+    out_suffix: SuffixSpec,
     kind: str) -> List[str]:
     """Generic 1:1 per-sample file matcher by *base name*.
 
     Used by both ``match_bbox_paths`` and ``match_region_weight_paths``
-    — strips ``image_suffix`` from each image filename, appends
-    ``out_suffix``, and looks the result up under ``src_dir``. Missing
-    matches raise ``FileNotFoundError`` listing up to the first five
-    offenders (strong contract: silently dropping samples biases batch
-    statistics and hides data-layout bugs).
+    — strips ``image_suffix`` from each image filename, then tries each
+    candidate in ``out_suffix`` (in order) and uses the first existing
+    ``<base><candidate>`` under ``src_dir``. Both ``image_suffix`` and
+    ``out_suffix`` accept either a single string (legacy contract) or a
+    sequence of strings, enabling layouts like
+    ``bbox_suffix=[".nii.gz", "-seg.nii.gz", "_pred.nii.gz"]``.
+
+    Missing matches raise ``FileNotFoundError`` listing up to the first
+    five offenders (strong contract: silently dropping samples biases
+    batch statistics and hides data-layout bugs).
 
     ``kind`` is purely an English label used in log / error messages
     ("BBox", "RegionWeight", ...) so callers don't need to format their
@@ -143,21 +242,32 @@ def _match_per_sample_paths(
     sdir = Path(src_dir)
     assert sdir.is_dir(), f"{kind} dir not found: {sdir}"
 
+    image_suffixes = _normalize_suffixes(image_suffix)
+    out_suffixes = _normalize_suffixes(out_suffix)
+
     out: List[str] = []
     missing: List[str] = []
     for img_path in image_paths:
         name = Path(img_path).name
-        # Strip image_suffix to get the base name; tolerate names that
-        # don't end with the suffix (use stem as fallback).
-        if name.endswith(image_suffix):
-            base = name[: -len(image_suffix)]
-        else:
+        # Strip any of the accepted image suffixes to get the base name;
+        # tolerate names that don't end with any of them (fall back to
+        # `Path.stem` — single-extension only, matches legacy behaviour).
+        base = _strip_suffix(name, image_suffixes)
+        if base is None:
             base = Path(name).stem
-        cand = sdir / f"{base}{out_suffix}"
-        if not cand.is_file():
-            missing.append(str(cand))
+        chosen: Optional[Path] = None
+        for sfx in out_suffixes:
+            cand = sdir / f"{base}{sfx}"
+            if cand.is_file():
+                chosen = cand
+                break
+        if chosen is None:
+            # Report all attempted candidates so users can see which
+            # suffixes were tried for the offending base.
+            attempts = ", ".join(f"{base}{sfx}" for sfx in out_suffixes)
+            missing.append(f"{sdir}/[{attempts}]")
         else:
-            out.append(str(cand))
+            out.append(str(chosen))
 
     if missing:
         # Show only the first few to keep the message readable.
@@ -165,20 +275,24 @@ def _match_per_sample_paths(
         more = f"\n  ... ({len(missing) - 5} more)" if len(missing) > 5 else ""
         raise FileNotFoundError(
             f"{kind} files not found for {len(missing)}/{len(image_paths)} "
-            f"samples under {sdir}:\n  {head}{more}")
+            f"samples (suffixes tried={out_suffixes}):\n  {head}{more}")
 
-    logger.info("Matched %d %s files under %s.", len(out), kind.lower(), sdir)
+    logger.info(
+        "Matched %d %s files under %s (suffixes=%s).",
+        len(out), kind.lower(), sdir, out_suffixes)
     return out
 
 
 def match_bbox_paths(
     image_paths: List[str],
     bbox_dir: str,
-    image_suffix: str,
-    bbox_suffix: str) -> List[str]:
+    image_suffix: SuffixSpec,
+    bbox_suffix: SuffixSpec) -> List[str]:
     """Resolve a per-sample list of ROI bbox NIfTI files matched 1:1 to
     ``image_paths`` by *base name* (i.e. filename with the image suffix
-    stripped, then `bbox_suffix` appended).
+    stripped, then `bbox_suffix` appended). Both suffix args accept a
+    single string or a sequence of strings; the first existing
+    ``<base><sfx>`` file under ``bbox_dir`` is taken per sample.
 
     Errors out (rather than silently dropping samples) if any image
     lacks a matching bbox file — a missing bbox means we'd fall back
@@ -192,11 +306,13 @@ def match_bbox_paths(
 def match_region_weight_paths(
     image_paths: List[str],
     region_weight_dir: str,
-    image_suffix: str,
-    region_weight_suffix: str) -> List[str]:
+    image_suffix: SuffixSpec,
+    region_weight_suffix: SuffixSpec) -> List[str]:
     """Resolve a per-sample list of region-weight NIfTI files matched 1:1
     to ``image_paths`` by *base name* (image suffix stripped, then
-    ``region_weight_suffix`` appended).
+    ``region_weight_suffix`` appended). Both suffix args accept a single
+    string or a sequence of strings; the first existing candidate per
+    sample is taken.
 
     Strong contract: every sample must have a matching file
     (FileNotFoundError otherwise), mirroring ``match_bbox_paths``. See

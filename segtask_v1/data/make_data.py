@@ -148,11 +148,20 @@ _DEFAULT_FG_SUBSAMPLE = 50_000
 # =============================================================================
 # Per-sample worker
 # =============================================================================
-def _stem(path: str, suffix: str) -> str:
-    """Return ``filename - suffix`` (or stem if suffix doesn't match)."""
+def _stem(path: str, suffix) -> str:
+    """Return ``filename - suffix`` (or single-extension stem if no
+    suffix matches). ``suffix`` accepts either a string or a sequence of
+    candidate suffixes — the first one whose `name.endswith` matches
+    wins. This mirrors the relaxed pairing rule in
+    :mod:`segtask_v1.data.loader`, so a single ``pid`` is computed
+    consistently across the make/train code paths even when images use
+    suffixes like ``.nii``, ``.nii.gz`` or custom variants.
+    """
     name = Path(path).name
-    if name.endswith(suffix):
-        return name[: -len(suffix)]
+    suffixes = [suffix] if isinstance(suffix, str) else list(suffix)
+    for sfx in suffixes:
+        if sfx and name.endswith(sfx):
+            return name[: -len(sfx)]
     return Path(name).stem
 
 

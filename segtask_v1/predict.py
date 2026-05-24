@@ -48,12 +48,16 @@ def main():
     parser = argparse.ArgumentParser(description="3D Segmentation Inference")
     parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config (use the same one as training)")
-    parser.add_argument("--checkpoint", "--ckpt", type=str, required=True,
-                        help="Path to trained checkpoint, e.g. outputs/best_model.pth")
-    parser.add_argument("--input", type=str, required=True,
-                        help="A NIfTI file OR a directory containing .nii/.nii.gz")
+    parser.add_argument("--checkpoint", "--ckpt", type=str, default=None,
+                        help="Path to trained checkpoint. Defaults to "
+                             "<cfg.train.output_dir>/best_model.pth.")
+    parser.add_argument("--input", type=str, default=None,
+                        help="A NIfTI file OR a directory containing .nii/.nii.gz. "
+                             "Defaults to cfg.data.image_dir.")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output directory (overrides cfg.predict.output_dir)")
+                        help="Output directory (overrides cfg.predict.output_dir). "
+                             "Defaults to <parent_of_image_dir>/<task_name>_pred, "
+                             "where task_name = basename(cfg.train.output_dir).")
     parser.add_argument("--bbox", type=str, default=None,
                         help="Optional ROI bbox NIfTI mask. Either a single "
                              "file (when --input is one file) or a directory "
@@ -63,6 +67,14 @@ def main():
     parser.add_argument("--weights", choices=["auto", "ema", "online"],
                         default="auto",
                         help="Which weights to load from checkpoint")
+    parser.add_argument("--precision",
+                        choices=["auto", "fp32", "bf16", "fp16"],
+                        default="auto",
+                        help="Inference precision. 'auto' (default) follows "
+                             "cfg.train.amp_dtype: bfloat16 unless training "
+                             "explicitly used fp16. 'fp16' is the legacy "
+                             "model.half() cast — known to produce NaN with "
+                             "ConvNeXt LayerNorm on CT background.")
     parser.add_argument("--save-probs", action="store_true",
                         help="Also save per-class sigmoid probability maps")
     parser.add_argument("--no-recursive", action="store_true",
@@ -78,8 +90,38 @@ def main():
         cfg.sync()
         cfg.validate()
 
+    # ------------------------------------------------------------------
+    # Resolve defaults for --checkpoint / --input / --output when omitted.
+    #   * checkpoint -> <cfg.train.output_dir>/best_model.pth
+    #   * input      -> cfg.data.image_dir
+    #   * output     -> <parent_of_image_dir>/<task_name>_pred, where
+    #                   task_name = basename(cfg.train.output_dir)
+    # ------------------------------------------------------------------
+    checkpoint_path = args.checkpoint
+    if not checkpoint_path:
+        train_out = getattr(cfg.train, "output_dir", "") or ""
+        if not train_out:
+            parser.error("--checkpoint not given and cfg.train.output_dir is empty.")
+        checkpoint_path = str(Path(train_out) / "best_model.pth")
+
+    input_path = args.input
+    if not input_path:
+        input_path = getattr(cfg.data, "image_dir", "") or ""
+        if not input_path:
+            parser.error("--input not given and cfg.data.image_dir is empty.")
+
     if args.output:
         cfg.predict.output_dir = args.output
+    else:
+        train_out = getattr(cfg.train, "output_dir", "") or ""
+        if not train_out:
+            parser.error("--output not given and cfg.train.output_dir is empty; "
+                         "cannot derive task name for default output dir.")
+        task_name = Path(train_out).name
+        # Sibling of the image source: parent dir of the input file/folder.
+        base_dir = Path(input_path).parent
+        cfg.predict.output_dir = str(base_dir / f"{task_name}_pred")
+
     if args.save_probs:
         cfg.predict.save_probabilities = True
 
@@ -87,9 +129,9 @@ def main():
     setup_logging(cfg.predict.output_dir, args.log_level)
     logger = logging.getLogger(__name__)
 
-    image_paths = _gather_nifti(args.input, recursive=not args.no_recursive)
-    logger.info("Found %d NIfTI file(s) under %s", len(image_paths), args.input)
-    logger.info("Checkpoint: %s (variant=%s)", args.checkpoint, args.weights)
+    image_paths = _gather_nifti(input_path, recursive=not args.no_recursive)
+    logger.info("Found %d NIfTI file(s) under %s", len(image_paths), input_path)
+    logger.info("Checkpoint: %s (variant=%s)", checkpoint_path, args.weights)
     logger.info("Output dir: %s", cfg.predict.output_dir)
 
     # Resolve bbox source priority: explicit --bbox > cfg.data.bbox_dir.
@@ -101,10 +143,11 @@ def main():
 
     run_inference(
         cfg=cfg,
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint_path,
         image_paths=image_paths,
         weight_variant=args.weights,
         bbox_paths=bbox_paths,
+        precision=args.precision,
     )
 
 

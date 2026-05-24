@@ -221,12 +221,43 @@ class Predictor:
         self.use_amp = (
             getattr(cfg.train, "use_amp", True) and device.type == "cuda")
 
+        # ---- Inference dtype --------------------------------------------
+        # ``run_inference`` casts the loaded model to ``.half()`` on CUDA
+        # so that all weights (and therefore all per-window inputs) run in
+        # float16 end-to-end. We detect that here and:
+        #   * record ``self.model_dtype`` so every forward call site can
+        #     cast the input batch to the same dtype before
+        #     ``self.model(x)`` (mixed-dtype matmul would otherwise raise);
+        #   * disable autocast when the model is already in fp16/bf16 —
+        #     wrapping a pure-half model in autocast has no benefit and
+        #     can fight with norm layers' internal fp32 accumulators.
+        # When ``run_inference`` keeps the model in fp32 (e.g. CPU), this
+        # falls back to the legacy AMP path with no behavioural change.
+        try:
+            self.model_dtype = next(model.parameters()).dtype
+        except StopIteration:
+            self.model_dtype = torch.float32
+        if self.model_dtype in (torch.float16, torch.bfloat16):
+            if self.use_amp:
+                logger.info(
+                    "Predictor: model weights are in %s — disabling autocast "
+                    "(inputs will be cast to %s before each forward).",
+                    self.model_dtype, self.model_dtype)
+            self.use_amp = False
+
         # Pad value for volume-edge patches. Zeros after normalization is
         # *not* a safe default (for z-score CT, "air" sits near -mean/std,
         # not 0). If the config doesn't specify, fall back to the volume's
         # per-patch edge (handled via `np.pad(mode="edge")` below).
         self.pad_value: Optional[float] = getattr(
             cfg.data, "pad_value", None)
+
+        # TODO-5 diagnostic: per-volume "first batch logged" guard. Reset
+        # at the top of every ``predict_volume`` and consumed by
+        # ``_forward_batch_gpu`` / ``_forward_batch`` so that EXACTLY one
+        # batch per volume produces a logits/sigmoid stat block. Avoids
+        # log spam while still letting us inspect every input volume.
+        self._diag_first_batch_logged: bool = True
 
         # Contract: channels ↔ label_values[1:]
         if len(self.label_values) - 1 != self.num_fg:
@@ -321,6 +352,28 @@ class Predictor:
             raw_vol, dc.intensity_min, dc.intensity_max,
             dc.normalize, dc.global_mean, dc.global_std)
 
+        # ---- TODO-5 diagnostic: normalized input stats -----------------
+        # If normalization differs from training (e.g. CT HU range mis-
+        # configured), the normalized volume's range / percentiles will
+        # be obviously off. Logged once per volume, very cheap.
+        try:
+            _v = vol
+            _vmin = float(_v.min()); _vmax = float(_v.max())
+            _vmean = float(_v.mean()); _vstd = float(_v.std())
+            _q = np.quantile(_v, [0.01, 0.5, 0.99])
+            logger.info(
+                "[diag] normalized input: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, std=%.4f, q1=%.4f, q50=%.4f, q99=%.4f "
+                "(normalize=%s, intensity=[%.1f,%.1f])",
+                tuple(_v.shape), _vmin, _vmax, _vmean, _vstd,
+                float(_q[0]), float(_q[1]), float(_q[2]),
+                dc.normalize, float(dc.intensity_min), float(dc.intensity_max))
+        except Exception as _e:
+            logger.warning("[diag] normalized-input stat failed: %s", _e)
+        # Reset per-volume "first batch already logged" flag so the
+        # forward path emits one logits/probability stat block per volume.
+        self._diag_first_batch_logged = False
+
         if self.patch_mode == "whole":
             prob_volume = self._whole_volume_forward(vol)
         elif self.patch_mode == "cubic":
@@ -335,6 +388,36 @@ class Predictor:
             # "z_axis" or "2_5d" — same window geometry; see _forward_batch
             # for the 2.5D-specific squeeze + reshape.
             prob_volume = self._sliding_window_z(vol)
+
+        # ---- TODO-5 diagnostic: blended probability stats --------------
+        # Run BEFORE bbox-splicing so zero-padding outside ROI does not
+        # bias the percentages. ``frac_gt_thr`` == fraction of in-ROI
+        # voxels classified as foreground; ~1.0 reproduces "all 1"
+        # symptom and points at the model itself, not post-processing.
+        try:
+            _pv = prob_volume  # (num_fg, D, H, W) inside-ROI only
+            _max_per_vox = _pv.max(axis=0)
+            _frac_gt_thr = float((_max_per_vox >= self.threshold).mean())
+            _q = np.quantile(_pv, [0.5, 0.9, 0.99, 0.999])
+            logger.info(
+                "[diag] in-ROI prob volume: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, q50=%.4f, q90=%.4f, q99=%.4f, q999=%.4f, "
+                "frac(max_prob>=%.2f)=%.4f",
+                tuple(_pv.shape), float(_pv.min()), float(_pv.max()),
+                float(_pv.mean()), float(_q[0]), float(_q[1]),
+                float(_q[2]), float(_q[3]), self.threshold, _frac_gt_thr)
+            if _frac_gt_thr > 0.95:
+                logger.warning(
+                    "[diag] %.1f%% of in-ROI voxels exceed threshold — "
+                    "the model itself is outputting near-saturated "
+                    "foreground; this is a TRAINING-side issue (most "
+                    "likely: training bbox/label semantics differ from "
+                    "this run, OR region weights drove the model to a "
+                    "trivial 'all-fg' minimum). Re-check cfg.data.bbox_dir, "
+                    "label_dir and region_weight_dir USED ON THE SERVER.",
+                    100.0 * _frac_gt_thr)
+        except Exception as _e:
+            logger.warning("[diag] prob-volume stat failed: %s", _e)
 
         # Splice the cropped prediction back to the original volume's
         # spatial extent so the saved NIfTI shares the source image's
@@ -813,7 +896,7 @@ class Predictor:
                         f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
                 with autocast(device_type="cuda", enabled=self.use_amp,
                               dtype=self.amp_dtype):
-                    pred = self.model(x)
+                    pred = self.model(x.to(self.model_dtype))
                     if isinstance(pred, list):
                         pred = pred[0]
                     if pred.shape[1] < self.num_fg:
@@ -822,6 +905,8 @@ class Predictor:
                             f"channels at dim 1; expected at least "
                             f"num_fg={self.num_fg}.")
                     prob = torch.sigmoid(pred.float())[:, :self.num_fg]
+                    self._diag_log_first_batch(
+                        "2.5D lift", x, pred[:, :self.num_fg], prob)
                     if self.tta_flip:
                         prob = self._tta_flip_ensemble(x, prob)
                 return prob
@@ -845,7 +930,7 @@ class Predictor:
             B, _, H, W = x_2d.shape
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):
-                pred = self.model(x_2d)
+                pred = self.model(x_2d.to(self.model_dtype))
                 if isinstance(pred, list):
                     pred = pred[0]
                 expected_c = self.num_fg * D
@@ -855,22 +940,111 @@ class Predictor:
                         f"num_fg*D = {self.num_fg}*{D} = {expected_c}")
                 pred_5d = pred.reshape(B, self.num_fg, D, H, W)
                 prob = torch.sigmoid(pred_5d.float())
+                self._diag_log_first_batch(
+                    "2.5D folded", x_2d, pred_5d, prob)
                 if self.tta_flip:
                     prob = self._tta_flip_ensemble_2_5d(x_2d, prob)
             return prob
 
         with autocast(device_type="cuda", enabled=self.use_amp,
                       dtype=self.amp_dtype):
-            pred = self.model(x)
+            pred = self.model(x.to(self.model_dtype))
             if isinstance(pred, list):
                 pred = pred[0]
             assert pred.shape[1] >= self.num_fg, (
                 f"Model output has {pred.shape[1]} channels; "
                 f"expected at least num_fg={self.num_fg} at 1x resolution.")
             prob = torch.sigmoid(pred.float())[:, :self.num_fg]
+            self._diag_log_first_batch(
+                "3D", x, pred[:, :self.num_fg], prob)
             if self.tta_flip:
                 prob = self._tta_flip_ensemble(x, prob)
         return prob
+
+    @torch.no_grad()
+    def _diag_log_first_batch(
+        self, tag: str,
+        x: torch.Tensor,
+        logits: torch.Tensor,
+        prob: torch.Tensor,
+    ) -> None:
+        """Emit a one-shot per-volume diagnostic block (TODO-5).
+
+        Logs descriptive stats for:
+          * the model input batch (post-normalize, post-window-build);
+          * the raw logits at the main head (pre-sigmoid);
+          * the post-sigmoid probabilities and the fraction of voxels
+            already exceeding ``self.threshold`` BEFORE any sliding-
+            window blending.
+
+        These three signals jointly distinguish "model genuinely
+        outputs near-saturated foreground" (logits >> +5,
+        sigmoid≈1.0, frac≈1.0 — points at training data / loss
+        regime) from "blending or post-processing collapses to 1"
+        (logits sane, frac small here but final label still all-1 —
+        points at the predictor pipeline).
+        """
+        if self._diag_first_batch_logged:
+            return
+        self._diag_first_batch_logged = True
+
+        def _q3(t: torch.Tensor, qs):
+            """``torch.quantile`` rejects tensors with > ~1.6e7 elements
+            on CUDA; we sub-sample uniformly so the diagnostic stays
+            cheap and never raises on big batches.
+
+            Implementation note: integer stride slicing (no
+            ``torch.linspace(...).long()``) — float32 ``linspace`` can
+            produce indices == n for n > 2^24 due to rounding, which
+            then triggers a CUDA index-out-of-bounds assert.
+            """
+            flat = t.detach().float().flatten()
+            n = flat.numel()
+            cap = 1_000_000
+            if n > cap:
+                stride = max(1, n // cap)
+                flat = flat[::stride]
+            qs_t = torch.tensor(qs, device=flat.device, dtype=flat.dtype)
+            return torch.quantile(flat, qs_t).cpu().tolist()
+
+        try:
+            xs = x.detach().float()
+            ls = logits.detach().float()
+            ps = prob.detach().float()
+            xq = _q3(xs, [0.01, 0.5, 0.99])
+            lq = _q3(ls, [0.01, 0.5, 0.99])
+            pq = _q3(ps, [0.5, 0.9, 0.99])
+            n_nan_logits = int(torch.isnan(ls).sum().item())
+            n_nan_prob = int(torch.isnan(ps).sum().item())
+            frac_thr = float((ps >= self.threshold).float().mean().item())
+            logger.info(
+                "[diag/forward %s] input: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, q1=%.4f, q50=%.4f, q99=%.4f",
+                tag, tuple(xs.shape),
+                float(xs.min()), float(xs.max()), float(xs.mean()),
+                float(xq[0]), float(xq[1]), float(xq[2]))
+            logger.info(
+                "[diag/forward %s] logits: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, q1=%.4f, q50=%.4f, q99=%.4f, n_nan=%d",
+                tag, tuple(ls.shape),
+                float(ls.min()), float(ls.max()), float(ls.mean()),
+                float(lq[0]), float(lq[1]), float(lq[2]), n_nan_logits)
+            logger.info(
+                "[diag/forward %s] sigmoid: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, q50=%.4f, q90=%.4f, q99=%.4f, "
+                "frac(prob>=%.2f)=%.4f, n_nan=%d",
+                tag, tuple(ps.shape),
+                float(ps.min()), float(ps.max()), float(ps.mean()),
+                float(pq[0]), float(pq[1]), float(pq[2]),
+                self.threshold, frac_thr, n_nan_prob)
+            if n_nan_logits > 0 or n_nan_prob > 0:
+                logger.error(
+                    "[diag/forward %s] NaN detected (logits=%d, prob=%d). "
+                    "This is the root cause of the 'all-foreground' "
+                    "predictions — re-run with '--precision bf16'.",
+                    tag, n_nan_logits, n_nan_prob)
+        except Exception as _e:
+            logger.warning("[diag/forward %s] stat failed: %s", tag, _e)
 
     def _build_z_window_input(
         self, vol: np.ndarray, z0: int, z1: int) -> np.ndarray:
@@ -1213,7 +1387,7 @@ class Predictor:
         autocast_ctx = autocast(
             device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype)
         with autocast_ctx:
-            pred = self.model(x)
+            pred = self.model(x.to(self.model_dtype))
             if isinstance(pred, list):
                 pred = pred[0]
             assert pred.shape[1] >= self.num_fg, (
@@ -1255,7 +1429,7 @@ class Predictor:
                 device_type="cuda", enabled=self.use_amp,
                 dtype=self.amp_dtype)
             with autocast_ctx:
-                pred = self.model(x)
+                pred = self.model(x.to(self.model_dtype))
                 if isinstance(pred, list):
                     pred = pred[0]
                 if pred.shape[1] < self.num_fg:
@@ -1274,7 +1448,7 @@ class Predictor:
         autocast_ctx = autocast(
             device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype)
         with autocast_ctx:
-            pred = self.model(x_2d)
+            pred = self.model(x_2d.to(self.model_dtype))
             if isinstance(pred, list):
                 pred = pred[0]
             expected_c = self.num_fg * D
@@ -1328,7 +1502,7 @@ class Predictor:
         count = 1.0
         for flip_dims in ([2], [3], [4], [2, 3], [2, 4], [3, 4], [2, 3, 4]):
             x_flip = torch.flip(x, flip_dims)
-            pred_flip = self.model(x_flip)
+            pred_flip = self.model(x_flip.to(self.model_dtype))
             if isinstance(pred_flip, list):
                 pred_flip = pred_flip[0]
             prob_flip = torch.sigmoid(pred_flip.float())[:, :self.num_fg]
@@ -1370,7 +1544,7 @@ class Predictor:
             ([2, 3], [3, 4])  # H + W
         ):
             x_flip = torch.flip(x_2d, flip_x_dims)
-            pred_flip = self.model(x_flip)
+            pred_flip = self.model(x_flip.to(self.model_dtype))
             if isinstance(pred_flip, list):
                 pred_flip = pred_flip[0]
             # (B, num_fg*D, H, W) → (B, num_fg, D, H, W)
@@ -1433,15 +1607,40 @@ class Predictor:
         Channel `c` of `prob_volume` corresponds to `label_values[c + 1]`.
         For each voxel: if max fg-probability > threshold, assign the
         winning class's label value; otherwise, background.
+
+        NaN handling: any NaN voxel is forced to background. Without
+        this, ``np.nan < threshold`` evaluates to ``False`` and the
+        threshold filter silently fails — a model that produces NaN
+        (e.g. fp16 LayerNorm overflow on near-constant CT background)
+        would otherwise collapse to "all foreground" everywhere. We
+        also log a single ERROR per call so the failure is loud.
         """
         bg_val = self.label_values[0]
         fg_values = np.array(self.label_values[1:], dtype=np.int64)
         assert len(fg_values) == self.num_fg
 
+        nan_mask = np.isnan(prob_volume).any(axis=0)  # (D, H, W)
+        n_nan = int(nan_mask.sum())
+        if n_nan > 0:
+            total = int(nan_mask.size)
+            logger.error(
+                "_prob_to_label: %d/%d voxels (%.2f%%) contain NaN "
+                "probabilities — forcing to background. Root cause is "
+                "almost always fp16 forward overflow; rerun inference "
+                "with '--precision bf16' (or 'fp32').",
+                n_nan, total, 100.0 * n_nan / max(1, total))
+
+        # Replace NaN with -inf so ``argmax`` / ``max`` ignore them; the
+        # nan_mask below then forces those voxels to background regardless.
+        if n_nan > 0:
+            prob_volume = np.where(np.isnan(prob_volume),
+                                   np.float32(-np.inf), prob_volume)
         max_prob = prob_volume.max(axis=0)            # (D, H, W)
         max_class = prob_volume.argmax(axis=0)        # (D, H, W)
         label_map = fg_values[max_class]
         label_map[max_prob < self.threshold] = bg_val
+        if n_nan > 0:
+            label_map[nan_mask] = bg_val
 
         # Pick the smallest signed int dtype that fits every label.
         max_abs = int(max(abs(v) for v in self.label_values))
@@ -1569,12 +1768,42 @@ def _select_state_dict(
     return primary, "online"
 
 
+_PRECISION_CHOICES = ("auto", "fp32", "bf16", "fp16")
+
+
+def _resolve_inference_precision(precision: str, cfg: Config) -> str:
+    """Pick the inference dtype.
+
+    ``auto`` (default) follows the trainer's effective AMP dtype, which
+    keeps inference numerics in lockstep with training:
+      * ``cfg.train.amp_dtype in {"bfloat16","bf16"}`` → ``bf16``
+      * ``"float16"/"fp16"``                          → ``fp16``
+      * anything else (incl. ``"auto"`` placeholder)  → ``bf16``
+
+    The legacy default was an unconditional ``.half()`` cast which on
+    LayerNorm-heavy backbones (ConvNeXt) overflows to NaN inside the
+    norm's variance computation when patches contain large constant
+    regions (CT background). We preserve fp16 as an opt-in only.
+    """
+    p = precision.lower()
+    if p not in _PRECISION_CHOICES:
+        raise ValueError(
+            f"precision={precision!r} not in {_PRECISION_CHOICES}")
+    if p != "auto":
+        return p
+    amp = (getattr(cfg.train, "amp_dtype", "bfloat16") or "bfloat16").lower()
+    if amp in ("float16", "fp16"):
+        return "fp16"
+    return "bf16"
+
+
 def run_inference(
     cfg: Config,
     checkpoint_path: str,
     image_paths: List[str],
     weight_variant: str = "auto",
     bbox_paths: Optional[List[str]] = None,
+    precision: str = "auto",
 ) -> None:
     """Run inference on a list of images using a trained model.
 
@@ -1588,6 +1817,12 @@ def run_inference(
             inside the bbox and the output is written back into the full
             volume's coordinate system. Pass ``None`` (default) to keep
             full-volume inference.
+        precision: ``auto`` (mirrors training AMP, default), ``fp32``
+            (full-precision weights, no autocast), ``bf16`` (fp32 weights
+            with bfloat16 autocast — same regime as training under
+            ``amp_dtype=bfloat16``), or ``fp16`` (legacy: cast model to
+            half. Known to produce NaN with ConvNeXt LayerNorm on CT
+            background, kept only for backwards-compat).
     """
     if bbox_paths is not None and len(bbox_paths) != len(image_paths):
         raise ValueError(
@@ -1624,6 +1859,28 @@ def run_inference(
             f"random weights. Unexpected keys: {unexpected[:8]}")
 
     model = model.to(device).eval()
+    # Inference precision: ``auto`` mirrors the trainer's amp_dtype.
+    # Default routes to bfloat16 autocast (same regime as training under
+    # cfg.train.amp_dtype=bfloat16) — fp32 weights, bf16 activations.
+    # The legacy ``model.half()`` path is preserved only when explicitly
+    # requested via ``precision='fp16'`` because ConvNeXt LayerNorm
+    # produces NaN on CT background patches in fp16 (see
+    # ``_resolve_inference_precision``).
+    resolved_precision = _resolve_inference_precision(precision, cfg)
+    if device.type == "cuda" and resolved_precision == "fp16":
+        model = model.half()
+        logger.info(
+            "Inference precision: fp16 (model cast to float16; device=%s). "
+            "WARNING: fp16 + LayerNorm backbones can overflow on near-"
+            "constant patches and produce NaN — prefer 'bf16' or 'fp32' "
+            "if you see NaN-driven 'all foreground' predictions.",
+            device)
+    else:
+        logger.info(
+            "Inference precision: %s (model in fp32; autocast=%s; device=%s).",
+            resolved_precision,
+            resolved_precision if resolved_precision in ("bf16", "fp16") else "off",
+            device)
     logger.info("Model loaded from %s (variant=%s)", checkpoint_path, label)
 
     predictor = Predictor(model, cfg, device)

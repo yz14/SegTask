@@ -631,8 +631,11 @@ class Trainer:
         # The augmentor applies spatial transforms jointly to image,
         # label, and (optionally) weight_map so alignment holds. label
         # uses nearest-neighbour interpolation (preserves discrete
-        # values); weight_map uses bilinear (preserves continuous,
-        # hand-annotated per-voxel weight gradients).
+        # values); weight_map's interpolation is selected by
+        # ``cfg.augment.wmap_interp_mode`` — "nearest" (default) for the
+        # discrete bg/fg integer weights produced by
+        # ``compute_region_weight_map``, or "bilinear" for continuous
+        # hand-annotated weights from ``region_weight_dir``.
         # Pass the largest multi-res scale so the augmentor can keep elastic
         # deformation physically conservative (BUG-E). For single-resolution
         # inputs (multi_res_scales == [1.0] or empty), max_scale==1.0 and the

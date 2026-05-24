@@ -25,12 +25,22 @@ class DataConfig:
 
     image_dir: str = ""
     label_dir: str = ""
-    image_suffix: str = ".nii.gz"
-    label_suffix: str = ".nii.gz"
+    # Suffix fields below all accept either a single string (legacy
+    # contract) or a YAML list of candidate suffixes. With a list,
+    # pairing under :mod:`segtask_v1.data.loader` strips the suffix to
+    # compute a *base* name and tries each candidate in order, taking
+    # the first existing file under the corresponding directory. This
+    # lets images / labels / bboxes / region-weights live side-by-side
+    # with mixed naming conventions (e.g. ``case01.nii.gz`` paired with
+    # ``case01-seg.nii.gz`` or ``case01_pred.nii.gz``). Order in the
+    # list expresses precedence (first match wins per sample).
+    image_suffix: Union[str, List[str]] = ".nii.gz"
+    label_suffix: Union[str, List[str]] = ".nii.gz"
 
     # Optional ROI bounding-box directory. When non-empty, each sample is
     # expected to have a matching NIfTI mask under ``bbox_dir`` (filename
-    # match against the image, suffix ``bbox_suffix``). At dataset init
+    # base-matched against the image, then any suffix in ``bbox_suffix``
+    # tried in order). At dataset init
     # time we load every bbox mask once, compute its axis-aligned
     # bounding box of nonzero voxels, log the mean (D, H, W) bbox size
     # across the dataset, and cache the per-sample bbox tuple. Each time
@@ -41,7 +51,7 @@ class DataConfig:
     # resolution, augmentation, prediction) untouched. Empty string =
     # disabled (legacy full-volume behaviour).
     bbox_dir: str = ""
-    bbox_suffix: str = ".nii.gz"
+    bbox_suffix: Union[str, List[str]] = ".nii.gz"
 
     # Optional per-sample region-weight NIfTI directory. When non-empty,
     # each sample must have a matching NIfTI file under ``region_weight_dir``
@@ -55,7 +65,7 @@ class DataConfig:
     # file (FileNotFoundError otherwise) — mirrors the ``bbox_dir`` strong-
     # match contract to avoid silent per-sample weight regressions.
     region_weight_dir: str = ""
-    region_weight_suffix: str = ".nii.gz"
+    region_weight_suffix: Union[str, List[str]] = ".nii.gz"
 
     # ---- Pre-computed npz pipeline ---------------------------------
     # Optional pre-computed npz package directory (output of
@@ -390,6 +400,30 @@ class AugConfig:
     # Simulate low resolution (downsample then upsample)
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
+
+    # ---- Weight-map spatial-resampling interpolation ------------------
+    # Controls how ``weight_map`` is resampled by ``_random_affine`` and
+    # ``_elastic_deform`` (the only two transforms that touch wmap with
+    # an interpolation kernel — flip uses ``torch.flip``, dropout/intensity
+    # transforms never touch wmap).
+    #
+    #   "nearest"  — preserves the EXACT discrete weight values produced
+    #                by ``compute_region_weight_map`` (e.g. bg=1, fg=4).
+    #                Required for the common case where region weights are
+    #                derived from a label map. SAFE DEFAULT.
+    #   "bilinear" — keeps continuous gradients intact at the cost of
+    #                quantising fg/bg integer weights into a noisy mixture
+    #                (the symptom: bg voxels become "0.x ~ 1.x", fg voxels
+    #                become "2.x ~ 4" near boundaries). Use this ONLY when
+    #                the per-sample wmap NIfTI is intentionally continuous
+    #                (e.g. distance-to-boundary maps in
+    #                ``region_weight_dir``).
+    #
+    # If you provide BOTH discrete fg/bg weights via ``compute_region_weight_map``
+    # AND you don't have a per-sample continuous rw NIfTI, leave this at
+    # "nearest". If your ``region_weight_dir`` ships continuous weights,
+    # set this to "bilinear" in your YAML.
+    wmap_interp_mode: str = "nearest"
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1117,11 @@ class Config:
         ), f"Invalid upsample_mode: {self.model.upsample_mode}"
         assert self.model.skip_mode in ("cat", "add"), \
             f"Invalid skip_mode: {self.model.skip_mode}"
+        assert self.augment.wmap_interp_mode in ("nearest", "bilinear"), (
+            f"Invalid augment.wmap_interp_mode: "
+            f"{self.augment.wmap_interp_mode!r}; expected "
+            f"'nearest' (discrete fg/bg weights, default) or "
+            f"'bilinear' (continuous hand-annotated weights).")
         assert self.model.attention_type in (
             "none", "se", "eca", "cbam", "coord",
         ), f"Invalid attention_type: {self.model.attention_type}"
