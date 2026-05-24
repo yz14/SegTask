@@ -433,6 +433,41 @@ class AugConfig:
 class ModelConfig:
     """UNet model architecture settings."""
 
+    # ---- Architecture family ---------------------------------------------
+    # Selects the top-level segmentation model implementation:
+    #   "unet" (default) — the in-house generic UNet3D / 2D UNet built
+    #                      from the ResNet/ConvNeXt backbones below
+    #                      (``backbone`` / ``block_type`` / ``norm_type`` /
+    #                      ``activation`` / ``attention_type`` / ``use_se`` /
+    #                      ``dropout`` all apply).
+    #   "adm"            — Paper-faithful ADM U-Net (Dhariwal & Nichol,
+    #                      NeurIPS 2021): GroupNorm32 + SiLU + ResBlock +
+    #                      AttentionBlock; timestep / class embedding paths
+    #                      removed. The legacy ``backbone`` / ``block_type``
+    #                      / ``norm_type`` / ``activation`` / ``use_se`` /
+    #                      ``attention_type`` fields are IGNORED. The
+    #                      following fields ARE honoured:
+    #                      ``encoder_channels``,
+    #                      ``encoder_blocks_per_stage``,
+    #                      ``decoder_blocks_per_stage``,
+    #                      ``stem_mode``,
+    #                      ``context_fusion`` (only ``shared_stem`` /
+    #                      ``multi_stem_proj`` supported on ADM/EDM2;
+    #                      ``hierarchical`` will raise),
+    #                      ``deep_supervision``,
+    #                      ``aux_seg_supervision``, ``aux_head_mode``,
+    #                      ``dropout`` (reused as ``ResBlock`` dropout).
+    #                      Plus the ``adm_*`` knobs below.
+    #                      Only ``data.patch_mode == "2_5d"`` is wired in
+    #                      this iteration.
+    #   "edm2"           — Paper-faithful EDM2 U-Net (Karras et al., CVPR
+    #                      2024): magnitude-preserving (MP) ops — MPConv
+    #                      with forced weight normalization, mp_silu,
+    #                      mp_sum, mp_cat, pixel-norm; noise / class
+    #                      embedding paths removed. Same whitelist as
+    #                      ``adm`` plus the ``edm2_*`` knobs below.
+    arch: str = "unet"
+
     # Backbone: "resnet" or "convnext"
     backbone: str = "resnet"
 
@@ -679,6 +714,43 @@ class ModelConfig:
     # ``downsample_mode`` + ``norm_type``). Set to False to fall back to the
     # generic Downsample path (legacy behaviour) for ablation purposes.
     convnext_downsample_lnfirst: bool = True
+
+    # ---- ADM-specific (only used when arch == "adm") --------------------
+    # Encoder/decoder level indices (0 = top, L-1 = bottleneck) that get
+    # multi-head self-attention. ADM's original ``attention_resolutions``
+    # is expressed in *downsample factors*; we expose level indices here
+    # because they remain meaningful regardless of stem stride and input
+    # size. Empty list => default = deepest two levels (e.g. for 5 levels
+    # this is [3, 4], matching the typical ADM setup of attn at /16 and
+    # /8 for a 256² model).
+    adm_attention_levels: List[int] = field(default_factory=list)
+
+    # Number of attention heads (used when ``adm_num_head_channels == -1``).
+    adm_num_heads: int = 4
+
+    # Channel-width-per-head mode (when != -1, num_heads is computed as
+    # ``channels // num_head_channels`` per AttentionBlock; matches ADM's
+    # paper preferred setting). -1 → fall back to ``adm_num_heads``.
+    adm_num_head_channels: int = -1
+
+    # ---- EDM2-specific (only used when arch == "edm2") -------------------
+    # Encoder/decoder level indices that get self-attention. EDM2's
+    # original ``attn_resolutions`` is expressed in pixel resolution; we
+    # use level indices (same convention as ``adm_attention_levels``).
+    # Empty list => default = bottleneck level only ([L-1]).
+    edm2_attention_levels: List[int] = field(default_factory=list)
+
+    # Channels per attention head (heads = out_ch // channels_per_head).
+    edm2_channels_per_head: int = 64
+
+    # Magnitude-preserving residual / attention / skip-cat balance
+    # parameters (paper Eq. 88 / 103). Defaults match networks_edm2.py.
+    edm2_res_balance: float = 0.3
+    edm2_attn_balance: float = 0.3
+    edm2_concat_balance: float = 0.5
+
+    # Output activation clipping (paper section 6.4). Set <= 0 to disable.
+    edm2_clip_act: float = 256.0
 
 
 # ---------------------------------------------------------------------------
@@ -1100,31 +1172,57 @@ class Config:
 
     def validate(self) -> None:
         """Validate configuration for consistency."""
-        assert self.model.backbone in ("resnet", "convnext"), \
-            f"Invalid backbone: {self.model.backbone}"
+        # Architecture family. Legacy ``backbone`` etc. are only validated
+        # when the in-house ``UNet3D`` build path is selected. ADM / EDM2
+        # archs ignore those fields entirely (paper-faithful internals);
+        # we only validate the small subset of fields they actually
+        # consume (encoder_channels lengths, stem_mode, context_fusion,
+        # aux_seg_supervision, deep_supervision — plus the arch-specific
+        # ``adm_*`` / ``edm2_*`` knobs at construction time).
+        arch = str(getattr(self.model, "arch", "unet")).lower()
+        assert arch in ("unet", "adm", "edm2"), (
+            f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
+        if arch == "unet":
+            assert self.model.backbone in ("resnet", "convnext"), \
+                f"Invalid backbone: {self.model.backbone}"
+            assert self.model.norm_type in ("batch", "instance", "group"), \
+                f"Invalid norm: {self.model.norm_type}"
+            assert self.model.activation in (
+                "relu", "leakyrelu", "gelu", "swish",
+            ), f"Invalid activation: {self.model.activation}"
+            assert self.model.downsample_mode in (
+                "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
+            ), f"Invalid downsample_mode: {self.model.downsample_mode}"
+            assert self.model.upsample_mode in (
+                "transpose", "trilinear", "nearest", "pixelshuffle",
+                "carafe", "dysample",
+            ), f"Invalid upsample_mode: {self.model.upsample_mode}"
+            assert self.model.skip_mode in ("cat", "add"), \
+                f"Invalid skip_mode: {self.model.skip_mode}"
+        else:
+            # ADM / EDM2 only support 2.5D for now (folded D-as-channels).
+            assert self.data.patch_mode == "2_5d", (
+                f"model.arch={arch!r} is currently only supported with "
+                f"data.patch_mode='2_5d'; got {self.data.patch_mode!r}. "
+                f"3D variants will be added in a follow-up.")
+            # Plan A only — hierarchical fusion would need mid-encoder
+            # injection in ADM/EDM2's flat block topology.
+            assert self.model.context_fusion in (
+                "shared_stem", "multi_stem_proj",
+            ), (
+                f"model.arch={arch!r} does not support context_fusion="
+                f"{self.model.context_fusion!r}; use 'shared_stem' or "
+                f"'multi_stem_proj'.")
         assert self.model.spatial_dims in (2, 3), \
             f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)"
-        assert self.model.norm_type in ("batch", "instance", "group"), \
-            f"Invalid norm: {self.model.norm_type}"
-        assert self.model.activation in ("relu", "leakyrelu", "gelu", "swish"), \
-            f"Invalid activation: {self.model.activation}"
-        assert self.model.downsample_mode in (
-            "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
-        ), f"Invalid downsample_mode: {self.model.downsample_mode}"
-        assert self.model.upsample_mode in (
-            "transpose", "trilinear", "nearest", "pixelshuffle",
-            "carafe", "dysample",
-        ), f"Invalid upsample_mode: {self.model.upsample_mode}"
-        assert self.model.skip_mode in ("cat", "add"), \
-            f"Invalid skip_mode: {self.model.skip_mode}"
         assert self.augment.wmap_interp_mode in ("nearest", "bilinear"), (
             f"Invalid augment.wmap_interp_mode: "
             f"{self.augment.wmap_interp_mode!r}; expected "
             f"'nearest' (discrete fg/bg weights, default) or "
             f"'bilinear' (continuous hand-annotated weights).")
-        assert self.model.attention_type in (
-            "none", "se", "eca", "cbam", "coord",
-        ), f"Invalid attention_type: {self.model.attention_type}"
+        # ``stem_mode`` / ``context_fusion`` / ``aux_head_mode`` apply to
+        # all archs (ADM/EDM2 also consume them via build_context_stem
+        # equivalents and the aux-head builder).
         assert self.model.stem_mode in (
             "conv3", "conv7", "dual", "patch2", "patch4",
         ), f"Invalid stem_mode: {self.model.stem_mode}"
@@ -1134,30 +1232,36 @@ class Config:
         assert getattr(self.model, "aux_head_mode", "linear") in (
             "linear", "conv",
         ), f"Invalid aux_head_mode: {self.model.aux_head_mode!r}"
-        assert self.model.decoder_type in ("unet", "unetpp", "unet3p"), \
-            f"Invalid decoder_type: {self.model.decoder_type}"
-        assert self.model.unet3p_cat_channels > 0, \
-            "unet3p_cat_channels must be > 0"
-        assert self.model.block_type in (
-            "basic", "preact", "bottleneck", "r2plus1d"), \
-            f"Invalid block_type: {self.model.block_type}"
-        # ``r2plus1d`` factorises 3D conv into spatial (1,3,3) + temporal
-        # (3,1,1) — the temporal sub-conv only reaches neighbouring slices
-        # when D is a real spatial axis, i.e. spatial_dims=3. In 2.5D mode
-        # D is folded into channels and the temporal kernel becomes a
-        # no-op cross-channel mixer; reject it up-front with a precise
-        # diagnostic instead of silently degrading to that pathological
-        # behaviour at forward-time.
-        if self.model.block_type == "r2plus1d":
-            assert self.model.spatial_dims == 3, (
-                "model.block_type='r2plus1d' requires spatial_dims=3 "
-                "(D must be a real spatial axis). It is incompatible "
-                "with the 2.5D patch_mode where D is folded into the "
-                "channel axis. To use Plan A on z-slab data, switch "
-                "your config to patch_mode='z_axis' (3D thin-slab) and "
-                "keep block_type='r2plus1d'.")
-        assert self.model.resenc_preset in ("none", "S", "M", "L", "XL"), \
-            f"Invalid resenc_preset: {self.model.resenc_preset}"
+        # Legacy ``unet`` arch only — backbone block types / decoder
+        # variants / r2plus1d / ResEnc presets / in-block attention.
+        if arch == "unet":
+            assert self.model.attention_type in (
+                "none", "se", "eca", "cbam", "coord",
+            ), f"Invalid attention_type: {self.model.attention_type}"
+            assert self.model.decoder_type in ("unet", "unetpp", "unet3p"), \
+                f"Invalid decoder_type: {self.model.decoder_type}"
+            assert self.model.unet3p_cat_channels > 0, \
+                "unet3p_cat_channels must be > 0"
+            assert self.model.block_type in (
+                "basic", "preact", "bottleneck", "r2plus1d"), \
+                f"Invalid block_type: {self.model.block_type}"
+            # ``r2plus1d`` factorises 3D conv into spatial (1,3,3) + temporal
+            # (3,1,1) — the temporal sub-conv only reaches neighbouring slices
+            # when D is a real spatial axis, i.e. spatial_dims=3. In 2.5D mode
+            # D is folded into channels and the temporal kernel becomes a
+            # no-op cross-channel mixer; reject it up-front with a precise
+            # diagnostic instead of silently degrading to that pathological
+            # behaviour at forward-time.
+            if self.model.block_type == "r2plus1d":
+                assert self.model.spatial_dims == 3, (
+                    "model.block_type='r2plus1d' requires spatial_dims=3 "
+                    "(D must be a real spatial axis). It is incompatible "
+                    "with the 2.5D patch_mode where D is folded into the "
+                    "channel axis. To use Plan A on z-slab data, switch "
+                    "your config to patch_mode='z_axis' (3D thin-slab) and "
+                    "keep block_type='r2plus1d'.")
+            assert self.model.resenc_preset in ("none", "S", "M", "L", "XL"), \
+                f"Invalid resenc_preset: {self.model.resenc_preset}"
         # Per-stage block-count lengths must align with encoder depth.
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage

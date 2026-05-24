@@ -47,5 +47,11 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 4 数据增强是否对wmap做了什么不当的处理，我看到wmap像加了噪点，原本应该是纯净的，例如背景都是1的区域权重，fg都是4的区域权重，但是背景区域都是噪点0和1，fg都是噪点2.x到4直接的连续值。是否对wmap做了像素的数据增强？是否在对wmap尺寸变化的时候插值不当（很有可能）？我看到标签倒是正常的。
 
-5 我用D:\codes\work-projects\SegTask\configs\lung.yaml在服务器上训练了肺部（除了数据路径这里用的是服务器的数据外），训练好后，dice=0.98，我在本地进行预测，为什么预测的值全为1，也就是输入图像，剪裁后，模型把剪裁的图像全预测成1，然后填充回去，结果就是一个巨大的立方体。请检查哪里出了问题。
+5 我打算对分割模型做一些改进，以下是我计划实现的两个方案，你先以2.5D的配置，单独实现这两个作为分割模型，注意，这两个方案是单独作为分割模型，而不需要配置backbone, block_type, norm_type这些，忠实于仓库中原始方案中的设定，需要配置的就是多分辨率输入的stem，encoder_channels, deep supervision, 输出按我目前的Unet这样把每个class拆分出来，每个class都单独做单标签损失。
+a ADM U-Net —— Dhariwal & Nichol, "Diffusion Models Beat GANs", NeurIPS 2021
+仓库: https://github.com/openai/guided-diffusion → guided_diffusion/unet.py
+D:\codes\work-projects\SegTask\guided-diff
 
+b EDM2 U-Net —— Karras et al., CVPR 2024, "Analyzing and Improving the Training Dynamics of Diffusion Models"
+仓库: https://github.com/NVlabs/edm2 → training/networks_edm2.py
+D:\codes\work-projects\SegTask\edm2

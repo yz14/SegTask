@@ -1,0 +1,212 @@
+# ============================================================================
+# 2.5D Segmentation Configuration — ADM U-Net arch
+#
+# Paper-faithful ADM U-Net (Dhariwal & Nichol, NeurIPS 2021) adapted as a
+# segmentation backbone:
+#   - GroupNorm32 + SiLU + ResBlock (timestep-emb path stripped) +
+#     multi-head AttentionBlock at the deepest two levels.
+#   - Multi-FOV stem ('shared_stem' / 'multi_stem_proj') — context fusion
+#     'hierarchical' is NOT supported on ADM/EDM2 archs (this iteration).
+#   - Output: (B, num_fg * D, H, W); SliceChannelLoss splits per class.
+#   - aux_seg_supervision (Plan A only — heads on the highest-res decoder
+#     feature) and deep_supervision compose normally.
+#
+# IGNORED fields when arch == "adm":
+#   model.backbone / model.block_type / model.norm_type / model.activation
+#   model.attention_type / model.use_se / model.decoder_type
+#   model.unet3p_cat_channels / model.resenc_preset / model.skip_attention
+#   model.skip_mode / model.upsample_mode / model.downsample_mode
+#   model.drop_path_rate / model.convnext_*  (paper fixes the internals).
+#
+# HONOURED fields:
+#   data.* (full pipeline)
+#   model.encoder_channels / encoder_blocks_per_stage / decoder_blocks_per_stage
+#   model.stem_mode (used for the multi-FOV stem)
+#   model.context_fusion (shared_stem | multi_stem_proj)
+#   model.deep_supervision / aux_seg_supervision / aux_head_mode
+#   model.dropout (reused as ResBlock dropout)
+#   model.adm_attention_levels / adm_num_heads / adm_num_head_channels
+# ============================================================================
+
+# =====================================================================
+# DATA — same as seg2_5d.yaml
+# =====================================================================
+data:
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+  bbox_suffix : ".nii.gz"
+  region_weight_suffix: ".nii.gz"
+  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
+  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
+  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"
+  bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"
+  npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
+
+  label_values: [0, 1, 2]
+  num_classes : 3
+
+  patch_size: [12, 256, 256]
+  patch_mode: "2_5d"
+
+  multi_res_scales: [1.0, 1.5, 2.0]
+  aug_oversample_ratio: 1.5
+
+  # Required when aux_keep_native_d=True (ADM consumes per-view native depths).
+  z_boundary_mode: "edge_pad"
+  aux_keep_native_d: true
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  val_ratio : 0.2
+  split_seed: 42
+  stratified_split: true
+
+  batch_size : 4
+  num_workers: 4
+  prefetch_factor: 4
+  pin_memory : true
+
+  foreground_oversample_ratio: 0.3
+  samples_per_volume: 8
+
+  cache_mode: "memory"
+  cache_max_volumes: 2
+
+
+# =====================================================================
+# AUGMENT — same as seg2_5d.yaml
+# =====================================================================
+augment:
+  enabled: true
+  random_flip_prob: 0.5
+  random_flip_axes: [2, 3, 4]
+  random_affine_prob : 0.3
+  random_rotate_range: [-15.0, 15.0]
+  random_scale_range : [0.85, 1.15]
+  elastic_deform_prob : 0.0
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 1.0
+  random_brightness_prob : 0.3
+  random_brightness_range: [-0.1, 0.1]
+  random_contrast_prob : 0.3
+  random_contrast_range: [0.8, 1.2]
+  random_gamma_prob : 0.2
+  random_gamma_range: [0.8, 1.2]
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std : 0.09
+  gaussian_blur_prob : 0.1
+  gaussian_blur_sigma: [0.5, 1.5]
+  simulate_lowres_prob: 0.1
+  simulate_lowres_zoom: [0.5, 1.0]
+
+
+# =====================================================================
+# MODEL — ADM U-Net
+# =====================================================================
+model:
+  arch: "adm"
+
+  encoder_channels: [32, 64, 128, 256, 256]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  # ADM/EDM2 archs ignore this field — the decoder per-level count is
+  # fixed by the encoder's skip-stack topology (paper convention:
+  # ``nb_k + 1`` ResBlocks per dec level, matching the +1 absorb-skip
+  # block). Listed for schema parity; mismatch logs a warning only.
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+
+  stem_mode: "conv3"
+  context_fusion: "multi_stem_proj"
+
+  deep_supervision: false
+  aux_seg_supervision: true
+  aux_head_mode: "linear"
+
+  # Reused as ResBlock dropout. Paper default is 0.0 (or up to 0.1 for
+  # the larger image-sizes); 0.0 keeps the architecture closest to the
+  # released ImageNet checkpoints.
+  dropout: 0.0
+
+  # ADM-specific:
+  # Default = deepest two levels, i.e. [3, 4] for 5 stages — matches the
+  # paper's typical ``attention_resolutions=[16, 8]`` for 256² inputs.
+  adm_attention_levels: [3, 4]
+  adm_num_heads: 4
+  adm_num_head_channels: -1
+
+
+# =====================================================================
+# LOSS — same as seg2_5d.yaml
+# =====================================================================
+loss:
+  name: "dice_focal"
+  compound_weights: [1.0, 1.0]
+  class_weights: [1.0, 1.0]
+  region_weights: [1.0, 4.0, 2.0]
+  dice_smooth : 1.0e-5
+  dice_squared: false
+  focal_alpha: 0.5
+  focal_gamma: 2.0
+  tversky_alpha: 0.3
+  tversky_beta : 0.7
+  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+  slice_loss_reduction: "per_volume"
+  aux_supervision_weights: []
+
+
+# =====================================================================
+# TRAIN — same as seg2_5d.yaml (output_dir distinct)
+# =====================================================================
+train:
+  epochs: 100
+
+  optimizer   : "adamw"
+  lr          : 1.0e-3
+  weight_decay: 1.0e-4
+
+  scheduler: "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 1
+  grad_clip_norm: 12.0
+
+  use_amp  : true
+  amp_dtype: "auto"
+
+  compile_mode: "default"
+
+  use_ema  : true
+  ema_decay: 0.999
+
+  output_dir: "outputs/lung_bone_adm"
+  save_every: 10
+  save_best_metric: "mean_dice"
+  save_best_mode: "max"
+
+  early_stopping: 15
+
+  log_every: 10
+  val_every: 1
+  vis_every: 10
+
+  seed: 42
+  deterministic: false
+
+
+# =====================================================================
+# PREDICT — same as seg2_5d.yaml
+# =====================================================================
+predict:
+  z_interleave_enabled: true
+  z_interleave_thresholds: [1.0, 1.5]
+  z_interleave_factors: [3, 2, 1]
+  z_overlap : 0.5
+  blend_mode: "gaussian"
+  batch_size: 4
+  tta_flip  : false
+  threshold : 0.5
+  output_dir: "predictions"
+  save_probabilities: false

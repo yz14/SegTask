@@ -157,15 +157,42 @@ def _make_convnext_downsample_builder(
     return build
 
 
-def build_model(cfg: Config) -> UNet3D:
-    """Build UNet3D model from config.
+def build_model(cfg: Config):
+    """Build a segmentation model from config.
 
-    Args:
-        cfg: Full configuration.
+    Dispatches on ``cfg.model.arch``:
 
-    Returns:
-        UNet3D model ready for training.
+      * ``"unet"`` (default) — :class:`models.unet.UNet3D` built via the
+        ResNet/ConvNeXt backbone path below (legacy, bit-identical).
+      * ``"adm"``  — :class:`models.adm_unet.ADMSegModel`. Paper-faithful
+        ADM blocks (Dhariwal & Nichol, NeurIPS 2021) with timestep-emb
+        path stripped. ``backbone`` / ``block_type`` / ``norm_type`` /
+        ``activation`` / ``use_se`` / ``attention_type`` / ``dropout``
+        configured at the YAML level are IGNORED for ADM (paper fixes
+        GroupNorm32 + SiLU); ``dropout`` is reused as ``ResBlock``
+        dropout. Reads ``encoder_channels``, ``encoder_blocks_per_stage``,
+        ``decoder_blocks_per_stage``, ``stem_mode``, ``context_fusion``,
+        ``deep_supervision``, ``aux_seg_supervision``, ``aux_head_mode``,
+        plus ``adm_*`` extras.
+      * ``"edm2"`` — :class:`models.edm2_unet.EDM2SegModel`. Paper-faithful
+        magnitude-preserving blocks (Karras et al., CVPR 2024) with
+        noise/class-emb path stripped. Same whitelist as ``adm`` plus
+        ``edm2_*`` extras.
+
+    The non-``unet`` archs route around all backbone-specific code below;
+    they have their own self-contained build functions in their modules.
     """
+    arch = str(getattr(cfg.model, "arch", "unet")).lower()
+    if arch == "adm":
+        from .adm_unet import build_adm_seg_model
+        return build_adm_seg_model(cfg)
+    if arch == "edm2":
+        from .edm2_unet import build_edm2_seg_model
+        return build_edm2_seg_model(cfg)
+    if arch != "unet":
+        raise ValueError(
+            f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
+
     mc = cfg.model
     enc_channels = list(mc.encoder_channels)
     num_fg = cfg.num_fg_classes
