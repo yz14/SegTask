@@ -27,16 +27,16 @@ class Encoder(nn.Module):
 
     def __init__(
         self,
-        in_channels: int,
-        stage_channels: List[int],
+        in_channels        : int,
+        stage_channels     : List[int],
         stage_builder,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        downsample_mode: str = "conv",
-        stem_mode: str = "conv3",
-        spatial_dims: int = 3,
-        context_n_views: int = 1,
+        norm_type          : str = "instance",
+        norm_groups        : int = 8,
+        activation         : str = "leakyrelu",
+        downsample_mode    : str = "conv",
+        stem_mode          : str = "conv3",
+        spatial_dims       : int = 3,
+        context_n_views    : int = 1,
         context_fusion     : str = "shared_stem",
         in_ch_per_view_list: List[int] = None,
         downsample_builder : Optional[Callable[[int, int], nn.Module]] = None):
@@ -84,7 +84,7 @@ class Encoder(nn.Module):
             in_ch_per_view_list=in_ch_per_view_list)
 
         # Encoder stages and downsampling
-        self.stages = nn.ModuleList()
+        self.stages      = nn.ModuleList()
         self.downsamples = nn.ModuleList()
 
         for i, ch in enumerate(stage_channels):
@@ -93,13 +93,13 @@ class Encoder(nn.Module):
             if i > 0:
                 # Inter-stage downsample (in_ch==out_ch; next stage's first block grows channels).
                 # ``downsample_builder`` lets backbones inject custom topologies (e.g. ConvNeXt LN-first).
-                ds_in = stage_channels[i - 1]
+                ds_in  = stage_channels[i - 1]
                 ds_out = stage_channels[i - 1]
                 if downsample_builder is not None:
                     self.downsamples.append(downsample_builder(ds_in, ds_out))
                 else:
                     self.downsamples.append(
-                        Downsample(
+                        Downsample(  # TODO 这里最后一层是norm，确定没有问题吗？需要加act吗？
                             ds_in, ds_out,
                             norm_type=norm_type, norm_groups=norm_groups,
                             mode=downsample_mode, spatial_dims=spatial_dims))
@@ -128,7 +128,7 @@ class Encoder(nn.Module):
             x = self.stem(x)
             aux_feats = {}
 
-        features: List[torch.Tensor] = []
+        features: List[torch.Tensor] = []  # TODO 需要加入stem的特征吗？这是一个全局特征，可以cat到seghead的输入特征
         for i, stage in enumerate(self.stages):
             if i > 0:
                 x = self.downsamples[i - 1](x)
@@ -157,18 +157,18 @@ class DecoderLevel(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        skip_ch: int,
-        out_ch: int,
+        in_ch         : int,
+        skip_ch       : int,
+        out_ch        : int,
         stage_builder,
-        upsample_mode: str = "transpose",
-        skip_mode: str = "cat",
+        upsample_mode : str = "transpose",
+        skip_mode     : str = "cat",
         skip_attention: bool = False,
-        spatial_dims: int = 3):
+        spatial_dims  : int = 3):
         super().__init__()
-        self.skip_mode = skip_mode
+        self.skip_mode    = skip_mode
         self.spatial_dims = spatial_dims
-        self.upsample  = Upsample(in_ch, out_ch, mode=upsample_mode,
+        self.upsample     = Upsample(in_ch, out_ch, mode=upsample_mode,
                                   spatial_dims=spatial_dims)
 
         if skip_mode == "cat":
@@ -183,8 +183,7 @@ class DecoderLevel(nn.Module):
         self.attn_gate = (
             AttentionGate3D(x_ch=skip_ch, g_ch=out_ch,
                             spatial_dims=spatial_dims)
-            if skip_attention else None
-        )
+            if skip_attention else None)
         self.stage = stage_builder(fused_ch, out_ch)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -192,6 +191,7 @@ class DecoderLevel(nn.Module):
 
         # Resize on shape mismatch (odd input sizes).
         if x.shape[2:] != skip.shape[2:]:
+            raise  # TODO 不允许有尺寸不匹配
             x = _match_size(x, skip.shape[2:], self.spatial_dims)
 
         if self.attn_gate is not None:
@@ -216,10 +216,10 @@ class Decoder(nn.Module):
         self,
         encoder_channels: List[int],
         stage_builder,
-        upsample_mode: str = "transpose",
-        skip_mode: str = "cat",
-        skip_attention: bool = False,
-        spatial_dims: int = 3):
+        upsample_mode   : str = "transpose",
+        skip_mode       : str = "cat",
+        skip_attention  : bool = False,
+        spatial_dims    : int = 3):
         super().__init__()
         self.levels = nn.ModuleList()
         self.spatial_dims = spatial_dims
@@ -227,16 +227,16 @@ class Decoder(nn.Module):
 
         # Deepest → shallowest; level i fuses encoder[n-2-i] (skip) with prior decoder output.
         for i in range(n - 1):
-            in_ch = encoder_channels[n - 1 - i]  # from deeper level
+            in_ch   = encoder_channels[n - 1 - i]  # from deeper level
             skip_ch = encoder_channels[n - 2 - i]  # skip connection
-            out_ch = encoder_channels[n - 2 - i]   # symmetric output
+            out_ch  = encoder_channels[n - 2 - i]  # symmetric output
 
             self.levels.append(
                 DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
-                             upsample_mode=upsample_mode,
-                             skip_mode=skip_mode,
-                             skip_attention=skip_attention,
-                             spatial_dims=spatial_dims))
+                             upsample_mode  = upsample_mode,
+                             skip_mode      = skip_mode,
+                             skip_attention = skip_attention,
+                             spatial_dims   = spatial_dims))
 
         # Output channels at each decoder level (low-res → high-res)
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
@@ -247,16 +247,15 @@ class Decoder(nn.Module):
         outputs = []
         for i, level in enumerate(self.levels):
             skip_idx = len(encoder_features) - 2 - i
-            x = level(x, encoder_features[skip_idx])
+            x        = level(x, encoder_features[skip_idx])
             outputs.append(x)
         return outputs
 
 
 class SegmentationHead(nn.Module):
-    """1×1(×1) convolution to produce per-class logits."""
+    """1x1(x1) convolution to produce per-class logits."""
 
-    def __init__(self, in_ch: int, num_classes: int,
-                 spatial_dims: int = 3):
+    def __init__(self, in_ch: int, num_classes: int, spatial_dims: int = 3):
         super().__init__()
         self.conv = _CONV[spatial_dims](in_ch, num_classes, kernel_size=1)
 
@@ -269,13 +268,12 @@ class ConvSegmentationHead(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        num_classes: int,
+        in_ch       : int,
+        num_classes : int,
         spatial_dims: int = 3,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-    ):
+        norm_type   : str = "instance",
+        norm_groups : int = 8,
+        activation  : str = "leakyrelu"):
         super().__init__()
         self.conv = ConvNormAct(
             in_ch, in_ch, kernel_size=3, stride=1, padding=1,
@@ -288,14 +286,13 @@ class ConvSegmentationHead(nn.Module):
 
 
 def _build_aux_head(
-    mode: str,
-    in_ch: int,
-    num_classes: int,
+    mode        : str,
+    in_ch       : int,
+    num_classes : int,
     spatial_dims: int,
-    norm_type: str = "instance",
-    norm_groups: int = 8,
-    activation: str = "leakyrelu",
-) -> nn.Module:
+    norm_type   : str = "instance",
+    norm_groups : int = 8,
+    activation  : str = "leakyrelu") -> nn.Module:
     """Aux seg head dispatch: ``linear`` (1×1) | ``conv`` (3×3 + 1×1). See ``ModelConfig.aux_head_mode``."""
     if mode == "linear":
         return SegmentationHead(in_ch, num_classes, spatial_dims=spatial_dims)
@@ -322,34 +319,33 @@ class UNet3D(nn.Module):
 
     def __init__(
         self,
-        encoder: Encoder,
+        encoder              : Encoder,
         decoder,
-        num_fg_classes: int,
-        deep_supervision: bool = False,
-        spatial_dims: int = 3,
-        aux_seg_supervision: bool = False,
-        aux_head_mode: str = "linear",
+        num_fg_classes       : int,
+        deep_supervision     : bool = False,
+        spatial_dims         : int = 3,
+        aux_seg_supervision  : bool = False,
+        aux_head_mode        : str = "linear",
         # Norm / activation are propagated to ``ConvSegmentationHead`` when
         # ``aux_head_mode == "conv"``; mirror the encoder defaults so the
         # aux head's norm/act stay homogeneous with the rest of the model.
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
+        norm_type            : str = "instance",
+        norm_groups          : int = 8,
+        activation           : str = "leakyrelu",
         aux_head_out_channels: List[int] = None):
         super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
+        self.encoder          = encoder
+        self.decoder          = decoder
         self.num_fg_classes   = num_fg_classes
         self.deep_supervision = deep_supervision
-        self.spatial_dims = spatial_dims
+        self.spatial_dims     = spatial_dims
 
         # Main head reads highest-res decoder feat; if stem stride > 1, the
         # output is upsampled back to input resolution in forward(). DS heads
         # stay at their native decoder resolutions (loss downsamples target).
         self.stem_stride = getattr(encoder, "stem_stride", 1)
-        self.seg_head = SegmentationHead(
-            decoder.out_channels[-1], num_fg_classes,
-            spatial_dims=spatial_dims)
+        self.seg_head    = SegmentationHead(  # TODO 这里单层是否过于简单？是否需要两层？像ConvSegmentationHead
+            decoder.out_channels[-1], num_fg_classes, spatial_dims=spatial_dims)
 
         # DS heads in decreasing resolution: forward returns [main, 2nd, ..., lowest]
         # to match DeepSupervisionLoss (weights[0] = highest-res).
@@ -366,7 +362,7 @@ class UNet3D(nn.Module):
         #     semantic depth where view k was injected at encoder stage k).
         # Aux outputs are upsampled to (H, W) of the main output.
         n_views = int(getattr(encoder, "context_n_views", 1))
-        fusion = str(getattr(encoder, "context_fusion", "shared_stem"))
+        fusion  = str(getattr(encoder, "context_fusion", "shared_stem"))
         self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
         self.aux_n_views = n_views
         # aux_feat_indices[k-1] = decoder feature index for aux head k (no per-call branching).
@@ -376,8 +372,7 @@ class UNet3D(nn.Module):
         # passes [num_fg*D_1, ..., num_fg*D_{K-1}] explicitly via aux_head_out_channels.
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
         if aux_head_out_channels is None:
-            self.aux_head_out_channels: List[int] = (
-                [num_fg_classes] * n_aux_expected)
+            self.aux_head_out_channels: List[int] = ([num_fg_classes] * n_aux_expected)
         else:
             if len(aux_head_out_channels) != n_aux_expected:
                 raise ValueError(
@@ -388,14 +383,13 @@ class UNet3D(nn.Module):
         # ``conv`` mode bakes in norm/activation; ``linear`` is a bare 1×1 conv.
         def _head(in_ch: int, out_ch: int) -> nn.Module:
             return _build_aux_head(
-                mode=aux_head_mode,
-                in_ch=in_ch,
-                num_classes=out_ch,
-                spatial_dims=spatial_dims,
-                norm_type=norm_type,
-                norm_groups=norm_groups,
-                activation=activation,
-            )
+                mode         = aux_head_mode,
+                in_ch        = in_ch,
+                num_classes  = out_ch,
+                spatial_dims = spatial_dims,
+                norm_type    = norm_type,
+                norm_groups  = norm_groups,
+                activation   = activation)
         self.aux_head_mode = aux_head_mode
         if self.aux_seg_supervision:
             n_dec = len(decoder.out_channels)
@@ -416,20 +410,19 @@ class UNet3D(nn.Module):
                 # Plan A: all aux heads on the highest-res decoder feat.
                 in_ch = decoder.out_channels[-1]
                 for k in range(1, n_views):
-                    self.aux_feat_indices.append(n_dec - 1)
+                    self.aux_feat_indices.append(n_dec - 1)  # 用最后一个特征
                     self.aux_heads.append(
                         _head(in_ch, self.aux_head_out_channels[k - 1]))
 
-    def forward(
-        self, x: torch.Tensor,
-    ) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
         """``x``: ``(B, in_channels, *spatial)``; 2.5D multi-FOV uses ``(B, n_views*D, H, W)``."""
         enc_features = self.encoder(x)
         dec_features = self.decoder(enc_features)
-        target_size = x.shape[2:]
+        target_size  = x.shape[2:]
 
         main_out = self.seg_head(dec_features[-1])
         if main_out.shape[2:] != target_size:
+            raise # TODO 不允许有尺寸不匹配
             # Restore to input resolution (bilinear/trilinear by spatial_dims).
             main_out = F.interpolate(
                 main_out, size=target_size,
@@ -441,6 +434,7 @@ class UNet3D(nn.Module):
             for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
                 ao = head(dec_features[feat_idx])
                 if ao.shape[2:] != target_size:
+                    raise  # TODO 不允许有尺寸不匹配
                     ao = F.interpolate(
                         ao, size=target_size,
                         mode=INTERP_SMOOTH[self.spatial_dims],
@@ -460,9 +454,9 @@ class UNet3D(nn.Module):
         return main_path
 
     def param_count(self) -> Dict[str, int]:
-        enc = sum(p.numel() for p in self.encoder.parameters())
-        dec = sum(p.numel() for p in self.decoder.parameters())
-        head = sum(p.numel() for p in self.seg_head.parameters())
+        enc   = sum(p.numel() for p in self.encoder.parameters())
+        dec   = sum(p.numel() for p in self.decoder.parameters())
+        head  = sum(p.numel() for p in self.seg_head.parameters())
         total = sum(p.numel() for p in self.parameters())
         return {"encoder": enc, "decoder": dec, "seg_head": head, "total": total}
 

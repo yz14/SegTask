@@ -170,13 +170,13 @@ def build_model(cfg: Config):
         context_n_views = 1
 
     # Per-view in-ch list (2.5D + aux_keep_native_d ON); else None → uniform split
-    in_ch_per_view_list = None
+    in_ch_per_view_list   = None
     aux_head_out_channels = None
     if (cfg.data.patch_mode == "2_5d"
             and bool(getattr(cfg.data, "aux_keep_native_d", False))
             and context_n_views > 1):
         depths = list(cfg.aux_view_depths)
-        in_ch_per_view_list = depths
+        in_ch_per_view_list   = depths
         aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]  # aux head k: num_fg*D_k
 
     # decoder builder call count varies: unet=n-1, unetpp=n*(n-1)/2, unet3p=0
@@ -230,7 +230,7 @@ def build_model(cfg: Config):
         downsample_builder  = downsample_builder)
 
     # decoder: unet | unetpp | unet3p
-    if mc.decoder_type == "unet3p":
+    if   mc.decoder_type == "unet3p":
         decoder = UNet3PDecoder(
             encoder_channels=enc_channels,
             cat_channels=mc.unet3p_cat_channels,
@@ -248,32 +248,31 @@ def build_model(cfg: Config):
             spatial_dims=spatial_dims)
     else:
         decoder = Decoder(
-            encoder_channels=enc_channels,
-            stage_builder=dec_builder,
-            upsample_mode=mc.upsample_mode,
-            skip_mode=mc.skip_mode,
-            skip_attention=mc.skip_attention,
-            spatial_dims=spatial_dims)
+            encoder_channels = enc_channels,
+            stage_builder    = dec_builder,
+            upsample_mode    = mc.upsample_mode,
+            skip_mode        = mc.skip_mode,
+            skip_attention   = mc.skip_attention,
+            spatial_dims     = spatial_dims)
 
     aux_seg_supervision = bool(getattr(mc, "aux_seg_supervision", False))
     # aux only meaningful with multi-FOV; mirror UNet3D's internal gate for accurate logging
     aux_seg_supervision = aux_seg_supervision and context_n_views > 1
     # per-view aux out channels only when 2.5D native-D ON; else None → default num_fg_classes
     aux_head_out_channels_arg = (
-        aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels)
-        else None)
+        aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels) else None)
     model = UNet3D(
-        encoder=encoder,
-        decoder=decoder,
-        num_fg_classes=out_classes,
-        deep_supervision=mc.deep_supervision,
-        spatial_dims=spatial_dims,
-        aux_seg_supervision=aux_seg_supervision,
-        aux_head_mode=getattr(mc, "aux_head_mode", "linear"),
-        aux_head_out_channels=aux_head_out_channels_arg,
-        norm_type=mc.norm_type,
-        norm_groups=mc.norm_groups,
-        activation=mc.activation)
+        encoder               = encoder,
+        decoder               = decoder,
+        num_fg_classes        = out_classes,
+        deep_supervision      = mc.deep_supervision,
+        spatial_dims          = spatial_dims,
+        aux_seg_supervision   = aux_seg_supervision,
+        aux_head_mode         = getattr(mc, "aux_head_mode", "linear"),
+        aux_head_out_channels = aux_head_out_channels_arg,
+        norm_type             = mc.norm_type,
+        norm_groups           = mc.norm_groups,
+        activation            = mc.activation)
 
     pc = model.param_count()
     logger.info(

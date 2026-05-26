@@ -26,15 +26,15 @@ class DataConfig:
     label_suffix: Union[str, List[str]] = ".nii.gz"
 
     # 可选 ROI bbox 掩码目录；设置后按 bbox 裁剪。空=禁用。
-    bbox_dir: str = ""
+    bbox_dir   : str = ""
     bbox_suffix: Union[str, List[str]] = ".nii.gz"
 
     # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > loss.region_weights。
-    region_weight_dir: str = ""
+    region_weight_dir   : str = ""
     region_weight_suffix: Union[str, List[str]] = ".nii.gz"
 
     # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
-    npz_dir: str = ""
+    npz_dir   : str = ""
     npz_suffix: str = ".npz"
 
     # True=启动时自动调用 make_data 生成；False=要求手动预生成。
@@ -45,7 +45,7 @@ class DataConfig:
 
     # 标签取值集（0=背景）。空=从数据自动探测。
     label_values: List[int] = field(default_factory=list)
-    num_classes: int = 0  # 由 label_values 自动设置
+    num_classes : int = 0  # 由 label_values 自动设置
 
     # 3D patch 尺寸 [D, H, W]。
     patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
@@ -63,24 +63,24 @@ class DataConfig:
 
     # 强度窗（CT HU）。
     intensity_min: float = -1024.0
-    intensity_max: float = 3071.0
+    intensity_max: float = 1024.0
     # 归一化："minmax"→[0,1]；"zscore"→零均值单位方差。
-    normalize: str = "minmax"
+    normalize  : str = "minmax"
     global_mean: float = 0.0
-    global_std: float = 1.0
+    global_std : float = 1.0
 
     # 训/验划分。
-    val_ratio: float = 0.2
+    val_ratio : float = 0.2
     split_seed: int = 42
     # 按首个前景类分层；样本太少时回退随机。
     stratified_split: bool = True
 
     # DataLoader。
-    batch_size: int = 2
-    num_workers: int = 4
-    pin_memory: bool = True
+    batch_size        : int = 2
+    num_workers       : int = 4
+    pin_memory        : bool = True
     persistent_workers: bool = True
-    prefetch_factor: int = 4
+    prefetch_factor   : int = 4
 
     # 前景过采样：中心点落在前景上的概率。
     foreground_oversample_ratio: float = 0.5
@@ -89,11 +89,11 @@ class DataConfig:
     samples_per_volume: int = 8
 
     # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
-    cache_mode: str = "memory"
-    cache_max_volumes: int = 0
+    cache_mode       : str = "memory"
+    cache_max_volumes: int = 1
 
     # z 轴边界填充（z_axis/2.5D）："stretch" 范围内拉伸；"edge_pad" 边缘复制后 resize（推荐）。
-    z_boundary_mode: str = "stretch"
+    z_boundary_mode: str = "edge_pad"
 
     # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
     # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
@@ -114,45 +114,45 @@ class AugConfig:
     enabled: bool = True
 
     # --- 空间变换（image + label 同步） ---
-    random_flip_prob: float = 0.5
+    random_flip_prob: float = 0.2
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
     # Affine：小角旋转 + 缩放，合成单次 grid_sample。
-    random_affine_prob: float = 0.3
+    random_affine_prob : float = 0.3
     random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
-    random_scale_range: List[float] = field(default_factory=lambda: [0.85, 1.15])
+    random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
 
     # 弹性形变（B-spline 随机位移场）。
-    elastic_deform_prob: float = 0.2
+    elastic_deform_prob : float = 0.2
     elastic_deform_sigma: float = 5.0   # 位移平滑度
     elastic_deform_alpha: float = 7.0   # 位移幅度（voxel）
 
     # Grid dropout：随机遮挡矩形子区域。
-    grid_dropout_prob: float = 0.0
+    grid_dropout_prob : float = 0.0
     grid_dropout_ratio: float = 0.3
     grid_dropout_holes: int = 4
 
     # --- 强度变换（仅 image） ---
-    random_brightness_prob: float = 0.3
+    random_brightness_prob : float = 0.3
     random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
-    random_contrast_prob: float = 0.3
+    random_contrast_prob : float = 0.3
     random_contrast_range: List[float] = field(default_factory=lambda: [0.8, 1.2])
 
-    random_gamma_prob: float = 0.2
+    random_gamma_prob : float = 0.2
     random_gamma_range: List[float] = field(default_factory=lambda: [0.8, 1.2])
 
     gaussian_noise_prob: float = 0.15
-    gaussian_noise_std: float = 0.05
+    gaussian_noise_std : float = 0.05
 
-    gaussian_blur_prob: float = 0.1
+    gaussian_blur_prob : float = 0.1
     gaussian_blur_sigma: List[float] = field(default_factory=lambda: [0.5, 1.5])
 
     # 模拟低分辨率（下采样后上采样）。
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
 
-    # weight_map 插值模式："nearest" 保持离散权重（默认）；"bilinear" 仅在连续手标 wmap 时用。
+    # weight_map 插值模式："nearest" 保持离散权重（默认）；"bilinear" 仅在连续手标 wmap 时用。  TODO 连续手标 wmap 时也要用nearest
     wmap_interp_mode: str = "nearest"
 
 
@@ -178,8 +178,7 @@ class ModelConfig:
 
     # 每级 encoder 通道数，决定深度。例：[32, 64, 128, 256, 512] = 5 级。
     encoder_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128, 256, 512]
-    )
+        default_factory=lambda: [32, 64, 128, 256, 512])
 
     # 每级 block 数默认值（仅在 encoder/decoder_blocks_per_stage 都为空时使用）。
     blocks_per_level: int = 2
@@ -196,7 +195,7 @@ class ModelConfig:
     resenc_preset: str = "none"
 
     # 归一化："batch" | "instance" | "group"。
-    norm_type: str = "instance"
+    norm_type  : str = "instance"
     norm_groups: int = 8
 
     # 激活："relu" | "leakyrelu" | "gelu" | "swish"。
@@ -205,7 +204,7 @@ class ModelConfig:
     dropout: float = 0.0
 
     # 旧 SE 开关（仅 attention_type=='none' 生效）。
-    use_se: bool = False
+    use_se      : bool = False
     se_reduction: int = 16
 
     # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
@@ -338,8 +337,7 @@ class LossConfig:
 
     # 深度监督逐级权重。
     deep_supervision_weights: List[float] = field(
-        default_factory=lambda: [1.0, 0.5, 0.25, 0.125]
-    )
+        default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
 
     # 2.5D 损失聚合（仅 patch_mode=="2_5d"）："per_slice" 逐 slice 独立（空 slice Dice≈1 零梯度）；
     # "per_volume" 按整体在 (D,H,W) 上聚合（2.5D 推荐）。仅影响 Dice 系。
@@ -359,25 +357,25 @@ class TrainConfig:
     epochs: int = 200
 
     # 优化器："adam" | "adamw" | "sgd"。
-    optimizer: str = "adamw"
-    lr: float = 1e-3
+    optimizer   : str = "adamw"
+    lr          : float = 1e-3
     weight_decay: float = 1e-4
-    momentum: float = 0.99   # 仅 SGD
-    nesterov: bool = True    # 仅 SGD
+    momentum    : float = 0.99   # 仅 SGD
+    nesterov    : bool = True    # 仅 SGD
 
     # 调度器："cosine" | "cosine_warm_restarts" | "poly" | "step" | "plateau" | "one_cycle"。
-    scheduler: str = "cosine"
+    scheduler    : str = "cosine"
     warmup_epochs: int = 5
-    warmup_lr: float = 1e-6
+    warmup_lr    : float = 1e-6
     cosine_min_lr: float = 1e-6
     # cosine_warm_restarts 重启周期 T_0 与倍率 T_mult。
     cosine_restart_period: int = 50
-    cosine_restart_mult: int = 2
-    poly_power: float = 0.9
-    step_size: int = 50
-    step_gamma: float = 0.1
-    plateau_patience: int = 10
-    plateau_factor: float = 0.5
+    cosine_restart_mult  : int = 2
+    poly_power           : float = 0.9
+    step_size            : int = 50
+    step_gamma           : float = 0.1
+    plateau_patience     : int = 10
+    plateau_factor       : float = 0.5
 
     # 梯度累积（有效 batch = batch_size * accum_steps）。
     grad_accum_steps: int = 1
@@ -386,21 +384,21 @@ class TrainConfig:
     grad_clip_norm: float = 12.0
 
     # AMP。amp_dtype 示例："float16"（需 GradScaler）、"bfloat16"（Ampere+，无需 scaler）。还有 "auto"（探测 BF16 否则回退 fp16）。
-    use_amp: bool = True
+    use_amp  : bool = True
     amp_dtype: str = "float16"
 
     # torch.compile："none" | "default" | "reduce-overhead" | "max-autotune"。
     compile_mode: str = "none"
 
     # EMA。
-    use_ema: bool = True
+    use_ema  : bool = True
     ema_decay: float = 0.999
 
     # Checkpoint 保存。
-    output_dir: str = "outputs"
-    save_every: int = 10
+    output_dir      : str = "outputs"
+    save_every      : int = 10
     save_best_metric: str = "mean_dice"
-    save_best_mode: str = "max"
+    save_best_mode  : str = "max"
 
     # 提前停止（0=禁用）。
     early_stopping: int = 0
@@ -410,7 +408,7 @@ class TrainConfig:
     val_every: int = 1
     vis_every: int = 10
 
-    seed: int = 42
+    seed         : int = 42
     deterministic: bool = False
 
     # Resume：从 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
@@ -493,7 +491,7 @@ class Config:
             lift    = bool(getattr(self.model, "lift_2_5d_to_3d", False))
             if lift:
                 self.model.spatial_dims = 3
-                self.model.in_channels = n_views
+                self.model.in_channels  = n_views
             else:
                 self.model.spatial_dims = 2
             if lift:
@@ -504,7 +502,7 @@ class Config:
                         "aux_keep_native_d=True implies z_boundary_mode='edge_pad'; "
                         "auto-upgraded from %r.", self.data.z_boundary_mode)
                     self.data.z_boundary_mode = "edge_pad"
-                depths = [int(round(D * float(s))) for s in self.data.multi_res_scales]
+                depths    = [int(round(D * float(s))) for s in self.data.multi_res_scales]
                 depths[0] = D  # s_0 == 1.0
                 self.model.in_channels = int(sum(depths))
             else:

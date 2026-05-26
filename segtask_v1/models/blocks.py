@@ -95,23 +95,22 @@ class ConvNormAct(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        kernel_size: int = 3,
-        stride: int = 1,
-        padding: int = 1,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        dropout: float = 0.0,
-        spatial_dims: int = 3,
-    ):
+        in_ch       : int,
+        out_ch      : int,
+        kernel_size : int = 3,
+        stride      : int = 1,
+        padding     : int = 1,
+        norm_type   : str = "instance",
+        norm_groups : int = 8,
+        activation  : str = "leakyrelu",
+        dropout     : float = 0.0,
+        spatial_dims: int = 3):
         super().__init__()
         d = _check_dims(spatial_dims)
         self.conv = _CONV[d](
             in_ch, out_ch, kernel_size, stride, padding, bias=False)
         self.norm = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
-        self.act = get_activation(activation)
+        self.act  = get_activation(activation)
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -507,47 +506,40 @@ class Downsample(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        mode: str = "conv",
-        spatial_dims: int = 3,
-    ):
+        in_ch       : int,
+        out_ch      : int,
+        norm_type   : str = "instance",
+        norm_groups : int = 8,
+        mode        : str = "conv",
+        spatial_dims: int = 3):
         super().__init__()
         d = _check_dims(spatial_dims)
         if mode not in self.VALID_MODES:
             raise ValueError(
                 f"Unknown downsample mode: {mode}. "
                 f"Valid: {self.VALID_MODES}")
-        self.mode = mode
+        self.mode         = mode
         self.spatial_dims = d
 
-        if mode == "conv":
-            self.op = _CONV[d](in_ch, out_ch, kernel_size=2, stride=2,
-                               bias=False)
+        if   mode == "conv":
+            self.op = _CONV[d](in_ch, out_ch, kernel_size=2, stride=2, bias=False)
         elif mode == "maxpool":
             self.op = nn.Sequential(
                 _MAXPOOL[d](kernel_size=2, stride=2),
-                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False),
-            )
+                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
         elif mode == "avgpool":
             self.op = nn.Sequential(
                 _AVGPOOL[d](kernel_size=2, stride=2),
-                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False),
-            )
+                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
         elif mode == "blurpool":
             self.op = nn.Sequential(
                 BlurPool3d(in_ch, stride=2, filt_size=3, spatial_dims=d),
-                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False),
-            )
+                _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
         else:  # pixelunshuffle
             channel_mult = 2 ** d  # r=2; channels grow by 2^spatial_dims
             self.op = nn.Sequential(
                 PixelUnshuffle3d(r=2, spatial_dims=d),
-                _CONV[d](in_ch * channel_mult, out_ch,
-                         kernel_size=1, bias=False),
-            )
+                _CONV[d](in_ch * channel_mult, out_ch, kernel_size=1, bias=False))
 
         self.norm = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
 

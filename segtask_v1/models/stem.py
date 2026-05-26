@@ -30,13 +30,12 @@ class DualConvStem(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        spatial_dims: int = 3,
-    ):
+        in_ch       : int,
+        out_ch      : int,
+        norm_type   : str = "instance",
+        norm_groups : int = 8,
+        activation  : str = "leakyrelu",
+        spatial_dims: int = 3):
         super().__init__()
         self.block1 = ConvNormAct(
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
@@ -56,22 +55,21 @@ class PatchEmbedStem(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        patch_size: int,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "gelu",
-        spatial_dims: int = 3,
-    ):
+        in_ch       : int,
+        out_ch      : int,
+        patch_size  : int,
+        norm_type   : str = "instance",
+        norm_groups : int = 8,
+        activation  : str = "gelu",
+        spatial_dims: int = 3):
         super().__init__()
         if patch_size < 1:
             raise ValueError(f"patch_size must be >= 1, got {patch_size}")
         self.patch_size = patch_size
-        self.conv = _CONV[spatial_dims](
+        self.conv       = _CONV[spatial_dims](
             in_ch, out_ch,
-            kernel_size=patch_size,
-            stride=patch_size,
+            kernel_size = patch_size,
+            stride      = patch_size,
             bias=False)
         self.norm = get_norm(norm_type, out_ch, norm_groups,
                              spatial_dims=spatial_dims)
@@ -82,27 +80,26 @@ class PatchEmbedStem(nn.Module):
 
 
 def build_stem(
-    mode: str,
-    in_ch: int,
-    out_ch: int,
-    norm_type: str = "instance",
-    norm_groups: int = 8,
-    activation: str = "leakyrelu",
-    spatial_dims: int = 3,
-) -> Tuple[nn.Module, int]:
+    mode        : str,
+    in_ch       : int,
+    out_ch      : int,
+    norm_type   : str = "instance",
+    norm_groups : int = 8,
+    activation  : str = "leakyrelu",
+    spatial_dims: int = 3) -> Tuple[nn.Module, int]:
     """Construct a stem; returns ``(stem_module, stem_stride)`` (1 for conv3/7/dual, N for patchN)."""
     if mode not in STEM_MODES:
         raise ValueError(f"Unknown stem mode: {mode!r}. Valid: {STEM_MODES}")
 
     if mode == "conv3":
-        stem = ConvNormAct(
+        stem = ConvNormAct(  # TODO 如果多加一层就是dual
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
     if mode == "conv7":
-        stem = ConvNormAct(
+        stem = ConvNormAct(  # TODO 再加一层conv3会不会好？
             in_ch, out_ch, kernel_size=7, stride=1, padding=3,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
@@ -140,16 +137,15 @@ class MultiStemProj(nn.Module):
 
     def __init__(
         self,
-        mode: str,
-        n_views: int,
-        in_ch_per_view: int,
-        out_ch: int,
-        norm_type: str = "instance",
-        norm_groups: int = 8,
-        activation: str = "leakyrelu",
-        spatial_dims: int = 3,
-        in_ch_per_view_list: List[int] = None,
-    ):
+        mode               : str,
+        n_views            : int,
+        in_ch_per_view     : int,
+        out_ch             : int,
+        norm_type          : str = "instance",
+        norm_groups        : int = 8,
+        activation         : str = "leakyrelu",
+        spatial_dims       : int = 3,
+        in_ch_per_view_list: List[int] = None):
         """Channel layout: uniform ``in_ch_per_view`` (default) or per-view
         ``in_ch_per_view_list`` (length must equal ``n_views``; takes precedence).
         """
@@ -181,7 +177,7 @@ class MultiStemProj(nn.Module):
             # Sub-stems share mode → stride must agree; defensive guard.
             raise RuntimeError(
                 f"MultiStemProj sub-stems disagree on stride: {strides}")
-        self.stems = nn.ModuleList(stems)
+        self.stems       = nn.ModuleList(stems)
         self.stem_stride = strides[0]
 
         # 1×1 fusion back to out_ch keeps downstream channel contract intact.
@@ -307,18 +303,17 @@ class HierarchicalStems(nn.Module):
 
 
 def build_context_stem(
-    mode: str,
-    fusion: str,
-    n_views: int,
-    in_ch_per_view: int,
-    out_ch: int,
-    norm_type: str = "instance",
-    norm_groups: int = 8,
-    activation: str = "leakyrelu",
-    spatial_dims: int = 3,
-    stage_channels: List[int] = None,
-    in_ch_per_view_list: List[int] = None,
-) -> Tuple[nn.Module, int]:
+    mode               : str,
+    fusion             : str,
+    n_views            : int,
+    in_ch_per_view     : int,
+    out_ch             : int,
+    norm_type          : str = "instance",
+    norm_groups        : int = 8,
+    activation         : str = "leakyrelu",
+    spatial_dims       : int = 3,
+    stage_channels     : List[int] = None,
+    in_ch_per_view_list: List[int] = None) -> Tuple[nn.Module, int]:
     """Dispatch the 2.5D multi-FOV context stem; returns ``(module, stem_stride)``.
 
     - ``n_views==1`` or ``shared_stem``: single stem over all channels (legacy path).
