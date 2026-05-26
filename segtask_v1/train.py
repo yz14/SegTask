@@ -109,7 +109,7 @@ def main():
     save_config(cfg, Path(cfg.train.output_dir) / "resolved_config.yaml")
 
     # Train
-    trainer = Trainer(model, cfg, train_loader, val_loader, device)
+    trainer      = Trainer(model, cfg, train_loader, val_loader, device)
     best_metrics = trainer.fit()
 
     logger.info("Best metrics: %s", best_metrics)

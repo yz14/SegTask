@@ -92,14 +92,14 @@ def build_stem(
         raise ValueError(f"Unknown stem mode: {mode!r}. Valid: {STEM_MODES}")
 
     if mode == "conv3":
-        stem = ConvNormAct(  # TODO 如果多加一层就是dual
+        stem = ConvNormAct(  # TODO 如果多加一层就是dual（可能不需要，因为enc第0层没有降采样）
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
     if mode == "conv7":
-        stem = ConvNormAct(  # TODO 再加一层conv3会不会好？
+        stem = ConvNormAct(  # TODO 再加一层conv3会不会好？（可能不需要，因为enc第0层没有降采样，相对于多的conv）
             in_ch, out_ch, kernel_size=7, stride=1, padding=3,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)

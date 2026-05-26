@@ -257,17 +257,16 @@ class Trainer:
 
     def __init__(
         self,
-        model: UNet3D,
-        cfg: Config,
+        model       : UNet3D,
+        cfg         : Config,
         train_loader: DataLoader,
-        val_loader: DataLoader,
-        device: torch.device,
-    ):
-        self.cfg = cfg
+        val_loader  : DataLoader,
+        device      : torch.device):
+        self.cfg          = cfg
         self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.device = device
-        tc = cfg.train
+        self.val_loader   = val_loader
+        self.device       = device
+        tc                = cfg.train
 
         # 设备放置优先：optimizer/EMA 需绑定已迁移参数；torch.compile 放到最后。
         self.model = model.to(device)
@@ -275,7 +274,7 @@ class Trainer:
         # --- Loss ------------------------------------------------------
         # base_loss 独立保留供验证使用；训练时 criterion 再包 DeepSupervisionLoss / MultiResolutionLoss。
         self.base_loss = build_loss(cfg.loss)
-        self.is_2_5d = cfg.data.patch_mode == "2_5d"
+        self.is_2_5d   = cfg.data.patch_mode == "2_5d"
         # Plan A lift：2.5D 走真 3D 形状 (B, num_fg, D, H, W)，D 作为空间轴。
         # 与 aux_keep_native_d 互斥；可与 aux_seg_supervision 合成。
         self.lift_2_5d_to_3d = bool(
@@ -432,11 +431,11 @@ class Trainer:
             self.aux_inner_losses = None
 
         # --- Optimizer + scheduler ------------------------------------
-        self.optimizer = build_optimizer(self.model, cfg)
+        self.optimizer  = build_optimizer(self.model, cfg)
         steps_per_epoch = len(train_loader)
-        warmup_steps = tc.warmup_epochs * steps_per_epoch
-        total_steps = tc.epochs * steps_per_epoch
-        post_warmup = total_steps - warmup_steps
+        warmup_steps    = tc.warmup_epochs * steps_per_epoch
+        total_steps     = tc.epochs * steps_per_epoch
+        post_warmup     = total_steps - warmup_steps
 
         # OneCycleLR 自带 warmup，与 WarmupScheduler 叠加会双 warmup 且 total_steps 失准。
         if tc.scheduler == "one_cycle" and warmup_steps > 0:
@@ -659,7 +658,7 @@ class Trainer:
     # ------------------------------------------------------------------
     def fit(self) -> Dict[str, float]:
         """Run the full training loop. Returns best validation metrics."""
-        tc = self.cfg.train
+        tc    = self.cfg.train
         timer = Timer()
 
         total_params = sum(p.numel() for p in self.model.parameters()) / 1e6
@@ -667,25 +666,22 @@ class Trainer:
         logger.info("Training: %d epochs, device=%s", tc.epochs, self.device)
         logger.info("Model params: %.2fM", total_params)
         mem = self._estimate_train_memory()
-        ema_part = (f" + ema={mem['ema_mib']:.1f}"
-                    if mem["ema_mib"] > 0 else "")
+        ema_part = (f" + ema={mem['ema_mib']:.1f}" if mem["ema_mib"] > 0 else "")
         logger.info(
             "Static GPU mem (persistent, excl. activations): "
             "param=%.1f + grad=%.1f + optim(%s,%dx)=%.1f%s "
             "= %.1f MiB (real peak reported per-epoch as 'GPU peak')",
             mem["param_mib"], mem["grad_mib"],
             mem["optim_name"], mem["optim_mult"], mem["optim_mib"],
-            ema_part, mem["persistent_mib"],
-        )
+            ema_part, mem["persistent_mib"])
         if self.device.type == "cuda":
-            cur_alloc = torch.cuda.memory_allocated(self.device) / (1 << 20)
+            cur_alloc  = torch.cuda.memory_allocated(self.device) / (1 << 20)
             cur_reserv = torch.cuda.memory_reserved(self.device) / (1 << 20)
             logger.info(
                 "CUDA mem at training start: allocated=%.1f MiB, "
                 "reserved=%.1f MiB (model already on device; "
                 "activations/workspace will add on top during forward).",
-                cur_alloc, cur_reserv,
-            )
+                cur_alloc, cur_reserv)
         logger.info("Train batches: %d, Val batches: %d",
                     len(self.train_loader), len(self.val_loader))
         logger.info("AMP=%s (dtype=%s, resolved=%s, scaler=%s), "
@@ -700,8 +696,7 @@ class Trainer:
         if tc.compile_mode != "none":
             logger.info(
                 "torch.compile mode: %s (active=%s)",
-                tc.compile_mode, self._compile_enabled,
-            )
+                tc.compile_mode, self._compile_enabled)
         logger.info("=" * 60)
 
         best_metrics: Dict[str, float] = {}
@@ -827,14 +822,14 @@ class Trainer:
         # on each component is averaged across the epoch independently.
         # Keys: "L_main", "L_aux_1", "L_aux_2", ...
         component_meters: Dict[str, AverageMeter] = {}
-        tc = self.cfg.train
+        tc    = self.cfg.train
         accum = self.grad_accum_steps
 
         total_steps = len(self.train_loader)
         # Any steps beyond `partial_start` belong to a partial accumulation
         # tail (len(loader) not divisible by accum). Divide those by the
         # real tail length so the effective LR doesn't shrink on them.
-        remainder = total_steps % accum if accum > 1 else 0
+        remainder     = total_steps % accum if accum > 1 else 0
         partial_start = total_steps - remainder
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -850,7 +845,7 @@ class Trainer:
             # already in float32, so this is forward-compatible with
             # configs that pin label dtype upstream.
             label = batch["label"].to(self.device, non_blocking=True).float()
-            wmap = batch.get("weight_map")
+            wmap  = batch.get("weight_map")
             if wmap is not None:
                 wmap = wmap.to(self.device, non_blocking=True)
                 if wmap.numel() == 0 or wmap.shape[1] == 0:
@@ -881,7 +876,7 @@ class Trainer:
             #     are kept at rank-5 ``(B, C_res, D, H, W)`` so per-view
             #     losses can index ``label[:, k]`` for aux head ``k``.
             label_all_views: Optional[torch.Tensor] = None
-            wmap_all_views: Optional[torch.Tensor] = None
+            wmap_all_views : Optional[torch.Tensor] = None
             # ``aux_view_labels[k]`` / ``aux_view_wmaps[k]`` carry the per-
             # view native-depth supervision targets when aux_keep_native_d
             # is on. They are list-form because views have varying D_k —

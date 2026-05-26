@@ -128,7 +128,7 @@ class Encoder(nn.Module):
             x = self.stem(x)
             aux_feats = {}
 
-        features: List[torch.Tensor] = []  # TODO 需要加入stem的特征吗？这是一个全局特征，可以cat到seghead的输入特征
+        features: List[torch.Tensor] = []  # TODO 需要加入stem的特征吗？这是一个全局特征，可以cat到seghead的输入特征（可能不需要因为enc第0层就是全局）
         for i, stage in enumerate(self.stages):
             if i > 0:
                 x = self.downsamples[i - 1](x)
@@ -344,7 +344,7 @@ class UNet3D(nn.Module):
         # output is upsampled back to input resolution in forward(). DS heads
         # stay at their native decoder resolutions (loss downsamples target).
         self.stem_stride = getattr(encoder, "stem_stride", 1)
-        self.seg_head    = SegmentationHead(  # TODO 这里单层是否过于简单？是否需要两层？像ConvSegmentationHead
+        self.seg_head    = SegmentationHead(  # TODO 这里单层是否过于简单？是否可以选择多层？像ConvSegmentationHead
             decoder.out_channels[-1], num_fg_classes, spatial_dims=spatial_dims)
 
         # DS heads in decreasing resolution: forward returns [main, 2nd, ..., lowest]

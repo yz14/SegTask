@@ -22,11 +22,11 @@ class AverageMeter:
         self.reset()
 
     def reset(self):
-        self.sum = 0.0
+        self.sum   = 0.0
         self.count = 0
 
     def update(self, val: float, n: int = 1):
-        self.sum += val * n
+        self.sum   += val * n
         self.count += n
 
     @property
