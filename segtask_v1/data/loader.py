@@ -198,7 +198,7 @@ def _match_per_sample_paths(
     assert sdir.is_dir(), f"{kind} dir not found: {sdir}"
 
     image_suffixes = _normalize_suffixes(image_suffix)
-    out_suffixes = _normalize_suffixes(out_suffix)
+    out_suffixes   = _normalize_suffixes(out_suffix)
 
     out: List[str] = []
     missing: List[str] = []
@@ -325,7 +325,7 @@ def detect_label_values(
     n_total = len(label_paths)
     if max_scan is None or max_scan >= n_total:
         scan_paths = label_paths
-        partial = False
+        partial    = False
     else:
         scan_paths = label_paths[:max_scan]
         partial = True
@@ -623,14 +623,14 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         label_paths=[label_paths[i] for i in val_idx])
     if bbox_paths_all is not None:
         train_paths["bbox_paths"] = [bbox_paths_all[i] for i in train_idx]
-        val_paths["bbox_paths"] = [bbox_paths_all[i] for i in val_idx]
+        val_paths["bbox_paths"]   = [bbox_paths_all[i] for i in val_idx]
     if rw_paths_all is not None:
         train_paths["region_weight_paths"] = [rw_paths_all[i] for i in train_idx]
-        val_paths["region_weight_paths"] = [rw_paths_all[i] for i in val_idx]
+        val_paths["region_weight_paths"]   = [rw_paths_all[i] for i in val_idx]
     # NPZ mode: pass the per-sample npz path slice; dataset routes I/O via npz readers.
     if npz_paths_all is not None:
         train_paths["npz_paths"] = [npz_paths_all[i] for i in train_idx]
-        val_paths["npz_paths"] = [npz_paths_all[i] for i in val_idx]
+        val_paths["npz_paths"]   = [npz_paths_all[i] for i in val_idx]
 
     if dc.patch_mode == "2_5d":
         # 2.5D reuses the z_axis dataset. Two layouts depending on aux_keep_native_d:
@@ -641,7 +641,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         n_views = max(len(dc.multi_res_scales), 1)
         if aux_native_kwargs["aux_keep_native_d"]:
             max_scale = max(dc.multi_res_scales)
-            eD_max = int(round(int(dc.patch_size[0]) * max_scale))
+            eD_max    = int(round(int(dc.patch_size[0]) * max_scale))
             logger.info(
                 "Using 2.5D patch mode + aux_keep_native_d=True "
                 "(oversample=%.2f, scales=%s, n_views=%d, max_scale=%.2f) "
@@ -662,8 +662,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             **train_paths,
             aug_oversample_ratio=train_oversample,
             multi_res_scales=dc.multi_res_scales,
-            foreground_oversample_ratio=dc.foreground_oversample_ratio,
-            samples_per_volume=dc.samples_per_volume,
+            foreground_oversample_ratio = dc.foreground_oversample_ratio,
+            samples_per_volume          = dc.samples_per_volume,
             is_train=True,
             **common_kwargs,
             **z_kwargs,

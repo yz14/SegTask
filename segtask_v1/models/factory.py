@@ -22,8 +22,7 @@ logger = logging.getLogger(__name__)
 def _resolve_blocks_per_stage(
     explicit: List[int],
     n_stages: int,
-    fallback: int,
-) -> List[int]:
+    fallback: int) -> List[int]:
     """Pick per-stage block counts: explicit list wins; else broadcast fallback."""
     if explicit:
         if len(explicit) != n_stages:
@@ -38,9 +37,9 @@ class _StatefulStageBuilder:
     """Per-call stage builder; reads num_blocks from counts[idx], advances idx."""
 
     def __init__(self, factory_fn, counts: List[int]):
-        self._fn = factory_fn
+        self._fn     = factory_fn
         self._counts = counts
-        self._idx = 0
+        self._idx    = 0
 
     def __call__(self, in_ch: int, out_ch: int):
         if self._idx >= len(self._counts):
@@ -60,17 +59,16 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ResNetStage:
         return ResNetStage(
             in_ch, out_ch,
-            num_blocks=num_blocks,
-            norm_type=mc.norm_type,
-            norm_groups=mc.norm_groups,
-            activation=mc.activation,
-            dropout=mc.dropout,
-            use_se=mc.use_se,
-            se_reduction=mc.se_reduction,
-            attention_type=mc.attention_type,
-            block_type=mc.block_type,
-            spatial_dims=spatial_dims,
-        )
+            num_blocks     = num_blocks,
+            norm_type      = mc.norm_type,
+            norm_groups    = mc.norm_groups,
+            activation     = mc.activation,
+            dropout        = mc.dropout,
+            use_se         = mc.use_se,
+            se_reduction   = mc.se_reduction,
+            attention_type = mc.attention_type,
+            block_type     = mc.block_type,
+            spatial_dims   = spatial_dims)
 
     return _StatefulStageBuilder(factory, counts)
 
@@ -97,23 +95,22 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             ", ".join(non_default))
     # linear drop-path rates over total blocks
     total_blocks = sum(counts)
-    dp_rates = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
-    rate_idx = [0]
-    ls_init = float(getattr(mc, "convnext_layer_scale_init", 1e-6))  # <=0 disables
+    dp_rates     = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
+    rate_idx     = [0]
+    ls_init      = float(getattr(mc, "convnext_layer_scale_init", 1e-6))  # <=0 disables
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
         start = rate_idx[0]
-        end = start + num_blocks
+        end   = start + num_blocks
         rates = dp_rates[start:end] if dp_rates else [0.0] * num_blocks
         rate_idx[0] = end
         return ConvNeXtStage(
             in_ch, out_ch,
-            num_blocks=num_blocks,
-            drop_path_rates=rates,
-            attention_type=mc.attention_type,
-            spatial_dims=spatial_dims,
-            layer_scale_init_value=ls_init,
-        )
+            num_blocks             = num_blocks,
+            drop_path_rates        = rates,
+            attention_type         = mc.attention_type,
+            spatial_dims           = spatial_dims,
+            layer_scale_init_value = ls_init)
 
     return _StatefulStageBuilder(factory, counts)
 
@@ -144,10 +141,10 @@ def build_model(cfg: Config):
         raise ValueError(
             f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
 
-    mc = cfg.model
+    mc           = cfg.model
     enc_channels = list(mc.encoder_channels)
-    num_fg = cfg.num_fg_classes
-    n_levels = len(enc_channels)
+    num_fg       = cfg.num_fg_classes
+    n_levels     = len(enc_channels)
     spatial_dims = getattr(mc, "spatial_dims", 3)
 
     # out_classes by mode:
@@ -186,7 +183,7 @@ def build_model(cfg: Config):
     enc_counts = _resolve_blocks_per_stage(
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
 
-    if mc.decoder_type == "unet":
+    if   mc.decoder_type == "unet":
         expected_dec_calls = n_levels - 1
     elif mc.decoder_type == "unetpp":
         expected_dec_calls = n_levels * (n_levels - 1) // 2
@@ -204,7 +201,7 @@ def build_model(cfg: Config):
 
     # separate enc/dec builders so call counters are independent
     downsample_builder = None
-    if mc.backbone == "resnet":
+    if   mc.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(cfg, enc_counts)
         dec_builder = _make_resnet_stage_builder(cfg, dec_counts)
     elif mc.backbone == "convnext":
@@ -218,19 +215,19 @@ def build_model(cfg: Config):
 
     # Build encoder
     encoder = Encoder(
-        in_channels=mc.in_channels,
-        stage_channels=enc_channels,
-        stage_builder=enc_builder,
-        norm_type=mc.norm_type,
-        norm_groups=mc.norm_groups,
-        activation=mc.activation,
-        downsample_mode=mc.downsample_mode,
-        stem_mode=mc.stem_mode,
-        spatial_dims=spatial_dims,
-        context_n_views=context_n_views,
-        context_fusion=getattr(mc, "context_fusion", "shared_stem"),
-        in_ch_per_view_list=in_ch_per_view_list,
-        downsample_builder=downsample_builder)
+        in_channels         = mc.in_channels,
+        stage_channels      = enc_channels,
+        stage_builder       = enc_builder,
+        norm_type           = mc.norm_type,
+        norm_groups         = mc.norm_groups,
+        activation          = mc.activation,
+        downsample_mode     = mc.downsample_mode,
+        stem_mode           = mc.stem_mode,
+        spatial_dims        = spatial_dims,
+        context_n_views     = context_n_views,
+        context_fusion      = getattr(mc, "context_fusion", "shared_stem"),
+        in_ch_per_view_list = in_ch_per_view_list,
+        downsample_builder  = downsample_builder)
 
     # decoder: unet | unetpp | unet3p
     if mc.decoder_type == "unet3p":

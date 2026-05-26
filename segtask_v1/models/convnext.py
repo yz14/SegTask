@@ -36,8 +36,8 @@ class LayerNorm3d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(num_channels))
-        self.bias = nn.Parameter(torch.zeros(num_channels))
-        self.eps = eps
+        self.bias   = nn.Parameter(torch.zeros(num_channels))
+        self.eps    = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, *spatial)
@@ -53,25 +53,23 @@ class ConvNeXtBlock(nn.Module):
 
     def __init__(
         self,
-        dim: int,
-        expand_ratio: float = 4.0,
-        drop_path: float = 0.0,
-        attention_type: str = "none",
-        spatial_dims: int = 3,
-        layer_scale_init_value: float = 1e-6,
-    ):
+        dim                   : int,
+        expand_ratio          : float = 4.0,
+        drop_path             : float = 0.0,
+        attention_type        : str = "none",
+        spatial_dims          : int = 3,
+        layer_scale_init_value: float = 1e-6):
         super().__init__()
         d = spatial_dims
         self.spatial_dims = d
         hidden = int(dim * expand_ratio)
 
-        self.dwconv = _CONV[d](dim, dim, kernel_size=7, padding=3,
-                               groups=dim, bias=True)
-        self.norm = LayerNorm3d(dim)
+        self.dwconv  = _CONV[d](dim, dim, kernel_size=7, padding=3, groups=dim, bias=True)
+        self.norm    = LayerNorm3d(dim)
         self.pwconv1 = _CONV[d](dim, hidden, kernel_size=1, bias=True)
-        self.act = nn.GELU()
+        self.act     = nn.GELU()
         self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
-        self.attn = make_attention(attention_type, dim, spatial_dims=d)
+        self.attn    = make_attention(attention_type, dim, spatial_dims=d)
         # LayerScale: init small → near-identity start; <=0 disables
         if layer_scale_init_value > 0.0:
             self.gamma = nn.Parameter(
@@ -81,7 +79,7 @@ class ConvNeXtBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
+        res = x
         out = self.dwconv(x)
         out = self.norm(out)
         out = self.pwconv1(out)
@@ -90,8 +88,8 @@ class ConvNeXtBlock(nn.Module):
         out = self.attn(out)
         if self.gamma is not None:
             shape = (1, -1) + (1,) * self.spatial_dims
-            out = out * self.gamma.reshape(shape)
-        return residual + self.drop_path(out)
+            out   = out * self.gamma.reshape(shape)
+        return res + self.drop_path(out)
 
 
 class ConvNeXtAdaptBlock(nn.Module):
@@ -99,24 +97,20 @@ class ConvNeXtAdaptBlock(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        expand_ratio: float = 4.0,
-        drop_path: float = 0.0,
-        attention_type: str = "none",
-        spatial_dims: int = 3,
-        layer_scale_init_value: float = 1e-6,
-    ):
+        in_ch                 : int,
+        out_ch                : int,
+        expand_ratio          : float = 4.0,
+        drop_path             : float = 0.0,
+        attention_type        : str = "none",
+        spatial_dims          : int = 3,
+        layer_scale_init_value: float = 1e-6):
         super().__init__()
         d = spatial_dims
         self.proj = (
             nn.Sequential(
                 _CONV[d](in_ch, out_ch, 1, bias=False),
-                LayerNorm3d(out_ch),
-            )
-            if in_ch != out_ch
-            else nn.Identity()
-        )
+                LayerNorm3d(out_ch))
+            if in_ch != out_ch else nn.Identity())
         self.block = ConvNeXtBlock(
             out_ch, expand_ratio, drop_path,
             attention_type=attention_type,
@@ -132,15 +126,14 @@ class ConvNeXtStage(nn.Module):
 
     def __init__(
         self,
-        in_ch: int,
-        out_ch: int,
-        num_blocks: int = 2,
-        expand_ratio: float = 4.0,
-        drop_path_rates: list = None,
-        attention_type: str = "none",
-        spatial_dims: int = 3,
-        layer_scale_init_value: float = 1e-6,
-    ):
+        in_ch                 : int,
+        out_ch                : int,
+        num_blocks            : int = 2,
+        expand_ratio          : float = 4.0,
+        drop_path_rates       : list = None,
+        attention_type        : str = "none",
+        spatial_dims          : int = 3,
+        layer_scale_init_value: float = 1e-6):
         super().__init__()
         d = spatial_dims
         if drop_path_rates is None:
@@ -166,17 +159,11 @@ class ConvNeXtStage(nn.Module):
 class ConvNeXtDownsample(nn.Module):
     """Paper-faithful ConvNeXt inter-stage downsample: LN → Conv(k=2,s=2). LN-first."""
 
-    def __init__(
-        self,
-        in_ch: int,
-        out_ch: int,
-        spatial_dims: int = 3,
-    ):
+    def __init__(self, in_ch: int, out_ch: int, spatial_dims: int = 3):
         super().__init__()
         d = spatial_dims
         self.norm = LayerNorm3d(in_ch)
-        self.conv = _CONV[d](in_ch, out_ch, kernel_size=2, stride=2,
-                             bias=True)
+        self.conv = _CONV[d](in_ch, out_ch, kernel_size=2, stride=2, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(self.norm(x))

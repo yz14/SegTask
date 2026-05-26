@@ -37,9 +37,9 @@ class Encoder(nn.Module):
         stem_mode: str = "conv3",
         spatial_dims: int = 3,
         context_n_views: int = 1,
-        context_fusion: str = "shared_stem",
+        context_fusion     : str = "shared_stem",
         in_ch_per_view_list: List[int] = None,
-        downsample_builder: Optional[Callable[[int, int], nn.Module]] = None):
+        downsample_builder : Optional[Callable[[int, int], nn.Module]] = None):
         super().__init__()
         self.spatial_dims = spatial_dims
         # Stem may introduce a spatial stride (patch2/patch4); stem_stride is

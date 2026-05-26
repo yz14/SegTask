@@ -634,7 +634,7 @@ def compute_bbox_from_volume(vol: np.ndarray) -> Optional[BBox]:
     """
     if vol.ndim != 3:
         raise ValueError(f"BBox volume must be 3D (D,H,W), got {vol.ndim}D")
-    mask = np.round(vol).astype(np.int32) != 0
+    mask = np.round(vol).astype(np.int16) != 0
     if not mask.any():
         return None
     d_any = np.any(mask, axis=(1, 2))
@@ -815,29 +815,30 @@ class SegDataset3D(Dataset):
 
     def __init__(
         self,
-        image_paths: List[str],
-        label_paths: List[str],
-        label_values: List[int],
-        patch_size: Tuple[int, int, int] = (64, 128, 128),
-        aug_oversample_ratio: float = 1.0,
-        multi_res_scales: Optional[List[float]] = None,
-        intensity_min: float = -1024.0,
-        intensity_max: float = 3071.0,
-        normalize: str = "minmax",
-        global_mean: float = 0.0,
-        global_std: float = 1.0,
+        image_paths                : List[str],
+        label_paths                : List[str],
+        label_values               : List[int],
+        patch_size                 : Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio       : float = 1.0,
+        multi_res_scales           : Optional[List[float]] = None,
+        intensity_min              : float = -1024.0,
+        intensity_max              : float = 3071.0,
+        normalize                  : str = "minmax",
+        global_mean                : float = 0.0,
+        global_std                 : float = 1.0,
         foreground_oversample_ratio: float = 0.5,
-        samples_per_volume: int = 8,
-        is_train: bool = True,
-        cache_enabled: bool = True,
-        cache_max_volumes: int = 0,
-        region_weights: Optional[List[float]] = None,
-        bbox_paths: Optional[List[str]] = None,
-        region_weight_paths: Optional[List[str]] = None,
-        z_boundary_mode: str = "stretch",
-        aux_keep_native_d: bool = False,
-        keep_native_multi_res: bool = False,
-        npz_paths: Optional[List[str]] = None):
+        samples_per_volume         : int = 8,
+        is_train                   : bool = True,
+        cache_enabled              : bool = True,
+        cache_max_volumes          : int = 0,
+        region_weights             : Optional[List[float]] = None,
+        bbox_paths                 : Optional[List[str]] = None,
+        region_weight_paths        : Optional[List[str]] = None,
+        z_boundary_mode            : str = "stretch",
+        aux_keep_native_d          : bool = False,
+        keep_native_multi_res      : bool = False,
+        npz_paths                  : Optional[List[str]] = None):
+
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert aug_oversample_ratio >= 1.0, (
@@ -846,11 +847,11 @@ class SegDataset3D(Dataset):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
                 f"got {z_boundary_mode!r}")
-        self.image_paths = image_paths
-        self.label_paths = label_paths
+        self.image_paths  = image_paths
+        self.label_paths  = label_paths
         self.label_values = label_values
-        self.patch_size = tuple(patch_size)
-        self.oversample = float(aug_oversample_ratio)
+        self.patch_size   = tuple(patch_size)
+        self.oversample   = float(aug_oversample_ratio)
         # Z-axis mode: ONLY the z (depth) extent is oversampled so the trainer
         # can center-crop rotation / elastic margin along z after GPU aug.
         # H, W are taken at full volume resolution during extraction and
@@ -867,21 +868,21 @@ class SegDataset3D(Dataset):
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
         assert all(s >= 1.0 for s in self.multi_res_scales), (
             f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
-        self.intensity_min = intensity_min
-        self.intensity_max = intensity_max
-        self.normalize = normalize
-        self.global_mean = global_mean
-        self.global_std = global_std
-        self.fg_ratio = foreground_oversample_ratio
+        self.intensity_min      = intensity_min
+        self.intensity_max      = intensity_max
+        self.normalize          = normalize
+        self.global_mean        = global_mean
+        self.global_std         = global_std
+        self.fg_ratio           = foreground_oversample_ratio
         self.samples_per_volume = samples_per_volume
-        self.is_train = is_train
-        self.region_weights = region_weights
+        self.is_train           = is_train
+        self.region_weights     = region_weights
         # Boundary handling for the scale=1.0 z-window. ``stretch`` keeps the
         # legacy "clamp + resize-stretch" behaviour; ``edge_pad`` switches
         # to ``extract_z_patch_padded`` so every window has exactly eD
         # physical-1-slice-spacing slices, matching the ``scale > 1.0``
         # contract and the inference predictor under the same toggle.
-        self.z_boundary_mode = z_boundary_mode
+        self.z_boundary_mode    = z_boundary_mode
 
         # ---- Native-depth multi-FOV path (2.5D + aux_seg_supervision) ----
         # When True (validated upstream in Config.validate to be only with

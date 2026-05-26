@@ -93,7 +93,7 @@ def _compute_fg_indices(
         return (np.zeros((0,), dtype=np.int32),
                 np.zeros((0, 3), dtype=np.int32))
     fg_slices = np.where(np.any(fg_mask, axis=(1, 2)))[0].astype(np.int32)
-    coords = np.argwhere(fg_mask).astype(np.int32)
+    coords    = np.argwhere(fg_mask).astype(np.int32)
     if fg_subsample > 0 and len(coords) > fg_subsample:
         rng = np.random.RandomState(seed)
         idx = rng.choice(len(coords), fg_subsample, replace=False)
@@ -176,34 +176,31 @@ def prepare_one(
 
     # 6. Provenance metadata (self-describing for debugging).
     meta = {
-        "pid": pid,
-        "src_image": str(image_path),
-        "src_label": str(label_path),
-        "src_bbox": str(bbox_path) if bbox_path else "",
-        "src_rw": str(rw_path) if rw_path else "",
-        "bbox": (
-            list(map(list, bbox)) if bbox is not None else None),
+        "pid"         : pid,
+        "src_image"   : str(image_path),
+        "src_label"   : str(label_path),
+        "src_bbox"    : str(bbox_path) if bbox_path else "",
+        "src_rw"      : str(rw_path) if rw_path else "",
+        "bbox"        : (list(map(list, bbox)) if bbox is not None else None),
         "label_values": list(map(int, label_values)),
-        "has_rw": rw is not None,
-        "rw_shift": 1.0,
-        "rw_dtype": rw_dtype_stored,    # int16 / float32 / None
-        "image_dtype": str(image.dtype),
-        "made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "tool_version": _TOOL_VERSION,
-    }
+        "has_rw"      : rw is not None,
+        "rw_shift"    : 1.0,
+        "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
+        "image_dtype" : str(image.dtype),
+        "made_at"     : datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
 
     # 7. Atomic write (tmp + rename). Pass an open file handle to np.savez
     # so it does NOT auto-append ".npz" to our tmp name.
     tmp_path = out_p.with_name(out_p.name + ".tmp")
-    save_fn = np.savez_compressed if compress else np.savez
-    payload = {
-        "image": image,
-        "label": label,
+    save_fn  = np.savez_compressed if compress else np.savez
+    payload  = {
+        "image"    : image,
+        "label"    : label,
         "fg_slices": fg_slices,
         "fg_coords": fg_coords,
-        "meta": meta_arr,
-    }
+        "meta"     : meta_arr}
     if rw is not None:
         payload["rw"] = rw
     with open(tmp_path, "wb") as fh:
@@ -215,14 +212,13 @@ def prepare_one(
 
     elapsed = time.perf_counter() - t0
     return {
-        "pid": pid,
-        "status": "written",
-        "size_bytes": out_p.stat().st_size,
-        "elapsed_s": elapsed,
-        "shape": tuple(image.shape),
-        "n_fg_slices": int(fg_slices.size),
-        "n_fg_coords": int(fg_coords.shape[0]),
-    }
+        "pid"         : pid,
+        "status"      : "written",
+        "size_bytes"  : out_p.stat().st_size,
+        "elapsed_s"   : elapsed,
+        "shape"       : tuple(image.shape),
+        "n_fg_slices" : int(fg_slices.size),
+        "n_fg_coords" : int(fg_coords.shape[0])}
 
 
 # =============================================================================
@@ -232,33 +228,32 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
     """Discover and pair image/label/bbox/rw paths via loader helpers; honours exclude_list."""
     dc = cfg.data
 
-    image_paths, label_paths = discover_samples(
+    image_paths, label_paths = discover_samples(  # 配对
         dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
 
     exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
-    image_paths, label_paths, _ = _filter_by_exclude(
+    image_paths, label_paths, _ = _filter_by_exclude(  # 过滤
         image_paths, label_paths, dc.image_suffix, exclude_pids)
 
     bbox_paths_all: Optional[List[str]] = None
     if getattr(dc, "bbox_dir", ""):
-        bbox_paths_all = match_bbox_paths(
+        bbox_paths_all = match_bbox_paths(  # 匹配bbox(严格1:1)
             image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
 
     rw_paths_all: Optional[List[str]] = None
     if getattr(dc, "region_weight_dir", ""):
-        rw_paths_all = match_region_weight_paths(
+        rw_paths_all = match_region_weight_paths(  # 匹配region weight(严格1:1)
             image_paths, dc.region_weight_dir, dc.image_suffix,
             getattr(dc, "region_weight_suffix", ".nii.gz"))
 
     samples: List[Dict[str, Optional[str]]] = []
     for i, (img, lbl) in enumerate(zip(image_paths, label_paths)):
         samples.append({
-            "pid": _stem(img, dc.image_suffix),
+            "pid"  : _stem(img, dc.image_suffix),
             "image": img,
             "label": lbl,
-            "bbox": bbox_paths_all[i] if bbox_paths_all else None,
-            "rw": rw_paths_all[i] if rw_paths_all else None,
-        })
+            "bbox" : bbox_paths_all[i] if bbox_paths_all else None,
+            "rw"   : rw_paths_all[i] if rw_paths_all else None})
     return samples
 
 
@@ -269,7 +264,7 @@ def _resolve_label_values(
     if dc.label_values:
         return list(map(int, dc.label_values))
     label_paths = [s["label"] for s in samples]
-    detected = detect_label_values(label_paths)
+    detected    = detect_label_values(label_paths)
     return list(map(int, detected))
 
 
@@ -305,11 +300,11 @@ def prepare_dataset(
         out_path = str(out_p / f"{s['pid']}.npz")
         tasks.append((s, out_path))
 
-    n_total = len(tasks)
+    n_total  = len(tasks)
     counters = {"written": 0, "skipped": 0, "failed": 0, "total": n_total}
-    failures: List[Tuple[str, str]] = []   # (pid, error)
-    timings: List[float] = []
-    sizes: List[int] = []
+    failures : List[Tuple[str, str]] = []   # (pid, error)
+    timings  : List[float] = []
+    sizes    : List[int] = []
 
     logger.info(
         "Preparing %d samples → %s (workers=%d, compress=%s, "
@@ -318,17 +313,16 @@ def prepare_dataset(
 
     def _kwargs(sample: Dict[str, Optional[str]], out_path: str) -> dict:
         return dict(
-            pid=sample["pid"],
-            image_path=sample["image"],
-            label_path=sample["label"],
-            bbox_path=sample["bbox"],
-            rw_path=sample["rw"],
-            out_path=out_path,
-            label_values=label_values,
-            fg_subsample=fg_subsample,
-            compress=compress,
-            overwrite=overwrite,
-        )
+            pid          = sample["pid"],
+            image_path   = sample["image"],
+            label_path   = sample["label"],
+            bbox_path    = sample["bbox"],
+            rw_path      = sample["rw"],
+            out_path     = out_path,
+            label_values = label_values,
+            fg_subsample = fg_subsample,
+            compress     = compress,
+            overwrite    = overwrite)
 
     t0 = time.perf_counter()
 

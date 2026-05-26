@@ -55,13 +55,13 @@ def get_conv(spatial_dims: int = 3) -> Type[nn.Module]:
 
 
 def get_norm(
-    norm_type: str,
+    norm_type   : str,
     num_channels: int,
-    num_groups: int = 8,
+    num_groups  : int = 8,
     spatial_dims: int = 3) -> nn.Module:
     """nD norm: ``batch`` / ``instance`` (per spatial_dims) | ``group`` (dim-agnostic)."""
     d = _check_dims(spatial_dims)
-    if norm_type == "batch":
+    if   norm_type == "batch":
         return _BN[d](num_channels)
     elif norm_type == "instance":
         return _IN[d](num_channels, affine=True)
@@ -75,7 +75,7 @@ def get_norm(
 
 def get_activation(name: str) -> nn.Module:
     """Create an activation layer."""
-    if name == "relu":
+    if   name == "relu":
         return nn.ReLU(inplace=True)
     elif name == "leakyrelu":
         return nn.LeakyReLU(0.01, inplace=True)
