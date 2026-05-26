@@ -1,47 +1,9 @@
-"""ResNet building blocks for 3D UNet encoder and decoder.
-
-Four block variants are provided (selectable per-stage):
-
-- ``ResNetBlock`` (``basic``, post-activation, default)
-    Classic: conv → norm → act → conv → norm (+ attention) → residual → act.
-    Lightweight and the best default for shallow-to-medium networks.
-
-- ``PreActResNetBlock`` (``preact``)
-    Pre-activation (He et al., "Identity Mappings in Deep Residual Networks",
-    ECCV 2016): norm → act → conv → norm → act → conv (+ attention) → residual.
-    Trains better at depth (16+ blocks per stage), recommended for
-    nnU-Net ResEnc-L / XL configurations.
-
-- ``BottleneckBlock`` (``bottleneck``)
-    1×1×1 reduce → 3×3×3 → 1×1×1 expand with an inverted-residual style
-    4× expansion (nnU-Net ResEnc XL), post-activation with pre-residual
-    norm matching the original ResNet-50 design.
-
-- ``R2Plus1DBlock`` (``r2plus1d``, **3D-only**)
-    Factorized (2+1)D residual block. Each logical 3×3×3 convolution is
-    split into a spatial 2D conv (kernel 1×3×3, operating on H/W) followed
-    by a temporal 1D conv (kernel 3×1×1, operating along the depth axis).
-    Source: Tran et al., "A Closer Look at Spatiotemporal Convolutions for
-    Action Recognition" (R(2+1)D, CVPR 2018) and Qiu et al. "P3D-ResNet"
-    (ICCV 2017). Adopted in nnFormer / MedNeXt for medical volumes with
-    thin-slab geometry, where the z axis carries genuine context but a
-    full isotropic 3×3×3 kernel is overkill (and parameter-heavy).
-
-    Why: lets a network with a (mostly) 2D inductive bias inject explicit
-    inter-slice context at a fraction of full-3D-conv FLOPs. Total params
-    per block ≈ ``24·C²`` vs. ``54·C²`` for full-3D basic (k=3, ignoring
-    shortcut), and the spatial sub-conv stays initialisable from any 2D
-    pretrained weight set.
-
-    Restriction: requires ``spatial_dims == 3``. Using it in 2.5D mode
-    (``spatial_dims == 2``, D folded into the channel axis) is rejected
-    in ``__init__`` — the depth axis must be present as a real spatial
-    dimension for the temporal sub-conv to be meaningful.
-
-Encoder level: N blocks (asymmetric counts allowed via
-``encoder_blocks_per_stage`` in config). Downsampling is external
-(see blocks.Downsample).
-Decoder level: M blocks (typically 1 in ResEnc), applied after skip fusion.
+"""ResNet blocks for 3D/2D UNet stages. Block types (block_type):
+  - 'basic'     : post-act, conv-norm-act-conv-norm; default, light
+  - 'preact'    : norm-act-conv-... (He 2016); better for deep ResEnc-L/XL
+  - 'bottleneck': 1x1 reduce / 3x3 / 1x1 expand (ResEnc-XL)
+  - 'r2plus1d'  : (1,3,3) spatial + (3,1,1) temporal, 3D-only; cheap z-context
+Downsampling is external (blocks.Downsample).
 """
 
 from __future__ import annotations
@@ -56,11 +18,8 @@ from .blocks import (
 
 
 class ResNetBlock(nn.Module):
-    """Single ResNet block: conv-norm-act-conv-norm + optional attention + residual.
-
-    Attention variant is controlled by ``attention_type`` (none/se/eca/cbam/coord).
-    The legacy ``use_se`` flag remains for backwards compatibility and is
-    treated as ``attention_type='se'`` when attention_type is 'none'.
+    """Post-act ResNet block (+ optional attention). attention_type: none|se|eca|cbam|coord.
+    Legacy use_se=True is promoted to attention_type='se' when not set.
     """
 
     def __init__(
@@ -87,14 +46,11 @@ class ResNetBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        # Back-compat: promote legacy use_se → attention_type="se" when the
-        # caller did not set attention_type explicitly.
         if attention_type == "none" and use_se:
-            attention_type = "se"
+            attention_type = "se"  # legacy use_se back-compat
         self.attn = make_attention(attention_type, out_ch,
                                    spatial_dims=d, reduction=se_reduction)
 
-        # Shortcut projection if channel mismatch
         self.shortcut = (
             nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
                           get_norm(norm_type, out_ch, norm_groups,
@@ -112,12 +68,7 @@ class ResNetBlock(nn.Module):
 
 
 class PreActResNetBlock(nn.Module):
-    """Pre-activation ResNet block (He et al., ECCV 2016).
-
-    Order: norm → act → conv → norm → act → conv (+ attention) → residual.
-    The raw ``x`` (no norm/act applied) forms the identity path, which
-    empirically improves gradient flow for deep encoders (ResEnc L/XL).
-    """
+    """Pre-act ResNet block (He 2016): norm-act-conv x2 + residual; better for deep encoders."""
 
     def __init__(
         self,
@@ -149,9 +100,7 @@ class PreActResNetBlock(nn.Module):
         self.attn = make_attention(attention_type, out_ch,
                                    spatial_dims=d, reduction=se_reduction)
 
-        # Shortcut is applied on the ORIGINAL x (no normalisation).  If the
-        # channel count changes we use a 1×1(×1) projection (still in the raw
-        # identity path — this follows the canonical pre-act design).
+        # shortcut on raw x; channel-mismatch uses 1x1 projection (canonical pre-act)
         self.shortcut = (
             _CONV[d](in_ch, out_ch, 1, bias=False)
             if in_ch != out_ch else nn.Identity())
@@ -166,12 +115,7 @@ class PreActResNetBlock(nn.Module):
 
 
 class BottleneckBlock(nn.Module):
-    """Inverted-residual / ResNet-50-style bottleneck block (3D).
-
-    1×1×1 reduce → 3×3×3 → 1×1×1 expand with ``expansion`` = 4 by default.
-    Used in nnU-Net ResEnc-XL for exceptionally deep encoders where basic
-    blocks become parameter-heavy.
-    """
+    """ResNet-50-style bottleneck: 1x1 reduce → 3x3 → 1x1 expand (expansion=4, for ResEnc-XL)."""
 
     def __init__(
         self,
@@ -226,37 +170,10 @@ class BottleneckBlock(nn.Module):
         return self.act3(out + residual)
 
 
-# ---------------------------------------------------------------------------
-# R(2+1)D residual block — 3D-only.
-#
-# Each logical 3×3×3 conv is factorised into:
-#   * spatial sub-conv : kernel (1, 3, 3), padding (0, 1, 1) — H/W only.
-#   * temporal sub-conv: kernel (3, 1, 1), padding (1, 0, 0) — D only.
-# Norm + activation are inserted between the two sub-convs (per the
-# original R(2+1)D paper; this is the key ingredient that makes the
-# factorisation strictly more expressive than a plain 3D conv with the
-# same param budget — non-linearity in the middle decouples spatial vs.
-# temporal feature spaces).
-#
-# We keep the *number of intermediate channels equal to ``out_ch``* (no
-# rank-reducing bottleneck). The R(2+1)D paper proposes an intermediate
-# width that exactly matches the param count of an isotropic 3D conv,
-# but in our setting the isotropic baseline is ``ResNetBlock`` (already
-# in the registry). Setting mid = out_ch keeps the block's internal
-# behaviour easy to reason about while still being substantially cheaper
-# (and stronger on z-context) than full 3D — see the docstring at the top
-# of this file for the param accounting.
-# ---------------------------------------------------------------------------
 class R2Plus1DBlock(nn.Module):
-    """Factorised (2+1)D residual block. ``spatial_dims=3`` only.
-
-    Mirrors :class:`ResNetBlock`'s post-activation residual structure but
-    replaces each 3×3×3 conv with a (1×3×3) spatial conv → norm → act →
-    (3×1×1) temporal conv. The block is stride-1; downsampling stays
-    external (handled by ``blocks.Downsample`` between stages, identical
-    to all other block types).
-
-    Args mirror :class:`ResNetBlock`. ``temporal_kernel`` defaults to 3.
+    """R(2+1)D residual block (Tran 2018), 3D-only.
+    Each 3x3x3 → (1,3,3) spatial conv + norm + act + (3,1,1) temporal conv.
+    Mid non-linearity is essential. mid_ch = out_ch (no bottleneck).
     """
 
     def __init__(
@@ -275,10 +192,7 @@ class R2Plus1DBlock(nn.Module):
     ):
         super().__init__()
         if spatial_dims != 3:
-            # The temporal sub-conv only makes sense when D is a real
-            # spatial axis. In 2.5D (spatial_dims=2) D has been folded
-            # into the channel axis, so a (3,1,1) kernel cannot reach
-            # neighbouring slices. Fail fast with a precise diagnostic.
+            # D must be a real axis; in 2.5D D is folded into channels.
             raise ValueError(
                 "R2Plus1DBlock requires spatial_dims=3 (D must be a real "
                 "spatial axis). For 2.5D mode (spatial_dims=2), use "
@@ -292,7 +206,7 @@ class R2Plus1DBlock(nn.Module):
         d = 3
         t_pad = temporal_kernel // 2
 
-        # --- First (2+1)D pair (in_ch → out_ch via a mid layer of out_ch) ---
+        # First (2+1)D pair (in_ch → out_ch)
         self.spatial1 = nn.Conv3d(
             in_ch, out_ch, kernel_size=(1, 3, 3),
             padding=(0, 1, 1), bias=False)
@@ -304,7 +218,7 @@ class R2Plus1DBlock(nn.Module):
         self.norm_t1 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act_t1 = get_activation(activation)
 
-        # --- Second (2+1)D pair (out_ch → out_ch) ----------------------------
+        # Second (2+1)D pair (out_ch → out_ch)
         self.spatial2 = nn.Conv3d(
             out_ch, out_ch, kernel_size=(1, 3, 3),
             padding=(0, 1, 1), bias=False)
@@ -314,18 +228,15 @@ class R2Plus1DBlock(nn.Module):
             out_ch, out_ch, kernel_size=(temporal_kernel, 1, 1),
             padding=(t_pad, 0, 0), bias=False)
         self.norm_t2 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
-        # Final activation applied AFTER residual addition (post-act style).
-        self.act_out = get_activation(activation)
+        self.act_out = get_activation(activation)  # applied after residual add
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        # Attention on the post-conv pre-residual feature, matching ``ResNetBlock``.
         if attention_type == "none" and use_se:
             attention_type = "se"
         self.attn = make_attention(
             attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
-        # Channel-mismatch shortcut: 1×1×1 + norm (mirrors ``ResNetBlock``).
         self.shortcut = (
             nn.Sequential(
                 _CONV[d](in_ch, out_ch, 1, bias=False),
@@ -339,22 +250,16 @@ class R2Plus1DBlock(nn.Module):
                 f"R2Plus1DBlock expects rank-5 input (B, C, D, H, W); "
                 f"got shape={tuple(x.shape)}.")
         residual = self.shortcut(x)
-        # First (2+1)D pair: spatial → temporal, with mid-non-linearity.
         out = self.act_s1(self.norm_s1(self.spatial1(x)))
         out = self.act_t1(self.norm_t1(self.temporal1(out)))
         out = self.drop(out)
-        # Second (2+1)D pair: matching post-act ResNet structure — no
-        # activation between norm_t2 and the residual add (the final act
-        # fires after addition, like ResNetBlock).
+        # post-act: no act before residual add (matches ResNetBlock)
         out = self.act_s2(self.norm_s2(self.spatial2(out)))
         out = self.norm_t2(self.temporal2(out))
         out = self.attn(out)
         return self.act_out(out + residual)
 
 
-# ---------------------------------------------------------------------------
-# Block-type dispatch registry
-# ---------------------------------------------------------------------------
 _BLOCK_REGISTRY = {
     "basic": ResNetBlock,
     "preact": PreActResNetBlock,
@@ -373,13 +278,8 @@ def _make_block(block_type: str, in_ch: int, out_ch: int, **kwargs) -> nn.Module
 
 
 class ResNetStage(nn.Module):
-    """A stage of N residual blocks at a fixed resolution.
-
-    First block may change channels (in_ch → out_ch).
-    Subsequent blocks maintain out_ch.
-
-    ``block_type`` selects the residual unit: "basic" (default),
-    "preact", or "bottleneck" (see module docstring).
+    """N residual blocks at one resolution. First block may change channels.
+    block_type: 'basic' (default) | 'preact' | 'bottleneck' | 'r2plus1d'.
     """
 
     def __init__(

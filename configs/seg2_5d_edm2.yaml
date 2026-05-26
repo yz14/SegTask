@@ -1,38 +1,19 @@
-# ============================================================================
-# 2.5D Segmentation Configuration — EDM2 U-Net arch
+# 2.5D 分割 — EDM2 U-Net (Karras et al., CVPR 2024) 作分割 backbone:
+#   Magnitude-preserving (MP) ops: MPConv + forced weight-norm, mp_silu, mp_sum,
+#     mp_cat, pixel-norm; Block (去 noise/class emb), 可选 MP self-attn
+#   Multi-FOV stem: MP-native (每 view MPConv → mp_cat → MPConv 1×1 fusion);
+#     不支持 'hierarchical'
+#   输出 (B, num_fg*D, H, W); MP seg-head + learnable out_gain
+#   aux_seg_supervision (仅 Plan A) / deep_supervision 正交
 #
-# Paper-faithful EDM2 U-Net (Karras et al., CVPR 2024) adapted as a
-# segmentation backbone:
-#   - Magnitude-preserving (MP) ops: MPConv with forced weight
-#     normalization, mp_silu (SiLU/0.596), mp_sum, mp_cat, pixel-norm.
-#   - Block (no-emb variant) with optional MP self-attention; noise/class
-#     embedding paths from the original diffusion model are removed.
-#   - Multi-FOV stem uses an MP-native variant (per-view MPConv → mp_cat
-#     → MPConv 1×1 fusion). 'hierarchical' fusion is NOT supported.
-#   - Output: (B, num_fg * D, H, W); MP seg-head with learnable out_gain.
-#   - aux_seg_supervision (Plan A only) and deep_supervision compose.
-#
-# IGNORED fields when arch == "edm2":
-#   model.backbone / model.block_type / model.norm_type / model.activation
-#   model.attention_type / model.use_se / model.decoder_type
-#   model.unet3p_cat_channels / model.resenc_preset / model.skip_attention
-#   model.skip_mode / model.upsample_mode / model.downsample_mode
-#   model.drop_path_rate / model.convnext_*  (paper fixes the internals).
-#
-# HONOURED fields:
-#   data.* (full pipeline)
-#   model.encoder_channels / encoder_blocks_per_stage / decoder_blocks_per_stage
-#   model.context_fusion (shared_stem | multi_stem_proj)
-#   model.deep_supervision / aux_seg_supervision / aux_head_mode
-#   model.dropout (reused as Block dropout)
-#   model.edm2_attention_levels / edm2_channels_per_head
-#   model.edm2_res_balance / edm2_attn_balance / edm2_concat_balance
-#   model.edm2_clip_act
-# ============================================================================
+# arch=='edm2' 时忽略: backbone/block_type/norm_type/activation/attention_type
+#   /use_se/decoder_type/unet3p_cat_channels/resenc_preset/skip_attention
+#   /skip_mode/upsample_mode/downsample_mode/drop_path_rate (论文固定)
+# 生效字段: data.*, encoder_channels/encoder_blocks_per_stage/decoder_blocks_per_stage,
+#   context_fusion, deep_supervision/aux_seg_supervision/aux_head_mode,
+#   dropout (Block), edm2_attention_levels/channels_per_head,
+#   edm2_res_balance/attn_balance/concat_balance/clip_act
 
-# =====================================================================
-# DATA
-# =====================================================================
 data:
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
@@ -76,9 +57,6 @@ data:
   cache_max_volumes: 2
 
 
-# =====================================================================
-# AUGMENT
-# =====================================================================
 augment:
   enabled: true
   random_flip_prob: 0.5
@@ -103,38 +81,26 @@ augment:
   simulate_lowres_zoom: [0.5, 1.0]
 
 
-# =====================================================================
 # MODEL — EDM2 U-Net
-# =====================================================================
 model:
   arch: "edm2"
 
-  # EDM2 paper's typical channel_mult for 256² is [1,2,3,4]; we keep the
-  # widths in line with seg2_5d.yaml for fair comparison (model_channels
-  # = 32 base, mults [1,2,4,8,8] gives the same progression).
+  # 与 seg2_5d 宽度一致 (mults [1,2,4,8,8], base=32); EDM2 论文 256² 典型 [1,2,3,4]
   encoder_channels: [32, 64, 128, 256, 256]
-  encoder_blocks_per_stage: [3, 3, 3, 3, 3]   # EDM2 paper default num_blocks=3
-  # IGNORED for EDM2 (see ADM yaml for the same caveat). Decoder per-level
-  # count is fixed at ``nb_k + 1`` by the paper's skip topology.
+  encoder_blocks_per_stage: [3, 3, 3, 3, 3]   # 论文默认 num_blocks=3
+  # EDM2 忽略 (decoder 块数由 skip-stack 固定: nb_k+1)
   decoder_blocks_per_stage: [3, 3, 3, 3]
 
-  # ``stem_mode`` is ignored for EDM2 (paper uses a 3×3 MPConv stem;
-  # the multi-FOV variant uses per-view 3×3 MPConv + mp_cat + 1×1 fusion).
-  # Kept for config schema consistency.
-  stem_mode: "conv3"
-  context_fusion: "multi_stem_proj"
+  stem_mode: "conv3"                    # EDM2 忽略 (使用 3×3 MPConv stem)
+  context_fusion: "multi_stem_proj"     # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
 
   deep_supervision: false
   aux_seg_supervision: true
   aux_head_mode: "linear"
 
-  # Reused as Block dropout. EDM2's Block applies dropout to the
-  # mid-residual feature when training (see networks_edm2.Block.forward).
-  dropout: 0.0
+  dropout: 0.0                          # 复用为 Block mid-residual dropout
 
-  # EDM2-specific:
-  # Default = deepest level only. Set [3, 4] to also attend the second-
-  # deepest stage if model capacity allows.
+  # EDM2 专属; 默认仅最深一级。[3,4] = 同时二、最深两级 (额外容量时)
   edm2_attention_levels: [4]
   edm2_channels_per_head: 64
   edm2_res_balance: 0.3
@@ -143,9 +109,6 @@ model:
   edm2_clip_act: 256.0
 
 
-# =====================================================================
-# LOSS
-# =====================================================================
 loss:
   name: "dice_focal"
   compound_weights: [1.0, 1.0]
@@ -162,9 +125,6 @@ loss:
   aux_supervision_weights: []
 
 
-# =====================================================================
-# TRAIN
-# =====================================================================
 train:
   epochs: 100
 
@@ -203,9 +163,6 @@ train:
   deterministic: false
 
 
-# =====================================================================
-# PREDICT
-# =====================================================================
 predict:
   z_interleave_enabled: true
   z_interleave_thresholds: [1.0, 1.5]

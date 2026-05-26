@@ -1,51 +1,37 @@
-# ============================================================================
-# 2.5D Segmentation Configuration — ADM U-Net arch
+# 2.5D 分割 — ADM U-Net (Dhariwal & Nichol, NeurIPS 2021) 作分割 backbone:
+#   GroupNorm32 + SiLU + ResBlock (去 timestep-emb) + 最深两级 multi-head Attention
+#   stem: 'shared_stem' | 'multi_stem_proj' ('hierarchical' 本 arch 不支持)
+#   输出 (B, num_fg*D, H, W); SliceChannelLoss 拆分
+#   aux_seg_supervision (仅 Plan A) 与 deep_supervision 正交
 #
-# Paper-faithful ADM U-Net (Dhariwal & Nichol, NeurIPS 2021) adapted as a
-# segmentation backbone:
-#   - GroupNorm32 + SiLU + ResBlock (timestep-emb path stripped) +
-#     multi-head AttentionBlock at the deepest two levels.
-#   - Multi-FOV stem ('shared_stem' / 'multi_stem_proj') — context fusion
-#     'hierarchical' is NOT supported on ADM/EDM2 archs (this iteration).
-#   - Output: (B, num_fg * D, H, W); SliceChannelLoss splits per class.
-#   - aux_seg_supervision (Plan A only — heads on the highest-res decoder
-#     feature) and deep_supervision compose normally.
-#
-# IGNORED fields when arch == "adm":
-#   model.backbone / model.block_type / model.norm_type / model.activation
-#   model.attention_type / model.use_se / model.decoder_type
-#   model.unet3p_cat_channels / model.resenc_preset / model.skip_attention
-#   model.skip_mode / model.upsample_mode / model.downsample_mode
-#   model.drop_path_rate / model.convnext_*  (paper fixes the internals).
-#
-# HONOURED fields:
-#   data.* (full pipeline)
-#   model.encoder_channels / encoder_blocks_per_stage / decoder_blocks_per_stage
-#   model.stem_mode (used for the multi-FOV stem)
-#   model.context_fusion (shared_stem | multi_stem_proj)
-#   model.deep_supervision / aux_seg_supervision / aux_head_mode
-#   model.dropout (reused as ResBlock dropout)
-#   model.adm_attention_levels / adm_num_heads / adm_num_head_channels
-# ============================================================================
+# arch=='adm' 时忽略: model.backbone/block_type/norm_type/activation/attention_type
+#   /use_se/decoder_type/unet3p_cat_channels/resenc_preset/skip_attention
+#   /skip_mode/upsample_mode/downsample_mode/drop_path_rate (论文固定)
+# 生效字段: data.*, encoder_channels/encoder_blocks_per_stage/decoder_blocks_per_stage,
+#   stem_mode/context_fusion, deep_supervision/aux_seg_supervision/aux_head_mode,
+#   dropout (ResBlock), adm_attention_levels/adm_num_heads/adm_num_head_channels
 
-# =====================================================================
-# DATA — same as seg2_5d.yaml
-# =====================================================================
+# DATA — 同 seg2_5d.yaml
 data:
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
-  bbox_suffix : ".nii.gz"
+  bbox_suffix : "_pred.nii.gz"
   region_weight_suffix: ".nii.gz"
-  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
-  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
-  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"
-  bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"
-  npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
+  # # Training dir
+  # image_dir: ""
+  # label_dir: ""
+  # bbox_dir : ""
+  # region_weight_dir: ""
+  # npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
 
-  label_values: [0, 1, 2]
-  num_classes : 3
+  # Inference dir
+  image_dir: "F:/airway_segment_with_img/imgs"
+  bbox_dir : "F:/airway_segment_with_img/body_convnext_pred"
 
-  patch_size: [12, 256, 256]
+  label_values: [0, 1]
+  num_classes : 2
+
+  patch_size: [12, 320, 400]
   patch_mode: "2_5d"
 
   multi_res_scales: [1.0, 1.5, 2.0]
@@ -75,9 +61,7 @@ data:
   cache_max_volumes: 2
 
 
-# =====================================================================
-# AUGMENT — same as seg2_5d.yaml
-# =====================================================================
+# AUGMENT — 同 seg2_5d.yaml
 augment:
   enabled: true
   random_flip_prob: 0.5
@@ -102,43 +86,37 @@ augment:
   simulate_lowres_zoom: [0.5, 1.0]
 
 
-# =====================================================================
 # MODEL — ADM U-Net
-# =====================================================================
 model:
   arch: "adm"
 
   encoder_channels: [32, 64, 128, 256, 256]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
-  # ADM/EDM2 archs ignore this field — the decoder per-level count is
-  # fixed by the encoder's skip-stack topology (paper convention:
-  # ``nb_k + 1`` ResBlocks per dec level, matching the +1 absorb-skip
-  # block). Listed for schema parity; mismatch logs a warning only.
+  # ADM/EDM2 忽略此字段 (decoder 块数由 encoder skip-stack 固定: nb_k+1); 仅警告不一致
   decoder_blocks_per_stage: [2, 2, 2, 2]
 
-  stem_mode: "conv3"
-  context_fusion: "multi_stem_proj"
+  stem_mode: "conv7"
+  context_fusion: "multi_stem_proj"     # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
 
   deep_supervision: false
   aux_seg_supervision: true
   aux_head_mode: "linear"
 
-  # Reused as ResBlock dropout. Paper default is 0.0 (or up to 0.1 for
-  # the larger image-sizes); 0.0 keeps the architecture closest to the
-  # released ImageNet checkpoints.
-  dropout: 0.0
+  dropout: 0.0                          # 复用为 ResBlock dropout (论文默认 0.0)
 
-  # ADM-specific:
-  # Default = deepest two levels, i.e. [3, 4] for 5 stages — matches the
-  # paper's typical ``attention_resolutions=[16, 8]`` for 256² inputs.
+  # 默认最深两级 (5 stages → [3,4]); 论文 256² 输入对应 attention_resolutions=[16,8]
   adm_attention_levels: [3, 4]
   adm_num_heads: 4
   adm_num_head_channels: -1
 
+  # 可选线性 attention (lucidrains; O(N) vs softmax O(N²)), 推荐用在浅高分辨率级。
+  # 与 adm_attention_levels 独立加成; 推荐: [] | [0,1] | [0,1,2,3] + adm_attention_levels=[4]
+  adm_linear_attention_levels: []
+  adm_linear_attention_num_heads: 4
+  adm_linear_attention_head_dim: 32     # 64 增容 (cost ∝ head_dim²·N)
 
-# =====================================================================
-# LOSS — same as seg2_5d.yaml
-# =====================================================================
+
+# LOSS / TRAIN / PREDICT — 同 seg2_5d.yaml
 loss:
   name: "dice_focal"
   compound_weights: [1.0, 1.0]
@@ -155,9 +133,6 @@ loss:
   aux_supervision_weights: []
 
 
-# =====================================================================
-# TRAIN — same as seg2_5d.yaml (output_dir distinct)
-# =====================================================================
 train:
   epochs: 100
 
@@ -181,7 +156,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir: "outputs/lung_bone_adm"
+  output_dir: "outputs/lung_adm"
   save_every: 10
   save_best_metric: "mean_dice"
   save_best_mode: "max"
@@ -196,11 +171,8 @@ train:
   deterministic: false
 
 
-# =====================================================================
-# PREDICT — same as seg2_5d.yaml
-# =====================================================================
 predict:
-  z_interleave_enabled: true
+  z_interleave_enabled: false
   z_interleave_thresholds: [1.0, 1.5]
   z_interleave_factors: [3, 2, 1]
   z_overlap : 0.5

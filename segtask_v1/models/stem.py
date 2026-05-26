@@ -1,54 +1,15 @@
 """Stem / patch-embed builders for 3D UNet.
 
-Plan C — hierarchical multi-FOV injection
------------------------------------------
-``"hierarchical"`` adds a third fusion strategy on top of ``shared_stem``
-and ``multi_stem_proj``. View 0 (true 1× FOV) drives the **main stem** at
-its native stride. Each auxiliary view ``k = 1..n_views-1`` is consumed
-by an independent **patchify stem of stride ``main_stem_stride * 2^k``**,
-producing a low-resolution feature map whose spatial size matches the
-encoder feature map at the **entrance of stage ``k``** (i.e., right after
-``Downsample`` ``k``). The encoder concatenates the aux feature with the
-main feature at that injection point and runs a 1×1 ``ConvNormAct``
-fusion to compress back to the stage's expected channel count — keeping
-the rest of the encoder / decoder / skip-connection contract bit-exact.
+Stem modes (control encoder input resolution):
+  conv3 / conv7 / dual : stride-1 (preserve resolution)
+  patch2 / patch4      : stride-N patchify (halves / quarters resolution; UNet wrapper
+                         applies a final upsample to restore output resolution)
 
-Why hierarchical: coarse-FOV context naturally aligns with deeper, lower-
-resolution semantic features (HRNet / PSPNet / nnFormer multi-scale
-context aggregation). Plan A fuses everything at the input resolution
-and lets the network compress wider FOVs by force; Plan C lets each FOV
-land at the matching semantic level by construction.
-
-
-Provides the initial feature-extraction layer applied to raw input volumes.
-The stem determines the resolution at which the encoder operates:
-
-- "conv3"  : classical 3×3×3 stride-1 conv (default; preserves resolution).
-- "conv7"  : ConvNeXt-style large-kernel 7×7×7 stride-1 conv (larger RF).
-- "dual"   : nnU-Net-style two stacked 3×3×3 stride-1 convs.
-- "patch2" : 2×2×2 stride-2 patch embedding (halves resolution).
-- "patch4" : 4×4×4 stride-4 patch embedding (Swin / ConvNeXt standard).
-
-Patch-embed stems (`patchN`) reduce spatial resolution by N, meaning the
-encoder produces features starting at (input / N).  The UNet wrapper
-(see `UNet3D`) restores the original resolution with a final learned
-upsample applied only to the main segmentation output.
-
-Multi-FOV context fusion (2.5D mode): when ``data.multi_res_scales`` has
-more than one z-FOV in 2.5D mode, the model input is laid out as
-``(B, n_views * D, H, W)`` — view 0 is the 1× FOV (D real slices), views
-1..K are wider z-FOVs each resampled back to D channels. Two fusion
-strategies are exposed:
-
-- "shared_stem"     : feed all ``n_views * D`` channels into ONE stem.
-                      Cheapest, but the stem must learn a single filter
-                      bank that works on physically heterogeneous channels
-                      (real slices vs. resampled "virtual" slices).
-- "multi_stem_proj" : ``n_views`` independent stems (each consumes D
-                      channels) → cat → 1×1 ConvNormAct fusion back to
-                      ``encoder_channels[0]``. Strictly more expressive
-                      than shared_stem at negligible param cost (stems are
-                      a small fraction of the network). RECOMMENDED.
+Multi-FOV context fusion (2.5D, n_views>1):
+  shared_stem     : single stem over all (n_views * D) channels (cheapest)
+  multi_stem_proj : per-view stems → concat → 1×1 fusion (recommended; FOV-specific filters)
+  hierarchical    : view 0 drives main stem at native stride; aux view k uses a patchify
+                    stem of stride main_stride * 2^k, injected at encoder stage k
 """
 
 from __future__ import annotations
@@ -91,11 +52,7 @@ class DualConvStem(nn.Module):
 
 
 class PatchEmbedStem(nn.Module):
-    """Patch-embedding stem: stride-N conv + norm + activation.
-
-    Resolution is reduced by a factor of ``patch_size`` along every spatial
-    axis.  Inspired by Swin Transformer and ConvNeXt patchify stems.
-    """
+    """Patch-embedding stem: stride-N conv + norm + activation; reduces resolution by ``patch_size``."""
 
     def __init__(
         self,
@@ -133,14 +90,7 @@ def build_stem(
     activation: str = "leakyrelu",
     spatial_dims: int = 3,
 ) -> Tuple[nn.Module, int]:
-    """Construct a stem module.
-
-    Returns:
-        (stem_module, stem_stride): ``stem_stride`` is the spatial
-        downsampling factor introduced by the stem (1 for stride-1 stems,
-        2 or 4 for patch-embed stems).  Callers use this to decide whether
-        a matching final-upsample is required downstream.
-    """
+    """Construct a stem; returns ``(stem_module, stem_stride)`` (1 for conv3/7/dual, N for patchN)."""
     if mode not in STEM_MODES:
         raise ValueError(f"Unknown stem mode: {mode!r}. Valid: {STEM_MODES}")
 
@@ -165,9 +115,8 @@ def build_stem(
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
-    # patch-embed variants
+    # patch-embed variants (default to GELU when caller leaves activation at the leakyrelu default).
     patch_size = 2 if mode == "patch2" else 4
-    # Patch-embed stems typically use GELU; expose activation for flexibility.
     stem = PatchEmbedStem(
         in_ch, out_ch, patch_size=patch_size,
         norm_type=norm_type, norm_groups=norm_groups,
@@ -183,25 +132,10 @@ CONTEXT_FUSION_MODES = ("shared_stem", "multi_stem_proj", "hierarchical")
 
 
 class MultiStemProj(nn.Module):
-    """``n_views`` independent stems → channel-concat → 1×1 fusion.
+    """``n_views`` independent stems → channel-concat → 1×1 fusion to ``out_ch``.
 
-    Designed for the 2.5D multi-FOV setup where the input tensor is laid
-    out as ``(B, n_views * in_ch_per_view, *spatial)`` with view ``i``
-    occupying channel slab ``[i * C, (i+1) * C)``. Each view goes through
-    its own stem (same ``mode`` / ``out_ch`` / hyper-params, independent
-    weights) so the network can learn FOV-specific low-level filters
-    instead of forcing a single shared filter bank to cover physically
-    heterogeneous inputs (raw slices vs. resampled wide-FOV slices).
-
-    The ``n_views`` stem outputs are concatenated on the channel axis,
-    yielding ``(B, n_views * out_ch, *spatial')`` (``spatial'`` = spatial
-    after each stem's stride). A 1×1 ``ConvNormAct`` projects them back
-    to ``out_ch`` so the rest of the encoder is contract-identical to a
-    single-stem build (no downstream channel-count surgery required).
-
-    All sub-stems share the same ``stem_stride`` (they're built from the
-    same ``mode``); ``MultiStemProj.stem_stride`` exposes that value so
-    the wrapping ``Encoder`` / ``UNet3D`` can keep its existing logic.
+    Each view (channel slab) gets its own stem so FOV-specific filters can be learned;
+    the 1×1 fusion keeps the encoder channel contract identical to a single-stem build.
     """
 
     def __init__(
@@ -216,18 +150,8 @@ class MultiStemProj(nn.Module):
         spatial_dims: int = 3,
         in_ch_per_view_list: List[int] = None,
     ):
-        """``MultiStemProj`` supports two channel-layout flavours:
-
-        * ``in_ch_per_view: int`` — every view contributes the SAME number
-          of channels (legacy / OFF path; equal D for all 2.5D views).
-        * ``in_ch_per_view_list: List[int]`` — per-view variable channel
-          counts (native-depth ON path; ``D_k = round(D * s_k)``). When
-          provided, takes precedence and ``in_ch_per_view`` is ignored.
-          Length must equal ``n_views``.
-
-        All sub-stems share the same ``mode`` and ``stem_stride`` so the
-        downstream encoder contract remains independent of the input
-        channel layout.
+        """Channel layout: uniform ``in_ch_per_view`` (default) or per-view
+        ``in_ch_per_view_list`` (length must equal ``n_views``; takes precedence).
         """
         super().__init__()
         if n_views < 1:
@@ -241,9 +165,7 @@ class MultiStemProj(nn.Module):
             self.in_ch_per_view_list: List[int] = [int(c) for c in in_ch_per_view_list]
         else:
             self.in_ch_per_view_list = [int(in_ch_per_view)] * n_views
-        # Kept for backward compatibility with consumers that introspect
-        # ``in_ch_per_view``; reflects the FIRST view's count when the
-        # layout is variable. Use ``in_ch_per_view_list`` for exact info.
+        # Back-compat shim: first view's count (use in_ch_per_view_list for full info).
         self.in_ch_per_view = self.in_ch_per_view_list[0]
 
         stems: List[nn.Module] = []
@@ -256,15 +178,13 @@ class MultiStemProj(nn.Module):
             stems.append(s)
             strides.append(stride)
         if len(set(strides)) != 1:
-            # Defensive: all stems are built from the same mode so this
-            # invariant should hold by construction.
+            # Sub-stems share mode → stride must agree; defensive guard.
             raise RuntimeError(
                 f"MultiStemProj sub-stems disagree on stride: {strides}")
         self.stems = nn.ModuleList(stems)
         self.stem_stride = strides[0]
 
-        # 1×1 fusion: cheap (1×1 conv on small spatial), keeps decoder /
-        # downsample channel contract intact (output channels = out_ch).
+        # 1×1 fusion back to out_ch keeps downstream channel contract intact.
         self.proj = ConvNormAct(
             n_views * out_ch, out_ch,
             kernel_size=1, stride=1, padding=0,
@@ -272,60 +192,28 @@ class MultiStemProj(nn.Module):
             activation=activation, spatial_dims=spatial_dims)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """``x``: ``(B, sum_k in_ch_per_view_list[k], *spatial)``.
-
-        For uniform per-view widths this collapses to
-        ``(B, n_views * in_ch_per_view, *spatial)``.
-        """
+        """``x``: ``(B, sum(in_ch_per_view_list), *spatial)``."""
         expected_c = sum(self.in_ch_per_view_list)
         if x.shape[1] != expected_c:
             raise ValueError(
                 f"MultiStemProj expects {expected_c} input channels "
                 f"(per-view={self.in_ch_per_view_list}); got {x.shape[1]}")
-        # Channel-wise split per view. ``torch.split`` accepts a list of
-        # split sizes for variable-width chunks (no copy: returns views).
+        # Per-view channel split (zero-copy views).
         chunks = torch.split(x, self.in_ch_per_view_list, dim=1)
         feats = [stem(c) for stem, c in zip(self.stems, chunks)]
         return self.proj(torch.cat(feats, dim=1))
 
 
 class HierarchicalStems(nn.Module):
-    """Plan C: per-FOV stems with stage-aligned strides for hierarchical injection.
+    """Per-FOV stems with stage-aligned strides; encoder fuses aux features per level.
 
-    Layout
-    ------
-    Input ``(B, n_views * in_ch_per_view, *spatial)``.
-      - View 0 (``chunks[0]``) → ``main_stem`` with stride ``s0`` =
-        ``build_stem(mode)`` native stride. Output spatial = ``spatial / s0``.
-      - View ``k`` for ``k = 1..n_views-1`` → ``aux_stems[k-1]``:
-        ``PatchEmbedStem`` with patch_size = ``s0 * 2^k``. Output spatial =
-        ``spatial / (s0 * 2^k)`` — matches the encoder feature map at the
-        entrance of stage ``k`` (after ``Downsample`` ``k``).
+    View 0 → ``main_stem`` at native stride ``s0``. View ``k`` (k≥1) → ``aux_stems[k-1]``
+    (``PatchEmbedStem``, stride ``s0 * 2^k``) with output channels =
+    ``stage_channels[k-1]`` so that the encoder's per-level cat-fusion is
+    ``2 * stage_channels[k-1] → stage_channels[k-1]``.
 
-    The encoder is responsible for cat-fusing each aux feature into the
-    main path at its registered injection level (``aux_levels[k-1] = k``)
-    via a 1×1 ``ConvNormAct``. This module only owns the stems and does
-    not perform fusion itself — keeping responsibilities separated and
-    letting the encoder size the per-level fusion conv from
-    ``aux_out_channels``.
-
-    Aux stem channel choice
-    -----------------------
-    Output channels of aux stem ``k`` default to ``stage_channels[k - 1]``
-    — the channel count at the injection point (post-downsample = pre-stage).
-    This makes the cat fusion exactly ``2 * stage_channels[k - 1]`` →
-    ``stage_channels[k - 1]``, a clean uniform pattern. Callers may pass
-    ``aux_channels`` explicitly to override.
-
-    Notes
-    -----
-    - With ``n_views == 1`` no aux stems are built; the module behaves
-      like a thin wrapper around the main stem (the dispatcher routes
-      this case to the single-stem path instead, but the constructor
-      handles it for robustness).
-    - ``forward`` is intentionally NOT implemented as a single op — the
-      encoder calls ``forward_main`` and ``forward_aux`` separately so
-      it can interleave aux features with stage-level downsampling.
+    No combined ``forward``: encoder calls ``forward_main`` / ``forward_aux``
+    separately to interleave aux features with stage-level downsampling.
     """
 
     def __init__(
@@ -341,12 +229,7 @@ class HierarchicalStems(nn.Module):
         aux_channels: List[int] = None,
         in_ch_per_view_list: List[int] = None,
     ):
-        """``HierarchicalStems`` supports both uniform and per-view input
-        channel counts (see :class:`MultiStemProj` docstring for the
-        rationale). When ``in_ch_per_view_list`` is provided, view 0
-        consumes ``in_ch_per_view_list[0]`` channels (main stem) and aux
-        stem ``k`` consumes ``in_ch_per_view_list[k]`` channels.
-        """
+        """Channel layout same as :class:`MultiStemProj`: uniform or per-view list."""
         super().__init__()
         if n_views < 1:
             raise ValueError(f"n_views must be >= 1, got {n_views}")
@@ -365,19 +248,16 @@ class HierarchicalStems(nn.Module):
             self.in_ch_per_view_list: List[int] = [int(c) for c in in_ch_per_view_list]
         else:
             self.in_ch_per_view_list = [int(in_ch_per_view)] * n_views
-        # Compatibility shim — first view's count.
+        # Back-compat shim — first view's count.
         self.in_ch_per_view = self.in_ch_per_view_list[0]
 
-        # Main stem — uses the user's chosen stem mode at native stride.
-        # Consumes view 0's input channel count.
+        # Main stem (view 0): user's stem mode at native stride.
         self.main_stem, self.stem_stride = build_stem(
             mode, self.in_ch_per_view_list[0], stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
 
-        # Aux stems: stride = main_stem_stride * 2^k for k = 1..n_aux.
-        # Output channels default to stage_channels[k - 1] (the channel
-        # count at the injection point, post-Downsample-k, pre-stage-k).
+        # Aux stems: stride = main_stride * 2^k; out_ch defaults to stage_channels[k-1].
         if aux_channels is None:
             aux_channels = [stage_channels[k - 1] for k in range(1, n_views)]
         if len(aux_channels) != n_aux:
@@ -417,11 +297,7 @@ class HierarchicalStems(nn.Module):
     def forward_aux(
         self, chunks: List[torch.Tensor],
     ) -> "OrderedDict[int, torch.Tensor]":
-        """Run each aux stem on its corresponding view chunk.
-
-        Returns an ordered mapping ``level -> aux_feature``. The encoder
-        looks up by level inside the stage loop.
-        """
+        """Run each aux stem on its view chunk; returns ordered ``{level: aux_feature}``."""
         from collections import OrderedDict
         out: "OrderedDict[int, torch.Tensor]" = OrderedDict()
         for k, stem in enumerate(self.aux_stems):
@@ -443,22 +319,11 @@ def build_context_stem(
     stage_channels: List[int] = None,
     in_ch_per_view_list: List[int] = None,
 ) -> Tuple[nn.Module, int]:
-    """Build the context-fusion stem for 2.5D multi-FOV mode.
+    """Dispatch the 2.5D multi-FOV context stem; returns ``(module, stem_stride)``.
 
-    Dispatch:
-      - ``n_views == 1`` OR ``fusion == "shared_stem"``: standard
-        ``build_stem`` over ``n_views * in_ch_per_view`` input channels.
-        With ``n_views == 1`` this is bit-identical to the single-FOV
-        legacy path (zero behaviour change).
-      - ``fusion == "multi_stem_proj"``: ``MultiStemProj`` with one
-        ``build_stem`` per view + 1×1 fusion back to ``out_ch``.
-      - ``fusion == "hierarchical"``: ``HierarchicalStems`` — main stem
-        for view 0 + per-aux-view patchify stems with stride-aligned
-        outputs. Requires ``stage_channels`` so aux output channels can
-        match the injection points. The encoder is responsible for the
-        per-level cat-fusion 1×1 conv (see ``Encoder.__init__``).
-
-    Returns ``(module, stem_stride)`` matching the ``build_stem`` ABI.
+    - ``n_views==1`` or ``shared_stem``: single stem over all channels (legacy path).
+    - ``multi_stem_proj``: per-view stems + 1×1 fusion.
+    - ``hierarchical``: needs ``stage_channels``; encoder cat-fuses per level.
     """
     if fusion not in CONTEXT_FUSION_MODES:
         raise ValueError(
@@ -492,8 +357,7 @@ def build_context_stem(
             "list) so aux stems can size their output channels to match "
             "each injection level. Pass stage_channels=encoder_channels.")
     if stage_channels[0] != out_ch:
-        # The dispatcher's contract is that out_ch == stage_channels[0]
-        # (the main-stem output). Fail fast on misalignment.
+        # Contract: out_ch must equal stage_channels[0] (main-stem output).
         raise ValueError(
             f"hierarchical fusion: out_ch ({out_ch}) must equal "
             f"stage_channels[0] ({stage_channels[0]}).")

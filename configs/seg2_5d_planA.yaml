@@ -1,34 +1,20 @@
-# ============================================================================
-# Plan A lift —— 2.5D pipeline → True 3D model (R(2+1)D blocks)
-# ----------------------------------------------------------------------------
-# 派生自 configs/seg2_5d.yaml，仅在以下字段做了"切方案"修改，其他保持一致：
+# Plan A lift — 2.5D pipeline → 真 3D 模型 (R(2+1)D blocks)。派生自 configs/seg2_5d.yaml。
+# 动机: 2D-folded 2.5D D 折入 channel 无 z 算子; lift 后 D 是真空间轴,
+# 每 R(2+1)D block 做 (3,1,1) z conv，z-context 从 stem 走到 head。
+# 多 FOV (1/1.5/2×) 作 n_views=3 输入通道嗂给 3D UNet。
 #
-#   model.backbone           : "convnext" → "resnet"   (r2plus1d 仅在 resnet 注册)
-#   model.block_type         : "basic"    → "r2plus1d" ((1,3,3) 空间 + (3,1,1) z)
-#   model.lift_2_5d_to_3d    : false      → true      (D 还原为真实空间轴)
-#   model.spatial_dims       : 2          → 3         (sync() 自动设；写出仅可读)
-#   model.in_channels        : 自动       → 3         (sync(): = len(multi_res_scales))
-#   model.aux_seg_supervision: true       → false     (本轮先跑主路径基线)
-#   data.aux_keep_native_d   : true       → false     (与 lift 互斥；validate 强制)
-#   data.patch_size          : [12,256,256] → [16,256,256]
-#       (5 stages encoder ⇒ D 必须能被 2**(n_levels-1)=16 整除；12 不合法)
-#   data.z_boundary_mode     : "stretch"  → "edge_pad" (lift 路径推荐统一 edge_pad)
-#   train.output_dir         : 独立目录，不与 convnext 实验 ckpt 冲突
-#   train.resume / pretrain  : 清空（架构不兼容旧 ckpt）
+# 与 seg2_5d.yaml 关键 diff:
+#   model.backbone:           convnext → resnet      (r2plus1d 仅 resnet 注册)
+#   model.block_type:         basic    → r2plus1d
+#   model.lift_2_5d_to_3d:    false    → true        (D 还原为真空间轴)
+#   model.aux_seg_supervision: true    → false       (本轮先跑主路径基线)
+#   data.aux_keep_native_d:   true     → false       (与 lift 互斥)
+#   data.patch_size:          [12,...] → [16,...]    (5 stages: D 需被 16 整除)
+#   data.z_boundary_mode:     stretch  → edge_pad    (lift 下 z 几何一致性)
+#   train.output_dir / resume / pretrain: 独立目录, 清空 (架构不兼容旧 ckpt)
 #
-# 一句话说明动机：
-#   原 2D-folded 2.5D 把 D 折进 channel，整网无 z 算子；lift 后 D 是真实空间轴，
-#   每个 R(2+1)D block 都做 (3,1,1) z 卷积，z-context 从 stem 一直走到 head；
-#   多 FOV (1.0/1.5/2.0×) 现在作为 n_views=3 的输入通道喂给 3D UNet，与 z 卷积
-#   一起真正能融合粗/细 z 上下文。
-#
-# 启动：
-#   python -m segtask_v1.train --config configs/seg2_5d_planA.yaml
-# ============================================================================
+# 启动: python -m segtask_v1.train --config configs/seg2_5d_planA.yaml
 
-# =====================================================================
-# DATA
-# =====================================================================
 data:
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
@@ -45,28 +31,15 @@ data:
   label_values: [0, 1, 2]
   num_classes : 3
 
-  # *** 关键修改 1 ***
-  # 5 stages encoder (encoder_channels 长度=5) ⇒ 4 次下采样 ⇒ D 必须能被
-  # 16 整除。lift 模式下 D 是真实空间轴，每一级 Downsample 都会把 D 减半。
-  # 12 在 D=4 时就不再整除——validate 会直接报错。改成 16。
+  # 5 stages encoder ⇒ D 需被 16 整除 (lift 下 D 是真空间轴, 逐级减半)
   patch_size: [16, 256, 256]
-
   patch_mode: "2_5d"
 
-  # lift 模式下作为 n_views=3 的输入通道喂进 3D UNet。
-  multi_res_scales: [1.0, 1.5, 2.0]
-
+  multi_res_scales: [1.0, 1.5, 2.0]    # lift 下作 n_views=3 输入通道
   aug_oversample_ratio: 1.5
 
-  # *** 关键修改 2 ***
-  # lift 路径建议统一 edge_pad；stretch 在 D 是真空间轴的情况下会让边界
-  # 窗口的 z 物理间距与中心窗口不同，破坏 R(2+1)D 的 z 卷积归纳偏置。
-  z_boundary_mode: "edge_pad"
-
-  # *** 关键修改 3 ***
-  # validate() 强制：lift_2_5d_to_3d=True 与 aux_keep_native_d=True 互斥
-  # （folded-D 通道槽位 vs 真 D 空间轴在物理布局上不兼容）。本轮先关闭。
-  aux_keep_native_d: false
+  z_boundary_mode: "edge_pad"          # lift 下 z 几何需与中心窗一致 (R(2+1)D 偏置)
+  aux_keep_native_d: false             # 与 lift 互斥 (validate 强制)
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -88,9 +61,7 @@ data:
   cache_max_volumes: 2
 
 
-# =====================================================================
-# AUGMENT  —— 与 seg2_5d.yaml 完全一致
-# =====================================================================
+# AUGMENT — 与 seg2_5d.yaml 一致
 augment:
   enabled: true
 
@@ -124,44 +95,24 @@ augment:
   simulate_lowres_zoom: [0.5, 1.0]
 
 
-# =====================================================================
-# MODEL  —— Plan A: ResNet + R(2+1)D + lift_2_5d_to_3d
-# =====================================================================
+# MODEL — ResNet + R(2+1)D + lift。spatial_dims/in_channels 由 sync() 自动设
 model:
-  # *** 关键修改 4 ***
-  # r2plus1d 仅在 resnet backbone 下注册（convnext 没有这个 block）。
-  backbone: "resnet"
+  backbone: "resnet"                   # r2plus1d 仅在 resnet 注册
 
-  # sync() 自动设 spatial_dims=3 / in_channels=len(multi_res_scales)=3；
-  # 写出来仅为可读性。
-  spatial_dims: 3
-  in_channels: 3
-
-  # 5 stages encoder：通道宽度与 seg2_5d.yaml 保持同量级，方便对比；
-  # 因为 lift 后 D 也参与 Downsample，激活体积比 2.5D 大，必要时可降到
-  # [24, 48, 96, 192, 192] 以省显存。
+  # 显存紧可降到 [24,48,96,192,192]
   encoder_channels: [32, 64, 128, 256, 256]
   encoder_blocks_per_stage: [2, 2, 3, 3, 3]   # ResEnc-S 风格
   decoder_blocks_per_stage: [2, 2, 2, 2]
 
-  # *** 关键修改 5 ***
-  # (1,3,3) 空间 conv + 中间非线性 + (3,1,1) 时间 conv。每个 stage 的每个
-  # block 都做一次 z 卷积——z-context 不再只靠 stem。
-  block_type: "r2plus1d"
-
-  # *** 关键修改 6 ***
-  # 开启 lift：trainer 跳过 (B, C_res, D, H, W) → (B, C_res*D, H, W) 的 squeeze；
-  # 模型输入保持 (B, n_views=3, D=16, H, W)；输出 (B, num_fg=2, D, H, W)；
-  # 损失走 MultiResolutionLoss(num_res=1)（绕过 SliceChannelLoss）。
-  lift_2_5d_to_3d: true
+  block_type: "r2plus1d"               # (1,3,3) 空间 + (3,1,1) z; 每 block 做 z conv
+  lift_2_5d_to_3d: true                # 跳过 squeeze, 走 3D UNet + MultiResLoss(1)
 
   norm_type  : "instance"
   norm_groups: 8
   activation : "leakyrelu"
   dropout    : 0.0
 
-  # r2plus1d block 自身已经在每个 stage 引入 z conv，不再叠加 SE，避免
-  # 把 z 上下文从特征里"挑掉"（SE 是通道注意力，会重新加权）。
+  # r2plus1d 已在每 stage 引入 z conv, 不再叠加 SE (避免通道加权"挑掉" z 上下文)
   use_se: false
   attention_type: "none"
   skip_attention: false
@@ -169,17 +120,9 @@ model:
   deep_supervision: false
 
   stem_mode    : "conv3"
+  context_fusion: "shared_stem"        # lift 下字段被忽略 (仅 2D-folded 生效)
 
-  # lift 模式下 n_views 作为输入通道直接进 stem；多视图融合不再走
-  # MultiStemProj/Hierarchical（那两条路径是 2D-folded 专属）。
-  # context_fusion 字段在 lift 下被忽略，但写明默认值便于阅读。
-  context_fusion: "shared_stem"
-
-  # *** 关键修改 7 ***
-  # 本轮先跑 lift 主路径的基线（仅 view 0 监督，其他视图作为输入通道）。
-  # 收敛后若想再加 aux 监督，把这个开关打开即可（validate 已正交支持
-  # lift + aux_seg_supervision，aux head 自动产 (B, num_fg, D, H, W)）。
-  aux_seg_supervision: false
+  aux_seg_supervision: false           # 本轮跑 lift 主路径基线; 收敛后可开
   aux_head_mode: "linear"
 
   decoder_type   : "unet"
@@ -190,9 +133,7 @@ model:
   drop_path_rate: 0.0
 
 
-# =====================================================================
-# LOSS  —— lift 模式自动绕过 SliceChannelLoss；其余配置沿用
-# =====================================================================
+# LOSS — lift 下自动绕过 SliceChannelLoss
 loss:
   name: "dice_focal"
   compound_weights: [1.0, 1.0]
@@ -211,15 +152,10 @@ loss:
 
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
-  # lift 模式下不调用 SliceChannelLoss；此字段被忽略但保留可读性。
-  slice_loss_reduction: "per_volume"
-
+  slice_loss_reduction: "per_volume"   # lift 下被忽略 (不走 SliceChannelLoss)
   aux_supervision_weights: []
 
 
-# =====================================================================
-# TRAIN
-# =====================================================================
 train:
   epochs: 100
 
@@ -243,8 +179,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  # *** 关键修改 8 *** 独立输出目录，与 convnext 实验互不污染
-  output_dir: "outputs/lung_bone_planA_r2plus1d"
+  output_dir: "outputs/lung_bone_planA_r2plus1d"     # 独立目录
   save_every: 10
   save_best_metric: "mean_dice"
   save_best_mode: "max"
@@ -258,17 +193,13 @@ train:
   seed: 42
   deterministic: false
 
-  # *** 关键修改 9 *** 架构不兼容旧 ckpt，从头训练
-  resume: ""
+  resume: ""                           # 架构不兼容旧 ckpt, 从头训练
   pretrain: ""
   pretrain_strict: false
   pretrain_load_ema: false
 
 
-# =====================================================================
-# PREDICT  —— 与 seg2_5d.yaml 一致；predictor 检测 lift_2_5d_to_3d
-#             自动走 rank-5 输入 + (B, num_fg, D, H, W) 输出路径
-# =====================================================================
+# PREDICT — predictor 检测 lift_2_5d_to_3d 自动走 rank-5 + (B,num_fg,D,H,W) 输出
 predict:
   z_interleave_enabled: true
   z_interleave_thresholds: [1.0, 1.5]

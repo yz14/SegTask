@@ -1,8 +1,5 @@
-# ============================================================================
-# 2.5D 多 FOV aux 监督对照实验 — 基线（无 aux 监督，作为对照）。
-# 设计：在 small_data 上跑 30 epoch，固定 seed/EMA/优化器，仅变化
-# {aux_seg_supervision, context_fusion, aux_head_mode} 三个开关。
-# ============================================================================
+# 2.5D 多 FOV aux 监督对照实验基线 (无 aux)。small_data 30 epoch, 固定 seed/EMA/optim,
+# 仅扫 {aux_seg_supervision, context_fusion, aux_head_mode}
 
 data:
   image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
@@ -58,7 +55,6 @@ augment:
 
 model:
   backbone: "resnet"
-  spatial_dims: 2
   encoder_channels: [32, 64, 128, 256, 512]
   blocks_per_level: 2
   block_type: "basic"

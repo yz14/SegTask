@@ -65,7 +65,6 @@ augment:
 
 model:
   backbone: "convnext"
-  spatial_dims: 2
   encoder_channels: [32, 64, 128, 256, 256]
   encoder_blocks_per_stage: [3, 3, 9, 3, 3]
   decoder_blocks_per_stage: [2, 2, 2, 2]

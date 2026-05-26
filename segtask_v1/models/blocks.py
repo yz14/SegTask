@@ -1,32 +1,14 @@
-"""Common building blocks shared across encoder/decoder implementations.
+"""Common 2D/3D building blocks for encoder/decoder.
 
-All blocks are spatial-dimension agnostic (n=2 or 3), routed via the
-``spatial_dims`` keyword (default 3 for backward compatibility). The ``*3D``
-class names are kept for API stability — they now denote ``spatial_dims=3``
-by default but can build a 2D variant via ``spatial_dims=2``.
+All modules accept ``spatial_dims`` (default 3); ``*3D`` names are kept for
+API stability but support 2D via ``spatial_dims=2``.
 
 Provides:
-- Layer factories (conv, norm, activation, pool, dropout) per spatial_dims
-- ConvNormAct: single conv + norm + activation
-- SqueezeExcite3D: channel attention (SE block, Hu 2018)
-- ECA3D: Efficient Channel Attention (Wang et al., CVPR 2020).
-- CBAM3D: Convolutional Block Attention Module (Woo et al., ECCV 2018).
-- CoordAttention3D: Coordinate Attention (Hou et al., CVPR 2021), generalised
-  to nD axis-wise pooling.
-- AttentionGate3D: skip-connection attention for UNet (Oktay et al.,
-  MIDL 2018 — "Attention U-Net").
-- make_attention(name, channels, spatial_dims=3): unified factory.
-- BlurPool3d: anti-aliased low-pass filter (Zhang, ICML 2019).
-- PixelShuffle3d / PixelUnshuffle3d: lossless space<->depth (ESPCN-style),
-  generalised to nD.
-- CARAFE3d: content-aware reassembly upsampler (Wang et al., ICCV 2019).
-  3D-only.
-- DySample3d: dynamic-sampling upsampler (Liu et al., ICCV 2023). 3D-only.
-- Downsample: multi-mode factor-2 nD downsampling (conv / maxpool / avgpool /
-  blurpool / pixelunshuffle).
-- Upsample: multi-mode factor-2 nD upsampling (transpose / linear /
-  nearest / pixelshuffle / carafe / dysample). carafe & dysample are
-  3D-only.
+  Factories (conv/norm/act/pool/drop), ConvNormAct,
+  Attention: SE, ECA, CBAM, CoordAttention, AttentionGate; ``make_attention`` factory,
+  BlurPool, PixelShuffle/Unshuffle, CARAFE (3D-only), DySample (3D-only),
+  Downsample (conv/maxpool/avgpool/blurpool/pixelunshuffle),
+  Upsample (transpose/trilinear/nearest/pixelshuffle/carafe/dysample).
 """
 
 from __future__ import annotations
@@ -77,11 +59,7 @@ def get_norm(
     num_channels: int,
     num_groups: int = 8,
     spatial_dims: int = 3) -> nn.Module:
-    """Create an nD normalization layer.
-
-    ``GroupNorm`` is dim-agnostic; ``BatchNorm`` / ``InstanceNorm`` are
-    routed to the matching nD variant.
-    """
+    """nD norm: ``batch`` / ``instance`` (per spatial_dims) | ``group`` (dim-agnostic)."""
     d = _check_dims(spatial_dims)
     if norm_type == "batch":
         return _BN[d](num_channels)
@@ -144,11 +122,7 @@ class ConvNormAct(nn.Module):
 # Squeeze-and-Excitation (channel attention)
 # ---------------------------------------------------------------------------
 class SqueezeExcite3D(nn.Module):
-    """nD Squeeze-and-Excitation block (Hu et al., 2018).
-
-    Global average pool → FC reduce → ReLU → FC expand → Sigmoid → scale.
-    Class name kept (``*3D``) for API stability — use ``spatial_dims=2`` for 2D.
-    """
+    """nD Squeeze-and-Excitation (Hu 2018): GAP → FC reduce → ReLU → FC expand → Sigmoid → scale."""
 
     def __init__(self, channels: int, reduction: int = 16,
                  spatial_dims: int = 3):
@@ -172,15 +146,10 @@ class SqueezeExcite3D(nn.Module):
         return x * scale
 
 
-# ---------------------------------------------------------------------------
-# Efficient Channel Attention (ECA)
-# Reference: Wang et al., "ECA-Net: Efficient Channel Attention for Deep
-# Convolutional Neural Networks", CVPR 2020.
-# Replaces SE's two FC layers with a single 1D convolution over channels.
-# Kernel size k is adaptively chosen from C: k = |log2(C)/gamma + b/gamma|_odd.
-# ---------------------------------------------------------------------------
+# ECA-Net (Wang 2020): 1D conv over channels in place of SE's two FC layers;
+# adaptive kernel k = |log2(C)/gamma + b/gamma|_odd.
 class ECA3D(nn.Module):
-    """nD Efficient Channel Attention. Class name kept for API stability."""
+    """nD Efficient Channel Attention (Wang 2020)."""
 
     def __init__(self, channels: int, k_size: int = 0, gamma: int = 2, b: int = 1,
                  spatial_dims: int = 3):
@@ -204,11 +173,8 @@ class ECA3D(nn.Module):
         return x * y.view(y.size(0), y.size(1), *([1] * self.spatial_dims))
 
 
-# ---------------------------------------------------------------------------
-# CBAM: Convolutional Block Attention Module (Woo et al., ECCV 2018).
-# Two sequential sub-modules: channel attention (MLP over GAP+GMP) then
-# spatial attention (7×7×7 conv over channel-wise avg+max concat).
-# ---------------------------------------------------------------------------
+# CBAM (Woo 2018): channel attention (MLP over GAP+GMP) → spatial attention
+# (k×k conv over channel-wise avg+max concat).
 class _CBAMChannelAttn(nn.Module):
     def __init__(self, channels: int, reduction: int = 16, spatial_dims: int = 3):
         super().__init__()
@@ -248,10 +214,7 @@ class _CBAMSpatialAttn(nn.Module):
 
 
 class CBAM3D(nn.Module):
-    """nD Convolutional Block Attention Module (channel → spatial).
-
-    Class name kept (``*3D``) for API stability.
-    """
+    """nD Convolutional Block Attention Module (channel → spatial)."""
 
     def __init__(self, channels: int, reduction: int = 16,
                  spatial_kernel: int = 7, spatial_dims: int = 3):
@@ -265,20 +228,10 @@ class CBAM3D(nn.Module):
         return self.spatial(self.channel(x))
 
 
-# ---------------------------------------------------------------------------
-# Coordinate Attention (Hou et al., CVPR 2021) — 3D extension.
-# Encodes spatial position by pooling along each axis separately, then
-# applies shared MLP to concatenated descriptors. Captures long-range
-# dependencies along one axis at a time — very effective for elongated
-# anatomical structures (vessels, airways, spine, …).
-# ---------------------------------------------------------------------------
+# Coordinate Attention (Hou 2021): per-axis pools → shared MLP → axis-wise scale.
+# Effective on elongated structures (vessels / airways / spine).
 class CoordAttention3D(nn.Module):
-    """nD Coordinate Attention (Hou et al., CVPR 2021).
-
-    Generalised to ``spatial_dims`` axis-wise pools + axis-wise output
-    convolutions. For 2D this is the original H/W formulation; for 3D it
-    is the D/H/W extension. Class name kept (``*3D``) for API stability.
-    """
+    """nD Coordinate Attention (Hou 2021); generalised to per-axis pools (D/H/W in 3D)."""
 
     def __init__(self, channels: int, reduction: int = 32,
                  spatial_dims: int = 3):
@@ -315,11 +268,9 @@ class CoordAttention3D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = self.spatial_dims
         B, C = x.shape[:2]
-        sizes = list(x.shape[2:])  # spatial sizes [s0, s1, ...]
+        sizes = list(x.shape[2:])
 
-        # Axis-wise pooled descriptors. Reshape each to put its kept axis
-        # at the FIRST spatial position, others 1, so they can be cat'd
-        # along that common axis for a shared 1x1 conv.
+        # Per-axis pool → reshape kept axis to first spatial position → cat for shared 1×1.
         descriptors = []
         for axis in range(d):
             p = self.pools[axis](x)  # keeps axis full, others 1
@@ -332,8 +283,7 @@ class CoordAttention3D(nn.Module):
 
         out = x
         for axis in range(d):
-            # Reshape per-axis attention back to broadcasting shape
-            # (B, C, 1, ..., size_axis, ..., 1).
+            # Broadcast back to (B, C, 1, ..., size_axis, ..., 1).
             broadcast_shape = [B, C] + [1] * d
             broadcast_shape[2 + axis] = sizes[axis]
             a = torch.sigmoid(self.axis_convs[axis](y_axes[axis])).reshape(
@@ -347,11 +297,7 @@ class CoordAttention3D(nn.Module):
 # ---------------------------------------------------------------------------
 def make_attention(name: str, channels: int,
                    spatial_dims: int = 3, **kwargs) -> nn.Module:
-    """Return a channel/spatial attention block by name.
-
-    Names: "none" | "se" | "eca" | "cbam" | "coord".
-    ``spatial_dims`` selects 2D vs 3D variant. Unknown name → ValueError.
-    """
+    """Attention factory: ``none``|``se``|``eca``|``cbam``|``coord``."""
     name = (name or "none").lower()
     if name == "none":
         return nn.Identity()
@@ -374,26 +320,10 @@ def make_attention(name: str, channels: int,
 ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord")
 
 
-# ---------------------------------------------------------------------------
-# Attention Gate for skip connections (Oktay et al., MIDL 2018).
-# Gates the encoder skip feature by a gating signal from the coarser
-# decoder path. Has become the standard attention mechanism for 3D medical
-# UNets (Attention U-Net).
-#
-#   x  (skip)  -- W_x 1x1 -- + -- ReLU -- W_psi 1x1 -- sigmoid -- * -- out
-#   g  (gate)  -- W_g 1x1 --/
-# ---------------------------------------------------------------------------
+# Attention Gate (Oktay 2018): gates encoder skip ``x`` by decoder signal ``g``
+# via additive 1×1 → ReLU → 1×1 → sigmoid mask. Standard for medical UNets.
 class AttentionGate3D(nn.Module):
-    """Additive attention gate for UNet skip connections (Oktay et al., 2018).
-
-    Class name kept (``*3D``) for API stability — use ``spatial_dims=2`` for 2D.
-
-    Args:
-        x_ch:  channels of the skip (encoder) feature.
-        g_ch:  channels of the gating (decoder) feature.
-        inter: bottleneck channel count (default = x_ch // 2, min 1).
-        spatial_dims: 2 or 3.
-    """
+    """Additive attention gate for UNet skips (Oktay 2018); ``inter`` defaults to ``x_ch // 2``."""
 
     def __init__(self, x_ch: int, g_ch: int, inter: int = 0,
                  spatial_dims: int = 3):
@@ -418,11 +348,7 @@ class AttentionGate3D(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """Gate skip feature ``x`` using decoder signal ``g``.
-
-        If the spatial sizes differ, ``g`` is linearly resized (bilinear/
-        trilinear per spatial_dims) to match ``x``.
-        """
+        """Gate skip ``x`` by decoder signal ``g``; resizes ``g`` to ``x`` if shapes differ."""
         if g.shape[2:] != x.shape[2:]:
             g = F.interpolate(
                 g, size=x.shape[2:],
@@ -431,19 +357,9 @@ class AttentionGate3D(nn.Module):
         return x * self.psi(self.relu(self.W_x(x) + self.W_g(g)))
 
 
-# ---------------------------------------------------------------------------
-# Anti-aliased downsampling: BlurPool3D
-# Reference: Zhang, "Making Convolutional Networks Shift-Invariant Again",
-# ICML 2019. Applying a low-pass (binomial) filter before subsampling
-# dramatically improves shift-invariance compared to naive strided ops.
-# ---------------------------------------------------------------------------
+# Anti-aliased downsample (Zhang 2019): fixed binomial low-pass before stride.
 class BlurPool3d(nn.Module):
-    """nD anti-aliased blur + stride downsample (class name kept for API).
-
-    A fixed (non-learned), depthwise separable binomial low-pass filter is
-    applied prior to subsampling. filt_size=3 uses [1,2,1]; filt_size=5
-    uses [1,4,6,4,1].
-    """
+    """nD anti-aliased blur+stride; binomial kernels [1,2,1] (filt=3) or [1,4,6,4,1] (filt=5)."""
 
     _BINOMIAL: dict = {
         2: (1., 1.),
@@ -474,7 +390,7 @@ class BlurPool3d(nn.Module):
         self.register_buffer("kernel", kernel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Replicate padding preserves boundary statistics.
+        # Replicate padding to preserve boundary stats.
         if self.pad:
             x = F.pad(x, [self.pad] * (2 * self.spatial_dims), mode="replicate")
         if self.spatial_dims == 3:
@@ -486,17 +402,9 @@ class BlurPool3d(nn.Module):
             stride=self.stride, padding=0, groups=self.channels)
 
 
-# ---------------------------------------------------------------------------
-# PixelShuffle / PixelUnshuffle in 3D (sub-pixel conv, ESPCN-style).
-# PyTorch ships nn.PixelShuffle for 2D only; we implement the 3D analogue
-# via a single reshape+permute. Both ops are lossless and parameter-free.
-# ---------------------------------------------------------------------------
+# Sub-pixel ops (ESPCN-style): nD reshape+permute, lossless and parameter-free.
 class PixelUnshuffle3d(nn.Module):
-    """nD space-to-depth: (B, C, r*s_0, r*s_1, ...) -> (B, C*r^d, s_0, s_1, ...).
-
-    Class name kept (``*3d``) for API stability. ``spatial_dims=2`` switches
-    to a 2D version (input rank 4).
-    """
+    """nD space-to-depth: ``(B, C, r*s0, r*s1, ...) → (B, C*r^d, s0, s1, ...)``."""
 
     def __init__(self, r: int = 2, spatial_dims: int = 3):
         super().__init__()
@@ -519,27 +427,20 @@ class PixelUnshuffle3d(nn.Module):
                 raise ValueError(
                     f"PixelUnshuffle3d(r={r}) needs spatial dims divisible "
                     f"by r, got {tuple(spatial)}")
-        # Reshape each spatial axis into (size/r, r), interleaving with axes:
-        # (B, C, s0/r, r, s1/r, r, ...).
+        # View each spatial axis as (size/r, r), interleaved.
         view_shape = [B, C]
         for s in spatial:
             view_shape.extend([s // r, r])
         y = x.view(view_shape)
-        # Permute order: keep B, C, then all r-axes (odd positions among
-        # spatial), then all size/r axes (even positions).
-        # In the original 3D ordering:
-        #   permute(0, 1, 3, 5, 7, 2, 4, 6) for d=3.
-        r_axes = [2 + 2 * i + 1 for i in range(d)]    # 3,5,7,... = r dims
-        s_axes = [2 + 2 * i     for i in range(d)]    # 2,4,6,... = size/r dims
+        # Permute B, C, all r-axes (odd), all size/r-axes (even). 3D: (0,1,3,5,7,2,4,6).
+        r_axes = [2 + 2 * i + 1 for i in range(d)]
+        s_axes = [2 + 2 * i     for i in range(d)]
         y = y.permute(0, 1, *r_axes, *s_axes).contiguous()
         return y.view(B, C * (r ** d), *(s // r for s in spatial))
 
 
 class PixelShuffle3d(nn.Module):
-    """nD depth-to-space inverse of PixelUnshuffle3d.
-
-    Class name kept (``*3d``) for API stability.
-    """
+    """nD depth-to-space; inverse of :class:`PixelUnshuffle3d`."""
 
     def __init__(self, r: int = 2, spatial_dims: int = 3):
         super().__init__()
@@ -563,12 +464,10 @@ class PixelShuffle3d(nn.Module):
                 f"PixelShuffle3d(r={r}, spatial_dims={d}) needs channels "
                 f"divisible by r^d={rd}, got C={Crd}")
         C = Crd // rd
-        # View: (B, C, r, r, ..., s0, s1, ...) — d r-axes followed by d size-axes.
+        # View: (B, C, r,...,r, s0,...,sd) — d r-axes then d size-axes.
         view_shape = [B, C] + [r] * d + spatial
         y = x.view(view_shape)
-        # Permute pattern (3D reference): 0, 1, 5, 2, 6, 3, 7, 4 means
-        # interleave (size_axis, r_axis) for each spatial dim.
-        # In our layout, r-axes start at index 2, size-axes at index 2+d.
+        # Interleave (size_axis, r_axis) per spatial dim. 3D ref: (0,1,5,2,6,3,7,4).
         perm = [0, 1]
         for i in range(d):
             perm.append(2 + d + i)   # size axis i
@@ -580,17 +479,7 @@ class PixelShuffle3d(nn.Module):
 def icnr_init_(weight: torch.Tensor, upscale: int,
                spatial_dims: int = 3,
                init: Type[nn.Module] = None) -> None:
-    """ICNR initialisation for sub-pixel convolution weights.
-
-    Reference: Aitken et al., "Checkerboard artifact free sub-pixel
-    convolution" (2017). Initialises conv-then-PixelShuffle so that its
-    effect is approximately nearest-neighbour upsampling.
-
-    Args:
-        weight: conv weight tensor (out_ch*r^d, in_ch, k, k[, k]).
-        upscale: r (upscale factor).
-        spatial_dims: 2 or 3.
-    """
+    """ICNR init (Aitken 2017): conv→PixelShuffle starts ≈ nearest-neighbour upsample."""
     d = _check_dims(spatial_dims)
     rd = upscale ** d
     out_total = weight.shape[0]
@@ -600,8 +489,7 @@ def icnr_init_(weight: torch.Tensor, upscale: int,
     sub = torch.empty(out_ch, *weight.shape[1:], device=weight.device,
                       dtype=weight.dtype)
     nn.init.kaiming_normal_(sub)
-    # Replicate each output filter r^d times so all sub-pixel siblings start
-    # identical → PixelShuffle output equals nearest-neighbour upsampling.
+    # Replicate each filter r^d times so sub-pixel siblings start identical → NN upsample.
     weight.data.copy_(sub.repeat_interleave(rd, dim=0))
 
 
@@ -609,17 +497,10 @@ def icnr_init_(weight: torch.Tensor, upscale: int,
 # Downsampling (multi-mode, factor 2)
 # ---------------------------------------------------------------------------
 class Downsample(nn.Module):
-    """Downsample spatial dims by factor 2 and project channels in_ch→out_ch.
+    """Factor-2 downsample + ``in_ch→out_ch`` projection + norm.
 
-    Modes:
-      - "conv"          : strided 2×2(×2) convolution (baseline).
-      - "maxpool"       : MaxPool(2) + 1×1 conv for channel projection.
-      - "avgpool"       : AvgPool(2) + 1×1 conv. Smoother than max.
-      - "blurpool"      : binomial blur + stride 2 + 1×1 conv (Zhang 2019).
-      - "pixelunshuffle": lossless space-to-depth (r=2) + 1×1 conv.
-
-    Use ``spatial_dims=2`` for 2D operation. All modes are followed by a
-    normalization layer.
+    Modes: ``conv`` (strided), ``maxpool`` / ``avgpool`` / ``blurpool`` (+ 1×1),
+    ``pixelunshuffle`` (space-to-depth + 1×1).
     """
 
     VALID_MODES = ("conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle")
@@ -674,32 +555,10 @@ class Downsample(nn.Module):
         return self.norm(self.op(x))
 
 
-# ---------------------------------------------------------------------------
-# Content-aware upsampling: CARAFE (3D)
-# Reference: Wang et al., "CARAFE: Content-Aware ReAssembly of FEatures",
-# ICCV 2019.  Predicts a spatially-varying reassembly kernel at every output
-# location, then upsamples each channel as a weighted sum over a k_up×k_up×k_up
-# neighbourhood in the low-res feature map.  Strong locality awareness,
-# significantly better than pixelshuffle/trilinear on dense prediction tasks.
-#
-# 3D notes
-# --------
-# For a k_up × k_up × k_up kernel the reassembly requires a (C, k_up^3)
-# intermediate tensor per spatial location, so memory scales with C·k_up^3.
-# The original 2D default (k_up=5) is too heavy in 3D; we default to k_up=3
-# (≈1/5 the memory) which keeps quality comparable on medical volumes.
-# ---------------------------------------------------------------------------
+# CARAFE (Wang ICCV 2019): predicts a spatially-varying reassembly kernel; better
+# locality than pixelshuffle/trilinear. ``k_up=3`` default in 3D (5 is too heavy).
 class CARAFE3d(nn.Module):
-    """3D Content-Aware ReAssembly of FEatures (scale=2).
-
-    Args:
-        in_ch:      input channel count.
-        out_ch:     output channel count (1×1×1 projection after reassembly).
-        scale:      upsample factor (only 2 tested here; any s ≥ 1 supported).
-        k_up:       reassembly kernel size (cube). Default 3 (memory friendly).
-        k_enc:      kernel size of the content-encoder conv. Default 3.
-        c_mid:      bottleneck channels for kernel prediction. Default 64.
-    """
+    """3D Content-Aware ReAssembly of FEatures (default scale=2, k_up=3)."""
 
     def __init__(
         self,
@@ -717,14 +576,12 @@ class CARAFE3d(nn.Module):
         self.k_up = k_up
         self.pad = k_up // 2
 
-        # Channel compressor (cheap bottleneck).
+        # Bottleneck → content encoder (predicts scale^3 · k_up^3 kernel logits/voxel).
         self.compress = nn.Conv3d(in_ch, c_mid, kernel_size=1)
-        # Content encoder: predicts scale^3 · k_up^3 kernel logits per voxel.
         self.encode = nn.Conv3d(
             c_mid, (scale ** 3) * (k_up ** 3),
             kernel_size=k_enc, padding=k_enc // 2)
         self.shuffle = PixelShuffle3d(r=scale)
-        # Final channel projection.
         self.proj = (nn.Conv3d(in_ch, out_ch, 1, bias=False)
                      if in_ch != out_ch else nn.Identity())
 
@@ -733,51 +590,33 @@ class CARAFE3d(nn.Module):
         s = self.scale
         k = self.k_up
 
-        # 1) Predict normalised reassembly kernel at upsampled resolution.
+        # 1) Predict + softmax reassembly kernel at upsampled resolution.
         w = self.compress(x)
         w = self.encode(w)                         # (B, s^3·k^3, D, H, W)
         w = self.shuffle(w)                        # (B, k^3, sD, sH, sW)
         w = F.softmax(w, dim=1)
 
-        # 2) Extract k^3 neighbourhood patches from the low-res feature map.
+        # 2) Extract k^3 neighbourhood patches.
         x_pad = F.pad(x, [self.pad] * 6, mode="replicate")
         x_unf = (x_pad
                  .unfold(2, k, 1).unfold(3, k, 1).unfold(4, k, 1)
                  .contiguous()
                  .view(B, C, D, H, W, k ** 3)
-                 .permute(0, 1, 5, 2, 3, 4)        # (B, C, k^3, D, H, W)
+                 .permute(0, 1, 5, 2, 3, 4)
                  .reshape(B, C * k ** 3, D, H, W))
 
-        # 3) Upsample patches with nearest — each sub-voxel inherits its
-        #    parent voxel's k^3 neighbourhood, so the predicted kernel picks
-        #    a different linear combination at every sub-voxel.
+        # 3) Nearest-upsample patches (sub-voxels inherit parent neighbourhood),
+        # then 4) weighted sum along the k^3 axis.
         x_up = F.interpolate(x_unf, scale_factor=s, mode="nearest")
         x_up = x_up.view(B, C, k ** 3, D * s, H * s, W * s)
-
-        # 4) Weighted sum along the k^3 axis.
-        out = (x_up * w.unsqueeze(1)).sum(dim=2)   # (B, C, sD, sH, sW)
+        out = (x_up * w.unsqueeze(1)).sum(dim=2)
         return self.proj(out)
 
 
-# ---------------------------------------------------------------------------
-# Content-aware upsampling: DySample (3D)
-# Reference: Liu et al., "Learning to Upsample by Learning to Sample",
-# ICCV 2023.  Predicts sampling offsets and uses grid_sample — extremely
-# light-weight (1–2 orders of magnitude fewer params than CARAFE) and in
-# 2D matches or outperforms CARAFE/DyConv on dense prediction.  Initial
-# offsets are near-zero so training starts from plain upsampling.
-# ---------------------------------------------------------------------------
+# DySample (Liu ICCV 2023): predicts grid_sample offsets; far lighter than CARAFE.
+# Near-zero offset init → starts ≈ plain bilinear upsample.
 class DySample3d(nn.Module):
-    """3D dynamic-sampling upsampler (scale=2).
-
-    Args:
-        in_ch:   input channel count.
-        out_ch:  output channel count.
-        scale:   upsample factor (default 2).
-        groups:  number of sampling groups. Higher = finer-grained sampling
-                 but more params. in_ch must be divisible by groups.
-        dyscope: enable DySample-S (dynamic scope gate) from the paper.
-    """
+    """3D dynamic-sampling upsampler (default scale=2, groups=4, dyscope=True)."""
 
     def __init__(
         self,
@@ -795,9 +634,8 @@ class DySample3d(nn.Module):
         self.groups = groups
         self.dyscope = dyscope
 
-        off_ch = 3 * groups * (scale ** 3)  # 3 coords × groups × s^3 sub-voxels
+        off_ch = 3 * groups * (scale ** 3)  # 3 coords × groups × s^3
         self.offset = nn.Conv3d(in_ch, off_ch, kernel_size=1)
-        # Near-zero offset init so DySample starts ≈ bilinear upsampling.
         nn.init.trunc_normal_(self.offset.weight, std=1e-3)
         nn.init.zeros_(self.offset.bias)
 
@@ -813,7 +651,7 @@ class DySample3d(nn.Module):
     @staticmethod
     def _normalised_grid(D: int, H: int, W: int,
                          device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Build base grid in grid_sample's (x, y, z) convention, range [-1,1]."""
+        """Base grid in grid_sample (x, y, z) convention, range [-1, 1]."""
         zs = torch.linspace(-1.0, 1.0, D, device=device, dtype=dtype)
         ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
         xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
@@ -826,33 +664,29 @@ class DySample3d(nn.Module):
         g = self.groups
         Du, Hu, Wu = D * s, H * s, W * s
 
-        # 1) Predict offsets at low-res, then shuffle to high-res.
-        off = self.offset(x)                                   # (B, 3·g·s^3, D, H, W)
+        # 1) Predict offsets at low-res, shuffle to high-res.
+        off = self.offset(x)
         if self.dyscope:
             # DySample-S: learnable scope gate in [0, 0.5].
             off = off * self.scope(x).sigmoid() * 0.5
-        off = self.shuffle(off)                                # (B, 3·g, Du, Hu, Wu)
-        off = off.view(B, g, 3, Du, Hu, Wu)                    # (B, g, 3, Du, Hu, Wu)
-        off = off.permute(0, 1, 3, 4, 5, 2)                    # (B, g, Du, Hu, Wu, 3)
+        off = self.shuffle(off)
+        off = off.view(B, g, 3, Du, Hu, Wu)
+        off = off.permute(0, 1, 3, 4, 5, 2)
 
-        # 2) Normalise offsets (pixels → grid_sample coord).  grid_sample
-        #    uses last-dim order (x, y, z) corresponding to (W, H, D).
+        # 2) Normalise offsets (pixels → grid coord; last-dim order x,y,z = W,H,D).
         norm = torch.tensor(
             [2.0 / max(W - 1, 1), 2.0 / max(H - 1, 1), 2.0 / max(D - 1, 1)],
             device=x.device, dtype=x.dtype)
         off = off * norm
 
-        # 3) Base grid at upsampled resolution + predicted offset.
-        base = self._normalised_grid(Du, Hu, Wu, x.device, x.dtype)  # (Du,Hu,Wu,3)
-        coord = base.unsqueeze(0).unsqueeze(0) + off                # (B,g,Du,Hu,Wu,3)
-
-        # 4) Grouped grid_sample.  Collapse (B, g) into batch dim.
+        # 3) Base grid + offset, 4) grouped grid_sample (collapse (B, g) into batch).
+        base = self._normalised_grid(Du, Hu, Wu, x.device, x.dtype)
+        coord = base.unsqueeze(0).unsqueeze(0) + off
         x_g = x.view(B, g, C // g, D, H, W).reshape(B * g, C // g, D, H, W)
         coord = coord.reshape(B * g, Du, Hu, Wu, 3)
         out = F.grid_sample(
             x_g, coord, mode="bilinear",
-            padding_mode="border", align_corners=True,
-        )                                                      # (B·g, C/g, Du, Hu, Wu)
+            padding_mode="border", align_corners=True)
         out = out.view(B, C, Du, Hu, Wu)
         return self.proj(out)
 
@@ -861,21 +695,10 @@ class DySample3d(nn.Module):
 # Upsampling (multi-mode, factor 2)
 # ---------------------------------------------------------------------------
 class Upsample(nn.Module):
-    """Upsample spatial dims by factor 2 and project channels in_ch→out_ch.
+    """Factor-2 upsample + ``in_ch→out_ch`` projection.
 
-    Modes:
-      - "transpose"   : ConvTranspose(2,2).
-      - "trilinear"   : linear interp (bilinear in 2D / trilinear in 3D)
-                        + 3×3(×3) refinement conv. Smooth.
-      - "nearest"     : nearest interp + 3×3(×3) conv (Odena-style).
-      - "pixelshuffle": sub-pixel conv (ESPCN). 1×1 conv expands channels
-                        to out_ch * 2^d, then PixelShuffle3d(r=2)
-                        rearranges into higher resolution. ICNR init.
-      - "carafe"      : CARAFE — 3D-only.
-      - "dysample"    : DySample — 3D-only.
-
-    ``spatial_dims=2`` selects the 2D variant; carafe/dysample are
-    rejected with a clear error in 2D mode.
+    Modes: ``transpose`` (ConvTranspose), ``trilinear`` / ``nearest`` (interp + 3×3 refine),
+    ``pixelshuffle`` (sub-pixel + ICNR), ``carafe`` / ``dysample`` (3D-only).
     """
 
     VALID_MODES = ("transpose", "trilinear", "nearest", "pixelshuffle",
@@ -905,11 +728,10 @@ class Upsample(nn.Module):
         if mode == "transpose":
             self.up = _CONV_T[d](in_ch, out_ch, kernel_size=2, stride=2)
         elif mode in ("trilinear", "nearest"):
-            # Parameter-free interp → 3x3(x3) refinement.
             self.up = _CONV[d](in_ch, out_ch, kernel_size=3, padding=1,
                                bias=False)
         elif mode == "pixelshuffle":
-            channel_mult = 2 ** d   # r=2; expand by 2^d
+            channel_mult = 2 ** d
             self.expand = _CONV[d](in_ch, out_ch * channel_mult,
                                    kernel_size=1, bias=False)
             self.shuffle = PixelShuffle3d(r=2, spatial_dims=d)
@@ -935,12 +757,12 @@ class Upsample(nn.Module):
             return self.up(x)
         if self.mode == "pixelshuffle":
             return self.shuffle(self.expand(x))
-        # carafe / dysample (3D-only, validated in __init__)
+        # carafe / dysample (validated 3D-only in __init__).
         return self.up(x)
 
 
 def _choose_groups(in_ch: int, preferred: int = 4) -> int:
-    """Largest divisor of in_ch not exceeding `preferred`."""
+    """Largest divisor of ``in_ch`` not exceeding ``preferred``."""
     for g in range(min(preferred, in_ch), 0, -1):
         if in_ch % g == 0:
             return g

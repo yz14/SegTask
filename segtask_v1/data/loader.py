@@ -20,19 +20,16 @@ from .dataset import (
     SegDataset3DCubic,
     SegDataset3DWhole,
     load_nifti,
-    load_npz_label_for_split,
-)
+    load_npz_label_for_split)
 
 logger = logging.getLogger(__name__)
 
 
 def _load_exclude_pids(exclude_list: str) -> set:
-    """Load a set of pids / stems from a plain-text exclude list.
+    """Load pids from a plain-text exclude list (one per line; ``#`` comments allowed).
 
-    Format: one pid per line. Blank lines and lines starting with ``#`` are
-    ignored. A trailing ``.nii.gz`` / ``.nii`` is tolerated (and stripped)
-    so users can paste raw filenames too. Returns an empty set when the
-    path is empty or missing (with a warning in the latter case).
+    Trailing ``.nii.gz``/``.nii`` is stripped so raw filenames are also accepted.
+    Returns empty set if path is empty or missing.
     """
     if not exclude_list:
         return set()
@@ -47,7 +44,6 @@ def _load_exclude_pids(exclude_list: str) -> set:
             s = raw.strip()
             if not s or s.startswith("#"):
                 continue
-            # Tolerate full filenames in the list.
             for suf in (".nii.gz", ".nii"):
                 if s.endswith(suf):
                     s = s[: -len(suf)]
@@ -62,18 +58,13 @@ def _filter_by_exclude(
     label_paths: List[str],
     image_suffix: SuffixSpec,
     exclude_pids: set) -> Tuple[List[str], List[str], List[int]]:
-    """Drop pairs whose image stem is in ``exclude_pids``.
-
-    Returns the filtered ``(image_paths, label_paths, keep_idx)`` where
-    ``keep_idx`` indexes back into the *original* lists — callers use this
-    to also re-align any companion list (e.g. bbox paths built later).
-    """
+    """Drop pairs whose image stem is in ``exclude_pids``; ``keep_idx`` re-aligns companion lists."""
     if not exclude_pids:
         return image_paths, label_paths, list(range(len(image_paths)))
 
     image_suffixes = _normalize_suffixes(image_suffix)
     keep_idx: List[int] = []
-    dropped: List[str] = []
+    dropped : List[str] = []
     for i, img_path in enumerate(image_paths):
         name = Path(img_path).name
         base = _strip_suffix(name, image_suffixes)
@@ -84,7 +75,7 @@ def _filter_by_exclude(
         else:
             keep_idx.append(i)
 
-    if dropped:
+    if dropped:  # loggin
         head = ", ".join(dropped[:10])
         more = f", ... (+{len(dropped) - 10} more)" if len(dropped) > 10 else ""
         logger.warning(
@@ -97,13 +88,7 @@ def _filter_by_exclude(
 
 
 def _normalize_suffixes(suffix: SuffixSpec) -> List[str]:
-    """Normalize a suffix spec into a list of candidate suffixes.
-
-    Accepts either a single string (legacy contract) or a Sequence of
-    strings (relaxed matching). Empty entries are dropped; duplicates are
-    de-duplicated while preserving order so callers can express precedence
-    via the list order (first match wins downstream).
-    """
+    """Normalise suffix spec to a de-duplicated list (string or sequence accepted)."""
     if isinstance(suffix, str):
         items = [suffix]
     else:
@@ -124,9 +109,7 @@ def _normalize_suffixes(suffix: SuffixSpec) -> List[str]:
 
 
 def _strip_suffix(name: str, suffixes: Sequence[str]) -> Optional[str]:
-    """Return the base name with the first matching suffix removed, or
-    ``None`` if none of the candidate suffixes are present. Suffixes are
-    tested in the order given so callers control precedence."""
+    """Strip the first matching suffix; return ``None`` if no candidate matches."""
     for sfx in suffixes:
         if name.endswith(sfx):
             return name[: -len(sfx)]
@@ -138,23 +121,11 @@ def discover_samples(
     image_suffix: SuffixSpec = ".nii.gz",
     label_suffix: SuffixSpec = ".nii.gz",
 ) -> Tuple[List[str], List[str]]:
-    """Discover matched image-label pairs from directories.
+    """Pair images and labels by *base name* (suffix stripped); first matching label wins.
 
-    Matching is done by *base name* (filename with the suffix stripped),
-    NOT by full filename. This relaxes the legacy strict-equality rule so
-    images and labels can use different naming conventions, e.g.
-    ``case01.nii.gz`` paired with ``case01-seg.nii.gz`` or
-    ``case01_pred.nii.gz`` simply by setting ``label_suffix`` to a list
-    such as ``[".nii.gz", "-seg.nii.gz", "_pred.nii.gz"]`` (first match
-    in list order wins per base name).
-
-    Both ``image_suffix`` and ``label_suffix`` accept either a single
-    string (legacy contract) or a sequence of strings. Backwards-
-    compatible: when both are single strings equal to one another the
-    behaviour matches the old by-filename intersection.
-
-    Returns:
-        (image_paths, label_paths) sorted by base name.
+    Both suffix args accept a single string or a sequence of candidates,
+    e.g. ``label_suffix=[".nii.gz", "-seg.nii.gz"]``.
+    Returns ``(image_paths, label_paths)`` sorted by base name.
     """
     img_dir, lbl_dir = Path(image_dir), Path(label_dir)
     assert img_dir.is_dir(), f"Image dir not found: {img_dir}"
@@ -163,9 +134,7 @@ def discover_samples(
     image_suffixes = _normalize_suffixes(image_suffix)
     label_suffixes = _normalize_suffixes(label_suffix)
 
-    # Enumerate images by any of the accepted image suffixes. When two
-    # files map to the same base, the earlier suffix in the list wins
-    # (matches `_strip_suffix`'s first-match-wins contract).
+    # Enumerate images by any accepted suffix; on collision earlier suffix wins.
     img_by_base: Dict[str, Path] = {}
     for sfx in image_suffixes:
         for p in sorted(img_dir.glob(f"*{sfx}")):
@@ -174,10 +143,9 @@ def discover_samples(
                 continue
             img_by_base.setdefault(base, p)
 
-    # For each image base, take the first label candidate whose
-    # ``<base><suffix>`` file exists under lbl_dir, in suffix list order.
-    image_paths: List[str] = []
-    label_paths: List[str] = []
+    # For each image base: first existing ``<base><suffix>`` under lbl_dir wins.
+    image_paths  : List[str] = []
+    label_paths  : List[str] = []
     missing_bases: List[str] = []
     for base in sorted(img_by_base.keys()):
         chosen: Optional[Path] = None
@@ -212,7 +180,7 @@ def discover_samples(
         "Found %d matched image-label pairs (image_suffixes=%s, "
         "label_suffixes=%s).",
         len(image_paths), image_suffixes, label_suffixes)
-    return image_paths, label_paths  # 匹配好的
+    return image_paths, label_paths
 
 
 def _match_per_sample_paths(
@@ -221,23 +189,10 @@ def _match_per_sample_paths(
     image_suffix: SuffixSpec,
     out_suffix: SuffixSpec,
     kind: str) -> List[str]:
-    """Generic 1:1 per-sample file matcher by *base name*.
+    """Strict 1:1 per-sample matcher by base name; raises on any missing match.
 
-    Used by both ``match_bbox_paths`` and ``match_region_weight_paths``
-    — strips ``image_suffix`` from each image filename, then tries each
-    candidate in ``out_suffix`` (in order) and uses the first existing
-    ``<base><candidate>`` under ``src_dir``. Both ``image_suffix`` and
-    ``out_suffix`` accept either a single string (legacy contract) or a
-    sequence of strings, enabling layouts like
-    ``bbox_suffix=[".nii.gz", "-seg.nii.gz", "_pred.nii.gz"]``.
-
-    Missing matches raise ``FileNotFoundError`` listing up to the first
-    five offenders (strong contract: silently dropping samples biases
-    batch statistics and hides data-layout bugs).
-
-    ``kind`` is purely an English label used in log / error messages
-    ("BBox", "RegionWeight", ...) so callers don't need to format their
-    own error strings.
+    Used by ``match_bbox_paths`` and ``match_region_weight_paths``.
+    ``kind`` is the label used in log / error messages.
     """
     sdir = Path(src_dir)
     assert sdir.is_dir(), f"{kind} dir not found: {sdir}"
@@ -249,12 +204,7 @@ def _match_per_sample_paths(
     missing: List[str] = []
     for img_path in image_paths:
         name = Path(img_path).name
-        # Strip any of the accepted image suffixes to get the base name;
-        # tolerate names that don't end with any of them (fall back to
-        # `Path.stem` — single-extension only, matches legacy behaviour).
-        base = _strip_suffix(name, image_suffixes)
-        if base is None:
-            base = Path(name).stem
+        base = _strip_suffix(name, image_suffixes) or Path(name).stem
         chosen: Optional[Path] = None
         for sfx in out_suffixes:
             cand = sdir / f"{base}{sfx}"
@@ -262,15 +212,12 @@ def _match_per_sample_paths(
                 chosen = cand
                 break
         if chosen is None:
-            # Report all attempted candidates so users can see which
-            # suffixes were tried for the offending base.
             attempts = ", ".join(f"{base}{sfx}" for sfx in out_suffixes)
             missing.append(f"{sdir}/[{attempts}]")
         else:
             out.append(str(chosen))
 
     if missing:
-        # Show only the first few to keep the message readable.
         head = "\n  ".join(missing[:5])
         more = f"\n  ... ({len(missing) - 5} more)" if len(missing) > 5 else ""
         raise FileNotFoundError(
@@ -288,19 +235,61 @@ def match_bbox_paths(
     bbox_dir: str,
     image_suffix: SuffixSpec,
     bbox_suffix: SuffixSpec) -> List[str]:
-    """Resolve a per-sample list of ROI bbox NIfTI files matched 1:1 to
-    ``image_paths`` by *base name* (i.e. filename with the image suffix
-    stripped, then `bbox_suffix` appended). Both suffix args accept a
-    single string or a sequence of strings; the first existing
-    ``<base><sfx>`` file under ``bbox_dir`` is taken per sample.
-
-    Errors out (rather than silently dropping samples) if any image
-    lacks a matching bbox file — a missing bbox means we'd fall back
-    to the whole volume for that sample, which is rarely intended and
-    biases batch statistics.
-    """
+    """Resolve per-sample bbox NIfTI paths 1:1 with ``image_paths``; raises on any miss."""
     return _match_per_sample_paths(
         image_paths, bbox_dir, image_suffix, bbox_suffix, kind="BBox")
+
+
+def match_bbox_paths_lenient(
+    image_paths: List[str],
+    bbox_dir: str,
+    image_suffix: SuffixSpec,
+    bbox_suffix: SuffixSpec) -> Tuple[List[str], List[str]]:
+    """Lenient bbox matcher for inference: samples without a bbox are dropped (warned), not raised.
+
+    Returns ``(matched_image_paths, matched_bbox_paths)`` aligned 1:1.
+    """
+    sdir = Path(bbox_dir)
+    assert sdir.is_dir(), f"BBox dir not found: {sdir}"
+
+    image_suffixes = _normalize_suffixes(image_suffix)
+    out_suffixes = _normalize_suffixes(bbox_suffix)
+
+    matched_images: List[str] = []
+    matched_bboxes: List[str] = []
+    missing: List[str] = []
+    for img_path in image_paths:
+        name = Path(img_path).name
+        base = _strip_suffix(name, image_suffixes)
+        if base is None:
+            base = Path(name).stem
+        chosen: Optional[Path] = None
+        for sfx in out_suffixes:
+            cand = sdir / f"{base}{sfx}"
+            if cand.is_file():
+                chosen = cand
+                break
+        if chosen is None:
+            missing.append(base)
+        else:
+            matched_images.append(img_path)
+            matched_bboxes.append(str(chosen))
+
+    if missing:
+        head = ", ".join(missing[:5])
+        more = f" ... (+{len(missing) - 5} more)" \
+            if len(missing) > 5 else ""
+        logger.warning(
+            "match_bbox_paths_lenient: %d/%d samples have no matching "
+            "bbox under %s (suffixes tried=%s) — they will be SKIPPED. "
+            "Missing bases: %s%s",
+            len(missing), len(image_paths), sdir, out_suffixes,
+            head, more)
+
+    logger.info(
+        "Matched %d/%d bbox files under %s (suffixes=%s).",
+        len(matched_bboxes), len(image_paths), sdir, out_suffixes)
+    return matched_images, matched_bboxes
 
 
 def match_region_weight_paths(
@@ -308,16 +297,9 @@ def match_region_weight_paths(
     region_weight_dir: str,
     image_suffix: SuffixSpec,
     region_weight_suffix: SuffixSpec) -> List[str]:
-    """Resolve a per-sample list of region-weight NIfTI files matched 1:1
-    to ``image_paths`` by *base name* (image suffix stripped, then
-    ``region_weight_suffix`` appended). Both suffix args accept a single
-    string or a sequence of strings; the first existing candidate per
-    sample is taken.
+    """Resolve per-sample region-weight NIfTI paths 1:1 with ``image_paths``; raises on any miss.
 
-    Strong contract: every sample must have a matching file
-    (FileNotFoundError otherwise), mirroring ``match_bbox_paths``. See
-    ``DataConfig.region_weight_dir`` for the semantics of the file
-    (background=0, non-bg = weight value; dataset adds +1 on load).
+    File semantics: background=0, non-bg = weight; dataset adds +1 on load.
     """
     return _match_per_sample_paths(
         image_paths, region_weight_dir, image_suffix, region_weight_suffix,
@@ -325,12 +307,7 @@ def match_region_weight_paths(
 
 
 def _default_label_loader(path: str) -> np.ndarray:
-    """Default label reader for label-scan helpers — int16 NIfTI.
-
-    Pulled out as a module-level helper so npz-mode callers can swap
-    in ``load_npz_label_for_split`` without re-implementing the
-    scan / split logic.
-    """
+    """Default int16 NIfTI label reader (npz mode swaps in ``load_npz_label_for_split``)."""
     return load_nifti(path, dtype=np.int16)
 
 
@@ -338,21 +315,10 @@ def detect_label_values(
     label_paths: List[str],
     max_scan: Optional[int] = None,
     label_loader_fn=None) -> List[int]:
-    """Auto-detect unique label values from the label files.
+    """Auto-detect unique label values; scans all files by default.
 
-    Scans ALL label files by default (previously only the first 5, which
-    silently missed rare classes distributed across the dataset). Pass
-    ``max_scan`` if the dataset is very large and a subset scan is
-    acceptable — results will be logged with an explicit "partial scan"
-    warning in that case.
-
-    Args:
-        label_loader_fn: Callable ``path -> int16 ndarray``. Defaults
-            to ``_default_label_loader`` (NIfTI). The npz code path
-            passes ``load_npz_label_for_split`` here so a single
-            implementation serves both data sources.
-
-    Returns a sorted list of integer label values starting with background.
+    ``max_scan`` enables a partial scan with a warning. ``label_loader_fn``
+    swaps the reader (NIfTI vs npz). Returns sorted ints starting with bg.
     """
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
@@ -366,9 +332,7 @@ def detect_label_values(
 
     all_labels = set()
     for path in scan_paths:
-        # Labels are small integer class indices — decoding as int16
-        # (vs. default float32) cuts peak RAM of this startup scan 4×
-        # with no downstream change (``np.round`` is a no-op on ints).
+        # int16 decode keeps the startup scan light on RAM.
         lbl    = label_loader_fn(path)
         unique = np.unique(lbl.astype(np.int32, copy=False)).tolist()
         all_labels.update(unique)
@@ -397,14 +361,11 @@ def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], Lis
 def _volume_primary_class(
     label_path: str, label_values: List[int],
     label_loader_fn=None) -> int:
-    """Return the label value that occupies the most voxels in the volume
-    (background counted too). Ties break on the smallest label value.
-    """
+    """Label value with the highest voxel count (ties broken by smallest label)."""
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     lbl = label_loader_fn(label_path)
     lbl_int = lbl.astype(np.int32, copy=False)
-    # Count voxels per requested label value; ignore stray labels.
     counts = np.array(
         [(lbl_int == v).sum() for v in label_values], dtype=np.int64)
     if counts.sum() == 0:
@@ -419,34 +380,22 @@ def stratified_train_val_split(
     seed: int,
     use_foreground_only: bool = True,
     label_loader_fn=None) -> Tuple[List[int], List[int]]:
-    """Stratified split by each volume's primary label.
+    """Stratify train/val by each volume's primary fg label; falls back to random if degenerate.
 
-    Each volume is assigned a stratum equal to the most-frequent foreground
-    label it contains (falling back to background for entirely-empty volumes).
-    Within each stratum, samples are shuffled and split according to
-    ``val_ratio``. When ``use_foreground_only`` is True (default), the
-    primary label is restricted to foreground — this matches the typical
-    medical-segmentation use case where the tumour / organ class distribution
-    matters far more than "how much background a volume has".
-
-    Falls back gracefully to a non-stratified split when the dataset is
-    too small to stratify (fewer than 2 samples per stratum would leave
-    some strata empty on one side).
+    ``use_foreground_only=True`` ignores background frequency when picking
+    the primary class (typical for medical segmentation).
     """
     n   = len(label_paths)
     rng = np.random.RandomState(seed)
 
-    # Determine which label values are used as strata keys.
     fg_vals = label_values[1:] if use_foreground_only and len(label_values) > 1 else label_values
     strata_vals = fg_vals if fg_vals else label_values
 
-    # Assign each volume to a stratum.
     strata: Dict[int, List[int]] = {v: [] for v in strata_vals}
-    fallback: List[int] = []  # volumes with no voxel in any fg class
+    fallback: List[int] = []  # volumes with no fg voxel
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     for idx, path in enumerate(label_paths):
-        # int16 decode — see ``detect_label_values`` for rationale.
         lbl = label_loader_fn(path)
         lbl_int = lbl.astype(np.int32, copy=False)
         counts = {v: int((lbl_int == v).sum()) for v in strata_vals}
@@ -454,12 +403,10 @@ def stratified_train_val_split(
         if best == 0:
             fallback.append(idx)
         else:
-            primary = min(v for v, c in counts.items() if c == best)  # tie-break by smallest label
+            primary = min(v for v, c in counts.items() if c == best)  # tie → smallest
             strata[primary].append(idx)
 
-    # Determine per-stratum split. If any stratum has < 2 samples we cannot
-    # stratify it cleanly; treat it as non-fractionable and put the entire
-    # bucket into train (preferring training coverage).
+    # Strata with <2 members go entirely to train (cannot fractionate cleanly).
     train_idx: List[int] = []
     val_idx: List[int] = []
 
@@ -471,13 +418,12 @@ def stratified_train_val_split(
             train_idx.extend(members)
             continue
         n_val_k = max(1, int(round(len(members) * val_ratio)))
-        # Never put every member of a stratum into val
+        # Never put every member of a stratum into val.
         n_val_k = min(n_val_k, len(members) - 1)
         val_idx.extend(members[:n_val_k])
         train_idx.extend(members[n_val_k:])
 
-    # Empty-label volumes are distributed by the same val_ratio, untouched
-    # by stratification.
+    # Empty-label volumes split by the same val_ratio (no stratification).
     rng.shuffle(fallback)
     n_val_f = int(round(len(fallback) * val_ratio))
     val_idx.extend(fallback[:n_val_f])
@@ -486,8 +432,7 @@ def stratified_train_val_split(
     rng.shuffle(train_idx)
     rng.shuffle(val_idx)
 
-    # Safety net: if splitting produced an empty val set (e.g., every
-    # stratum has 1 sample), fall back to random split so training can proceed.
+    # Safety net: if either split is empty, fall back to random.
     if not val_idx or not train_idx:
         logger.warning(
             "Stratified split produced degenerate sets "
@@ -504,19 +449,7 @@ def stratified_train_val_split(
 
 def discover_npz_samples(
     npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
-    """Discover pre-computed npz packages produced by ``make_data``.
-
-    Returns a sorted list of npz paths (one per sample). The
-    per-sample pid is derived from the filename (stem with the
-    ``npz_suffix`` stripped) and is used as the exclude-list key —
-    same pid convention as ``discover_samples`` so an exclude list
-    written for the NIfTI pipeline transfers verbatim.
-
-    Sidecar files emitted by ``make_data`` (``_manifest.json``,
-    ``_failures.txt``) and any other dotfile / underscore-prefixed
-    artefact are ignored to avoid mistaking bookkeeping files for
-    samples.
-    """
+    """List ``make_data`` npz packages under ``npz_dir``; ignores ``_*`` / dot sidecars."""
     d = Path(npz_dir)
     assert d.is_dir(), f"NPZ dir not found: {d}"
     paths = sorted(
@@ -531,42 +464,23 @@ def discover_npz_samples(
 
 
 def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
-    """Build train and val DataLoaders from config.
+    """Build train/val DataLoaders: discover → detect labels → split → dataset/loader.
 
-    Steps:
-    1. Discover samples — npz packages when ``data.npz_dir`` is set,
-       otherwise (image, label) NIfTI pairs.
-    2. Auto-detect label values if not specified.
-    3. Split into train/val (stratified by primary foreground class
-       by default).
-    4. Create the appropriate Dataset subclass + DataLoader for each.
-
-    NPZ vs. NIfTI mode are mutually exclusive: ``npz_dir`` non-empty
-    forces the npz path and ignores ``image_dir`` / ``label_dir`` /
-    ``bbox_dir`` / ``region_weight_dir`` (a one-line warning is
-    logged so misconfiguration is loud).
+    NPZ vs. NIfTI modes are mutually exclusive: a non-empty ``data.npz_dir``
+    forces the npz path and ignores ``image_dir``/``label_dir``/``bbox_dir``/
+    ``region_weight_dir`` (logged loudly).
     """
     dc = cfg.data
 
-    # ---- Source dispatch: npz packages vs. legacy NIfTI -----------
+    # Source dispatch: npz packages vs. NIfTI.
     npz_dir = getattr(dc, "npz_dir", "")
     if npz_dir:
         npz_suffix = getattr(dc, "npz_suffix", ".npz")
-        # ---- Auto-build hook --------------------------------------
-        # Turn the npz pipeline into a single-command UX: when the
-        # configured ``npz_dir`` is missing or empty, run
-        # ``make_data.prepare_dataset`` inline (one-time cost,
-        # subsequent runs reuse the cache). A partially-populated
-        # directory is treated as authoritative — we do NOT silently
-        # top it up, because a previous interrupted build may have
-        # written incomplete files; the user is expected to re-run
-        # make_data manually with ``--overwrite`` or wipe the
-        # directory. This policy keeps the auto-build path strictly
-        # idempotent and surprise-free.
-        npz_p = Path(npz_dir)
+        # Auto-build npz cache when missing/empty (one-time cost; partial dir is
+        # treated as authoritative — user must re-run make_data with --overwrite).
+        npz_p       = Path(npz_dir)
         npz_present = npz_p.is_dir() and any(
-            x for x in npz_p.glob(f"*{npz_suffix}")
-            if not x.name.startswith(("_", ".")))
+            x for x in npz_p.glob(f"*{npz_suffix}") if not x.name.startswith(("_", ".")))
         if not npz_present:
             if not bool(getattr(dc, "npz_auto_build", True)):
                 raise FileNotFoundError(
@@ -580,10 +494,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 "make_data.prepare_dataset (workers=%d). This is a "
                 "one-time cost; subsequent train runs will reuse the "
                 "npz cache.", npz_dir, max(dc.num_workers, 1))
-            # Local import keeps the module import graph clean for
-            # users who never enable npz mode (avoids paying the
-            # ProcessPoolExecutor / SimpleITK-in-make_data cost up
-            # front at every loader.py import).
+            # Local import: keeps the make_data deps off the loader.py path.
             from .make_data import prepare_dataset
             counters = prepare_dataset(
                 cfg, npz_dir,
@@ -615,39 +526,27 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             getattr(dc, "bbox_dir", ""),
             getattr(dc, "region_weight_dir", ""))
         npz_paths_all = discover_npz_samples(npz_dir, npz_suffix)
-        # In npz mode, image_paths / label_paths are aliases of the
-        # npz path list — the dataset uses ``_npz_paths`` for actual
-        # I/O and only consults ``image_paths`` for ``len()`` /
-        # cache-key purposes.
+        # In npz mode image_paths/label_paths alias the npz list (used only for len/cache keys);
+        # actual I/O routes through ``_npz_paths`` inside the dataset.
         image_paths = list(npz_paths_all)
         label_paths = list(npz_paths_all)
-        # Apply the same exclude_list contract as the NIfTI path:
-        # pids are computed by stripping ``npz_suffix`` from each
-        # filename, matching ``make_data``'s output convention.
         exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
         image_paths, label_paths, keep_idx = _filter_by_exclude(
             image_paths, label_paths, npz_suffix, exclude_pids)
         if exclude_pids:
             npz_paths_all = [npz_paths_all[i] for i in keep_idx]
-        # Label-scan helpers route via the npz reader so we don't
-        # re-implement detect / stratified-split logic.
         label_loader_fn = load_npz_label_for_split
     else:
         npz_paths_all = None
-        # Discover samples, 数据配对
         image_paths, label_paths = discover_samples(
             dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
 
-        # Drop bad samples (e.g. SimpleITK-unreadable NIfTIs with non-orthonormal
-        # direction cosines) listed in `data.exclude_list`. Done BEFORE label
-        # auto-detection / stratified split so those stages never touch the
-        # offending files. `keep_idx` later re-aligns the bbox list too.
+        # Apply exclude_list before label scan/split so those stages skip bad files.
         exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
         image_paths, label_paths, _ = _filter_by_exclude(
             image_paths, label_paths, dc.image_suffix, exclude_pids)
-        label_loader_fn = None  # default = NIfTI int16 reader
+        label_loader_fn = None  # default NIfTI int16 reader
 
-    # Auto-detect labels if needed, 标签值确认
     if not dc.label_values:
         dc.label_values = detect_label_values(
             label_paths, label_loader_fn=label_loader_fn)
@@ -656,7 +555,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
-    # Split — stratified by primary foreground class when requested.
+    # Stratified split by primary fg class (random fallback below).
     if getattr(dc, "stratified_split", True) and dc.num_classes >= 2:
         train_idx, val_idx = stratified_train_val_split(
             label_paths, dc.label_values, dc.val_ratio, dc.split_seed,
@@ -668,43 +567,31 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                     len(train_idx), len(val_idx))
 
     cache = dc.cache_mode == "memory"
-    rw = cfg.loss.region_weights if cfg.loss.region_weights else None
-    # `aug_oversample_ratio` now applies to BOTH z_axis and cubic modes (BUG-B).
-    # Validation sets always use oversample=1.0 so val patches match the
-    # physical patch size verbatim; no GPU augmentation runs on val data.
+    rw    = cfg.loss.region_weights if cfg.loss.region_weights else None
+    # Train uses oversample ≥ 1.0 (extra slack absorbed by augmentation);
+    # val always uses 1.0 so patches match the physical patch_size verbatim.
     train_oversample = max(dc.aug_oversample_ratio, 1.0)
     common_kwargs = dict(
-        label_values=dc.label_values,
-        patch_size=tuple(dc.patch_size),
-        intensity_min=dc.intensity_min,
-        intensity_max=dc.intensity_max,
-        normalize=dc.normalize,
-        global_mean=dc.global_mean,
-        global_std=dc.global_std,
-        cache_enabled=cache,
-        cache_max_volumes=getattr(dc, "cache_max_volumes", 0),
-        region_weights=rw)
-    # ``z_boundary_mode`` is meaningful for the z-axis-style datasets
-    # (z_axis / 2_5d) but not for cubic / whole. Inject it only there
-    # to keep the cubic / whole dataset signatures untouched.
+        label_values      = dc.label_values,
+        patch_size        = tuple(dc.patch_size),
+        intensity_min     = dc.intensity_min,
+        intensity_max     = dc.intensity_max,
+        normalize         = dc.normalize,
+        global_mean       = dc.global_mean,
+        global_std        = dc.global_std,
+        cache_enabled     = cache,
+        cache_max_volumes = getattr(dc, "cache_max_volumes", 0),
+        region_weights    = rw)
+    # z_boundary_mode applies only to z_axis / 2.5d datasets.
     z_kwargs = dict(z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"))
 
-    # ``aux_keep_native_d`` is a 2.5D-only switch (Config.validate enforces
-    # this). For non-2.5D modes the kwarg is silently False; for 2.5D
-    # modes the dataset uses it to dispatch the simplified single-cube
-    # path (see ``SegDataset3D._getitem_native_d``).
+    # 2.5D-only switch — single max-FOV cube path; trainer center-crops per view.
     aux_native_kwargs = dict(
-        aux_keep_native_d=bool(getattr(dc, "aux_keep_native_d", False))
+        aux_keep_native_d = bool(getattr(dc, "aux_keep_native_d", False))
         and dc.patch_mode == "2_5d"
         and len(dc.multi_res_scales) > 1)
 
-    # ``keep_native_multi_res`` is the 3D analogue of
-    # ``aux_keep_native_d`` — the dataset emits a single max-FOV cube
-    # at native physical resolution and the trainer (R2) crops+resizes
-    # per view before the model forward. Config.validate enforces the
-    # patch_mode / multi_res_scales preconditions; we still gate
-    # defensively so a stale flag in 2_5d / whole modes never affects
-    # the dataset emission contract.
+    # 3D analogue of aux_keep_native_d for z_axis / cubic; defensively gated by mode.
     keep_native_kwargs_z = dict(
         keep_native_multi_res=bool(getattr(dc, "keep_native_multi_res", False))
         and dc.patch_mode == "z_axis"
@@ -714,22 +601,14 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         and dc.patch_mode == "cubic"
         and len(dc.multi_res_scales) > 1)
 
-    # Optional ROI bbox paths — matched 1:1 to image_paths, then split
-    # along the same train/val indices so each per-sample bbox stays
-    # aligned with its image / label after the split. Skipped in npz
-    # mode (bbox is already pre-applied inside the npz packages).
+    # Per-sample ROI bbox paths (NIfTI mode only; npz already has bbox baked in).
     bbox_paths_all: Optional[List[str]] = None
     if npz_paths_all is None and getattr(dc, "bbox_dir", ""):
         bbox_paths_all = match_bbox_paths(
             image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
 
-    # Optional per-sample region-weight NIfTI paths — same 1:1 matching
-    # as bbox_paths_all, strong-contract (error out on any missing file).
-    # When set, takes precedence over ``loss.region_weights`` at runtime
-    # inside the dataset (see ``SegDataset3D.__getitem__`` et al.).
-    # Skipped in npz mode (rw is embedded as the optional ``rw`` key
-    # of each npz package; the dataset's ``_has_region_weight_file``
-    # override checks the npz directly).
+    # Per-sample region-weight NIfTI paths (NIfTI mode only; npz embeds rw).
+    # When set, overrides loss.region_weights inside the dataset.
     rw_paths_all: Optional[List[str]] = None
     if npz_paths_all is None and getattr(dc, "region_weight_dir", ""):
         rw_paths_all = match_region_weight_paths(
@@ -748,37 +627,17 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     if rw_paths_all is not None:
         train_paths["region_weight_paths"] = [rw_paths_all[i] for i in train_idx]
         val_paths["region_weight_paths"] = [rw_paths_all[i] for i in val_idx]
-    # In npz mode, every dataset constructor receives the matching
-    # ``npz_paths`` slice. The dataset routes ``_load_image`` /
-    # ``_load_label`` / ``_load_region_weight`` / ``_build_index`` via
-    # the npz readers; ``image_paths`` / ``label_paths`` (above) are
-    # left as aliases of the same path list for ``len()`` and cache-
-    # key consistency only.
+    # NPZ mode: pass the per-sample npz path slice; dataset routes I/O via npz readers.
     if npz_paths_all is not None:
         train_paths["npz_paths"] = [npz_paths_all[i] for i in train_idx]
         val_paths["npz_paths"] = [npz_paths_all[i] for i in val_idx]
 
     if dc.patch_mode == "2_5d":
-        # 2.5D mode reuses the z_axis dataset; the channel-layout depends
-        # on ``data.aux_keep_native_d``:
-        #
-        #   False (legacy):
-        #     Each scale ``s`` extracts ``round(eD * s)`` slices around the
-        #     same z-center (edge-padded for s>1.0; ``z_boundary_mode`` for
-        #     s==1.0) and is resized back to ``(eD, pH, pW)`` — yielding a
-        #     ``(C_res=n_views, eD, pH, pW)`` channel stack. The trainer's
-        #     ``_squeeze_2_5d`` collapses ``(B, n_views, D, H, W)`` →
-        #     ``(B, n_views * D, H, W)`` for the 2D model with view 0 as
-        #     the supervision target.
-        #
-        #   True (native depth):
-        #     The dataset takes the simplified single-cube path: extract a
-        #     SINGLE max-FOV cube of depth ``round(eD * max_scale)`` around
-        #     the z-center (edge-padded), resize H,W only. Output shape
-        #     ``(1, eD * max_scale, pH, pW)`` — same arity as single-res
-        #     path. The trainer's ``_split_views_native_d`` later center-
-        #     crops per view at native depth and concatenates along the
-        #     channel axis for the model forward.
+        # 2.5D reuses the z_axis dataset. Two layouts depending on aux_keep_native_d:
+        #   False (legacy): each scale extracts round(eD*s) slices, resized to (eD,pH,pW);
+        #     trainer collapses (B, n_views, D, H, W) → (B, n_views*D, H, W).
+        #   True: single max-FOV cube of depth round(eD*max_scale); trainer
+        #     center-crops per view at native depth before forward.
         n_views = max(len(dc.multi_res_scales), 1)
         if aux_native_kwargs["aux_keep_native_d"]:
             max_scale = max(dc.multi_res_scales)
@@ -822,9 +681,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     elif dc.patch_mode == "whole":
         logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
                     train_oversample)
-        # Whole mode ignores `foreground_oversample_ratio` and
-        # `multi_res_scales` (validated in Config). Builds a 1-channel
-        # (eD, eH, eW) resize of the full volume.
+        # Whole mode ignores fg oversample / multi_res_scales (validated in Config).
         train_ds = SegDataset3DWhole(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -903,9 +760,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             **z_kwargs,
             **keep_native_kwargs_z)
 
-    # Only pass ``persistent_workers`` / ``prefetch_factor`` when workers
-    # are actually spawned — PyTorch raises ValueError if either is set
-    # with ``num_workers == 0``.
+    # persistent_workers / prefetch_factor only valid when num_workers > 0.
     loader_kwargs: Dict[str, object] = {}
     if dc.num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(
@@ -937,28 +792,15 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         loader_kwargs.get("persistent_workers", "n/a"),
         loader_kwargs.get("prefetch_factor", "n/a"))
 
-    # --- Memory-cache diagnostics -------------------------------------
-    # The per-worker ``VolumeCache`` is a classic OOM source: with
-    # ``cache_mode="memory"`` and ``cache_max_volumes=0`` (the legacy
-    # unbounded default), every worker eventually keeps every volume it
-    # has touched in RAM. On N workers that's N independent copies.
-    # Sample one real volume to estimate the realistic footprint, then
-    # emit an actionable recommendation. This is purely diagnostic — it
-    # never changes behaviour on its own.
+    # Memory-cache footprint estimate (purely diagnostic; per-worker caches multiply).
     if dc.cache_mode == "memory":
         try:
-            # Use the TRAIN dataset's precomputed bboxes (when present) to
-            # estimate the realistic post-crop cached footprint — the
-            # legacy estimator read a full-volume sample which massively
-            # over-counted for ROI-cropped pipelines AND ignored the
-            # region-weight cache, producing a misleading "safe" number
-            # on the way to the actual Host-OOM.
+            # Estimate realistic post-crop bytes/vol from train_ds bboxes when present.
             bboxes = getattr(train_ds, "_bboxes", None)
             npz_paths_train = getattr(train_ds, "_npz_paths", None)
             has_rw_runtime = bool(getattr(dc, "region_weight_dir", ""))
             if npz_paths_train is not None:
-                # NPZ mode: read shape + rw-key presence directly
-                # from the first npz package; no NIfTI decode.
+                # NPZ: read shape + rw-key presence from the first npz, no NIfTI decode.
                 from .dataset import _open_npz as _peek_npz  # local alias
                 _f = _peek_npz(npz_paths_train[0])
                 _shape = _f["image"].shape
@@ -966,8 +808,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 has_rw_runtime = "rw" in _f.files
             else:
                 def _cached_voxels(i: int) -> int:
-                    """Voxel count per cached volume for sample i (bbox-cropped
-                    when a bbox is available, full volume otherwise)."""
+                    """Voxels per cached volume i (bbox-cropped when available)."""
                     bb = bboxes[i] if bboxes and i < len(bboxes) else None
                     if bb is not None:
                         (d0, d1), (h0, h1), (w0, w1) = bb
@@ -976,18 +817,14 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                     sample = load_nifti(image_paths[i])
                     return int(sample.size)
                 sample_voxels = _cached_voxels(0)
-            # image cached as float32 (4B/voxel), label as int16 (2B/voxel).
+            # image fp32 (4B), label int16 (2B), rw fp32 (4B, when configured).
             bytes_per_img = sample_voxels * 4
             bytes_per_lbl = sample_voxels * 2
-            # Region-weight cache (float32) is allocated per-worker
-            # alongside image+label whenever rw is configured (NIfTI
-            # path: ``region_weight_dir``; npz path: ``rw`` key
-            # detected on the first sample).
             bytes_per_rw = sample_voxels * 4 if has_rw_runtime else 0
             per_vol_bytes = bytes_per_img + bytes_per_lbl + bytes_per_rw
             n_train_vols = len(train_idx)
             cap = int(dc.cache_max_volumes)
-            # Effective cap: 0 means unbounded → assume worst case (all).
+            # cap=0 means unbounded → worst-case: every volume cached.
             eff_cap = cap if cap > 0 else n_train_vols
             eff_cap = min(eff_cap, n_train_vols)
             workers = max(dc.num_workers, 1)
@@ -1003,8 +840,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 eff_cap, workers, total_gb,
                 bytes_per_img / (1024 ** 2))
             if cap == 0 and n_train_vols * workers >= 16:
-                # Heuristic: 8 GiB is a generous ceiling for most dev
-                # machines; recommend a cap that stays under that bound.
+                # Recommend a cap that fits under an 8 GiB budget heuristic.
                 budget_gb = 8.0
                 rec = max(
                     1,

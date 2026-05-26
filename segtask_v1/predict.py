@@ -2,7 +2,7 @@
 
 Usage:
     # Predict every .nii / .nii.gz file under a folder (recursive):
-    python -m segtask_v1.predict --config configs/seg2_5d.yaml --checkpoint outputs/lung_bone_convnext/best_model.pth --input F:/CT_data/airway_segment_data/nii --output F:/CT_data/airway_segment_data/lung_bone_pred
+    python -m segtask_v1.predict --config configs/seg2_5d.yaml --checkpoint *.pth --input nii_dir --output out_dir
 
     # Predict a single file:
     python -m segtask_v1.predict --config configs/seg2_5d.yaml \
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import List
 
 from .config import load_config
-from .data.loader import match_bbox_paths
+from .data.loader import match_bbox_paths_lenient
 from .predictor import run_inference
 from .train import apply_overrides, setup_logging
 
@@ -49,32 +49,20 @@ def main():
     parser.add_argument("--config", type=str, required=True,
                         help="Path to YAML config (use the same one as training)")
     parser.add_argument("--checkpoint", "--ckpt", type=str, default=None,
-                        help="Path to trained checkpoint. Defaults to "
-                             "<cfg.train.output_dir>/best_model.pth.")
+                        help="Checkpoint path; default <cfg.train.output_dir>/best_model.pth")
     parser.add_argument("--input", type=str, default=None,
-                        help="A NIfTI file OR a directory containing .nii/.nii.gz. "
-                             "Defaults to cfg.data.image_dir.")
+                        help="NIfTI file or dir; default cfg.data.image_dir")
     parser.add_argument("--output", type=str, default=None,
-                        help="Output directory (overrides cfg.predict.output_dir). "
-                             "Defaults to <parent_of_image_dir>/<task_name>_pred, "
-                             "where task_name = basename(cfg.train.output_dir).")
+                        help="Output dir; default <input_parent>/<task_name>_pred")
     parser.add_argument("--bbox", type=str, default=None,
-                        help="Optional ROI bbox NIfTI mask. Either a single "
-                             "file (when --input is one file) or a directory "
-                             "matching --input by filename. When omitted, "
-                             "falls back to cfg.data.bbox_dir if set; "
-                             "pass --bbox '' to force-disable.")
+                        help="ROI bbox file/dir; '' disables; default falls back to cfg.data.bbox_dir")
     parser.add_argument("--weights", choices=["auto", "ema", "online"],
                         default="auto",
                         help="Which weights to load from checkpoint")
     parser.add_argument("--precision",
                         choices=["auto", "fp32", "bf16", "fp16"],
                         default="auto",
-                        help="Inference precision. 'auto' (default) follows "
-                             "cfg.train.amp_dtype: bfloat16 unless training "
-                             "explicitly used fp16. 'fp16' is the legacy "
-                             "model.half() cast — known to produce NaN with "
-                             "ConvNeXt LayerNorm on CT background.")
+                        help="Inference precision. auto: follow cfg.train.amp_dtype. fp16 may NaN with ConvNeXt+LN.")
     parser.add_argument("--save-probs", action="store_true",
                         help="Also save per-class sigmoid probability maps")
     parser.add_argument("--no-recursive", action="store_true",
@@ -90,13 +78,8 @@ def main():
         cfg.sync()
         cfg.validate()
 
-    # ------------------------------------------------------------------
-    # Resolve defaults for --checkpoint / --input / --output when omitted.
-    #   * checkpoint -> <cfg.train.output_dir>/best_model.pth
-    #   * input      -> cfg.data.image_dir
-    #   * output     -> <parent_of_image_dir>/<task_name>_pred, where
-    #                   task_name = basename(cfg.train.output_dir)
-    # ------------------------------------------------------------------
+    # Resolve defaults: ckpt=<train_out>/best_model.pth, input=cfg.data.image_dir,
+    # output=<input_parent>/<task_name>_pred (task_name=basename(train_out))
     checkpoint_path = args.checkpoint
     if not checkpoint_path:
         train_out = getattr(cfg.train, "output_dir", "") or ""
@@ -118,7 +101,6 @@ def main():
             parser.error("--output not given and cfg.train.output_dir is empty; "
                          "cannot derive task name for default output dir.")
         task_name = Path(train_out).name
-        # Sibling of the image source: parent dir of the input file/folder.
         base_dir = Path(input_path).parent
         cfg.predict.output_dir = str(base_dir / f"{task_name}_pred")
 
@@ -134,12 +116,16 @@ def main():
     logger.info("Checkpoint: %s (variant=%s)", checkpoint_path, args.weights)
     logger.info("Output dir: %s", cfg.predict.output_dir)
 
-    # Resolve bbox source priority: explicit --bbox > cfg.data.bbox_dir.
-    # Pass --bbox '' to force-disable even if cfg has bbox_dir set.
-    bbox_paths = _resolve_bbox_paths(args.bbox, image_paths, cfg)
+    # bbox priority: --bbox > cfg.data.bbox_dir; lenient match drops unmatched images
+    image_paths, bbox_paths = _resolve_bbox_paths(
+        args.bbox, image_paths, cfg)
     if bbox_paths is not None:
         logger.info("BBox enabled: %d masks aligned with inputs.",
                     len(bbox_paths))
+    if not image_paths:
+        logger.error("No images left to predict after bbox matching. "
+                     "Exiting without running inference.")
+        return
 
     run_inference(
         cfg=cfg,
@@ -152,41 +138,34 @@ def main():
 
 
 def _resolve_bbox_paths(
-    cli_bbox: object, image_paths: List[str], cfg) -> object:
-    """Decide which bbox source to use and return a per-image path list
-    (or None when bbox is disabled).
-
-    Priority:
-      1. ``--bbox`` explicit override:
-         - empty string         → disable bbox (overrides cfg).
-         - a single file path   → only valid when --input is one file.
-         - a directory          → match by filename via ``match_bbox_paths``.
-      2. Otherwise, fall back to ``cfg.data.bbox_dir`` (matched by name).
-      3. If neither is set, return None (full-volume inference).
+    cli_bbox: object, image_paths: List[str], cfg):
+    """Resolve bbox source. Returns (image_paths, bbox_paths|None); image list may be filtered.
+    Priority: --bbox (''=disable, file=single, dir=lenient match) > cfg.data.bbox_dir > None.
     """
     if cli_bbox is not None:
         if cli_bbox == "":
-            return None
+            return image_paths, None
         p = Path(cli_bbox)
         if p.is_file():
             if len(image_paths) != 1:
                 raise ValueError(
                     f"--bbox is a single file but --input expanded to "
                     f"{len(image_paths)} images; pass a directory instead.")
-            return [str(p)]
+            return image_paths, [str(p)]
         if not p.is_dir():
             raise FileNotFoundError(f"--bbox path not found: {p}")
         bbox_dir = str(p)
     else:
         bbox_dir = getattr(cfg.data, "bbox_dir", "") or ""
         if not bbox_dir:
-            return None
+            return image_paths, None
 
-    return match_bbox_paths(
+    matched_images, matched_bboxes = match_bbox_paths_lenient(
         image_paths,
         bbox_dir,
         cfg.data.image_suffix,
         getattr(cfg.data, "bbox_suffix", ".nii.gz"))
+    return matched_images, matched_bboxes
 
 
 if __name__ == "__main__":

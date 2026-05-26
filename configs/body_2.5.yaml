@@ -32,15 +32,12 @@ data:
   cache_max_volumes: 24
 
 
-# =====================================================================
-# AUGMENT — 与 seg3d.yaml 相同；3D 增强器在 squeeze 之前作用，
-#           所以语义对 2.5D 完全一致（仍在 (B,1,D,H,W) 张量上）。
-# =====================================================================
+# AUGMENT — 3D 增强器在 squeeze 前作用于 (B,1,D,H,W); 2.5D 语义与 seg3d 一致
 augment:
   enabled: true
 
   random_flip_prob: 0.2
-  random_flip_axes: [2, 3, 4]   # D, H, W —— D-flip 在增强阶段做，不是推理阶段
+  random_flip_axes: [2, 3, 4]   # D,H,W; D-flip 仅训练阶段
 
   random_affine_prob : 0.3
   random_rotate_range: [-15.0, 15.0]
@@ -69,58 +66,16 @@ augment:
   simulate_lowres_zoom: [0.5, 1.0]
 
 
-# =====================================================================
-# MODEL — 2D UNet (spatial_dims=2)
-# =====================================================================
+# MODEL — 详细说明见 configs/seg2_5d.yaml
 model:
   backbone: "convnext"
-
-  # 由 Config.sync() 自动设置；写在这里仅为可读性。
-  spatial_dims: 2
-
-  # 2D 模型显存友好，可加大通道数。
   encoder_channels: [32, 64, 128, 256, 256]
-  encoder_blocks_per_stage: [3, 3, 9, 3, 3]    # 必须 == len(encoder_channels)
-  decoder_blocks_per_stage: [2, 2, 2, 2]       # 必须 == len(encoder_channels) - 1
-  # 2.5D 折叠模式合法值："basic" | "preact" | "bottleneck"。
-  # ``r2plus1d``（方案 A，因子化 (2+1)D 残差块）需要 spatial_dims=3，即 D
-  # 仍是真实空间轴。要在 2.5D 数据流上启用方案 A，请同时打开下面的
-  # ``lift_2_5d_to_3d``（Plan A 升维开关）。否则只有 basic/preact/bottleneck
-  # 合法。
+  encoder_blocks_per_stage: [3, 3, 9, 3, 3]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  # 'basic'(默认) | 'preact' | 'bottleneck' | 'r2plus1d'(需 lift_2_5d_to_3d=true)
   block_type: "basic"
 
-  # ---- Plan A "升维"开关 ----
-  # 默认 false（经典 2.5D 折叠路径，D 折入通道维，2D UNet + SliceChannelLoss）。
-  # 设为 true 时：
-  #   * trainer 跳过 (B, C_res, D, H, W) → (B, C_res*D, H, W) 的 squeeze；
-  #     图像保持 (B, n_views, D, H, W) 进入真 3D UNet（spatial_dims 自动改为 3）。
-  #   * 模型输入通道 = n_views = len(multi_res_scales)，每个 FOV 视图算一通道；
-  #     输出 (B, num_fg, D, H, W)（单分辨率真 3D 分割）。
-  #   * 损失走 MultiResolutionLoss(num_res=1) 而不是 SliceChannelLoss；
-  #     ``loss.slice_loss_reduction`` 在 lift 模式下被忽略。
-  #   * 仅 view 0（1× FOV）作为监督目标；wider FOV 仍作为输入通道喂给 stem
-  #     （``context_fusion`` 仍生效），但不参与监督。
-  # 推荐与 ``block_type: "r2plus1d"`` 配合，让 (2+1)D 因子化卷积获得真实
-  # 的 z 方向上下文。
-  # 限制：
-  #   1. 与 data.aux_keep_native_d 互斥（folded-D 通道槽位 vs. 真 D 空间轴
-  #      在物理布局上不兼容；Config.validate() 会显式拒绝）。
-  #   2. 几何约束：``patch_size[0]`` (D) 必须能被 ``2**(len(encoder_channels)-1)``
-  #      整除。Downsample 在每层把 D 也减半，5 stages 需 D≥16；4 stages 需 D≥8。
-  #      经典 2.5D 折叠路径不受此约束（D 折入通道维），开 lift 时则会受。
-  #      违反时 validate() 立即报错并给出具体修复建议。
-  #
-  # 与 ``aux_seg_supervision`` 正交支持（v2 起）：每个 aux head 输出
-  # ``(B, num_fg, D, H, W)``（spatial_dims=3 自动产生 3D 1×1×1 conv），
-  # 每视图 aux 损失走 MultiResolutionLoss(num_res=1) 而非 SliceChannelLoss。
-  # 与 ``deep_supervision`` 也正交（DS 仅作用于主路径）。
-  #
-  # 推荐组合（典型起点）：
-  #   patch_size: [16, 256, 256]
-  #   encoder_channels: [32, 64, 128, 256, 256]
-  #   block_type: "r2plus1d"
-  #   lift_2_5d_to_3d: true
-  #   aux_seg_supervision: true   # 可选：让 wider FOV 也被监督
+  # Plan A 升维: false=折叠 (2D + SliceChannelLoss); true=真 3D (与 aux_keep_native_d 互斥)
   lift_2_5d_to_3d: false
 
   norm_type  : "instance"
@@ -134,38 +89,13 @@ model:
 
   deep_supervision: false
 
-  stem_mode    : "conv7"
+  stem_mode    : "conv7"          # 'conv1' | 'conv3' | 'conv7' | 'patchify'
 
-  # 多 z-FOV 上下文融合策略（仅 patch_mode=2_5d 且 len(multi_res_scales)>1 生效）。
-  #   "multi_stem_proj" — 方案 A。每个 view 独立 stem + 1×1 融合回 base 通道（早融合）。
-  #   "hierarchical"    — 方案 C，推荐。view k 经 stride-2^k patchify stem 产出低分辨率
-  #                        特征，cat 注入到 encoder stage k 入口（粗 FOV 进深层语义）。
-  #                        约束：len(multi_res_scales) <= len(encoder_channels)，且
-  #                              patch_size[1:] 能被 2^(n_views-1) 整除。
-  #   "shared_stem"     — 单 stem 在 n_views*D 通道上跑（更省参，但物理异质共用滤波器）。
+  # 'multi_stem_proj' (Plan A, 早融合) | 'hierarchical' (Plan C) | 'shared_stem'
   context_fusion: "multi_stem_proj"
 
-  # 多 z-FOV 辅助分割监督（仅 2.5D 且 len(multi_res_scales)>1 生效）。
-  #   false  — 默认/旧行为：seghead 仅对 view 0（1× FOV）做预测，aux 视野
-  #            仅作为 stem 输入辅助上下文（无显式监督）。
-  #   true   — 强引导：seghead 额外为每个 aux view k=1..n_views-1 输出一份
-  #            (B, num_fg*D, H, W) 预测，对应 dataset 里 view k 重采样回 D
-  #            通道的 label 做监督。aux head 拓扑依据 context_fusion 自动选择：
-  #              * multi_stem_proj / shared_stem (Plan A)：所有 aux head
-  #                并联挂在最高分辨率的 decoder 特征上（与 stem 早融合对称）。
-  #              * hierarchical (Plan C)：aux head k 挂在 dec_features[-1-k]，
-  #                即与 encoder stage k 同语义深度的 decoder 特征上（与 stem
-  #                stride-2^k 注入位置对称）。
-  #            权重由 loss.aux_supervision_weights 控制。eval/predict 阶段
-  #            模型仍只输出主预测张量，predictor 行为不变。
-  aux_seg_supervision: true
-
-  # Aux head 拓扑（仅 aux_seg_supervision=true 生效）。
-  #   "linear" — 单层 1×1 conv（与 main head 等容量；推荐 Plan A）。
-  #   "conv"   — 3×3 ConvNormAct + 1×1（推荐 Plan C：低分辨率特征处加一层
-  #              空间聚合，更接近 "main head + decoder block" 的容量）。
-  # 参数开销 < 网络总量 1%。
-  aux_head_mode: "linear"
+  aux_seg_supervision: true       # 多 FOV 辅助分割监督 (仅 2_5d + n_views>1)
+  aux_head_mode: "linear"         # 'linear' (Plan A) | 'conv' (Plan C)
 
   decoder_type   : "unet"
   downsample_mode: "conv"
@@ -175,19 +105,13 @@ model:
   drop_path_rate: 0.0
 
 
-# =====================================================================
-# LOSS — 2.5D 走 SliceChannelLoss 包装；底层 base_loss 在 (B*D,1,H,W) 上
-#        作为标准 2D 二值损失生效，所有 LossConfig 选项原样适用。
-# =====================================================================
+# LOSS — 2.5D 走 SliceChannelLoss，base_loss 在 (B*D,1,H,W) 作 2D 二值损失
 loss:
   name: "dice_focal"
   compound_weights: [1.0, 1.0]
 
-  # 长度 = num_fg_classes（不含背景）。
-  class_weights: [1.0]
-
-  # 与 z_axis/cubic 一致：按 label_values 全长（含 bg）一一对应。
-  region_weights: [1.0, 4.0]
+  class_weights: [1.0]            # 长 = num_fg_classes (不含 bg)
+  region_weights: [1.0, 4.0]      # 按 label_values 全长 (含 bg)
 
   dice_smooth : 1.0e-5
   dice_squared: false
@@ -200,31 +124,13 @@ loss:
 
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
-  # 2.5D 专用：SliceChannelLoss 的 reduction 模式。
-  #   "per_slice"  —— 默认/旧版行为：把 (B, num_fg*D, H, W) 拆为 (B*D, 1, H, W)
-  #                   后逐切片计算 Dice/Tversky，仅在 (H, W) 上求和。
-  #                   缺陷：空切片 Dice ≈ smooth/smooth ≈ 1，loss ≈ 0，
-  #                   稀释梯度；不约束跨切片结构一致性。
-  #   "per_volume" —— 推荐：把 pred 视作 (B, num_fg, D, H, W)，逐窗口做 3D
-  #                   Dice/Tversky（在 (D, H, W) 上求和）。空切片不再"白送"，
-  #                   隐式正则跨切片一致性。BCE/Focal/Lovász 数学等价不变。
-  # 切换该开关只影响 Dice 系数家族的聚合域；class_weights / region_weights /
-  # focal/tversky 超参 / deep_supervision 全部继续生效。
+  # 'per_slice' (旧, 空切片 Dice≈1 稀释梯度) | 'per_volume' (推荐, 3D Dice, 隐式 z 正则)
   slice_loss_reduction: "per_volume"
 
-  # 多 z-FOV 辅助监督权重（仅 model.aux_seg_supervision=true 生效）。
-  # 长度 = n_views - 1（即 aux view 数）。空列表 → 自动用 0.5^k 几何衰减
-  # （n_views=3 → [0.5, 0.25]，n_views=4 → [0.5, 0.25, 0.125]）。
-  # 训练总损失：
-  #   L = L_main(view_0) + Σ_{k=1..K} w_k * L_aux(view_k)
-  # 其中 L_aux 为同款 SliceChannelLoss（不走 deep supervision），与主损失
-  # 共享 base_loss（dice_focal 等）与 slice_loss_reduction 设置。
+  # 辅助监督权重 (长 = n_views-1)。空 → 0.5^k 自动衰减。L_aux 不走 deep supervision
   aux_supervision_weights: []
 
 
-# =====================================================================
-# TRAIN
-# =====================================================================
 train:
   epochs: 100
 
@@ -241,10 +147,7 @@ train:
   grad_clip_norm: 12.0
 
   use_amp  : true
-  # bfloat16 强烈推荐：fp16 在 InstanceNorm 上偶发方差下溢导致 forward NaN
-  # （即使 loss 端 clamp 也无法恢复 NaN）。bf16 指数范围 ≈ fp32，方差不会下溢，
-  # 速度与 fp16 接近；trainer 自动对 bf16 关闭 GradScaler。
-  # Ampere 及更新架构（含 RTX 3080 Ti）原生支持。
+  # 'auto' (推荐 bf16) | 'bf16' | 'fp16' | 'fp32'; bf16 避免 IN 方差下溢 NaN
   amp_dtype: "auto"
 
   compile_mode: "default"
@@ -268,25 +171,19 @@ train:
 
   resume: ""
 
-  # 仅加载模型权重做迁移学习初始化；不恢复 optimizer/scheduler/epoch/RNG。
-  # 与 resume 同时设置时 resume 优先（pretrain 被忽略）。
+  # 仅加载权重作迁移学习 (不恢复 optim/sched/epoch/RNG); resume 优先
   pretrain: ""
   pretrain_strict: false
   pretrain_load_ema: false
 
 
-# =====================================================================
-# PREDICT — 2.5D 推理走 z 轴滑窗，与 z_axis 几何完全一致；
-#           内部对每个窗口 squeeze + 2D forward + reshape。
-#           TTA 仅翻转 H/W（D 是 channel 轴，翻转会破坏物理 slice 顺序）。
-# =====================================================================
+# PREDICT — z 轴滑窗 (几何同 z_axis); TTA 仅翻 H/W (D 是 channel 轴)
 predict:
   z_interleave_enabled: false
-  # 可选：覆盖默认阈值/因子
   z_interleave_thresholds: [1.0, 1.5]
   z_interleave_factors: [3, 2, 1]
   z_overlap : 0.5
-  blend_mode: "gaussian"
+  blend_mode: "gaussian"          # 'gaussian' | 'constant'
   batch_size: 4
   tta_flip  : false
   threshold : 0.5

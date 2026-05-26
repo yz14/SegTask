@@ -39,7 +39,8 @@ def _make_cfg(arch: str,
               aux: bool = True,
               ds: bool = False,
               aux_keep_native_d: bool = True,
-              context_fusion: str = "multi_stem_proj"):
+              context_fusion: str = "multi_stem_proj",
+              adm_linear_attention_levels=None):
     """Build a minimal :class:`Config` for the requested arch.
 
     Avoids depending on real data dirs by only constructing in-memory
@@ -86,6 +87,12 @@ def _make_cfg(arch: str,
         cfg.model.adm_attention_levels = [4]
         cfg.model.adm_num_heads = 2
         cfg.model.adm_num_head_channels = -1
+        if adm_linear_attention_levels is not None:
+            cfg.model.adm_linear_attention_levels = list(
+                adm_linear_attention_levels)
+            # Use head_dim=8 in the smoke test so hidden=32 stays small.
+            cfg.model.adm_linear_attention_num_heads = 4
+            cfg.model.adm_linear_attention_head_dim = 8
     elif arch == "edm2":
         cfg.model.edm2_attention_levels = [4]
         cfg.model.edm2_channels_per_head = 32  # match channel widths
@@ -122,10 +129,12 @@ def _check_main_shape(out, num_fg: int, D: int, H: int, W: int) -> torch.Tensor:
 
 
 def _run_arch(arch: str, *, ds: bool, aux: bool, aux_keep_native_d: bool,
-              context_fusion: str = "multi_stem_proj") -> None:
+              context_fusion: str = "multi_stem_proj",
+              adm_linear_attention_levels=None) -> None:
     cfg = _make_cfg(arch, ds=ds, aux=aux,
                     aux_keep_native_d=aux_keep_native_d,
-                    context_fusion=context_fusion)
+                    context_fusion=context_fusion,
+                    adm_linear_attention_levels=adm_linear_attention_levels)
     from segtask_v1.models.factory import build_model
 
     model = build_model(cfg)
@@ -235,6 +244,25 @@ def main() -> int:
             logger.error("FAIL: arch=%s ds=%s aux=%s native_d=%s fusion=%s\n%s",
                          arch, ds, aux, native_d, fusion,
                          traceback.format_exc())
+
+    # ADM + LinearAttention smoke matrix.
+    lin_cases = [
+        # (label, lin_levels)
+        ("light",     [0, 1]),                # shallow only
+        ("full",      [0, 1, 2, 3]),          # lucidrains-style every-level
+        ("overlap",   [3, 4]),                # overlap with softmax-attn levels
+    ]
+    for label, lin_levels in lin_cases:
+        try:
+            _run_arch("adm", ds=False, aux=True, aux_keep_native_d=True,
+                      context_fusion="multi_stem_proj",
+                      adm_linear_attention_levels=lin_levels)
+            logger.info("[adm] linear-attn (%s, levels=%s) smoke OK",
+                        label, lin_levels)
+        except Exception:
+            failures += 1
+            logger.error("FAIL: adm linear-attn label=%s levels=%s\n%s",
+                         label, lin_levels, traceback.format_exc())
 
     # Single-FOV (n_views=1) smoke — aux disabled automatically.
     for arch in ("adm", "edm2"):

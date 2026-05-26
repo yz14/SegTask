@@ -1,12 +1,6 @@
-# ============================================================================
-# Plan A 升维收益对照 — 组 2/3：升维 3D + R(2+1)D（Plan-A）
-#
-# 角色：与 Baseline-2.5D 仅差 {block_type, lift_2_5d_to_3d}。
-# 路径：lift 模式 —— D 保持真实空间轴，2D UNet 重建为真 3D UNet（spatial_dims=3,
-#       in_channels=n_views=3），R(2+1)D 因子化卷积获得真实 z 方向上下文，
-#       loss 走 MultiResolutionLoss(num_res=1) 而非 SliceChannelLoss。
-# 期望：在小数据上验证 R(2+1)D + 升维带来的 Dice 增益与显存/速度代价。
-# ============================================================================
+# Plan A 升维对照 2/3 — lift 3D + R(2+1)D。与 Baseline-2.5D 仅差 {block_type, lift_2_5d_to_3d}。
+# lift: D 保持真空间轴; 2D UNet 重建为 3D UNet (spatial_dims=3, in_channels=n_views=3);
+# loss 走 MultiResolutionLoss(1)。验 R(2+1)D + lift 的 Dice 增益 vs 显存/速度
 
 data:
   image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
@@ -21,13 +15,13 @@ data:
   label_values: [0, 1, 2]
   num_classes: 3
 
-  # 几何约束：lift + 5 stages 要求 D % 2^4 == 0 → D=16。
+  # lift + 5 stages 要求 D % 2^4 == 0 → D=16
   patch_size: [16, 256, 256]
   patch_mode: "2_5d"
   multi_res_scales: [1.0, 1.5, 2.0]
   aug_oversample_ratio: 1.5
   z_boundary_mode: "edge_pad"
-  aux_keep_native_d: false   # lift 与 aux_keep_native_d 互斥（validate 拒绝）
+  aux_keep_native_d: false       # 与 lift 互斥 (validate 拒绝)
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -64,15 +58,12 @@ augment:
 
 model:
   backbone: "resnet"
-  # spatial_dims / in_channels 由 sync() 自动改写为 3 / n_views=3。
-  spatial_dims: 2
+  # sync() 自动: spatial_dims=3, in_channels=n_views=3
   encoder_channels: [32, 64, 128, 256, 256]
   blocks_per_level: 2
 
-  # === 关键变量 (1/2)：因子化 (2+1)D 残差块 ===
-  block_type: "r2plus1d"
-  # === 关键变量 (2/2)：升维到真 3D ===
-  lift_2_5d_to_3d: true
+  block_type: "r2plus1d"        # 关键: 因子化 (2+1)D 残差块
+  lift_2_5d_to_3d: true         # 关键: 升维真 3D
 
   norm_type: "instance"
   norm_groups: 8
@@ -84,11 +75,7 @@ model:
   deep_supervision: false
   stem_mode: "conv3"
   context_fusion: "multi_stem_proj"
-  # 作为 Plan A 对照组，本实验显式关闭 aux 监督（仅 view 0 监督主路径），
-  # 以便与 lift_a_planA_aux.yaml 隔离"lift + R(2+1)D"本身的收益 vs.
-  # "lift + R(2+1)D + 多视图 aux 监督"的叠加收益。v2 起 lift 与
-  # aux_seg_supervision 已正交支持（见 seg2_5d.yaml:205 的说明），此处的
-  # false 仅是实验设计选择，并非兼容性限制。
+  # 实验设计: 仅 view 0 监督主路径，与 lift_a_planA_aux.yaml 对比 aux 的叠加收益
   aux_seg_supervision: false
   aux_head_mode: "linear"
   decoder_type: "unet"
@@ -105,8 +92,7 @@ loss:
   dice_smooth: 1.0e-5
   focal_alpha: 0.5
   focal_gamma: 2.0
-  # lift 模式 bypass SliceChannelLoss，本字段被忽略（写出仅为可读性）。
-  slice_loss_reduction: "per_volume"
+  slice_loss_reduction: "per_volume"  # lift 下被忽略
   aux_supervision_weights: []
 
 train:

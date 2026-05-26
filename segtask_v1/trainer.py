@@ -24,28 +24,18 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# GradScaler moved from torch.cuda.amp to torch.amp in PyTorch ≥ 2.3. The
-# new constructor takes a device string as the first positional argument;
-# the legacy CUDA-namespace constructor does NOT and would silently bind
-# "cuda" to `init_scale`, producing a confusing TypeError later inside
-# `torch.full(..., self._init_scale, ...)`. Probe the signature to call
-# whichever form the installed torch supports.
+# PyTorch ≥ 2.3 使用 torch.amp.GradScaler（首位参数为 device）；旧版在 torch.cuda.amp 不接受该参数。探测后选用。
 import inspect as _inspect
 try:
     from torch.amp import GradScaler as _GradScaler  # type: ignore
     from torch.amp import autocast  # type: ignore
-except ImportError:  # pragma: no cover - version-dependent
+except ImportError:  # pragma: no cover
     from torch.cuda.amp import GradScaler as _GradScaler  # type: ignore
     from torch.amp import autocast  # type: ignore
 
 
-def GradScaler(device: str = "cuda", **kwargs):  # noqa: N802 - mimic class
-    """Version-agnostic GradScaler constructor.
-
-    Passes ``device`` only when the underlying class accepts it (PyTorch
-    ≥ 2.3). On older builds (e.g. 2.2) the legacy ``torch.cuda.amp.GradScaler``
-    is CUDA-only and rejects the argument.
-    """
+def GradScaler(device: str = "cuda", **kwargs):  # noqa: N802
+    """版本无关的 GradScaler 构造：仅在新 API 接受 ``device`` 时传入。"""
     try:
         params = _inspect.signature(_GradScaler).parameters
     except (TypeError, ValueError):
@@ -78,21 +68,12 @@ _AMP_DTYPES = {
 # Helpers
 # ---------------------------------------------------------------------------
 def _unwrap_compile(m: nn.Module) -> nn.Module:
-    """Strip the `_orig_mod` wrapper added by `torch.compile` so state_dict
-    keys don't get a `_orig_mod.` prefix that breaks reloading into an
-    uncompiled model."""
+    """剥去 torch.compile 加的 ``_orig_mod`` 包装，使 state_dict 键不带 ``_orig_mod.`` 前缀。"""
     return getattr(m, "_orig_mod", m)
 
 
 def _cuda_supports_bf16() -> bool:
-    """Return True when the current CUDA device can run bf16 autocast
-    efficiently (native tensor-core path).
-
-    Uses ``torch.cuda.is_bf16_supported`` when available (PyTorch ≥ 1.10
-    on CUDA, also handles ROCm); falls back to a compute-capability check
-    (``>= (8, 0)`` = Ampere+) for older builds. Returns False when no
-    CUDA device is visible so CPU-only runs stay on fp16 trivially.
-    """
+    """当前 CUDA 设备是否原生支持 bf16 autocast（Ampere+ 或 ROCm）。"""
     if not torch.cuda.is_available():
         return False
     is_bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
@@ -158,10 +139,7 @@ def build_scheduler(
         return torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=milestones, gamma=tc.step_gamma)
     elif tc.scheduler == "plateau":
-        # Plateau direction must match the best-metric direction so LR
-        # reduction fires on stagnation of the ACTUAL optimization target
-        # (previously hardcoded "max", which silently minimized loss-style
-        # metrics).
+        # Plateau 方向跟随 save_best_mode，以在真实优化目标停滞时降 LR。
         plateau_mode = tc.save_best_mode if tc.save_best_mode in ("max", "min") else "max"
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode=plateau_mode, patience=tc.plateau_patience,
@@ -172,8 +150,7 @@ def build_scheduler(
             optimizer, T_0=max(T_0, 1), T_mult=tc.cosine_restart_mult,
             eta_min=tc.cosine_min_lr)
     elif tc.scheduler == "one_cycle":
-        # OneCycleLR manages its own rising segment via `pct_start`; stacking
-        # WarmupScheduler on top is rejected in Trainer.__init__.
+        # OneCycleLR 自带 warmup（pct_start）；Trainer 拒绝与 WarmupScheduler 叠加。
         total_steps = tc.epochs * steps_per_epoch
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=tc.lr, total_steps=total_steps,
@@ -185,18 +162,11 @@ def build_scheduler(
 # Warmup wrapper
 # ---------------------------------------------------------------------------
 class WarmupScheduler:
-    """Linear warmup, then delegate to a base scheduler.
+    """线性 warmup 后委托 base scheduler。
 
-    During warmup: LR ramps linearly from `warmup_lr` to `base_lr` over
-    `warmup_steps` optimizer steps. The base scheduler is NOT stepped here.
-    After warmup: the base scheduler drives LR. `ReduceLROnPlateau` is the
-    only base scheduler stepped per epoch (via `step_epoch`); all others are
-    stepped per optimizer step.
-
-    Because warmup consumes `warmup_steps`, the base scheduler's horizon
-    must be built with `post_warmup_steps = total_steps - warmup_steps`
-    (see `build_scheduler`), otherwise cosine / poly / step never reach
-    their full schedules.
+    Warmup 期：LR 从 warmup_lr 线性上升到 base_lr（base scheduler 不动）。
+    Warmup 后：base scheduler 驱动。Plateau 逐 epoch step，其余逐 step 动。
+    horizon 需以 ``post_warmup_steps`` 构建（见 build_scheduler）。
     """
 
     def __init__(
@@ -241,10 +211,7 @@ class WarmupScheduler:
         return self.optimizer.param_groups[0]["lr"]
 
     def state_dict(self) -> Dict:
-        # Persist the defining warmup parameters too, so `load_state_dict`
-        # can detect accidental config changes (e.g. `warmup_epochs` edited
-        # before resume) that would otherwise silently mis-align the LR
-        # schedule. The base scheduler's own state is kept unchanged.
+        # 同时持久化 warmup 参数，以便 load 时检出配置漂移。
         return {
             "current_step": self.current_step,
             "warmup_steps": self.warmup_steps,
@@ -258,8 +225,7 @@ class WarmupScheduler:
         ckpt_warmup_steps = state.get("warmup_steps")
         ckpt_warmup_lr = state.get("warmup_lr")
         ckpt_base_lr = state.get("base_lr")
-        # Warn loudly on config drift across resume. Mismatching warmup
-        # config would slot `current_step` into a different schedule shape.
+        # warmup 参数漂移会导致 current_step 套入不同 shape，响亮警告。
         mismatches = []
         if (ckpt_warmup_steps is not None
                 and int(ckpt_warmup_steps) != int(self.warmup_steps)):
@@ -274,9 +240,8 @@ class WarmupScheduler:
         if mismatches:
             import logging as _logging
             _logging.getLogger(__name__).warning(
-                "Warmup config drift on resume (%s). `current_step` will be "
-                "restored but the schedule shape differs; LR trajectory "
-                "may not match the original run.", "; ".join(mismatches))
+                "Warmup config drift on resume (%s); current_step restored "
+                "but schedule shape differs.", "; ".join(mismatches))
 
         self.current_step = int(state.get("current_step", 0))
         base_state = state.get("base_scheduler", None)
@@ -304,65 +269,36 @@ class Trainer:
         self.device = device
         tc = cfg.train
 
-        # --- Device placement FIRST. Optimizer/EMA must bind to the already
-        #     placed parameters; `torch.compile` is applied LAST so the only
-        #     part that needs to know about the wrapper is state_dict I/O.
+        # 设备放置优先：optimizer/EMA 需绑定已迁移参数；torch.compile 放到最后。
         self.model = model.to(device)
 
         # --- Loss ------------------------------------------------------
-        # `base_loss` is kept separately for validation. The training-time
-        # criterion wraps it in DeepSupervisionLoss / MultiResolutionLoss,
-        # which assume list-of-tensors pred and multi-resolution label
-        # stacks. Validation collapses both down to 1x and calls `base_loss`
-        # directly to avoid a shape-contract mismatch.
+        # base_loss 独立保留供验证使用；训练时 criterion 再包 DeepSupervisionLoss / MultiResolutionLoss。
         self.base_loss = build_loss(cfg.loss)
         self.is_2_5d = cfg.data.patch_mode == "2_5d"
-        # Plan A "lift" — when set, the 2.5D pipeline is routed through a
-        # 3D-shape-contract loss / forward path (D stays a real spatial
-        # axis, model is a true 3D UNet, output is (B, num_fg, D, H, W)).
-        # Validated upstream by Config.validate(): must be 2.5D mode and
-        # mutually exclusive with aux_keep_native_d. Composes with
-        # aux_seg_supervision (each aux head emits rank-5 (B, num_fg, D,
-        # H, W) and the per-view aux loss runs through MultiResolutionLoss
-        # (num_res=1) — see the aux_inner_loss lift branch below).
+        # Plan A lift：2.5D 走真 3D 形状 (B, num_fg, D, H, W)，D 作为空间轴。
+        # 与 aux_keep_native_d 互斥；可与 aux_seg_supervision 合成。
         self.lift_2_5d_to_3d = bool(
             getattr(cfg.model, "lift_2_5d_to_3d", False) and self.is_2_5d)
 
-        # ``aux_keep_native_d`` flag is decided early so the aux loss
-        # block below can build per-view ``SliceChannelLoss`` instances
-        # (one per native D_k) instead of a single shared one.
-        # ``aux_view_depths`` and the inflated ``target_patch_size`` D
-        # axis are still finalised later in __init__ once we know
-        # ``cfg.model.in_channels`` and crop targets.
+        # 提前决定 aux_keep_native_d，以便下面按视图构造 SliceChannelLoss。
+        # aux_view_depths 与 target_patch_size 在下方裁剪部分最终设定。
         self.aux_keep_native_d = bool(
             getattr(cfg.data, "aux_keep_native_d", False)
             and self.is_2_5d
             and len(cfg.data.multi_res_scales) > 1)
-        # Provisional — overwritten in the cropping section once we have
-        # the full cfg context. Kept here so the aux loss block can read it.
         self.aux_view_depths: List[int] = (
             list(cfg.aux_view_depths) if self.aux_keep_native_d else [])
 
-        # ``keep_native_multi_res`` (3D modes) is the analogue of
-        # ``aux_keep_native_d`` for z_axis / cubic. The dataset emits a
-        # single max-FOV cube; the trainer center-crops per view at
-        # native physical size and resizes each view back to
-        # ``patch_size`` immediately before the model forward, finally
-        # producing the standard ``(B, C_res, pD, pH, pW)`` 3D model
-        # input. Strict gating mirrors Config.validate so a stale flag
-        # in 2.5D / whole / single-scale modes never silently flips
-        # the trainer geometry path.
+        # keep_native_multi_res：aux_keep_native_d 的 3D 对应 (z_axis/cubic)。
+        # dataset 发单 max-FOV cube；trainer 逐视图中心裁并 resize 回 patch_size。
         self.keep_native_multi_res = bool(
             getattr(cfg.data, "keep_native_multi_res", False)
             and not self.is_2_5d
             and cfg.data.patch_mode in ("z_axis", "cubic")
             and len(cfg.data.multi_res_scales) > 1)
         if self.keep_native_multi_res:
-            # Per-view native sizes ``(D_k, H_k, W_k) = round(patch_size *
-            # s_k)``. Both 3D modes anchor on the canonical ``patch_size``;
-            # z_axis only scales D so H_k/W_k collapse to pH/pW, while
-            # cubic scales all three axes. Pre-computed once so the split
-            # helper has nothing to compute on the hot path.
+            # 预算逐视图原生尺寸 (D_k,H_k,W_k)；z_axis 只缩 D，cubic 缩 3 轴。
             pD, pH, pW = (int(x) for x in cfg.data.patch_size)
             self._mr_native_sizes: List[Tuple[int, int, int]] = []
             for s in cfg.data.multi_res_scales:
@@ -373,23 +309,13 @@ class Trainer:
                     H_k = int(round(pH * float(s)))
                     W_k = int(round(pW * float(s)))
                 self._mr_native_sizes.append((D_k, H_k, W_k))
-            # View 0 invariant (s_0 == 1.0) — ground these to patch_size
-            # exactly to defend against floating-point drift in round().
+            # view 0 强制对齐 patch_size，防浮点漂移。
             self._mr_native_sizes[0] = (pD, pH, pW)
         else:
             self._mr_native_sizes = []
 
-        # Composition order matters:
-        #   INNER — wraps `base_loss` for the patch-mode contract:
-        #     - 3D modes: ``MultiResolutionLoss`` splits pred channels by
-        #       resolution scale (C_res). Pred:  (B, num_fg*C_res, ...).
-        #     - 2.5D mode: ``SliceChannelLoss`` splits pred channels by
-        #       foreground class (D slices per class). Pred is rank-4:
-        #       (B, num_fg*D, H, W); label is (B, D, H, W) raw.
-        #   OUTER = DeepSupervisionLoss(INNER) — iterates over the list of
-        #     per-decoder-level tensors, downsamples label+weight_map to
-        #     each, and delegates to INNER. DS uses nearest interpolation
-        #     in spatial dims of pred, so it works for both 3D and 2D paths.
+        # 损失复合：INNER = MultiResolutionLoss 或 SliceChannelLoss；OUTER = DeepSupervisionLoss(INNER)。
+        # 3D: pred (B, num_fg*C_res, ...)；2.5D: pred (B, num_fg*D, H, W) + label (B, D, H, W)。
         if self.is_2_5d and not self.lift_2_5d_to_3d:
             num_slices = int(cfg.data.patch_size[0])
             inner = SliceChannelLoss(
@@ -405,11 +331,8 @@ class Trainer:
                 cfg.loss.name, cfg.loss.slice_loss_reduction,
                 num_slices, cfg.num_fg_classes)
         else:
-            # 3D modes OR lifted-2.5D — both share the same shape contract
-            # ``pred=(B, num_fg*C_res, D, H, W)``, ``label=(B, C_res, D, H, W)``.
-            # Lift forces ``num_res=1`` since aux views are not supervision
-            # targets in lift mode (only view 0 = 1× FOV is). 3D modes
-            # follow ``len(multi_res_scales)`` as before.
+            # 3D 或 lifted-2.5D：shape 合同 (B, num_fg*C_res, D, H, W)。
+            # lift 强制 num_res=1（aux 视图不作主监督目标）；3D 按 multi_res_scales 长度。
             if self.lift_2_5d_to_3d:
                 num_res = 1
             else:
@@ -430,21 +353,11 @@ class Trainer:
                 inner, cfg.loss.deep_supervision_weights)
         else:
             self.criterion = inner
-        # Keep a handle to the INNER wrapper for unified metric reshaping.
-        # Both wrappers expose ``split_for_metrics(pred, label_raw) ->
-        # (pred_per_class, target_binary)`` so trainer code is mode-agnostic.
+        # 保留 INNER 句柄供指标 reshape（split_for_metrics 统一 3D / 2.5D 路径）。
         self._inner_loss = inner
 
-        # ---- Multi-FOV aux segmentation supervision (2.5D mode) -----
-        # Active only when (1) we're in 2.5D mode, (2) the user opted in via
-        # ``model.aux_seg_supervision``, AND (3) there is at least one aux
-        # FOV view (n_views>1). Otherwise the aux path is fully bypassed
-        # (no extra modules built, no behaviour change).
+        # ---- 2.5D 多 FOV aux 分割监督：仅 2.5D + n_views>1 + opt-in 时启用 ----
         n_views_data = len(cfg.data.multi_res_scales)
-        # lift mode now composes with aux_seg_supervision (each aux head
-        # emits a 3D ``(B, num_fg, D, H, W)`` prediction and the per-view
-        # aux loss runs through MultiResolutionLoss(num_res=1) — see the
-        # branch in the aux_inner_loss construction below).
         self.aux_seg_supervision = bool(
             getattr(cfg.model, "aux_seg_supervision", False)
             and self.is_2_5d
@@ -453,42 +366,19 @@ class Trainer:
             n_aux = n_views_data - 1
             user_w = list(getattr(cfg.loss, "aux_supervision_weights", []))
             if not user_w:
-                # Geometric decay default — wider FOVs (less precise pixel
-                # alignment with view 0's true geometry) get smaller weight.
-                # Same convention as deep_supervision_weights.
+                # 几何衰减：更宽 FOV 对齐较差，权重越小。
                 user_w = [0.5 ** (k + 1) for k in range(n_aux)]
             elif len(user_w) != n_aux:
-                # Defensive — Config.validate() already guards this, but
-                # repeat the check so a hand-crafted Config dict still
-                # fails fast if it bypasses YAML loading.
+                # 防手造配置绕过 YAML；快速失败。
                 raise ValueError(
                     f"loss.aux_supervision_weights length ({len(user_w)}) "
                     f"must equal n_views-1 ({n_aux}); got {user_w}.")
             self.aux_weights = [float(w) for w in user_w]
-            # Aux paths compute single-resolution per-view losses (no DS
-            # for aux — DS structure is reserved for the main path's
-            # multi-scale supervision). The inner SliceChannelLoss is the
-            # same shape contract as the main one: (B, num_fg*D_k, H, W)
-            # pred + (B, D_k, H, W) raw label.
-            #
-            # Two layouts:
-            #   - Legacy (aux_keep_native_d=False): every aux view has
-            #     ``num_slices = D`` (input is z-resampled back to D).
-            #     A single shared ``SliceChannelLoss`` handles every view.
-            #   - Native depth (aux_keep_native_d=True): aux view k has
-            #     ``num_slices = D_k = round(D * s_k)``. We build ONE
-            #     ``SliceChannelLoss`` per aux view so the slice-channel
-            #     contract is exact (the wrapper uses ``num_slices`` to
-            #     reshape (B, num_fg*D_k, H, W) → (B*num_fg, D_k, H, W)).
+            # Aux 均为单分辨率逐视图损失（不走 DS）。两种布局：
+            #   - aux_keep_native_d=False：所有 view num_slices=D，共享单 SliceChannelLoss。
+            #   - aux_keep_native_d=True ：view k 的 num_slices=D_k，逐视图独立构造。
             if self.lift_2_5d_to_3d:
-                # Lift+aux: aux heads emit ``(B, num_fg, D, H, W)`` (3D
-                # 1×1×1 conv via ``spatial_dims=3``); the per-view aux
-                # label is the rank-5 slice ``label_all[:, k:k+1]``
-                # (``(B, 1, D, H, W)``) z-resampled by the dataset. Aux
-                # loss mirrors the main path's contract — single-
-                # resolution MultiResolutionLoss with ``num_res=1`` — and
-                # bypasses SliceChannelLoss entirely. Mutually exclusive
-                # with aux_keep_native_d (validate() rejects).
+                # Lift+aux：aux 头发 (B, num_fg, D, H, W)；走 MultiResolutionLoss(num_res=1)。
                 self.aux_inner_loss = MultiResolutionLoss(
                     base_loss=self.base_loss,
                     num_fg_classes=cfg.num_fg_classes,
@@ -501,8 +391,7 @@ class Trainer:
                     "weights=%s, fusion=%s",
                     n_aux, self.aux_weights, cfg.model.context_fusion)
             elif getattr(self, "aux_keep_native_d", False):
-                # ``self.aux_view_depths`` was built earlier in __init__;
-                # validated to match ``cfg.aux_view_depths``.
+                # 逐视图 SliceChannelLoss（num_slices=D_k）。
                 aux_depths = self.aux_view_depths[1:]  # skip view 0
                 assert len(aux_depths) == n_aux, (
                     f"aux_view_depths excluding view 0 has length "
@@ -549,9 +438,7 @@ class Trainer:
         total_steps = tc.epochs * steps_per_epoch
         post_warmup = total_steps - warmup_steps
 
-        # OneCycleLR carries its own rising segment via pct_start; stacking
-        # WarmupScheduler on top produces a double warmup and mis-aligned
-        # total_steps. Refuse this combination explicitly.
+        # OneCycleLR 自带 warmup，与 WarmupScheduler 叠加会双 warmup 且 total_steps 失准。
         if tc.scheduler == "one_cycle" and warmup_steps > 0:
             raise ValueError(
                 "OneCycleLR has built-in warmup (pct_start). "
@@ -566,10 +453,7 @@ class Trainer:
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
 
         # --- AMP -------------------------------------------------------
-        # Resolve the "auto" sentinel first: pick bf16 iff the current
-        # CUDA device supports it (Ampere+ on SM 8.0, plus a few older
-        # ROCm configs). Falls back to fp16 otherwise so behaviour on
-        # Volta / Turing is bit-identical to the legacy default.
+        # "auto"：设备原生支持 bf16 则选 bf16，否则 fp16。
         amp_dtype_cfg = tc.amp_dtype
         if amp_dtype_cfg == "auto":
             amp_dtype_cfg = self._resolve_auto_amp_dtype(device)
@@ -583,28 +467,17 @@ class Trainer:
         self.amp_dtype = _AMP_DTYPES[amp_dtype_cfg]
         self._amp_dtype_name = amp_dtype_cfg
         self.use_amp = tc.use_amp and device.type == "cuda"
-        # GradScaler is only meaningful for fp16; bf16 has fp32-range
-        # mantissa-clipped values and does not require loss scaling. Leaving
-        # the scaler disabled skips a redundant unscale pass.
+        # GradScaler 仅 fp16 需要；bf16 不需 loss scaling。
         self._scaler_active = self.use_amp and self.amp_dtype == torch.float16
         self.scaler = GradScaler("cuda", enabled=self._scaler_active)
 
         # --- EMA (bind to placed, not-yet-compiled model) -------------
         self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
 
-        # --- torch.compile (last) -------------------------------------
-        # torch.compile's Inductor CUDA backend requires Triton. Triton has
-        # no official Windows wheel, so on most Windows + CUDA setups the
-        # `torch.compile(...)` call itself succeeds but the FIRST forward
-        # raises `torch._inductor.exc.TritonMissing` ~1 minute into training.
-        # Probe up-front and gracefully fall back to eager so the user gets
-        # an actionable warning at startup instead of a deep dynamo trace.
+        # --- torch.compile (最后) -------------------------------------
+        # Inductor CUDA 后端需 Triton（Windows 无官方轮子）；提前探测以避免首次 forward 报错。
         self._compile_enabled = False
-        # One-shot diagnostic: log the actual GPU memory peak after the
-        # first complete forward + backward + optimizer step cycle. Set to
-        # True by ``_train_epoch`` after the first optimizer step boundary,
-        # so the message fires once per ``Trainer.fit()`` call regardless
-        # of grad_accum_steps. CUDA-only (CPU/MPS skip the log).
+        # 首次 step 完整后一次性记录 GPU 峰值（仅 CUDA）。
         self._first_step_mem_logged = False
         if tc.compile_mode != "none" and hasattr(torch, "compile"):
             triton_ok = True
@@ -613,13 +486,8 @@ class Trainer:
                 if importlib.util.find_spec("triton") is None:
                     triton_ok = False
                     logger.warning(
-                        "torch.compile requested (mode='%s') but Triton is "
-                        "not installed; CUDA Inductor backend cannot run "
-                        "without it (common on Windows). Falling back to "
-                        "eager execution. To enable compile: install a "
-                        "Triton build compatible with your torch/CUDA, or "
-                        "set train.compile_mode='none' in the config to "
-                        "silence this warning.",
+                        "torch.compile (mode='%s') requested but Triton not installed; "
+                        "falling back to eager. Install Triton or set compile_mode='none'.",
                         tc.compile_mode,
                     )
             if triton_ok:
@@ -627,45 +495,21 @@ class Trainer:
                 self.model = torch.compile(self.model, mode=tc.compile_mode)
                 self._compile_enabled = True
 
-        # --- Augmentation ---------------------------------------------
-        # The augmentor applies spatial transforms jointly to image,
-        # label, and (optionally) weight_map so alignment holds. label
-        # uses nearest-neighbour interpolation (preserves discrete
-        # values); weight_map's interpolation is selected by
-        # ``cfg.augment.wmap_interp_mode`` — "nearest" (default) for the
-        # discrete bg/fg integer weights produced by
-        # ``compute_region_weight_map``, or "bilinear" for continuous
-        # hand-annotated weights from ``region_weight_dir``.
-        # Pass the largest multi-res scale so the augmentor can keep elastic
-        # deformation physically conservative (BUG-E). For single-resolution
-        # inputs (multi_res_scales == [1.0] or empty), max_scale==1.0 and the
-        # augmentor is bit-identical to the previous behaviour.
+        # --- 增强 ---------------------------------------------
+        # 对 image/label/wmap 同步空间变换；label 近邻，wmap 按 cfg.augment.wmap_interp_mode。
+        # 传入 max_scale 以保持弹性形变物理一致（单分辨率时与旧行为一致）。
         _scales = cfg.data.multi_res_scales or [1.0]
         self.augmentor = GPUAugmentor(cfg.augment, max_scale=max(_scales))
 
-        # --- Cropping (oversampled patches) ---------------------------
-        # Both `z_axis` and `cubic` patch modes now honour
-        # `aug_oversample_ratio` (BUG-B): the dataset emits an oversized
-        # patch, the augmentor applies spatial transforms (whose
-        # `padding_mode="zeros"` at rotated corners would otherwise leak
-        # into the effective field-of-view), and we center-crop back to
-        # `patch_size` here after augmentation.
-        #
-        # ``aux_keep_native_d`` (2.5D ONLY): the dataset emits a single
-        # max-FOV cube of depth ``round(D * max_scale)`` (× oversample
-        # margin). The post-augment center crop must therefore preserve
-        # the ENTIRE max-FOV (not just D) — view 0 takes the centered D
-        # slices in the per-view split below; aux views need wider z spans.
-        # We override the D-axis target accordingly and keep H, W at
-        # their patch_size values.
+        # --- 裁剪（过采样 patch）---------------------------
+        # z_axis/cubic 遵 aug_oversample_ratio：dataset 发超尺寸 patch，增强后中心裁回 patch_size。
+        # aux_keep_native_d (2.5D)：dataset 发 max-FOV cube，裁剪保留整个 max-FOV，aux 视图需更宽 z。
         if self.aux_keep_native_d:
             max_scale = max(cfg.data.multi_res_scales)
             target_d_native = int(round(int(cfg.data.patch_size[0]) * max_scale))
             self.target_patch_size = (target_d_native,
                                       int(cfg.data.patch_size[1]),
                                       int(cfg.data.patch_size[2]))
-            # Sanity-check the provisional ``aux_view_depths`` set early
-            # in __init__ now that we have the full Config view.
             assert self.aux_view_depths[0] == int(cfg.data.patch_size[0]), (
                 "aux_view_depths[0] must equal patch_size[0]; got "
                 f"{self.aux_view_depths[0]} vs {cfg.data.patch_size[0]}.")
@@ -678,14 +522,8 @@ class Trainer:
                 target_d_native, self.aux_view_depths,
                 int(cfg.model.in_channels))
         elif self.keep_native_multi_res:
-            # 3D lazy-extraction path: dataset emits a max-FOV cube
-            # (× oversample margin). The post-augment center crop must
-            # therefore drop the augment oversample but PRESERVE the
-            # full max-FOV physical size — the per-view split below
-            # then center-crops per scale and resizes each view to the
-            # canonical patch_size. For z_axis the FOV expansion is
-            # z-only (matches the dataset emission shape ``(1, eD*max,
-            # pH, pW)``); for cubic all three axes scale.
+            # 3D 懒抽取：dataset 发 max-FOV cube，裁剪后仍保留全 max-FOV，逐视图裁并 resize 到 patch_size。
+            # z_axis 仅缩 z，cubic 缩 3 轴。
             max_scale = max(cfg.data.multi_res_scales)
             pD, pH, pW = (int(x) for x in cfg.data.patch_size)
             if cfg.data.patch_mode == "z_axis":
@@ -696,9 +534,7 @@ class Trainer:
                     int(round(pD * max_scale)),
                     int(round(pH * max_scale)),
                     int(round(pW * max_scale)))
-            # Cross-check: per-view native sizes must all fit inside the
-            # max-FOV target along every axis. (Round-trip rounding is
-            # safe because s_max defines the target axis-by-axis.)
+            # 交叉检查：逐视图原生尺寸必须全部不超过 max-FOV 目标。
             for k, (D_k, H_k, W_k) in enumerate(self._mr_native_sizes):
                 tD, tH, tW = self.target_patch_size
                 if D_k > tD or H_k > tH or W_k > tW:
@@ -734,11 +570,7 @@ class Trainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Resume / Pretrain ----------------------------------------
-        # Semantics:
-        #   * `resume`   → full state restore (training continues exactly).
-        #   * `pretrain` → model-weights-only initialisation; epoch / optim /
-        #                  scheduler / scaler / best / RNG all stay fresh.
-        # `resume` wins when both are configured *and* the file exists.
+        # resume = 完整状态恢复；pretrain = 仅加载 model 权重。两者同设且文件存在时 resume 优先。
         resume_active = bool(tc.resume) and os.path.isfile(tc.resume)
         pretrain_active = bool(tc.pretrain) and os.path.isfile(tc.pretrain)
 
@@ -755,7 +587,7 @@ class Trainer:
                 strict=tc.pretrain_strict,
                 load_ema=tc.pretrain_load_ema)
         else:
-            # Surface mis-configurations early instead of silently ignoring.
+            # 路径误配时提前警告，不静默忽略。
             if tc.resume and not os.path.isfile(tc.resume):
                 logger.warning(
                     "`train.resume` is set but file not found: %s. "
@@ -770,13 +602,7 @@ class Trainer:
     # ------------------------------------------------------------------
     @staticmethod
     def _resolve_auto_amp_dtype(device: torch.device) -> str:
-        """Map ``amp_dtype="auto"`` to a concrete dtype name.
-
-        Chooses ``"bfloat16"`` when the CUDA device supports it natively
-        (Ampere+ / MI100+ / SM 8.0+), else ``"float16"``. On CPU/MPS this
-        returns ``"float16"`` — autocast is disabled anyway because
-        ``use_amp`` is gated on ``device.type == "cuda"``.
-        """
+        """将 ``amp_dtype="auto"`` 解析为 "bfloat16"（CUDA 原生支持时）或 "float16"。"""
         if device.type == "cuda" and _cuda_supports_bf16():
             return "bfloat16"
         return "float16"
@@ -785,47 +611,18 @@ class Trainer:
     # Memory accounting
     # ------------------------------------------------------------------
     def _estimate_train_memory(self) -> Dict[str, float]:
-        """Static estimate of persistent training-side GPU memory (MiB).
+        """静态估计训练侧持久 GPU 内存（MiB）：包含 params/grads/optim_state/EMA。
 
-        Components accounted for:
-          * Model parameters (training storage dtype, typically fp32 even
-            under autocast — autocast casts on the fly and does NOT
-            change the master copy).
-          * Gradients (allocated lazily during the first backward(); same
-            dtype as params).
-          * Optimizer state. Multiplier per param is introspected from the
-            optimizer class:
-              - Adam / AdamW / RAdam / NAdam / Adamax: 2 fp32 tensors
-                per trainable param (exp_avg + exp_avg_sq).
-              - SGD: 1 fp32 tensor if any param group sets momentum>0,
-                else 0.
-              - Lion: 1 fp32 tensor per trainable param.
-              - Unknown adaptive optimizer: conservative 2x default.
-          * EMA shadow: full state_dict() clone (params + buffers, native
-            dtypes) when ``use_ema=true``.
-
-        Excluded (cannot be known without running forward):
-          * Activations / autograd saved tensors — depend on input shape,
-            patch size, AMP dtype, and checkpointing.
-          * cuDNN / cuBLAS workspace and allocator fragmentation.
-          * Dataloader staging tensors (host→device prefetch).
-
-        For the actual end-to-end peak (which includes everything above),
-        see the per-epoch ``GPU peak (epoch N): X MiB`` line emitted in
-        ``fit()``.
+        不含激活/cuDNN workspace/dataloader staging。真实峰值见 fit() 逐 epoch 的 'GPU peak'。
+        Optimizer mult 推断：Adam 系=2、SGD(momentum)=1、Lion=1、未知默认=2。
         """
         MIB = 1 << 20
         params = list(self.model.parameters())
 
-        # Param storage — sum of numel*element_size to honor mixed dtypes
-        # (e.g. some buffers in fp16, BN in fp32 etc).
         param_bytes = sum(p.numel() * p.element_size() for p in params)
-
-        # Gradients only allocated for trainable params; same dtype.
         grad_bytes = sum(p.numel() * p.element_size()
                          for p in params if p.requires_grad)
 
-        # Optimizer state introspection.
         optim_name = type(self.optimizer).__name__
         n_train = sum(p.numel() for p in params if p.requires_grad)
         adam_family = {"Adam", "AdamW", "RAdam", "NAdam", "Adamax"}
@@ -838,11 +635,9 @@ class Trainer:
         elif optim_name == "Lion":
             optim_mult = 1
         else:
-            optim_mult = 2  # conservative default
-        # Optimizer states are fp32 in PyTorch's default implementations.
-        optim_bytes = optim_mult * n_train * 4
+            optim_mult = 2  # 保守默认
+        optim_bytes = optim_mult * n_train * 4  # fp32
 
-        # EMA shadow: state_dict() clone (covers params + buffers).
         ema_bytes = 0
         if self.ema is not None:
             ema_bytes = sum(t.numel() * t.element_size()

@@ -1,30 +1,12 @@
 """GPU-based 3D data augmentation for segmentation.
 
-All augmentations operate on CUDA tensors for speed.
-Spatial transforms are per-sample independent (not batch-level).
-Intensity transforms are applied to image only.
-
-Spatial augmentations:
-  - Random flip (per-sample, per-axis independent)
-  - Random affine (rotation + scale via grid_sample, per-sample)
-  - Elastic deformation (smooth random displacement field, per-sample)
-  - Grid dropout (mask out rectangular sub-regions)
-
-Intensity augmentations:
-  - Brightness, contrast, gamma, noise, blur, simulate low-res
-
-Input shapes:
-  image:      (B, 1, D, H, W) float32
-  label:      (B, C, D, H, W) float32 binary or raw-integer masks
-  weight_map: (B, 1, D, H, W) float32, optional. Per-voxel loss weights
-              (background = 1.0). Spatial transforms are applied with the
-              SAME parameters as image / label so they stay aligned. The
-              interpolation mode for wmap is controlled by
-              ``AugConfig.wmap_interp_mode`` ("nearest" by default to
-              preserve discrete fg/bg integer weights — e.g. bg=1, fg=4 —
-              produced by ``compute_region_weight_map``; switch to
-              "bilinear" only when ``region_weight_dir`` ships continuous
-              hand-annotated gradients).
+Spatial transforms (flip / affine / elastic / grid-dropout) are per-sample;
+intensity transforms (brightness / contrast / gamma / noise / blur / lowres)
+operate on image only. Inputs:
+  image      (B, 1, D, H, W), label (B, C, D, H, W), weight_map (B, 1, D, H, W) optional.
+weight_map receives the same spatial transforms as image/label; its
+interpolation is set by ``AugConfig.wmap_interp_mode`` ("nearest" preserves
+discrete fg/bg weights; "bilinear" for continuous hand-annotated weights).
 """
 
 from __future__ import annotations
@@ -39,32 +21,19 @@ from ..config import AugConfig
 
 
 class GPUAugmentor:
-    """GPU-based 3D data augmentation pipeline with per-sample transforms.
+    """GPU 3D augmentation pipeline (per-sample transforms).
 
-    Args:
-        cfg: Augmentation config.
-        max_scale: Largest multi-res scale in the input (default 1.0 for
-            single-resolution). This ONLY affects elastic deformation: the
-            displacement field is defined in *canonical* voxels shared across
-            all channels, but each channel represents a different physical
-            field-of-view; applying the same canonical displacement to
-            scale-2.0 channels results in 2x physical displacement. We
-            divide `elastic_deform_alpha` by `max_scale` so that the LARGEST
-            physical displacement matches the configured alpha \u2014 smaller
-            scales then see proportionally less warp, which is safe.
+    ``max_scale`` is the largest multi-res scale in the input; it scales
+    down ``elastic_deform_alpha`` so the largest physical channel sees at
+    most ``alpha`` voxels of displacement.
     """
 
     def __init__(self, cfg: AugConfig, max_scale: float = 1.0):
         self.cfg = cfg
         self.enabled = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
-        # Resolve wmap interpolation mode once at construction.
-        # Only ``_random_affine`` and ``_elastic_deform`` actually touch
-        # wmap with an interpolation kernel; flips are exact, dropout
-        # / intensity transforms never operate on wmap. See
-        # ``AugConfig.wmap_interp_mode`` for the rationale behind the
-        # "nearest" default (preserves discrete fg/bg integer weights
-        # produced by ``compute_region_weight_map``).
+        # wmap interp: "nearest" preserves discrete fg/bg weights (default);
+        # "bilinear" for continuous weights. Only affine/elastic touch wmap.
         wmode = getattr(cfg, "wmap_interp_mode", "nearest")
         if wmode not in ("nearest", "bilinear"):
             raise ValueError(
@@ -76,26 +45,13 @@ class GPUAugmentor:
         self, image: torch.Tensor, label: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Apply augmentations to a batch.
-
-        Args:
-            image: (B, 1, D, H, W) on GPU.
-            label: (B, C, D, H, W) on GPU.
-            weight_map: optional (B, 1, D, H, W) on GPU. Receives the
-                same spatial transforms as image/label but with bilinear
-                interpolation (vs. label's nearest) so continuous
-                per-sample weights stay un-quantised.
-
-        Returns:
-            Augmented ``(image, label, weight_map)``. ``weight_map`` is
-            ``None`` iff the input was None.
-        """
+        """Apply augmentations to a batch; returns ``(image, label, weight_map)``."""
         if not self.enabled:
             return image, label, weight_map
 
         c = self.cfg
 
-        # --- Spatial augmentations (image + label [+ weight_map], per-sample) ---
+        # Spatial: flip / affine / elastic / grid-dropout
         image, label, weight_map = _random_flip(
             image, label, c.random_flip_prob, c.random_flip_axes,
             weight_map=weight_map)
@@ -103,9 +59,7 @@ class GPUAugmentor:
             image, label, c.random_affine_prob, c.random_rotate_range,
             c.random_scale_range, weight_map=weight_map,
             wmap_mode=self.wmap_interp_mode)
-        # BUG-E: divide alpha by max_scale so the LARGEST physical channel
-        # receives at most `alpha` voxel-displacement. Smaller-scale channels
-        # see proportionally less warp, which is the conservative choice.
+        # Scale alpha down by max_scale so largest physical channel sees ≤ alpha voxels.
         effective_alpha = c.elastic_deform_alpha / self.max_scale
         image, label, weight_map = _elastic_deform(
             image, label, c.elastic_deform_prob, c.elastic_deform_sigma,
@@ -115,7 +69,7 @@ class GPUAugmentor:
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
             c.grid_dropout_holes, weight_map=weight_map)
 
-        # --- Intensity augmentations (image only, per-sample) ---
+        # Intensity (image only)
         image = _random_brightness(image, c.random_brightness_prob, c.random_brightness_range)
         image = _random_contrast(image, c.random_contrast_prob, c.random_contrast_range)
         image = _random_gamma(image, c.random_gamma_prob, c.random_gamma_range)
@@ -134,11 +88,7 @@ def _random_flip(
     prob: float, axes: list,
     weight_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Per-sample random flip. Each sample and axis is independently random.
-
-    ``weight_map`` (if provided) is flipped on the same per-sample axes
-    so it stays voxel-aligned with image / label.
-    """
+    """Per-sample random flip; each sample and axis independently sampled."""
     B = image.shape[0]
     for axis in axes:
         mask = torch.rand(B, device=image.device) < prob  # (B,) bool
@@ -157,33 +107,11 @@ def _random_affine(
     weight_map: Optional[torch.Tensor] = None,
     wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Per-sample random 3D affine (rotation around all axes + scale).
+    """Per-sample random 3D affine (Euler rotation + isotropic scale) via grid_sample.
 
-    Uses F.grid_sample with a per-sample affine matrix for efficiency.
-    Rotation angles are sampled uniformly in rotate_range (degrees).
-    Scale is sampled uniformly in scale_range.
-
-    ``weight_map`` (if provided) is resampled with the same grid using
-    **bilinear** interpolation so continuous per-voxel weights are not
-    quantised by the label-style nearest path.
-
-    Padding policy (BUG-1 fix): all three streams use
-    ``padding_mode="border"`` — replicate the boundary voxel for
-    out-of-bounds samples. Rationale:
-      * weight_map carries the +1 shift contract from the dataset
-        (bg=1.0, fg=w+1, see ``load_region_weight_volume``). Padding
-        with zeros silently ignored the loss in those voxels (weight=0)
-        — a hidden mask on the supervision signal that did NOT exist in
-        the un-augmented path. ``border`` preserves bg=1 in oversample
-        slack regions, matching the original loss weighting.
-      * Image/label staying on ``border`` keeps this transform internally
-        consistent with ``_elastic_deform`` (which has always used
-        border) so the two spatial transforms produce the same kind of
-        boundary artefact instead of two different ones.
-      * The ``aug_oversample_ratio`` cushion (typically 1.3–1.5) means
-        the model never trains on extrapolated tissue that touches the
-        center-cropped patch in the common case; border replication
-        only fills the to-be-cropped slack.
+    All three streams use ``padding_mode="border"`` so out-of-bounds voxels
+    replicate the boundary; this preserves the bg=1 contract of weight_map
+    (produced by ``load_region_weight_volume``) instead of zeroing the loss.
     """
     B, _, D, H, W = image.shape
     device = image.device
@@ -213,11 +141,7 @@ def _random_affine(
     # Label: use nearest interpolation to preserve binary values
     label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
 
-    # Weight map: ``wmap_mode`` controls quantisation behaviour.
-    #   "nearest"  — preserves discrete fg/bg integer weights produced
-    #                by ``compute_region_weight_map`` (default).
-    #   "bilinear" — smooth resample for hand-annotated continuous
-    #                weights from ``region_weight_dir``.
+    # wmap: nearest=preserve discrete weights, bilinear=smooth continuous weights.
     if weight_map is not None:
         weight_map[idx] = F.grid_sample(
             weight_map[idx], grid, mode=wmap_mode,
@@ -228,15 +152,7 @@ def _random_affine(
 
 def _build_rotation_matrices(
     angles: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Build 3x4 affine matrices from Euler angles (x,y,z) and isotropic scale.
-
-    Args:
-        angles: (N, 3) rotation angles in radians.
-        scales: (N, 1) scale factors.
-
-    Returns:
-        (N, 3, 4) affine matrices.
-    """
+    """Build (N, 3, 4) affine matrices from Euler angles (rad, N x 3) and scales (N x 1)."""
     N = angles.shape[0]
     device = angles.device
 
@@ -279,20 +195,8 @@ def _elastic_deform(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Per-sample 3D elastic deformation via smooth random displacement field.
 
-    Algorithm:
-    1. Generate random displacement on a coarse grid (N(0,1))
-    2. Upsample to full resolution (trilinear = smooth interpolation)
-    3. Scale so that ``alpha`` controls displacement in **voxels**
-    4. Convert per-dimension to normalised grid coordinates for grid_sample
-    5. Apply via grid_sample
-
-    Args:
-        sigma: Controls the *smoothness* of the deformation field.
-            Larger → smoother (fewer coarse control points).
-            Typical range: 4–9.
-        alpha: Controls the *magnitude* of displacement in **voxels**.
-            After interpolation the displacement std ≈ alpha voxels.
-            Typical range: 3–12.  (95 % of displacements within ±2·alpha voxels.)
+    sigma controls smoothness (typical 4–9, larger=smoother);
+    alpha controls displacement magnitude in voxels (typical 3–12).
     """
     B, _, D, H, W = image.shape
     device = image.device
@@ -304,44 +208,26 @@ def _elastic_deform(
     idx = mask.nonzero(as_tuple=True)[0]
     n = idx.shape[0]
 
-    # Coarse grid size (controls smoothness — fewer points = smoother)
+    # Coarse displacement, upsampled (trilinear acts as smoothing).
     cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
     cW = max(int(round(W / sigma)), 4)
-
-    # Random displacement on coarse grid, then upsample (acts as smoothing)
     disp = torch.randn(n, 3, cD, cH, cW, device=device)
     disp = F.interpolate(disp, size=(D, H, W), mode="trilinear", align_corners=False)
 
-    # Scale displacement to voxel-space magnitude ``alpha``, then convert
-    # each channel to normalised grid coordinates independently.
-    #
-    # After permute(0,2,3,4,1) the 3 channels map to grid axes as:
-    #   channel 0 → x (W-axis)
-    #   channel 1 → y (H-axis)
-    #   channel 2 → z (D-axis)
-    #
-    # For align_corners=False, 1 voxel = 2/N in grid coords (grid spans
-    # [-1, 1] over N pixels).  So: grid_disp = voxel_disp × (2 / N).
+    # Convert voxel displacement → normalised grid coords (1 voxel = 2/N for align_corners=False).
+    # After permute, channels (0,1,2) map to grid axes (W, H, D).
     voxel_to_grid = torch.tensor(
         [2.0 / W, 2.0 / H, 2.0 / D],
         dtype=disp.dtype, device=device,
     ).reshape(1, 3, 1, 1, 1)
     disp = disp * alpha * voxel_to_grid
 
-    # Build sampling grid: identity + displacement
-    # grid_sample expects grid in [-1, 1], shape (N, D, H, W, 3)
-    grid = _identity_grid(n, D, H, W, device)  # (n, D, H, W, 3)
-    grid = grid + disp.permute(0, 2, 3, 4, 1)  # add displacement
+    grid = _identity_grid(n, D, H, W, device) + disp.permute(0, 2, 3, 4, 1)
 
-    # Apply to image
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
-
-    # Apply to label (nearest to preserve discrete values)
     label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
-
-    # Weight map: ``wmap_mode`` controls quantisation. See _random_affine.
     if weight_map is not None:
         weight_map[idx] = F.grid_sample(
             weight_map[idx], grid, mode=wmap_mode,
@@ -352,11 +238,7 @@ def _elastic_deform(
 
 def _identity_grid(
     N: int, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """Create identity sampling grid in [-1, 1] for grid_sample (align_corners=False).
-
-    For align_corners=False, pixel i (0-indexed) maps to coordinate (2i+1)/s - 1,
-    i.e. coordinates span [-1+1/s, 1-1/s] instead of [-1, 1].
-    """
+    """Identity grid in [-1+1/s, 1-1/s] for grid_sample(align_corners=False)."""
     vecs = [torch.linspace(-1 + 1/s, 1 - 1/s, s, device=device) for s in (D, H, W)]
     grids = torch.meshgrid(*vecs, indexing="ij")  # (D, H, W) each
     grid = torch.stack(grids[::-1], dim=-1)  # (D, H, W, 3) — order: W, H, D for grid_sample
@@ -368,15 +250,10 @@ def _grid_dropout(
     prob: float, ratio: float, num_holes: int,
     weight_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Grid dropout: mask out rectangular sub-regions with zeros.
+    """Mask out ``num_holes`` rectangular sub-regions of the image with zeros.
 
-    Vectorized: generates all B × num_holes hole positions in a single
-    batched `torch.randint` call and marks the boolean mask via advanced
-    indexing. Label and weight_map are NOT masked (preserve ground truth
-    and the original loss weighting in the dropped regions).
-
-    Samples not selected by the Bernoulli mask pass through unchanged
-    (their hole-mask stays all-ones via `selected` gating).
+    Label and weight_map are not masked (ground truth and loss weights are
+    preserved inside dropped regions).
     """
     if prob <= 0 or ratio <= 0:
         return image, label, weight_map
@@ -388,32 +265,25 @@ def _grid_dropout(
     if not selected.any():
         return image, label, weight_map
 
-    # Hole sizes are constant per call — ratio and num_holes are scalars.
     frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
     hd = max(1, int(D * frac))
     hh = max(1, int(H * frac))
     hw = max(1, int(W * frac))
 
-    # Sample B × num_holes top-left corners in a single kernel launch.
+    # Per-sample hole top-left corners (B, num_holes) — all sampled in one call.
     d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)
     h0 = torch.randint(0, max(H - hh, 1), (B, num_holes), device=device)
     w0 = torch.randint(0, max(W - hw, 1), (B, num_holes), device=device)
 
-    # Build per-sample hole mask without per-sample Python loops.
     hole_mask = torch.ones(B, 1, D, H, W, device=device, dtype=image.dtype)
-    # Pre-compute axis offset vectors, then broadcast-set via advanced indexing
-    # one hole at a time — keep the inner dim small (num_holes is typically < 8).
-    d_off = torch.arange(hd, device=device)  # (hd,)
+    d_off = torch.arange(hd, device=device)
     h_off = torch.arange(hh, device=device)
     w_off = torch.arange(hw, device=device)
     for k in range(num_holes):
-        # (B,), per-sample start indices for this hole
-        ds = d0[:, k, None] + d_off[None, :]      # (B, hd)
-        hs = h0[:, k, None] + h_off[None, :]      # (B, hh)
-        ws = w0[:, k, None] + w_off[None, :]      # (B, hw)
+        ds = d0[:, k, None] + d_off[None, :]
+        hs = h0[:, k, None] + h_off[None, :]
+        ws = w0[:, k, None] + w_off[None, :]
         b_idx = torch.arange(B, device=device)
-        # Fancy-index over (B, D, H, W): broadcast b_idx × ds × hs × ws
-        # to a (B, hd, hh, hw) cartesian product.
         hole_mask[
             b_idx[:, None, None, None], :,
             ds[:, :, None, None],
@@ -421,9 +291,8 @@ def _grid_dropout(
             ws[:, None, None, :],
         ] = 0
 
-    # Only zero-out samples that were selected; un-selected keep identity mask
+    # effective = selected ? hole_mask : 1
     gate = selected.reshape(B, 1, 1, 1, 1).to(image.dtype)
-    # effective_mask = selected ? hole_mask : 1
     effective = hole_mask * gate + (1.0 - gate)
     return image * effective, label, weight_map
 
@@ -447,21 +316,13 @@ def _random_brightness(
 
 def _random_contrast(
     image: torch.Tensor, prob: float, crange: list) -> torch.Tensor:
-    """Per-sample random multiplicative contrast.
-
-    BUG-C fix: the mean used as the contrast pivot is computed **per-channel**
-    (over D, H, W only). The previous implementation flattened ALL channels
-    into one mean, which for multi-resolution inputs blended the intensity
-    statistics of physically different scales into a single pivot, producing
-    inconsistent contrast scaling across channels.
-    """
+    """Per-sample random multiplicative contrast around the per-channel mean pivot."""
     if prob <= 0:
         return image
     B = image.shape[0]
     mask = torch.rand(B, device=image.device) < prob
     if not mask.any():
         return image
-    # Per-sample, per-channel mean (shape (B, C, 1, 1, 1)).
     spatial_dims = tuple(range(2, image.ndim))
     mean = image.mean(dim=spatial_dims, keepdim=True)
     factor = torch.ones(B, 1, 1, 1, 1, device=image.device)
@@ -473,16 +334,7 @@ def _random_contrast(
 
 def _random_gamma(
     image: torch.Tensor, prob: float, grange: list) -> torch.Tensor:
-    """Per-sample random gamma correction, fully vectorized.
-
-    For each sample independently:
-      1. Min/max-normalize to [0, 1] per-sample (stats taken over C,D,H,W).
-      2. pow(gamma_i) with gamma_i sampled per-sample from grange.
-      3. De-normalize back to the original intensity range.
-
-    Samples not selected by the Bernoulli mask are returned unchanged
-    by setting their effective gamma to 1.0 (identity).
-    """
+    """Per-sample random gamma: minmax-normalise per-channel, pow(gamma), de-normalise."""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -491,17 +343,14 @@ def _random_gamma(
     if not mask.any():
         return image
 
-    # BUG-C fix: reduce over SPATIAL dims only, keeping channels independent.
-    # With multi-resolution inputs each channel has a different physical
-    # range; pooling the min/max across channels coupled all scales to the
-    # scale with the widest histogram, giving non-uniform gamma effects.
+    # Reduce over spatial dims only — keep channels independent (multi-res safe).
     reduce_dims = tuple(range(2, image.ndim))
     mn = image.amin(dim=reduce_dims, keepdim=True)  # (B,C,1,1,1)
     mx = image.amax(dim=reduce_dims, keepdim=True)
     rng = (mx - mn).clamp(min=1e-7)
     normed = ((image - mn) / rng).clamp(0.0, 1.0)
 
-    # Per-sample gamma; identity (1.0) for samples not selected.
+    # Identity gamma=1.0 for un-selected samples.
     gamma = torch.empty(B, device=device).uniform_(grange[0], grange[1])
     gamma = torch.where(mask, gamma, torch.ones_like(gamma))
     gshape = (B,) + (1,) * (image.ndim - 1)
@@ -526,15 +375,7 @@ def _gaussian_noise(
 
 def _gaussian_blur_3d(
     image: torch.Tensor, prob: float, sigma_range: list) -> torch.Tensor:
-    """Batched 3D Gaussian blur via separable 1D convolutions.
-
-    ISSUE-L: the previous implementation looped over selected samples in
-    Python, issuing 3 * n conv3d launches. We now sample ONE sigma per
-    call and apply it to all selected samples in a single pass (3 launches
-    total). The trade-off — selected samples share a common blur strength
-    inside a minibatch — is acceptable because sigma still varies across
-    calls/epochs, and per-sample diversity comes from the Bernoulli gate.
-    """
+    """Batched separable 3D Gaussian blur; one sigma shared across selected samples per call."""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -545,15 +386,13 @@ def _gaussian_blur_3d(
     idx = mask.nonzero(as_tuple=True)[0]
     sigma = float(torch.empty(1).uniform_(sigma_range[0], sigma_range[1]))
     ks = max(int(2 * round(3 * sigma) + 1), 3)
-    # Separable 1D Gaussian kernel, shared across samples/channels.
     x = torch.arange(ks, dtype=image.dtype, device=image.device) - ks // 2
     k1d = torch.exp(-0.5 * (x / sigma) ** 2)
     k1d = k1d / k1d.sum()
     pad = ks // 2
 
-    # Collapse batch+channel into the conv3d batch axis so the same 1D
-    # kernel convolves every (sample, channel) slice independently.
-    sub = image[idx]                       # (n, C, D, H, W)
+    # Fold (B, C) into conv3d batch axis so the 1D kernel hits every (sample, channel) slice.
+    sub = image[idx]
     n, C = sub.shape[:2]
     sub = sub.reshape(n * C, 1, *sub.shape[2:])
 
@@ -572,13 +411,7 @@ def _gaussian_blur_3d(
 
 def _simulate_lowres(
     image: torch.Tensor, prob: float, zoom_range: list) -> torch.Tensor:
-    """Batched "simulate low resolution" by downsample→upsample.
-
-    ISSUE-L: like Gaussian blur above, we now sample ONE zoom factor per
-    call and apply it to every selected sample in a single pair of
-    `F.interpolate` calls. Per-sample diversity still comes from the
-    Bernoulli selection gate; the zoom factor itself varies across calls.
-    """
+    """Simulate low-res by trilinear downsample→upsample; one zoom factor per call."""
     if prob <= 0:
         return image
     B = image.shape[0]

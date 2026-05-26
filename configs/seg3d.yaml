@@ -1,21 +1,8 @@
-# ============================================================================
-# 3D Segmentation Training Configuration — Reference-documented template
-# ----------------------------------------------------------------------------
-# Usage:
-#   python -m segtask_v1.train --config configs/seg3d.yaml
-#   python -m segtask_v1.train --config configs/seg3d.yaml --override train.epochs=50 model.backbone=convnext
-#
-# Every field lists its valid options / typical range so this file can be
-# used as a reference manual. Fields commented out (prefixed with `#`) use
-# their dataclass defaults (see segtask_v1/config.py for authoritative
-# definitions). Uncomment only when you want to override the default.
-# ============================================================================
+# 3D 分割 reference 配置。注释掉的字段用 dataclass 默认 (见 segtask_v1/config.py)。
+# 用法: python -m segtask_v1.train --config configs/seg3d.yaml [--override key=val ...]
 
-# =====================================================================
-# DATA — paths, patching strategy, preprocessing, dataloader
-# =====================================================================
 data:
-  # Source directories for NIfTI volumes. Image / label filenames must match.
+  # NIfTI 路径。image / label 文件名必须一致
   image_dir: "F:/BaiduNetdiskDownload/lung_nii"
   label_dir: "F:/BaiduNetdiskDownload/lung_bone"
   bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"            # F:/BaiduNetdiskDownload/bone_bbox
@@ -26,480 +13,256 @@ data:
   region_weight_suffix: ".nii.gz"
   npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
 
-  # Integer label values in the mask, ordered [bg, fg1, fg2, ...].
-  # Empty list => auto-detect from all label files on first run.
-  # Example: [0, 1, 2] for background + 2 foreground classes.
+  # label 整数值，[bg, fg1, fg2, ...]。空 => 首运自动检测。例: [0,1,2]
   label_values: [0, 1, 2]
-  num_classes : 3          # 0 => auto-set from len(label_values)
+  num_classes : 3          # 0 => 自动 = len(label_values)
 
-  # ---- Patch extraction ----------------------------------------------
-  # 3D patch size fed to the model: [D, H, W].
-  patch_size: [32, 256, 256]
+  patch_size: [32, 256, 256]            # [D, H, W]
 
-  # patch_mode — how each training sample is extracted from the volume.
-  #   "z_axis": 仅沿 z 轴滑块；x,y 保持全尺寸 resize 到 (pH, pW)。
-  #             支持 multi_res_scales（只在 z 方向缩放）。
-  #   "cubic" : 采样中心点 (x,y,z)，抽取完整 3D 立方 patch。
-  #             支持 multi_res_scales（3 轴同比缩放 → 物理 FOV 扩展）。
-  #   "whole" : 整卷直接 resize 到 patch_size，不切块不滑窗。
-  #             最简单，适合病灶占据整卷大部分或算力/显存充裕时。
-  #             multi_res_scales 必须为 [1.0]（强制校验）。
-  #   "2_5d"  : 2.5D 方案：沿用 z_axis 单分辨率取片（multi_res_scales 必须为
-  #             [1.0]），但训练时增强后将 (B,1,D,H,W) squeeze 为 (B,D,H,W) 喂给
-  #             2D 模型；输出 (B, num_fg*D, H, W) 由 SliceChannelLoss 拆为
-  #             num_fg 组的 D 通道二值预测。Config.sync() 会自动把
-  #             model.spatial_dims=2 与 model.in_channels=patch_size[0] 同步。
-  #             示例配置：configs/seg2_5d.yaml
+  # patch_mode — 训练样本抽取方式:
+  #   'z_axis' — 沿 z 轴滑块；x,y resize 到 (pH,pW)。支持 multi_res (仅 z)
+  #   'cubic'  — 中心点抽 3D cube。支持 multi_res (3 轴同比)
+  #   'whole'  — 整卷 resize 到 patch_size。multi_res 必须 [1.0]
+  #   '2_5d'   — 见 configs/seg2_5d.yaml
   patch_mode: "z_axis"
 
-  # Augmentation oversample ratio — extract larger patch, augment, then
-  # trainer center-crops back to patch_size. 抵消 rotate/elastic 的黑色边角。
-  # 语义：
-  #   z_axis : 仅 z 轴放大 (eD = pD * ratio)，x,y 不变。
-  #   cubic  : 3 轴同比放大。
-  #   whole  : 3 轴同比放大（整卷 resize 到 ratio 倍 patch_size 后再 crop）。
-  # 建议：打开 random_affine/elastic 时设 1.3~1.5；否则保 1.0。
+  # 增强 oversample: 先抽较大 patch 增强后中心 crop 回 patch_size, 抵消黑边角。
+  # z_axis 仅 z；cubic/whole 三轴同比。开 affine/elastic 时设 1.3~1.5，否则 1.0
   aug_oversample_ratio: 1.5
 
-  # Multi-resolution input — stack multiple physical FOV 视图作为输入通道。
-  # [1.0] 单分辨率（legacy 1 通道）；[1.0, 1.5, 2.0] 三分辨率（3 通道）。
-  # 详细语义见 patch_mode 说明。whole 模式下必须为 [1.0]。
+  # 多分辨率输入 (多 FOV)。[1.0] 单分辨率；[1.0,1.5,2.0] 多分辨率 (3 通道)。whole 必须 [1.0]
   multi_res_scales: [1.0]
 
-  # ---- 3D 多分辨率 lazy 单 cube 提取（z_axis / cubic）-----------------
-  # 仅在 patch_mode in {"z_axis","cubic"} 且 len(multi_res_scales) > 1 时生效。
-  #
-  # false（默认，bit-identical 旧行为）：
-  #   每个 scale 在 dataset CPU worker 中独立调用 scipy.ndimage.zoom 抽取并
-  #   resize 到 (eD, eH, eW)，沿 C_res 维堆叠输出 (C_res, eD, eH, eW)。增强
-  #   在已下采样的画布上跑 1 次共享 grid_sample；aux view 的高频细节在
-  #   增强前已损失。
-  #
-  # true（新路径）：
-  #   dataset 仅抽取 ONE max-FOV cube 并输出 (1, eD_max, *)：z_axis 仅 z 轴
-  #   按 max_scale 放大，cubic 三轴同时放大。增强 1 次跑在最大分辨率 cube
-  #   上，trainer 在 forward 前 per-view 中心裁剪到原生物理尺寸 (D_k,H_k,W_k)
-  #   并 F.interpolate 回 patch_size，最后沿 C_res 维堆叠 (B, C_res, pD, pH, pW)
-  #   —— 模型契约不变。Predictor 滑窗在 ON 时同步走 GPU 单 cube → per-view
-  #   裁剪 + 缩放路径，无 scipy 调用。约束（Config.validate 强制）：
-  #     * multi_res_scales[0] == 1.0；
-  #     * z_axis 自动锁定 z_boundary_mode='edge_pad'；
-  #     * 与 aux_keep_native_d（2.5D 专属）互斥。
+  # 3D 多分辨率 lazy 单 cube 提取 (仅 z_axis/cubic + n>1)。
+  #   false — 默认: 每 scale 独立 scipy.zoom; aux 高频细节在增强前已损
+  #   true  — 只抽 max-FOV cube 增强 1 次，trainer per-view crop+interpolate; 锁 edge_pad; 与 aux_keep_native_d 互斥
   keep_native_multi_res: false
 
-  # ---- Intensity preprocessing ---------------------------------------
-  # CT HU windowing (clip intensities before normalization).
+  # HU 窗 + 归一化。normalize: 'minmax' → [0,1] | 'zscore' → (x-mean)/std (需 global_mean/std)
   intensity_min: -1024.0
   intensity_max: 1024.0
-
-  # normalize:
-  #   "minmax" : (x - min) / (max - min)              → [0, 1]
-  #   "zscore" : (x - global_mean) / global_std        → 零均值单位方差
   normalize: "minmax"
-  # global_mean / global_std — only used when normalize == "zscore".
   # global_mean: 0.0
   # global_std : 1.0
 
-  # ---- Train/val split -----------------------------------------------
   val_ratio : 0.2
   split_seed: 42
-  # stratified_split: 按每个体数据"主要前景类"分层抽样。类别不平衡时强烈推荐。
-  # 数据集太小无法分层时自动 fallback 到随机划分。
-  # stratified_split: true
+  # stratified_split: true   # 按主要前景类分层; 太小自动 fallback 随机
 
-  # ---- DataLoader ----------------------------------------------------
   batch_size : 2
   num_workers: 4
   pin_memory : true
 
-  # ---- Sampling ------------------------------------------------------
-  # Probability of centering patch on a foreground voxel (vs. uniform
-  # spatial sampling). 0.0 = 纯均匀；0.5 = 一半样本强制 fg 中心。
-  # z_axis 模式：对应 z 切片前景过采样；cubic：3D 前景体素过采样；
-  # whole 模式：此参数被忽略（无中心采样）。
-  foreground_oversample_ratio: 0.3
+  foreground_oversample_ratio: 0.3       # 前景中心采样概率 (whole 忽略)
+  samples_per_volume: 8                  # 每卷每 epoch 样本数
 
-  # Samples per volume per epoch（控制 epoch 长度）：
-  #   epoch 内每卷产出多少个（位置/增广各异）的训练样本。
-  samples_per_volume: 8
-
-  # ---- Caching --------------------------------------------------------
-  # cache_mode: "none" | "memory"
-  #   memory: LRU 内存缓存已解码的体数据（image + label），加速 I/O。
-  cache_mode: "memory"
-  cache_max_volumes: 1  # 0 = 不限（可能 OOM）；建议 ≈ num_workers * 少量
+  cache_mode: "memory"                   # 'none' | 'memory' (LRU 缓存已解码体数据)
+  cache_max_volumes: 1                   # 0 = 不限 (可能 OOM)
 
 
-# =====================================================================
-# AUGMENT — GPU-side data augmentation (per-sample independent)
-# =====================================================================
+# AUGMENT — GPU-side per-sample augmentation
 augment:
-  # Master switch. 关闭后跳过整个增广流水线。
   enabled: true
 
-  # ---- Spatial augmentations (image + label 一致) ---------------------
   random_flip_prob: 0.5
-  # random_flip_axes: 允许翻转的空间轴索引（相对于 (B, C, D, H, W)）：
-  #   2 = D（z 轴）, 3 = H（y 轴）, 4 = W（x 轴）
-  random_flip_axes: [2, 3, 4]
+  random_flip_axes: [2, 3, 4]            # 2=D, 3=H, 4=W (相对 B,C,D,H,W)
 
-  # Affine = 旋转 + 缩放，合成在一次 grid_sample 中。
+  # affine = rotate+scale, 同一次 grid_sample
   random_affine_prob : 0.3
-  random_rotate_range: [-30.0, 30.0]     # 角度（degrees）
-  random_scale_range : [0.65, 1.25]      # 各向同性缩放因子
+  random_rotate_range: [-30.0, 30.0]     # degrees
+  random_scale_range : [0.65, 1.25]
 
-  # Elastic deformation（B-spline 随机位移场）
-  # - sigma : 位移场的平滑度（粗网格间距）。推荐 3~7。
-  # - alpha : 位移幅度（体素为单位，std）。推荐 1~10，小分辨率小值。
+  # B-spline 位移场; sigma 平滑度 (3~7); alpha 幅度 (1~10, 体素)
   elastic_deform_prob : 0.02
   elastic_deform_sigma: 5.0
   elastic_deform_alpha: 1.0
 
-  # Grid dropout — 在空间维度随机挖掉若干矩形块（强正则）
+  # 随机挖掉矩形块 (强正则)
   grid_dropout_prob : 0.0
-  grid_dropout_ratio: 0.3               # 被挖掉的空间面积占比
-  grid_dropout_holes: 4                 # 矩形块数量
+  grid_dropout_ratio: 0.3
+  grid_dropout_holes: 4
 
-  # ---- Intensity augmentations (image only) --------------------------
   random_brightness_prob : 0.3
-  random_brightness_range: [-0.1, 0.1]  # 加性偏移
+  random_brightness_range: [-0.1, 0.1]   # 加性
 
   random_contrast_prob : 0.3
-  random_contrast_range: [0.8, 1.2]     # 乘性缩放
+  random_contrast_range: [0.8, 1.2]      # 乘性
 
   random_gamma_prob : 0.2
-  random_gamma_range: [0.8, 1.2]        # gamma 校正指数
+  random_gamma_range: [0.8, 1.2]
 
   gaussian_noise_prob: 0.2
   gaussian_noise_std : 0.1
 
   gaussian_blur_prob : 0.1
-  gaussian_blur_sigma: [0.5, 1.5]       # 高斯核 sigma 随机范围
+  gaussian_blur_sigma: [0.5, 1.5]
 
-  # Simulate low resolution: 先降采再插值回原分辨率。
+  # 降采后插值回原分辨率
   simulate_lowres_prob: 0.1
-  simulate_lowres_zoom: [0.5, 1.0]      # zoom 因子（下采倍率的倒数）
+  simulate_lowres_zoom: [0.5, 1.0]
 
 
-# =====================================================================
-# MODEL — UNet3D 架构
-# =====================================================================
+# MODEL — UNet3D
 model:
-  # backbone: "resnet" | "convnext"
-  backbone: "resnet"
+  backbone: "resnet"                     # 'resnet' | 'convnext'
 
-  # 输入通道数。= len(multi_res_scales)，sync() 会自动同步，通常无需手写。
-  in_channels: 1
+  in_channels: 1                         # = len(multi_res_scales), sync() 自动同步
 
-  # 每一层编码器通道数。列表长度即网络层数（=下采样次数+1）。
-  # 5 级 = 4 次下采样。
-  encoder_channels: [32, 64, 128, 256, 256]
+  encoder_channels: [32, 64, 128, 256, 256]   # 长 = 层数 (下采样次数+1)
+  blocks_per_level: 2                    # 默认每级 block 数
 
-  # 每级的 block 数（默认）。若要每级不同块数，使用
-  # encoder_blocks_per_stage / decoder_blocks_per_stage。
-  blocks_per_level: 2
-
-  # block_type (resnet 专用)："basic" | "preact" | "bottleneck" | "r2plus1d"
-  #   "basic"      — 经典 post-act ResNet（默认）。
-  #   "preact"     — 预激活 ResNet（深度 encoder 推荐）。
-  #   "bottleneck" — 1×1×1/3×3×3/1×1×1 倒残差（nnU-Net ResEnc-XL）。
-  #   "r2plus1d"   — 因子化 (2+1)D 残差块（方案 A）：
-  #                    每个 3×3×3 conv 被拆为 (1,3,3) 空间 conv + 中间非线性
-  #                    + (3,1,1) 时间 conv，专门给 thin-slab z_axis / cubic
-  #                    几何加 z 方向上下文。参数比 basic 略高、显著低于纯 3D
-  #                    isotropic（≈24·C² vs 54·C²/块）。
-  #                    要求 spatial_dims=3（即非 2.5D）；2.5D 模式会被 validate()
-  #                    显式拒绝。下游 stem / downsample / decoder 契约不变。
+  # block_type (resnet): 'basic'(默认) | 'preact'(深) | 'bottleneck'(ResEnc-XL) | 'r2plus1d'(需 3D, z 上下文)
   block_type: "basic"
 
-  # 非对称每级 block 数（nnU-Net ResEncUNet 风格）。留空则用 blocks_per_level。
-  # 长度必须 = len(encoder_channels)（decoder 为 -1）。
+  # 非对称每级 block 数; 长度 = len(encoder_channels) [decoder = -1]
   # encoder_blocks_per_stage: []
   # decoder_blocks_per_stage: []
 
-  # ResEnc 预设：一键应用 nnU-Net 论文推荐配置。
-  #   "none" | "S" | "M" | "L" | "XL"
-  # 非 "none" 且上面两个列表为空时，sync() 会自动填入该 preset 的每级块数。
+  # ResEnc 预设: 'none' | 'S' | 'M' | 'L' | 'XL'。非 none 且上面两列空时 sync() 自动填
   # resenc_preset: "none"
 
-  # ---- Normalization ---------------------------------------------------
-  # norm_type: "batch" | "instance" | "group"
-  norm_type  : "instance"
-  norm_groups: 8                         # 仅 group norm 使用
+  norm_type  : "instance"                # 'batch' | 'instance' | 'group'
+  norm_groups: 8                         # 仅 group norm
 
-  # ---- Activation / regularization -------------------------------------
-  # activation: "relu" | "leakyrelu" | "gelu" | "swish"
-  activation: "leakyrelu"
+  activation: "leakyrelu"                # 'relu' | 'leakyrelu' | 'gelu' | 'swish'
   dropout   : 0.0
 
-  # ---- Attention -------------------------------------------------------
-  # 旧 SE 开关（已 legacy）。优先使用 attention_type。
-  use_se      : false
+  use_se      : false                    # legacy; 优先用 attention_type
   se_reduction: 16
+  # attention_type: "none"                # 'none' | 'se' | 'eca' | 'cbam' | 'coord'
+  # skip_attention: false                 # Skip 路 AttentionGate3D (Oktay 2018)
 
-  # Block 内通道/空间注意力：
-  #   "none" | "se" | "eca" | "cbam" | "coord"
-  # attention_type: "none"
+  deep_supervision: false                # 多 decoder 层预测; 权重见 loss.deep_supervision_weights
 
-  # Skip 连接上的 AttentionGate3D（Oktay et al. MIDL 2018）。
-  # skip_attention: false
-
-  # ---- Deep supervision ------------------------------------------------
-  # 在多个 decoder 层级输出预测，loss.deep_supervision_weights 控制权重。
-  deep_supervision: false
-
-  # ---- Stem --------------------------------------------------------------
-  # 首层设计："conv3" | "conv7" | "dual" | "patch2" | "patch4"
-  # patchN 会将输入分辨率降 N 倍；UNet3D 输出端会补一个匹配的 trilinear 上采样。
+  # 'conv3' | 'conv7' | 'dual' | 'patch2' | 'patch4' (patchN 降 N 倍, 输出补 trilinear)
   stem_mode: "conv3"
 
-  # ---- Decoder topology -----------------------------------------------
-  # "unet"   : 经典对称 UNet（默认）
-  # "unetpp" : UNet++（DLMIA 2018 Zhou et al.）nested dense
-  # "unet3p" : Full-scale skip UNet 3+（ICASSP 2020 Huang et al.）
-  decoder_type: "unet"
-  unet3p_cat_channels: 64  # 仅 unet3p 使用
+  decoder_type: "unet"                   # 'unet' | 'unetpp' | 'unet3p'
+  unet3p_cat_channels: 64                # 仅 unet3p
 
-  # ---- Down / Up sampling ---------------------------------------------
-  # downsample_mode:
-  #   "conv"          : strided 3D 卷积（默认）
-  #   "maxpool"       : 3D max pool
-  #   "avgpool"       : 3D average pool
-  #   "blurpool"      : BlurPool（抗混叠）
-  #   "pixelunshuffle": PixelUnshuffle / space-to-depth
+  # 'conv'(默认) | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
   downsample_mode: "conv"
-
-  # upsample_mode:
-  #   "transpose"    : 转置卷积（默认）
-  #   "trilinear"    : 三线性插值 + 1x1 卷积
-  #   "nearest"      : 最近邻 + 1x1 卷积
-  #   "pixelshuffle" : PixelShuffle / depth-to-space
-  #   "carafe"       : CARAFE 轻量级内容感知上采样
-  #   "dysample"     : DySample (ICCV 2023) 动态采样点
+  # 'transpose' | 'trilinear'(默认) | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
   upsample_mode: "trilinear"
 
-  # skip_mode: "cat"（concat 通道）| "add"（按通道加）
-  skip_mode: "cat"
+  skip_mode: "cat"                       # 'cat' | 'add'
 
-  # Stochastic depth / drop path，仅 convnext 生效。
-  drop_path_rate: 0.0
+  drop_path_rate: 0.0                    # 仅 convnext
 
 
-# =====================================================================
-# LOSS — 损失函数
-# =====================================================================
+# LOSS
 loss:
-  # name — 单独损失 (single):
-  #   "dice"           : Soft Dice
-  #   "bce"            : Binary CE with logits（按前景类独立）
-  #   "focal"          : Focal loss (Lin et al. ICCV 2017)
-  #   "tversky"        : Tversky loss（FP/FN 非对称权重）
-  #   "gdl"            : Generalized Dice (Sudre et al. DLMIA 2017)
-  #                      ——自动按类别体积倒数加权，强不平衡下首选。
-  #   "focal_tversky"  : Focal Tversky (Abraham & Khan ISBI 2019)
-  #                      ——小病灶/细结构友好，γ>1 聚焦难类。
-  #   "lovasz"         : Lovász-Hinge (Berman et al. CVPR 2018)
-  #                      ——IoU 直接替代梯度，与 Dice/BCE 互补。
-  #   "cldice"         : Soft clDice (Shit et al. CVPR 2021)
-  #                      ——拓扑保持（血管/气道连通性）。单用慎重，建议与 Dice 组合。
-  #
-  # name — 复合损失 (compound, 权重见 compound_weights):
-  #   "dice_bce"           : Dice + BCE（通用默认）
-  #   "dice_focal"         : Dice + Focal
-  #   "dice_tversky"       : Dice + Tversky
-  #   "focal_plus_tversky" : Focal + Tversky（= 旧版 "focal_tversky" 复合）
-  #   "dice_cldice"        : Dice + clDice（Shit 原论文推荐组合）
-  #   "dice_focal_tversky" : Dice + Focal Tversky
-  #   "dice_lovasz"        : Dice + Lovász
-  #   "bce_lovasz"         : BCE + Lovász
-  #   "gdl_bce"            : Generalized Dice + BCE
-  #   "gdl_focal"          : Generalized Dice + Focal
+  # 单独: 'dice' | 'bce' | 'focal' | 'tversky' | 'gdl' | 'focal_tversky' | 'lovasz' | 'cldice'
+  # 复合: 'dice_bce' | 'dice_focal' | 'dice_tversky' | 'focal_plus_tversky' | 'dice_cldice'
+  #       | 'dice_focal_tversky' | 'dice_lovasz' | 'bce_lovasz' | 'gdl_bce' | 'gdl_focal'
+  # 说明: gdl 自动体积倒数加权(不平衡首选); focal_tversky 小病灶友好;
+  #       lovasz IoU 梯度替代; cldice 拓扑保持 (血管/气道), 建议与 Dice 组合
   name: "dice_focal"
 
-  # Compound 组分权重 [loss1_w, loss2_w]（仅 dice_bce / dice_focal 使用）。
-  compound_weights: [1.0, 1.0]
+  compound_weights: [1.0, 1.0]           # [loss1_w, loss2_w] 仅 compound 使用
 
-  # Per-class 权重（按前景类）。空 = 均匀。长度 = num_fg_classes。
-  class_weights: [1.0, 1.0]
+  class_weights: [1.0, 1.0]              # 按前景类; 长度 = num_fg_classes (空 = 均匀)
 
-  # Per-region 空间权重：按 label_values 逐值给一个权重（包含 bg）。
-  # 例：label_values=[0,1,2]，region_weights=[1.0, 2.0, 1.0]
-  #     => 标签值为 1 的体素在 loss 中权重 2.0。空列表 = 禁用。
+  # 按 label_values 逐值 (含 bg)。例: [0,1,2]+[1,2,1] => label=1 体素 loss 权重 2。空 = 禁用
   region_weights: [1.0, 2.0, 1.0]
 
-  # ---- Dice 设定 ------------------------------------------------------
-  dice_smooth : 1.0e-5        # 防止 0/0
-  dice_squared: false         # true → Dice^2 变体（收敛更稳但梯度弱）
+  dice_smooth : 1.0e-5                   # 防 0/0
+  dice_squared: false                    # true → Dice^2 (稳但梯度弱)
 
-  # ---- Focal 设定 -----------------------------------------------------
-  focal_alpha: 0.5           # 正类权重
-  focal_gamma: 2.0            # 难样本指数
+  focal_alpha: 0.5                       # 正类权重
+  focal_gamma: 2.0                       # 难样本指数
 
-  # ---- Tversky 设定 ---------------------------------------------------
-  # alpha = FP 权重，beta = FN 权重。alpha=beta=0.5 等价于 Dice。
-  # 对漏检敏感的任务（召回优先）：alpha<beta，如 0.3 / 0.7。
+  # Tversky: alpha=FP, beta=FN。alpha=beta=0.5 等价 Dice; 召回优先: alpha<beta (如 0.3/0.7)
   tversky_alpha: 0.3
   tversky_beta : 0.7
 
-  # ---- Dice / Tversky 聚合模式 ----------------------------------------
-  # batch_dice: true → 先在 batch+空间维聚合 TP/denom 再求商（nnU-Net 默认，
-  #                   对稀疏前景 patch 更稳）。false → 逐 sample-class 计算
-  #                   再求平均。GDL 无论此开关均用 batch_dice=true。
+  # batch_dice: true → nnU-Net 默认 batch+空间聚合 (稀疏更稳); false → per-sample-class。GDL 总是 true
   # batch_dice: false
-  # ignore_empty: 仅 per-sample 模式生效。true → 当前样本缺失的前景类不参
-  #               与类平均（避免 dice=1 假象掩盖其它类误差）。
-  # ignore_empty: false
+  # ignore_empty: false                    # 仅 per-sample; 跳过缺失前景类避免 dice=1 假象
 
-  # ---- Generalized Dice Loss (GDL) ------------------------------------
-  # gdl_weight_type:
-  #   "square"  : w_c = 1 / (Σ t_c)^2    （Sudre et al. 原论文推荐）
-  #   "simple"  : w_c = 1 / Σ t_c
-  #   "uniform" : 禁用自动加权（≈ batch_dice 的 Dice）
-  # gdl_weight_type: "square"
-  # gdl_w_max: 1.0e5     # 1/volume 的夹紧上限，防空类爆炸
+  # gdl_weight_type: "square" | "simple" | "uniform"  # Sudre 原论 'square'
+  # gdl_w_max: 1.0e5                       # 1/volume 上限, 防空类爆炸
 
-  # ---- Focal Tversky (Abraham & Khan 2019) ---------------------------
-  # 本实现 (1 - TI)^gamma，gamma ≥ 1 聚焦难类；默认 4/3 对应原论文 γ=0.75。
-  # focal_tversky_gamma: 1.3333
-
-  # ---- Lovász-Hinge (Berman et al. 2018) -----------------------------
-  # per_sample=true → 每 (B, C) 独立排序取平均（默认）
-  # per_sample=false → channel 级 batch 内一次排序，对 tiny patch 更平滑
-  # lovasz_per_sample: true
-
-  # ---- Soft clDice (Shit et al. 2021) --------------------------------
-  # cldice_iter: 软骨架化迭代次数（2D 推荐 3，3D 粗血管 3~5，细血管 5~10）。
-  # cldice_iter : 3
+  # focal_tversky_gamma: 1.3333            # (1-TI)^gamma, gamma≥1; 默认 4/3 ≈ 原论 γ=0.75
+  # lovasz_per_sample: true                # true=per (B,C); false=channel 级 (tiny patch 更稳)
+  # cldice_iter : 3                        # 软骨架化迭代次数 (2D=3, 3D 细血管 5~10)
   # cldice_smooth: 1.0
 
-  # Deep supervision 每层 loss 权重（由浅到深衰减）。
-  # 需与 model.deep_supervision: true 搭配。长度 ≤ decoder 层数。
+  # Deep supervision 每层权重 (浅→深衰减); 需 model.deep_supervision=true; 长 ≤ decoder 层数
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
 
-# =====================================================================
-# TRAIN — 训练循环 / 优化器 / 调度器 / 混合精度 / 检查点
-# =====================================================================
 train:
   epochs: 50
 
-  # ---- Optimizer ------------------------------------------------------
-  # optimizer: "adam" | "adamw" | "sgd"
-  optimizer   : "adamw"
+  optimizer   : "adamw"                  # 'adam' | 'adamw' | 'sgd'
   lr          : 1.0e-3
   weight_decay: 1.0e-4
-  # 仅 SGD 使用：
-  # momentum: 0.99
+  # momentum: 0.99                         # 仅 SGD
   # nesterov: true
 
-  # ---- Scheduler ------------------------------------------------------
-  # scheduler:
-  #   "cosine"               : CosineAnnealingLR（默认）
-  #   "cosine_warm_restarts" : CosineAnnealingWarmRestarts（周期性重启）
-  #   "poly"                 : (1 - step/T)^poly_power
-  #   "step"                 : MultiStepLR（每 step_size epochs 衰减 step_gamma）
-  #   "plateau"              : ReduceLROnPlateau（验证指标停滞时衰减）
-  #   "one_cycle"            : OneCycleLR（内建 warmup，禁止叠加 warmup_epochs）
+  # scheduler: 'cosine' | 'cosine_warm_restarts' | 'poly' | 'step' | 'plateau' | 'one_cycle'
   scheduler: "cosine"
 
-  # Warmup（线性 warmup → 从 warmup_lr 升到 lr）。0 = 禁用。
-  # one_cycle 模式下必须为 0（它内置 pct_start）。
-  warmup_epochs: 5
+  warmup_epochs: 5                       # one_cycle 下必须 0 (内置 pct_start)
   warmup_lr    : 1.0e-6
 
-  # cosine / cosine_warm_restarts 相关：
-  cosine_min_lr        : 1.0e-6    # cosine 到达的下限
-  cosine_restart_period: 50        # T_0（epochs）
-  cosine_restart_mult  : 2         # T_mult，每次重启周期倍增
+  cosine_min_lr        : 1.0e-6
+  cosine_restart_period: 50              # T_0 (epochs)
+  cosine_restart_mult  : 2               # T_mult
 
-  # poly / step / plateau 相关（仅对应 scheduler 时生效）：
-  # poly_power      : 0.9
-  # step_size       : 50            # 每多少 epoch 衰减一次
-  # step_gamma      : 0.1           # 衰减系数
+  # poly_power: 0.9
+  # step_size: 50                          # MultiStepLR
+  # step_gamma: 0.1
   # plateau_patience: 10
   # plateau_factor  : 0.5
 
-  # ---- Batch / Grad --------------------------------------------------
-  # 梯度累积：等效 batch = data.batch_size * grad_accum_steps
-  grad_accum_steps: 1
-  # 梯度范数裁剪；0 = 禁用。
-  grad_clip_norm: 12.0
+  grad_accum_steps: 1                    # 等效 batch = batch_size * grad_accum_steps
+  grad_clip_norm: 12.0                   # 0 = 禁用
 
-  # ---- Mixed precision (AMP) ------------------------------------------
   use_amp: true
-  # amp_dtype: "float16" | "fp16" | "bfloat16" | "bf16"
-  #   fp16 需要 GradScaler（自动启用）；bf16 无需 scaler，数值稳定性更好。
+  # 'float16'/'fp16' (需 GradScaler) | 'bfloat16'/'bf16' (无需 scaler, 稳定)
   amp_dtype: "bfloat16"
 
-  # ---- torch.compile (PyTorch 2+) ------------------------------------
-  # compile_mode: "none" | "default" | "reduce-overhead" | "max-autotune"
+  # torch.compile (PT2+): 'none' | 'default' | 'reduce-overhead' | 'max-autotune'
   compile_mode: "none"
 
-  # ---- EMA ------------------------------------------------------------
   use_ema  : true
   ema_decay: 0.999
 
-  # ---- Checkpointing --------------------------------------------------
   output_dir: "outputs/lung_bone_zaxis"
-  save_every: 10                     # 每 N epochs 存一次周期性 checkpoint
-  save_best_metric: "mean_dice"     # 跟踪哪个验证指标决定 best
-  # save_best_mode: "max" | "min"
-  save_best_mode: "max"
+  save_every: 10
+  save_best_metric: "mean_dice"
+  save_best_mode: "max"                  # 'max' | 'min'
 
-  # Early stopping（连续 N 次验证无提升就停）。0 = 禁用。
-  early_stopping: 15
+  early_stopping: 15                     # 0 = 禁用
 
-  # ---- Logging --------------------------------------------------------
-  log_every: 10                     # 每 N 个 micro-step 记一次训练 loss
-  val_every: 1                      # 每 N epoch 跑一次验证
-  vis_every: 10                     # 每 N epoch 导出可视化（如启用）
+  log_every: 10                          # 训练 loss 记录 (micro-step)
+  val_every: 1
+  vis_every: 10
 
-  # ---- Reproducibility ------------------------------------------------
   seed: 42
-  # true 会启用 cudnn deterministic（速度下降但可复现）。
-  deterministic: false
+  deterministic: false                   # cudnn deterministic (慢)
 
-  # 从 checkpoint 继续训练（完整 state：model/optimizer/scheduler/ema/rng）。
-  resume: ""
+  resume: ""                             # 完整 state 恢复 (model/optim/sched/ema/rng)
 
-  # 仅加载模型权重作为初始化（迁移学习）。不恢复 optimizer/scheduler/epoch/RNG。
-  # 与 resume 同时设置时，若 resume 文件存在则 pretrain 被忽略。
+  # 仅加载权重 作初始 (迁移学习); resume 优先
   pretrain: ""
-  # 默认 False，允许 head 形状不一致；missing/unexpected keys 会写日志。
-  pretrain_strict: false
-  # ckpt 含 EMA 时是否优先取 EMA shadow 作为初始权重。
-  pretrain_load_ema: false
+  pretrain_strict: false                 # false 允许 head 形状不一致
+  pretrain_load_ema: false               # ckpt 含 EMA 时是否优先取 shadow
 
 
-# =====================================================================
-# PREDICT — 推理 / 滑窗 / TTA
-# =====================================================================
 predict:
-  # 滑窗相邻窗口重叠比例（0.0 ~ 0.95）。
-  #   z_axis 模式：沿 z 轴窗口的 overlap；
-  #   cubic  模式：3 轴都复用此值；
-  #   whole  模式：忽略（无滑窗）。
+  # 滑窗重叠 (0~0.95)。z_axis: 沿 z; cubic: 三轴同值; whole: 忽略
   z_overlap: 0.5
+  blend_mode: "gaussian"                 # 'gaussian'(推荐) | 'average'
 
-  # 窗口融合权重：
-  #   "gaussian": 中心权重高、边缘低（推荐，缝合痕迹更平滑）
-  #   "average" : 均匀权重（= 简单平均）
-  blend_mode: "gaussian"
+  batch_size: 2                          # 推理 batch (可大于训练)
 
-  # 推理 batch size（可大于训练值，通常显存富裕）。
-  batch_size: 2
+  tta_flip: false                        # 8× forward, +0.3~1.0 mDice
 
-  # Test-Time Augmentation：启用后对 7 种轴翻转组合做均值。
-  # 代价是 8x forward；精度提升通常 +0.3~1.0 mDice。
-  tta_flip: false
-
-  # 多类别 sigmoid 概率转 label map 的阈值。每前景类最大概率 < threshold
-  # 的体素归为背景（label_values[0]）。
+  # 前景类最大概率 < threshold 的体素归背景 (label_values[0])
   threshold: 0.5
-
-  # 结果输出目录（相对于当前 CWD 或绝对路径）。
   output_dir: "predictions"
-
-  # 是否同时保存每个前景类的概率图（NIfTI 额外文件）。
-  save_probabilities: false
+  save_probabilities: false              # 同时保存每前景类概率图
 

@@ -1,8 +1,4 @@
-"""Configuration system using dataclasses + YAML.
-
-All tunable parameters are centralized here. The YAML config file maps
-directly to nested dataclasses for type safety and IDE autocompletion.
-"""
+"""Dataclass + YAML config. Each YAML file maps directly to nested dataclasses."""
 
 from __future__ import annotations
 
@@ -21,332 +17,90 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 @dataclass
 class DataConfig:
-    """Data paths and preprocessing settings."""
+    """Data paths and preprocessing."""
 
     image_dir: str = ""
     label_dir: str = ""
-    # Suffix fields below all accept either a single string (legacy
-    # contract) or a YAML list of candidate suffixes. With a list,
-    # pairing under :mod:`segtask_v1.data.loader` strips the suffix to
-    # compute a *base* name and tries each candidate in order, taking
-    # the first existing file under the corresponding directory. This
-    # lets images / labels / bboxes / region-weights live side-by-side
-    # with mixed naming conventions (e.g. ``case01.nii.gz`` paired with
-    # ``case01-seg.nii.gz`` or ``case01_pred.nii.gz``). Order in the
-    # list expresses precedence (first match wins per sample).
+    # 后缀：单值或候选列表（取首个存在）。例：".nii.gz" 或 [".nii.gz", "-seg.nii.gz"]。
     image_suffix: Union[str, List[str]] = ".nii.gz"
     label_suffix: Union[str, List[str]] = ".nii.gz"
 
-    # Optional ROI bounding-box directory. When non-empty, each sample is
-    # expected to have a matching NIfTI mask under ``bbox_dir`` (filename
-    # base-matched against the image, then any suffix in ``bbox_suffix``
-    # tried in order). At dataset init
-    # time we load every bbox mask once, compute its axis-aligned
-    # bounding box of nonzero voxels, log the mean (D, H, W) bbox size
-    # across the dataset, and cache the per-sample bbox tuple. Each time
-    # an image / label volume is loaded it is cropped to that bbox before
-    # any downstream preprocessing or patch extraction. This both shrinks
-    # the working volume for large CT scans where only a sub-region is
-    # of interest, and keeps the rest of the pipeline (patching, multi-
-    # resolution, augmentation, prediction) untouched. Empty string =
-    # disabled (legacy full-volume behaviour).
+    # 可选 ROI bbox 掩码目录；设置后按 bbox 裁剪。空=禁用。
     bbox_dir: str = ""
     bbox_suffix: Union[str, List[str]] = ".nii.gz"
 
-    # Optional per-sample region-weight NIfTI directory. When non-empty,
-    # each sample must have a matching NIfTI file under ``region_weight_dir``
-    # (filename match against the image, suffix ``region_weight_suffix``).
-    # The file is expected to be a hand-annotated continuous weight volume
-    # with background = 0 and non-background voxels set to the desired
-    # weight value; the dataset adds +1 on load so background → 1 and the
-    # annotated regions become (w + 1). Precedence:
-    #   per-sample file (if dir set)  >  ``loss.region_weights``  >  disabled.
-    # When ``region_weight_dir`` is set, every sample must have a matching
-    # file (FileNotFoundError otherwise) — mirrors the ``bbox_dir`` strong-
-    # match contract to avoid silent per-sample weight regressions.
+    # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > loss.region_weights。
     region_weight_dir: str = ""
     region_weight_suffix: Union[str, List[str]] = ".nii.gz"
 
-    # ---- Pre-computed npz pipeline ---------------------------------
-    # Optional pre-computed npz package directory (output of
-    # ``segtask_v1.data.make_data``). When non-empty, the trainer's
-    # data loader reads bbox-cropped image / label / region_weight
-    # plus pre-computed foreground indices straight from
-    # ``<npz_dir>/<pid>.npz`` and IGNORES ``image_dir`` /
-    # ``label_dir`` / ``bbox_dir`` / ``region_weight_dir`` at runtime.
-    # The npz files store:
-    #   image      int16  (D', H', W')  raw HU, bbox-cropped
-    #   label      int16  (D', H', W')  raw labels, bbox-cropped
-    #   rw         float32 (D', H', W')  +1 shifted, optional
-    #   fg_slices  int32  (M,)          per-z fg index in cropped frame
-    #   fg_coords  int32  (N, 3)        sub-sampled (seed=42, N<=50000)
-    #   meta       object dict          provenance
-    # Benefits: (1) eliminates the SimpleITK gzip-decompress peak that
-    # OOMs ``num_workers >= 4`` with concurrent image+label+rw reads;
-    # (2) lets DataLoader workers ``mmap`` arrays out of the OS page
-    # cache (shared across workers); (3) skips the dataset's startup
-    # ``precompute_bboxes`` + ``_build_index`` scans (fg indices are
-    # baked in). Strong contract: every sample expected from
-    # discovery (or every pid in ``<npz_dir>/_manifest.json``) must
-    # have a matching npz file. Empty string = legacy NIfTI pipeline.
-    #
-    # Companion field ``npz_suffix`` lets users co-locate npz files
-    # with non-standard extensions (e.g. when sharded across folders);
-    # default ``.npz`` matches make_data's output verbatim.
+    # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
     npz_dir: str = ""
     npz_suffix: str = ".npz"
 
-    # When True (default) and ``npz_dir`` points at a missing or
-    # empty directory at trainer startup, ``build_dataloaders``
-    # calls ``segtask_v1.data.make_data.prepare_dataset`` inline
-    # before constructing the loaders — turning the npz pipeline
-    # into a one-shot "just set npz_dir and run train" UX. Set to
-    # False to require an explicit ``python -m segtask_v1.data.
-    # make_data ...`` invocation (recommended for cluster runs
-    # where the build step should be a separate scheduled job).
-    # This switch only fires when the directory is empty; a
-    # partially-populated directory (e.g. resume after a crashed
-    # build) is treated as authoritative — re-run make_data
-    # manually with ``--overwrite`` or wipe the directory to force
-    # a rebuild.
+    # True=启动时自动调用 make_data 生成；False=要求手动预生成。
     npz_auto_build: bool = True
 
-    # 样本排除清单（文本文件路径，每行一个 pid / stem）。pid 定义为
-    # `image_path.name`（不含后缀，即 `<name>{image_suffix}` 去掉后缀的部分）。
-    # 命中的 pid 会在 `discover_samples` 之后立刻从 image/label/bbox 配对中剔除。
-    # 典型用途：跳过 SimpleITK 无法读取的非正交 direction cosines 文件
-    # （参见 `tools/scan_bad_nifti.py` 扫描脚本）。留空 = 不过滤。
+    # 样本排除清单路径（每行一个 pid）。空=不过滤。
     exclude_list: str = ""
 
-    # Label mapping: integer label values in the mask (0=background).
-    # e.g. [0, 1, 2] for 3-class. Empty = auto-detect from data.
+    # 标签取值集（0=背景）。空=从数据自动探测。
     label_values: List[int] = field(default_factory=list)
-    num_classes: int = 0  # auto-set from label_values
+    num_classes: int = 0  # 由 label_values 自动设置
 
-    # 3D patch size: [D, H, W] — model input resolution
+    # 3D patch 尺寸 [D, H, W]。
     patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
 
-    # Patch extraction mode:
-    #   "z_axis" — slide along z-axis, extract D slices, resize H,W to target.
-    #              Supports `multi_res_scales` (z-axis-only scaling).
-    #   "cubic"  — sample center (x,y,z), extract full 3D cube of patch_size.
-    #              Supports `multi_res_scales` (all 3 axes scale).
-    #   "whole"  — resize the ENTIRE volume to `patch_size` (no sliding
-    #              window, no sub-cropping). Simplest mode; useful when the
-    #              object of interest spans most of every volume and memory
-    #              / compute budget allows feeding the full downsampled
-    #              volume each step. `multi_res_scales` must be [1.0] here
-    #              (scaling has no physical meaning beyond the volume).
-    #   "2_5d"   — 2.5D mode: reuses the z_axis dataset path with
-    #              `multi_res_scales=[1.0]` (forced). The trainer squeezes
-    #              the C_res=1 axis after augmentation, treating the D
-    #              slices as input channels for a planar 2D UNet. Model
-    #              ``spatial_dims`` is auto-set to 2 and ``in_channels``
-    #              auto-set to ``patch_size[0] = D``. The model output
-    #              ``(B, num_fg*D, H, W)`` is split per fg class into
-    #              D-channel binary maps by ``SliceChannelLoss``.
+    # Patch 抽取模式。示例："z_axis"（仅 z 滑块，H/W 全尺寸）、"2_5d"（D 折叠为通道驱动 2D UNet）。
+    # 其他："cubic" 3 轴中心抽取；"whole" 整体 resize。
     patch_mode: str = "z_axis"
 
-    # Augmentation oversample ratio (applies to BOTH z_axis and cubic modes).
-    # Dataset extracts a patch of size `round(patch_size * ratio)` on every
-    # axis, the augmentor applies spatial transforms (rotate/elastic with
-    # `zeros` padding), and the trainer center-crops back to patch_size.
-    # This removes the black-corner artefacts that grid_sample introduces
-    # at rotated edges. 1.0 = disabled (legacy behaviour), 1.4~1.5 recommended
-    # whenever `random_affine_prob` or `elastic_deform_prob` > 0.
+    # 增强过采样比：先抽 round(patch_size*ratio)，增强后中心裁回。1.0=禁用；affine/elastic 建议 1.4–1.5。
     aug_oversample_ratio: float = 1.0
 
-    # Multi-resolution input — supported in BOTH z_axis and cubic modes,
-    # with axis semantics matching each mode:
-    #   cubic  — scale applies on ALL three axes (D, H, W). Each scale
-    #            extracts a physically larger cube around the same center
-    #            and resizes back to extract_size.
-    #   z_axis — scale applies ON Z ONLY. Each scale extracts a wider z
-    #            range (round(eD * scale) slices) around the same z center
-    #            and resizes back to extract_size. H, W are always full
-    #            volume resolution in z_axis mode — no in-plane scaling
-    #            makes sense there.
-    # Each scale's output is stacked as an input channel: [1.0] = 1-channel
-    # (legacy), [1.0, 1.5, 2.0] = 3-channel input.
+    # 多分辨率 FOV：各 scale 同中心抽更宽 FOV，resize 后作额外输入通道。
+    # 示例：[1.0] 单通道；[1.0, 1.5, 2.0] 3 通道。cubic 作用 3 轴，z_axis 仅 z 轴。
     multi_res_scales: List[float] = field(default_factory=lambda: [1.0])
 
-    # Intensity windowing (HU for CT)
+    # 强度窗（CT HU）。
     intensity_min: float = -1024.0
     intensity_max: float = 3071.0
-    # Normalization: "minmax" -> [0,1], "zscore" -> zero-mean unit-var
+    # 归一化："minmax"→[0,1]；"zscore"→零均值单位方差。
     normalize: str = "minmax"
     global_mean: float = 0.0
     global_std: float = 1.0
 
-    # Train/val split
+    # 训/验划分。
     val_ratio: float = 0.2
     split_seed: int = 42
-    # Stratified split by each volume's primary foreground class.
-    # Strongly recommended when class distribution is imbalanced (typical
-    # medical imaging case). Falls back to random split if the dataset is
-    # too small to stratify cleanly.
+    # 按首个前景类分层；样本太少时回退随机。
     stratified_split: bool = True
 
-    # DataLoader
+    # DataLoader。
     batch_size: int = 2
     num_workers: int = 4
     pin_memory: bool = True
-    # Keep worker processes alive across epochs. On Windows (spawn start
-    # method) and macOS this avoids re-pickling the whole Dataset and
-    # re-warming every per-worker volume cache at the start of every
-    # epoch — usually the single biggest source of "epoch start stall"
-    # on non-Linux hosts. Only consulted when ``num_workers > 0``.
     persistent_workers: bool = True
-    # How many batches each worker prefetches ahead of consumption. The
-    # PyTorch default is 2; raising to 4 hides sitk decode + preprocessing
-    # latency behind GPU compute more effectively. Only consulted when
-    # ``num_workers > 0``.
     prefetch_factor: int = 4
 
-    # Foreground oversampling: probability of centering patch on foreground
+    # 前景过采样：中心点落在前景上的概率。
     foreground_oversample_ratio: float = 0.5
 
-    # Samples per volume per epoch (controls epoch length)
+    # 每体积每 epoch 采样次数。
     samples_per_volume: int = 8
 
-    # Caching: "none" or "memory".
-    # `memory` keeps decoded volumes (image+label) in an LRU-bounded in-RAM
-    # cache. `cache_max_volumes` caps the number of cached volumes per
-    # worker — set to 0 for unbounded (matches the legacy behaviour, but
-    # risks OOM on large datasets). The recommended setting is a few times
-    # the effective prefetch horizon (= num_workers * samples_per_volume).
+    # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
     cache_mode: str = "memory"
-    cache_max_volumes: int = 0  # 0 = unbounded
+    cache_max_volumes: int = 0
 
-    # ---- Z-axis boundary-window handling (z_axis / 2.5D modes) ----
-    # Controls how the ``scale=1.0`` channel of a z-window is built when
-    # the candidate window has fewer than ``extract_size[0]`` real slices
-    # — i.e. (a) the volume is shorter than the patch in z, or (b) the
-    # sampled center sits close enough to a volume boundary that
-    # ``[z_center - eD/2, z_center + eD/2)`` partially falls outside the
-    # volume.
-    #
-    # "stretch"  (default, backward compatible): take the in-bounds
-    #     slices verbatim and let ``resize_3d`` / ``F.interpolate``
-    #     stretch them to ``eD`` slices along z. Pitfall: in 2.5D mode
-    #     the model's input-channel index implicitly encodes a
-    #     "channel k = z_center + (k - eD/2)" physical mapping; a
-    #     stretched boundary window remaps that mapping non-linearly,
-    #     producing a train-test slice-spacing mismatch and
-    #     systematically lower quality near volume edges.
-    #
-    # "edge_pad" (recommended for 2.5D): edge-replicate-pad the
-    #     window symmetrically along z to exactly ``eD`` slices BEFORE
-    #     any resize, so every channel keeps its physical 1-slice
-    #     spacing regardless of where the window sits relative to the
-    #     volume boundary. ``scale > 1.0`` channels already use this
-    #     contract (via ``extract_z_patch_padded``) — turning the
-    #     toggle on simply makes the ``scale=1.0`` channel match.
-    #
-    # The toggle covers BOTH the training dataset (``SegDataset3D``)
-    # and the inference predictor (``Predictor._build_z_window_input``
-    # CPU/GPU paths + ``_sliding_window_z`` reverse-resize) so that
-    # train and inference geometries stay strictly consistent. Modes
-    # other than z_axis / 2.5D are unaffected.
+    # z 轴边界填充（z_axis/2.5D）："stretch" 范围内拉伸；"edge_pad" 边缘复制后 resize（推荐）。
     z_boundary_mode: str = "stretch"
 
-    # ---- 2.5D multi-FOV: keep auxiliary views at NATIVE depth ----
-    # When False (default, fully backward compatible):
-    #   Each scale s_k extracts ``round(eD * s_k)`` slices around the
-    #   sampled z-center and is **z-resampled back to eD slices** so that
-    #   all views share the same D channel count, producing a stacked
-    #   input ``(B, n_views * D, H, W)``. Auxiliary FOVs therefore lose
-    #   information along z (compression).
-    #
-    # When True (only valid for ``patch_mode == "2_5d"`` with
-    # ``len(multi_res_scales) > 1`` and ``model.aux_seg_supervision = True``):
-    #   The dataset extracts a SINGLE max-FOV cube of depth
-    #   ``round(eD * max_scale)`` (edge-padded at volume boundaries),
-    #   runs all 3D augmentations on that single cube — **once** — and the
-    #   trainer center-crops per view at native depth ``D_k = round(eD *
-    #   s_k)`` immediately before the model forward. Each aux head therefore
-    #   predicts ``(B, num_fg * D_k, H, W)`` against view k's native-depth
-    #   label, with no z-axis information loss for wider FOVs.
-    #
-    # Geometric equivalence
-    # ---------------------
-    # All views share the same z-center (``_sample_z`` is computed once).
-    # Center-cropping ``D_k`` slices from the max-FOV cube yields exactly
-    # the same physical slice set as the per-view independent extraction
-    # used by the False-path (slice spacing == 1 along z) — but with a
-    # SINGLE shared augmentation field, eliminating the cross-view
-    # geometric drift that ``False`` introduces by running grid_sample
-    # independently per view.
-    #
-    # Side constraints (enforced in ``validate()``)
-    # ---------------------------------------------
-    # * ``z_boundary_mode`` is forced to ``"edge_pad"`` (the max-scale path
-    #   inherently uses ``extract_z_patch_padded``; ``stretch`` would have
-    #   no consumer and would silently mislead).
-    # * Inactive in 3D modes (multi_res_scales is a channel-stack there,
-    #   D-resampling is not part of that semantics).
+    # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
+    # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
     aux_keep_native_d: bool = False
 
-    # ---- 3D multi-FOV: lazy single-cube extraction (z_axis / cubic) ----
-    # When False (default, fully backward compatible):
-    #   For each scale s_k in ``multi_res_scales`` the dataset extracts a
-    #   physical cube of size ``round(extract_size * s_k)`` around the
-    #   sampled centre (z-only for ``z_axis``; all three axes for
-    #   ``cubic``), resizes it to ``extract_size`` (one ``scipy.ndimage.
-    #   zoom`` call per view), and stacks all views as the leading
-    #   ``C_res`` axis → ``(C_res, eD, eH, eW)``. Augmentation then runs
-    #   ONCE on the canonical-resolution stack with a SHARED grid_sample,
-    #   which means: (a) each view's high-frequency content is already
-    #   attenuated by the per-view zoom BEFORE augment, and (b) the K
-    #   per-view zooms run on every CPU worker.
-    #
-    # When True (only valid for ``patch_mode in {"z_axis", "cubic"}``,
-    # ``len(multi_res_scales) > 1`` and ``multi_res_scales[0] == 1.0``):
-    #   The dataset extracts a SINGLE max-FOV cube at the largest
-    #   physical resolution and emits it as ``(1, eD_max, eH_max, eW_max)``
-    #   (raw integer labels, continuous weights). All 3D augmentations
-    #   then run on this single cube with one shared grid_sample call.
-    #   The trainer (R2 — see ``_split_views_native_3d``) center-crops
-    #   per view at native physical size ``round(extract_size * s_k)`` and
-    #   resizes each view back to ``extract_size`` immediately before the
-    #   3D forward, finally producing the standard ``(B, C_res, eD, eH,
-    #   eW)`` model input.
-    #
-    # Geometric equivalence
-    # ---------------------
-    # All views share the same centre by construction (centre sampling
-    # runs once on the max-FOV cube). Center-cropping the per-view sub-
-    # cube and resizing to canonical size produces the SAME physical
-    # voxel set as the per-view independent extraction in the False-path
-    # (modulo a single linear/nearest interpolation pass instead of two:
-    # one in dataset + one inside grid_sample). The benefits over False
-    # are: (a) one shared aug field (cross-view warp consistency by
-    # construction); (b) aux views are not pre-downsampled before aug,
-    # preserving high-frequency detail; (c) no per-view scipy zoom in
-    # the CPU dataset workers.
-    #
-    # Side constraints (enforced in ``validate()``)
-    # ---------------------------------------------
-    # * ``z_boundary_mode`` is forced to ``"edge_pad"`` in z_axis mode
-    #   (the max-scale path always uses ``extract_z_patch_padded``;
-    #   ``stretch`` would have no consumer and silently mislead).
-    # * Mutually exclusive with ``aux_keep_native_d`` (which is the
-    #   2.5D analogue; that flag has fundamentally different semantics
-    #   — no per-view resize at all, since the 2D model consumes the
-    #   per-view depth as input channels directly).
-    # * Inactive in ``2_5d`` (use ``aux_keep_native_d``) and ``whole``
-    #   (multi-res has no physical meaning there).
-    # * ``multi_res_scales[0]`` must be ``1.0`` (view 0 = canonical
-    #   geometry; same invariant as the False-path and as 2.5D).
-    #
-    # Predictor / inference
-    # ---------------------
-    # Inference path (predict.py / Predictor) is NOT wired in this
-    # release — train-only switch. Enable only for training experiments
-    # until the inference codepath ships. Setting True together with
-    # ``train.resume`` of a False-path checkpoint is fine — only the
-    # data emission contract changes; model weights / shapes are
-    # identical.
+    # 3D 多 FOV 懒加载单 cube（z_axis/cubic）。True：dataset 发单 cube，trainer 逐视图裁剪/重采样。
+    # 约束：scales[0]==1.0；与 aux_keep_native_d 互斥；z_axis 强制 edge_pad。
     keep_native_multi_res: bool = False
 
 
@@ -355,33 +109,30 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class AugConfig:
-    """GPU data augmentation settings.
-
-    All spatial transforms are per-sample independent (not batch-level).
-    """
+    """GPU 数据增强。所有空间变换逐样本独立。"""
 
     enabled: bool = True
 
-    # --- Spatial (applied to image + label jointly) ---
+    # --- 空间变换（image + label 同步） ---
     random_flip_prob: float = 0.5
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
-    # Affine: rotation (small angles, degrees) + scale, composed into one grid_sample
+    # Affine：小角旋转 + 缩放，合成单次 grid_sample。
     random_affine_prob: float = 0.3
     random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
     random_scale_range: List[float] = field(default_factory=lambda: [0.85, 1.15])
 
-    # Elastic deformation (B-spline random displacement field)
+    # 弹性形变（B-spline 随机位移场）。
     elastic_deform_prob: float = 0.2
-    elastic_deform_sigma: float = 5.0   # Smoothness of displacement (coarse grid spacing)
-    elastic_deform_alpha: float = 7.0   # Displacement magnitude in voxels (std)
+    elastic_deform_sigma: float = 5.0   # 位移平滑度
+    elastic_deform_alpha: float = 7.0   # 位移幅度（voxel）
 
-    # Grid dropout (mask out rectangular sub-regions)
+    # Grid dropout：随机遮挡矩形子区域。
     grid_dropout_prob: float = 0.0
-    grid_dropout_ratio: float = 0.3  # fraction of spatial area to drop
-    grid_dropout_holes: int = 4      # number of rectangular holes
+    grid_dropout_ratio: float = 0.3
+    grid_dropout_holes: int = 4
 
-    # --- Intensity (image only) ---
+    # --- 强度变换（仅 image） ---
     random_brightness_prob: float = 0.3
     random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
@@ -397,32 +148,11 @@ class AugConfig:
     gaussian_blur_prob: float = 0.1
     gaussian_blur_sigma: List[float] = field(default_factory=lambda: [0.5, 1.5])
 
-    # Simulate low resolution (downsample then upsample)
+    # 模拟低分辨率（下采样后上采样）。
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
 
-    # ---- Weight-map spatial-resampling interpolation ------------------
-    # Controls how ``weight_map`` is resampled by ``_random_affine`` and
-    # ``_elastic_deform`` (the only two transforms that touch wmap with
-    # an interpolation kernel — flip uses ``torch.flip``, dropout/intensity
-    # transforms never touch wmap).
-    #
-    #   "nearest"  — preserves the EXACT discrete weight values produced
-    #                by ``compute_region_weight_map`` (e.g. bg=1, fg=4).
-    #                Required for the common case where region weights are
-    #                derived from a label map. SAFE DEFAULT.
-    #   "bilinear" — keeps continuous gradients intact at the cost of
-    #                quantising fg/bg integer weights into a noisy mixture
-    #                (the symptom: bg voxels become "0.x ~ 1.x", fg voxels
-    #                become "2.x ~ 4" near boundaries). Use this ONLY when
-    #                the per-sample wmap NIfTI is intentionally continuous
-    #                (e.g. distance-to-boundary maps in
-    #                ``region_weight_dir``).
-    #
-    # If you provide BOTH discrete fg/bg weights via ``compute_region_weight_map``
-    # AND you don't have a per-sample continuous rw NIfTI, leave this at
-    # "nearest". If your ``region_weight_dir`` ships continuous weights,
-    # set this to "bilinear" in your YAML.
+    # weight_map 插值模式："nearest" 保持离散权重（默认）；"bilinear" 仅在连续手标 wmap 时用。
     wmap_interp_mode: str = "nearest"
 
 
@@ -431,325 +161,128 @@ class AugConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
-    """UNet model architecture settings."""
+    """模型架构设置。"""
 
-    # ---- Architecture family ---------------------------------------------
-    # Selects the top-level segmentation model implementation:
-    #   "unet" (default) — the in-house generic UNet3D / 2D UNet built
-    #                      from the ResNet/ConvNeXt backbones below
-    #                      (``backbone`` / ``block_type`` / ``norm_type`` /
-    #                      ``activation`` / ``attention_type`` / ``use_se`` /
-    #                      ``dropout`` all apply).
-    #   "adm"            — Paper-faithful ADM U-Net (Dhariwal & Nichol,
-    #                      NeurIPS 2021): GroupNorm32 + SiLU + ResBlock +
-    #                      AttentionBlock; timestep / class embedding paths
-    #                      removed. The legacy ``backbone`` / ``block_type``
-    #                      / ``norm_type`` / ``activation`` / ``use_se`` /
-    #                      ``attention_type`` fields are IGNORED. The
-    #                      following fields ARE honoured:
-    #                      ``encoder_channels``,
-    #                      ``encoder_blocks_per_stage``,
-    #                      ``decoder_blocks_per_stage``,
-    #                      ``stem_mode``,
-    #                      ``context_fusion`` (only ``shared_stem`` /
-    #                      ``multi_stem_proj`` supported on ADM/EDM2;
-    #                      ``hierarchical`` will raise),
-    #                      ``deep_supervision``,
-    #                      ``aux_seg_supervision``, ``aux_head_mode``,
-    #                      ``dropout`` (reused as ``ResBlock`` dropout).
-    #                      Plus the ``adm_*`` knobs below.
-    #                      Only ``data.patch_mode == "2_5d"`` is wired in
-    #                      this iteration.
-    #   "edm2"           — Paper-faithful EDM2 U-Net (Karras et al., CVPR
-    #                      2024): magnitude-preserving (MP) ops — MPConv
-    #                      with forced weight normalization, mp_silu,
-    #                      mp_sum, mp_cat, pixel-norm; noise / class
-    #                      embedding paths removed. Same whitelist as
-    #                      ``adm`` plus the ``edm2_*`` knobs below.
+    # 架构族。示例："unet"（本项目 UNet，读下面 backbone/block/norm 等）、"adm"（ADM U-Net，仅 2.5D，读 adm_*）。
+    # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）。
     arch: str = "unet"
 
-    # Backbone: "resnet" or "convnext"
+    # Backbone："resnet" 或 "convnext"。
     backbone: str = "resnet"
 
-    # Spatial dimensionality of the network. 3 = volumetric 3D UNet
-    # (default, used by z_axis / cubic / whole patch modes). 2 = planar
-    # 2D UNet (used by the 2.5D patch mode where D slices are stacked
-    # as input channels). All blocks/stages/decoders honour this value.
+    # 3 = 3D UNet（z_axis/cubic/whole）；2 = 2D UNet（2.5D）。
     spatial_dims: int = 3
 
-    # Input channels (always 1 for single-modality 3D)
+    # 输入通道数（单模态 3D 为 1）。
     in_channels: int = 1
 
-    # Channel progression per encoder level (determines network depth)
-    # e.g. [32, 64, 128, 256, 512] = 5 levels
+    # 每级 encoder 通道数，决定深度。例：[32, 64, 128, 256, 512] = 5 级。
     encoder_channels: List[int] = field(
         default_factory=lambda: [32, 64, 128, 256, 512]
     )
 
-    # Blocks per encoder/decoder level (used when encoder_blocks_per_stage
-    # and decoder_blocks_per_stage are both empty — kept for back-compat).
+    # 每级 block 数默认值（仅在 encoder/decoder_blocks_per_stage 都为空时使用）。
     blocks_per_level: int = 2
 
-    # Residual block variant (see models.resnet):
-    #   "basic"      — classic post-act ResNet (default).
-    #   "preact"     — pre-activation ResNet (deep encoders).
-    #   "bottleneck" — 1×1×1/3×3×3/1×1×1 expansion (nnU-Net ResEnc-XL).
-    #   "r2plus1d"   — factorised (2+1)D residual block (Plan A: inject
-    #                  z-axis context via a (1,3,3) spatial conv + (3,1,1)
-    #                  temporal conv with mid non-linearity). REQUIRES
-    #                  ``spatial_dims=3`` (i.e. patch_mode in z_axis /
-    #                  cubic / whole). Rejected at validate() time when
-    #                  used with 2.5D mode — see validate() for details.
-    # ConvNeXt backbone ignores this field.
+    # 残差块变体（仅 resnet）。示例："basic" 标准 ResNet；"r2plus1d" (1,3,3)+(3,1,1) 分解卷积（需 spatial_dims=3）。
+    # 还有 "preact" / "bottleneck"。
     block_type: str = "basic"
 
-    # Asymmetric per-stage block counts (nnU-Net ResEncUNet style).
-    # Length must equal len(encoder_channels) when non-empty. Decoder length
-    # must equal len(encoder_channels) - 1 when non-empty.
+    # 逐级 block 数（nnU-Net ResEncUNet 风格）。非空时长度须与网络深度匹配。
     encoder_blocks_per_stage: List[int] = field(default_factory=list)
     decoder_blocks_per_stage: List[int] = field(default_factory=list)
 
-    # nnU-Net ResEnc preset (Isensee et al., MICCAI 2024).
-    # One of: "none" | "S" | "M" | "L" | "XL". When != "none" AND the user
-    # has not supplied explicit per-stage counts, ``sync()`` auto-populates
-    # encoder_blocks_per_stage (trimmed/extended to len(encoder_channels))
-    # and sets decoder_blocks_per_stage = [1, 1, ...].
+    # nnU-Net ResEnc 预设："none" | "S" | "M" | "L" | "XL"。非 none 且 *_blocks_per_stage 为空时 sync() 自填。
     resenc_preset: str = "none"
 
-    # Normalization: "batch", "instance", "group"
+    # 归一化："batch" | "instance" | "group"。
     norm_type: str = "instance"
     norm_groups: int = 8
 
-    # Activation: "relu", "leakyrelu", "gelu", "swish"
+    # 激活："relu" | "leakyrelu" | "gelu" | "swish"。
     activation: str = "leakyrelu"
 
-    # Dropout in blocks
     dropout: float = 0.0
 
-    # Squeeze-and-Excitation attention (legacy flag; prefer attention_type).
-    # When attention_type == "none" and use_se == True, SE is enabled.
+    # 旧 SE 开关（仅 attention_type=='none' 生效）。
     use_se: bool = False
     se_reduction: int = 16
 
-    # In-block channel/spatial attention applied inside each ResNet/ConvNeXt
-    # block. One of: "none" | "se" | "eca" | "cbam" | "coord".
+    # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
     attention_type: str = "none"
 
-    # AttentionGate3D on skip connections (Oktay et al., MIDL 2018).
+    # skip 连接上的 AttentionGate3D（Oktay 2018）。
     skip_attention: bool = False
 
-    # Deep supervision: output predictions at multiple decoder levels
+    # 深度监督：多 decoder 级输出预测。
     deep_supervision: bool = False
 
-    # ---- Multi-FOV auxiliary segmentation supervision (2.5D mode only) ----
-    # When True AND ``data.patch_mode == "2_5d"`` AND
-    # ``len(data.multi_res_scales) > 1``, the seg head is mirrored across
-    # views: in addition to the main view-0 prediction, the model emits
-    # one auxiliary prediction per aux view k=1..n_views-1 (each shaped
-    # ``(B, num_fg * D, H, W)`` — same contract as the main head).
-    #
-    # Geometric symmetry with the stem fusion choice (auto-detected from
-    # ``context_fusion``):
-    #   - "shared_stem"  / "multi_stem_proj" (Plan A): aux heads are
-    #       mounted in PARALLEL on the highest-resolution decoder feature
-    #       (``dec_features[-1]``), each with its own 1×1 conv. Mirrors the
-    #       early-fusion stem layout — every view shares the full encoder/
-    #       decoder pyramid and only differs in its final classifier.
-    #   - "hierarchical" (Plan C): aux head k reads
-    #       ``dec_features[-1-k]`` (the decoder feature at the same
-    #       semantic depth as the encoder stage where view k was injected)
-    #       then 1×1-conv + interpolate back to (H, W). Mirrors the
-    #       hierarchical injection point — coarse-FOV supervision lands
-    #       at the matching low-resolution decoder feature.
-    #
-    # Loss-side wiring lives in ``loss.aux_supervision_weights``: per-aux-
-    # view scalar weights (length ``n_views-1``). Empty → defaults to
-    # geometric decay ``0.5^k``. Set ``aux_seg_supervision=False`` to
-    # disable entirely (bit-identical to legacy path; no extra heads built).
-    #
-    # Always inactive when ``len(multi_res_scales) == 1`` (no aux views to
-    # supervise) or in 3D modes (multi-FOV is fed as scale channels there,
-    # not as views). The forward call keeps emitting a single tensor at
-    # eval time — predictor.py is unchanged.
+    # 多 FOV 辅助分割监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，辅助 view k 输出 (B, num_fg*D, H, W)。
+    # 损失权重见 loss.aux_supervision_weights（空则默认 0.5^k）。单视图/3D 不生效。
     aux_seg_supervision: bool = False
 
-    # ---- Aux seg head topology (only when aux_seg_supervision==True) ----
-    # Controls the per-aux-view classifier shape:
-    #   "linear" — single ``Conv1×1(out_ch=num_fg*D)`` (default; minimal
-    #              cost, equal capacity to the main head). Recommended for
-    #              Plan A (multi_stem_proj / shared_stem) where every aux
-    #              head shares the highest-resolution decoder feature with
-    #              the main head — extra capacity is unlikely to help.
-    #   "conv"   — ``ConvNormAct(3×3) → Conv1×1`` (≈2 layers). Recommended
-    #              for Plan C (hierarchical) because aux head ``k`` reads
-    #              the LOW-RESOLUTION decoder feature at level ``k`` (i.e.
-    #              ``input/(stem_stride * 2^k)``), where the spatial
-    #              context aggregation per output cell is closer to the
-    #              decoder's stage block than to the main head's full-res
-    #              feature; a 3×3 conv lets the head re-aggregate before
-    #              the linear classifier (closer to "main head + a stage
-    #              block" capacity). Adds <1% params at typical sizes.
-    # The mode is applied uniformly to all aux heads of a build; no per-k
-    # override is exposed (we observed no benefit in preliminary checks
-    # and the extra config surface would obscure intent).
+    # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
     aux_head_mode: str = "linear"
 
-    # ---- Plan A 2.5D-to-3D lift (used together with block_type="r2plus1d") ----
-    # When True AND ``data.patch_mode == "2_5d"`` the trainer SKIPS the
-    # ``(B, C_res, D, H, W) → (B, C_res*D, H, W)`` squeeze that folds D
-    # into the channel axis. Instead D is preserved as a real spatial axis
-    # and the model is rebuilt as a true 3D UNet:
-    #
-    #   * ``spatial_dims`` is auto-set to 3 (overrides the 2.5D-mode default).
-    #   * ``in_channels`` is auto-set to ``len(data.multi_res_scales)``
-    #     (one channel per FOV view) instead of ``D * n_views``.
-    #   * Model output is ``(B, num_fg, D, H, W)`` (single-resolution true
-    #     3D segmentation), not the folded ``(B, num_fg * D, H, W)``.
-    #   * The trainer routes the loss through ``MultiResolutionLoss``
-    #     ``(num_res=1)`` (using only view 0 = 1× FOV as supervision target),
-    #     bypassing ``SliceChannelLoss`` entirely. ``loss.slice_loss_reduction``
-    #     is therefore ignored in lift mode.
-    #
-    # Why this exists: Plan A's R(2+1)D block (``block_type="r2plus1d"``)
-    # decomposes a 3D conv into a (1,3,3) spatial conv + a (3,1,1) temporal
-    # conv. The temporal sub-conv is meaningful ONLY when D is a real
-    # spatial axis. Lifting the 2.5D pipeline to 3D gives R(2+1)D direct
-    # access to inter-slice context while keeping the 2.5D dataset /
-    # augmentation / oversampling defaults — switching this flag is a
-    # single-line A/B test against the folded baseline.
-    #
-    # Restrictions (enforced in validate()):
-    #   * Only valid when ``data.patch_mode == "2_5d"``.
-    #   * Mutually exclusive with ``data.aux_keep_native_d`` (which packs
-    #     view-specific ``D_k`` slabs into the channel axis — fundamentally
-    #     a folded-D layout).
-    #
-    # Composes with (orthogonal):
-    #   * ``aux_seg_supervision`` — each aux head emits
-    #     ``(B, num_fg, D, H, W)`` (3D 1×1×1 conv, since spatial_dims=3)
-    #     and the per-view aux loss runs through MultiResolutionLoss
-    #     (num_res=1) on view k's z-resampled D-deep label. View 0 (1×
-    #     FOV) drives the main head; view k (k=1..n_views-1) drives
-    #     aux head k.
-    #   * ``deep_supervision`` — main path produces a list of decoder-
-    #     resolution outputs as before; aux path stays single-resolution
-    #     per view (DS structure is reserved for the main path).
+    # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
+    # 与 data.aux_keep_native_d 互斥，仅在 2.5D 生效。
     lift_2_5d_to_3d: bool = False
 
-    # Stem / patch-embed (see models.stem.build_stem):
-    # "conv3" | "conv7" | "dual" | "patch2" | "patch4".
-    # patchN stems reduce input resolution by N; UNet3D adds a matching
-    # trilinear upsample on the main output to restore original resolution.
+    # Stem / patch-embed："conv3" | "conv7" | "dual" | "patch2" | "patch4"。patchN 降 N 倍分辨率（UNet3D 主输出加上采样）。
     stem_mode: str = "conv3"
 
-    # ---- Multi-FOV context fusion (2.5D mode only) ----
-    # When ``data.patch_mode == "2_5d"`` AND ``len(data.multi_res_scales) > 1``,
-    # the model input is laid out as ``(B, n_views * D, H, W)`` with view 0 =
-    # the 1× FOV (real D slices) and views 1..K = wider z-FOVs each resampled
-    # back to D channels (see SegDataset3D z-axis multi-res semantics).
-    #
-    # "shared_stem"     — feed all ``n_views * D`` channels through ONE stem.
-    #                     Cheapest, but mixes physically heterogeneous
-    #                     channels (raw vs. resampled "virtual" slices)
-    #                     through a single filter bank.
-    # "multi_stem_proj" — Plan A. ``n_views`` independent stems
-    #                     (each on D channels) → cat → 1×1 ConvNormAct
-    #                     fusion back to ``encoder_channels[0]``. Strictly
-    #                     more expressive at negligible param cost; encoder
-    #                     downstream is contract-identical (early fusion
-    #                     at full resolution).
-    # "hierarchical"    — Plan C. View 0 drives the main stem; aux view
-    #                     ``k`` (k=1..n_views-1) goes through a stride-
-    #                     ``main_stem_stride * 2^k`` patchify stem and is
-    #                     cat-fused into the main path at the entrance of
-    #                     encoder stage ``k`` (post-Downsample-k). A 1×1
-    #                     ConvNormAct compresses back to the stage's
-    #                     expected channel count, so decoder/skip
-    #                     contracts are bit-identical. Coarse-FOV context
-    #                     thus enters at semantically-matched depth
-    #                     instead of being squashed at the input layer.
-    #                     Requires ``len(multi_res_scales) <= len(encoder_channels)``.
-    # When ``len(multi_res_scales) == 1`` this field is a no-op (the path
-    # collapses to the single-stem legacy behaviour and is bit-identical
-    # to pre-multi-FOV training). Ignored entirely in 3D modes.
+    # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
+    # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
     context_fusion: str = "multi_stem_proj"
 
-    # Decoder topology:
-    #   "unet"   — classical symmetric UNet decoder (default).
-    #   "unetpp" — UNet++ nested dense decoder (Zhou et al., DLMIA 2018).
-    #   "unet3p" — Full-scale skip decoder (Huang et al., ICASSP 2020).
+    # Decoder 拓扑："unet" 对称（默认）；"unetpp" 嵌套稠密；"unet3p" 全尺度 skip。
     decoder_type: str = "unet"
 
-    # UNet3+ per-branch channel count (only used when decoder_type=="unet3p").
+    # UNet3+ 各分支通道数（仅 decoder_type=="unet3p"）。
     unet3p_cat_channels: int = 64
 
-    # Downsampling mode (see models.blocks.Downsample):
-    # "conv" | "maxpool" | "avgpool" | "blurpool" | "pixelunshuffle"
+    # 下采样："conv" | "maxpool" | "avgpool" | "blurpool" | "pixelunshuffle"。
     downsample_mode: str = "conv"
 
-    # Upsampling mode (see models.blocks.Upsample):
-    # "transpose" | "trilinear" | "nearest" | "pixelshuffle"
-    #   | "carafe" | "dysample"
+    # 上采样："transpose" | "trilinear" | "nearest" | "pixelshuffle" | "carafe" | "dysample"。
     upsample_mode: str = "transpose"
 
-    # Skip connection mode: "cat" (concatenate) or "add"
+    # skip："cat" 或 "add"。
     skip_mode: str = "cat"
 
-    # Stochastic depth (drop path) rate — ConvNext only
+    # ConvNeXt: drop path / LayerScale / LN-first downsample。
     drop_path_rate: float = 0.0
+    convnext_layer_scale_init: float = 1e-6  # <=0 禁用
+    convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
 
-    # ConvNeXt LayerScale (Touvron et al.) initial value — only used when
-    # ``backbone == "convnext"``. Initialises a learnable per-channel scale
-    # ``gamma = layer_scale_init * ones(C)`` applied to the block branch
-    # before residual addition, making each block start near-identity. This
-    # matches official ConvNeXt and is essential for stable training of
-    # deep networks combined with stochastic depth. Set to ``0.0`` (or
-    # negative) to DISABLE LayerScale and recover the legacy behaviour.
-    convnext_layer_scale_init: float = 1e-6
-
-    # ConvNeXt paper-faithful downsample topology. When True (default) and
-    # ``backbone == "convnext"``, inter-stage downsamples use
-    # ``LayerNorm → Conv(k=2, s=2)`` (norm-first, LN specifically) instead
-    # of the generic ``Downsample`` (which would otherwise pick up
-    # ``downsample_mode`` + ``norm_type``). Set to False to fall back to the
-    # generic Downsample path (legacy behaviour) for ablation purposes.
-    convnext_downsample_lnfirst: bool = True
-
-    # ---- ADM-specific (only used when arch == "adm") --------------------
-    # Encoder/decoder level indices (0 = top, L-1 = bottleneck) that get
-    # multi-head self-attention. ADM's original ``attention_resolutions``
-    # is expressed in *downsample factors*; we expose level indices here
-    # because they remain meaningful regardless of stem stride and input
-    # size. Empty list => default = deepest two levels (e.g. for 5 levels
-    # this is [3, 4], matching the typical ADM setup of attn at /16 and
-    # /8 for a 256² model).
+    # ---- ADM 专用（arch=="adm"） ----
+    # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空=默认最深两级。
     adm_attention_levels: List[int] = field(default_factory=list)
 
-    # Number of attention heads (used when ``adm_num_head_channels == -1``).
+    # 头数：仅在 adm_num_head_channels==-1 时使用。
     adm_num_heads: int = 4
-
-    # Channel-width-per-head mode (when != -1, num_heads is computed as
-    # ``channels // num_head_channels`` per AttentionBlock; matches ADM's
-    # paper preferred setting). -1 → fall back to ``adm_num_heads``.
+    # !=-1 时 num_heads = channels // num_head_channels。
     adm_num_head_channels: int = -1
 
-    # ---- EDM2-specific (only used when arch == "edm2") -------------------
-    # Encoder/decoder level indices that get self-attention. EDM2's
-    # original ``attn_resolutions`` is expressed in pixel resolution; we
-    # use level indices (same convention as ``adm_attention_levels``).
-    # Empty list => default = bottleneck level only ([L-1]).
+    # ---- LinearAttention（lucidrains 风格，可选） ----
+    # 在指定级追加 Residual(PreNorm(LinearAttention))；O(N) 复杂度，可与 adm_attention_levels 叠加。
+    adm_linear_attention_levels: List[int] = field(default_factory=list)
+    adm_linear_attention_num_heads: int = 4
+    adm_linear_attention_head_dim: int = 32
+
+    # ---- EDM2 专用（arch=="edm2"） ----
+    # 带自注意力的级索引。空=默认仅 bottleneck。
     edm2_attention_levels: List[int] = field(default_factory=list)
 
-    # Channels per attention head (heads = out_ch // channels_per_head).
+    # heads = out_ch // channels_per_head。
     edm2_channels_per_head: int = 64
 
-    # Magnitude-preserving residual / attention / skip-cat balance
-    # parameters (paper Eq. 88 / 103). Defaults match networks_edm2.py.
+    # MP 残差/注意力/skip-cat 平衡系数（论文 Eq. 88 / 103）。
     edm2_res_balance: float = 0.3
     edm2_attn_balance: float = 0.3
     edm2_concat_balance: float = 0.5
 
-    # Output activation clipping (paper section 6.4). Set <= 0 to disable.
+    # 输出激活裁剪（论文 6.4）；<=0 禁用。
     edm2_clip_act: float = 256.0
 
 
@@ -758,123 +291,61 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class LossConfig:
-    """Loss function settings.
+    """损失函数设置。输出为逐类独立 sigmoid，每个前景类产生 (B, 1, D, H, W) 二值输出。"""
 
-    Output is always per-class independent sigmoid:
-    each foreground class gets its own binary output (B, 1, D, H, W).
-    """
-
-    # Loss: "dice", "bce", "dice_bce", "focal", "dice_focal", "tversky"
+    # 损失名：常用 "dice_bce" 或 "dice_focal"；其他选项见 validate() 白名单。
     name: str = "dice_bce"
 
-    # Weights for compound losses [loss1_w, loss2_w]
+    # 复合损失权重 [loss1_w, loss2_w]。
     compound_weights: List[float] = field(default_factory=lambda: [1.0, 1.0])
 
-    # Per-class loss weights (empty = uniform). Length = num_fg_classes.
+    # 逐类损失权重（空=均匀）；长度 = num_fg_classes。
     class_weights: List[float] = field(default_factory=list)
 
-    # Per-region spatial weights: one weight per label value (including bg).
-    # e.g. label_values=[0,1,2,3,4], region_weights=[1.0, 2.0, 2.0, 1.0, 1.0]
-    # means voxels with label 1 or 2 get 2x loss weight at that spatial position.
-    # Empty = disabled (uniform spatial weight).
+    # 逐区域空间权重：按 label 取值一个权重（含 bg）。例：[1.0, 2.0, 2.0, 1.0, 1.0] → label 1/2 位置损失×2。空=禁用。
     region_weights: List[float] = field(default_factory=list)
 
-    # Dice settings
+    # Dice 参数。
     dice_smooth: float = 1e-5
     dice_squared: bool = False
 
-    # Focal loss settings
+    # Focal 参数。
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
-    # Tversky loss settings
-    tversky_alpha: float = 0.3  # FP weight
-    tversky_beta: float = 0.7   # FN weight
+    # Tversky 参数（alpha=FP权重, beta=FN权重）。
+    tversky_alpha: float = 0.3
+    tversky_beta: float = 0.7
 
-    # Dice / Tversky aggregation mode: batch_dice sums TP / denom across
-    # the whole batch+spatial before dividing (nnU-Net default for Dice).
-    # Affects BinaryDiceLoss, BinaryTverskyLoss, BinaryFocalTverskyLoss,
-    # GeneralizedDiceLoss (for GDL the default here is overridden to True
-    # in _build_gdl — see paper).
+    # True：全 batch+空间上汇总 TP/分母后一次除（nnU-Net Dice 默认）。作用于 Dice/Tversky/FocalTversky/GDL。
     batch_dice: bool = False
-    # Per-sample mode only: exclude classes with no GT voxels in the
-    # current sample from the dice mean (prevents empty-class Dice≈1 from
-    # masking errors on other classes).
+    # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
     ignore_empty: bool = False
 
-    # ---- Generalized Dice Loss (Sudre et al., DLMIA 2017) ----
-    # Volume-based class re-weighting scheme.
-    # "square" (paper) | "simple" (w=1/Σt) | "uniform" (disabled).
+    # GDL 体积加权："square"（论文）| "simple"（w=1/Σt）| "uniform"（禁用）。
     gdl_weight_type: str = "square"
-    gdl_w_max: float = 1.0e5    # clamp 1/volume to avoid explosion on empty classes
+    gdl_w_max: float = 1.0e5  # 限住 1/volume。
 
-    # ---- Focal Tversky Loss (Abraham & Khan, ISBI 2019) ----
-    # Our convention: (1 - TI)^gamma with gamma ≥ 1 → focus on hard classes.
-    # Default 4/3 matches the authors' γ_paper = 0.75 recommendation.
+    # Focal Tversky：(1-TI)^gamma，gamma≥1。
     focal_tversky_gamma: float = 4.0 / 3.0
 
-    # ---- Lovász-Hinge (Berman et al., CVPR 2018) ----
-    # per_sample=True → average loss over (B, C) independent sorts (default);
-    # per_sample=False → batch-level Lovász (one sort over all B samples per
-    #                    channel), smoother on tiny patches.
+    # Lovász-Hinge：True=逐 (B, C) 排序取均；False=批级排序（小 patch 更平滑）。
     lovasz_per_sample: bool = True
 
-    # ---- Soft clDice (Shit et al., CVPR 2021) ----
-    # Skeletonisation iterations. Paper: 3 for 2D, 3–10 for 3D depending on
-    # structure thickness.
+    # Soft clDice 骨架化迭代：2D 用 3，3D 取 3–10。
     cldice_iter: int = 3
     cldice_smooth: float = 1.0
 
-    # Deep supervision weight decay
+    # 深度监督逐级权重。
     deep_supervision_weights: List[float] = field(
         default_factory=lambda: [1.0, 0.5, 0.25, 0.125]
     )
 
-    # ---- 2.5D loss reduction (only used when data.patch_mode == "2_5d") ----
-    # Controls how ``SliceChannelLoss`` aggregates the per-class binary loss
-    # across the D slice axis (which the 2.5D model exposes as input
-    # channels and a (num_fg * D)-channel output).
-    #
-    # "per_slice"  (default, backward compatible): the loss is computed
-    #     INDEPENDENTLY on every 2D slice. Internally pred / target are
-    #     reshaped to ``(B*D, 1, H, W)`` so the base loss treats each
-    #     slice as a standalone 2D binary segmentation problem. Dice /
-    #     Tversky reduce only over (H, W).
-    #
-    #     Pitfall: a slice with no foreground gives Dice ≈
-    #     ``(0+smooth)/(0+smooth) ≈ 1`` → loss ≈ 0. With D=12 and FG
-    #     concentrated in a few slices, most slices contribute zero
-    #     gradient and dilute the useful signal. There is also no
-    #     mechanism enforcing across-slice structural coherence, which
-    #     can produce "stairstep" artefacts after Gaussian z-blending.
-    #
-    # "per_volume" (recommended for 2.5D): the loss is computed on the
-    #     full per-window volume. Internally pred is reshaped to
-    #     ``(B, num_fg, D, H, W)`` and split by class into
-    #     ``(B, 1, D, H, W)`` so Dice / Tversky reduce over (D, H, W) as
-    #     a single volumetric Dice. Empty slices no longer game the loss
-    #     because the whole-window denominator stays large; the network
-    #     is also implicitly regularised toward 3D-consistent predictions.
-    #
-    #     BCE / Focal / Lovász-style losses are mathematically equivalent
-    #     under both reductions (per-voxel mean over the same voxels);
-    #     only Dice-family aggregation is affected.
+    # 2.5D 损失聚合（仅 patch_mode=="2_5d"）："per_slice" 逐 slice 独立（空 slice Dice≈1 零梯度）；
+    # "per_volume" 按整体在 (D,H,W) 上聚合（2.5D 推荐）。仅影响 Dice 系。
     slice_loss_reduction: str = "per_slice"
 
-    # ---- Multi-FOV aux segmentation supervision weights (2.5D mode) ----
-    # Used only when ``model.aux_seg_supervision == True``. One weight per
-    # aux view (k = 1..n_views-1, where n_views = len(data.multi_res_scales)).
-    # The total training loss is::
-    #
-    #     L_total = L_main(view_0) + Σ_{k=1..n_views-1} w_k * L_aux(view_k)
-    #
-    # ``L_main`` runs through the full DS+SliceChannel pipeline as before;
-    # each ``L_aux`` is a SliceChannelLoss on view k's resampled label at
-    # the model's native (H, W) resolution (no DS for aux paths).
-    #
-    # Empty list → trainer auto-fills with geometric decay ``0.5 ** k``
-    # (e.g. n_views=3 → weights=[0.5, 0.25]). Length must equal
-    # n_views - 1 when explicitly provided.
+    # 2.5D 多 FOV 辅助头权重（仅 model.aux_seg_supervision=True）：长度 = n_views-1。空 = trainer 自填 0.5^k。
     aux_supervision_weights: List[float] = field(default_factory=list)
 
 
@@ -883,23 +354,23 @@ class LossConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    """Training loop settings."""
+    """训练循环设置。"""
 
     epochs: int = 200
 
-    # Optimizer: "adam", "adamw", "sgd"
+    # 优化器："adam" | "adamw" | "sgd"。
     optimizer: str = "adamw"
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    momentum: float = 0.99   # SGD only
-    nesterov: bool = True    # SGD only
+    momentum: float = 0.99   # 仅 SGD
+    nesterov: bool = True    # 仅 SGD
 
-    # Scheduler: "cosine", "cosine_warm_restarts", "poly", "step", "plateau", "one_cycle"
+    # 调度器："cosine" | "cosine_warm_restarts" | "poly" | "step" | "plateau" | "one_cycle"。
     scheduler: str = "cosine"
     warmup_epochs: int = 5
     warmup_lr: float = 1e-6
     cosine_min_lr: float = 1e-6
-    # Cosine warm restarts: restart period in epochs (T_0), multiplier (T_mult)
+    # cosine_warm_restarts 重启周期 T_0 与倍率 T_mult。
     cosine_restart_period: int = 50
     cosine_restart_mult: int = 2
     poly_power: float = 0.9
@@ -908,68 +379,50 @@ class TrainConfig:
     plateau_patience: int = 10
     plateau_factor: float = 0.5
 
-    # Gradient accumulation (effective batch = batch_size * accum_steps)
+    # 梯度累积（有效 batch = batch_size * accum_steps）。
     grad_accum_steps: int = 1
 
-    # Gradient clipping
+    # 梯度裁剪。
     grad_clip_norm: float = 12.0
 
-    # Mixed precision (AMP)
-    #   amp_dtype:
-    #     - "float16" / "fp16": legacy default; requires GradScaler; tends
-    #        to overflow on large dice/BCE reductions (handled in-trainer
-    #        via fp32 loss cast + logit clamp).
-    #     - "bfloat16" / "bf16": Ampere+ only (RTX 30/40, A100, H100...).
-    #        Same fp32 dynamic range (no ±inf / NaN from overflow), no
-    #        loss scaler needed — skips the unscale pass on every step.
-    #     - "auto": resolved at Trainer-build time to "bfloat16" iff the
-    #        current CUDA device reports bf16 support (``cuda_capability
-    #        >= (8, 0)`` or ``torch.cuda.is_bf16_supported()``), else
-    #        falls back to "float16". Recommended default for mixed
-    #        fleets; bit-identical to "float16" on pre-Ampere GPUs.
+    # AMP。amp_dtype 示例："float16"（需 GradScaler）、"bfloat16"（Ampere+，无需 scaler）。还有 "auto"（探测 BF16 否则回退 fp16）。
     use_amp: bool = True
     amp_dtype: str = "float16"
 
-    # torch.compile (PyTorch 2.0+, "none", "default", "reduce-overhead", "max-autotune")
+    # torch.compile："none" | "default" | "reduce-overhead" | "max-autotune"。
     compile_mode: str = "none"
 
-    # EMA
+    # EMA。
     use_ema: bool = True
     ema_decay: float = 0.999
 
-    # Checkpointing
+    # Checkpoint 保存。
     output_dir: str = "outputs"
     save_every: int = 10
     save_best_metric: str = "mean_dice"
     save_best_mode: str = "max"
 
-    # Early stopping (0 = disabled)
+    # 提前停止（0=禁用）。
     early_stopping: int = 0
 
-    # Logging
+    # 日志。
     log_every: int = 10
     val_every: int = 1
     vis_every: int = 10
 
-    # Reproducibility
     seed: int = 42
     deterministic: bool = False
 
-    # Resume: 从训练 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
+    # Resume：从 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
     resume: str = ""
 
-    # Pretrain: 仅加载 model 权重作为初始化（迁移学习用）。不恢复任何训练状态：
-    #   - epoch 从 0 开始，optimizer/scheduler/scaler/best_metric/patience/RNG 全部不动。
-    #   - 若启用 EMA，EMA shadow 会被加载后的 model 权重重新对齐。
-    #   - 若同时设置了 `resume` 且 resume 文件存在，则 pretrain 被忽略（resume 优先）。
+    # Pretrain：仅加载 model 权重作初始化。若同时设置了 resume 且存在则 pretrain 被忽略。
     pretrain: str = ""
 
-    # 是否对 pretrain 权重 strict 加载。默认 False 以允许 head 形状不一致（不同任务 num_classes）。
-    # 加载完成后会日志输出 missing / unexpected keys 数量与示例。
+    # strict 加载；默认 False 允许 head 形状不一致。
     pretrain_strict: bool = False
 
-    # 当 pretrain checkpoint 含 EMA shadow 时，是否优先用 EMA shadow 作为初始权重
-    # （EMA 权重通常更稳定，更适合做迁移起点）。默认 False（用 online 权重）。
+    # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
 
 
@@ -978,60 +431,35 @@ class TrainConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class PredictConfig:
-    """Inference settings for z-axis sliding window prediction."""
+    """推理设置（z 轴滑动窗口）。"""
 
-    # Sliding window overlap ratio along z-axis (0.0 = no overlap, 0.5 = 50%)
+    # z 轴重叠比（0.0 = 不重叠，0.5 = 50%）。
     z_overlap: float = 0.5
 
-    # Blending mode for overlapping regions: "gaussian" or "average"
+    # 重叠区融合："gaussian" 或 "average"。
     blend_mode: str = "gaussian"
 
-    # Batch size for inference patches
+    # 推理 batch 大小。
     batch_size: int = 2
 
-    # Test-time augmentation: flip along axes
+    # TTA flip。
     tta_flip: bool = False
 
-    # Binarization threshold for sigmoid output
+    # sigmoid 二值化阈值。
     threshold: float = 0.5
 
-    # Output directory for predictions
+    # 预测输出目录。
     output_dir: str = "predictions"
 
-    # Save probability maps (in addition to binary masks)
+    # 是否保存概率图（在二值 mask 之外）。
     save_probabilities: bool = False
 
-    # ---- Z-axis interleaved multi-stream prediction (2.5D only) ----
-    # Splits the input volume into ``k`` interleaved sub-volumes along z
-    # (slices ``i, i+k, i+2k, ...`` for ``i = 0..k-1``), runs the
-    # standard 2.5D z-sliding-window inference on each sub-volume
-    # independently, then weaves the per-stream probabilities back into
-    # the original z indices (``out[:, i::k] = stream_i_prob``). Streams
-    # cover disjoint slice sets so the recombination is exact — no
-    # cross-stream blending required.
-    #
-    # Rationale: the 2.5D model sees ``patch_D`` "pseudo-adjacent"
-    # channel-slices. Sampling every k-th slice makes each window span
-    # ``k * patch_D * z_spacing`` mm physically, widening the effective
-    # z receptive field without retraining. Most useful on thin-slice
-    # scans where adjacent slices are highly redundant.
-    #
-    # Distribution-shift caveat: inputs become an apparent-spacing of
-    # ``k * z_spacing``. Recommend an A/B vs. k=1 on held-out data
-    # before relying on this in production.
-    #
-    # Disabled by default to preserve legacy behaviour bit-exactly.
+    # z 轴交错多流推理（仅 2.5D）：按 z 拆 k 个子体 (slices i,i+k,...)，独立推理后缝回原 z。
+    # 动机：加宽 z 感受野。警告：子流表现为 k * z_spacing。
     z_interleave_enabled: bool = False
 
-    # Per-volume k is chosen by physical z spacing (mm). With sorted
-    # ``z_interleave_thresholds = [t_1, t_2, ..., t_n]`` (ascending) and
-    # ``z_interleave_factors = [f_1, f_2, ..., f_n, f_fallback]``
-    # (length n+1), the rule is:
-    #   z_spacing <= t_1 → k = f_1
-    #   t_1 < z_spacing <= t_2 → k = f_2
-    #   ...
-    #   z_spacing > t_n → k = f_fallback
-    # Defaults follow TODO 1: ≤1.0 mm → k=3; (1.0, 1.5] → k=2; >1.5 → k=1.
+    # k 按物理 z 间距（mm）选择。thresholds 升序，factors 长度 = len(thresholds)+1（含 fallback）。
+    # 默认：z<=1.0 → k=3；1.0<z<=1.5 → k=2；z>1.5 → k=1。
     z_interleave_thresholds: List[float] = field(
         default_factory=lambda: [1.0, 1.5])
     z_interleave_factors: List[int] = field(
@@ -1043,86 +471,47 @@ class PredictConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class Config:
-    """Top-level configuration combining all sub-configs."""
+    """顶层配置，聚合所有子配置。"""
 
-    data: DataConfig = field(default_factory=DataConfig)
-    augment: AugConfig = field(default_factory=AugConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    loss: LossConfig = field(default_factory=LossConfig)
-    train: TrainConfig = field(default_factory=TrainConfig)
+    data   : DataConfig    = field(default_factory=DataConfig)
+    augment: AugConfig     = field(default_factory=AugConfig)
+    model  : ModelConfig   = field(default_factory=ModelConfig)
+    loss   : LossConfig    = field(default_factory=LossConfig)
+    train  : TrainConfig   = field(default_factory=TrainConfig)
     predict: PredictConfig = field(default_factory=PredictConfig)
 
     def sync(self) -> None:
-        """Synchronize dependent fields across sub-configs."""
+        """同步跨子配置的对应字段。"""
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
 
         if self.data.patch_mode == "2_5d":
-            # 2.5D mode: planar 2D backbone consuming D slices as channels.
-            # Multi-FOV (multi_res_scales) extension: each extra z-FOV view
-            # contributes additional input channels.
-            #
-            # Two channel-layouts are supported, gated by ``data.aux_keep_native_d``:
-            #
-            #   False (legacy):
-            #     Each view k is z-resampled to D channels — total
-            #     ``in_channels = D * n_views``.
-            #
-            #   True (native depth):
-            #     View k keeps its native depth ``D_k = round(D * s_k)``;
-            #     concatenation along the channel axis gives
-            #     ``in_channels = sum_k D_k``. View-0 always uses
-            #     ``s_0 == 1`` so ``D_0 == D`` (the supervision target).
+            # 2.5D channel 布局：lift=True → n_views；aux_keep_native_d=True → sum_k round(D*s_k)；
+            # 其他 → D * n_views。
             n_views = max(len(self.data.multi_res_scales), 1)
-            D = int(self.data.patch_size[0])
-            lift = bool(getattr(self.model, "lift_2_5d_to_3d", False))
+            D       = int(self.data.patch_size[0])
+            lift    = bool(getattr(self.model, "lift_2_5d_to_3d", False))
             if lift:
-                # Lift mode: D stays a real spatial axis. The 2D-folded
-                # layout is bypassed end-to-end (trainer skips squeeze,
-                # loss bypasses SliceChannelLoss). Each FOV view becomes
-                # ONE input channel; the stem consumes ``n_views`` input
-                # channels and the model output is single-resolution
-                # ``(B, num_fg, D, H, W)``. Mutually exclusive with
-                # aux_keep_native_d (validated below).
                 self.model.spatial_dims = 3
                 self.model.in_channels = n_views
             else:
                 self.model.spatial_dims = 2
             if lift:
-                pass  # in_channels already set above; skip folded layouts
+                pass
             elif self.data.aux_keep_native_d and n_views > 1:
-                # Native-depth layout. Force edge_pad — the single-cube
-                # extraction always uses ``extract_z_patch_padded`` so a
-                # ``stretch`` value would dangle without effect (and worse,
-                # mislead readers). Quietly upgrade and log.
                 if self.data.z_boundary_mode != "edge_pad":
                     logger.info(
                         "aux_keep_native_d=True implies z_boundary_mode='edge_pad'; "
                         "auto-upgraded from %r.", self.data.z_boundary_mode)
                     self.data.z_boundary_mode = "edge_pad"
                 depths = [int(round(D * float(s))) for s in self.data.multi_res_scales]
-                # View 0 must equal D exactly (s_0 == 1.0 invariant).
-                depths[0] = D
+                depths[0] = D  # s_0 == 1.0
                 self.model.in_channels = int(sum(depths))
             else:
                 self.model.in_channels = D * n_views
         else:
-            # 3D modes: in_channels follows multi_res_scales (legacy).
-            # Both z_axis and cubic stack per-scale views as input channels;
-            # a single scale ([1.0]) gives the legacy 1-channel input.
-            #
-            # ``data.keep_native_multi_res`` does NOT change the channel
-            # count: even though the dataset emits a ``(1, eD_max, ...)``
-            # single-cube tensor, the trainer (R2) splits it back to
-            # ``(B, C_res, eD, eH, eW)`` before forward — model contract
-            # is bit-identical. The flag here only affects the
-            # dataset/trainer geometry path; the model construction
-            # below is untouched.
+            # 3D：in_channels = len(multi_res_scales)。keep_native_multi_res 不改通道数，仅几何路径不同。
             self.model.in_channels = len(self.data.multi_res_scales)
-            # Auto-upgrade z_boundary_mode for the lazy-extraction path
-            # (z_axis only — cubic doesn't use this knob). Mirrors the
-            # 2.5D ``aux_keep_native_d`` behaviour: ``stretch`` would
-            # have no consumer in the single-max-FOV-cube path.
             if (self.data.keep_native_multi_res
                     and self.data.patch_mode == "z_axis"
                     and len(self.data.multi_res_scales) > 1
@@ -1133,18 +522,15 @@ class Config:
                     self.data.z_boundary_mode)
                 self.data.z_boundary_mode = "edge_pad"
 
-        # nnU-Net ResEnc preset: populate per-stage block counts when the
-        # user has not supplied explicit lists.
         self._apply_resenc_preset()
 
     def _apply_resenc_preset(self) -> None:
-        """Expand ``model.resenc_preset`` into per-stage block counts."""
-        mc = self.model
+        """将 model.resenc_preset 展开为逐级 block 数；用户显式传入优先。"""
+        mc     = self.model
         preset = (mc.resenc_preset or "none").lower()
         if preset == "none":
             return
         if mc.encoder_blocks_per_stage and mc.decoder_blocks_per_stage:
-            # User-supplied lists win over preset.
             return
 
         n_levels = len(mc.encoder_channels)
@@ -1155,10 +541,10 @@ class Config:
             "xl": [1, 4, 6, 8, 8, 10, 10, 10],
         }
         if preset not in templates:
-            return  # validate() will flag the error.
+            return
 
         tpl = templates[preset]
-        # Trim or extend (repeating the deepest-stage count) to match n_levels.
+        # 裁剪或拓展（重复最深级计数）以匹配 n_levels。
         if n_levels <= len(tpl):
             enc_blocks = tpl[:n_levels]
         else:
@@ -1167,18 +553,10 @@ class Config:
         if not mc.encoder_blocks_per_stage:
             mc.encoder_blocks_per_stage = enc_blocks
         if not mc.decoder_blocks_per_stage:
-            # Lightweight decoder = 1 block / stage (ResEnc recipe).
             mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
 
     def validate(self) -> None:
-        """Validate configuration for consistency."""
-        # Architecture family. Legacy ``backbone`` etc. are only validated
-        # when the in-house ``UNet3D`` build path is selected. ADM / EDM2
-        # archs ignore those fields entirely (paper-faithful internals);
-        # we only validate the small subset of fields they actually
-        # consume (encoder_channels lengths, stem_mode, context_fusion,
-        # aux_seg_supervision, deep_supervision — plus the arch-specific
-        # ``adm_*`` / ``edm2_*`` knobs at construction time).
+        """校验配置一致性。仅 arch=='unet' 时校验 backbone/block/norm 等旧字段。"""
         arch = str(getattr(self.model, "arch", "unet")).lower()
         assert arch in ("unet", "adm", "edm2"), (
             f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
@@ -1200,29 +578,20 @@ class Config:
             assert self.model.skip_mode in ("cat", "add"), \
                 f"Invalid skip_mode: {self.model.skip_mode}"
         else:
-            # ADM / EDM2 only support 2.5D for now (folded D-as-channels).
+            # ADM / EDM2 仅支持 2.5D + Plan A（shared_stem / multi_stem_proj）。
             assert self.data.patch_mode == "2_5d", (
-                f"model.arch={arch!r} is currently only supported with "
-                f"data.patch_mode='2_5d'; got {self.data.patch_mode!r}. "
-                f"3D variants will be added in a follow-up.")
-            # Plan A only — hierarchical fusion would need mid-encoder
-            # injection in ADM/EDM2's flat block topology.
+                f"model.arch={arch!r} requires data.patch_mode='2_5d'; got {self.data.patch_mode!r}.")
             assert self.model.context_fusion in (
                 "shared_stem", "multi_stem_proj",
             ), (
-                f"model.arch={arch!r} does not support context_fusion="
-                f"{self.model.context_fusion!r}; use 'shared_stem' or "
-                f"'multi_stem_proj'.")
+                f"model.arch={arch!r} only supports context_fusion in "
+                f"('shared_stem','multi_stem_proj'); got {self.model.context_fusion!r}.")
         assert self.model.spatial_dims in (2, 3), \
             f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)"
         assert self.augment.wmap_interp_mode in ("nearest", "bilinear"), (
-            f"Invalid augment.wmap_interp_mode: "
-            f"{self.augment.wmap_interp_mode!r}; expected "
-            f"'nearest' (discrete fg/bg weights, default) or "
-            f"'bilinear' (continuous hand-annotated weights).")
-        # ``stem_mode`` / ``context_fusion`` / ``aux_head_mode`` apply to
-        # all archs (ADM/EDM2 also consume them via build_context_stem
-        # equivalents and the aux-head builder).
+            f"Invalid augment.wmap_interp_mode: {self.augment.wmap_interp_mode!r} "
+            "(expected 'nearest' or 'bilinear').")
+        # 下面三项适用于所有 arch（ADM/EDM2 也读取）。
         assert self.model.stem_mode in (
             "conv3", "conv7", "dual", "patch2", "patch4",
         ), f"Invalid stem_mode: {self.model.stem_mode}"
@@ -1232,8 +601,7 @@ class Config:
         assert getattr(self.model, "aux_head_mode", "linear") in (
             "linear", "conv",
         ), f"Invalid aux_head_mode: {self.model.aux_head_mode!r}"
-        # Legacy ``unet`` arch only — backbone block types / decoder
-        # variants / r2plus1d / ResEnc presets / in-block attention.
+        # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
             assert self.model.attention_type in (
                 "none", "se", "eca", "cbam", "coord",
@@ -1245,24 +613,15 @@ class Config:
             assert self.model.block_type in (
                 "basic", "preact", "bottleneck", "r2plus1d"), \
                 f"Invalid block_type: {self.model.block_type}"
-            # ``r2plus1d`` factorises 3D conv into spatial (1,3,3) + temporal
-            # (3,1,1) — the temporal sub-conv only reaches neighbouring slices
-            # when D is a real spatial axis, i.e. spatial_dims=3. In 2.5D mode
-            # D is folded into channels and the temporal kernel becomes a
-            # no-op cross-channel mixer; reject it up-front with a precise
-            # diagnostic instead of silently degrading to that pathological
-            # behaviour at forward-time.
+            # r2plus1d 需 D 为真空间轴；2.5D 下 D 在通道轴，拒绝。
             if self.model.block_type == "r2plus1d":
                 assert self.model.spatial_dims == 3, (
-                    "model.block_type='r2plus1d' requires spatial_dims=3 "
-                    "(D must be a real spatial axis). It is incompatible "
-                    "with the 2.5D patch_mode where D is folded into the "
-                    "channel axis. To use Plan A on z-slab data, switch "
-                    "your config to patch_mode='z_axis' (3D thin-slab) and "
-                    "keep block_type='r2plus1d'.")
+                    "model.block_type='r2plus1d' requires spatial_dims=3; "
+                    "incompatible with 2.5D (D folded into channel axis). "
+                    "Use patch_mode='z_axis' for Plan A on z-slab data.")
             assert self.model.resenc_preset in ("none", "S", "M", "L", "XL"), \
                 f"Invalid resenc_preset: {self.model.resenc_preset}"
-        # Per-stage block-count lengths must align with encoder depth.
+        # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage
         dbps = self.model.decoder_blocks_per_stage
@@ -1279,15 +638,12 @@ class Config:
             assert all(b >= 1 for b in dbps), \
                 "decoder_blocks_per_stage entries must all be >= 1"
         assert self.loss.name in (
-            # Classical single losses.
+            # 单损失
             "dice", "bce", "focal", "tversky",
-            # High-quality single losses (Round "new losses").
             "gdl", "focal_tversky", "lovasz", "cldice",
-            # Compounds.
+            # 复合损失
             "dice_bce", "dice_focal", "dice_tversky",
-            "focal_plus_tversky",   # legacy (Focal + Tversky summed)
-            "dice_cldice",          # Shit et al. 2021 recipe
-            "dice_focal_tversky",   # Dice + Abraham 2019 FTL
+            "focal_plus_tversky", "dice_cldice", "dice_focal_tversky",
             "dice_lovasz", "bce_lovasz",
             "gdl_bce", "gdl_focal",
         ), f"Invalid loss: {self.loss.name}"
@@ -1313,182 +669,93 @@ class Config:
             f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
             "expected 'stretch' or 'edge_pad'.")
         if self.data.patch_mode == "whole":
-            # Multi-resolution has no physical meaning in whole-volume mode:
-            # the input already spans the entire volume, there is nothing
-            # outside to extract a "wider FOV" view from.
+            # whole 模式下多分辨率无物理意义。
             assert len(self.data.multi_res_scales) == 1 \
                 and self.data.multi_res_scales[0] == 1.0, (
-                "whole-volume mode requires multi_res_scales=[1.0]; got "
-                f"{self.data.multi_res_scales}.")
-        # ``aux_keep_native_d`` is meaningful only in 2.5D + multi-view +
-        # aux-supervision. Reject misuse early with a precise diagnostic
-        # rather than silently letting downstream surgery fire.
+                f"whole-volume mode requires multi_res_scales=[1.0]; got {self.data.multi_res_scales}.")
+        # aux_keep_native_d：仅 2.5D + 多视图有意义。
         if self.data.aux_keep_native_d:
             assert self.data.patch_mode == "2_5d", (
-                "data.aux_keep_native_d=True is only valid in patch_mode="
-                f"'2_5d'; got patch_mode={self.data.patch_mode!r}.")
+                f"data.aux_keep_native_d=True requires patch_mode='2_5d'; got {self.data.patch_mode!r}.")
             assert len(self.data.multi_res_scales) > 1, (
-                "data.aux_keep_native_d=True requires at least one auxiliary "
-                "view (len(multi_res_scales) > 1); got "
-                f"multi_res_scales={self.data.multi_res_scales}.")
+                "data.aux_keep_native_d=True requires len(multi_res_scales) > 1; "
+                f"got {self.data.multi_res_scales}.")
 
-        # ``keep_native_multi_res`` is the 3D analogue of
-        # ``aux_keep_native_d``: lazy single-max-FOV-cube extraction
-        # in the dataset, with per-view crop+resize deferred to the
-        # trainer (R2). Strict gating early so a misuse never silently
-        # downgrades the data emission contract.
+        # keep_native_multi_res：aux_keep_native_d 的 3D 对应，dataset 发单 cube 后由 trainer 逐视图几何处理。
         if self.data.keep_native_multi_res:
             assert self.data.patch_mode in ("z_axis", "cubic"), (
-                "data.keep_native_multi_res=True is only valid in 3D "
-                "patch_mode in {'z_axis', 'cubic'}; got patch_mode="
-                f"{self.data.patch_mode!r}. Use data.aux_keep_native_d "
-                "for the 2.5D analogue.")
+                "data.keep_native_multi_res=True requires patch_mode in "
+                f"('z_axis','cubic'); got {self.data.patch_mode!r}. Use "
+                "data.aux_keep_native_d for the 2.5D analogue.")
             assert len(self.data.multi_res_scales) > 1, (
-                "data.keep_native_multi_res=True requires at least one "
-                "auxiliary view (len(multi_res_scales) > 1); got "
-                f"multi_res_scales={self.data.multi_res_scales}. "
-                "With a single scale the lazy path has nothing to defer.")
+                "data.keep_native_multi_res=True requires len(multi_res_scales) > 1; "
+                f"got {self.data.multi_res_scales}.")
             assert float(self.data.multi_res_scales[0]) == 1.0, (
-                "data.keep_native_multi_res=True requires "
-                "multi_res_scales[0] == 1.0 (view 0 = canonical "
-                f"geometry); got multi_res_scales={self.data.multi_res_scales}.")
+                "data.keep_native_multi_res=True requires multi_res_scales[0]==1.0; "
+                f"got {self.data.multi_res_scales}.")
             assert not self.data.aux_keep_native_d, (
-                "data.keep_native_multi_res and data.aux_keep_native_d "
-                "are mutually exclusive (3D vs 2.5D analogues). Pick one.")
+                "keep_native_multi_res and aux_keep_native_d are mutually exclusive (3D vs 2.5D analogues).")
             if self.data.patch_mode == "z_axis":
                 assert self.data.z_boundary_mode == "edge_pad", (
-                    "keep_native_multi_res=True (z_axis) requires "
-                    "z_boundary_mode='edge_pad' (set automatically by "
-                    f"sync()); got {self.data.z_boundary_mode!r}.")
+                    "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
+                    f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
 
         if self.data.patch_mode == "2_5d":
-            # 2.5D mode invariants enforced by sync(); re-check here so a
-            # stale config caught after manual edit fails fast.
+            # 2.5D 不变式重检（防手改后陈旧配置）。
             assert len(self.data.multi_res_scales) >= 1, (
                 "2.5D mode requires at least one entry in multi_res_scales.")
             assert self.data.multi_res_scales[0] == 1.0, (
-                "2.5D mode requires multi_res_scales[0] == 1.0 — view 0 is "
-                "the true-geometry FOV used as the prediction target. "
-                f"Got multi_res_scales={self.data.multi_res_scales}.")
+                "2.5D mode requires multi_res_scales[0]==1.0 (view 0 = prediction target); "
+                f"got {self.data.multi_res_scales}.")
             n_views = len(self.data.multi_res_scales)
             lift = bool(getattr(self.model, "lift_2_5d_to_3d", False))
             if lift:
-                # Lift mode: D preserved as a real spatial axis, model is
-                # a true 3D UNet over (B, n_views, D, H, W). Mutually
-                # exclusive with the folded-D channel-packing layouts.
+                # lift：D 保留为空间轴（真 3D UNet），与折叠-D 布局互斥。
                 assert self.model.spatial_dims == 3, (
-                    "lift_2_5d_to_3d=True requires model.spatial_dims=3 "
-                    "(set automatically by sync()).")
+                    "lift_2_5d_to_3d=True requires model.spatial_dims=3 (auto-set by sync()).")
                 assert self.model.in_channels == n_views, (
-                    f"lift_2_5d_to_3d=True requires model.in_channels == "
-                    f"len(multi_res_scales) = {n_views}; got "
-                    f"in_channels={self.model.in_channels}. Set automatically "
-                    f"by sync(); a mismatch means in_channels was hand-edited.")
+                    f"lift_2_5d_to_3d=True requires in_channels == n_views ({n_views}); "
+                    f"got {self.model.in_channels}.")
                 assert not self.data.aux_keep_native_d, (
-                    "lift_2_5d_to_3d=True is mutually exclusive with "
-                    "data.aux_keep_native_d (folded-D channel slabs vs. "
-                    "real-D spatial axis are incompatible). Disable one.")
-                # lift + aux_seg_supervision IS now supported. The aux
-                # heads emit ``(B, num_fg, D, H, W)`` (3D 1×1×1 conv,
-                # gated by ``spatial_dims=3``) and the trainer routes
-                # the per-view aux loss through MultiResolutionLoss
-                # (num_res=1) instead of SliceChannelLoss. The only
-                # remaining mutex is with ``aux_keep_native_d`` (folded-D
-                # channel slabs cannot coexist with the real-D spatial
-                # axis), already enforced above.
-                # In lift mode the loss bypasses SliceChannelLoss entirely,
-                # so slice_loss_reduction has no effect. Surface the dead
-                # knob now rather than silently letting it look meaningful.
-                if getattr(self.loss, "slice_loss_reduction", "per_slice") not in ("per_slice", "per_volume"):
-                    pass  # type validation handled elsewhere
-                # No need to validate in_channels arithmetic further; sync()
-                # owns the formula and lift skips the folded layouts above.
-
-                # --- Geometric constraint: thin-slab D must survive every
-                # encoder downsample. The shared ``Downsample`` block uses
-                # an isotropic factor-2 stride (``conv``/``maxpool``/...) with
-                # kernel_size=2; given ``n_levels`` encoder stages there are
-                # ``n_down = n_levels - 1`` halvings, so D must be divisible
-                # by ``2**n_down`` (and >= it). The 2.5D folded path was
-                # immune because D was on the channel axis; lift mode hits
-                # this constraint head-on. Surface it now with a precise
-                # diagnostic — otherwise the user gets an opaque
-                # ``Conv3d kernel size > input size`` error deep in forward.
+                    "lift_2_5d_to_3d and aux_keep_native_d are mutually exclusive.")
+                # 几何约束：D 需 % 2**(n_levels-1) == 0，且 >= 2**(n_levels-1)。
                 n_levels = len(self.model.encoder_channels)
-                n_down = n_levels - 1
                 D = int(self.data.patch_size[0])
-                req = 1 << n_down
+                req = 1 << (n_levels - 1)
                 if D < req or D % req != 0:
                     raise AssertionError(
-                        f"lift_2_5d_to_3d=True with len(encoder_channels)="
-                        f"{n_levels} requires patch_size[0] (D={D}) to be "
-                        f"divisible by 2**(n_levels-1)={req}. The shared "
-                        f"Downsample block halves every spatial axis (D "
-                        f"included) at each stage, and an isotropic "
-                        f"kernel-2/stride-2 conv on D<2 fails. Fixes:\n"
-                        f"  * Increase patch_size[0] to >= {req} (and a "
-                        f"multiple of {req}).\n"
-                        f"  * Or reduce len(encoder_channels) so 2**(n-1) "
-                        f"<= D (e.g. 4 stages need D>=8, 3 stages need D>=4).\n"
-                        f"  * Anisotropic per-axis strides (keep D unchanged "
-                        f"at deep stages) is not yet implemented and would "
-                        f"be a separate feature.")
+                        f"lift_2_5d_to_3d=True with {n_levels} encoder stages requires "
+                        f"patch_size[0] (D={D}) divisible by 2**(n_levels-1)={req}. "
+                        f"Increase D to a multiple of {req}, or reduce len(encoder_channels).")
             else:
                 assert self.model.spatial_dims == 2, (
-                    "2.5D mode requires model.spatial_dims=2 (set "
-                    "automatically by sync()). To run a 3D model on the "
-                    "same 2.5D pipeline (Plan A), set "
-                    "model.lift_2_5d_to_3d=True (and typically "
-                    "model.block_type='r2plus1d').")
+                    "2.5D mode requires model.spatial_dims=2 (auto-set by sync()). "
+                    "For Plan A 3D lift, set model.lift_2_5d_to_3d=True.")
             if (not lift) and self.data.aux_keep_native_d and n_views > 1:
-                # Native-depth layout: in_channels = sum_k round(D * s_k),
-                # with s_0 == 1.0 fixing D_0 == D. This is the channel
-                # count after the trainer's per-view center-crop and
-                # cat-along-channel step before the 2D forward.
                 depths = self.aux_view_depths
                 expected_in = int(sum(depths))
                 assert self.model.in_channels == expected_in, (
-                    f"2.5D + aux_keep_native_d=True requires "
-                    f"model.in_channels == sum(round(D * s_k)) = "
-                    f"sum({depths}) = {expected_in}; got "
-                    f"in_channels={self.model.in_channels}. "
-                    f"This is normally set automatically by sync(); a "
-                    f"mismatch here means in_channels was hand-edited "
-                    f"after sync() ran.")
+                    f"2.5D + aux_keep_native_d=True requires in_channels == sum(D_k) = "
+                    f"sum({depths}) = {expected_in}; got {self.model.in_channels}.")
                 assert self.data.z_boundary_mode == "edge_pad", (
-                    "aux_keep_native_d=True requires z_boundary_mode="
-                    "'edge_pad' (set automatically by sync()); got "
-                    f"{self.data.z_boundary_mode!r}.")
-                # ON-mode is meaningful only when aux supervision is on —
-                # otherwise the wider FOVs would contribute extra channels
-                # to the model trunk but never receive a target signal,
-                # which is almost certainly a configuration error.
+                    f"aux_keep_native_d=True requires z_boundary_mode='edge_pad'; "
+                    f"got {self.data.z_boundary_mode!r}.")
+                # 辅视图提供额外输入却无监督信号不合理。
                 assert getattr(self.model, "aux_seg_supervision", False), (
-                    "aux_keep_native_d=True is only meaningful with "
-                    "model.aux_seg_supervision=True (each native-depth "
-                    "view k must drive an aux head predicting "
-                    "(B, num_fg * D_k, H, W)). Either enable "
-                    "aux_seg_supervision or set aux_keep_native_d=False.")
+                    "aux_keep_native_d=True requires model.aux_seg_supervision=True "
+                    "(each native-depth view k drives an aux head).")
             elif not lift:
                 expected_in = int(self.data.patch_size[0]) * n_views
                 assert self.model.in_channels == expected_in, (
-                    f"2.5D mode requires model.in_channels == "
-                    f"patch_size[0] * len(multi_res_scales) = "
+                    f"2.5D requires in_channels == patch_size[0] * n_views = "
                     f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
-                    f"got in_channels={self.model.in_channels}.")
-            # Plan C constraints: aux view k injects at encoder stage k,
-            # so we need at least one stage per aux view + the main one.
+                    f"got {self.model.in_channels}.")
+            # Plan C：aux view k 注入 encoder 第 k 级。
             if self.model.context_fusion == "hierarchical" and n_views > 1:
                 n_stages = len(self.model.encoder_channels)
                 assert n_views <= n_stages, (
-                    f"context_fusion='hierarchical' requires "
-                    f"len(multi_res_scales) <= len(encoder_channels) so each "
-                    f"aux view k=1..n_views-1 has a matching stage k to "
-                    f"inject into; got n_views={n_views}, "
-                    f"n_stages={n_stages}.")
-                # The deepest aux stem has stride main_stem_stride * 2^(n_views-1).
-                # Validate H and W are divisible by that stride to avoid a
-                # silent spatial mismatch at fusion time.
+                    f"context_fusion='hierarchical' requires n_views <= n_stages; "
+                    f"got n_views={n_views}, n_stages={n_stages}.")
                 stem_stride_map = {
                     "conv3": 1, "conv7": 1, "dual": 1,
                     "patch2": 2, "patch4": 4,
@@ -1497,87 +764,54 @@ class Config:
                 deepest = s0 * (2 ** (n_views - 1))
                 pH, pW = int(self.data.patch_size[1]), int(self.data.patch_size[2])
                 assert pH % deepest == 0 and pW % deepest == 0, (
-                    f"context_fusion='hierarchical' with n_views={n_views} "
-                    f"and stem_mode={self.model.stem_mode!r} requires "
-                    f"patch_size[1] and patch_size[2] divisible by "
-                    f"{deepest}; got patch_size=({pH}, {pW}).")
-            # Aux seg supervision constraints — only meaningful when
-            # there is at least one aux view (n_views > 1).
+                    f"hierarchical fusion with n_views={n_views}, stem_mode={self.model.stem_mode!r} "
+                    f"requires patch H/W divisible by {deepest}; got ({pH}, {pW}).")
+            # aux 监督：仅在 n_views > 1 时有意义。
             if getattr(self.model, "aux_seg_supervision", False):
                 assert n_views > 1, (
-                    "model.aux_seg_supervision=True requires "
-                    "len(multi_res_scales) > 1 (at least one aux FOV "
-                    "to supervise); got n_views=1.")
+                    "aux_seg_supervision=True requires n_views > 1; got 1.")
                 aw = list(getattr(self.loss, "aux_supervision_weights", []))
                 if aw:
                     assert len(aw) == n_views - 1, (
-                        f"loss.aux_supervision_weights length ({len(aw)}) "
-                        f"must equal n_views-1 ({n_views - 1}); got {aw}.")
+                        f"aux_supervision_weights length must = n_views-1 ({n_views-1}); got {aw}.")
                     assert all(w >= 0 for w in aw), (
-                        f"loss.aux_supervision_weights must be non-negative; "
-                        f"got {aw}.")
-                # Plan C requires len(decoder)>=n_views to give each aux
-                # view a unique decoder feature index. ``unet`` decoder
-                # produces n_levels-1 features and we mount aux head k on
-                # dec_features[-1-k] for k=1..n_views-1 → need n_views-1
-                # < n_levels-1, i.e. n_views < n_levels. Plan A (parallel)
-                # has no such constraint.
+                        f"aux_supervision_weights must be non-negative; got {aw}.")
+                # Plan C 需 n_views < n_levels，使每 aux 头走不同 decoder 特征。
                 if self.model.context_fusion == "hierarchical":
                     n_levels = len(self.model.encoder_channels)
                     assert n_views < n_levels, (
-                        f"aux_seg_supervision with context_fusion="
-                        f"'hierarchical' requires n_views < "
-                        f"len(encoder_channels) (one decoder feature per "
-                        f"aux view + the main one); got n_views={n_views}, "
-                        f"n_levels={n_levels}.")
+                        f"aux_seg_supervision + hierarchical requires n_views < n_levels; "
+                        f"got n_views={n_views}, n_levels={n_levels}.")
         assert self.data.aug_oversample_ratio >= 1.0, \
             "aug_oversample_ratio must be >= 1.0"
         assert len(self.data.multi_res_scales) >= 1, \
             "multi_res_scales must have at least one scale (e.g. [1.0])"
         assert all(s >= 1.0 for s in self.data.multi_res_scales), \
             "All multi_res_scales must be >= 1.0"
-        # Multi-resolution is now supported in both z_axis and cubic modes.
-        # In z_axis mode the scale factor applies to the z-axis only
-        # (see DataConfig.multi_res_scales docstring); `sync()` auto-sets
-        # `model.in_channels = len(multi_res_scales)` in both modes so the
-        # network input/output channel count matches the stacked views.
         assert self.train.save_best_mode in ("max", "min"), \
             f"Invalid save_best_mode: {self.train.save_best_mode}"
-        # ---- z-interleaved 2.5D inference: shape & monotonicity checks ----
-        # Off by default; only validated when the flag is on, so legacy
-        # configs without these fields remain bit-exactly accepted.
+        # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
             assert self.data.patch_mode == "2_5d", (
-                "predict.z_interleave_enabled=True is only valid for "
-                f"patch_mode='2_5d'; got {self.data.patch_mode!r}. The "
-                "interleaved scheme widens the z receptive field of the "
-                "2D-folded D-channel input — it has no effect on true-3D "
-                "patch modes (z_axis/cubic/whole).")
+                f"predict.z_interleave_enabled=True requires patch_mode='2_5d'; "
+                f"got {self.data.patch_mode!r}.")
             thr = self.predict.z_interleave_thresholds
             fac = self.predict.z_interleave_factors
             assert len(fac) == len(thr) + 1, (
-                "predict.z_interleave_factors must have exactly "
-                "len(z_interleave_thresholds)+1 entries (one per spacing "
-                f"bucket + a fallback for >max-threshold); got "
-                f"thresholds={thr}, factors={fac}.")
+                f"z_interleave_factors length must = len(thresholds)+1; "
+                f"got thresholds={thr}, factors={fac}.")
             assert all(t > 0 for t in thr), (
-                f"predict.z_interleave_thresholds must all be > 0; got {thr}.")
+                f"z_interleave_thresholds must all > 0; got {thr}.")
             assert thr == sorted(thr), (
-                f"predict.z_interleave_thresholds must be ascending; got {thr}.")
+                f"z_interleave_thresholds must be ascending; got {thr}.")
             assert all(int(f) >= 1 for f in fac), (
-                f"predict.z_interleave_factors must all be >= 1; got {fac}.")
-            # edge_pad keeps short sub-streams geometrically faithful; the
-            # 'stretch' legacy behaviour would rescale a (D//k)-slice
-            # tail-stream up to patch_D and partially defeat the
-            # interleaving's whole point. Warn rather than hard-fail so
-            # an existing 'stretch' config can still opt-in for a probe.
+                f"z_interleave_factors must all >= 1; got {fac}.")
+            # stretch 会拉伸短子流、冲淡交错收益，仅警告。
             if self.data.z_boundary_mode != "edge_pad":
                 logger.warning(
-                    "predict.z_interleave_enabled=True with "
-                    "z_boundary_mode=%r: short sub-streams will be "
-                    "stretched along z when their length < patch_D, "
-                    "which dilutes the interleave effect. Prefer "
-                    "'edge_pad'.", self.data.z_boundary_mode)
+                    "z_interleave_enabled=True with z_boundary_mode=%r: "
+                    "short sub-streams will be stretched along z. Prefer 'edge_pad'.",
+                    self.data.z_boundary_mode)
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)
@@ -1589,25 +823,16 @@ class Config:
 
     @property
     def aux_view_depths(self) -> List[int]:
-        """Per-view native depths ``D_k = round(D * s_k)`` for 2.5D mode.
+        """2.5D 下每视图原生深度 D_k = round(D * s_k)，强制 D_0 = D。非 2.5D 返回空列表。
 
-        Always returns a list of length ``len(data.multi_res_scales)``,
-        with element 0 fixed to ``D`` (view 0 invariant). For modes other
-        than ``2_5d`` returns an empty list.
-
-        This helper is shape-only — it does NOT depend on
-        ``data.aux_keep_native_d``. Consumers gate on the flag explicitly:
-          - flag OFF: ignore this list and use the legacy ``D * n_views``
-            channel layout.
-          - flag ON: use the list to (a) center-crop each view at its
-            native depth, (b) size per-view stems & aux heads.
+        仅形状计算，不依赖 data.aux_keep_native_d；调用方自行根据该标志决定是否使用。
         """
         if self.data.patch_mode != "2_5d":
             return []
         D = int(self.data.patch_size[0])
         depths = [int(round(D * float(s))) for s in self.data.multi_res_scales]
         if depths:
-            depths[0] = D  # enforce s_0 == 1.0 invariant
+            depths[0] = D  # s_0 == 1.0
         return depths
 
 

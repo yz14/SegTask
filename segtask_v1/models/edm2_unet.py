@@ -1,94 +1,35 @@
-"""EDM2 U-Net segmentation backbone (Karras et al., CVPR 2024).
+"""EDM2 U-Net segmentation backbone (Karras 2024).
 
-Faithful reimplementation of the magnitude-preserving (MP) U-Net blocks
-from ``edm2/training/networks_edm2.py``:
+Faithful re-impl of the magnitude-preserving (MP) blocks from
+``edm2/training/networks_edm2.py``:
+  - ``MPConv`` (forced weight-norm + MP scaling), ``mp_silu`` / ``mp_sum`` / ``mp_cat``,
+    pixel-norm at the start of each enc ``Block``.
+  - ``Block`` with optional resample (``up`` / ``down``) and optional MHSA;
+    diffusion FiLM path (``emb_linear`` / ``emb_gain``) removed.
+  - Encoder: per-level ``_conv`` (level 0) or ``_down`` (level>0) + ``nb`` enc Blocks
+    (one skip pushed per block).
+  - Decoder: deepest = ``_in0(attn) + _in1``; others = ``_up``; each level runs
+    ``nb + 1`` dec Blocks, each ``mp_cat``-ing one skip onto its input.
 
-  * ``MPConv`` with **forced weight normalization** during training and
-    magnitude-preserving scaling at every forward.
-  * ``mp_silu`` (SiLU rescaled by 1/0.596 to preserve magnitude).
-  * ``mp_sum`` / ``mp_cat`` (magnitude-preserving residual + skip-cat).
-  * Pixel-norm at the start of each ``Block`` (encoder flavor).
-  * ``Block`` with optional resampling (``up``/``down``) and optional
-    multi-head self-attention. The diffusion noise/class-embedding path
-    (``emb_linear``, ``emb_gain``, FiLM modulation) is **removed** —
-    segmentation does not need timestep conditioning.
-  * Encoder: per-level ``_conv`` (level 0) or ``_down`` Block (level>0)
-    followed by ``num_blocks`` enc Blocks; one skip is pushed per block.
-  * Decoder: deepest level uses ``_in0`` (attention) + ``_in1`` Blocks;
-    other levels use ``_up`` Block (resample 'up'); each level then
-    runs ``num_blocks + 1`` dec Blocks, every one ``mp_cat``ing the
-    next skip onto its input.
+Removed (diffusion-only): ``MPFourier`` / class embedding / FiLM / ``+1 ones``
+input channel / ``Precond`` wrapper.
 
-Removed (vs. the original)
---------------------------
-  * ``MPFourier`` noise embedding & class-label embedding (no diffusion).
-  * The +1 "ones" channel concatenation at input (paper trick for
-    diffusion conditioning); irrelevant to segmentation.
-  * The ``emb_linear`` FiLM modulation inside each ``Block``.
+Multi-FOV MP stem: ``shared_stem`` (single MPConv) | ``multi_stem_proj``
+(per-view MPConv → ``mp_cat`` → 1×1 MPConv fusion). ``hierarchical`` rejected.
 
-Stem
-----
-The multi-FOV input is consumed by an MP-native multi-FOV stem:
+Intentional deviations from the paper:
+  1. Seg head uses ``MPConv kernel=[1,1]`` for parity (paper used 3×3).
+  2. ``_MPMultiStemProj`` applies an extra ``mp_silu`` per view before ``mp_cat``
+     to match the smoke-tested baseline; remove it for paper-faithful flow.
+  3. DS / aux heads are out-of-paper extensions (``_MPSegHead``).
 
-  * ``shared_stem``     — single ``MPConv`` over ``n_views * D``
-                          channels.
-  * ``multi_stem_proj`` — per-view ``MPConv`` → ``mp_cat`` → ``MPConv``
-                          1×1 fusion back to ``encoder_channels[0]``.
-  * ``hierarchical``    — rejected (same as ADM, will be added later).
+DS / aux capture: ``dec_features[i] = post-blocks of level (L-2-i)`` (length
+``L-1``, ordered ``[low_res, ..., high_res]``); aux heads (Plan A only) sit on
+``dec_features[-1]`` and are upsampled to the input ``(H, W)``.
 
-Output contract
----------------
-Mirrors :class:`models.unet.UNet3D`:
-
-  * eval / no aux → tensor (or list when DS is on at construction).
-  * train + ``aux_seg_supervision`` → ``{"main": ..., "aux": [...]}``.
-
-For 2.5D folded mode ``num_fg_classes = num_fg * D`` (main head); aux
-head ``k`` emits ``num_fg * D_k`` channels with ``aux_keep_native_d``.
-
-Deviations vs. the original EDM2 paper / repo (audited & accepted)
-------------------------------------------------------------------
-The MP primitives + ``Block`` internals + per-level encoder/decoder
-topology are byte-faithful to ``training/networks_edm2.py``:
-``MPConv`` with forced weight normalization & magnitude-preserving
-scaling, ``mp_silu``, ``mp_sum``, ``mp_cat``, ``_normalize`` (pixel-norm),
-``_resample`` (low-pass filter resample), encoder = ``_conv|_down`` +
-``nb`` enc Blocks, decoder deepest = ``_in0(attn=True) + _in1`` /
-others = ``_up`` + ``nb+1`` dec Blocks each ``mp_cat``-ing one skip,
-``concat_balance`` / ``res_balance`` / ``attn_balance`` parameters,
-learnable ``out_gain`` scalar.
-
-Intentional deviations made for segmentation use:
-
-  1. **Output head kernel.** Paper uses ``MPConv kernel=[3, 3]``;
-     we use ``MPConv kernel=[1, 1]`` for parity with the other archs'
-     1×1 seg head contract.
-  2. **Multi-FOV stem.** Paper has a single ``MPConv 3×3`` stem
-     (single-resolution input). For the 2.5D multi-FOV setting we
-     compose per-view ``MPConv 3×3`` stems with ``mp_cat`` + an
-     ``MPConv 1×1`` fusion. NOTE: an extra ``mp_silu`` is currently
-     applied to each per-view stem output before ``mp_cat``. The
-     paper's stem feeds directly into the next ``Block``'s pixel-norm
-     + ``conv_res0`` without an intervening activation, so this is
-     a (very small) divergence; left in to keep behaviour matching
-     the smoke-tested baseline. Remove ``_mp_silu`` from
-     ``_MPMultiStemProj.forward`` to recover paper-faithful flow.
-  3. **DS / aux heads.** Outside the paper's scope (segmentation-
-     only). Implemented as ``MPSegHead`` (MPConv 1×1 with its own
-     ``out_gain``) per UNet3D conventions.
-
-What's *removed* (also intentionally) — diffusion-only:
-  - ``MPFourier`` noise embedding & ``emb_label`` MPConv.
-  - The ``emb_linear`` FiLM modulation inside each ``Block`` (the
-    ``mp_silu(y * (emb*gain + 1))`` step is replaced by ``mp_silu(y)``).
-  - The ``cat([x, ones_like(x[:, :1])], dim=1)`` ones-channel trick
-    at encoder input.
-  - ``Precond`` wrapper (sigma preconditioning, EDM2 only).
-
-DS / aux head capture rule mirrors ADM's: capture
-``dec_features[i] = post-blocks of level (L-2-i)`` (i.e. *after* that
-level's dec Blocks, which is post-resample for non-deepest levels);
-length ``L - 1``, ordered ``[low_res, ..., high_res]``.
+Output contract mirrors :class:`models.unet.UNet3D`: eval/no-aux returns a
+tensor (or list when DS is on); train + ``aux_seg_supervision`` returns
+``{"main": ..., "aux": [...]}``. 2.5D folded: ``num_fg_classes = num_fg * D``.
 """
 
 from __future__ import annotations

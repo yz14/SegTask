@@ -1,108 +1,69 @@
-# ===========================================================================
-# SegTask Default Configuration
-# ===========================================================================
-# This config uses TotalSegmentator body_pred data as an example.
-# Adjust paths, label_values, and model settings for your specific task.
-# ===========================================================================
+# SegTask default config (TotalSegmentator body_pred). Adjust paths/labels for your task.
 
-# ---------------------------------------------------------------------------
-# Data settings
-# ---------------------------------------------------------------------------
 data:
-  # Paths to image and label directories
   image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
   label_dir: "F:/med_data/Totalsegmentator_dataset_v201/body_pred"
   meta_csv: "F:/med_data/Totalsegmentator_dataset_v201/meta.csv"
 
-  # File pattern matching
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
 
-  # Label values in the mask (0=background, 1=body, 2=body_extremities)
-  # Leave empty to auto-detect from data
+  # 空 => 自动检测; 此处 0=bg, 1=body, 2=extremities
   label_values: [0, 1, 2]
   num_classes: 3
 
-  # Data mode: "2d", "2.5d", "3d"
-  # - 2d:   single axial slices, model uses Conv2d
-  # - 2.5d: stack of contiguous slices as multi-channel 2D input
-  # - 3d:   volumetric patches, model uses Conv3d
+  # mode: '2d' | '2.5d' (多切片作 2D 多通道) | '3d'
   mode: "2.5d"
 
-  # 2.5D: number of context slices on each side of the center slice
-  # Total input channels = 2 * num_slices_per_side + 1
-  # e.g. num_slices_per_side=1 → 3 channels (center ± 1 slice)
+  # 2.5D 中心切片两侧上下文切片数; 总通道数 = 2*num_slices_per_side + 1
   num_slices_per_side: 1
 
-  # 2D/2.5D target spatial size [H, W] — all slices are RESIZED to this size.
-  # Uses bilinear interpolation for images, nearest-neighbor for labels.
-  # Works identically at train and test time (no labels needed).
+  # 2D/2.5D 目标 [H,W]; image 双线性/label 最近邻 resize
   target_size: [256, 256]
 
-  # 3D patch size (only used when mode="3d")
-  patch_size: [96, 96, 96]
+  patch_size: [96, 96, 96]               # 仅 mode='3d'
 
-  # Intensity windowing (HU range for CT)
-  intensity_min: -1024.0
+  intensity_min: -1024.0                 # CT HU 窗
   intensity_max: 3071.0
 
-  # Normalization: "minmax" → [0,1], "zscore" → zero-mean unit-var
-  normalize: "minmax"
-
-  # Global statistics for zscore normalization
-  # (auto-computed from training set if using zscore)
-  global_mean: 0.0
+  normalize: "minmax"                    # 'minmax' → [0,1] | 'zscore'
+  global_mean: 0.0                       # zscore 使用 (auto)
   global_std: 1.0
 
-  # Target spacing for resampling (0 = keep original)
-  target_spacing: [0.0, 0.0, 0.0]
+  target_spacing: [0.0, 0.0, 0.0]        # 0 = 保持原 spacing
 
-  # Train/val/test split
-  # "meta" = use split column from meta.csv
-  # "random" = random split with given ratios
-  split_method: "random"
+  split_method: "random"                 # 'random' | 'meta' (使用 meta.csv split 列)
   val_ratio: 0.15
   test_ratio: 0.15
   split_seed: 42
 
-  # DataLoader
   batch_size: 8
   num_workers: 4
   pin_memory: true
   prefetch_factor: 2
 
-  # Foreground oversampling: probability that a sample contains foreground
-  # 0.0 = random sampling, 0.5 = 50% chance of foreground-biased
-  foreground_oversample_ratio: 0.5
+  foreground_oversample_ratio: 0.5       # 前景偏重概率 (0=随机)
+  class_sample_weights: []               # per-class 采样权重 (空=均匀)
 
-  # Per-class sampling weights (empty = uniform)
-  # e.g. [1.0, 3.0, 2.0] to oversample class 1 (body) and class 2
-  class_sample_weights: []
+  cache_mode: "none"                     # 'none' | 'memory'
 
-  # Caching: "none", "memory" (RAM cache)
-  cache_mode: "none"
-
-# ---------------------------------------------------------------------------
-# Augmentation settings (applied on GPU)
-# ---------------------------------------------------------------------------
+# AUGMENT (GPU)
 augment:
   enabled: true
 
-  # Spatial augmentation
-  random_flip_axes: [0, 1]       # axes to randomly flip (0=H, 1=W)
+  random_flip_axes: [0, 1]               # 0=H, 1=W
   random_flip_prob: 0.5
 
   random_rotate_prob: 0.3
-  random_rotate_range: 15.0      # degrees
+  random_rotate_range: 15.0              # degrees
 
   random_scale_prob: 0.2
   random_scale_range: [0.85, 1.15]
 
-  elastic_deform_prob: 0.0       # elastic deformation (expensive, off by default)
+  elastic_deform_prob: 0.0               # 贵, 默认关
   elastic_deform_sigma: 5.0
   elastic_deform_alpha: 100.0
 
-  # Intensity augmentation (applied to image only)
   random_brightness_prob: 0.3
   random_brightness_range: [-0.1, 0.1]
 
@@ -118,219 +79,139 @@ augment:
   gaussian_blur_prob: 0.1
   gaussian_blur_sigma: [0.5, 1.5]
 
-  # Cutout / random erasing
-  cutout_prob: 0.0
+  cutout_prob: 0.0                       # random erasing
   cutout_num_holes: 1
   cutout_size_ratio: [0.05, 0.15]
 
-  # Mixup (batch-level)
-  mixup_prob: 0.0
+  mixup_prob: 0.0                        # batch-level
   mixup_alpha: 0.2
 
-# ---------------------------------------------------------------------------
-# Model architecture
-# ---------------------------------------------------------------------------
 model:
-  # Encoder backbone: "vgg", "resnet", "vit"
-  encoder_name: "resnet"
+  encoder_name: "resnet"                 # 'vgg' | 'resnet' | 'vit'
+  decoder_name: "resnet"                 # 'vgg' | 'resnet' | 'vit'
 
-  # Decoder backbone: "vgg", "resnet", "vit"
-  decoder_name: "resnet"
+  # spatial_dims: 2                       # auto: 2d/2.5d→2, 3d→3
+  # in_channels: 3                        # auto: 从 data.mode + num_slices_per_side
 
-  # Spatial dimensionality (auto-set from data.mode: 2d/2.5d → 2, 3d → 3)
-  # spatial_dims: 2  # auto
-
-  # Input channels (auto-set from data.mode + num_slices_per_side)
-  # in_channels: 3  # auto
-
-  # Channel progression for each encoder level
-  # More levels = deeper network, more channels = wider network
   encoder_channels: [32, 64, 128, 256, 512]
-
-  # Number of blocks (conv groups or residual blocks) per encoder level
   encoder_blocks_per_level: [2, 2, 2, 2, 2]
 
-  # Decoder channels (auto-set as reverse of encoder if empty)
-  decoder_channels: []  # auto: [256, 128, 64, 32]
-
-  # Number of blocks per decoder level
+  decoder_channels: []                   # 空 => 反转 encoder
   decoder_blocks_per_level: [2, 2, 2, 2]
 
-  # Bottleneck channels (0 = same as last encoder channel)
-  bottleneck_channels: 0
+  bottleneck_channels: 0                 # 0 = 同最后 encoder
 
-  # Normalization: "batch", "instance", "group"
-  # instance: works well with small batch sizes (medical imaging)
-  # batch: requires larger batch sizes
-  norm_type: "instance"
-  norm_groups: 8  # for group norm only
+  norm_type: "instance"                  # 'batch' | 'instance' (small batch 友好) | 'group'
+  norm_groups: 8                         # 仅 group
 
-  # Activation: "relu", "leakyrelu", "gelu", "swish"
-  activation: "leakyrelu"
-
-  # Dropout in encoder/decoder blocks
+  activation: "leakyrelu"                # 'relu' | 'leakyrelu' | 'gelu' | 'swish'
   dropout: 0.0
 
-  # Deep supervision: multi-scale loss (better gradient flow)
-  deep_supervision: false
+  deep_supervision: false                # 多尺度 loss
 
-  # ViT-specific settings (only used when encoder/decoder = "vit")
+  # ViT (仅 encoder/decoder='vit')
   vit_patch_size: 2
   vit_num_heads: 8
   vit_mlp_ratio: 4.0
   vit_qkv_bias: true
   vit_drop_path_rate: 0.1
 
-  # Upsampling in decoder: "transpose" (learnable), "bilinear"/"trilinear"
-  upsample_mode: "transpose"
+  upsample_mode: "transpose"             # 'transpose' (学习) | 'bilinear'/'trilinear'
+  skip_mode: "cat"                       # 'cat' | 'add'
 
-  # Skip connection mode: "cat" (concatenate) or "add" (element-wise add)
-  skip_mode: "cat"
-
-# ---------------------------------------------------------------------------
-# Loss function
-# ---------------------------------------------------------------------------
 loss:
-  # Output mode:
-  #   "softmax"   — standard multi-class softmax (output includes background)
-  #   "per_class" — per-class independent sigmoid (each fg class gets its own
-  #                 binary output channel; background is implicit)
+  # 'softmax' (多类, 含 bg) | 'per_class' (每前景类独立 sigmoid)
   output_mode: "softmax"
 
-  # Loss type: "dice", "ce", "dice_ce", "focal", "tversky", "dice_focal"
-  # In per_class mode: "ce" becomes BCE, "focal" uses binary focal, etc.
+  # 'dice' | 'ce' | 'dice_ce' | 'focal' | 'tversky' | 'dice_focal' (per_class 下 ce→BCE)
   name: "dice_ce"
 
-  # Weights for compound losses (e.g. [dice_weight, ce_weight])
   compound_weights: [1.0, 1.0]
+  class_weights: []                      # 空 = 均匀
 
-  # Per-class loss weights (empty = uniform)
-  # e.g. [0.1, 1.0, 0.5] to downweight background and upweight body
-  class_weights: []
-
-  # Dice loss settings
   dice_smooth: 1.0e-5
   dice_squared: false
 
-  # Focal loss settings
   focal_alpha: 0.25
   focal_gamma: 2.0
 
-  # Tversky loss settings (alpha=FP weight, beta=FN weight)
-  tversky_alpha: 0.3
-  tversky_beta: 0.7
+  tversky_alpha: 0.3                     # FP 权重
+  tversky_beta: 0.7                      # FN 权重
 
-  # Label smoothing for cross-entropy
   label_smoothing: 0.0
 
-  # Spatial weight mode: "none", "border" (upweight boundaries)
-  spatial_weight_mode: "none"
+  spatial_weight_mode: "none"            # 'none' | 'border' (边界加权)
   border_weight_sigma: 5.0
   border_weight_w0: 10.0
 
-  # Deep supervision loss weights (geometric decay)
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
-# ---------------------------------------------------------------------------
-# Training settings
-# ---------------------------------------------------------------------------
 train:
   epochs: 200
 
-  # Optimizer: "adam", "adamw", "sgd"
-  optimizer: "adamw"
+  optimizer: "adamw"                     # 'adam' | 'adamw' | 'sgd'
   lr: 1.0e-3
   weight_decay: 1.0e-4
 
-  # SGD-specific
-  momentum: 0.99
+  momentum: 0.99                         # 仅 SGD
   nesterov: true
 
-  # LR scheduler: "cosine", "poly", "step", "plateau", "one_cycle"
-  scheduler: "cosine"
+  scheduler: "cosine"                    # 'cosine' | 'poly' | 'step' | 'plateau' | 'one_cycle'
 
-  # Warmup
   warmup_epochs: 5
   warmup_lr: 1.0e-6
 
-  # Cosine scheduler minimum LR
   cosine_min_lr: 1.0e-6
-
-  # Poly scheduler power
   poly_power: 0.9
-
-  # Step scheduler
   step_size: 50
   step_gamma: 0.1
-
-  # ReduceOnPlateau
   plateau_patience: 10
   plateau_factor: 0.5
 
-  # Gradient clipping
   grad_clip_norm: 12.0
-  grad_clip_value: 0.0  # 0 = disabled
+  grad_clip_value: 0.0                   # 0 = 禁用
 
-  # Mixed precision (AMP) — significant speedup on modern GPUs
   use_amp: true
-  amp_dtype: "float16"  # "float16" or "bfloat16"
+  amp_dtype: "float16"                   # 'float16' | 'bfloat16'
 
-  # Exponential Moving Average
   use_ema: true
   ema_decay: 0.999
 
-  # Checkpointing
   output_dir: "outputs"
-  save_every: 10           # save checkpoint every N epochs
-  save_best_metric: "mean_dice"  # metric to track for best model
-  save_best_mode: "max"    # "max" (higher is better) or "min"
+  save_every: 10
+  save_best_metric: "mean_dice"
+  save_best_mode: "max"                  # 'max' | 'min'
 
-  # Early stopping (0 = disabled)
-  early_stopping: 0
+  early_stopping: 0                      # 0 = 禁用
 
-  # Logging
-  log_every: 10            # log every N steps
-  val_every: 1             # validate every N epochs
-  vis_every: 10            # save visualization every N epochs
+  log_every: 10
+  val_every: 1
+  vis_every: 10
 
-  # Reproducibility
   seed: 42
   deterministic: false
 
-  # Resume training from checkpoint (full state)
-  resume: ""
+  resume: ""                             # 完整 state 恢复
 
-  # Pretrain: model-weights-only initialisation for transfer learning.
-  # Optimizer/scheduler/epoch/RNG are NOT restored. Ignored when `resume` is set.
+  # 仅加载权重作迁移学习初始 (不恢复 optim/sched/epoch/RNG); resume 优先
   pretrain: ""
   pretrain_strict: false
   pretrain_load_ema: false
 
-  # Multi-GPU (DDP) — not yet implemented
-  distributed: false
+  distributed: false                     # DDP 未实现
 
-# ---------------------------------------------------------------------------
-# Prediction / inference settings
-# ---------------------------------------------------------------------------
 predict:
-  # Sliding window overlap (0-1)
-  patch_overlap: 0.5
+  patch_overlap: 0.5                     # 滑窗重叠 (0~1)
+  blend_mode: "gaussian"                 # 'gaussian' | 'constant'
 
-  # Blending mode: "constant" (simple average) or "gaussian" (weighted)
-  blend_mode: "gaussian"
-
-  # Batch size for inference patches
   batch_size: 4
 
-  # Test-Time Augmentation
   tta_enabled: false
   tta_flips: true
 
-  # Post-processing
-  min_component_size: 0    # minimum connected component size (0 = disabled)
+  min_component_size: 0                  # 最小连通域 (0 = 禁用)
   fill_holes: false
   threshold: 0.5
 
-  # Output
   save_probabilities: false
   output_dir: "predictions"

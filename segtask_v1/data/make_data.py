@@ -1,104 +1,22 @@
-"""Pre-compute per-sample npz packages for fast / OOM-free training.
+"""Offline per-sample npz packager (image + label + optional rw + fg-index).
 
-Motivation
-----------
-The runtime data pipeline (``SegDataset3D`` & friends) decodes
-``image.nii.gz`` + ``label.nii.gz`` + ``region_weight.nii.gz`` PER
-sample PER worker and applies the per-sample ROI bbox on the fly.
-Even with the streaming ``load_nifti_cropped`` reader, ``.nii.gz`` is
-not a seekable stream — ITK must decompress the FULL native-dtype
-buffer inside ``Execute()`` before any ROI can be returned. With
-``num_workers=4`` × (image, label, region_weight) = 12 concurrent
-gzip-decompress peaks, that trivially OOMs a 16 GiB host on large
-CTs (the symptom seen in production: ``RuntimeError: bad allocation``
-inside ``SimpleITK ImageFileReader_Execute`` on the third concurrent
-load).
+Decouples training from the gzip-decompress peak of NIfTI by writing one
+bbox-cropped npz per sample. Runtime then mmaps these (uncompressed) npz
+so multiple workers share the OS page cache.
 
-This module materialises a one-shot offline pre-processing stage
-that runs ONCE and writes a per-sample npz package. The training
-pipeline then mmaps the npz directly, which:
+Output: ``<out_dir>/<pid>.npz`` with keys:
+  - ``image`` int16, ``label`` int16 (both bbox-cropped, raw HU/labels)
+  - ``fg_slices`` int32 (M,), ``fg_coords`` int32 (N, 3) (cropped frame)
+  - ``meta`` 0-d object (provenance: pid, src paths, bbox, label_values, ...)
+  - ``rw`` int16 or fp32 (only if ``region_weight_dir`` set; +1-shifted)
 
-  * removes the gzip-decompress peak (npz arrays are stored as raw
-    ``.npy`` blobs — ``np.load(..., mmap_mode='r')`` returns a memmap
-    backed by the OS page cache, SHARED across workers);
-  * removes the per-sample bbox-mask read + ``compute_bbox_from_volume``
-    pass (bbox is already applied to the stored arrays);
-  * removes the dataset's ``_build_index`` / ``precompute_bboxes``
-    startup scan (foreground slice indices and 3D coordinates are
-    stored in the npz);
-  * shrinks the per-sample on-disk footprint ~14× by storing only the
-    ROI cube (image / label / rw all share the SAME bbox).
+Image stays raw HU because intensity windowing is a train-time hparam.
+Default uses ``np.savez`` (uncompressed) so npy blobs can be memmap-shared;
+``--compress`` opts into ``savez_compressed`` (smaller, slower, no sharing).
 
-Output contract (per sample)
-----------------------------
-File: ``<out_dir>/<pid>.npz`` where ``pid = image_filename - image_suffix``.
-
-Mandatory keys::
-
-    image      int16   (D', H', W')   raw HU values, bbox-cropped
-    label      int16   (D', H', W')   raw label values, bbox-cropped
-    fg_slices  int32   (M,)           z-indices (in the cropped frame!)
-                                      where ``label != background``;
-                                      empty array when no fg present
-    fg_coords  int32   (N, 3)         (d, h, w) coordinates of fg
-                                      voxels in the cropped frame,
-                                      sub-sampled to ``--fg-subsample``
-                                      (default 50000) with seed=42;
-                                      empty (0, 3) when no fg
-    meta       object 0-d             pickled dict with provenance:
-        {'pid', 'src_image', 'src_label', 'src_bbox', 'src_rw',
-         'orig_shape':(D,H,W), 'bbox':((d0,d1),(h0,h1),(w0,w1))|None,
-         'label_values': [...], 'has_rw': bool, 'rw_shift': 1.0,
-         'image_dtype':'int16', 'made_at': iso8601, 'tool_version': str}
-
-Optional key (present iff a ``region_weight_dir`` is configured)::
-
-    rw         int16   (D', H', W')   already-+1-shifted weight map,
-              OR fp32                 bbox-cropped (matches
-                                      ``load_region_weight_volume``).
-                                      int16 when source values fit
-                                      (the common case for hand-
-                                      annotated weights — saves ~50%
-                                      of npz size); fp32 fallback
-                                      for non-integer or out-of-
-                                      int16-range sources. Runtime
-                                      loader always returns fp32
-                                      regardless of stored dtype.
-
-Why ``image`` stays raw HU and not pre-normalised:
-   ``intensity_min/max/normalize/global_mean/global_std`` are training-
-   time hyper-parameters; locking them at preprocessing time would
-   force a re-make whenever the windowing changes. The runtime
-   ``preprocess_image(inplace=True)`` is one clip + one affine pass
-   on the ROI cube — negligible cost on the worker side.
-
-Why ``rw`` is pre-+1-shifted:
-   Mirrors ``load_region_weight_volume`` semantics so the runtime
-   loader is dtype-/value-equivalent to the legacy NIfTI path with
-   no extra arithmetic.
-
-Why ``np.savez`` (NOT ``savez_compressed``) by default:
-   The whole point is to avoid decompress peaks. ``np.savez`` writes
-   each array as a raw ``.npy`` inside an uncompressed zip, which
-   ``np.load(..., mmap_mode='r')`` can memmap directly. With four
-   workers reading the SAME npz, the OS page cache is shared — net
-   RAM is one copy, not four. Pass ``--compress`` to opt into
-   ``savez_compressed`` (smaller on disk; load path falls back to
-   in-memory decode and loses the page-cache sharing benefit).
-
-CLI
----
-::
-
-    python -m segtask_v1.data.make_data \
-        --config configs/seg2_5d.yaml \
-        --out F:/path/to/prepared \
-        --workers 4
-
-Increment-friendly: existing ``<pid>.npz`` files are skipped unless
-``--overwrite`` is set. Failures are isolated per sample and
-aggregated into ``<out_dir>/_failures.txt`` (one pid per line) so
-they can be plugged straight into ``data.exclude_list``.
+CLI: ``python -m segtask_v1.data.make_data --config <yaml> --out <dir> [--workers N]``.
+Existing npz are skipped unless ``--overwrite``. Failures collected in
+``<out_dir>/_failures.txt`` (compatible with ``data.exclude_list``).
 """
 
 from __future__ import annotations
@@ -139,9 +57,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_VERSION = "make_data/1.0"
 
-# Default subsample cap — matches ``SegDataset3DCubic._build_index``
-# so the runtime fg-coord pool is identical regardless of the data
-# source. Override via CLI for very dense / very sparse datasets.
+# Matches SegDataset3DCubic._build_index cap; override via CLI if needed.
 _DEFAULT_FG_SUBSAMPLE = 50_000
 
 
@@ -149,14 +65,7 @@ _DEFAULT_FG_SUBSAMPLE = 50_000
 # Per-sample worker
 # =============================================================================
 def _stem(path: str, suffix) -> str:
-    """Return ``filename - suffix`` (or single-extension stem if no
-    suffix matches). ``suffix`` accepts either a string or a sequence of
-    candidate suffixes — the first one whose `name.endswith` matches
-    wins. This mirrors the relaxed pairing rule in
-    :mod:`segtask_v1.data.loader`, so a single ``pid`` is computed
-    consistently across the make/train code paths even when images use
-    suffixes like ``.nii``, ``.nii.gz`` or custom variants.
-    """
+    """Return ``filename - suffix``; ``suffix`` may be a string or list of candidates."""
     name = Path(path).name
     suffixes = [suffix] if isinstance(suffix, str) else list(suffix)
     for sfx in suffixes:
@@ -170,15 +79,10 @@ def _compute_fg_indices(
     bg_val: int,
     fg_subsample: int,
     seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute (fg_slices, fg_coords) from a (D, H, W) label volume.
+    """Compute fg_slices (z-indices) and fg_coords (sub-sampled to ``fg_subsample``).
 
-    Mirrors the in-dataset index builders:
-      * ``SegDataset3D._build_index`` records fg slice indices;
-      * ``SegDataset3DCubic._build_index`` sub-samples 3D fg coords
-        with a fixed RNG seed (42) to a maximum cap (default 50000).
-
-    Both are computed unconditionally so the same npz feeds any
-    patch_mode without re-scanning the label at runtime.
+    Mirrors ``SegDataset3D._build_index`` / ``SegDataset3DCubic._build_index``
+    (seed=42) so any patch_mode can be served without rescanning at runtime.
     """
     if label.size == 0:
         return (np.zeros((0,), dtype=np.int32),
@@ -188,11 +92,7 @@ def _compute_fg_indices(
     if not fg_mask.any():
         return (np.zeros((0,), dtype=np.int32),
                 np.zeros((0, 3), dtype=np.int32))
-    # z-axis index (cropped frame).
     fg_slices = np.where(np.any(fg_mask, axis=(1, 2)))[0].astype(np.int32)
-    # Full 3D coords, sub-sampled with the same RNG / cap as
-    # ``SegDataset3DCubic._build_index`` so the cubic index is
-    # bit-equivalent to the legacy on-the-fly path.
     coords = np.argwhere(fg_mask).astype(np.int32)
     if fg_subsample > 0 and len(coords) > fg_subsample:
         rng = np.random.RandomState(seed)
@@ -202,12 +102,7 @@ def _compute_fg_indices(
 
 
 def _bbox_from_mask_path(bbox_path: Optional[str]) -> Optional[BBox]:
-    """Compute the ROI bbox from a mask NIfTI, mirroring
-    ``precompute_bboxes`` (int16 decode → ``compute_bbox_from_volume``).
-
-    Returns ``None`` when the mask is entirely empty or no path was
-    supplied — the caller then stores the full volume.
-    """
+    """Decode mask as int16 → ``compute_bbox_from_volume``; ``None`` if no path / empty mask."""
     if not bbox_path:
         return None
     mask = load_nifti(bbox_path, dtype=np.int16)
@@ -225,15 +120,10 @@ def prepare_one(
     fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
     compress: bool = False,
     overwrite: bool = False) -> Dict[str, object]:
-    """Materialise the npz package for ONE sample.
+    """Materialise the npz package for one sample; idempotent unless ``overwrite``.
 
-    Returns a small status dict with timing + disk-size info — the
-    multiprocessing collector uses it for the aggregate progress log.
-
-    Idempotent: if ``out_path`` already exists and ``overwrite`` is
-    False, the function returns immediately with ``status='skipped'``.
-    Errors are caught and re-raised by the caller (per-sample isolation
-    is done at the executor level).
+    Returns a status dict (pid, status, size_bytes, elapsed_s, ...) used by
+    the aggregate progress log.
     """
     out_p = Path(out_path)
     if out_p.is_file() and not overwrite:
@@ -243,16 +133,11 @@ def prepare_one(
     t0 = time.perf_counter()
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- 1. Compute bbox (independent NIfTI; small int16 decode) ---
+    # 1. Bbox from mask (None if no mask / empty).
     bbox = _bbox_from_mask_path(bbox_path)
 
-    # --- 2. Load image as int16 HU (raw) cropped to bbox -----------
-    # int16 is the native CT storage dtype; load_nifti_cropped reads
-    # the stored dtype natively (no float promotion) when an integer
-    # output is requested. Raw HU is preserved verbatim.
+    # 2-3. Load image (raw HU, int16) and label (int16), cropped to bbox.
     image = load_nifti_cropped(image_path, bbox=bbox, dtype=np.int16)
-
-    # --- 3. Load label int16 cropped to bbox -----------------------
     label = load_nifti_cropped(label_path, bbox=bbox, dtype=np.int16)
 
     if image.shape != label.shape:
@@ -260,16 +145,8 @@ def prepare_one(
             f"image shape {image.shape} != label shape {label.shape} for "
             f"pid={pid} (image={image_path}, label={label_path})")
 
-    # --- 4. Load region weight (+1 shifted) cropped to bbox -------
-    # Source NIfTI is hand-annotated (background=0, fg=integer
-    # weight) → after +1 shift the entire volume is small non-
-    # negative integers. Storing as int16 instead of fp32 cuts the
-    # rw payload 4× on disk (~50% of total npz size on lung_weight).
-    # The runtime loader (``load_npz_region_weight``) casts back to
-    # fp32 on read, so downstream behaviour is bit-equivalent.
-    # Defensive guard: if a future weight source ever produces non-
-    # integer or out-of-int16-range values, fall back to fp32 so we
-    # never lose precision silently.
+    # 4. Region weight (+1-shifted): store int16 when integer-valued and in range,
+    # else fp32 (runtime loader returns fp32 either way).
     rw: Optional[np.ndarray] = None
     rw_dtype_stored = None
     if rw_path:
@@ -290,22 +167,14 @@ def prepare_one(
             rw_dtype_stored = "float32"
             logger.warning(
                 "pid=%s rw has non-integer or out-of-int16 values "
-                "(min=%.3f, max=%.3f, integer_valued=%s) — storing "
-                "as float32. Disk usage for this sample is 4x higher "
-                "than int16-storable samples.",
+                "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
                 pid, rw_min, rw_max, is_integer_valued)
 
-    # --- 5. Foreground indices in the CROPPED frame ----------------
+    # 5. Foreground indices in the cropped frame.
     bg_val = int(label_values[0])
     fg_slices, fg_coords = _compute_fg_indices(label, bg_val, fg_subsample)
 
-    # --- 6. Provenance metadata ------------------------------------
-    # Original (uncropped) image shape — read from the SimpleITK header
-    # via a header-only pass would be tidier, but we already have
-    # ``bbox`` (the half-open cropped extents in the original frame)
-    # which is sufficient for any reverse mapping the predictor
-    # might want later. We also stash the source paths so the npz
-    # is self-describing for debugging.
+    # 6. Provenance metadata (self-describing for debugging).
     meta = {
         "pid": pid,
         "src_image": str(image_path),
@@ -317,24 +186,15 @@ def prepare_one(
         "label_values": list(map(int, label_values)),
         "has_rw": rw is not None,
         "rw_shift": 1.0,
-        "rw_dtype": rw_dtype_stored,    # 'int16' / 'float32' / None
+        "rw_dtype": rw_dtype_stored,    # int16 / float32 / None
         "image_dtype": str(image.dtype),
         "made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tool_version": _TOOL_VERSION,
     }
     meta_arr = np.array(meta, dtype=object)
 
-    # --- 7. Write npz atomically (write-to-tmp + rename) -----------
-    # ``np.savez(_compressed)`` does not stream — it builds the entire
-    # zip in memory before flushing. For our ROI sizes (≤ a few 100
-    # MiB) that is fine, and the in-process peak is bounded by the
-    # arrays we already hold. We write to ``out_path.tmp`` then rename
-    # so an interrupted run never leaves a half-written npz behind.
-    # Pass an OPEN FILE HANDLE to np.savez — when given a string/Path,
-    # numpy auto-appends ``.npz`` to the filename, which silently
-    # turns ``foo.npz.tmp`` into ``foo.npz.tmp.npz`` on disk and
-    # breaks the subsequent rename. The file-object overload writes
-    # to exactly the path we open.
+    # 7. Atomic write (tmp + rename). Pass an open file handle to np.savez
+    # so it does NOT auto-append ".npz" to our tmp name.
     tmp_path = out_p.with_name(out_p.name + ".tmp")
     save_fn = np.savez_compressed if compress else np.savez
     payload = {
@@ -348,7 +208,7 @@ def prepare_one(
         payload["rw"] = rw
     with open(tmp_path, "wb") as fh:
         save_fn(fh, **payload)
-    # Windows requires the destination to NOT exist before rename.
+    # Windows: destination must not exist before rename.
     if out_p.exists():
         out_p.unlink()
     tmp_path.rename(out_p)
@@ -369,21 +229,12 @@ def prepare_one(
 # Top-level driver (CLI + library entry point)
 # =============================================================================
 def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
-    """Discover image/label/bbox/rw paths from a Config and return a
-    list of per-sample dicts ready for ``prepare_one``.
-
-    Re-uses the loader's discovery / matching helpers verbatim so the
-    npz pipeline stays in lockstep with the runtime pipeline (same
-    pid convention, same strong-contract bbox / rw matching, same
-    exclude-list filtering).
-    """
+    """Discover and pair image/label/bbox/rw paths via loader helpers; honours exclude_list."""
     dc = cfg.data
 
-    # Pair up images and labels.
     image_paths, label_paths = discover_samples(
         dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
 
-    # Honour the same exclude list as the runtime trainer.
     exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
     image_paths, label_paths, _ = _filter_by_exclude(
         image_paths, label_paths, dc.image_suffix, exclude_pids)
@@ -432,22 +283,10 @@ def prepare_dataset(
     limit: int = 0) -> Dict[str, int]:
     """Pre-compute npz packages for every sample under ``cfg.data``.
 
-    Args:
-        cfg:           Config object (same one trainer uses).
-        out_dir:       Output directory; created if missing.
-        workers:       Parallel worker processes (each peaks at one
-                       cropped sample's ROI buffer; tune to host RAM).
-                       Pass 0 to run inline (single-process — useful
-                       for debugging tracebacks).
-        fg_subsample:  Cap on stored 3D fg coordinates per sample.
-        compress:      Use ``np.savez_compressed`` (slower load,
-                       smaller disk; loses memmap shareability).
-        overwrite:     Re-write existing npz files.
-        limit:         If > 0, only process the first N samples
-                       (smoke-test mode).
-
-    Returns:
-        Counters dict ``{written, skipped, failed, total}``.
+    ``workers``: parallel processes (0 = inline / single-process for debugging).
+    ``compress``: ``np.savez_compressed`` (smaller disk, loses memmap sharing).
+    ``limit > 0``: smoke-test on the first N samples only.
+    Returns counters ``{written, skipped, failed, total}``.
     """
     out_p = Path(out_dir)
     out_p.mkdir(parents=True, exist_ok=True)
@@ -461,8 +300,6 @@ def prepare_dataset(
     label_values = _resolve_label_values(cfg, samples)
     logger.info("Using label_values=%s (bg=%d)", label_values, label_values[0])
 
-    # Pre-compute output paths and skip-list to make the progress log
-    # accurate (skipped count visible from the start).
     tasks: List[Tuple[Dict[str, Optional[str]], str]] = []
     for s in samples:
         out_path = str(out_p / f"{s['pid']}.npz")
@@ -496,7 +333,7 @@ def prepare_dataset(
     t0 = time.perf_counter()
 
     if workers <= 0:
-        # Inline path — easier to debug (full traceback, no pickling).
+        # Inline: full traceback, no pickling — easier to debug.
         for i, (s, out_path) in enumerate(tasks):
             try:
                 res = prepare_one(**_kwargs(s, out_path))
@@ -507,9 +344,7 @@ def prepare_dataset(
                 failures.append((s["pid"], _short_exc(exc)))
                 logger.exception("FAILED pid=%s: %s", s["pid"], exc)
     else:
-        # Process pool. ``ProcessPoolExecutor`` uses spawn on Windows;
-        # the per-worker import cost (SimpleITK) is paid once per
-        # worker and amortised across many samples.
+        # Process pool (spawn on Windows; SimpleITK import paid once per worker).
         with ProcessPoolExecutor(max_workers=workers) as pool:
             future_to_pid = {
                 pool.submit(prepare_one, **_kwargs(s, out_path)): s["pid"]
@@ -541,11 +376,7 @@ def prepare_dataset(
         (total_bytes / max(len(sizes), 1)) / (1024 ** 2) if sizes else 0.0,
         mean_s)
 
-    # Persist the failure list — directly compatible with
-    # ``data.exclude_list`` (one pid per line, # comments allowed).
-    # Always clear the stale file when the new run produces no
-    # failures so a successful re-run leaves no misleading
-    # ``_failures.txt`` behind.
+    # _failures.txt is data.exclude_list-compatible; clear stale file on success.
     fail_path = out_p / "_failures.txt"
     if not failures and fail_path.is_file():
         fail_path.unlink()
@@ -561,7 +392,7 @@ def prepare_dataset(
             "either re-run with --overwrite for the affected files OR add "
             "them to data.exclude_list.", len(failures), fail_path)
 
-    # Manifest: small json summarising the run for downstream traceability.
+    # Run manifest for downstream traceability.
     manifest = {
         "tool_version": _TOOL_VERSION,
         "made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -616,8 +447,7 @@ def _log_progress(
 
 
 def _short_exc(exc: BaseException, max_len: int = 200) -> str:
-    """Single-line, length-bounded exception summary for the CSV-ish
-    failure file."""
+    """Single-line length-bounded exception summary for the failure file."""
     msg = f"{type(exc).__name__}: {exc}".replace("\n", " | ").replace("\t", " ")
     return msg[:max_len]
 
@@ -670,11 +500,7 @@ def main() -> int:
     cfg = load_config(args.config)
     logger.info("Config loaded from %s", args.config)
     if args.override:
-        # Reuse train.py's override semantics so users can swap
-        # image_dir / label_dir / bbox_dir on the fly without
-        # editing the yaml — useful for smoke-testing on a
-        # different small_data folder. Imported lazily to keep the
-        # ``make_data`` import path free of trainer dependencies.
+        # Reuse train.py override semantics; lazy import keeps make_data lean.
         from ..train import apply_overrides
         apply_overrides(cfg, args.override)
         cfg.sync()

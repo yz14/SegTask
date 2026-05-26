@@ -1,98 +1,40 @@
-"""ADM U-Net segmentation backbone (Dhariwal & Nichol, NeurIPS 2021).
+"""ADM U-Net segmentation backbone (Dhariwal & Nichol 2021).
 
-Faithful reimplementation of the encoder / middle / decoder *blocks* from
-the ``guided-diffusion`` repository (``guided_diffusion/unet.py``):
+Faithful re-impl of the enc/mid/dec blocks from ``guided_diffusion/unet.py``:
+  - ``GroupNorm32`` (32 groups, fallback when not divisible) + SiLU.
+  - ``ResBlock`` with the timestep-embedding path removed.
+  - Multi-head ``AttentionBlock`` (QKVAttentionLegacy, zero-init ``proj_out``).
+  - Stride-2 conv ``Downsample``; nearest+conv ``Upsample``.
+  - Per-block skip topology identical to ADM (one skip per enc ResBlock
+    + one per Downsample + one for the stem).
 
-  * ``GroupNorm32`` (32 groups; falls back to ``num_channels`` groups when
-    the channel count is not divisible by 32).
-  * SiLU activation.
-  * ``ResBlock`` (paper-faithful) with the **timestep-embedding path
-    removed** — diffusion-only conditioning is irrelevant for segmentation.
-  * Multi-head ``AttentionBlock`` (QKVAttentionLegacy, in-place residual,
-    zero-initialised ``proj_out``).
-  * Stride-2 conv ``Downsample`` and nearest+conv ``Upsample`` from ADM.
-  * Per-block skip-connection topology identical to ADM (one skip per
-    encoder ResBlock + one per Downsample + one for the stem).
+Removed (diffusion-only): ``time_embed`` / ``label_emb`` / ``use_scale_shift_norm`` /
+``AttentionPool2d`` / fp16 utils / ``checkpoint`` / ``Encoder/SuperResModel``.
 
-Stem
-----
-The multi-FOV input ``(B, n_views * D, H, W)`` is consumed by the shared
-``build_context_stem`` helper in ``models.stem`` (``shared_stem`` /
-``multi_stem_proj``). ``hierarchical`` fusion is intentionally not
-supported on ADM/EDM2 archs in this iteration — its mid-encoder
-injection point would require pulling ADM's flat ``input_blocks`` apart
-in a non-trivial way; reject up front in ``Config.validate``.
+Multi-FOV stem: delegated to ``build_context_stem`` (``shared_stem`` |
+``multi_stem_proj``). ``hierarchical`` is rejected up front in ``Config.validate``.
 
-Heads / output contract
-----------------------
-The model output contract matches :class:`models.unet.UNet3D`:
+Intentional deviations from the paper:
+  1. Stem goes through ``ConvNormAct`` (Conv3x3 + GN + SiLU) instead of the bare
+     paper Conv2d, to compose with the multi-FOV stem helper.
+  2. Output head is ``Conv1x1`` (:class:`SegmentationHead`) rather than the paper's
+     ``GN → SiLU → Conv3x3 (zero-init)`` — same IO contract, smaller capacity.
+  3. DS / aux heads are out-of-paper extensions following :class:`UNet3D` convention.
+  4. ``resblock_updown`` not exposed; plain Down/Up always.
+  5. Attention specified by level index (``adm_attention_levels``) instead of by
+     downsample factor (paper's ``attention_resolutions``).
 
-  * eval / no aux → ``Tensor (B, num_fg_classes, H, W)`` (or list when
-    deep supervision is enabled at construction time, kept for backward
-    compat).
-  * train + ``aux_seg_supervision`` → ``{"main": ..., "aux": [...]}``.
+Optional extension (off by default; lucidrains-style ``denoising-diffusion-pytorch``):
+  ``adm_linear_attention_levels`` adds ``Residual(PreNorm(LinearAttention))`` at the
+  end of each listed level. Composes additively with ``adm_attention_levels``.
 
-For 2.5D mode ``num_fg_classes = num_fg * D`` (folded), and aux head
-``k`` emits ``num_fg * D_k`` channels when ``aux_keep_native_d`` is on.
+Stage-level dec feature capture: ``dec_features[i] = post-blocks, pre-upsample
+feature of level (L-2-i)`` (length ``L-1``, ordered ``[low_res, ..., high_res]``);
+mirrors :attr:`models.unet.Decoder.out_channels`. Deepest level is NOT captured.
 
-Deviations vs. the original ADM paper / repo (audited & accepted)
------------------------------------------------------------------
-The encoder / middle / decoder ``Block`` internals are byte-faithful to
-``guided_diffusion/unet.py``: GroupNorm32, SiLU, ResBlock topology,
-AttentionBlock with ``QKVAttentionLegacy``, zero-init ``proj_out``,
-stride-2 conv Downsample, nearest+conv Upsample, middle = R→A→R, and the
-per-block skip stack (one per ResBlock + one per Downsample + the stem)
-with the decoder's ``nb+1`` ResBlocks per level all match.
-
-The following are *intentional* deviations made for segmentation use:
-
-  1. **Stem.** ADM uses a bare ``Conv2d(in, ch, 3, padding=1)`` (no
-     norm, no activation). We delegate to the multi-FOV-aware
-     ``build_context_stem`` which goes through ``ConvNormAct`` →
-     ``Conv3x3 + GroupNorm + SiLU``. This adds one GN+SiLU vs. the
-     paper. Trade-off: enables ``shared_stem`` / ``multi_stem_proj``
-     fusion to compose with the rest of the repo.
-  2. **Output head.** ADM uses ``GN → SiLU → Conv3x3 (zero-init)``.
-     We use ``Conv1x1`` (the in-house :class:`SegmentationHead`) for
-     parity with the other archs and the existing predictor pipeline.
-     Smaller head capacity but identical IO contract.
-  3. **DS / aux heads.** Outside the paper's scope (ADM is a diffusion
-     model; deep supervision and aux multi-FOV heads are seg-only). The
-     additions follow the same per-arch convention as :class:`UNet3D`.
-  4. **``resblock_updown``** option not exposed (paper default is
-     ``False``; we always use the plain Down/Up modules).
-  5. **``attention_resolutions`` → ``adm_attention_levels``.** ADM
-     specifies attention by downsample factor; we use level indices.
-     Equivalent for uniform per-level block counts; just a config UX
-     change (level 0 = top, L-1 = bottleneck).
-
-What's *removed* (also intentionally) — diffusion-only:
-  - ``timestep_embedding`` / ``time_embed`` / ``label_emb``.
-  - ``use_scale_shift_norm`` (depends on emb; moot once emb is gone).
-  - ``AttentionPool2d``, ``EncoderUNetModel``, ``SuperResModel``,
-    fp16 utilities, ``checkpoint``.
-
-Stage-level decoder feature capture
------------------------------------
-ADM's ``output_blocks`` are flat (one ``TimestepEmbedSequential`` per
-sub-block). For the DS / aux head contract to match the existing UNet3D
-build, we group blocks by *encoder level* and capture one feature per
-decoder level:
-
-    dec_features[i] = post-blocks, pre-upsample feature of level
-                       L-2-i  (i in 0..L-2)
-
-That gives a list of length ``L-1`` ordered ``[low_res, ..., high_res]``,
-matching :attr:`models.unet.Decoder.out_channels` semantics:
-
-    dec_features[-1] = highest-res (level 0 output, channels = C[0])
-    dec_features[-1-k] = encoder stage k mirror (channels = C[k], res = 2^k)
-
-The deepest level (L-1, bottleneck-refinement) is NOT captured —
-its res duplicates the bottleneck and would push the DS-head count
-to ``L-1`` instead of ``L-2`` (existing
-:attr:`LossConfig.deep_supervision_weights` is sized for ``L-2`` DS heads
-by convention).
+Output contract mirrors :class:`models.unet.UNet3D`: eval/no-aux returns a tensor
+(or list with DS); train + ``aux_seg_supervision`` returns ``{"main": ..., "aux": [...]}``.
+2.5D folded: ``num_fg_classes = num_fg * D``.
 """
 
 from __future__ import annotations
@@ -152,7 +94,16 @@ class _Upsample(nn.Module):
             self.conv = _conv2d(channels, channels, 3, padding=1)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        # ``upsample_nearest2d`` lacks a bfloat16 / fp16 kernel on older
+        # PyTorch builds (observed on torch < 2.1 with bf16 AMP).
+        # Cast→interpolate→cast-back keeps the AMP outer-context happy
+        # without forcing fp32 on the conv that follows.
+        if x.dtype in (torch.bfloat16, torch.float16):
+            orig_dtype = x.dtype
+            x = F.interpolate(x.float(), scale_factor=2.0,
+                              mode="nearest").to(orig_dtype)
+        else:
+            x = F.interpolate(x, scale_factor=2.0, mode="nearest")
         if self.use_conv:
             x = self.conv(x)
         return x
@@ -238,6 +189,62 @@ class _QKVAttentionLegacy(nn.Module):
         return a.reshape(bs, -1, length)
 
 
+class _LinearAttention(nn.Module):
+    """O(N) linear attention (Shen 2021) via KᵀV trick: ``softmax(Q,feat) @ (softmax(K,spat) @ Vᵀ)ᵀ``.
+
+    Cost ``O(D² N)`` instead of softmax attention's ``O(D N²)`` — enables attention on
+    high-resolution maps without the N² memory blowup. Matches lucidrains' impl: 1×1
+    QKV conv (no bias), Q/K softmax over feat/spatial, ``head_dim**-0.5`` scale on Q,
+    final ``Conv1×1 + GroupNorm(1)`` projection.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, head_dim: int = 32):
+        super().__init__()
+        self.scale = float(head_dim) ** -0.5
+        self.num_heads = num_heads
+        hidden = num_heads * head_dim
+        self.to_qkv = nn.Conv2d(channels, hidden * 3, 1, bias=False)
+        # ``GroupNorm(1, channels)`` ≡ per-sample LayerNorm over channels;
+        # lucidrains uses this on the post-projection output (NOT zero-init).
+        self.to_out = nn.Sequential(
+            nn.Conv2d(hidden, channels, 1),
+            nn.GroupNorm(1, channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim=1)
+        q, k, v = (
+            t.reshape(b, self.num_heads, -1, h * w) for t in qkv
+        )  # each [B, H, head_dim, N]
+        q = q.softmax(dim=-2)
+        k = k.softmax(dim=-1)
+        q = q * self.scale
+        # context: [B, H, head_dim_v, head_dim_k] (square in head_dim).
+        context = torch.einsum("bhdn,bhen->bhde", k, v)
+        out = torch.einsum("bhde,bhdn->bhen", context, q)
+        out = out.reshape(b, -1, h, w)
+        return self.to_out(out)
+
+
+class _LinearAttentionBlock(nn.Module):
+    """``Residual(PreNorm(LinearAttention))`` (lucidrains style).
+
+    Pre-norm is ``GroupNorm(1)`` (per-sample LN over channels) to match
+    LinearAttention's channel-softmax statistic. Composes additively with
+    ADM's softmax ``_AttentionBlock``; placed once per level after all ResBlocks.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, head_dim: int = 32):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, channels)
+        self.attn = _LinearAttention(channels, num_heads=num_heads,
+                                      head_dim=head_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.attn(self.norm(x)) + x
+
+
 class _AttentionBlock(nn.Module):
     """ADM ``AttentionBlock`` — multi-head self-attention over flattened spatial."""
 
@@ -277,10 +284,8 @@ class _AttentionBlock(nn.Module):
 def _resolve_attention_levels(
     n_levels: int, attn_levels: Optional[Sequence[int]]
 ) -> List[int]:
-    """Return the set of encoder/decoder level indices that get attention.
-
-    Default: deepest two levels (`[L-2, L-1]`) — matches ADM's typical
-    ``attention_resolutions=[16, 8]`` for a 256-input 5-level model.
+    """Resolve attention level indices; default = deepest two levels (matches ADM's
+    typical ``attention_resolutions=[16, 8]`` on a 256-input 5-level model).
     """
     if attn_levels is None:
         if n_levels >= 2:
@@ -295,16 +300,11 @@ def _resolve_attention_levels(
 
 
 class _ADMEncoder(nn.Module):
-    """Paper-faithful ADM encoder: stem + L levels of (nb × ResBlock + opt Attn)
-    + Downsample between levels.
+    """ADM encoder: stem + L levels of (nb × ResBlock + optional Attn) + Downsample.
 
-    Returns:
-        - ``enc_features``: ``[stage_0, ..., stage_{L-1}]`` post-blocks-pre-
-          downsample, length ``L``. Stored only for diagnostics — the
-          decoder uses ``enc_skips`` instead.
-        - ``enc_skips``: full ADM skip stack (one per ResBlock + one per
-          Downsample + one for the stem), pushed in evaluation order. The
-          decoder pops from this stack in reverse.
+    Returns ``{enc_features, enc_skips}``. ``enc_skips`` holds the full ADM stack
+    (one per ResBlock + one per Downsample + one for the stem); decoder pops in reverse.
+    ``enc_features`` is post-blocks-pre-downsample per level (diagnostics only).
     """
 
     def __init__(
@@ -316,6 +316,9 @@ class _ADMEncoder(nn.Module):
         num_heads: int,
         num_head_channels: int,
         dropout: float,
+        linear_attention_levels: Optional[List[int]] = None,
+        linear_attention_num_heads: int = 4,
+        linear_attention_head_dim: int = 32,
     ):
         super().__init__()
         self.stem = stem
@@ -323,12 +326,12 @@ class _ADMEncoder(nn.Module):
         n_levels = len(encoder_channels)
         self.n_levels = n_levels
         self.attention_levels = list(attention_levels)
+        self.linear_attention_levels = list(linear_attention_levels or [])
         self.encoder_blocks_per_stage = list(encoder_blocks_per_stage)
 
         self.levels = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-        # Track skip-channel layout so the decoder can build correct
-        # in_ch for each cat-fused ResBlock without re-deriving it.
+        # Track skip-channel layout so the decoder can size cat-fusion in_ch.
         self.skip_channels: List[int] = [encoder_channels[0]]  # stem skip
 
         for level, ch_out in enumerate(encoder_channels):
@@ -352,6 +355,16 @@ class _ADMEncoder(nn.Module):
                         )
                     )
                 self.skip_channels.append(ch_out)
+            # One LinearAttention at end of level (after all ResBlocks + any softmax-attn);
+            # rewrites the last pushed skip with the linear-attended feature.
+            if level in self.linear_attention_levels:
+                blocks_this_level.append(
+                    _LinearAttentionBlock(
+                        ch_out,
+                        num_heads=linear_attention_num_heads,
+                        head_dim=linear_attention_head_dim,
+                    )
+                )
             self.levels.append(nn.ModuleList(blocks_this_level))
             if level < n_levels - 1:
                 self.downsamples.append(_Downsample(ch_out, use_conv=True))
@@ -373,12 +386,9 @@ class _ADMEncoder(nn.Module):
                     enc_skips.append(x)
                 else:  # AttentionBlock
                     x = blk(x)
-                    # ADM does NOT push attention output to skip stack;
-                    # we replace the previously pushed skip with the
-                    # attended version (matching ADM's behaviour where
-                    # AttentionBlock follows ResBlock inside the same
-                    # TimestepEmbedSequential — the sequential's output
-                    # is what gets pushed).
+                    # ADM groups ResBlock + Attn in one TimestepEmbedSequential and
+                    # pushes the sequential's output — i.e. attended feature replaces
+                    # the previous skip rather than being appended.
                     enc_skips[-1] = x
             enc_features.append(x)
             if level < self.n_levels - 1:
@@ -412,12 +422,10 @@ class _ADMMiddle(nn.Module):
 
 
 class _ADMDecoder(nn.Module):
-    """Paper-faithful ADM decoder: per-level (nb+1) × (cat skip → ResBlock + opt
-    Attn) followed by an Upsample at every non-final level.
+    """ADM decoder: per-level (nb+1) × (cat skip → ResBlock + opt Attn) + Upsample.
 
-    Captures ``dec_features[i] = post-blocks, pre-upsample`` for every level
-    *except the deepest* (level L-1 = bottleneck refinement). Length =
-    ``L - 1``, ordered ``[low_res, ..., high_res]``.
+    Captures ``dec_features[i] = post-blocks, pre-upsample`` of level (L-2-i) for
+    every level except the deepest. Length ``L-1``, ordered ``[low_res, ..., high_res]``.
     """
 
     def __init__(
@@ -429,27 +437,23 @@ class _ADMDecoder(nn.Module):
         num_heads: int,
         num_head_channels: int,
         dropout: float,
+        linear_attention_levels: Optional[List[int]] = None,
+        linear_attention_num_heads: int = 4,
+        linear_attention_head_dim: int = 32,
     ):
         super().__init__()
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
         self.n_levels = n_levels
-        # Each decoder level uses ``num_blocks + 1`` ResBlocks, where
-        # ``num_blocks`` comes from ``decoder_blocks_per_stage[level]``.
-        # ``decoder_blocks_per_stage`` length is ``n_levels`` to mirror
-        # the encoder counts (extra entry at the deepest level used for
-        # the bottleneck-refinement decoder pass).
+        # Each level uses (decoder_blocks_per_stage[level] + 1) ResBlocks; length
+        # mirrors the encoder counts (extra entry at deepest = bottleneck refinement).
         if len(decoder_blocks_per_stage) != n_levels:
             raise ValueError(
                 f"decoder_blocks_per_stage length {len(decoder_blocks_per_stage)} "
                 f"!= expected {n_levels}")
         self.decoder_blocks_per_stage = list(decoder_blocks_per_stage)
 
-        # Build decoder levels in reverse order (deepest first).
-        # For each level we need to know which skip-channel slice will
-        # be popped: skip_channels was pushed in encoder order, so the
-        # decoder pops in reverse. We resolve channel counts at build
-        # time by walking the same stack.
+        # Build deepest → shallowest; pop skip_channels (in encoder push order) in reverse.
         skip_stack = list(skip_channels)
         self.levels = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -476,6 +480,16 @@ class _ADMDecoder(nn.Module):
                             num_head_channels=num_head_channels,
                         )
                     )
+            # One LinearAttention at end of level (after cat-fusion ResBlocks + softmax-attn).
+            # Decoder linear-attn does not touch the skip stack (pop-count = ResBlock count).
+            if linear_attention_levels and level in linear_attention_levels:
+                blocks_this_level.append(
+                    _LinearAttentionBlock(
+                        ch,
+                        num_heads=linear_attention_num_heads,
+                        head_dim=linear_attention_head_dim,
+                    )
+                )
             self.levels.append(nn.ModuleList(blocks_this_level))
             if level > 0:
                 # Upsample preserves channel count (ADM convention).
@@ -558,6 +572,10 @@ class ADMSegModel(nn.Module):
         deep_supervision: bool,
         aux_seg_supervision: bool,
         aux_head_mode: str,
+        # Optional lucidrains-style linear attention (composes with softmax attn).
+        linear_attention_levels: Optional[List[int]] = None,
+        linear_attention_num_heads: int = 4,
+        linear_attention_head_dim: int = 32,
         aux_head_out_channels: Optional[List[int]] = None,
     ):
         super().__init__()
@@ -576,6 +594,9 @@ class ADMSegModel(nn.Module):
             num_heads=num_heads,
             num_head_channels=num_head_channels,
             dropout=dropout,
+            linear_attention_levels=linear_attention_levels,
+            linear_attention_num_heads=linear_attention_num_heads,
+            linear_attention_head_dim=linear_attention_head_dim,
         )
         self.middle = _ADMMiddle(
             channels=encoder_channels[-1],
@@ -591,18 +612,19 @@ class ADMSegModel(nn.Module):
             num_heads=num_heads,
             num_head_channels=num_head_channels,
             dropout=dropout,
+            linear_attention_levels=linear_attention_levels,
+            linear_attention_num_heads=linear_attention_num_heads,
+            linear_attention_head_dim=linear_attention_head_dim,
         )
 
-        # Main seg head — paper would use Conv3 with GN/SiLU. Our
-        # contract uses a 1×1 logit conv (matches UNet3D / DS heads).
+        # 1×1 logit conv (paper uses Conv3+GN+SiLU; we match UNet3D / DS contract).
         self.seg_head = SegmentationHead(
             self.decoder.out_channels[-1],
             num_fg_classes,
             spatial_dims=2,
         )
 
-        # Deep-supervision heads on lower-res decoder features (matches
-        # UNet3D conventions).
+        # DS heads on lower-res decoder features (matches UNet3D).
         self.ds_heads = nn.ModuleList()
         if self.deep_supervision:
             for ch in reversed(self.decoder.out_channels[:-1]):
@@ -610,8 +632,7 @@ class ADMSegModel(nn.Module):
                     SegmentationHead(ch, num_fg_classes, spatial_dims=2)
                 )
 
-        # Aux seg supervision (Plan A only — every aux head sits in
-        # parallel on the highest-resolution decoder feature).
+        # Aux seg supervision (Plan A only: all aux heads on highest-res dec feat).
         n_views = self.context_n_views
         self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
@@ -639,9 +660,7 @@ class ADMSegModel(nn.Module):
                         in_ch=in_ch,
                         num_classes=aux_out[k - 1],
                         spatial_dims=2,
-                        # Mirror our default UNet decoder norm/activation
-                        # for the ConvSegmentationHead variant; ignored
-                        # for ``mode='linear'`` (1×1 only).
+                        # GN+SiLU matches ADM style (only used when mode='conv').
                         norm_type="group",
                         norm_groups=32 if in_ch % 32 == 0 else 8,
                         activation="swish",  # SiLU
@@ -706,37 +725,21 @@ class ADMSegModel(nn.Module):
 
 
 def build_adm_seg_model(cfg) -> ADMSegModel:
-    """Build :class:`ADMSegModel` from a :class:`segtask_v1.config.Config`.
+    """Build :class:`ADMSegModel` from :class:`segtask_v1.config.Config`.
 
-    Reads the same set of config fields as the reference UNet build path
-    that this iteration whitelisted for ``arch != "unet"``:
-
-      * ``data.patch_mode`` / ``data.patch_size`` / ``data.multi_res_scales``
-        / ``data.aux_keep_native_d``
-      * ``model.encoder_channels``
-      * ``model.encoder_blocks_per_stage`` / ``model.decoder_blocks_per_stage``
-      * ``model.stem_mode`` / ``model.context_fusion``
-      * ``model.deep_supervision`` / ``model.aux_seg_supervision``
-        / ``model.aux_head_mode``
-      * ``model.dropout``  (re-used as the ADM ``ResBlock`` dropout)
-
-    Plus ADM-specific:
-
-      * ``model.adm_attention_levels``  (List[int]; encoder/decoder level
-        indices that get attention; default = [L-2, L-1])
-      * ``model.adm_num_heads``  (default 4)
-      * ``model.adm_num_head_channels``  (default -1 → ``num_heads`` mode)
+    Reads the standard data/model fields plus ADM-specific:
+      ``adm_attention_levels`` (level indices; default = [L-2, L-1]),
+      ``adm_num_heads`` (default 4), ``adm_num_head_channels`` (default -1).
+    ``model.dropout`` is reused as the ADM ResBlock dropout.
     """
     mc = cfg.model
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
 
-    # 2.5D output contract (this iteration only supports patch_mode='2_5d').
+    # 2.5D-only for now (other modes need stem/in_ch/out_ch wiring).
     assert cfg.data.patch_mode == "2_5d", (
-        "arch='adm' is currently only wired for patch_mode='2_5d'. "
-        "Other patch modes can be added later — they only need the "
-        "stem/in_ch/out_ch wiring branch updated.")
+        "arch='adm' is currently only wired for patch_mode='2_5d'.")
     D = int(cfg.data.patch_size[0])
     out_classes = num_fg * D
     n_views = max(len(cfg.data.multi_res_scales), 1)
@@ -749,17 +752,8 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         raise ValueError(
             f"encoder_blocks_per_stage length {len(enc_bps)} "
             f"!= len(encoder_channels) {n_levels}")
-    # ADM's encoder/decoder block counts are *strictly coupled* by the
-    # paper's skip-stack topology: encoder pushes ``nb_k + 1`` skips per
-    # level (nb_k ResBlocks + 1 Downsample at non-final levels, with a
-    # single extra stem skip absorbed by level 0's +1). The decoder
-    # consumes ``nb_k + 1`` skips per level (its (nb_k + 1) ResBlocks).
-    # For total skip balance we therefore set
-    #     dec_bps_full[k] = enc_bps[k]
-    # internally (the +1 is added inside ``_ADMDecoder``). The
-    # user-supplied ``decoder_blocks_per_stage`` is IGNORED for ADM/EDM2
-    # archs because allowing arbitrary asymmetry would break the skip
-    # stack — log a warning when the user attempted to override.
+    # Skip-stack balance fixes dec_bps_full[k] = enc_bps[k] (decoder adds the +1
+    # internally). User-supplied decoder_blocks_per_stage is ignored — warn if set.
     if mc.decoder_blocks_per_stage and (
             list(mc.decoder_blocks_per_stage) != enc_bps[:-1]):
         logger.warning(
@@ -773,17 +767,25 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     attn_levels = _resolve_attention_levels(
         n_levels, getattr(mc, "adm_attention_levels", None))
 
-    # Multi-FOV stem. Only ``shared_stem`` and ``multi_stem_proj`` are
-    # supported on ADM/EDM2 in this iteration; ``hierarchical`` would
-    # need mid-encoder injection support and is rejected upstream.
+    # Optional lucidrains-style linear attention; off by default.
+    raw_lin = getattr(mc, "adm_linear_attention_levels", None) or []
+    lin_attn_levels: List[int] = sorted({int(v) for v in raw_lin})
+    for v in lin_attn_levels:
+        if v < 0 or v >= n_levels:
+            raise ValueError(
+                f"adm_linear_attention_levels entry {v} out of range "
+                f"[0, {n_levels - 1}]")
+    lin_num_heads = int(getattr(mc, "adm_linear_attention_num_heads", 4))
+    lin_head_dim = int(getattr(mc, "adm_linear_attention_head_dim", 32))
+
+    # Only shared_stem / multi_stem_proj supported; hierarchical needs mid-encoder injection.
     if mc.context_fusion == "hierarchical":
         raise ValueError(
             "model.arch='adm' does not yet support context_fusion="
             "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj' "
             "for ADM. (Hierarchical fusion will be added in a follow-up.)")
 
-    # Per-view input channel count: native-depth ON path uses variable
-    # D_k per view; OFF path uses uniform D.
+    # Native-depth ON: per-view variable D_k; OFF: uniform D.
     in_ch_per_view_list = None
     aux_head_out_channels = None
     if (bool(getattr(cfg.data, "aux_keep_native_d", False))
@@ -794,7 +796,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         in_channels = sum(depths)
     else:
         in_channels = D * n_views
-    in_ch_per_view = D  # uniform fallback for shared/multi_stem_proj
+    in_ch_per_view = D  # uniform fallback
 
     stem, stem_stride = build_context_stem(
         mode=mc.stem_mode,
@@ -802,8 +804,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         n_views=n_views,
         in_ch_per_view=in_ch_per_view,
         out_ch=enc_channels[0],
-        # ADM-style stem: GroupNorm + SiLU. ``build_context_stem``
-        # delegates to ``ConvNormAct``, which understands these names.
+        # ADM-style stem: GroupNorm + SiLU.
         norm_type="group",
         norm_groups=32 if enc_channels[0] % 32 == 0 else 8,
         activation="swish",  # SiLU
@@ -825,6 +826,9 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         num_heads=int(getattr(mc, "adm_num_heads", 4)),
         num_head_channels=int(getattr(mc, "adm_num_head_channels", -1)),
         dropout=float(getattr(mc, "dropout", 0.0)),
+        linear_attention_levels=lin_attn_levels,
+        linear_attention_num_heads=lin_num_heads,
+        linear_attention_head_dim=lin_head_dim,
         num_fg_classes=out_classes,
         deep_supervision=bool(mc.deep_supervision),
         aux_seg_supervision=aux_seg,
@@ -836,12 +840,14 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     logger.info(
         "Built ADMSegModel: enc=%.2fM, mid=%.2fM, dec=%.2fM, total=%.2fM, "
         "channels=%s, enc_blocks=%s, dec_blocks=%s, attn_levels=%s, "
+        "lin_attn_levels=%s (heads=%d, head_dim=%d), "
         "in_ch=%d (per_view=%s), out_classes=%d (fg=%d, D=%d), "
         "stem=%s(stride=%d, n_views=%d, fusion=%s), ds=%s, aux_seg=%s "
         "(n_aux=%d, mode=%s)",
         pc["encoder"] / 1e6, pc["middle"] / 1e6, pc["decoder"] / 1e6,
         pc["total"] / 1e6,
         enc_channels, enc_bps, dec_bps_full, attn_levels,
+        lin_attn_levels, lin_num_heads, lin_head_dim,
         in_channels,
         in_ch_per_view_list if in_ch_per_view_list is not None
         else [in_ch_per_view] * n_views,

@@ -1,12 +1,5 @@
-# ============================================================================
-# Plan A 升维收益对照 — 组 3/3：原生 z_axis 3D 多分辨率（Reference-3D）
-#
-# 角色：作为"原生 3D 上限"参照。同样使用多 FOV（multi_res_scales=[1.0,1.5,2.0]）
-#       让 stem 看到等量的 z 上下文，但走 z_axis 3D 路径（每个 view 是 1 个输入
-#       通道，模型 spatial_dims=3，C_res=3，输出 (B, num_fg*3, D, H, W)）。
-# 期望：lift+r2plus1d 应介于 baseline 2.5D 与本组之间或接近本组；若 lift
-#       显著超过本组，提示因子化 (2+1)D 在 small data 上比标准 3D conv 更稳。
-# ============================================================================
+# Plan A 升维对照 3/3 — 原生 z_axis 3D 多分辨率 (上限参照)。
+# spatial_dims=3, C_res=3, 输出 (B, num_fg*3, D, H, W)。以同量多 FOV 对照 lift+r2plus1d
 
 data:
   image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
@@ -21,10 +14,8 @@ data:
   label_values: [0, 1, 2]
   num_classes: 3
 
-  # 与另两组共用 D=16；z_axis 3D 没有 lift 的几何约束，但保持一致以做公平对比。
-  patch_size: [16, 256, 256]
-  # === 关键变量：原生 3D z_axis 滑块 ===
-  patch_mode: "z_axis"
+  patch_size: [16, 256, 256]    # 三组共用 (z_axis 3D 无 lift 几何约束)
+  patch_mode: "z_axis"          # 关键: 原生 3D z_axis 滑块
   multi_res_scales: [1.0, 1.5, 2.0]
   aug_oversample_ratio: 1.5
   z_boundary_mode: "edge_pad"
@@ -65,11 +56,11 @@ augment:
 
 model:
   backbone: "resnet"
-  spatial_dims: 3                     # 原生 3D
+  spatial_dims: 3               # 原生 3D (sync 不会改, patch_mode='z_axis' 不参与 2.5D 逻辑)
   encoder_channels: [32, 64, 128, 256, 256]
   blocks_per_level: 2
-  block_type: "basic"                 # 标准 3D 残差块（非 r2plus1d）
-  lift_2_5d_to_3d: false              # 3D 模式下本字段是 no-op
+  block_type: "basic"           # 标准 3D 残差 (非 r2plus1d)
+  lift_2_5d_to_3d: false        # 3D 模式下 no-op
 
   norm_type: "instance"
   norm_groups: 8
@@ -80,7 +71,7 @@ model:
   skip_attention: false
   deep_supervision: false
   stem_mode: "conv3"
-  # context_fusion 在 3D 模式下被忽略（stem 直接吃 n_views 通道）。
+  # context_fusion 在 3D 模式下忽略 (stem 直接吃 n_views 通道)
   decoder_type: "unet"
   downsample_mode: "conv"
   upsample_mode: "trilinear"

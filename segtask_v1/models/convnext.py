@@ -1,22 +1,7 @@
-"""ConvNeXt building blocks for 3D UNet encoder and decoder.
+"""ConvNeXt blocks for 3D UNet (Liu 2022, dim-agnostic 2D/3D).
 
-ConvNeXt block (adapted from "A ConvNet for the 2020s", Liu et al. 2022):
-  - Depthwise 7x7x7 conv
-  - LayerNorm (channels-first, mathematically equivalent to the official
-    channels-last LN since stats are over the C axis only)
-  - Pointwise expansion (4x, 1x1 conv ≡ Linear in channels-last)
-  - GELU activation
-  - Pointwise projection back
-  - LayerScale (learnable per-channel scale, init ``1e-6``) — critical for
-    stable training of deep networks; matches official block. Set
-    ``layer_scale_init_value <= 0`` to disable.
-  - Residual connection + optional drop path
-
-Encoder level: N ConvNeXt blocks (no downsampling — handled separately).
-Decoder level: N ConvNeXt blocks after skip-connection fusion.
-
-A paper-faithful ``ConvNeXtDownsample`` (LayerNorm → Conv stride 2) is
-also provided for use between encoder stages when the backbone is ConvNeXt.
+Block: dwconv7 → LN(C) → pwconv(4x) → GELU → pwconv → LayerScale → residual+DropPath.
+Downsample: LN → Conv(k=2,s=2), paper-faithful inter-stage.
 """
 
 from __future__ import annotations
@@ -28,7 +13,7 @@ from .blocks import _CONV, make_attention
 
 
 class DropPath(nn.Module):
-    """Stochastic depth (drop path) for residual blocks."""
+    """Stochastic depth for residual blocks."""
 
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -39,22 +24,14 @@ class DropPath(nn.Module):
             return x
         keep = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        # Sample the Bernoulli mask in float32 regardless of x.dtype. Under
-        # AMP (fp16/bf16) torch.bernoulli on the probability tensor has
-        # inconsistent backend support across CUDA versions — generate in
-        # fp32, then cast to x.dtype. The /keep division is fused into the
-        # cast to preserve numerical stability.
+        # sample mask in fp32 then cast (AMP fp16/bf16 bernoulli backend is flaky)
         prob = torch.full(shape, keep, device=x.device, dtype=torch.float32)
         mask = torch.bernoulli(prob).to(dtype=x.dtype)
         return x * mask / keep
 
 
 class LayerNorm3d(nn.Module):
-    """Channel-first LayerNorm — dim-agnostic (works for 2D and 3D inputs).
-
-    Computes per-spatial-position statistics across the channel axis.
-    Class name kept for API stability; auto-detects ndim from input.
-    """
+    """Channel-first LayerNorm (2D/3D); stats over C only. Name kept for API stability."""
 
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
@@ -63,7 +40,7 @@ class LayerNorm3d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, *spatial) — stats over C dimension.
+        # x: (B, C, *spatial)
         u = x.mean(dim=1, keepdim=True)
         s = (x - u).pow(2).mean(dim=1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
@@ -72,12 +49,7 @@ class LayerNorm3d(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    """Single ConvNeXt block (3D version).
-
-    Architecture:
-      depthwise 7x7x7 conv → LayerNorm → 1x1 expand (4x) → GELU → 1x1 project
-      → optional attention (se/eca/cbam/coord) → residual.
-    """
+    """ConvNeXt block: dwconv7 → LN → pw(4x) → GELU → pw → attn? → LayerScale → residual."""
 
     def __init__(
         self,
@@ -100,10 +72,7 @@ class ConvNeXtBlock(nn.Module):
         self.act = nn.GELU()
         self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
         self.attn = make_attention(attention_type, dim, spatial_dims=d)
-        # LayerScale (Touvron et al. "Going deeper with Image Transformers",
-        # adopted by ConvNeXt). Initialised at 1e-6 so the block starts
-        # near-identity — essential for stable training when combined with
-        # stochastic depth. Disabled when ``layer_scale_init_value <= 0``.
+        # LayerScale: init small → near-identity start; <=0 disables
         if layer_scale_init_value > 0.0:
             self.gamma = nn.Parameter(
                 layer_scale_init_value * torch.ones(dim), requires_grad=True)
@@ -120,17 +89,13 @@ class ConvNeXtBlock(nn.Module):
         out = self.pwconv2(out)
         out = self.attn(out)
         if self.gamma is not None:
-            # Reshape gamma to (1, C, 1, ...) for broadcast on channel-first.
             shape = (1, -1) + (1,) * self.spatial_dims
             out = out * self.gamma.reshape(shape)
         return residual + self.drop_path(out)
 
 
 class ConvNeXtAdaptBlock(nn.Module):
-    """ConvNeXt block with channel adaptation.
-
-    If in_ch != out_ch, applies a 1x1 projection before the ConvNeXt block.
-    """
+    """ConvNeXt block with optional 1x1 channel projection (in_ch != out_ch)."""
 
     def __init__(
         self,
@@ -163,10 +128,7 @@ class ConvNeXtAdaptBlock(nn.Module):
 
 
 class ConvNeXtStage(nn.Module):
-    """A stage of N ConvNeXt blocks at a fixed resolution.
-
-    First block may change channels. Subsequent blocks maintain out_ch.
-    """
+    """N ConvNeXt blocks at one resolution (first block may change channels)."""
 
     def __init__(
         self,
@@ -202,28 +164,7 @@ class ConvNeXtStage(nn.Module):
 
 
 class ConvNeXtDownsample(nn.Module):
-    """Paper-faithful ConvNeXt inter-stage downsample: LayerNorm → Conv(s=2).
-
-    Official ConvNeXt (Liu et al. 2022) places a *separate* downsample layer
-    between every pair of stages, consisting of:
-
-        LayerNorm(C_in)  →  Conv(k=2, s=2, C_in → C_out)
-
-    Two differences from the generic :class:`Downsample` in ``blocks.py``:
-
-    1. **Norm-first ordering**: LayerNorm is applied *before* the stride-2
-       convolution (not after), regularising the input distribution to the
-       downsampling conv. This is what the paper does and what every
-       reference re-implementation (timm, mmcls, monai) follows.
-    2. **LayerNorm specifically** (not BN/IN/GN), matching the channel
-       statistics used inside each ConvNeXt block.
-
-    Channel projection (``in_ch → out_ch``) is folded into the stride-2 conv
-    — no extra 1x1 needed. When ``in_ch == out_ch`` (the layout this UNet
-    uses, where channel growth happens inside the next stage's first block),
-    the conv is square in channels but the spatial halving and the
-    pre-conv LN remain paper-faithful.
-    """
+    """Paper-faithful ConvNeXt inter-stage downsample: LN → Conv(k=2,s=2). LN-first."""
 
     def __init__(
         self,
