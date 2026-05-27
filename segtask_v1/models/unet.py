@@ -40,6 +40,7 @@ class Encoder(nn.Module):
         if context_n_views < 1:
             raise ValueError(
                 f"context_n_views must be >= 1, got {context_n_views}")
+
         if in_ch_per_view_list is not None:
             if len(in_ch_per_view_list) != context_n_views:
                 raise ValueError(
@@ -287,7 +288,7 @@ def _build_aux_head(
 
 
 class UNet3D(nn.Module):
-    """通用 UNet。aux_seg_supervision 在 context_n_views>1 时构建逐 FOV 辅助头。
+    """通用 UNet。aux_seg_supervision 在 context_n_views>1 时构建逐 FOV 辅助头
 
     forward 返回：
       - eval / 无 aux：Tensor 或 [main, ds1, ...]（深监督）。

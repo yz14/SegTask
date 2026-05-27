@@ -434,7 +434,8 @@ def discover_npz_samples(
 
 
 def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
-    """构建 train/val DataLoader。训练仅读 npz：data.npz_dir 必须设。目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。所有逐体积 I/O 走 npz（bbox/fg 索引/区域权重 均预烘）。"""
+    """构建 train/val DataLoader。训练仅读 npz：data.npz_dir 必须设。
+    目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。"""
     dc = cfg.data
 
     npz_dir = getattr(dc, "npz_dir", "")
@@ -459,14 +460,11 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 f"data.npz_auto_build: true to build inline.")
         logger.info(
             "data.npz_dir=%s is empty/missing — auto-building via "
-            "make_data.prepare_dataset (workers=%d). One-time cost; "
-            "subsequent runs reuse the cache.",
+            "make_data.prepare_dataset (workers=%d). One-time cost; ",
             npz_dir, max(dc.num_workers, 1))
         from .make_data import prepare_dataset  # 本地导入（重依赖）
         counters = prepare_dataset(
-            cfg, npz_dir,
-            workers=max(dc.num_workers, 1),
-            overwrite=False)
+            cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
         logger.info(
             "Auto-build complete: written=%d, skipped=%d, failed=%d / total=%d.",
             counters["written"], counters["skipped"],
@@ -489,8 +487,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         npz_dir, npz_suffix)
     npz_paths_all = discover_npz_samples(npz_dir, npz_suffix)
     # image_paths/label_paths 仅为别名（计 len/缓存键）；实际 I/O 由 dataset._npz_paths。
-    image_paths = list(npz_paths_all)
-    label_paths = list(npz_paths_all)
+    image_paths  = list(npz_paths_all)
+    label_paths  = list(npz_paths_all)
     exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
     image_paths, label_paths, keep_idx = _filter_by_exclude(
         image_paths, label_paths, npz_suffix, exclude_pids)
@@ -553,13 +551,13 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
 
     # NPZ-only 训练：bbox/region-weight 预烘在 npz 包中。
     train_paths = dict(
-        image_paths=[image_paths[i] for i in train_idx],
-        label_paths=[label_paths[i] for i in train_idx],
-        npz_paths  =[npz_paths_all[i] for i in train_idx])
+        image_paths = [image_paths[i] for i in train_idx],
+        label_paths = [label_paths[i] for i in train_idx],
+        npz_paths   = [npz_paths_all[i] for i in train_idx])
     val_paths = dict(
-        image_paths=[image_paths[i] for i in val_idx],
-        label_paths=[label_paths[i] for i in val_idx],
-        npz_paths  =[npz_paths_all[i] for i in val_idx])
+        image_paths = [image_paths[i] for i in val_idx],
+        label_paths = [label_paths[i] for i in val_idx],
+        npz_paths   = [npz_paths_all[i] for i in val_idx])
 
     if dc.patch_mode == "2_5d":
         # 2.5D 复用 z_axis dataset。aux_keep_native_d=False 时逐 scale 抽切片、trainer 折叠 D 入通道；=True 时单 max-FOV cube，trainer 中心裁。
@@ -585,21 +583,21 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 n_views * int(dc.patch_size[0]))
         train_ds = SegDataset3D(
             **train_paths,
-            aug_oversample_ratio=train_oversample,
-            multi_res_scales=dc.multi_res_scales,
+            aug_oversample_ratio        = train_oversample,
+            multi_res_scales            = dc.multi_res_scales,
             foreground_oversample_ratio = dc.foreground_oversample_ratio,
             samples_per_volume          = dc.samples_per_volume,
-            is_train=True,
+            is_train                    = True,
             **common_kwargs,
             **z_kwargs,
             **aux_native_kwargs)
         val_ds = SegDataset3D(
             **val_paths,
-            aug_oversample_ratio=1.0,
-            multi_res_scales=dc.multi_res_scales,
-            foreground_oversample_ratio=0.0,
-            samples_per_volume=max(dc.samples_per_volume // 2, 1),
-            is_train=False,
+            aug_oversample_ratio        = 1.0,
+            multi_res_scales            = dc.multi_res_scales,
+            foreground_oversample_ratio = 0.0,
+            samples_per_volume          = max(dc.samples_per_volume // 2, 1),
+            is_train                    = False,
             **common_kwargs,
             **z_kwargs,
             **aux_native_kwargs)
@@ -609,15 +607,15 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         # whole 忽略 fg oversample / multi_res_scales（Config 已校验）。
         train_ds = SegDataset3DWhole(
             **train_paths,
-            aug_oversample_ratio=train_oversample,
-            samples_per_volume=dc.samples_per_volume,
-            is_train=True,
+            aug_oversample_ratio = train_oversample,
+            samples_per_volume   = dc.samples_per_volume,
+            is_train             = True,
             **common_kwargs)
         val_ds = SegDataset3DWhole(
             **val_paths,
-            aug_oversample_ratio=1.0,
-            samples_per_volume=max(dc.samples_per_volume // 2, 1),
-            is_train=False,
+            aug_oversample_ratio = 1.0,
+            samples_per_volume   = max(dc.samples_per_volume // 2, 1),
+            is_train             = False,
             **common_kwargs)
     elif dc.patch_mode == "cubic":
         if keep_native_kwargs_cubic["keep_native_multi_res"]:
@@ -634,23 +632,23 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 train_oversample, dc.multi_res_scales)
         train_ds = SegDataset3DCubic(
             **train_paths,
-            aug_oversample_ratio=train_oversample,
-            multi_res_scales=dc.multi_res_scales,
-            foreground_oversample_ratio=dc.foreground_oversample_ratio,
-            samples_per_volume=dc.samples_per_volume,
-            is_train=True,
+            aug_oversample_ratio        = train_oversample,
+            multi_res_scales            = dc.multi_res_scales,
+            foreground_oversample_ratio = dc.foreground_oversample_ratio,
+            samples_per_volume          = dc.samples_per_volume,
+            is_train                    = True,
             **common_kwargs,
             **keep_native_kwargs_cubic)
         val_ds = SegDataset3DCubic(
             **val_paths,
-            aug_oversample_ratio=1.0,
-            multi_res_scales=dc.multi_res_scales,
-            foreground_oversample_ratio=0.0,
-            samples_per_volume=max(dc.samples_per_volume // 2, 1),
-            is_train=False,
+            aug_oversample_ratio        = 1.0,
+            multi_res_scales            = dc.multi_res_scales,
+            foreground_oversample_ratio = 0.0,
+            samples_per_volume          = max(dc.samples_per_volume // 2, 1),
+            is_train                    = False,
             **common_kwargs,
             **keep_native_kwargs_cubic)
-    else:
+    else:  # TODO 这里和2.5D是一样的处理，现在都必须是输出max_scale * oversample * extract_size，所以这里是否可以和2.5D合并了做一条判断语句
         if keep_native_kwargs_z["keep_native_multi_res"]:
             logger.info(
                 "Using Z_AXIS patch mode + keep_native_multi_res=True "

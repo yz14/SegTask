@@ -234,18 +234,19 @@ def _resolve_label_values(
 
 
 def prepare_dataset(
-    cfg: Config,
-    out_dir: str,
-    workers: int = 4,
+    cfg         : Config,
+    out_dir     : str,
+    workers     : int = 4,
     fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
-    compress: bool = False,
-    overwrite: bool = False,
-    limit: int = 0) -> Dict[str, int]:
-    """为 cfg.data 下的所有样本预烘 npz。workers=0 为内联（调试）；compress 使用 savez_compressed；limit>0 仅处理前 N 个。返 counters {written, skipped, failed, total}。"""
+    compress    : bool = True,
+    overwrite   : bool = False,
+    limit       : int = 0) -> Dict[str, int]:
+    """为 cfg.data 下的所有样本生成 npz。
+    compress 使用 savez_compressed；limit>0 仅处理前 N 个。返 counters {written, skipped, failed, total}。"""
     out_p = Path(out_dir)
     out_p.mkdir(parents=True, exist_ok=True)
 
-    samples = _build_sample_table(cfg)
+    samples = _build_sample_table(cfg)  # 配对路径
     if limit and limit > 0:
         samples = samples[:limit]
         logger.info("--limit %d: processing only the first %d samples.",
@@ -286,7 +287,7 @@ def prepare_dataset(
     t0 = time.perf_counter()
 
     if workers <= 0:
-        # 内联：全 traceback、无 pickle，便于调试。
+        # 内联：全 traceback、无 pickle，便于调试
         for i, (s, out_path) in enumerate(tasks):
             try:
                 res = prepare_one(**_kwargs(s, out_path))
@@ -297,12 +298,11 @@ def prepare_dataset(
                 failures.append((s["pid"], _short_exc(exc)))
                 logger.exception("FAILED pid=%s: %s", s["pid"], exc)
     else:
-        # 进程池（Windows spawn；SimpleITK 逐 worker 导入一次）。
+        # 进程池（Windows spawn；SimpleITK 逐 worker 导入一次）
         with ProcessPoolExecutor(max_workers=workers) as pool:
             future_to_pid = {
                 pool.submit(prepare_one, **_kwargs(s, out_path)): s["pid"]
-                for s, out_path in tasks
-            }
+                for s, out_path in tasks}
             for i, fut in enumerate(as_completed(future_to_pid)):
                 pid = future_to_pid[fut]
                 try:
@@ -314,20 +314,18 @@ def prepare_dataset(
                     failures.append((pid, _short_exc(exc)))
                     logger.error("FAILED pid=%s: %s", pid, exc)
 
-    # 汇总报告。
-    elapsed = time.perf_counter() - t0
+    # 汇总报告
+    elapsed     = time.perf_counter() - t0
     total_bytes = sum(sizes)
-    total_gb = total_bytes / (1024 ** 3)
-    mean_s = (sum(timings) / max(len(timings), 1)) if timings else 0.0
+    total_gb    = total_bytes / (1024 ** 3)
+    mean_s      = (sum(timings) / max(len(timings), 1)) if timings else 0.0
     logger.info(
         "Done in %.1fs: written=%d, skipped=%d, failed=%d / total=%d. "
         "Total npz size: %.2f GiB (mean per sample: %.1f MiB, "
         "mean compute: %.2fs).",
         elapsed, counters["written"], counters["skipped"],
-        counters["failed"], counters["total"],
-        total_gb,
-        (total_bytes / max(len(sizes), 1)) / (1024 ** 2) if sizes else 0.0,
-        mean_s)
+        counters["failed"], counters["total"], total_gb,
+        (total_bytes / max(len(sizes), 1)) / (1024 ** 2) if sizes else 0.0, mean_s)
 
     # _failures.txt 与 data.exclude_list 兼容；成功时清除陈旧文件。
     fail_path = out_p / "_failures.txt"

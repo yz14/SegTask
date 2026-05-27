@@ -110,12 +110,11 @@ class BinaryDiceLoss(nn.Module):
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
-        target = _check_inputs(pred, target, weight_map)
+        target    = _check_inputs(pred, target, weight_map)
         pred_prob = torch.sigmoid(pred)
-        B, C = pred.shape[:2]
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
-        p_den = p * p if self.squared else p  # t is binary → t**2 == t
+        B, C      = pred.shape[:2]
+        p, t      = pred_prob.reshape(B, C, -1), target.reshape(B, C, -1)
+        p_den     = p * p if self.squared else p  # 意义？
 
         sum_dims: Tuple[int, ...] = (0, 2) if self.batch_dice else (2,)
 
@@ -292,18 +291,14 @@ class CompoundLoss(nn.Module):
 # Deep Supervision Wrapper
 # ---------------------------------------------------------------------------
 class DeepSupervisionLoss(nn.Module):
-    """多尺度深监督。默认将 target 近邻下采样到每个 pred 尺寸（nnU-Net 风格，节存）。
-    weights 高分辨率优先；normalize_weights=True 时归一使总损失与单尺度可比。
-    upsample_pred=True 改为上采样 pred 到 target 分辨率（费内存但保连续梯度）。
-    """
+    """多尺度深监督。默认将 target 近邻下采样到每个 pred 尺寸"""
 
     def __init__(
         self,
-        base_loss: nn.Module,
-        weights: Sequence[float],
+        base_loss        : nn.Module,
+        weights          : Sequence[float],
         normalize_weights: bool = True,
-        upsample_pred: bool = False,
-    ):
+        upsample_pred    : bool = False):
         super().__init__()
         self.base_loss = base_loss
         w = list(weights)
@@ -317,10 +312,9 @@ class DeepSupervisionLoss(nn.Module):
 
     def forward(
         self,
-        preds: Union[torch.Tensor, List[torch.Tensor]],
-        target: torch.Tensor,
-        weight_map: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        preds     : Union[torch.Tensor, List[torch.Tensor]],
+        target    : torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 旁路：单 tensor（DS 上游禁用或推理时）。
         if isinstance(preds, torch.Tensor):
             return self.base_loss(preds, target, weight_map=weight_map)
@@ -328,8 +322,7 @@ class DeepSupervisionLoss(nn.Module):
         if len(preds) != len(self.weights):
             raise ValueError(
                 f"Number of predictions ({len(preds)}) must match number "
-                f"of DS weights ({len(self.weights)})"
-            )
+                f"of DS weights ({len(self.weights)})")
 
         total = preds[0].new_zeros(())
         for w, pred in zip(self.weights, preds):
@@ -345,12 +338,10 @@ class DeepSupervisionLoss(nn.Module):
                     )
                 else:
                     tgt_i = F.interpolate(
-                        target, size=pred.shape[2:], mode="nearest"
-                    )
+                        target, size=pred.shape[2:], mode="nearest")
                     if weight_map is not None:
                         wm_i = F.interpolate(
-                            weight_map, size=pred.shape[2:], mode="nearest"
-                        )
+                            weight_map, size=pred.shape[2:], mode="nearest")
             total = total + w * self.base_loss(pred, tgt_i, weight_map=wm_i)
         return total
 
@@ -636,12 +627,11 @@ class SoftCLDiceLoss(nn.Module):
 # ---------------------------------------------------------------------------
 def _build_dice(cfg: LossConfig, cw: Optional[List[float]]) -> BinaryDiceLoss:
     return BinaryDiceLoss(
-        smooth=cfg.dice_smooth,
-        squared=cfg.dice_squared,
-        batch_dice=getattr(cfg, "batch_dice", False),
-        ignore_empty=getattr(cfg, "ignore_empty", False),
-        class_weights=cw,
-    )
+        smooth        = cfg.dice_smooth,
+        squared       = cfg.dice_squared,
+        batch_dice    = getattr(cfg, "batch_dice", False),
+        ignore_empty  = getattr(cfg, "ignore_empty", False),
+        class_weights = cw)
 
 
 def _build_bce(cfg: LossConfig, cw: Optional[List[float]]) -> BCELoss:
@@ -709,32 +699,26 @@ def _build_cldice(
 
 
 _SINGLE_BUILDERS = {
-    "dice": _build_dice,
-    "bce": _build_bce,
-    "focal": _build_focal,
-    "tversky": _build_tversky,
-    # New (Round "high-quality losses")
-    "gdl": _build_gdl,
+    "dice"         : _build_dice,
+    "bce"          : _build_bce,
+    "focal"        : _build_focal,
+    "tversky"      : _build_tversky,
+    "gdl"          : _build_gdl,
     "focal_tversky": _build_focal_tversky,
-    "lovasz": _build_lovasz,
-    "cldice": _build_cldice,
-}
+    "lovasz"       : _build_lovasz,
+    "cldice"       : _build_cldice}
 
 _COMPOUND_BUILDERS = {
-    "dice_bce": (_build_dice, _build_bce),
-    "dice_focal": (_build_dice, _build_focal),
-    "dice_tversky": (_build_dice, _build_tversky),
-    # New compounds.
-    # NOTE: "focal_tversky" by itself is a single loss now (the standalone
-    # Focal-Tversky); to combine Focal + Tversky use "focal_plus_tversky".
+    "dice_bce"          : (_build_dice, _build_bce),
+    "dice_focal"        : (_build_dice, _build_focal),
+    "dice_tversky"      : (_build_dice, _build_tversky),
     "focal_plus_tversky": (_build_focal, _build_tversky),
-    "dice_cldice": (_build_dice, _build_cldice),          # Shit et al. recipe
+    "dice_cldice"       : (_build_dice, _build_cldice),          # Shit et al. recipe
     "dice_focal_tversky": (_build_dice, _build_focal_tversky),
-    "dice_lovasz": (_build_dice, _build_lovasz),
-    "bce_lovasz": (_build_bce, _build_lovasz),
-    "gdl_bce": (_build_gdl, _build_bce),
-    "gdl_focal": (_build_gdl, _build_focal),
-}
+    "dice_lovasz"       : (_build_dice, _build_lovasz),
+    "bce_lovasz"        : (_build_bce, _build_lovasz),
+    "gdl_bce"           : (_build_gdl, _build_bce),
+    "gdl_focal"         : (_build_gdl, _build_focal)}
 
 
 def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
@@ -750,35 +734,27 @@ def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
 
 
 class MultiResolutionLoss(nn.Module):
-    """多分辨率 label 格式包装。模型输出 (B, num_fg*C_res, D,H,W)、label (B, C_res, D,H,W) 整数。
-    按 C_res 拆 pred、逐尺度 binary 化 label、逐分辨率 base_loss 后取均。。"""
+    """多分辨率损失。
+    输入预测值 (B, num_fg*C_res, D,H,W)、标签 (B, C_res, D,H,W) 。
+    按 C_res 拆 pred、逐尺度 binary 化 label、逐分辨率 base_loss 后取均。"""
 
-    def __init__(
-        self,
-        base_loss: nn.Module,
-        num_fg_classes: int,
-        num_res: int,
-        label_values: List[int],
-    ):
+    def __init__(self, base_loss: nn.Module, num_fg_classes: int, num_res: int, label_values: List[int]):
         super().__init__()
-        self.base_loss = base_loss
-        self.num_fg = num_fg_classes
-        self.num_res = num_res
+        self.base_loss    = base_loss
+        self.num_fg       = num_fg_classes
+        self.num_res      = num_res
         self.label_values = label_values
-        self.fg_values = label_values[1:]  # exclude background
+        self.fg_values    = label_values[1:]  # exclude background
 
     def forward(
-        self,
-        pred: torch.Tensor,
-        label_raw: torch.Tensor,
-        weight_map: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """跨全部分辨率计算损失并取均。pred (B,num_fg*C_res,*); label_raw (B,C_res,*) 整数。。"""
+        self, pred: torch.Tensor, label_raw: torch.Tensor, weight_map: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+        """跨全部分辨率计算损失并取均。pred (B,num_fg*C_res,*); label_raw (B,C_res,*) 。"""
         total = pred.new_zeros(())
 
         for r in range(self.num_res):
-            pred_r = pred[:, r * self.num_fg:(r + 1) * self.num_fg]
-            lbl_r = label_raw[:, r]
+            pred_r   = pred[:, r * self.num_fg:(r + 1) * self.num_fg]
+            lbl_r    = label_raw[:, r]
             target_r = self._label_to_binary(lbl_r)
 
             # 逐分辨率 weight_map：(B,D,H,W) → (B,1,D,H,W)。
@@ -786,7 +762,7 @@ class MultiResolutionLoss(nn.Module):
             if weight_map is not None:
                 wm_r = weight_map[:, r:r + 1]  # (B, 1, D, H, W)
 
-            total = total + self.base_loss(pred_r, target_r, weight_map=wm_r)
+            total = total + self.base_loss(pred_r, target_r, weight_map=wm_r)  # TODO 主路径是否应该权重更大？
 
         return total / self.num_res
 
@@ -795,14 +771,14 @@ class MultiResolutionLoss(nn.Module):
         fg = torch.tensor(self.fg_values, device=label.device, dtype=label.dtype)
         # label (B,D,H,W) → (B,1,D,H,W); fg (num_fg,) → (1,num_fg,1,1,1)。
         label_exp = label.unsqueeze(1)
-        fg_exp = fg.reshape(1, -1, *([1] * (label.ndim - 1)))
+        fg_exp    = fg.reshape(1, -1, *([1] * (label.ndim - 1)))
         return (label_exp == fg_exp).float()
 
     def split_for_metrics(
-        self, pred: torch.Tensor, label_raw: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, pred: torch.Tensor, label_raw: torch.Tensor
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
         """为指标抽取首分辨率（3D）二值化：返 (pred_1x, target_1x)，均 (B,num_fg,*spatial)。。"""
-        pred_1x = pred[:, :self.num_fg]
+        pred_1x   = pred[:, :self.num_fg]
         target_1x = self._label_to_binary(label_raw[:, 0])
         return pred_1x, target_1x
 
@@ -824,13 +800,7 @@ class SliceChannelLoss(nn.Module):
     _VALID_REDUCTIONS = ("per_slice", "per_volume")
 
     def __init__(
-        self,
-        base_loss: nn.Module,
-        num_fg_classes: int,
-        num_slices: int,
-        label_values: List[int],
-        reduction: str = "per_slice",
-    ):
+        self, base_loss: nn.Module, num_fg_classes: int, num_slices: int, label_values: List[int], reduction: str = "per_slice"):
         super().__init__()
         if num_slices < 1:
             raise ValueError(f"num_slices must be >= 1, got {num_slices}")
@@ -838,12 +808,13 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"reduction must be one of {self._VALID_REDUCTIONS}, "
                 f"got {reduction!r}")
-        self.base_loss = base_loss
-        self.num_fg = num_fg_classes
-        self.num_slices = num_slices
+
+        self.base_loss    = base_loss
+        self.num_fg       = num_fg_classes
+        self.num_slices   = num_slices
         self.label_values = label_values
-        self.fg_values = label_values[1:]  # exclude background
-        self.reduction = reduction
+        self.fg_values    = label_values[1:]  # exclude background
+        self.reduction    = reduction
 
         # 构造时验长：forward 重读 base_loss.class_weights（跟随 device 定位，不复制 buffer）。
         cw_buf = getattr(base_loss, "class_weights", None)
@@ -864,15 +835,16 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"SliceChannelLoss expects (B, D, H, W) raw label, "
                 f"got rank-{label_raw.ndim}")
+
         B, D, H, W = label_raw.shape
         if D != self.num_slices:
             raise ValueError(
                 f"label slice count {D} != configured num_slices "
                 f"{self.num_slices}")
-        fg = torch.tensor(self.fg_values,
-                          device=label_raw.device, dtype=label_raw.dtype)
-        flat = label_raw.reshape(B * D, H, W).unsqueeze(1)         # (B*D, 1, H, W)
+
+        fg   = torch.tensor(self.fg_values, device=label_raw.device, dtype=label_raw.dtype)
         fg_b = fg.reshape(1, -1, 1, 1)                              # (1, num_fg, 1, 1)
+        flat = label_raw.reshape(B * D, H, W).unsqueeze(1)          # (B*D, 1, H, W)
         return (flat == fg_b).float()                               # (B*D, num_fg, H, W)
 
     def _split_pred(self, pred: torch.Tensor) -> torch.Tensor:
@@ -881,8 +853,9 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"SliceChannelLoss expects (B, num_fg*D, H, W) pred, "
                 f"got rank-{pred.ndim}")
+
         B, total_c, H, W = pred.shape
-        D = self.num_slices
+        D                = self.num_slices
         if total_c != self.num_fg * D:
             raise ValueError(
                 f"pred channel count {total_c} != num_fg*D = "
@@ -903,6 +876,7 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"SliceChannelLoss expects (B, D, H, W) weight_map, "
                 f"got rank-{weight_map.ndim}")
+
         B, D, H, W = weight_map.shape
         if D != num_slices:
             raise ValueError(
@@ -918,8 +892,9 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"SliceChannelLoss expects (B, num_fg*D, H, W) pred, "
                 f"got rank-{pred.ndim}")
+
         B, total_c, H, W = pred.shape
-        D = self.num_slices
+        D                = self.num_slices
         if total_c != self.num_fg * D:
             raise ValueError(
                 f"pred channel count {total_c} != num_fg*D = "
@@ -932,21 +907,22 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"SliceChannelLoss expects (B, D, H, W) raw label, "
                 f"got rank-{label_raw.ndim}")
+
         B, D, H, W = label_raw.shape
         if D != self.num_slices:
             raise ValueError(
                 f"label slice count {D} != configured num_slices "
                 f"{self.num_slices}")
-        fg = torch.tensor(self.fg_values,
-                          device=label_raw.device, dtype=label_raw.dtype)
-        flat = label_raw.unsqueeze(1)                               # (B, 1, D, H, W)
+
+        fg   = torch.tensor(self.fg_values, device=label_raw.device, dtype=label_raw.dtype)
         fg_b = fg.reshape(1, -1, 1, 1, 1)                            # (1, num_fg, 1, 1, 1)
+        flat = label_raw.unsqueeze(1)                                # (B, 1, D, H, W)
         return (flat == fg_b).float()                                # (B, num_fg, D, H, W)
 
     @staticmethod
     def _wmap_to_5d(
-        weight_map: Optional[torch.Tensor], num_slices: int,
-    ) -> Optional[torch.Tensor]:
+        weight_map: Optional[torch.Tensor], num_slices: int
+        ) -> Optional[torch.Tensor]:
         """(B,D,H,W) → (B,1,D,H,W) 供 base loss 广播。"""
         if weight_map is None:
             return None
@@ -954,6 +930,7 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"SliceChannelLoss expects (B, D, H, W) weight_map, "
                 f"got rank-{weight_map.ndim}")
+
         B, D, H, W = weight_map.shape
         if D != num_slices:
             raise ValueError(
@@ -963,53 +940,47 @@ class SliceChannelLoss(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-    def _aggregate_per_class(
-        self, terms: List[torch.Tensor]) -> torch.Tensor:
+    def _aggregate_per_class(self, terms: List[torch.Tensor]) -> torch.Tensor:
         """逐类损失汇总为最终标量：cw=None 时简单均值；否则 Σ w_c·L_c/Σ w_c（幅值与 cw 选择无关）。。"""
         if not terms:
             # num_fg==0 会被 Config.validate 拒；保留分支避免退化构造崩。
             raise RuntimeError(
                 "SliceChannelLoss._aggregate_per_class got 0 terms")
         stacked = torch.stack(terms)  # (num_fg,)
-        cw_buf = getattr(self.base_loss, "class_weights", None)
+        cw_buf  = getattr(self.base_loss, "class_weights", None)
         if cw_buf is None:
             return stacked.mean()
         cw = cw_buf.to(stacked.device).to(stacked.dtype)
         return (stacked * cw).sum() / cw.sum().clamp(min=EPS)
 
     def forward(
-        self,
-        pred: torch.Tensor,
-        label_raw: torch.Tensor,
-        weight_map: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        self, pred: torch.Tensor, label_raw: torch.Tensor, weight_map: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
         """按配置的 reduction 计逐类均值损失。"""
         if self.reduction == "per_volume":
-            pred_5d = self._split_pred_5d(pred)              # (B, num_fg, D, H, W)
-            target_5d = self._label_to_binary_5d(label_raw)  # (B, num_fg, D, H, W)
-            wm_5d = self._wmap_to_5d(weight_map, self.num_slices)
+            pred_5d   = self._split_pred_5d(pred)              # (B, num_fg, D, H, W)
+            target_5d = self._label_to_binary_5d(label_raw)    # (B, num_fg, D, H, W)
+            wm_5d     = self._wmap_to_5d(weight_map, self.num_slices)
 
             # 3D 二值分割逐类循环：Dice/Tversky 跨 (D,H,W) 汇总，空切与非空切共享分母。
             terms: List[torch.Tensor] = []
             for c in range(self.num_fg):
-                pred_c = pred_5d[:, c:c + 1]                 # (B, 1, D, H, W)
+                pred_c   = pred_5d[:, c:c + 1]               # (B, 1, D, H, W)
                 target_c = target_5d[:, c:c + 1]             # (B, 1, D, H, W)
-                terms.append(self.base_loss(
-                    pred_c, target_c, weight_map=wm_5d))
+                terms.append(self.base_loss(pred_c, target_c, weight_map=wm_5d))
             return self._aggregate_per_class(terms)
 
-        # 默认 per_slice (rank-4)。
-        pred_flat = self._split_pred(pred)                  # (B*D, num_fg, H, W)
+        # 默认 per_slice
+        pred_flat   = self._split_pred(pred)                # (B*D, num_fg, H, W)
         target_flat = self._label_to_binary(label_raw)      # (B*D, num_fg, H, W)
-        wm_flat = self._flatten_weight_map(weight_map, self.num_slices)
+        wm_flat     = self._flatten_weight_map(weight_map, self.num_slices)
 
         # 逐 fg 类传单通道二值张量使 base_loss 作为独立 2D 二值分割。
         terms = []
         for c in range(self.num_fg):
-            pred_c = pred_flat[:, c:c + 1]                  # (B*D, 1, H, W)
+            pred_c   = pred_flat[:, c:c + 1]                # (B*D, 1, H, W)
             target_c = target_flat[:, c:c + 1]              # (B*D, 1, H, W)
-            terms.append(
-                self.base_loss(pred_c, target_c, weight_map=wm_flat))
+            terms.append(self.base_loss(pred_c, target_c, weight_map=wm_flat))
         return self._aggregate_per_class(terms)
 
     def split_for_metrics(
@@ -1026,19 +997,18 @@ class SliceChannelLoss(nn.Module):
 
 def build_loss(cfg: LossConfig) -> nn.Module:
     """按 cfg 构造损失（全部逐类独立 sigmoid 二值）。"""
-    cw = list(cfg.class_weights) if cfg.class_weights else None
+    cw   = list(cfg.class_weights) if cfg.class_weights else None
     name = cfg.name.lower()
 
     if name in _SINGLE_BUILDERS:
         return _SINGLE_BUILDERS[name](cfg, cw)
 
     if name in _COMPOUND_BUILDERS:
-        builders = _COMPOUND_BUILDERS[name]
+        builders   = _COMPOUND_BUILDERS[name]
         components = [b(cfg, cw) for b in builders]
-        weights = _compound_weights(cfg, len(components))
+        weights    = _compound_weights(cfg, len(components))
         return CompoundLoss(components, weights)
 
     supported = sorted(
-        list(_SINGLE_BUILDERS.keys()) + list(_COMPOUND_BUILDERS.keys())
-    )
+        list(_SINGLE_BUILDERS.keys()) + list(_COMPOUND_BUILDERS.keys()))
     raise ValueError(f"Unknown loss: {cfg.name!r}. Supported: {supported}")

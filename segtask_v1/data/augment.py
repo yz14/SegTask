@@ -15,8 +15,8 @@ class GPUAugmentor:
     """GPU 3D 增强管道。max_scale 为输入多分辨率最大 scale，用于缩小 elastic_deform_alpha，使最大物理通道位移 ≤ alpha 体素。"""
 
     def __init__(self, cfg: AugConfig, max_scale: float = 1.0):
-        self.cfg = cfg
-        self.enabled = cfg.enabled
+        self.cfg       = cfg
+        self.enabled   = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
         # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。仅 affine/elastic 动 wmap。
         wmode = getattr(cfg, "wmap_interp_mode", "nearest")
@@ -27,9 +27,8 @@ class GPUAugmentor:
         self.wmap_interp_mode = wmode
 
     def __call__(
-        self, image: torch.Tensor, label: torch.Tensor,
-        weight_map: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        self, image: torch.Tensor, label: torch.Tensor, weight_map: Optional[torch.Tensor] = None
+        ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """对 batch 应用增强；返回 (image, label, weight_map)。"""
         if not self.enabled:
             return image, label, weight_map
@@ -38,8 +37,7 @@ class GPUAugmentor:
 
         # Spatial: flip / affine / elastic / grid-dropout
         image, label, weight_map = _random_flip(
-            image, label, c.random_flip_prob, c.random_flip_axes,
-            weight_map=weight_map)
+            image, label, c.random_flip_prob, c.random_flip_axes, weight_map=weight_map)
         image, label, weight_map = _random_affine(
             image, label, c.random_affine_prob, c.random_rotate_range,
             c.random_scale_range, weight_map=weight_map,
@@ -76,7 +74,7 @@ def _random_flip(
     for axis in axes:
         mask = torch.rand(B, device=image.device) < prob  # (B,) bool
         if mask.any():
-            idx = mask.nonzero(as_tuple=True)[0]
+            idx        = mask.nonzero(as_tuple=True)[0]
             image[idx] = torch.flip(image[idx], [axis])  # axis indexes into (B,C,D,H,W)
             label[idx] = torch.flip(label[idx], [axis])
             if weight_map is not None:

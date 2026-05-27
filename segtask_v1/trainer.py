@@ -47,9 +47,8 @@ logger = logging.getLogger(__name__)
 
 
 _AMP_DTYPES = {
-    "float16": torch.float16, "fp16": torch.float16,
-    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-}
+    "float16" : torch.float16, "fp16": torch.float16,
+    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16}
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +82,14 @@ def _cuda_supports_bf16() -> bool:
 def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     tc = cfg.train
     params = [p for p in model.parameters() if p.requires_grad]
-    if tc.optimizer == "adamw":
+    if   tc.optimizer == "adamw":
         return torch.optim.AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
     elif tc.optimizer == "adam":
         return torch.optim.Adam(params, lr=tc.lr, weight_decay=tc.weight_decay)
     elif tc.optimizer == "sgd":
         return torch.optim.SGD(
             params, lr=tc.lr, weight_decay=tc.weight_decay,
-            momentum=tc.momentum, nesterov=tc.nesterov,
-        )
+            momentum=tc.momentum, nesterov=tc.nesterov)
     raise ValueError(f"Unknown optimizer: {tc.optimizer}")
 
 
@@ -257,7 +255,7 @@ class Trainer:
         self.lift_2_5d_to_3d = bool(
             getattr(cfg.model, "lift_2_5d_to_3d", False) and self.is_2_5d)
 
-        # 提前决定，便于按视图构造 SliceChannelLoss。
+        # 2.5D时aux为原尺寸
         self.aux_keep_native_d = bool(
             getattr(cfg.data, "aux_keep_native_d", False)
             and self.is_2_5d
@@ -265,15 +263,14 @@ class Trainer:
         self.aux_view_depths: List[int] = (
             list(cfg.aux_view_depths) if self.aux_keep_native_d else [])
 
-        # keep_native_multi_res：aux_keep_native_d 的 3D 对应（z_axis/cubic），
-        # dataset 发单 max-FOV cube；trainer 逐视图中心裁 + resize 回 patch_size。
+        # 3D多分辨率输入
         self.keep_native_multi_res = bool(
             getattr(cfg.data, "keep_native_multi_res", False)
             and not self.is_2_5d
             and cfg.data.patch_mode in ("z_axis", "cubic")
             and len(cfg.data.multi_res_scales) > 1)
         if self.keep_native_multi_res:
-            # 逐视图原生尺寸：z_axis 仅缩 D；cubic 缩 3 轴。
+            # 每个视图的原始尺寸：z_axis 仅缩 D；cubic 缩 3 轴。
             pD, pH, pW = (int(x) for x in cfg.data.patch_size)
             self._mr_native_sizes: List[Tuple[int, int, int]] = []
             for s in cfg.data.multi_res_scales:
@@ -293,13 +290,12 @@ class Trainer:
         # 3D pred (B, num_fg*C_res, ...)；2.5D pred (B, num_fg*D, H, W) + label (B, D, H, W)。
         if self.is_2_5d and not self.lift_2_5d_to_3d:
             num_slices = int(cfg.data.patch_size[0])
-            inner = SliceChannelLoss(
-                base_loss=self.base_loss,
-                num_fg_classes=cfg.num_fg_classes,
-                num_slices=num_slices,
-                label_values=cfg.data.label_values,
-                reduction=cfg.loss.slice_loss_reduction,
-            )
+            inner      = SliceChannelLoss(  # 2D切片损失
+                base_loss      = self.base_loss,
+                num_fg_classes = cfg.num_fg_classes,
+                num_slices     = num_slices,
+                label_values   = cfg.data.label_values,
+                reduction      = cfg.loss.slice_loss_reduction)
             num_res = 1   # 仅日志用；SliceChannelLoss 内部 C_res==1
             logger.info(
                 "Loss: %s [2.5D, reduction=%s], num_slices=%d, fg_classes=%d",
@@ -312,12 +308,11 @@ class Trainer:
                 num_res = 1
             else:
                 num_res = len(cfg.data.multi_res_scales)
-            inner = MultiResolutionLoss(
-                base_loss=self.base_loss,
-                num_fg_classes=cfg.num_fg_classes,
-                num_res=num_res,
-                label_values=cfg.data.label_values,
-            )
+            inner = MultiResolutionLoss(  # 3D体积损失
+                base_loss      = self.base_loss,
+                num_fg_classes = cfg.num_fg_classes,
+                num_res        = num_res,
+                label_values   = cfg.data.label_values)
             logger.info(
                 "Loss: %s, scales=%d, fg_classes=%d%s",
                 cfg.loss.name, num_res, cfg.num_fg_classes,
@@ -338,7 +333,7 @@ class Trainer:
             and self.is_2_5d
             and n_views_data > 1)
         if self.aux_seg_supervision:
-            n_aux = n_views_data - 1
+            n_aux  = n_views_data - 1
             user_w = list(getattr(cfg.loss, "aux_supervision_weights", []))
             if not user_w:
                 # 几何衰减：越宽 FOV 对齐越差，权重越小。
@@ -477,8 +472,8 @@ class Trainer:
         # z_axis/cubic：dataset 发超尺寸 patch，增强后中心裁回 patch_size。
         # aux_keep_native_d (2.5D)：dataset 发 max-FOV cube，保留全尺寸供 aux 视图。
         if self.aux_keep_native_d:
-            max_scale = max(cfg.data.multi_res_scales)
-            target_d_native = int(round(int(cfg.data.patch_size[0]) * max_scale))
+            max_scale              = max(cfg.data.multi_res_scales)
+            target_d_native        = int(round(int(cfg.data.patch_size[0]) * max_scale))
             self.target_patch_size = (target_d_native,
                                       int(cfg.data.patch_size[1]),
                                       int(cfg.data.patch_size[2]))
@@ -495,11 +490,10 @@ class Trainer:
                 int(cfg.model.in_channels))
         elif self.keep_native_multi_res:
             # 3D 懒抽取：保留全 max-FOV，后面逐视图裁+resize。z_axis 仅缩 z，cubic 缩 3 轴。
-            max_scale = max(cfg.data.multi_res_scales)
+            max_scale  = max(cfg.data.multi_res_scales)
             pD, pH, pW = (int(x) for x in cfg.data.patch_size)
             if cfg.data.patch_mode == "z_axis":
-                self.target_patch_size = (
-                    int(round(pD * max_scale)), pH, pW)
+                self.target_patch_size = (int(round(pD * max_scale)), pH, pW)
             else:  # cubic
                 self.target_patch_size = (
                     int(round(pD * max_scale)),
@@ -527,13 +521,12 @@ class Trainer:
         self.grad_accum_steps = max(tc.grad_accum_steps, 1)
 
         # --- Tracking --------------------------------------------------
-        self.num_fg = cfg.num_fg_classes
-        self._best_mode = tc.save_best_mode  # "max" or "min"
-        self.best_metric: float = (
-            -math.inf if self._best_mode == "max" else math.inf)
-        self.has_best = False
-        self.best_epoch = 0
-        self.start_epoch = 0
+        self.num_fg           = cfg.num_fg_classes
+        self._best_mode       = tc.save_best_mode  # "max" or "min"
+        self.best_metric      = (-math.inf if self._best_mode == "max" else math.inf)
+        self.has_best         = False
+        self.best_epoch       = 0
+        self.start_epoch      = 0
         self.patience_counter = 0
 
         # --- Output directory -----------------------------------------
@@ -668,7 +661,6 @@ class Trainer:
         logger.info("=" * 60)
 
         best_metrics: Dict[str, float] = {}
-
         for epoch in range(self.start_epoch, tc.epochs):
             train_metrics = self._train_epoch(epoch)
 
@@ -775,45 +767,40 @@ class Trainer:
         loss_meter = AverageMeter()
         dice_meter = AverageMeter()
         # 逐分量 meter（L_main / L_aux_k），首 batch 延初始化。
-        component_meters: Dict[str, AverageMeter] = {}
-        tc    = self.cfg.train
-        accum = self.grad_accum_steps
+        component_meters = {}
+        tc               = self.cfg.train
+        accum            = self.grad_accum_steps
 
-        total_steps = len(self.train_loader)
-        # `partial_start` 之后是不整除 accum 的尾巴；那部分除以真尾长，避免有效 LR 缩水。
+        total_steps   = len(self.train_loader)
         remainder     = total_steps % accum if accum > 1 else 0
         partial_start = total_steps - remainder
 
         self.optimizer.zero_grad(set_to_none=True)
-
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
-            # label 以 int16 传输（减半 PCIe 带宽），GPU 上转 fp32 供 augmentor / 损失。
             label = batch["label"].to(self.device, non_blocking=True).float()
             wmap  = batch.get("weight_map")
             if wmap is not None:
                 wmap = wmap.to(self.device, non_blocking=True)
                 if wmap.numel() == 0 or wmap.shape[1] == 0:
-                    wmap = None  # 空 collate 哨兵视为缺失
+                    wmap = None  # 视为缺失
+            
+            image, label, wmap = self.augmentor(image, label, wmap)  # 数据增强
 
-            # GPU 增强：image/label/wmap 共享一次采样的空间变换（label 近邻）。
-            image, label, wmap = self.augmentor(image, label, wmap)
-
-            # 中心裁回 patch_size（增强过采样时）。
+            # oversample时中心裁回 patch_size*max_scale
             if self.needs_crop:
                 image, label, wmap = self._center_crop(image, label, wmap)
 
-            # 3D 懒多分辨率：从 max-FOV cube 重建逐视图 C_res 堆叠。
+            # 3D 懒多分辨率：从 max-FOV cube 重建逐视图，resize到patch_size后通道拼接
             if self.keep_native_multi_res:
-                image, label, wmap = self._split_views_native_3d(
-                    image, label, wmap)
+                image, label, wmap = self._split_views_native_3d(image, label, wmap)
 
-            # 2.5D 适配：将 C_res=1 折入 D。启用 aux 时保留 rank-5 label/wmap 供逐视图索引。
+            # 2.5D 懒多分辨率
             label_all_views: Optional[torch.Tensor] = None
             wmap_all_views : Optional[torch.Tensor] = None
             # aux_keep_native_d 时逐视图 D_k 不同，必须用 list。
             aux_view_labels: Optional[List[torch.Tensor]] = None
-            aux_view_wmaps: Optional[List[Optional[torch.Tensor]]] = None
+            aux_view_wmaps : Optional[List[Optional[torch.Tensor]]] = None
             if self.is_2_5d:
                 if self.lift_2_5d_to_3d and self.aux_seg_supervision:
                     # Lift+aux：image 保 rank-5；label/wmap 逐视图取 [:, k:k+1] 维持 C_res 轴。
@@ -829,8 +816,7 @@ class Trainer:
                         wmap = wmap[:, :1].contiguous()
                 elif self.aux_seg_supervision and self.aux_keep_native_d:
                     # 原生深度路径：forward 前逐视图中心裁，view 0 = 主监督，view k = D_k aux。
-                    (image, label, wmap,
-                     aux_view_labels, aux_view_wmaps) = (
+                    (image, label, wmap, aux_view_labels, aux_view_wmaps) = (
                         self._split_views_native_d(image, label, wmap))
                 elif self.aux_seg_supervision:
                     image, label_all_views, wmap_all_views = (
@@ -842,46 +828,40 @@ class Trainer:
                 else:
                     image, label, wmap = self._squeeze_2_5d(image, label, wmap)
 
-            # 有效累积分母（尾巴 step 用真尾长）。
-            if remainder > 0 and step >= partial_start:
+            # 有效累积分母（尾巴 step 用真尾长）
+            if remainder > 0 and step >= partial_start:  # TODO 不太懂
                 effective_accum = remainder
             else:
                 effective_accum = accum
 
             # Forward 走 AMP，损失下 fp32：Dice/BCE 在 fp16 下汇总易溢出→NaN。
-            with autocast(device_type="cuda", enabled=self.use_amp,
-                          dtype=self.amp_dtype):
+            with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 pred = self.model(image)
             breakdown: Dict[str, float] = {}
+            # aux监督 + aux为原尺寸
             if self.aux_seg_supervision and self.aux_keep_native_d:
-                # 原生深度 aux：aux_view_labels[k] 为 D_k；label/wmap 为 view 0。
                 loss = self._compute_loss_aux_native_d_fp32(
-                    pred, label, wmap,
-                    aux_view_labels, aux_view_wmaps,
-                    breakdown=breakdown)
+                    pred, label, wmap, aux_view_labels, aux_view_wmaps, breakdown=breakdown)
             elif self.aux_seg_supervision:
                 # aux 路径：pred 为 dict，逐视图路由。主路仍走 DS-wrapped criterion。
                 # breakdown 以 detach 标量填 L_main/L_aux_k/w_aux_k/L_total 供诊断。
                 loss = self._compute_loss_aux_fp32(
-                    pred, label_all_views, wmap_all_views,
-                    breakdown=breakdown)
+                    pred, label_all_views, wmap_all_views, breakdown=breakdown)
             else:
                 loss = self._compute_loss_fp32(
                     self.criterion, pred, label, weight_map=wmap)
             if effective_accum > 1:
                 loss = loss / effective_accum
 
-            # Backward（累加到 .grad）。
+            # Backward
             self.scaler.scale(loss).backward()
 
-            # 每 accum 个微步 / epoch 末刷尾 step。
-            is_step_boundary = (
-                (step + 1) % accum == 0 or (step + 1) == total_steps)
+            # 参数更新
+            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_step_boundary:
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(
-                        self.model.parameters(), tc.grad_clip_norm)
+                    nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip_norm)
 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -891,12 +871,10 @@ class Trainer:
                 if self.ema is not None:
                     self.ema.update(self.model)
 
-                # 首个完整 optimizer-step 周期后记一次真实 GPU 峰值（fit 调用中仅一次）。
-                if (not self._first_step_mem_logged
-                        and self.device.type == "cuda"):
+                # 首个完整 optimizer-step 周期后记一次真实 GPU 峰值（fit 调用中仅一次）
+                if (not self._first_step_mem_logged and self.device.type == "cuda"):
                     one_step_peak = (
-                        torch.cuda.max_memory_allocated(self.device)
-                        / (1 << 20))
+                        torch.cuda.max_memory_allocated(self.device) / (1 << 20))
                     logger.info(
                         "Actual one-step GPU peak: %.1f MiB "
                         "(forward + backward + optimizer.step + EMA "
@@ -904,13 +882,11 @@ class Trainer:
                         "training peak should stay close to this; the "
                         "full-epoch peak is reported separately at end "
                         "of each epoch as 'GPU peak (epoch N)'.",
-                        one_step_peak, accum,
-                    )
+                        one_step_peak, accum)
                     self._first_step_mem_logged = True
 
-            # 记录未缩放损失，丢弃非有限值避免污染均值（GradScaler 会跳该 step）。
-            loss_val = (loss.item() * effective_accum
-                        if effective_accum > 1 else loss.item())
+            # 记录未缩放损失，丢弃非有限值避免污染均值（GradScaler 会跳该 step）
+            loss_val = (loss.item() * effective_accum if effective_accum > 1 else loss.item())
             if math.isfinite(loss_val):
                 loss_meter.update(loss_val, image.shape[0])
                 for name, val in breakdown.items():
@@ -933,7 +909,7 @@ class Trainer:
                     # 与模式无关：3D 返 (B,num_fg,*spatial)；2.5D 返 (B*D,num_fg,H,W)。
                     p_1x, lbl_1x = self._inner_loss.split_for_metrics(
                         p.detach(), label)
-                    dice = compute_dice_per_class(p_1x, lbl_1x)
+                    dice      = compute_dice_per_class(p_1x, lbl_1x)
                     mean_dice = dice.mean().item()
                     dice_meter.update(mean_dice, image.shape[0])
                 aux_msg = self._format_breakdown(breakdown)
@@ -1068,11 +1044,8 @@ class Trainer:
 
     @staticmethod
     def _compute_loss_fp32(
-        loss_fn: nn.Module,
-        pred,
-        target: torch.Tensor,
-        weight_map: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        loss_fn: nn.Module, pred, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
         """在 autocast 外以 fp32 调用 loss_fn；pred 裁裁防±inf，整型 label 保持。"""
         c = Trainer._LOGIT_CLAMP
         if isinstance(pred, list):
@@ -1080,7 +1053,7 @@ class Trainer:
         else:
             pred_fp32 = pred.float().clamp(-c, c)
         target_fp32 = target.float() if target.is_floating_point() else target
-        wmap_fp32 = weight_map.float() if weight_map is not None else None
+        wmap_fp32   = weight_map.float() if weight_map is not None else None
         with autocast(device_type="cuda", enabled=False):
             if wmap_fp32 is None:
                 return loss_fn(pred_fp32, target_fp32)
@@ -1099,11 +1072,8 @@ class Trainer:
         return pred
 
     def _split_views_native_3d(
-        self,
-        image: torch.Tensor,
-        label: torch.Tensor,
-        wmap: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        self, image: torch.Tensor, label: torch.Tensor, wmap : Optional[torch.Tensor]
+        ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """3D 懒多分辨率：从 (B,1,eD_max,eH_max,eW_max) max-FOV cube 逐视图裁+resize
         为 (B,C_res,pD,pH,pW)，与旧 False-path 素阶等价（label 近邻，img/wmap 三线性）。"""
         if not self.keep_native_multi_res:
@@ -1129,8 +1099,7 @@ class Trainer:
 
         pD, pH, pW = (int(x) for x in self.cfg.data.patch_size)
 
-        def _center_crop_3d(t: torch.Tensor, sizes: Tuple[int, int, int]
-                             ) -> torch.Tensor:
+        def _center_crop_3d(t: torch.Tensor, sizes: Tuple[int, int, int]) -> torch.Tensor:
             """(B,1,D,H,W) 中心裁出 (d_k,h_k,w_k)。"""
             d_k, h_k, w_k = sizes
             d0 = (tD - d_k) // 2
@@ -1138,26 +1107,21 @@ class Trainer:
             w0 = (tW - w_k) // 2
             return t[:, :, d0:d0 + d_k, h0:h0 + h_k, w0:w0 + w_k]
 
-        img_views: List[torch.Tensor] = []
-        lbl_views: List[torch.Tensor] = []
+        img_views : List[torch.Tensor] = []
+        lbl_views : List[torch.Tensor] = []
         wmap_views: List[torch.Tensor] = []
         for k, sizes in enumerate(self._mr_native_sizes):
-            img_k = _center_crop_3d(image, sizes)
-            lbl_k = _center_crop_3d(label, sizes)
-            wmap_k = (_center_crop_3d(wmap, sizes)
-                      if wmap is not None else None)
+            img_k  = _center_crop_3d(image, sizes)
+            lbl_k  = _center_crop_3d(label, sizes)
+            wmap_k = (_center_crop_3d(wmap, sizes) if wmap is not None else None)
 
             # 记与原生尺寸不同时 resize 回 patch_size；view 0 / 重合轴跳过 interpolate。
             if sizes != (pD, pH, pW):
                 img_k = F.interpolate(
-                    img_k, size=(pD, pH, pW),
-                    mode="trilinear", align_corners=False)
-                # label 用 nearest 保持离散值。
+                    img_k, size=(pD, pH, pW), mode="trilinear", align_corners=False)
                 lbl_k = F.interpolate(lbl_k, size=(pD, pH, pW), mode="nearest")
                 if wmap_k is not None:
-                    wmap_k = F.interpolate(
-                        wmap_k, size=(pD, pH, pW),
-                        mode="trilinear", align_corners=False)
+                    wmap_k = F.interpolate(wmap_k, size=(pD, pH, pW), mode="nearest")
 
             # 每 view 贡献 1 个通道：squeeze(1) 后 stack(dim=1) → (B,C_res,pD,pH,pW)。
             img_views.append(img_k.squeeze(1))
@@ -1173,17 +1137,8 @@ class Trainer:
         return image_out, label_out, wmap_out
 
     def _split_views_native_d(
-        self,
-        image: torch.Tensor,
-        label: torch.Tensor,
-        wmap: Optional[torch.Tensor],
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-        List[torch.Tensor],
-        List[Optional[torch.Tensor]],
-    ]:
+        self, image: torch.Tensor, label: torch.Tensor, wmap: Optional[torch.Tensor]
+        ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], List[torch.Tensor], List[Optional[torch.Tensor]]]:
         """2.5D 懒多分辨率：(B,1,eD_max,H,W) 逐视图中心抽 D_k 切片。
         输出 image (B,ΣD_k,H,W)、view0 作主监督、aux 以 list 返回（D_k 可变）。"""
         if not self.aux_keep_native_d:
@@ -1197,9 +1152,10 @@ class Trainer:
             raise ValueError(
                 "image / label shape mismatch: "
                 f"image={tuple(image.shape)}, label={tuple(label.shape)}")
+
         B, _, eD_max, H, W = image.shape
-        depths = self.aux_view_depths
-        D = depths[0]
+        depths             = self.aux_view_depths  # 各个视图的D
+        D                  = depths[0]
         if eD_max != int(self.target_patch_size[0]):
             raise ValueError(
                 f"native-d split expects depth axis == target_patch_size[0]"
@@ -1217,14 +1173,14 @@ class Trainer:
             return t[:, 0, d0:d0 + d_k].contiguous()  # (B, d_k, H, W)
 
         # ---- View 0：主监督目标 (B,D,H,W) -----------------------------
-        view0_img = _center_slab(image, D)
+        view0_img  = _center_slab(image, D)
         label_main = _center_slab(label, D)
-        wmap_main = _center_slab(wmap, D) if wmap is not None else None
+        wmap_main  = _center_slab(wmap, D) if wmap is not None else None
 
         # ---- Aux views ---------------------------------------------------
-        aux_imgs: List[torch.Tensor] = []
-        aux_labels: List[torch.Tensor] = []
-        aux_wmaps: List[Optional[torch.Tensor]] = []
+        aux_imgs  : List[torch.Tensor]           = []
+        aux_labels: List[torch.Tensor]           = []
+        aux_wmaps : List[Optional[torch.Tensor]] = []
         for d_k in depths[1:]:
             aux_imgs.append(_center_slab(image, d_k))
             aux_labels.append(_center_slab(label, d_k))
@@ -1234,7 +1190,7 @@ class Trainer:
         if aux_imgs:
             image_2d = torch.cat([view0_img] + aux_imgs, dim=1).contiguous()
         else:
-            # 防御：按约 aux_keep_native_d 要求 n_views>1，但退化为单视图。
+            # 退化为单视图。
             image_2d = view0_img.contiguous()
         expected_in = sum(depths)
         if image_2d.shape[1] != expected_in:
@@ -1244,17 +1200,13 @@ class Trainer:
         return image_2d, label_main, wmap_main, aux_labels, aux_wmaps
 
     def _compute_loss_aux_native_d_fp32(
-        self,
-        pred,
-        label_main: torch.Tensor,
-        wmap_main: Optional[torch.Tensor],
+        self, pred, label_main: torch.Tensor, wmap_main : Optional[torch.Tensor],
         aux_labels: Optional[List[torch.Tensor]],
-        aux_wmaps: Optional[List[Optional[torch.Tensor]]],
-        breakdown: Optional[Dict[str, float]] = None,
-    ) -> torch.Tensor:
-        """原生深度 aux 损失聚合：aux 目标以 list 传入，逐视图走自己的 SliceChannelLoss。
+        aux_wmaps : Optional[List[Optional[torch.Tensor]]],
+        breakdown : Optional[Dict[str, float]] = None) -> torch.Tensor:
+        """逐视图走自己的 SliceChannelLoss。
         公式与 breakdown schema 与 _compute_loss_aux_fp32 一致。"""
-        if isinstance(pred, dict):
+        if isinstance(pred, dict):  # aux监督时是字典
             main_pred = pred["main"]
             aux_preds = pred.get("aux", []) or []
         else:
@@ -1285,11 +1237,9 @@ class Trainer:
         for k_idx, (ap, w_k, loss_k, lbl_k) in enumerate(zip(
                 aux_preds, self.aux_weights, self.aux_inner_losses, aux_labels)):
             view_k = k_idx + 1
-            wm_k = (aux_wmaps[k_idx]
-                    if aux_wmaps is not None else None)
-            aux_l = self._compute_loss_fp32(
-                loss_k, ap, lbl_k, weight_map=wm_k)
-            total = total + w_k * aux_l
+            wm_k   = (aux_wmaps[k_idx] if aux_wmaps is not None else None)
+            aux_l  = self._compute_loss_fp32(loss_k, ap, lbl_k, weight_map=wm_k)
+            total  = total + w_k * aux_l
             if breakdown is not None:
                 breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())
                 breakdown[f"w_aux_{view_k}"] = float(w_k)
@@ -1410,10 +1360,9 @@ class Trainer:
         self,
         image: torch.Tensor,
         label: torch.Tensor,
-        wmap: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        wmap : Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """增强后将超尺寸 tensor 中心裁回 target_patch_size。"""
-        tD, tH, tW = self.target_patch_size
+        tD, tH, tW    = self.target_patch_size
         _, _, D, H, W = image.shape
         d0, h0, w0 = (D - tD) // 2, (H - tH) // 2, (W - tW) // 2
         image = image[:, :, d0:d0 + tD, h0:h0 + tH, w0:w0 + tW]

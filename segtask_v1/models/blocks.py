@@ -91,8 +91,7 @@ class ConvNormAct(nn.Module):
         spatial_dims: int = 3):
         super().__init__()
         d = _check_dims(spatial_dims)
-        self.conv = _CONV[d](
-            in_ch, out_ch, kernel_size, stride, padding, bias=False)
+        self.conv = _CONV[d](in_ch, out_ch, kernel_size, stride, padding, bias=False)
         self.norm = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act  = get_activation(activation)
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()

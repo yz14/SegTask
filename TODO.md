@@ -49,4 +49,6 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 5 有的代码注释太详细了，详细到影响阅读代码了，不需要像写文章那样写的这么细致，总结性的一两句话描述关键信息即可。如果某个参数有多个选项，则给两个示例，并简要描述意义即可。可以参考D:\codes\work-projects\SegTask\segtask_v1\config.py这里的注释。  
 
-6 训练阶段数据读取只接受npz，没有npz则先make，请检查数据准备和数据读取这块全部代码，是否有旧代码需要删除。并且，npz里面已经算好了fg_slice和fg_coor（请确认），所以数据读取里面对应的旧代码也需要删除？预测阶段只接收读取原始nii图像后，预处理，再预测（模拟真实场景）。
+6 D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py这里的不同数据的读取，里面有很多公用的函数，很多是可以复用的，是否可以写一个通用的读取方法类，然后不同的方法再去继承会好一些呢？
+
+7 torch的所有reshape的操作全部替换为einops

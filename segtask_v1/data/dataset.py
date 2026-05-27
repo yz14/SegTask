@@ -283,7 +283,7 @@ def compute_region_weight_map(
     volume: np.ndarray, label_values: List[int],
     region_weights: List[float]) -> np.ndarray:
     """由整数 label 与逐值权重生成 (1,D,H,W) fp32 区域权重图；未命中标签赋 1.0。"""
-    vol = np.round(volume).astype(np.int32)
+    vol  = np.round(volume).astype(np.int16)  # int16已经足够
     wmap = np.ones_like(vol, dtype=np.float32)
     for lv, w in zip(label_values, region_weights):
         wmap[vol == lv] = w
@@ -526,12 +526,12 @@ class SegDataset3D(Dataset):
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
 
-        # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw。
-        self._npz_paths: List[str] = list(npz_paths)
+        # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw
+        self._npz_paths       : List[str] = list(npz_paths)
         self._npz_has_rw_cache: Dict[int, bool] = {}
 
-        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样。
-        self._vol_fg_slices: List[np.ndarray] = []
+        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样
+        self._vol_fg_slices : List[np.ndarray] = []
         self._vol_all_slices: List[int] = []
         self._build_index()
 
@@ -540,12 +540,12 @@ class SegDataset3D(Dataset):
         logger.info(
             "Loading pre-computed fg indices from %d npz packages...",
             len(self._npz_paths))
-        total_fg = 0
+        total_fg     = 0
         total_slices = 0
         for path in self._npz_paths:
-            f = _open_npz(path)
+            f  = _open_npz(path)
             fg = np.asarray(f["fg_slices"], dtype=np.int32)
-            D = int(f["image"].shape[0])
+            D  = int(f["image"].shape[0])
             self._vol_fg_slices.append(fg)
             self._vol_all_slices.append(D)
             total_fg += len(fg)
@@ -556,7 +556,7 @@ class SegDataset3D(Dataset):
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         """加载+预处理 image（npz，带缓存）。"""
-        path = self._npz_paths[vol_idx]
+        path   = self._npz_paths[vol_idx]
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
@@ -568,7 +568,7 @@ class SegDataset3D(Dataset):
 
     def _load_label(self, vol_idx: int) -> np.ndarray:
         """加载原始 int16 label（npz，带缓存）。"""
-        path = self._npz_paths[vol_idx]
+        path   = self._npz_paths[vol_idx]
         cached = self._lbl_cache.get(path)
         if cached is not None:
             return cached
@@ -611,6 +611,8 @@ class SegDataset3D(Dataset):
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
 
+
+        # TODO: _getitem_native_d和_getitem_native_multi_res_z是一样的功能，是否可以用一个来通用。现在必须是只输出最大分辨率那个，然后在train的过程中中心检查得到多个分辨率，所以这里需要改
         # 原生深度多 FOV 简化路径（发单 max-FOV cube，trainer 增强后逐视图裁）。
         if self.aux_keep_native_d:
             return self._getitem_native_d(vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
@@ -620,60 +622,16 @@ class SegDataset3D(Dataset):
         if self.keep_native_multi_res:
             return self._getitem_native_multi_res_z(vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
 
-        # 逐 scale 拼通道。s=1.0 遵 z_boundary_mode；s>1 总使用 edge-replicate 保物理 z-FOV。
-        img_channels: List[np.ndarray] = []
-        lbl_channels: List[np.ndarray] = []
-        wmap_channels: List[np.ndarray] = []
-        for scale in self.multi_res_scales:
-            D_s = int(round(eD * scale))
-            # 抽取路径：s>1 总走 padded；s=1 按 z_boundary_mode。
-            use_padded = (scale != 1.0) or (self.z_boundary_mode == "edge_pad")
-            if use_padded:
-                img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, D_s)
-            else:
-                img_s, lbl_s = self._extract_z_patch(img, lbl, z, D_s)
-            rw_s = (self._extract_z_single(rw_vol, z, D_s, use_padded)
-                    if rw_vol is not None else None)
-
-            # 单次 3D zoom：(actual_d, H_vol, W_vol) → (eD, pH, pW)。
-            img_s = resize_3d(img_s, eD, eH, eW, is_label=False)
-            lbl_s = resize_3d(lbl_s, eD, eH, eW, is_label=True)
-            img_channels.append(img_s)
-            lbl_channels.append(lbl_s)
-
-            # 区域权重优先级：样本文件 > 静态映射。
-            if rw_s is not None:
-                # 线性 resize 保留连续梯度（近邻会量化→噪点）。
-                wmap_s = resize_3d(rw_s, eD, eH, eW, is_label=False)
-                wmap_channels.append(wmap_s)
-            elif self.region_weights:
-                wmap_s = compute_region_weight_map(
-                    lbl_s, self.label_values, self.region_weights)
-                wmap_channels.append(wmap_s[0])  # 去领头 1
-
-        # 按 scale 堆叠为通道 → (C_res, eD, pH, pW)。C_res=1 时与旧 z_axis 输出一致。
-        # label 以 int16 过 PCIe（带宽减半）；image/weight_map 仍 fp32（autocast 需浮点）。
-        result = {
-            "image": torch.from_numpy(
-                np.stack(img_channels, axis=0).astype(np.float32, copy=False)),
-            "label": torch.from_numpy(
-                np.ascontiguousarray(np.stack(lbl_channels, axis=0)))}
-        if wmap_channels:
-            result["weight_map"] = torch.from_numpy(
-                np.stack(wmap_channels, axis=0).astype(np.float32, copy=False))
-        return result
-
     def _getitem_native_d(
         self,
         vol_idx: int,
-        img: np.ndarray,
-        lbl: np.ndarray,
-        rw_vol: Optional[np.ndarray],
-        z: int,
-        eD: int,
-        eH: int,
-        eW: int,
-    ) -> Dict[str, torch.Tensor]:
+        img    : np.ndarray,
+        lbl    : np.ndarray,
+        rw_vol : Optional[np.ndarray],
+        z      : int,
+        eD     : int,
+        eH     : int,
+        eW     : int) -> Dict[str, torch.Tensor]:
         """原生深度多 FOV 路径发单 max-FOV cube (1, eD_max, eH, eW)，eD_max=round(eD*max_scale)。
         trainer.augment+_split_views_native_d 逐视图裁。优点：共享增强/aux 无 z 重采样/低内存。"""
         eD_max = int(round(eD * self._max_scale))
@@ -689,17 +647,16 @@ class SegDataset3D(Dataset):
             # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致；n_views 坍缩为单 cube。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
             # int16 label（同 __getitem__）。
-            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
-        }
-        if rw_s is not None:
-            wmap_s = resize_3d(rw_s, eD_max, eH, eW, is_label=False)
+            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
+        if rw_s is not None:  # TODO 这里也必须用nearest，检查下面代码是否正确
+            rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True)
             result["weight_map"] = torch.from_numpy(
-                wmap_s[None].astype(np.float32, copy=False))
+                rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
-            wmap_s = compute_region_weight_map(
+            rw_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
-                wmap_s.astype(np.float32, copy=False))
+                rw_s.astype(np.float32, copy=False))
         return result
 
     def _getitem_native_multi_res_z(
@@ -729,21 +686,20 @@ class SegDataset3D(Dataset):
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
         }
         if rw_s is not None:
-            wmap_s = resize_3d(rw_s, eD_max, eH, eW, is_label=False)
+            rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True)
             result["weight_map"] = torch.from_numpy(
-                wmap_s[None].astype(np.float32, copy=False))
+                rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
-            wmap_s = compute_region_weight_map(
+            rw_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
-                wmap_s.astype(np.float32, copy=False))
+                rw_s.astype(np.float32, copy=False))
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
         """采样中心 z：以 fg_ratio 概率从前景切片采样，否则均匀采样。"""
         fg_slices = self._vol_fg_slices[vol_idx]
-        if (self.is_train
-            and self.fg_ratio > 0
+        if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
             and np.random.random() < self.fg_ratio):
             return int(np.random.choice(fg_slices))
@@ -769,8 +725,7 @@ class SegDataset3D(Dataset):
         """image+label 同步 edge-padded 抽取（语义见模块级 extract_z_patch_padded）。"""
         return (
             extract_z_patch_padded(img, z_center, D_patch),
-            extract_z_patch_padded(lbl, z_center, D_patch),
-        )
+            extract_z_patch_padded(lbl, z_center, D_patch))
 
     def _extract_z_single(
         self, vol: np.ndarray, z_center: int, D_patch: int,
@@ -792,12 +747,12 @@ def extract_z_patch_padded(
     vol: np.ndarray, z_center: int, D_patch: int) -> np.ndarray:
     """以 z_center 为中心从 vol 抽 D_patch 切片；越界部分 mode='edge' 复制边界。
     保留物理 z-FOV（输出始终 D_patch）；H/W 不动；label 下复制边界近邻值安全。"""
-    D_vol = vol.shape[0]
-    half  = D_patch // 2
-    lo = z_center - half
-    hi = lo + D_patch
-    src_lo = max(lo, 0)
-    src_hi = min(hi, D_vol)
+    D_vol      = vol.shape[0]
+    half       = D_patch // 2
+    lo         = z_center - half
+    hi         = lo + D_patch
+    src_lo     = max(lo, 0)
+    src_hi     = min(hi, D_vol)
     pad_before = max(-lo, 0)
     pad_after  = max(hi - D_vol, 0)
 
@@ -931,9 +886,9 @@ class SegDataset3DCubic(Dataset):
             len(self._npz_paths))
         total_fg = 0
         for path in self._npz_paths:
-            f = _open_npz(path)
+            f      = _open_npz(path)
             coords = np.asarray(f["fg_coords"], dtype=np.int32)
-            shape = tuple(int(s) for s in f["image"].shape)
+            shape  = tuple(int(s) for s in f["image"].shape)
             self._vol_shapes.append(shape)
             self._vol_fg_coords.append(coords)
             total_fg += len(coords)
@@ -988,8 +943,8 @@ class SegDataset3DCubic(Dataset):
         """多分辨率统一路径：逐 scale 抽 (scale*extract_size) cube → resize 到 extract_size；
         按 scale 堆叠为通道。multi_res_scales=[1.0] 为单分辨率。"""
         vol_idx = idx % len(self.image_paths)
-        img = self._load_image(vol_idx)
-        lbl = self._load_label(vol_idx)
+        img     = self._load_image(vol_idx)
+        lbl     = self._load_label(vol_idx)
         D, H, W = img.shape
 
         center = self._sample_center(vol_idx, D, H, W)
@@ -1000,43 +955,9 @@ class SegDataset3DCubic(Dataset):
                   if self._has_region_weight_file(vol_idx) else None)
 
         # 3D cubic 懒 max-FOV cube：发单 cube，trainer (R2) 逐视图中心裁+resize 产出标准 5D 输入。
-        if self.keep_native_multi_res:
+        if self.keep_native_multi_res:  # TODO 现在必须是只输出最大分辨率那个，然后在train的过程中中心检查得到多个分辨率，所以这里需要改
             return self._getitem_native_multi_res_cubic(
                 center, img, lbl, rw_vol, eD, eH, eW)
-
-        img_channels, lbl_channels, wmap_channels = [], [], []
-        for scale in self.multi_res_scales:
-            sD = int(round(eD * scale))
-            sH = int(round(eH * scale))
-            sW = int(round(eW * scale))
-
-            img_s = _extract_cubic_patch(img, center, (sD, sH, sW))
-            lbl_s = _extract_cubic_patch(lbl, center, (sD, sH, sW))
-            rw_s = (_extract_cubic_patch(rw_vol, center, (sD, sH, sW))
-                    if rw_vol is not None else None)
-
-            img_s = resize_3d(img_s, eD, eH, eW, is_label=False)
-            lbl_s = resize_3d(lbl_s, eD, eH, eW, is_label=True)
-
-            img_channels.append(img_s)
-            lbl_channels.append(lbl_s)
-
-            # 区域权重优先级：样本文件 > 静态映射。
-            if rw_s is not None:
-                wmap_s = resize_3d(rw_s, eD, eH, eW, is_label=False)
-                wmap_channels.append(wmap_s)
-            elif self.region_weights:
-                wmap_s = compute_region_weight_map(lbl_s, self.label_values, self.region_weights)
-                wmap_channels.append(wmap_s[0])  # 去领头 1 → (D,H,W)
-
-        # label 以 int16 传输（同 SegDataset3D.__getitem__）。
-        result = {
-            "image": torch.from_numpy(np.stack(img_channels, axis=0).astype(np.float32, copy=False)),
-            "label": torch.from_numpy(np.ascontiguousarray(np.stack(lbl_channels, axis=0)))}
-        if wmap_channels:
-            result["weight_map"] = torch.from_numpy(
-                np.stack(wmap_channels, axis=0).astype(np.float32, copy=False))
-        return result
 
     def _getitem_native_multi_res_cubic(
         self,
@@ -1046,34 +967,32 @@ class SegDataset3DCubic(Dataset):
         rw_vol: Optional[np.ndarray],
         eD: int,
         eH: int,
-        eW: int,
-    ) -> Dict[str, torch.Tensor]:
+        eW: int) -> Dict[str, torch.Tensor]:
         """3D cubic 懒路径发单 max-FOV cube (1, eD_max, eH_max, eW_max)，
         尺寸为 round(extract_size*max_scale)。差越轴体积过小时由 _extract_cubic_patch 边界填充。
         与旧逐视图 “_extract_cubic_patch + resize_3d” 素阶等价。"""
-        eD_max = int(round(eD * self._max_scale))
-        eH_max = int(round(eH * self._max_scale))
-        eW_max = int(round(eW * self._max_scale))
+        eD_max   = int(round(eD * self._max_scale))
+        eH_max   = int(round(eH * self._max_scale))
+        eW_max   = int(round(eW * self._max_scale))
         size_max = (eD_max, eH_max, eW_max)
 
         img_s = _extract_cubic_patch(img, center, size_max)
         lbl_s = _extract_cubic_patch(lbl, center, size_max)
-        rw_s = (_extract_cubic_patch(rw_vol, center, size_max)
+        rw_s  = (_extract_cubic_patch(rw_vol, center, size_max)
                 if rw_vol is not None else None)
 
         result = {
             # 领头 "1" = 压叠 C_res 轴；trainer (R2) 逐视图裁+resize。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
-            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
-        }
+            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
         if rw_s is not None:
             result["weight_map"] = torch.from_numpy(
                 rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
-            wmap_s = compute_region_weight_map(
+            rw_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
-                wmap_s.astype(np.float32, copy=False))
+                rw_s.astype(np.float32, copy=False))
         return result
 
     def _safe_center_range(
@@ -1081,14 +1000,14 @@ class SegDataset3DCubic(Dataset):
         """逐轴返中心点 (lo,hi) 区间（hi 独立上界，供 randint/clip）：使最大 scale cube 在界内。
         轴 size < patch 时退为体积中心，接受边界填充（与旧行为一致）。。"""
         eD, eH, eW = self.extract_size
-        sD = int(round(eD * self._max_scale))
-        sH = int(round(eH * self._max_scale))
-        sW = int(round(eW * self._max_scale))
+        sD         = int(round(eD * self._max_scale))
+        sH         = int(round(eH * self._max_scale))
+        sW         = int(round(eW * self._max_scale))
 
         def _axis(size: int, patch: int) -> Tuple[int, int]:
             half = patch // 2
-            lo = half
-            # _extract_cubic_patch 取 [c-patch//2, c-patch//2+patch)。
+            lo   = half
+            # _extract_cubic_patch 取 [c-patch//2, c-patch//2+patch)
             hi = size - (patch - half)
             if hi <= lo:
                 # 该轴体积太小：中心采样，接受填充。
@@ -1229,9 +1148,9 @@ class SegDataset3DWhole(Dataset):
         return len(self.image_paths) * self.samples_per_volume
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        vol_idx = idx % len(self.image_paths)
-        img = self._load_image(vol_idx)
-        lbl = self._load_label(vol_idx)
+        vol_idx    = idx % len(self.image_paths)
+        img        = self._load_image(vol_idx)
+        lbl        = self._load_label(vol_idx)
         eD, eH, eW = self.extract_size
 
         # 全卷单次 3D zoom。
@@ -1246,11 +1165,10 @@ class SegDataset3DWhole(Dataset):
         # 区域权重优先级：样本文件 > 静态映射。
         if self._has_region_weight_file(vol_idx):
             rw_vol = self._load_region_weight(vol_idx)
-            wmap = resize_3d(rw_vol, eD, eH, eW, is_label=False)
-            result["weight_map"] = torch.from_numpy(
-                wmap[np.newaxis]).float()
+            rw_vol = resize_3d(rw_vol, eD, eH, eW, is_label=False)
+            result["weight_map"] = torch.from_numpy(rw_vol[np.newaxis]).float()
         elif self.region_weights:
-            wmap = compute_region_weight_map(
+            rw_vol = compute_region_weight_map(
                 lbl_r, self.label_values, self.region_weights)
-            result["weight_map"] = torch.from_numpy(wmap).float()
+            result["weight_map"] = torch.from_numpy(rw_vol).float()
         return result

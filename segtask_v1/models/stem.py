@@ -119,7 +119,7 @@ CONTEXT_FUSION_MODES = ("shared_stem", "multi_stem_proj", "hierarchical")
 
 
 class MultiStemProj(nn.Module):
-    """n_views 个独立 stem → 通道 cat → 1×1 融合为 out_ch；逐 view 学 FOV 专属滤波器，与单 stem 下游同契约。"""
+    """n_views 个独立 stem → 通道 cat → 1×1 融合为 out_ch；逐 view 学 FOV 专属滤波器。"""
 
     def __init__(
         self,
@@ -132,11 +132,11 @@ class MultiStemProj(nn.Module):
         activation         : str = "leakyrelu",
         spatial_dims       : int = 3,
         in_ch_per_view_list: List[int] = None):
-        """通道布局：默认均分 in_ch_per_view；in_ch_per_view_list 非空时优先（长度=n_views）。"""
         super().__init__()
         if n_views < 1:
             raise ValueError(f"n_views must be >= 1, got {n_views}")
         self.n_views = n_views
+
         if in_ch_per_view_list is not None:
             if len(in_ch_per_view_list) != n_views:
                 raise ValueError(
@@ -148,8 +148,8 @@ class MultiStemProj(nn.Module):
         # 后兼容：仅首 view 计数（完整信息请读 in_ch_per_view_list）。
         self.in_ch_per_view = self.in_ch_per_view_list[0]
 
-        stems: List[nn.Module] = []
-        strides: List[int] = []
+        stems  : List[nn.Module] = []
+        strides: List[int]       = []
         for c_v in self.in_ch_per_view_list:
             s, stride = build_stem(
                 mode, c_v, out_ch,
@@ -180,7 +180,7 @@ class MultiStemProj(nn.Module):
                 f"(per-view={self.in_ch_per_view_list}); got {x.shape[1]}")
         # 逐 view 通道拆分（零拷贝）。
         chunks = torch.split(x, self.in_ch_per_view_list, dim=1)
-        feats = [stem(c) for stem, c in zip(self.stems, chunks)]
+        feats  = [stem(c) for stem, c in zip(self.stems, chunks)]
         return self.proj(torch.cat(feats, dim=1))
 
 
@@ -198,8 +198,7 @@ class HierarchicalStems(nn.Module):
         activation: str = "leakyrelu",
         spatial_dims: int = 3,
         aux_channels: List[int] = None,
-        in_ch_per_view_list: List[int] = None,
-    ):
+        in_ch_per_view_list: List[int] = None):
         """通道布局同 MultiStemProj：均分或逐 view 列表。"""
         super().__init__()
         if n_views < 1:
@@ -222,7 +221,7 @@ class HierarchicalStems(nn.Module):
         # 后兼容：仅首 view 计数。
         self.in_ch_per_view = self.in_ch_per_view_list[0]
 
-        # Main stem (view 0)：用户指定模式，原生 stride。
+        # Main stem (view 0)
         self.main_stem, self.stem_stride = build_stem(
             mode, self.in_ch_per_view_list[0], stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
@@ -301,17 +300,17 @@ def build_context_stem(
         raise ValueError(
             f"in_ch_per_view_list length ({len(in_ch_per_view_list)}) "
             f"must equal n_views ({n_views})")
+
     if n_views == 1 or fusion == "shared_stem":
         # 总输入通道：逐 view 列表求和 或 均分。
         total_in = (sum(in_ch_per_view_list)
-                    if in_ch_per_view_list is not None
-                    else n_views * in_ch_per_view)
-        return build_stem(
+                    if in_ch_per_view_list is not None else n_views * in_ch_per_view)
+        return build_stem(  # 一个stem
             mode, total_in, out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
     if fusion == "multi_stem_proj":
-        msp = MultiStemProj(
+        msp = MultiStemProj(  # 每个FOV一个stem
             mode=mode, n_views=n_views,
             in_ch_per_view=in_ch_per_view, out_ch=out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
@@ -329,7 +328,8 @@ def build_context_stem(
         raise ValueError(
             f"hierarchical fusion: out_ch ({out_ch}) must equal "
             f"stage_channels[0] ({stage_channels[0]}).")
-    hier = HierarchicalStems(
+
+    hier = HierarchicalStems(  # TODO: 需要检查是不是我想要的
         mode=mode, n_views=n_views,
         in_ch_per_view=in_ch_per_view,
         stage_channels=stage_channels,

@@ -185,7 +185,7 @@ def build_model(cfg: Config):
     else:  # unet3p: no stage_builder calls
         expected_dec_calls = 0
 
-    if mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
+    if   mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
         dec_counts = _resolve_blocks_per_stage(
             mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
     elif mc.decoder_blocks_per_stage:
