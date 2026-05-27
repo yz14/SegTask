@@ -1,9 +1,4 @@
-"""CLI entry point for 3D segmentation training.
-
-Usage:
-    python -m segtask_v1.train --config configs/seg3d.yaml
-    python -m segtask_v1.train --config configs/seg3d.yaml --override train.epochs=50
-"""
+"""3D 分割训练 CLI 入口。示例：`python -m segtask_v1.train --config configs/seg3d.yaml [--override train.epochs=50 ...]`。"""
 
 from __future__ import annotations
 
@@ -22,7 +17,7 @@ from .utils import seed_everything
 
 
 def setup_logging(output_dir: str, level: str = "INFO") -> None:
-    """Configure logging to console and file."""
+    """同时输出控制台与文件日志。"""
     fmt = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
@@ -41,10 +36,7 @@ def setup_logging(output_dir: str, level: str = "INFO") -> None:
 
 
 def apply_overrides(cfg, overrides: list) -> None:
-    """Apply dot-notation overrides to config.
-
-    Example: --override train.epochs=50 model.backbone=convnext
-    """
+    """应用点记法 override。示例：--override train.epochs=50 model.backbone=convnext。"""
     for ov in overrides:
         if "=" not in ov:
             continue
@@ -55,7 +47,7 @@ def apply_overrides(cfg, overrides: list) -> None:
             obj = getattr(obj, p)
         attr = parts[-1]
         old_val = getattr(obj, attr)
-        # Cast to original type
+        # 转为原类型。
         if isinstance(old_val, bool):
             new_val = val.lower() in ("true", "1", "yes")
         elif isinstance(old_val, int):

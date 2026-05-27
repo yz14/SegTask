@@ -1,36 +1,4 @@
-"""EDM2 U-Net segmentation backbone (Karras 2024).
-
-Faithful re-impl of the magnitude-preserving (MP) blocks from
-``edm2/training/networks_edm2.py``:
-  - ``MPConv`` (forced weight-norm + MP scaling), ``mp_silu`` / ``mp_sum`` / ``mp_cat``,
-    pixel-norm at the start of each enc ``Block``.
-  - ``Block`` with optional resample (``up`` / ``down``) and optional MHSA;
-    diffusion FiLM path (``emb_linear`` / ``emb_gain``) removed.
-  - Encoder: per-level ``_conv`` (level 0) or ``_down`` (level>0) + ``nb`` enc Blocks
-    (one skip pushed per block).
-  - Decoder: deepest = ``_in0(attn) + _in1``; others = ``_up``; each level runs
-    ``nb + 1`` dec Blocks, each ``mp_cat``-ing one skip onto its input.
-
-Removed (diffusion-only): ``MPFourier`` / class embedding / FiLM / ``+1 ones``
-input channel / ``Precond`` wrapper.
-
-Multi-FOV MP stem: ``shared_stem`` (single MPConv) | ``multi_stem_proj``
-(per-view MPConv → ``mp_cat`` → 1×1 MPConv fusion). ``hierarchical`` rejected.
-
-Intentional deviations from the paper:
-  1. Seg head uses ``MPConv kernel=[1,1]`` for parity (paper used 3×3).
-  2. ``_MPMultiStemProj`` applies an extra ``mp_silu`` per view before ``mp_cat``
-     to match the smoke-tested baseline; remove it for paper-faithful flow.
-  3. DS / aux heads are out-of-paper extensions (``_MPSegHead``).
-
-DS / aux capture: ``dec_features[i] = post-blocks of level (L-2-i)`` (length
-``L-1``, ordered ``[low_res, ..., high_res]``); aux heads (Plan A only) sit on
-``dec_features[-1]`` and are upsampled to the input ``(H, W)``.
-
-Output contract mirrors :class:`models.unet.UNet3D`: eval/no-aux returns a
-tensor (or list when DS is on); train + ``aux_seg_supervision`` returns
-``{"main": ..., "aux": [...]}``. 2.5D folded: ``num_fg_classes = num_fg * D``.
-"""
+"""EDM2 U-Net 分割 backbone (Karras 2024)。忠实 MP 块：MPConv、mp_silu/mp_sum/mp_cat、pixel-norm、Block (可选 resample/MHSA，去扩散 FiLM)。仅 2.5D；DS/aux 为附加扩展（_MPSegHead 1×1 代替论文 3×3）。Multi-FOV stem：shared_stem | multi_stem_proj（拒 hierarchical）。forward 合同与 UNet3D 一致。"""
 
 from __future__ import annotations
 
@@ -96,13 +64,7 @@ def _mp_cat(a: torch.Tensor, b: torch.Tensor, dim: int = 1, t: float = 0.5) -> t
 
 
 class _MPConv(nn.Module):
-    """Magnitude-preserving conv / fully-connected with forced weight norm.
-
-    Faithful to ``edm2.training.networks_edm2.MPConv`` (kernel-empty
-    list ⇒ FC; otherwise 2D conv with ``padding=k//2``). Independent
-    of ``torch_utils.persistence`` (we drop persistence for runtime
-    flexibility).
-    """
+    """保幅 conv/FC，强制 weight-norm。kernel 为空 list 时 FC；否则 2D conv padding=k//2。"""
 
     def __init__(self, in_channels: int, out_channels: int, kernel):
         super().__init__()
@@ -114,9 +76,9 @@ class _MPConv(nn.Module):
         w = self.weight.to(torch.float32)
         if self.training:
             with torch.no_grad():
-                self.weight.copy_(_normalize(w))  # forced weight normalization
-        w = _normalize(w)  # traditional weight normalization
-        # Magnitude-preserving scaling: divide by sqrt(fan_in).
+                self.weight.copy_(_normalize(w))  # 强制 weight-norm
+        w = _normalize(w)  # 传统 weight-norm
+        # MP 缩放：除以 sqrt(fan_in)。
         fan_in = float(w[0].numel())
         w = w * (gain / float(np.sqrt(fan_in)))
         w = w.to(x.dtype)
@@ -127,25 +89,7 @@ class _MPConv(nn.Module):
 
 
 class _Block(nn.Module):
-    """EDM2 ``Block`` with the diffusion-emb path removed.
-
-    Topology (matches ``networks_edm2.Block`` minus the
-    ``emb_linear`` / ``emb_gain`` FiLM):
-
-        x = resample(x, mode)
-        if flavor == 'enc' and conv_skip is not None: x = conv_skip(x)
-        if flavor == 'enc': x = pixel_norm(x)
-        y = conv_res0(mp_silu(x))
-        y = mp_silu(y)               # ← was: mp_silu(y * (emb*gain + 1))
-        y = dropout(y) if training
-        y = conv_res1(y)
-        if flavor == 'dec' and conv_skip is not None: x = conv_skip(x)
-        x = mp_sum(x, y, t=res_balance)
-        if attention:
-            y = attn_qkv(x); ... ; y = attn_proj(y)
-            x = mp_sum(x, y, t=attn_balance)
-        x = clip(x)
-    """
+    """EDM2 Block，去 FiLM。拓扑：resample→(可选 conv_skip + pixel_norm if enc)→conv_res0→mp_silu→conv_res1→mp_sum(主/残差)→(可选 attn)→clip。"""
 
     def __init__(
         self,
@@ -231,12 +175,7 @@ class _Block(nn.Module):
 
 
 class _MPMultiStemProj(nn.Module):
-    """``n_views`` independent ``MPConv`` stems → ``mp_cat`` → ``MPConv 1×1`` fusion.
-
-    All sub-stems use a stride-1 ``3×3`` ``MPConv`` (matches EDM2's
-    encoder ``_conv`` entry at level 0). Output spatial dims are
-    preserved (``stem_stride = 1``).
-    """
+    """n_views 个独立 MPConv stem → mp_cat → 1×1 MPConv 融合。全部 stride-1 3×3（同 EDM2 level0 _conv）；保留空间分辨率。"""
 
     def __init__(
         self,
@@ -252,9 +191,7 @@ class _MPMultiStemProj(nn.Module):
             _MPConv(c_v, out_ch, kernel=[3, 3])
             for c_v in self.in_ch_per_view_list
         ])
-        # 1×1 fusion back to out_ch (cat is 2 ways at a time via mp_cat).
-        # When n_views >= 3 we fold by repeated mp_cat then a single
-        # MPConv 1×1 over the ``n_views * out_ch`` cat'd channels.
+        # 1×1 融合回 out_ch；n_views≥3 时逐对 mp_cat 后一次 1×1。
         self.proj = _MPConv(n_views * out_ch, out_ch, kernel=[1, 1])
         self.stem_stride = 1
 
@@ -266,8 +203,7 @@ class _MPMultiStemProj(nn.Module):
                 f"(per_view={self.in_ch_per_view_list}); got {x.shape[1]}")
         chunks = torch.split(x, self.in_ch_per_view_list, dim=1)
         feats = [_mp_silu(stem(c)) for stem, c in zip(self.stems, chunks)]
-        # Repeated mp_cat keeps magnitude approximately preserved across
-        # the n-view fold (each pairwise mp_cat is t=0.5 by default).
+        # 逐对 mp_cat (t=0.5) 近似保幅。
         out = feats[0]
         for f in feats[1:]:
             out = _mp_cat(out, f, dim=1)
@@ -275,7 +211,7 @@ class _MPMultiStemProj(nn.Module):
 
 
 class _MPSharedStem(nn.Module):
-    """Single ``MPConv 3×3`` over the full ``n_views*D`` input slab."""
+    """在全 n_views*D 输入上的单一 MPConv 3×3。"""
 
     def __init__(self, in_channels: int, out_ch: int):
         super().__init__()
@@ -293,7 +229,7 @@ def _build_edm2_stem(
     out_ch: int,
     in_ch_per_view_list: Optional[List[int]] = None,
 ):
-    """Dispatch to the right MP stem variant. Rejects 'hierarchical'."""
+    """分派 MP stem 变体；hierarchical 拒绝。"""
     if fusion == "hierarchical":
         raise ValueError(
             "model.arch='edm2' does not yet support context_fusion="
@@ -316,8 +252,7 @@ def _build_edm2_stem(
 def _resolve_attn_levels(
     n_levels: int, attn_levels: Optional[Sequence[int]]
 ) -> List[int]:
-    """Default = deepest level only (matches the typical EDM2 ``attn_resolutions``
-    being a single small res like 16)."""
+    """默认仅最深级（同 EDM2 常见 attn_resolutions 为单一小分辨率）。"""
     if attn_levels is None:
         return [n_levels - 1]
     out = sorted({int(v) for v in attn_levels})
@@ -329,9 +264,7 @@ def _resolve_attn_levels(
 
 
 class _EDM2Encoder(nn.Module):
-    """Per-level ``_conv`` (level 0) or ``_down`` (level>0) + ``num_blocks`` enc
-    Blocks. Each block pushes a skip onto the stack.
-    """
+    """逐级 _conv (level 0) 或 _down (level>0) + num_blocks 个 enc Block。每块 push 一个 skip。"""
 
     def __init__(
         self,
@@ -350,11 +283,9 @@ class _EDM2Encoder(nn.Module):
         self.encoder_blocks_per_stage = list(encoder_blocks_per_stage)
 
         self.level_blocks = nn.ModuleList()
-        # The level-entry op:
-        #   level 0 = stem (already applied) → identity here.
-        #   level k>0 = _down Block (preserves channels, halves res).
+        # level 0 为 stem (已处理) → identity；level k>0 为 _down Block（通道不变、分辨率减半）。
         self.level_entries = nn.ModuleList()
-        # Track skip-channel layout for the decoder to size cat-fusion.
+        # skip-channel 布局供 decoder 算 cat-fusion。
         self.skip_channels: List[int] = [encoder_channels[0]]  # stem feature
 
         for level in range(n_levels):
@@ -362,7 +293,7 @@ class _EDM2Encoder(nn.Module):
             if level == 0:
                 self.level_entries.append(nn.Identity())
             else:
-                # ``_down`` keeps in/out channels equal to the previous level's.
+                # _down 保持 in/out=上一级通道。
                 prev_ch = encoder_channels[level - 1]
                 self.level_entries.append(
                     _Block(prev_ch, prev_ch,
@@ -405,9 +336,7 @@ class _EDM2Encoder(nn.Module):
 
 
 class _EDM2Decoder(nn.Module):
-    """Per-level entry (deepest=``_in0+_in1``, else ``_up``) + ``num_blocks+1``
-    dec Blocks. Every dec block ``mp_cat``s the next skip onto its input.
-    """
+    """逐级 entry（最深=_in0+_in1，其余=_up）+ (num_blocks+1) 个 dec Block；每块 mp_cat 一个 skip。"""
 
     def __init__(
         self,
@@ -436,12 +365,10 @@ class _EDM2Decoder(nn.Module):
         for ridx, level in enumerate(reversed(range(n_levels))):
             attention = (level in attention_levels)
             if level == n_levels - 1:
-                # Deepest: _in0 (attention=True) + _in1
+                # 最深级：_in0 (attention=True) + _in1。
                 self.level_entries.append(
                     _Block(ch, ch, flavor="dec", attention=True,
                            **block_kwargs))
-                # _in1 chained inside the same entry (use a small Sequential).
-                # Express both as a single ModuleList for clarity.
                 self.level_entries_kind.append("in0_in1")
                 self._in1 = _Block(ch, ch, flavor="dec", **block_kwargs)
             else:
@@ -503,9 +430,7 @@ class _EDM2Decoder(nn.Module):
 
 
 class _MPSegHead(nn.Module):
-    """1×1 MPConv classifier with a learnable ``out_gain`` scalar
-    (matches EDM2's ``out_conv`` topology, but with kernel=[1,1] for our
-    seg-head contract instead of paper's [3,3])."""
+    """1×1 MPConv 分类头，带可学 out_gain（同 EDM2 out_conv，仅 kernel 改为 1×1）。"""
 
     def __init__(self, in_ch: int, num_classes: int):
         super().__init__()
@@ -513,9 +438,7 @@ class _MPSegHead(nn.Module):
         self.out_gain = nn.Parameter(torch.zeros([]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # ``self.out_gain`` is a 0-dim trainable scalar; ``MPConv.forward``
-        # multiplies the (already MP-scaled) weight by ``gain`` before the
-        # conv. Passing the tensor directly preserves autograd.
+        # out_gain 为 0维可学标量；MPConv 以它 gain 乘权重。
         return self.conv(x, gain=self.out_gain)
 
 
@@ -525,10 +448,7 @@ class _MPSegHead(nn.Module):
 
 
 class EDM2SegModel(nn.Module):
-    """EDM2 U-Net adapted as a segmentation model.
-
-    See module docstring; output contract mirrors :class:`models.unet.UNet3D`.
-    """
+    """EDM2 U-Net 适配为分割模型；forward 合同同 UNet3D。"""
 
     def __init__(
         self,
@@ -669,20 +589,7 @@ class EDM2SegModel(nn.Module):
 
 
 def build_edm2_seg_model(cfg) -> EDM2SegModel:
-    """Build :class:`EDM2SegModel` from a :class:`segtask_v1.config.Config`.
-
-    Reads the same whitelisted set of config fields as :func:`build_adm_seg_model`
-    plus EDM2-specific hyper-parameters:
-
-      * ``model.edm2_attention_levels`` (List[int]; default = [L-1])
-      * ``model.edm2_channels_per_head`` (default 64)
-      * ``model.edm2_res_balance`` (default 0.3)
-      * ``model.edm2_attn_balance`` (default 0.3)
-      * ``model.edm2_concat_balance`` (default 0.5)
-      * ``model.edm2_clip_act`` (default 256.0)
-
-    The shared ``model.dropout`` is reused as EDM2's ``dropout`` Block kwarg.
-    """
+    """从 Config 构造 EDM2SegModel。读取 EDM2 专有：edm2_attention_levels（默认 [L-1]）、edm2_channels_per_head(64)、edm2_res_balance/attn_balance(0.3)、edm2_concat_balance(0.5)、edm2_clip_act(256.0)。复用 model.dropout 为 Block dropout。"""
     mc = cfg.model
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
@@ -701,10 +608,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         raise ValueError(
             f"encoder_blocks_per_stage length {len(enc_bps)} "
             f"!= len(encoder_channels) {n_levels}")
-    # Same paper-mandated coupling as ADM: encoder pushes ``nb_k + 1``
-    # skips per level, decoder pops ``nb_k + 1`` (the +1 is added inside
-    # the decoder's per-level loop). User-supplied
-    # ``decoder_blocks_per_stage`` is ignored — log a warning when set.
+    # 与 ADM 同的 skip-stack 耦合：enc/dec 每级 nb+1 skip，用户 decoder_blocks_per_stage 被忽略（不一致告警）。
     if mc.decoder_blocks_per_stage and (
             list(mc.decoder_blocks_per_stage) != enc_bps[:-1]):
         logger.warning(

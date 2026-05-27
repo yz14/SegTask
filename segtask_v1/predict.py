@@ -1,17 +1,4 @@
-"""CLI entry point for 3D segmentation inference.
-
-Usage:
-    # Predict every .nii / .nii.gz file under a folder (recursive):
-    python -m segtask_v1.predict --config configs/seg2_5d.yaml --checkpoint *.pth --input nii_dir --output out_dir
-
-    # Predict a single file:
-    python -m segtask_v1.predict --config configs/seg2_5d.yaml \
-        --checkpoint outputs/best_model.pth --input case_001.nii.gz
-
-    # Force EMA / online weights, save probability maps, override predict cfg:
-    python -m segtask_v1.predict ... --weights ema --save-probs \
-        --override predict.batch_size=4 predict.tta_flip=true
-"""
+"""3D 分割推理 CLI 入口。示例：`python -m segtask_v1.predict --config <yaml> --checkpoint <pth> --input <file_or_dir> [--output <dir>] [--weights ema|online|auto] [--save-probs] [--override k=v ...]`。"""
 
 from __future__ import annotations
 
@@ -28,7 +15,7 @@ from .train import apply_overrides, setup_logging
 
 
 def _gather_nifti(input_path: str, recursive: bool = True) -> List[str]:
-    """Collect .nii / .nii.gz files from a file or directory."""
+    """从文件或目录收集 .nii/.nii.gz。"""
     p = Path(input_path)
     if not p.exists():
         raise FileNotFoundError(p)
@@ -78,8 +65,7 @@ def main():
         cfg.sync()
         cfg.validate()
 
-    # Resolve defaults: ckpt=<train_out>/best_model.pth, input=cfg.data.image_dir,
-    # output=<input_parent>/<task_name>_pred (task_name=basename(train_out))
+    # 默认解析：ckpt=<train_out>/best_model.pth；input=cfg.data.image_dir；output=<input_parent>/<task_name>_pred (task_name=basename(train_out))。
     checkpoint_path = args.checkpoint
     if not checkpoint_path:
         train_out = getattr(cfg.train, "output_dir", "") or ""
@@ -116,7 +102,7 @@ def main():
     logger.info("Checkpoint: %s (variant=%s)", checkpoint_path, args.weights)
     logger.info("Output dir: %s", cfg.predict.output_dir)
 
-    # bbox priority: --bbox > cfg.data.bbox_dir; lenient match drops unmatched images
+    # bbox 优先级：--bbox > cfg.data.bbox_dir；宽容匹配丢弃未匹配图像。
     image_paths, bbox_paths = _resolve_bbox_paths(
         args.bbox, image_paths, cfg)
     if bbox_paths is not None:
@@ -139,9 +125,7 @@ def main():
 
 def _resolve_bbox_paths(
     cli_bbox: object, image_paths: List[str], cfg):
-    """Resolve bbox source. Returns (image_paths, bbox_paths|None); image list may be filtered.
-    Priority: --bbox (''=disable, file=single, dir=lenient match) > cfg.data.bbox_dir > None.
-    """
+    """解析 bbox 源，返 (image_paths, bbox_paths|None)；image 可被过滤。优先：--bbox (''=禁/file=单/dir=宽容匹配) > cfg.data.bbox_dir > None。"""
     if cli_bbox is not None:
         if cli_bbox == "":
             return image_paths, None

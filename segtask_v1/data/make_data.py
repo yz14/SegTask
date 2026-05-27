@@ -1,23 +1,4 @@
-"""Offline per-sample npz packager (image + label + optional rw + fg-index).
-
-Decouples training from the gzip-decompress peak of NIfTI by writing one
-bbox-cropped npz per sample. Runtime then mmaps these (uncompressed) npz
-so multiple workers share the OS page cache.
-
-Output: ``<out_dir>/<pid>.npz`` with keys:
-  - ``image`` int16, ``label`` int16 (both bbox-cropped, raw HU/labels)
-  - ``fg_slices`` int32 (M,), ``fg_coords`` int32 (N, 3) (cropped frame)
-  - ``meta`` 0-d object (provenance: pid, src paths, bbox, label_values, ...)
-  - ``rw`` int16 or fp32 (only if ``region_weight_dir`` set; +1-shifted)
-
-Image stays raw HU because intensity windowing is a train-time hparam.
-Default uses ``np.savez`` (uncompressed) so npy blobs can be memmap-shared;
-``--compress`` opts into ``savez_compressed`` (smaller, slower, no sharing).
-
-CLI: ``python -m segtask_v1.data.make_data --config <yaml> --out <dir> [--workers N]``.
-Existing npz are skipped unless ``--overwrite``. Failures collected in
-``<out_dir>/_failures.txt`` (compatible with ``data.exclude_list``).
-"""
+"""逐样本 npz 预烘包（image+label+可选 rw+fg 索引）。将 bbox 裁剪后的体积输出为 <out_dir>/<pid>.npz，训练时 mmap 多 worker 共享 OS page cache。默认 np.savez 不压缩（供共享）；--compress 使用 savez_compressed。CLI：`python -m segtask_v1.data.make_data --config <yaml> --out <dir> [--workers N]`。已存在不覆盖（除非 --overwrite）；失败写 <out_dir>/_failures.txt（与 data.exclude_list 兼容）。"""
 
 from __future__ import annotations
 
@@ -57,15 +38,12 @@ logger = logging.getLogger(__name__)
 
 _TOOL_VERSION = "make_data/1.0"
 
-# Matches SegDataset3DCubic._build_index cap; override via CLI if needed.
+# 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
 
 
-# =============================================================================
-# Per-sample worker
-# =============================================================================
 def _stem(path: str, suffix) -> str:
-    """Return ``filename - suffix``; ``suffix`` may be a string or list of candidates."""
+    """返回去后缀的文件名；suffix 可为 str 或候选列表。"""
     name = Path(path).name
     suffixes = [suffix] if isinstance(suffix, str) else list(suffix)
     for sfx in suffixes:
@@ -79,11 +57,7 @@ def _compute_fg_indices(
     bg_val: int,
     fg_subsample: int,
     seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute fg_slices (z-indices) and fg_coords (sub-sampled to ``fg_subsample``).
-
-    Mirrors ``SegDataset3D._build_index`` / ``SegDataset3DCubic._build_index``
-    (seed=42) so any patch_mode can be served without rescanning at runtime.
-    """
+    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 SegDataset3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
     if label.size == 0:
         return (np.zeros((0,), dtype=np.int32),
                 np.zeros((0, 3), dtype=np.int32))
@@ -102,7 +76,7 @@ def _compute_fg_indices(
 
 
 def _bbox_from_mask_path(bbox_path: Optional[str]) -> Optional[BBox]:
-    """Decode mask as int16 → ``compute_bbox_from_volume``; ``None`` if no path / empty mask."""
+    """读 mask→compute_bbox_from_volume；路径为空或 mask 空返 None。"""
     if not bbox_path:
         return None
     mask = load_nifti(bbox_path, dtype=np.int16)
@@ -120,11 +94,7 @@ def prepare_one(
     fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
     compress: bool = False,
     overwrite: bool = False) -> Dict[str, object]:
-    """Materialise the npz package for one sample; idempotent unless ``overwrite``.
-
-    Returns a status dict (pid, status, size_bytes, elapsed_s, ...) used by
-    the aggregate progress log.
-    """
+    """为单样本生成 npz 包；默认幂等（除非 overwrite）。返状态 dict (pid/status/size/耗时/...)。"""
     out_p = Path(out_path)
     if out_p.is_file() and not overwrite:
         return {"pid": pid, "status": "skipped",
@@ -133,10 +103,10 @@ def prepare_one(
     t0 = time.perf_counter()
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Bbox from mask (None if no mask / empty).
+    # 1. mask → bbox（无/空为 None）。
     bbox = _bbox_from_mask_path(bbox_path)
 
-    # 2-3. Load image (raw HU, int16) and label (int16), cropped to bbox.
+    # 2-3. 读 image (raw HU int16) 与 label (int16)，按 bbox 裁剪。
     image = load_nifti_cropped(image_path, bbox=bbox, dtype=np.int16)
     label = load_nifti_cropped(label_path, bbox=bbox, dtype=np.int16)
 
@@ -145,8 +115,7 @@ def prepare_one(
             f"image shape {image.shape} != label shape {label.shape} for "
             f"pid={pid} (image={image_path}, label={label_path})")
 
-    # 4. Region weight (+1-shifted): store int16 when integer-valued and in range,
-    # else fp32 (runtime loader returns fp32 either way).
+    # 4. 区域权重（+1 偏移）：整数且 int16 范围内存 int16，否则 fp32（runtime 始终返 fp32）。
     rw: Optional[np.ndarray] = None
     rw_dtype_stored = None
     if rw_path:
@@ -170,11 +139,11 @@ def prepare_one(
                 "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
                 pid, rw_min, rw_max, is_integer_valued)
 
-    # 5. Foreground indices in the cropped frame.
+    # 5. 裁剪坐标系下的前景索引。
     bg_val = int(label_values[0])
     fg_slices, fg_coords = _compute_fg_indices(label, bg_val, fg_subsample)
 
-    # 6. Provenance metadata (self-describing for debugging).
+    # 6. 谱系 meta（自描述）。
     meta = {
         "pid"         : pid,
         "src_image"   : str(image_path),
@@ -191,8 +160,7 @@ def prepare_one(
         "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
 
-    # 7. Atomic write (tmp + rename). Pass an open file handle to np.savez
-    # so it does NOT auto-append ".npz" to our tmp name.
+    # 7. 原子写（tmp + rename）；传文件句柄避免 np.savez 自动追加 .npz。
     tmp_path = out_p.with_name(out_p.name + ".tmp")
     save_fn  = np.savez_compressed if compress else np.savez
     payload  = {
@@ -205,7 +173,7 @@ def prepare_one(
         payload["rw"] = rw
     with open(tmp_path, "wb") as fh:
         save_fn(fh, **payload)
-    # Windows: destination must not exist before rename.
+    # Windows：rename 前目标不能存在。
     if out_p.exists():
         out_p.unlink()
     tmp_path.rename(out_p)
@@ -221,11 +189,8 @@ def prepare_one(
         "n_fg_coords" : int(fg_coords.shape[0])}
 
 
-# =============================================================================
-# Top-level driver (CLI + library entry point)
-# =============================================================================
 def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
-    """Discover and pair image/label/bbox/rw paths via loader helpers; honours exclude_list."""
+    """通过 loader helpers 发现/配对 image/label/bbox/rw 路径；遵守 exclude_list。"""
     dc = cfg.data
 
     image_paths, label_paths = discover_samples(  # 配对
@@ -259,7 +224,7 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
 
 def _resolve_label_values(
     cfg: Config, samples: List[Dict[str, Optional[str]]]) -> List[int]:
-    """Auto-detect label values if not configured (mirrors loader)."""
+    """未配置时自动探测 label values（同 loader）。"""
     dc = cfg.data
     if dc.label_values:
         return list(map(int, dc.label_values))
@@ -276,13 +241,7 @@ def prepare_dataset(
     compress: bool = False,
     overwrite: bool = False,
     limit: int = 0) -> Dict[str, int]:
-    """Pre-compute npz packages for every sample under ``cfg.data``.
-
-    ``workers``: parallel processes (0 = inline / single-process for debugging).
-    ``compress``: ``np.savez_compressed`` (smaller disk, loses memmap sharing).
-    ``limit > 0``: smoke-test on the first N samples only.
-    Returns counters ``{written, skipped, failed, total}``.
-    """
+    """为 cfg.data 下的所有样本预烘 npz。workers=0 为内联（调试）；compress 使用 savez_compressed；limit>0 仅处理前 N 个。返 counters {written, skipped, failed, total}。"""
     out_p = Path(out_dir)
     out_p.mkdir(parents=True, exist_ok=True)
 
@@ -302,7 +261,7 @@ def prepare_dataset(
 
     n_total  = len(tasks)
     counters = {"written": 0, "skipped": 0, "failed": 0, "total": n_total}
-    failures : List[Tuple[str, str]] = []   # (pid, error)
+    failures : List[Tuple[str, str]] = []   # (pid, err)
     timings  : List[float] = []
     sizes    : List[int] = []
 
@@ -327,7 +286,7 @@ def prepare_dataset(
     t0 = time.perf_counter()
 
     if workers <= 0:
-        # Inline: full traceback, no pickling — easier to debug.
+        # 内联：全 traceback、无 pickle，便于调试。
         for i, (s, out_path) in enumerate(tasks):
             try:
                 res = prepare_one(**_kwargs(s, out_path))
@@ -338,7 +297,7 @@ def prepare_dataset(
                 failures.append((s["pid"], _short_exc(exc)))
                 logger.exception("FAILED pid=%s: %s", s["pid"], exc)
     else:
-        # Process pool (spawn on Windows; SimpleITK import paid once per worker).
+        # 进程池（Windows spawn；SimpleITK 逐 worker 导入一次）。
         with ProcessPoolExecutor(max_workers=workers) as pool:
             future_to_pid = {
                 pool.submit(prepare_one, **_kwargs(s, out_path)): s["pid"]
@@ -355,7 +314,7 @@ def prepare_dataset(
                     failures.append((pid, _short_exc(exc)))
                     logger.error("FAILED pid=%s: %s", pid, exc)
 
-    # Aggregate report.
+    # 汇总报告。
     elapsed = time.perf_counter() - t0
     total_bytes = sum(sizes)
     total_gb = total_bytes / (1024 ** 3)
@@ -370,7 +329,7 @@ def prepare_dataset(
         (total_bytes / max(len(sizes), 1)) / (1024 ** 2) if sizes else 0.0,
         mean_s)
 
-    # _failures.txt is data.exclude_list-compatible; clear stale file on success.
+    # _failures.txt 与 data.exclude_list 兼容；成功时清除陈旧文件。
     fail_path = out_p / "_failures.txt"
     if not failures and fail_path.is_file():
         fail_path.unlink()
@@ -386,7 +345,7 @@ def prepare_dataset(
             "either re-run with --overwrite for the affected files OR add "
             "them to data.exclude_list.", len(failures), fail_path)
 
-    # Run manifest for downstream traceability.
+    # 供下游追溯的 manifest。
     manifest = {
         "tool_version": _TOOL_VERSION,
         "made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -415,7 +374,7 @@ def _record(
     counters: Dict[str, int],
     timings: List[float],
     sizes: List[int]) -> None:
-    """Bookkeeping for both the inline and pool paths."""
+    """内联/池两路共用的计数。"""
     status = res.get("status", "written")
     counters[status] = counters.get(status, 0) + 1
     timings.append(float(res.get("elapsed_s", 0.0)))
@@ -424,7 +383,7 @@ def _record(
 
 def _log_progress(
     done: int, total: int, res: Dict[str, object], t0: float) -> None:
-    """Periodic per-sample / batched progress line."""
+    """逐样本/批次进度日志。"""
     if done == 1 or done == total or done % 10 == 0:
         elapsed = time.perf_counter() - t0
         rate = done / max(elapsed, 1e-6)
@@ -441,14 +400,11 @@ def _log_progress(
 
 
 def _short_exc(exc: BaseException, max_len: int = 200) -> str:
-    """Single-line length-bounded exception summary for the failure file."""
+    """单行限长的异常概要，写入 failures 文件。"""
     msg = f"{type(exc).__name__}: {exc}".replace("\n", " | ").replace("\t", " ")
     return msg[:max_len]
 
 
-# =============================================================================
-# CLI
-# =============================================================================
 def _setup_logging(level: str = "INFO") -> None:
     fmt = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
@@ -494,7 +450,7 @@ def main() -> int:
     cfg = load_config(args.config)
     logger.info("Config loaded from %s", args.config)
     if args.override:
-        # Reuse train.py override semantics; lazy import keeps make_data lean.
+        # 复用 train.py override 语义；懒导入保持 make_data 轻量。
         from ..train import apply_overrides
         apply_overrides(cfg, args.override)
         cfg.sync()

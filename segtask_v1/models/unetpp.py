@@ -1,9 +1,4 @@
-"""UNet++ nested dense decoder (Zhou 2018/2020).
-
-Nodes X[i,j]: i=depth, j=column. j=0 is encoder; j>=1 fuses all prior same-depth
-nodes + upsampled X[i+1,j-1]. Exposes diagonal X[i,n-1-i] as decoder outputs
-(low-res → high-res) to stay UNet3D-compatible.
-"""
+"""UNet++ 嵌套稠密 decoder (Zhou 2018/2020)。节点 X[i,j]：i 深度、j 列；j=0 为 encoder，j>=1 融合同深度前列与上采样的 X[i+1,j-1]。对角线 X[i,n-1-i] 作为输出（low-res→high-res）。"""
 
 from __future__ import annotations
 
@@ -18,13 +13,10 @@ from .blocks import INTERP_SMOOTH, AttentionGate3D, Upsample
 
 
 class UNetPPDecoder(nn.Module):
-    """UNet++ nested decoder. Exposes diagonal X[i,n-1-i] as low-res→high-res outputs.
+    """UNet++ 嵌套 decoder。对角线 X[i,n-1-i] 为输出（low-res→high-res）。
 
-    Args:
-        encoder_channels: encoder widths, highest-res first.
-        stage_builder: (in_ch, out_ch) -> Module for each node's conv block.
-        upsample_mode: e.g. 'transpose' (learned) | 'trilinear' (parameter-free).
-        skip_attention: if True, gate upsampled branch by X[i,0] (Oktay 2018).
+    参数：upsample_mode示例 'transpose' 可学 或 'trilinear' 无参；
+    skip_attention=True 时用 X[i,0] 对上采样分支作 gate (Oktay 2018)。
     """
 
     def __init__(
@@ -43,7 +35,7 @@ class UNetPPDecoder(nn.Module):
         self.skip_attention = skip_attention
         self.spatial_dims = spatial_dims
 
-        # Nested grid keyed by 'i_j' so ModuleDict registers deterministically.
+        # 以 'i_j' 为 key 保证 ModuleDict 注册顺序确定。
         self.upsamples = nn.ModuleDict()
         self.blocks = nn.ModuleDict()
         self.gates = nn.ModuleDict() if skip_attention else None
@@ -51,14 +43,14 @@ class UNetPPDecoder(nn.Module):
         for i in range(n - 1):
             for j in range(1, n - i):
                 key = f"{i}_{j}"
-                # Upsample X[i+1, j-1] (channels enc[i+1]) → enc[i]
+                # X[i+1, j-1] (enc[i+1] 通道) 上采样到 enc[i]。
                 self.upsamples[key] = Upsample(
                     encoder_channels[i + 1],
                     encoder_channels[i],
                     mode=upsample_mode,
                     spatial_dims=spatial_dims,
                 )
-                # Fused: j same-depth nodes + 1 upsampled = (j+1) * enc[i]
+                # 融合：j 个同深度节点 + 1 上采样 = (j+1)*enc[i]。
                 fused_ch = (j + 1) * encoder_channels[i]
                 self.blocks[key] = stage_builder(fused_ch, encoder_channels[i])
 
@@ -69,17 +61,17 @@ class UNetPPDecoder(nn.Module):
                         spatial_dims=spatial_dims,
                     )
 
-        # Diagonal X[i, n-1-i] widths (low-res → high-res), matches classical Decoder
+        # 对角线 X[i, n-1-i] 通道（low-res→high-res），与经典 Decoder 一致。
         self.out_channels = [encoder_channels[n - 2 - k] for k in range(n - 1)]
 
     def forward(self, encoder_features: List[torch.Tensor]) -> List[torch.Tensor]:
-        """encoder_features high-res first; returns diagonal low-res → high-res."""
+        """encoder_features：high-res 优先；返回对角线 low-res→high-res。"""
         n = self.n
         x: List[List[torch.Tensor]] = [[None] * (n - i) for i in range(n)]  # type: ignore
         for i in range(n):
             x[i][0] = encoder_features[i]
 
-        # Fill columns left→right; column j depends only on column j-1
+        # 逐列填充（j 仅依赖 j-1）。
         for j in range(1, n):
             for i in range(n - j):
                 key = f"{i}_{j}"

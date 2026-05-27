@@ -1,13 +1,4 @@
-"""GPU-based 3D data augmentation for segmentation.
-
-Spatial transforms (flip / affine / elastic / grid-dropout) are per-sample;
-intensity transforms (brightness / contrast / gamma / noise / blur / lowres)
-operate on image only. Inputs:
-  image      (B, 1, D, H, W), label (B, C, D, H, W), weight_map (B, 1, D, H, W) optional.
-weight_map receives the same spatial transforms as image/label; its
-interpolation is set by ``AugConfig.wmap_interp_mode`` ("nearest" preserves
-discrete fg/bg weights; "bilinear" for continuous hand-annotated weights).
-"""
+"""GPU 3D 分割数据增强。空间变换（flip/affine/elastic/grid-dropout）逐样本独立；强度变换仅作用于 image。weight_map 同步受空间变换，插值由 AugConfig.wmap_interp_mode 控制。"""
 
 from __future__ import annotations
 
@@ -21,19 +12,13 @@ from ..config import AugConfig
 
 
 class GPUAugmentor:
-    """GPU 3D augmentation pipeline (per-sample transforms).
-
-    ``max_scale`` is the largest multi-res scale in the input; it scales
-    down ``elastic_deform_alpha`` so the largest physical channel sees at
-    most ``alpha`` voxels of displacement.
-    """
+    """GPU 3D 增强管道。max_scale 为输入多分辨率最大 scale，用于缩小 elastic_deform_alpha，使最大物理通道位移 ≤ alpha 体素。"""
 
     def __init__(self, cfg: AugConfig, max_scale: float = 1.0):
         self.cfg = cfg
         self.enabled = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
-        # wmap interp: "nearest" preserves discrete fg/bg weights (default);
-        # "bilinear" for continuous weights. Only affine/elastic touch wmap.
+        # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。仅 affine/elastic 动 wmap。
         wmode = getattr(cfg, "wmap_interp_mode", "nearest")
         if wmode not in ("nearest", "bilinear"):
             raise ValueError(
@@ -45,7 +30,7 @@ class GPUAugmentor:
         self, image: torch.Tensor, label: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Apply augmentations to a batch; returns ``(image, label, weight_map)``."""
+        """对 batch 应用增强；返回 (image, label, weight_map)。"""
         if not self.enabled:
             return image, label, weight_map
 
@@ -59,7 +44,7 @@ class GPUAugmentor:
             image, label, c.random_affine_prob, c.random_rotate_range,
             c.random_scale_range, weight_map=weight_map,
             wmap_mode=self.wmap_interp_mode)
-        # Scale alpha down by max_scale so largest physical channel sees ≤ alpha voxels.
+        # 按 max_scale 缩小 alpha。
         effective_alpha = c.elastic_deform_alpha / self.max_scale
         image, label, weight_map = _elastic_deform(
             image, label, c.elastic_deform_prob, c.elastic_deform_sigma,
@@ -80,15 +65,13 @@ class GPUAugmentor:
         return image, label, weight_map
 
 
-# ===========================================================================
-# Spatial augmentations (per-sample independent)
-# ===========================================================================
+# 空间增强（逐样本独立）。
 def _random_flip(
     image: torch.Tensor, label: torch.Tensor,
     prob: float, axes: list,
     weight_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Per-sample random flip; each sample and axis independently sampled."""
+    """逐样本随机翻转；每轴独立采样。"""
     B = image.shape[0]
     for axis in axes:
         mask = torch.rand(B, device=image.device) < prob  # (B,) bool
@@ -107,41 +90,32 @@ def _random_affine(
     weight_map: Optional[torch.Tensor] = None,
     wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Per-sample random 3D affine (Euler rotation + isotropic scale) via grid_sample.
-
-    All three streams use ``padding_mode="border"`` so out-of-bounds voxels
-    replicate the boundary; this preserves the bg=1 contract of weight_map
-    (produced by ``load_region_weight_volume``) instead of zeroing the loss.
-    """
+    """逐样本 3D 仿射（欧拉旋转 + 各同性缩放）。三路均用 padding_mode='border' 保边界，避免将 weight_map 背景=1 归零。"""
     B, _, D, H, W = image.shape
     device = image.device
 
-    # Decide which samples get augmented
+    # 选择被增强的样本。
     mask = torch.rand(B, device=device) < prob
     if not mask.any():
         return image, label, weight_map
 
-    # Sample rotation angles (radians) and scale per sample
+    # 逐样本采样旋转角（弧度）与 scale。
     n = mask.sum().item()
     lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
     angles = torch.empty(n, 3, device=device).uniform_(lo, hi)  # (n, 3) for x,y,z
     scales = torch.empty(n, 1, device=device).uniform_(scale_range[0], scale_range[1])
 
-    # Build per-sample 3x4 affine matrices
-    affines = _build_rotation_matrices(angles, scales)  # (n, 3, 4)
-
-    # Generate grids
-    grid = F.affine_grid(affines, [n, 1, D, H, W], align_corners=False)  # (n, D, H, W, 3)
-
-    # Apply to selected samples
+    # 构建逐样本 3x4 仿射 + grid。
+    affines = _build_rotation_matrices(angles, scales)
+    grid = F.affine_grid(affines, [n, 1, D, H, W], align_corners=False)
     idx = mask.nonzero(as_tuple=True)[0]
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
 
-    # Label: use nearest interpolation to preserve binary values
+    # label 用 nearest 保二值。
     label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
 
-    # wmap: nearest=preserve discrete weights, bilinear=smooth continuous weights.
+    # wmap：nearest 保离散权重；bilinear 平滑连续权重。
     if weight_map is not None:
         weight_map[idx] = F.grid_sample(
             weight_map[idx], grid, mode=wmap_mode,
@@ -152,32 +126,28 @@ def _random_affine(
 
 def _build_rotation_matrices(
     angles: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """Build (N, 3, 4) affine matrices from Euler angles (rad, N x 3) and scales (N x 1)."""
+    """从欧拉角（N×3 rad）与 scales（N×1）构建 (N,3,4) 仿射矩阵。"""
     N = angles.shape[0]
     device = angles.device
 
     cx, cy, cz = angles[:, 0].cos(), angles[:, 1].cos(), angles[:, 2].cos()
     sx, sy, sz = angles[:, 0].sin(), angles[:, 1].sin(), angles[:, 2].sin()
 
-    # Rotation matrix R = Rz @ Ry @ Rx
+    # R = Rz @ Ry @ Rx。
     zeros = torch.zeros(N, device=device)
 
-    # Row 0
     r00 = cy * cz
     r01 = sx * sy * cz - cx * sz
     r02 = cx * sy * cz + sx * sz
-    # Row 1
     r10 = cy * sz
     r11 = sx * sy * sz + cx * cz
     r12 = cx * sy * sz - sx * cz
-    # Row 2
     r20 = -sy
     r21 = sx * cy
     r22 = cx * cy
 
     s = scales.squeeze(-1)  # (N,)
-
-    # Build 3x4: [s*R | 0]
+    # 3x4 = [s*R | 0]。
     mat = torch.stack([
         s * r00, s * r01, s * r02, zeros,
         s * r10, s * r11, s * r12, zeros,
@@ -193,11 +163,7 @@ def _elastic_deform(
     weight_map: Optional[torch.Tensor] = None,
     wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Per-sample 3D elastic deformation via smooth random displacement field.
-
-    sigma controls smoothness (typical 4–9, larger=smoother);
-    alpha controls displacement magnitude in voxels (typical 3–12).
-    """
+    """逐样本 3D 弹性形变。sigma 控平滑度（常 4–9）；alpha 控位移幅度体素（常 3–12）。"""
     B, _, D, H, W = image.shape
     device = image.device
 
@@ -208,15 +174,14 @@ def _elastic_deform(
     idx = mask.nonzero(as_tuple=True)[0]
     n = idx.shape[0]
 
-    # Coarse displacement, upsampled (trilinear acts as smoothing).
+    # 粗采样位移，上采平滑。
     cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
     cW = max(int(round(W / sigma)), 4)
     disp = torch.randn(n, 3, cD, cH, cW, device=device)
     disp = F.interpolate(disp, size=(D, H, W), mode="trilinear", align_corners=False)
 
-    # Convert voxel displacement → normalised grid coords (1 voxel = 2/N for align_corners=False).
-    # After permute, channels (0,1,2) map to grid axes (W, H, D).
+    # 体素位移→归一化 grid 坐标（1 voxel = 2/N）；permute 后通道 (0,1,2) 对应 grid 轴 (W,H,D)。
     voxel_to_grid = torch.tensor(
         [2.0 / W, 2.0 / H, 2.0 / D],
         dtype=disp.dtype, device=device,
@@ -238,10 +203,10 @@ def _elastic_deform(
 
 def _identity_grid(
     N: int, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """Identity grid in [-1+1/s, 1-1/s] for grid_sample(align_corners=False)."""
+    """grid_sample(align_corners=False) 用的单位网格，范围 [-1+1/s, 1-1/s]。"""
     vecs = [torch.linspace(-1 + 1/s, 1 - 1/s, s, device=device) for s in (D, H, W)]
     grids = torch.meshgrid(*vecs, indexing="ij")  # (D, H, W) each
-    grid = torch.stack(grids[::-1], dim=-1)  # (D, H, W, 3) — order: W, H, D for grid_sample
+    grid = torch.stack(grids[::-1], dim=-1)  # (D,H,W,3)；grid_sample 顺序 W,H,D
     return grid.unsqueeze(0).expand(N, -1, -1, -1, -1)
 
 
@@ -250,11 +215,7 @@ def _grid_dropout(
     prob: float, ratio: float, num_holes: int,
     weight_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Mask out ``num_holes`` rectangular sub-regions of the image with zeros.
-
-    Label and weight_map are not masked (ground truth and loss weights are
-    preserved inside dropped regions).
-    """
+    """随机零掩 num_holes 个矩形区域。label/weight_map 不被掩。"""
     if prob <= 0 or ratio <= 0:
         return image, label, weight_map
 
@@ -270,7 +231,7 @@ def _grid_dropout(
     hh = max(1, int(H * frac))
     hw = max(1, int(W * frac))
 
-    # Per-sample hole top-left corners (B, num_holes) — all sampled in one call.
+    # 逐样本 hole 左上角。
     d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)
     h0 = torch.randint(0, max(H - hh, 1), (B, num_holes), device=device)
     w0 = torch.randint(0, max(W - hw, 1), (B, num_holes), device=device)
@@ -291,18 +252,16 @@ def _grid_dropout(
             ws[:, None, None, :],
         ] = 0
 
-    # effective = selected ? hole_mask : 1
+    # effective = selected ? hole_mask : 1。
     gate = selected.reshape(B, 1, 1, 1, 1).to(image.dtype)
     effective = hole_mask * gate + (1.0 - gate)
     return image * effective, label, weight_map
 
 
-# ===========================================================================
-# Intensity augmentations (per-sample independent)
-# ===========================================================================
+# 强度增强（逐样本独立）。
 def _random_brightness(
     image: torch.Tensor, prob: float, brange: list) -> torch.Tensor:
-    """Per-sample random additive brightness shift."""
+    """逐样本随机加性亮度偏移。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -316,7 +275,7 @@ def _random_brightness(
 
 def _random_contrast(
     image: torch.Tensor, prob: float, crange: list) -> torch.Tensor:
-    """Per-sample random multiplicative contrast around the per-channel mean pivot."""
+    """逐样本随机对比度，以逐通道均值为轴。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -334,7 +293,7 @@ def _random_contrast(
 
 def _random_gamma(
     image: torch.Tensor, prob: float, grange: list) -> torch.Tensor:
-    """Per-sample random gamma: minmax-normalise per-channel, pow(gamma), de-normalise."""
+    """逐样本随机 gamma：逐通道 minmax 归一→pow(gamma)→反归一。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -343,14 +302,14 @@ def _random_gamma(
     if not mask.any():
         return image
 
-    # Reduce over spatial dims only — keep channels independent (multi-res safe).
+    # 仅在空间轴 reduce，通道独立（多分辨率安全）。
     reduce_dims = tuple(range(2, image.ndim))
     mn = image.amin(dim=reduce_dims, keepdim=True)  # (B,C,1,1,1)
     mx = image.amax(dim=reduce_dims, keepdim=True)
     rng = (mx - mn).clamp(min=1e-7)
     normed = ((image - mn) / rng).clamp(0.0, 1.0)
 
-    # Identity gamma=1.0 for un-selected samples.
+    # 未选中样本 gamma=1。
     gamma = torch.empty(B, device=device).uniform_(grange[0], grange[1])
     gamma = torch.where(mask, gamma, torch.ones_like(gamma))
     gshape = (B,) + (1,) * (image.ndim - 1)
@@ -361,7 +320,7 @@ def _random_gamma(
 
 def _gaussian_noise(
     image: torch.Tensor, prob: float, std: float) -> torch.Tensor:
-    """Per-sample additive Gaussian noise."""
+    """逐样本加性高斯噪声。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -375,7 +334,7 @@ def _gaussian_noise(
 
 def _gaussian_blur_3d(
     image: torch.Tensor, prob: float, sigma_range: list) -> torch.Tensor:
-    """Batched separable 3D Gaussian blur; one sigma shared across selected samples per call."""
+    """批量可分离 3D 高斯模糊；同一调用共享 sigma。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -391,7 +350,7 @@ def _gaussian_blur_3d(
     k1d = k1d / k1d.sum()
     pad = ks // 2
 
-    # Fold (B, C) into conv3d batch axis so the 1D kernel hits every (sample, channel) slice.
+    # 将 (B,C) 折入 conv3d batch 轴，1D 核作用于每个 (样本, 通道) 切片。
     sub = image[idx]
     n, C = sub.shape[:2]
     sub = sub.reshape(n * C, 1, *sub.shape[2:])
@@ -411,7 +370,7 @@ def _gaussian_blur_3d(
 
 def _simulate_lowres(
     image: torch.Tensor, prob: float, zoom_range: list) -> torch.Tensor:
-    """Simulate low-res by trilinear downsample→upsample; one zoom factor per call."""
+    """trilinear 下采→上采模拟低分辨率；同一调用共享 zoom。"""
     if prob <= 0:
         return image
     B = image.shape[0]

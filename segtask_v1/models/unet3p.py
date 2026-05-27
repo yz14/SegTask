@@ -1,9 +1,4 @@
-"""UNet3+ full-scale skip decoder (Huang 2020).
-
-Each decoder node D_i fuses n branches: encoders E_j (j<i pooled, j=i same, j=n-1 upsampled)
-and already-computed deeper decoders D_j (i<j<n-1, upsampled). Branches concat then fuse to a
-uniform fused_channels width across all depths.
-"""
+"""UNet3+ 全尺度 skip decoder (Huang 2020)。每个节点 D_i 融合 n 分支：E_j (j<i 池化、j=i 同级、j=n-1 上采) 与已计 D_j (i<j<n-1 上采)。分支 cat 后融合为统一 fused_channels。"""
 
 from __future__ import annotations
 
@@ -17,13 +12,10 @@ from .blocks import INTERP_SMOOTH, AttentionGate3D, ConvNormAct
 
 
 class UNet3PDecoder(nn.Module):
-    """UNet3+ full-scale skip decoder; out_channels low-res → high-res.
+    """UNet3+ 全尺度 skip decoder；out_channels low-res→high-res。
 
-    Args:
-        encoder_channels: encoder widths, highest-res first, bottleneck last.
-        cat_channels: per-branch width after 3x3 conv (paper: 64).
-        fused_channels: per-node output width; 0 → cat_channels * n (e.g. 320 at n=5).
-        skip_attention: gate each branch by same-level E_i.
+    参数：cat_channels 分支宽度（论文64）；fused_channels 节点输出宽（0=cat_channels*n）；
+    skip_attention=True 时用同级 E_i 对各分支作 gate。
     """
 
     def __init__(
@@ -53,7 +45,7 @@ class UNet3PDecoder(nn.Module):
                 norm_type=norm_type, norm_groups=norm_groups,
                 activation=activation, spatial_dims=spatial_dims)
 
-        # For each decoder depth i, build n branch convs (one per source j) + a fusion conv.
+        # 每个深度 i 构造 n 个分支卷积 + 1 个融合卷积。
         self.branches = nn.ModuleList()
         self.fusions = nn.ModuleList()
         self.gates = nn.ModuleList() if skip_attention else None
@@ -64,7 +56,7 @@ class UNet3PDecoder(nn.Module):
                 if j <= i:
                     src_ch = encoder_channels[j]
                 elif j < n - 1:
-                    src_ch = self.fused_ch       # deeper decoder node
+                    src_ch = self.fused_ch       # 更深 decoder 节点
                 else:
                     src_ch = encoder_channels[n - 1]  # bottleneck
                 branch_convs.append(_cna(src_ch, cat_channels))
@@ -84,7 +76,7 @@ class UNet3PDecoder(nn.Module):
         if src.shape[2:] == target_shape:
             return src
         if mode == "down":
-            # adaptive pool handles non-2^k feature maps (odd patch sizes)
+            # adaptive pool 处理非 2^k 特征图。
             if self.spatial_dims == 3:
                 return F.adaptive_max_pool3d(src, target_shape)
             return F.adaptive_max_pool2d(src, target_shape)
@@ -93,11 +85,11 @@ class UNet3PDecoder(nn.Module):
             mode=INTERP_SMOOTH[self.spatial_dims], align_corners=False)
 
     def forward(self, encoder_features: List[torch.Tensor]) -> List[torch.Tensor]:
-        """Return decoder features [low_res, ..., high_res]."""
+        """返回 [low_res, ..., high_res] decoder 特征。"""
         n = self.n
         decoder_nodes: List[torch.Tensor] = [None] * (n - 1)  # type: ignore
 
-        # iterate deepest → shallowest so deeper D_j is ready when needed
+        # 自深至浅迭代，保证需要的 D_j 已就绪。
         for i in range(n - 2, -1, -1):
             tgt_shape = encoder_features[i].shape[2:]
             gate_signal = encoder_features[i]

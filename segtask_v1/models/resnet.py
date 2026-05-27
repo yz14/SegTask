@@ -1,10 +1,4 @@
-"""ResNet blocks for 3D/2D UNet stages. Block types (block_type):
-  - 'basic'     : post-act, conv-norm-act-conv-norm; default, light
-  - 'preact'    : norm-act-conv-... (He 2016); better for deep ResEnc-L/XL
-  - 'bottleneck': 1x1 reduce / 3x3 / 1x1 expand (ResEnc-XL)
-  - 'r2plus1d'  : (1,3,3) spatial + (3,1,1) temporal, 3D-only; cheap z-context
-Downsampling is external (blocks.Downsample).
-"""
+"""UNet stage 用 ResNet 块。block_type 示例：'basic' 轻量后置激活 、'r2plus1d' (1,3,3)+(3,1,1) 仅 3D。还有 'preact'/'bottleneck'。下采样由 blocks.Downsample 外部完成。"""
 
 from __future__ import annotations
 
@@ -18,9 +12,7 @@ from .blocks import (
 
 
 class ResNetBlock(nn.Module):
-    """Post-act ResNet block (+ optional attention). attention_type: none|se|eca|cbam|coord.
-    Legacy use_se=True is promoted to attention_type='se' when not set.
-    """
+    """后置激活 ResNet 块（可选 attention）。use_se=True 且 attention_type=='none' 时提升为 'se'。"""
 
     def __init__(
         self,
@@ -47,7 +39,7 @@ class ResNetBlock(nn.Module):
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         if attention_type == "none" and use_se:
-            attention_type = "se"  # legacy use_se back-compat
+            attention_type = "se"  # 旧 use_se 向后兼容
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
         self.shortcut = (
@@ -65,7 +57,7 @@ class ResNetBlock(nn.Module):
 
 
 class PreActResNetBlock(nn.Module):
-    """Pre-act ResNet block (He 2016): norm-act-conv x2 + residual; better for deep encoders."""
+    """预激活 ResNet 块 (He 2016)：norm-act-conv × 2 + 残差；适合深 encoder。"""
 
     def __init__(
         self,
@@ -95,7 +87,7 @@ class PreActResNetBlock(nn.Module):
             attention_type = "se"
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
-        # shortcut on raw x; channel-mismatch uses 1x1 projection (canonical pre-act)
+        # shortcut 作用于原 x；通道不匹配时用 1×1 投影（标准 pre-act）。
         self.shortcut = (
             _CONV[d](in_ch, out_ch, 1, bias=False)
             if in_ch != out_ch else nn.Identity())
@@ -110,7 +102,7 @@ class PreActResNetBlock(nn.Module):
 
 
 class BottleneckBlock(nn.Module):
-    """ResNet-50-style bottleneck: 1x1 reduce → 3x3 → 1x1 expand (expansion=4, for ResEnc-XL)."""
+    """ResNet-50 风 bottleneck：1×1 压 → 3×3 → 1×1 扩（expansion=4，适 ResEnc-XL）。"""
 
     def __init__(
         self,
@@ -163,10 +155,7 @@ class BottleneckBlock(nn.Module):
 
 
 class R2Plus1DBlock(nn.Module):
-    """R(2+1)D residual block (Tran 2018), 3D-only.
-    Each 3x3x3 → (1,3,3) spatial conv + norm + act + (3,1,1) temporal conv.
-    Mid non-linearity is essential. mid_ch = out_ch (no bottleneck).
-    """
+    """R(2+1)D 残差块 (Tran 2018)，仅 3D。每个 3×3×3 拆为 (1,3,3) 空间 + norm + act + (3,1,1) 时间；中间非线性不可省，mid_ch=out_ch。"""
 
     def __init__(
         self,
@@ -183,7 +172,7 @@ class R2Plus1DBlock(nn.Module):
         temporal_kernel: int = 3):
         super().__init__()
         if spatial_dims != 3:
-            # D must be a real axis; in 2.5D D is folded into channels.
+            # D 必须是真空间轴；2.5D 中 D 被折叠到通道。
             raise ValueError(
                 "R2Plus1DBlock requires spatial_dims=3 (D must be a real "
                 "spatial axis). For 2.5D mode (spatial_dims=2), use "
@@ -197,7 +186,7 @@ class R2Plus1DBlock(nn.Module):
         d = 3
         t_pad = temporal_kernel // 2
 
-        # First (2+1)D pair (in_ch → out_ch)
+        # 第一组 (2+1)D：in_ch → out_ch。
         self.spatial1 = nn.Conv3d(
             in_ch, out_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False)
         self.norm_s1  = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
@@ -208,7 +197,7 @@ class R2Plus1DBlock(nn.Module):
         self.norm_t1   = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
         self.act_t1    = get_activation(activation)
 
-        # Second (2+1)D pair (out_ch → out_ch)
+        # 第二组 (2+1)D：out_ch → out_ch。
         self.spatial2 = nn.Conv3d(
             out_ch, out_ch, kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False)
         self.norm_s2  = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
@@ -217,7 +206,7 @@ class R2Plus1DBlock(nn.Module):
         self.temporal2 = nn.Conv3d(
             out_ch, out_ch, kernel_size=(temporal_kernel, 1, 1), padding=(t_pad, 0, 0), bias=False)
         self.norm_t2   = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
-        self.act_out   = get_activation(activation)  # applied after residual add
+        self.act_out   = get_activation(activation)  # 残差相加后再激活
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
@@ -240,7 +229,7 @@ class R2Plus1DBlock(nn.Module):
         out = self.act_s1(self.norm_s1(self.spatial1(x)))
         out = self.act_t1(self.norm_t1(self.temporal1(out)))
         out = self.drop(out)
-        # post-act: no act before residual add (matches ResNetBlock)
+        # 后置激活：残差前不加 act（对齐 ResNetBlock）。
         out = self.act_s2(self.norm_s2(self.spatial2(out)))
         out = self.norm_t2(self.temporal2(out))
         out = self.attn(out)
@@ -264,9 +253,7 @@ def _make_block(block_type: str, in_ch: int, out_ch: int, **kwargs) -> nn.Module
 
 
 class ResNetStage(nn.Module):
-    """N residual blocks at one resolution. First block may change channels.
-    block_type: 'basic' (default) | 'preact' | 'bottleneck' | 'r2plus1d'.
-    """
+    """同分辨率下的 N 个残差块，首块可变通道。block_type：'basic'/'preact'/'bottleneck'/'r2plus1d'。"""
 
     def __init__(
         self,

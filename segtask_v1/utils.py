@@ -1,4 +1,4 @@
-"""Training utilities: AverageMeter, ModelEMA, Timer, dice metrics, seeding."""
+"""训练工具：AverageMeter、ModelEMA、Timer、dice 指标、随机性。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class AverageMeter:
-    """Running mean tracker."""
+    """跟踪运行均值。"""
 
     def __init__(self):
         self.reset()
@@ -35,7 +35,7 @@ class AverageMeter:
 
 
 class ModelEMA:
-    """Param EMA with in-place apply/restore (single-GPU only; not DDP/FSDP-safe)."""
+    """参数 EMA，支持原地 apply/restore（仅单卡，不兼容 DDP/FSDP）。"""
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
@@ -51,12 +51,12 @@ class ModelEMA:
             if param.is_floating_point():
                 self.shadow[k].mul_(self.decay).add_(param, alpha=1.0 - self.decay)
             else:
-                # int buffers (e.g. BN num_batches_tracked) just follow latest
+                # 整型 buffer（如 BN num_batches_tracked）直接跟随最新。
                 self.shadow[k].copy_(param)
 
     @torch.no_grad()
     def apply_shadow(self, model: nn.Module) -> None:
-        """Swap shadow weights into model; live weights saved to backup for restore()."""
+        """将 shadow 权重换入 model；live 存入 backup 供 restore()。"""
         if self._swapped:
             return
         sd = model.state_dict()
@@ -85,7 +85,7 @@ class ModelEMA:
             for k, v in loaded.items():
                 self.shadow[k].copy_(v)
         else:
-            # mismatched keys: rebuild shadow from scratch
+            # key 不一致：从零重建 shadow。
             self.shadow = {k: v.detach().clone() for k, v in loaded.items()}
             self._backup = {}
             self._swapped = False
@@ -93,7 +93,7 @@ class ModelEMA:
 
 
 class Timer:
-    """Elapsed time tracker."""
+    """计时器。"""
 
     def __init__(self):
         self.start = time.time()
@@ -116,9 +116,7 @@ def compute_dice_per_class(
     smooth: float = 1e-5,
     ignore_empty: bool = True,
 ) -> torch.Tensor:
-    """Per-class sigmoid Dice on (B,C,D,H,W). ignore_empty=True (nnU-Net): empty-GT samples
-    excluded from mean; classes fully empty in batch return 0.0.
-    """
+    """(B,C,D,H,W) 逐类 sigmoid Dice。ignore_empty=True (nnU-Net)：空 GT 样本不入均；batch 全空类返 0。"""
     pred_bin = (torch.sigmoid(pred) > threshold).float()
     B, C = pred.shape[:2]
     p = pred_bin.reshape(B, C, -1)
@@ -145,9 +143,7 @@ def dice_batch_stats(
     target: torch.Tensor,
     threshold: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
-    """Per-class primitives (inter, denom, n_with_gt) for nnU-Net-style pooled dice:
-    final_dice[c] = 2*Σinter[c] / Σdenom[c] over the full validation set.
-    """
+    """逐类汇汇 (inter, denom, n_with_gt)，供 nnU-Net pooled dice：final_dice[c]=2·Σinter[c]/Σdenom[c]。"""
     pred_bin = (torch.sigmoid(pred) > threshold).float()
     B, C = pred.shape[:2]
     p = pred_bin.reshape(B, C, -1)
@@ -159,7 +155,7 @@ def dice_batch_stats(
 
 
 def seed_everything(seed: int, deterministic: bool = False) -> None:
-    """Seed RNGs. deterministic=True forces cudnn deterministic (slower)."""
+    """设置随机种子。deterministic=True 强制 cudnn deterministic（较慢）。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

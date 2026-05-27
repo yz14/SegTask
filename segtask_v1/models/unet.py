@@ -1,8 +1,4 @@
-"""Generic 3D UNet (encoder/decoder symmetric in channels; backbone blocks injected by factory).
-
-Supports deep supervision, cat/add skip fusion, multi-FOV context fusion (2.5D),
-and auxiliary per-FOV seg heads (Plan A: shared trunk, Plan C: hierarchical).
-"""
+"""通用 UNet：对称 enc/dec，backbone block 由 factory 注入。支持深监督、cat/add skip、多 FOV 融合及辅助分割头。"""
 
 from __future__ import annotations
 
@@ -20,10 +16,7 @@ from .stem import HierarchicalStems, build_context_stem, build_stem
 
 
 class Encoder(nn.Module):
-    """UNet encoder: stem + N stages with downsamples between them.
-
-    Returns ``[level_0, ..., bottleneck]`` (level_0 is highest resolution).
-    """
+    """UNet encoder：stem + N 个 stage（中间下采样）。返回 [level_0, ..., bottleneck]，level_0 最高分辨率。"""
 
     def __init__(
         self,
@@ -42,11 +35,8 @@ class Encoder(nn.Module):
         downsample_builder : Optional[Callable[[int, int], nn.Module]] = None):
         super().__init__()
         self.spatial_dims = spatial_dims
-        # Stem may introduce a spatial stride (patch2/patch4); stem_stride is
-        # exposed so the wrapping UNet can add a matching final upsample.
-        # Multi-FOV (2.5D, n_views>1): channel layout is uniform per-view by
-        # default, or per-view variable when ``in_ch_per_view_list`` is given
-        # (native-depth path D_k = round(D * s_k)).
+        # patchN stem 引入空间 stride，外层 UNet 用 stem_stride 补尾部上采样。
+        # 多 FOV (2.5D, n_views>1)：默认通道均分；in_ch_per_view_list 非空时按 view 分（native-depth）。
         if context_n_views < 1:
             raise ValueError(
                 f"context_n_views must be >= 1, got {context_n_views}")
@@ -68,7 +58,7 @@ class Encoder(nn.Module):
                     f"context_n_views ({context_n_views})")
             in_ch_per_view = in_channels // context_n_views
         self.context_n_views = context_n_views
-        # Persisted so UNet3D can mirror stem topology when building aux heads.
+        # UNet3D 构建 aux head 时需读此字段对齐 stem 拓扑。
         self.context_fusion = context_fusion
         self.in_ch_per_view_list: List[int] = (
             list(in_ch_per_view_list) if in_ch_per_view_list is not None
@@ -91,8 +81,8 @@ class Encoder(nn.Module):
             in_ch = stage_channels[i - 1] if i > 0 else stage_channels[0]
             self.stages.append(stage_builder(in_ch, ch))
             if i > 0:
-                # Inter-stage downsample (in_ch==out_ch; next stage's first block grows channels).
-                # ``downsample_builder`` lets backbones inject custom topologies (e.g. ConvNeXt LN-first).
+                # stage 间下采样（通道不变，下一 stage 首 block 升通道）。
+                # downsample_builder 允许 backbone 注入自定义拓扑（如 ConvNeXt LN-first）。
                 ds_in  = stage_channels[i - 1]
                 ds_out = stage_channels[i - 1]
                 if downsample_builder is not None:
@@ -104,8 +94,7 @@ class Encoder(nn.Module):
                             norm_type=norm_type, norm_groups=norm_groups,
                             mode=downsample_mode, spatial_dims=spatial_dims))
 
-        # Hierarchical stem only: per-level cat(main, aux) → 1×1 fuse → stage_channels[k-1].
-        # Keys are str(level); rest of the encoder/decoder/skip contract stays unchanged.
+        # 仅 hierarchical stem：每级 cat(main, aux) → 1×1 → stage_channels[k-1]。key 为 str(level)。
         self.aux_fuse = nn.ModuleDict()
         if isinstance(self.stem, HierarchicalStems):
             hs = self.stem
@@ -119,7 +108,7 @@ class Encoder(nn.Module):
                     activation=activation, spatial_dims=spatial_dims)
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Returns ``[level_0, ..., level_N]``; hierarchical stem cat-fuses aux feats post-downsample."""
+        """返回 [level_0, ..., level_N]；hierarchical stem 在下采样后 cat 注入 aux 特征。"""
         if isinstance(self.stem, HierarchicalStems):
             chunks = self.stem.split_views(x)
             x = self.stem.forward_main(chunks[0])
@@ -135,8 +124,7 @@ class Encoder(nn.Module):
                 if i in aux_feats:
                     aux = aux_feats[i]
                     if aux.shape[2:] != x.shape[2:]:
-                        # Aux stem strides are computed to match exactly; mismatch
-                        # implies misaligned input dims — fail fast with diagnostic.
+                        # aux stem stride 已对齐 main；不匹配说明输入未按 aux stem stride 整除。
                         raise RuntimeError(
                             f"Plan C aux feature spatial mismatch at "
                             f"level {i}: main={tuple(x.shape[2:])}, "
@@ -150,10 +138,7 @@ class Encoder(nn.Module):
 
 
 class DecoderLevel(nn.Module):
-    """Single decoder level: upsample → (optional attention-gated) skip fusion → stage blocks.
-
-    ``skip_attention`` enables Attention U-Net (Oktay 2018) gating on the skip feature.
-    """
+    """单层 decoder：上采样 → (可选 attention-gate) skip 融合 → stage block。skip_attention 启用 Attention U-Net (Oktay 2018)。"""
 
     def __init__(
         self,
@@ -173,8 +158,7 @@ class DecoderLevel(nn.Module):
 
         if skip_mode == "cat":
             fused_ch = out_ch + skip_ch
-        else:  # add
-            # Project skip to match out_ch if needed
+        else:  # add：必要时投影 skip 通道。
             self.skip_proj = (
                 _CONV[spatial_dims](skip_ch, out_ch, 1, bias=False)
                 if skip_ch != out_ch else nn.Identity())
@@ -189,13 +173,13 @@ class DecoderLevel(nn.Module):
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.upsample(x)
 
-        # Resize on shape mismatch (odd input sizes).
+        # 奇数尺寸下兜底重采样。
         if x.shape[2:] != skip.shape[2:]:
             raise  # TODO 不允许有尺寸不匹配
             x = _match_size(x, skip.shape[2:], self.spatial_dims)
 
         if self.attn_gate is not None:
-            # Upsampled decoder feat gates the skip (shapes now match).
+            # 用上采样后的 decoder 特征作 gate。
             skip = self.attn_gate(skip, x)
 
         if self.skip_mode == "cat":
@@ -207,10 +191,7 @@ class DecoderLevel(nn.Module):
 
 
 class Decoder(nn.Module):
-    """UNet decoder: N levels of upsample + skip fusion + blocks.
-
-    Input ``[level_0, ..., bottleneck]`` → output ``[dec_low_res, ..., dec_high_res]``.
-    """
+    """UNet decoder：N 层上采样+skip 融合。输入 [level_0,...,bottleneck] → 输出 [dec_low_res,...,dec_high_res]。"""
 
     def __init__(
         self,
@@ -225,11 +206,11 @@ class Decoder(nn.Module):
         self.spatial_dims = spatial_dims
         n = len(encoder_channels)
 
-        # Deepest → shallowest; level i fuses encoder[n-2-i] (skip) with prior decoder output.
+        # 自深至浅；level i 融合 encoder[n-2-i] 作为 skip。
         for i in range(n - 1):
             in_ch   = encoder_channels[n - 1 - i]  # from deeper level
             skip_ch = encoder_channels[n - 2 - i]  # skip connection
-            out_ch  = encoder_channels[n - 2 - i]  # symmetric output
+            out_ch  = encoder_channels[n - 2 - i]  # symmetric output  # TODO: 是否换成 encoder_channels[n - 1 - i]压缩的少一些，效果会更好？
 
             self.levels.append(
                 DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
@@ -238,11 +219,11 @@ class Decoder(nn.Module):
                              skip_attention = skip_attention,
                              spatial_dims   = spatial_dims))
 
-        # Output channels at each decoder level (low-res → high-res)
+        # 各 decoder 层的输出通道（low-res → high-res）。
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
 
     def forward(self, encoder_features: List[torch.Tensor]) -> List[torch.Tensor]:
-        """``[level_0, ..., bottleneck]`` → ``[dec_low_res, ..., dec_high_res]``."""
+        """[level_0, ..., bottleneck] → [dec_low_res, ..., dec_high_res]。"""
         x = encoder_features[-1]  # bottleneck
         outputs = []
         for i, level in enumerate(self.levels):
@@ -253,7 +234,7 @@ class Decoder(nn.Module):
 
 
 class SegmentationHead(nn.Module):
-    """1x1(x1) convolution to produce per-class logits."""
+    """1×1 卷积输出逐类 logits。"""
 
     def __init__(self, in_ch: int, num_classes: int, spatial_dims: int = 3):
         super().__init__()
@@ -264,7 +245,7 @@ class SegmentationHead(nn.Module):
 
 
 class ConvSegmentationHead(nn.Module):
-    """3×3 ConvNormAct → 1×1 logits; richer aux head than :class:`SegmentationHead` (~1% extra params)."""
+    """3×3 ConvNormAct → 1×1 logits；比 SegmentationHead 更厚的 aux 头（约 +1% 参数）。"""
 
     def __init__(
         self,
@@ -293,7 +274,7 @@ def _build_aux_head(
     norm_type   : str = "instance",
     norm_groups : int = 8,
     activation  : str = "leakyrelu") -> nn.Module:
-    """Aux seg head dispatch: ``linear`` (1×1) | ``conv`` (3×3 + 1×1). See ``ModelConfig.aux_head_mode``."""
+    """Aux 头分派：'linear' (1×1) | 'conv' (3×3+1×1)。见 ModelConfig.aux_head_mode。"""
     if mode == "linear":
         return SegmentationHead(in_ch, num_classes, spatial_dims=spatial_dims)
     if mode == "conv":
@@ -306,15 +287,11 @@ def _build_aux_head(
 
 
 class UNet3D(nn.Module):
-    """Generic 3D UNet with pluggable encoder/decoder stages.
+    """通用 UNet。aux_seg_supervision 在 context_n_views>1 时构建逐 FOV 辅助头。
 
-    ``aux_seg_supervision`` builds per-FOV aux heads symmetric to the encoder
-    stem topology; active only when ``encoder.context_n_views > 1``.
-
-    Forward returns:
-      - eval / no-aux training: ``Tensor`` or ``[main, ds1, ..., dsN]`` (when DS).
-      - training + aux active : ``{"main": tensor|list, "aux": [aux_1, ..., aux_{K-1}]}``
-        with all aux outputs upsampled to ``main_out`` spatial size.
+    forward 返回：
+      - eval / 无 aux：Tensor 或 [main, ds1, ...]（深监督）。
+      - train + aux：{"main": ..., "aux": [...]}，aux 上采样到 main 尺寸。
     """
 
     def __init__(
@@ -326,9 +303,7 @@ class UNet3D(nn.Module):
         spatial_dims         : int = 3,
         aux_seg_supervision  : bool = False,
         aux_head_mode        : str = "linear",
-        # Norm / activation are propagated to ``ConvSegmentationHead`` when
-        # ``aux_head_mode == "conv"``; mirror the encoder defaults so the
-        # aux head's norm/act stay homogeneous with the rest of the model.
+        # aux_head_mode=='conv' 时透传到 ConvSegmentationHead；与 encoder 默认对齐。
         norm_type            : str = "instance",
         norm_groups          : int = 8,
         activation           : str = "leakyrelu",
@@ -340,36 +315,28 @@ class UNet3D(nn.Module):
         self.deep_supervision = deep_supervision
         self.spatial_dims     = spatial_dims
 
-        # Main head reads highest-res decoder feat; if stem stride > 1, the
-        # output is upsampled back to input resolution in forward(). DS heads
-        # stay at their native decoder resolutions (loss downsamples target).
+        # 主头读最高分辨率 decoder 特征；stem_stride>1 时 forward 末尾上采回输入分辨率。DS 头保留各自分辨率。
         self.stem_stride = getattr(encoder, "stem_stride", 1)
         self.seg_head    = SegmentationHead(  # TODO 这里单层是否过于简单？是否可以选择多层？像ConvSegmentationHead
             decoder.out_channels[-1], num_fg_classes, spatial_dims=spatial_dims)
 
-        # DS heads in decreasing resolution: forward returns [main, 2nd, ..., lowest]
-        # to match DeepSupervisionLoss (weights[0] = highest-res).
+        # DS 头按分辨率递减：forward 返回 [main, 2nd, ..., lowest]，对齐 DeepSupervisionLoss。
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
             for ch in reversed(decoder.out_channels[:-1]):
                 self.ds_heads.append(SegmentationHead(
                     ch, num_fg_classes, spatial_dims=spatial_dims))
 
-        # Aux seg heads mirror the stem fusion topology:
-        #   Plan A (shared_stem / multi_stem_proj): all aux heads on dec_features[-1]
-        #     (parallel multi-task heads on shared trunk).
-        #   Plan C (hierarchical): aux head k reads dec_features[-1-k] (matches the
-        #     semantic depth where view k was injected at encoder stage k).
-        # Aux outputs are upsampled to (H, W) of the main output.
+        # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
+        # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
         n_views = int(getattr(encoder, "context_n_views", 1))
         fusion  = str(getattr(encoder, "context_fusion", "shared_stem"))
         self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
         self.aux_n_views = n_views
-        # aux_feat_indices[k-1] = decoder feature index for aux head k (no per-call branching).
+        # aux_feat_indices[k-1]：aux 头 k 用的 decoder 特征索引（避免运行时分支）。
         self.aux_feat_indices: List[int] = []
         self.aux_heads = nn.ModuleList()
-        # Per-aux out channels: default num_fg_classes (uniform-D path); native-depth ON
-        # passes [num_fg*D_1, ..., num_fg*D_{K-1}] explicitly via aux_head_out_channels.
+        # aux 通道默认 num_fg；native-depth 路径显式传 [num_fg*D_1, ..., num_fg*D_{K-1}]。
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
         if aux_head_out_channels is None:
             self.aux_head_out_channels: List[int] = ([num_fg_classes] * n_aux_expected)
@@ -380,7 +347,7 @@ class UNet3D(nn.Module):
                     f"({len(aux_head_out_channels)}) must equal "
                     f"n_views - 1 ({n_aux_expected}).")
             self.aux_head_out_channels = [int(c) for c in aux_head_out_channels]
-        # ``conv`` mode bakes in norm/activation; ``linear`` is a bare 1×1 conv.
+        # 'conv' 含 norm/act；'linear' 仅 1×1。
         def _head(in_ch: int, out_ch: int) -> nn.Module:
             return _build_aux_head(
                 mode         = aux_head_mode,
@@ -394,7 +361,7 @@ class UNet3D(nn.Module):
         if self.aux_seg_supervision:
             n_dec = len(decoder.out_channels)
             if fusion == "hierarchical":
-                # dec_features ordering: [-1]=highest-res (stage 0), [-1-k] mirrors stage k.
+                # dec_features：[-1] 最高分辨率，[-1-k] 镜像 stage k。
                 if n_views > n_dec:
                     raise ValueError(
                         f"aux_seg_supervision (hierarchical) requires "
@@ -407,7 +374,7 @@ class UNet3D(nn.Module):
                         _head(decoder.out_channels[feat_idx],
                               self.aux_head_out_channels[k - 1]))
             else:
-                # Plan A: all aux heads on the highest-res decoder feat.
+                # Plan A：所有 aux 头读最高分辨率 decoder 特征。
                 in_ch = decoder.out_channels[-1]
                 for k in range(1, n_views):
                     self.aux_feat_indices.append(n_dec - 1)  # 用最后一个特征
@@ -415,7 +382,7 @@ class UNet3D(nn.Module):
                         _head(in_ch, self.aux_head_out_channels[k - 1]))
 
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
-        """``x``: ``(B, in_channels, *spatial)``; 2.5D multi-FOV uses ``(B, n_views*D, H, W)``."""
+        """x: (B, in_channels, *spatial)；2.5D 多 FOV 为 (B, n_views*D, H, W)。"""
         enc_features = self.encoder(x)
         dec_features = self.decoder(enc_features)
         target_size  = x.shape[2:]
@@ -423,12 +390,12 @@ class UNet3D(nn.Module):
         main_out = self.seg_head(dec_features[-1])
         if main_out.shape[2:] != target_size:
             raise # TODO 不允许有尺寸不匹配
-            # Restore to input resolution (bilinear/trilinear by spatial_dims).
+            # 还原到输入分辨率。
             main_out = F.interpolate(
                 main_out, size=target_size,
                 mode=INTERP_SMOOTH[self.spatial_dims], align_corners=False)
 
-        # Aux outputs only in training; eval path keeps the legacy tensor / list contract.
+        # aux 仅训练时输出；eval 保持原 tensor/list 协议。
         aux_outs: List[torch.Tensor] = []
         if self.aux_seg_supervision and self.training:
             for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
@@ -442,7 +409,7 @@ class UNet3D(nn.Module):
                 aux_outs.append(ao)
 
         if self.deep_supervision and self.training:
-            # dec_features=[low,...,high]; main_out used [-1]; DS heads run on [-2]..[low].
+            # dec_features=[low,...,high]；main 用 [-1]，DS 头用 [-2]..[low]。
             main_path: Union[torch.Tensor, List[torch.Tensor]] = [main_out]
             for i, head in enumerate(self.ds_heads):
                 main_path.append(head(dec_features[-2 - i]))
@@ -462,7 +429,7 @@ class UNet3D(nn.Module):
 
 
 def _match_size(x: torch.Tensor, target_size, spatial_dims: int = 3) -> torch.Tensor:
-    """Resize x to match target spatial size (bilinear/trilinear by dim)."""
+    """按 spatial_dims 重采样 x 到 target_size。"""
     return F.interpolate(
         x, size=target_size,
         mode=INTERP_SMOOTH[spatial_dims], align_corners=False)

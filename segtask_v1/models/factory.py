@@ -1,4 +1,4 @@
-"""Model factory: build UNet3D/ADM/EDM2 from config."""
+"""根据 config 构建 UNet3D / ADM / EDM2 模型。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def _resolve_blocks_per_stage(
     explicit: List[int],
     n_stages: int,
     fallback: int) -> List[int]:
-    """Pick per-stage block counts: explicit list wins; else broadcast fallback."""
+    """逐级 block 数：显式列表优先，否则广播 fallback。"""
     if explicit:
         if len(explicit) != n_stages:
             raise ValueError(
@@ -34,7 +34,7 @@ def _resolve_blocks_per_stage(
 
 
 class _StatefulStageBuilder:
-    """Per-call stage builder; reads num_blocks from counts[idx], advances idx."""
+    """有状态 stage 构建器：逐次调用从 counts[idx] 读 num_blocks。"""
 
     def __init__(self, factory_fn, counts: List[int]):
         self._fn     = factory_fn
@@ -52,7 +52,7 @@ class _StatefulStageBuilder:
 
 
 def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
-    """Return a stateful builder for the given per-stage block counts."""
+    """返回按逐级 block 数构建 ResNet stage 的有状态函数。"""
     mc = cfg.model
     spatial_dims = getattr(mc, "spatial_dims", 3)
 
@@ -74,7 +74,7 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
 
 
 def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
-    """ConvNeXt stage builder. Blocks hard-code LN+GELU; warns if user set other norm/act."""
+    """ConvNeXt stage 构建器：块内硬编码 LN+GELU；用户设其他 norm/act 时警告。"""
     mc = cfg.model
     spatial_dims = getattr(mc, "spatial_dims", 3)
     non_default = []
@@ -93,11 +93,11 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             "ConvNeXt blocks: %s. (They still apply to the stem/decoder "
             "skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
-    # linear drop-path rates over total blocks
+    # 总 block 上线性增的 drop-path。
     total_blocks = sum(counts)
     dp_rates     = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
     rate_idx     = [0]
-    ls_init      = float(getattr(mc, "convnext_layer_scale_init", 1e-6))  # <=0 disables
+    ls_init      = float(getattr(mc, "convnext_layer_scale_init", 1e-6))  # <=0 禁用
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
         start = rate_idx[0]
@@ -117,7 +117,7 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
 
 def _make_convnext_downsample_builder(
     cfg: Config) -> Callable[[int, int], ConvNeXtDownsample]:
-    """Builder for paper-faithful LN → Conv(s=2) inter-stage downsample."""
+    """论文风 ConvNeXt 阶间下采样 LN→Conv(s=2) 构建器。"""
     spatial_dims = getattr(cfg.model, "spatial_dims", 3)
 
     def build(in_ch: int, out_ch: int) -> ConvNeXtDownsample:
@@ -127,9 +127,7 @@ def _make_convnext_downsample_builder(
 
 
 def build_model(cfg: Config):
-    """Build seg model dispatched on cfg.model.arch: 'unet' (default) | 'adm' | 'edm2'.
-    'adm'/'edm2' ignore most backbone/block knobs (paper-faithful GN+SiLU / MP blocks).
-    """
+    """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'（后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
     arch = str(getattr(cfg.model, "arch", "unet")).lower()
     if arch == "adm":
         from .adm_unet import build_adm_seg_model
@@ -147,12 +145,9 @@ def build_model(cfg: Config):
     n_levels     = len(enc_channels)
     spatial_dims = getattr(mc, "spatial_dims", 3)
 
-    # out_classes by mode:
-    #   3D (z_axis/cubic/whole): num_fg * num_res (one per multi_res scale)
-    #   2.5D folded: num_fg * D  (SliceChannelLoss splits per-fg into D slices)
-    #   2.5D lifted (lift_2_5d_to_3d): true 3D, single-res, num_fg
+    # out_classes：3D = num_fg*num_res；2.5D 折叠 = num_fg*D；2.5D lift = num_fg。
     lift = bool(getattr(mc, "lift_2_5d_to_3d", False))
-    if cfg.data.patch_mode == "2_5d" and not lift:
+    if   cfg.data.patch_mode == "2_5d" and not lift:
         num_res = 1
         D = int(cfg.data.patch_size[0])
         out_classes = num_fg * D
@@ -163,13 +158,13 @@ def build_model(cfg: Config):
         num_res = len(cfg.data.multi_res_scales)
         out_classes = num_fg * num_res
 
-    # multi-FOV context views into the stem (2.5D-only; 3D stem reads scales directly)
+    # 多 FOV 上下文仅 2.5D 有意义；3D stem 直接读取 scales。
     if cfg.data.patch_mode == "2_5d":
         context_n_views = max(len(cfg.data.multi_res_scales), 1)
     else:
         context_n_views = 1
 
-    # Per-view in-ch list (2.5D + aux_keep_native_d ON); else None → uniform split
+    # 2.5D + aux_keep_native_d 时按 view 拆分输入通道；否则 None 代表均分。
     in_ch_per_view_list   = None
     aux_head_out_channels = None
     if (cfg.data.patch_mode == "2_5d"
@@ -177,9 +172,9 @@ def build_model(cfg: Config):
             and context_n_views > 1):
         depths = list(cfg.aux_view_depths)
         in_ch_per_view_list   = depths
-        aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]  # aux head k: num_fg*D_k
+        aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]  # aux 头 k：num_fg*D_k
 
-    # decoder builder call count varies: unet=n-1, unetpp=n*(n-1)/2, unet3p=0
+    # decoder builder 调用次数：unet=n-1，unetpp=n*(n-1)/2，unet3p=0。
     enc_counts = _resolve_blocks_per_stage(
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
 
@@ -194,12 +189,12 @@ def build_model(cfg: Config):
         dec_counts = _resolve_blocks_per_stage(
             mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
     elif mc.decoder_blocks_per_stage:
-        # UNet++: broadcast first count to every nested node
+        # UNet++：首项广播到所有嵌套节点。
         dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
     else:
         dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)
 
-    # separate enc/dec builders so call counters are independent
+    # enc/dec 分别构建以使计数独立。
     downsample_builder = None
     if   mc.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(cfg, enc_counts)
@@ -207,7 +202,7 @@ def build_model(cfg: Config):
     elif mc.backbone == "convnext":
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)
-        # LN-first downsample; toggle to fall back to generic Downsample for ablation
+        # LN-first 下采样；置 False 回退通用 Downsample（消融实验）。
         if bool(getattr(mc, "convnext_downsample_lnfirst", True)):
             downsample_builder = _make_convnext_downsample_builder(cfg)
     else:
@@ -256,9 +251,9 @@ def build_model(cfg: Config):
             spatial_dims     = spatial_dims)
 
     aux_seg_supervision = bool(getattr(mc, "aux_seg_supervision", False))
-    # aux only meaningful with multi-FOV; mirror UNet3D's internal gate for accurate logging
+    # aux 仅多 FOV 时有意义；镜像 UNet3D 内部门控以准确日志。
     aux_seg_supervision = aux_seg_supervision and context_n_views > 1
-    # per-view aux out channels only when 2.5D native-D ON; else None → default num_fg_classes
+    # 逐 view aux 通道仅 2.5D native-D 时使用；否则 None=默认 num_fg_classes。
     aux_head_out_channels_arg = (
         aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels) else None)
     model = UNet3D(

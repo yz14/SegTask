@@ -1,15 +1,4 @@
-"""Common 2D/3D building blocks for encoder/decoder.
-
-All modules accept ``spatial_dims`` (default 3); ``*3D`` names are kept for
-API stability but support 2D via ``spatial_dims=2``.
-
-Provides:
-  Factories (conv/norm/act/pool/drop), ConvNormAct,
-  Attention: SE, ECA, CBAM, CoordAttention, AttentionGate; ``make_attention`` factory,
-  BlurPool, PixelShuffle/Unshuffle, CARAFE (3D-only), DySample (3D-only),
-  Downsample (conv/maxpool/avgpool/blurpool/pixelunshuffle),
-  Upsample (transpose/trilinear/nearest/pixelshuffle/carafe/dysample).
-"""
+"""encoder/decoder 通用 2D/3D 基础块。所有模块接受 spatial_dims（默认3）；*3D 名称仅为 API 兼容。包含工厂、ConvNormAct、attention (SE/ECA/CBAM/Coord/Gate)、BlurPool、PixelShuffle、CARAFE/DySample、3D 上/下采样。"""
 
 from __future__ import annotations
 
@@ -20,9 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Layer factories — spatial_dims dispatch tables
-# ---------------------------------------------------------------------------
+# spatial_dims 分派表。
 _CONV     = {2: nn.Conv2d,            3: nn.Conv3d}
 _CONV_T   = {2: nn.ConvTranspose2d,   3: nn.ConvTranspose3d}
 _BN       = {2: nn.BatchNorm2d,       3: nn.BatchNorm3d}
@@ -33,7 +20,7 @@ _AVGPOOL  = {2: nn.AvgPool2d,         3: nn.AvgPool3d}
 _AAVGPOOL = {2: nn.AdaptiveAvgPool2d, 3: nn.AdaptiveAvgPool3d}
 _AMAXPOOL = {2: nn.AdaptiveMaxPool2d, 3: nn.AdaptiveMaxPool3d}
 
-#: smooth (linear) interpolation mode for ``F.interpolate`` per spatial_dims.
+#: F.interpolate 的平滑插值模式。
 INTERP_SMOOTH = {2: "bilinear", 3: "trilinear"}
 
 
@@ -45,12 +32,12 @@ def _check_dims(spatial_dims: int) -> int:
 
 
 def get_conv3d() -> Type[nn.Module]:
-    """Back-compat alias — returns ``nn.Conv3d`` unconditionally."""
+    """向后兼容别名：始终返回 nn.Conv3d。"""
     return nn.Conv3d
 
 
 def get_conv(spatial_dims: int = 3) -> Type[nn.Module]:
-    """Return the conv class (`Conv2d`/`Conv3d`) for the given dim."""
+    """返回对应维度的 Conv2d/Conv3d 类。"""
     return _CONV[_check_dims(spatial_dims)]
 
 
@@ -59,7 +46,7 @@ def get_norm(
     num_channels: int,
     num_groups  : int = 8,
     spatial_dims: int = 3) -> nn.Module:
-    """nD norm: ``batch`` / ``instance`` (per spatial_dims) | ``group`` (dim-agnostic)."""
+    """nD norm：'batch' | 'instance' | 'group'（与维度无关）。"""
     d = _check_dims(spatial_dims)
     if   norm_type == "batch":
         return _BN[d](num_channels)
@@ -74,7 +61,7 @@ def get_norm(
 
 
 def get_activation(name: str) -> nn.Module:
-    """Create an activation layer."""
+    """创建激活层：'relu' | 'leakyrelu' | 'gelu' | 'swish'。"""
     if   name == "relu":
         return nn.ReLU(inplace=True)
     elif name == "leakyrelu":
@@ -87,11 +74,8 @@ def get_activation(name: str) -> nn.Module:
         raise ValueError(f"Unknown activation: {name}")
 
 
-# ---------------------------------------------------------------------------
-# Conv + Norm + Activation
-# ---------------------------------------------------------------------------
 class ConvNormAct(nn.Module):
-    """nD convolution + normalization + activation (default 3D)."""
+    """nD Conv + Norm + Activation（默认 3D）。"""
 
     def __init__(
         self,
@@ -117,11 +101,8 @@ class ConvNormAct(nn.Module):
         return self.drop(self.act(self.norm(self.conv(x))))
 
 
-# ---------------------------------------------------------------------------
-# Squeeze-and-Excitation (channel attention)
-# ---------------------------------------------------------------------------
 class SqueezeExcite3D(nn.Module):
-    """nD Squeeze-and-Excitation (Hu 2018): GAP → FC reduce → ReLU → FC expand → Sigmoid → scale."""
+    """nD SE (Hu 2018)：GAP → FC 压 → ReLU → FC 扩 → Sigmoid → 通道加权。"""
 
     def __init__(self, channels: int, reduction: int = 16,
                  spatial_dims: int = 3):
@@ -145,10 +126,8 @@ class SqueezeExcite3D(nn.Module):
         return x * scale
 
 
-# ECA-Net (Wang 2020): 1D conv over channels in place of SE's two FC layers;
-# adaptive kernel k = |log2(C)/gamma + b/gamma|_odd.
 class ECA3D(nn.Module):
-    """nD Efficient Channel Attention (Wang 2020)."""
+    """nD ECA (Wang 2020)：用通道 1D 卷积替代 SE 的两 FC；自适应奇数核 k=|log2(C)/γ+b/γ|。"""
 
     def __init__(self, channels: int, k_size: int = 0, gamma: int = 2, b: int = 1,
                  spatial_dims: int = 3):
@@ -156,7 +135,7 @@ class ECA3D(nn.Module):
         d = _check_dims(spatial_dims)
         self.spatial_dims = d
         if k_size <= 0:
-            # Adaptive kernel size; force odd.
+            # 自适应核尺寸，强制奇数。
             import math
             k = int(abs(math.log2(max(channels, 2)) / gamma + b / gamma))
             k_size = k if k % 2 else k + 1
@@ -172,8 +151,7 @@ class ECA3D(nn.Module):
         return x * y.view(y.size(0), y.size(1), *([1] * self.spatial_dims))
 
 
-# CBAM (Woo 2018): channel attention (MLP over GAP+GMP) → spatial attention
-# (k×k conv over channel-wise avg+max concat).
+# CBAM (Woo 2018)：通道 attention (MLP 于 GAP+GMP) → 空间 attention (在 avg+max cat 上的 k×k 卷积)。
 class _CBAMChannelAttn(nn.Module):
     def __init__(self, channels: int, reduction: int = 16, spatial_dims: int = 3):
         super().__init__()
@@ -213,7 +191,7 @@ class _CBAMSpatialAttn(nn.Module):
 
 
 class CBAM3D(nn.Module):
-    """nD Convolutional Block Attention Module (channel → spatial)."""
+    """nD CBAM（通道→空间）。"""
 
     def __init__(self, channels: int, reduction: int = 16,
                  spatial_kernel: int = 7, spatial_dims: int = 3):
@@ -227,10 +205,9 @@ class CBAM3D(nn.Module):
         return self.spatial(self.channel(x))
 
 
-# Coordinate Attention (Hou 2021): per-axis pools → shared MLP → axis-wise scale.
-# Effective on elongated structures (vessels / airways / spine).
+# Coordinate Attention (Hou 2021)：逐轴 pool → 共享 MLP → 逐轴加权；适合细长结构（血管/气道/脉柱）。
 class CoordAttention3D(nn.Module):
-    """nD Coordinate Attention (Hou 2021); generalised to per-axis pools (D/H/W in 3D)."""
+    """nD Coord Attention（3D 中逐 D/H/W 轴 pool）。"""
 
     def __init__(self, channels: int, reduction: int = 32,
                  spatial_dims: int = 3):
@@ -239,21 +216,18 @@ class CoordAttention3D(nn.Module):
         self.spatial_dims = d
         mid = max(channels // reduction, 8)
 
-        # Per-axis pool: each pool keeps one spatial axis full and collapses
-        # the others to size 1. The output_size tuple has length == d.
+        # 每个 pool 保留一个轴，其余压为 1。
         self.pools = nn.ModuleList([
             _AAVGPOOL[d](self._axis_pool_size(d, axis))
             for axis in range(d)
         ])
 
-        # Shared bottleneck conv (operates on a column-stacked rank-(d+2)
-        # tensor where the FIRST spatial axis is the concatenation axis).
+        # 共享 bottleneck 卷积，作用于列拼后的 rank-(d+2) 张量（首空间轴为拼接轴）。
         self.conv1 = _CONV[d](channels, mid, kernel_size=1, bias=False)
         self.norm1 = _BN[d](mid)
         self.act = nn.Hardswish(inplace=True)
 
-        # Per-axis output conv: maps mid -> channels, applied on the slice
-        # corresponding to that axis.
+        # 逐轴输出卷积：mid→channels。
         self.axis_convs = nn.ModuleList([
             _CONV[d](mid, channels, kernel_size=1, bias=False)
             for _ in range(d)
@@ -261,7 +235,7 @@ class CoordAttention3D(nn.Module):
 
     @staticmethod
     def _axis_pool_size(spatial_dims: int, keep_axis: int) -> Tuple:
-        """Pool tuple keeping ``keep_axis`` full (None) and others size 1."""
+        """保留 keep_axis (None)，其余轴压为 1。"""
         return tuple(None if i == keep_axis else 1 for i in range(spatial_dims))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -269,11 +243,10 @@ class CoordAttention3D(nn.Module):
         B, C = x.shape[:2]
         sizes = list(x.shape[2:])
 
-        # Per-axis pool → reshape kept axis to first spatial position → cat for shared 1×1.
+        # 逐轴 pool → reshape 到首空间位 → cat 供共享 1×1。
         descriptors = []
         for axis in range(d):
-            p = self.pools[axis](x)  # keeps axis full, others 1
-            # Move axis to the first spatial position.
+            p = self.pools[axis](x)  # 保留该轴，其余为 1
             new_shape = [B, C, sizes[axis]] + [1] * (d - 1)
             descriptors.append(p.reshape(new_shape))
         y = torch.cat(descriptors, dim=2)
@@ -282,7 +255,7 @@ class CoordAttention3D(nn.Module):
 
         out = x
         for axis in range(d):
-            # Broadcast back to (B, C, 1, ..., size_axis, ..., 1).
+            # 广播回 (B, C, 1, ..., size_axis, ..., 1)。
             broadcast_shape = [B, C] + [1] * d
             broadcast_shape[2 + axis] = sizes[axis]
             a = torch.sigmoid(self.axis_convs[axis](y_axes[axis])).reshape(
@@ -291,12 +264,9 @@ class CoordAttention3D(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
-# Unified channel-attention factory.
-# ---------------------------------------------------------------------------
 def make_attention(name: str, channels: int,
                    spatial_dims: int = 3, **kwargs) -> nn.Module:
-    """Attention factory: ``none``|``se``|``eca``|``cbam``|``coord``."""
+    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'。"""
     name = (name or "none").lower()
     if name == "none":
         return nn.Identity()
@@ -319,10 +289,8 @@ def make_attention(name: str, channels: int,
 ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord")
 
 
-# Attention Gate (Oktay 2018): gates encoder skip ``x`` by decoder signal ``g``
-# via additive 1×1 → ReLU → 1×1 → sigmoid mask. Standard for medical UNets.
 class AttentionGate3D(nn.Module):
-    """Additive attention gate for UNet skips (Oktay 2018); ``inter`` defaults to ``x_ch // 2``."""
+    """UNet skip 加性 attention gate (Oktay 2018)：1×1→ReLU→1×1→sigmoid。inter 默认 x_ch//2。"""
 
     def __init__(self, x_ch: int, g_ch: int, inter: int = 0,
                  spatial_dims: int = 3):
@@ -347,7 +315,7 @@ class AttentionGate3D(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-        """Gate skip ``x`` by decoder signal ``g``; resizes ``g`` to ``x`` if shapes differ."""
+        """用解码信号 g 门控 skip x；必要时将 g 重采样到 x 尺寸。"""
         if g.shape[2:] != x.shape[2:]:
             g = F.interpolate(
                 g, size=x.shape[2:],
@@ -356,9 +324,8 @@ class AttentionGate3D(nn.Module):
         return x * self.psi(self.relu(self.W_x(x) + self.W_g(g)))
 
 
-# Anti-aliased downsample (Zhang 2019): fixed binomial low-pass before stride.
 class BlurPool3d(nn.Module):
-    """nD anti-aliased blur+stride; binomial kernels [1,2,1] (filt=3) or [1,4,6,4,1] (filt=5)."""
+    """抗混叠下采样 (Zhang 2019)：二项式低通 [1,2,1] (filt=3) 或 [1,4,6,4,1] (filt=5)。"""
 
     _BINOMIAL: dict = {
         2: (1., 1.),
@@ -378,18 +345,18 @@ class BlurPool3d(nn.Module):
         self.pad = filt_size // 2
 
         a = torch.tensor(self._BINOMIAL[filt_size], dtype=torch.float32)
-        # nD separable kernel via outer products.
+        # nD 可分离核：逐次外积。
         kernel = a
         for _ in range(d - 1):
-            kernel = kernel.unsqueeze(-1) * a  # iterative outer product
+            kernel = kernel.unsqueeze(-1) * a
         kernel = kernel / kernel.sum()
-        # Add (out_ch=channels, in_ch_per_group=1) leading dims.
+        # 补 (out_ch=channels, in_ch_per_group=1) 领轴。
         kernel = kernel[None, None].expand(
             channels, 1, *kernel.shape).contiguous()
         self.register_buffer("kernel", kernel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Replicate padding to preserve boundary stats.
+        # replicate padding 保留边界统计。
         if self.pad:
             x = F.pad(x, [self.pad] * (2 * self.spatial_dims), mode="replicate")
         if self.spatial_dims == 3:
@@ -401,9 +368,9 @@ class BlurPool3d(nn.Module):
             stride=self.stride, padding=0, groups=self.channels)
 
 
-# Sub-pixel ops (ESPCN-style): nD reshape+permute, lossless and parameter-free.
+# Sub-pixel 操作（ESPCN 风）：nD reshape+permute，无损无参。
 class PixelUnshuffle3d(nn.Module):
-    """nD space-to-depth: ``(B, C, r*s0, r*s1, ...) → (B, C*r^d, s0, s1, ...)``."""
+    """nD space-to-depth：(B,C,r*s0,r*s1,...) → (B,C*r^d,s0,s1,...)。"""
 
     def __init__(self, r: int = 2, spatial_dims: int = 3):
         super().__init__()
@@ -426,12 +393,12 @@ class PixelUnshuffle3d(nn.Module):
                 raise ValueError(
                     f"PixelUnshuffle3d(r={r}) needs spatial dims divisible "
                     f"by r, got {tuple(spatial)}")
-        # View each spatial axis as (size/r, r), interleaved.
+        # 每个空间轴拆为 (size/r, r) 交错。
         view_shape = [B, C]
         for s in spatial:
             view_shape.extend([s // r, r])
         y = x.view(view_shape)
-        # Permute B, C, all r-axes (odd), all size/r-axes (even). 3D: (0,1,3,5,7,2,4,6).
+        # 重排：3D 为 (0,1,3,5,7,2,4,6)，即 r-axes 在前、size/r-axes 在后。
         r_axes = [2 + 2 * i + 1 for i in range(d)]
         s_axes = [2 + 2 * i     for i in range(d)]
         y = y.permute(0, 1, *r_axes, *s_axes).contiguous()
@@ -439,7 +406,7 @@ class PixelUnshuffle3d(nn.Module):
 
 
 class PixelShuffle3d(nn.Module):
-    """nD depth-to-space; inverse of :class:`PixelUnshuffle3d`."""
+    """nD depth-to-space；PixelUnshuffle3d 的逆。"""
 
     def __init__(self, r: int = 2, spatial_dims: int = 3):
         super().__init__()
@@ -463,14 +430,14 @@ class PixelShuffle3d(nn.Module):
                 f"PixelShuffle3d(r={r}, spatial_dims={d}) needs channels "
                 f"divisible by r^d={rd}, got C={Crd}")
         C = Crd // rd
-        # View: (B, C, r,...,r, s0,...,sd) — d r-axes then d size-axes.
+        # view：(B,C,r,...,r,s0,...,sd)，先 d 个 r-axes 后 d 个 size-axes。
         view_shape = [B, C] + [r] * d + spatial
         y = x.view(view_shape)
-        # Interleave (size_axis, r_axis) per spatial dim. 3D ref: (0,1,5,2,6,3,7,4).
+        # 交错 (size_axis, r_axis)。
         perm = [0, 1]
         for i in range(d):
-            perm.append(2 + d + i)   # size axis i
-            perm.append(2 + i)       # r axis i
+            perm.append(2 + d + i)   # size 轴 i
+            perm.append(2 + i)       # r 轴 i
         y = y.permute(perm).contiguous()
         return y.view(B, C, *(s * r for s in spatial))
 
@@ -478,7 +445,7 @@ class PixelShuffle3d(nn.Module):
 def icnr_init_(weight: torch.Tensor, upscale: int,
                spatial_dims: int = 3,
                init: Type[nn.Module] = None) -> None:
-    """ICNR init (Aitken 2017): conv→PixelShuffle starts ≈ nearest-neighbour upsample."""
+    """ICNR init (Aitken 2017)：conv+PixelShuffle 初始近似最近邻上采样。"""
     d = _check_dims(spatial_dims)
     rd = upscale ** d
     out_total = weight.shape[0]
@@ -488,19 +455,12 @@ def icnr_init_(weight: torch.Tensor, upscale: int,
     sub = torch.empty(out_ch, *weight.shape[1:], device=weight.device,
                       dtype=weight.dtype)
     nn.init.kaiming_normal_(sub)
-    # Replicate each filter r^d times so sub-pixel siblings start identical → NN upsample.
+    # 每个滤波器复制 r^d 次，子像素同源 → NN 上采样。
     weight.data.copy_(sub.repeat_interleave(rd, dim=0))
 
 
-# ---------------------------------------------------------------------------
-# Downsampling (multi-mode, factor 2)
-# ---------------------------------------------------------------------------
 class Downsample(nn.Module):
-    """Factor-2 downsample + ``in_ch→out_ch`` projection + norm.
-
-    Modes: ``conv`` (strided), ``maxpool`` / ``avgpool`` / ``blurpool`` (+ 1×1),
-    ``pixelunshuffle`` (space-to-depth + 1×1).
-    """
+    """×2 下采样 + in_ch→out_ch 投影 + norm。模式：'conv' 带步长 、'maxpool'/'avgpool'/'blurpool' (+1×1)、'pixelunshuffle'(s2d+1×1)。"""
 
     VALID_MODES = ("conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle")
 
@@ -535,8 +495,8 @@ class Downsample(nn.Module):
             self.op = nn.Sequential(
                 BlurPool3d(in_ch, stride=2, filt_size=3, spatial_dims=d),
                 _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
-        else:  # pixelunshuffle
-            channel_mult = 2 ** d  # r=2; channels grow by 2^spatial_dims
+        else:  # pixelunshuffle：r=2，通道×2^d。
+            channel_mult = 2 ** d
             self.op = nn.Sequential(
                 PixelUnshuffle3d(r=2, spatial_dims=d),
                 _CONV[d](in_ch * channel_mult, out_ch, kernel_size=1, bias=False))
@@ -547,10 +507,8 @@ class Downsample(nn.Module):
         return self.norm(self.op(x))
 
 
-# CARAFE (Wang ICCV 2019): predicts a spatially-varying reassembly kernel; better
-# locality than pixelshuffle/trilinear. ``k_up=3`` default in 3D (5 is too heavy).
 class CARAFE3d(nn.Module):
-    """3D Content-Aware ReAssembly of FEatures (default scale=2, k_up=3)."""
+    """3D CARAFE (Wang ICCV 2019)：预测逐体素重装配核，局部性优于 pixelshuffle/trilinear。默认 scale=2,k_up=3（3D 中 k_up=5 过重）。"""
 
     def __init__(
         self,
@@ -568,7 +526,7 @@ class CARAFE3d(nn.Module):
         self.k_up = k_up
         self.pad = k_up // 2
 
-        # Bottleneck → content encoder (predicts scale^3 · k_up^3 kernel logits/voxel).
+        # Bottleneck → 内容编码器（预测 scale^3 · k_up^3 核 logits/voxel）。
         self.compress = nn.Conv3d(in_ch, c_mid, kernel_size=1)
         self.encode = nn.Conv3d(
             c_mid, (scale ** 3) * (k_up ** 3),
@@ -582,13 +540,13 @@ class CARAFE3d(nn.Module):
         s = self.scale
         k = self.k_up
 
-        # 1) Predict + softmax reassembly kernel at upsampled resolution.
+        # 1) 高分辨率上预测重装配核 + softmax。
         w = self.compress(x)
         w = self.encode(w)                         # (B, s^3·k^3, D, H, W)
         w = self.shuffle(w)                        # (B, k^3, sD, sH, sW)
         w = F.softmax(w, dim=1)
 
-        # 2) Extract k^3 neighbourhood patches.
+        # 2) 取 k^3 邻域 patch。
         x_pad = F.pad(x, [self.pad] * 6, mode="replicate")
         x_unf = (x_pad
                  .unfold(2, k, 1).unfold(3, k, 1).unfold(4, k, 1)
@@ -597,18 +555,15 @@ class CARAFE3d(nn.Module):
                  .permute(0, 1, 5, 2, 3, 4)
                  .reshape(B, C * k ** 3, D, H, W))
 
-        # 3) Nearest-upsample patches (sub-voxels inherit parent neighbourhood),
-        # then 4) weighted sum along the k^3 axis.
+        # 3) 最近邻上采 patch，4) 沿 k^3 轴加权求和。
         x_up = F.interpolate(x_unf, scale_factor=s, mode="nearest")
         x_up = x_up.view(B, C, k ** 3, D * s, H * s, W * s)
         out = (x_up * w.unsqueeze(1)).sum(dim=2)
         return self.proj(out)
 
 
-# DySample (Liu ICCV 2023): predicts grid_sample offsets; far lighter than CARAFE.
-# Near-zero offset init → starts ≈ plain bilinear upsample.
 class DySample3d(nn.Module):
-    """3D dynamic-sampling upsampler (default scale=2, groups=4, dyscope=True)."""
+    """3D DySample (Liu ICCV 2023)：预测 grid_sample 偏移，轻于 CARAFE；偏移近 0 初始 ≈ 双线性上采样。默认 scale=2,groups=4,dyscope=True。"""
 
     def __init__(
         self,
@@ -626,7 +581,7 @@ class DySample3d(nn.Module):
         self.groups = groups
         self.dyscope = dyscope
 
-        off_ch = 3 * groups * (scale ** 3)  # 3 coords × groups × s^3
+        off_ch = 3 * groups * (scale ** 3)  # 3 坐标 × groups × s^3
         self.offset = nn.Conv3d(in_ch, off_ch, kernel_size=1)
         nn.init.trunc_normal_(self.offset.weight, std=1e-3)
         nn.init.zeros_(self.offset.bias)
@@ -643,7 +598,7 @@ class DySample3d(nn.Module):
     @staticmethod
     def _normalised_grid(D: int, H: int, W: int,
                          device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Base grid in grid_sample (x, y, z) convention, range [-1, 1]."""
+        """grid_sample 的基础网格 (x,y,z)，范围 [-1,1]。"""
         zs = torch.linspace(-1.0, 1.0, D, device=device, dtype=dtype)
         ys = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
         xs = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
@@ -656,22 +611,22 @@ class DySample3d(nn.Module):
         g = self.groups
         Du, Hu, Wu = D * s, H * s, W * s
 
-        # 1) Predict offsets at low-res, shuffle to high-res.
+        # 1) 低分辨率预测偏移，shuffle 到高分辨率。
         off = self.offset(x)
         if self.dyscope:
-            # DySample-S: learnable scope gate in [0, 0.5].
+            # DySample-S：可学 scope gate，范围 [0, 0.5]。
             off = off * self.scope(x).sigmoid() * 0.5
         off = self.shuffle(off)
         off = off.view(B, g, 3, Du, Hu, Wu)
         off = off.permute(0, 1, 3, 4, 5, 2)
 
-        # 2) Normalise offsets (pixels → grid coord; last-dim order x,y,z = W,H,D).
+        # 2) 偏移归一化（像素→grid 坐标；末轴顺序 x,y,z = W,H,D）。
         norm = torch.tensor(
             [2.0 / max(W - 1, 1), 2.0 / max(H - 1, 1), 2.0 / max(D - 1, 1)],
             device=x.device, dtype=x.dtype)
         off = off * norm
 
-        # 3) Base grid + offset, 4) grouped grid_sample (collapse (B, g) into batch).
+        # 3) 基础网格+偏移，4) 分组 grid_sample（合并 (B,g) 为 batch）。
         base = self._normalised_grid(Du, Hu, Wu, x.device, x.dtype)
         coord = base.unsqueeze(0).unsqueeze(0) + off
         x_g = x.view(B, g, C // g, D, H, W).reshape(B * g, C // g, D, H, W)
@@ -683,15 +638,8 @@ class DySample3d(nn.Module):
         return self.proj(out)
 
 
-# ---------------------------------------------------------------------------
-# Upsampling (multi-mode, factor 2)
-# ---------------------------------------------------------------------------
 class Upsample(nn.Module):
-    """Factor-2 upsample + ``in_ch→out_ch`` projection.
-
-    Modes: ``transpose`` (ConvTranspose), ``trilinear`` / ``nearest`` (interp + 3×3 refine),
-    ``pixelshuffle`` (sub-pixel + ICNR), ``carafe`` / ``dysample`` (3D-only).
-    """
+    """×2 上采样 + in_ch→out_ch 投影。模式：'transpose' 、'trilinear'/'nearest'(插值+3×3精修)、'pixelshuffle'(子像素+ICNR)、'carafe'/'dysample' 仅 3D。"""
 
     VALID_MODES = ("transpose", "trilinear", "nearest", "pixelshuffle",
                    "carafe", "dysample")
@@ -749,12 +697,12 @@ class Upsample(nn.Module):
             return self.up(x)
         if self.mode == "pixelshuffle":
             return self.shuffle(self.expand(x))
-        # carafe / dysample (validated 3D-only in __init__).
+        # carafe / dysample（__init__ 已限 3D）。
         return self.up(x)
 
 
 def _choose_groups(in_ch: int, preferred: int = 4) -> int:
-    """Largest divisor of ``in_ch`` not exceeding ``preferred``."""
+    """不超过 preferred 的 in_ch 最大因子。"""
     for g in range(min(preferred, in_ch), 0, -1):
         if in_ch % g == 0:
             return g

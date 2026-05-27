@@ -1,7 +1,4 @@
-"""DataLoader factory + train/val split.
-
-Scans the data directories, splits into train/val, and creates DataLoaders.
-"""
+"""DataLoader 工厂 + 训/验划分。扫描数据目录、划分 train/val、创建 DataLoader。"""
 
 from __future__ import annotations
 
@@ -26,11 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_exclude_pids(exclude_list: str) -> set:
-    """Load pids from a plain-text exclude list (one per line; ``#`` comments allowed).
-
-    Trailing ``.nii.gz``/``.nii`` is stripped so raw filenames are also accepted.
-    Returns empty set if path is empty or missing.
-    """
+    """从文本读排除 pid 列表（每行一个，'#' 为注释）；可含 .nii(.gz) 后缀。路径为空或不存在返回空集。"""
     if not exclude_list:
         return set()
     p = Path(exclude_list)
@@ -58,7 +51,7 @@ def _filter_by_exclude(
     label_paths: List[str],
     image_suffix: SuffixSpec,
     exclude_pids: set) -> Tuple[List[str], List[str], List[int]]:
-    """Drop pairs whose image stem is in ``exclude_pids``; ``keep_idx`` re-aligns companion lists."""
+    """丢弃 image 基名在 exclude_pids 中的对；keep_idx 用于同步同名列表。"""
     if not exclude_pids:
         return image_paths, label_paths, list(range(len(image_paths)))
 
@@ -88,7 +81,7 @@ def _filter_by_exclude(
 
 
 def _normalize_suffixes(suffix: SuffixSpec) -> List[str]:
-    """Normalise suffix spec to a de-duplicated list (string or sequence accepted)."""
+    """将后缀规范为去重列表（接受 str 或序列）。"""
     if isinstance(suffix, str):
         items = [suffix]
     else:
@@ -109,7 +102,7 @@ def _normalize_suffixes(suffix: SuffixSpec) -> List[str]:
 
 
 def _strip_suffix(name: str, suffixes: Sequence[str]) -> Optional[str]:
-    """Strip the first matching suffix; return ``None`` if no candidate matches."""
+    """剔除首个匹配的后缀；无匹配返 None。"""
     for sfx in suffixes:
         if name.endswith(sfx):
             return name[: -len(sfx)]
@@ -121,12 +114,7 @@ def discover_samples(
     image_suffix: SuffixSpec = ".nii.gz",
     label_suffix: SuffixSpec = ".nii.gz",
 ) -> Tuple[List[str], List[str]]:
-    """Pair images and labels by *base name* (suffix stripped); first matching label wins.
-
-    Both suffix args accept a single string or a sequence of candidates,
-    e.g. ``label_suffix=[".nii.gz", "-seg.nii.gz"]``.
-    Returns ``(image_paths, label_paths)`` sorted by base name.
-    """
+    """按基名配对 image/label（首个匹配胜出）。后缀接受单个或候选序列。按基名排序返回。"""
     img_dir, lbl_dir = Path(image_dir), Path(label_dir)
     assert img_dir.is_dir(), f"Image dir not found: {img_dir}"
     assert lbl_dir.is_dir(), f"Label dir not found: {lbl_dir}"
@@ -134,7 +122,7 @@ def discover_samples(
     image_suffixes = _normalize_suffixes(image_suffix)
     label_suffixes = _normalize_suffixes(label_suffix)
 
-    # Enumerate images by any accepted suffix; on collision earlier suffix wins.
+    # 按接受后缀枚举 image；冲突时首项胜。
     img_by_base: Dict[str, Path] = {}
     for sfx in image_suffixes:
         for p in sorted(img_dir.glob(f"*{sfx}")):
@@ -143,7 +131,7 @@ def discover_samples(
                 continue
             img_by_base.setdefault(base, p)
 
-    # For each image base: first existing ``<base><suffix>`` under lbl_dir wins.
+    # 每个 base：lbl_dir 下首个存在的 <base><suffix> 胜。
     image_paths  : List[str] = []
     label_paths  : List[str] = []
     missing_bases: List[str] = []
@@ -189,11 +177,7 @@ def _match_per_sample_paths(
     image_suffix: SuffixSpec,
     out_suffix: SuffixSpec,
     kind: str) -> List[str]:
-    """Strict 1:1 per-sample matcher by base name; raises on any missing match.
-
-    Used by ``match_bbox_paths`` and ``match_region_weight_paths``.
-    ``kind`` is the label used in log / error messages.
-    """
+    """严格 1:1 按基名匹配；任意缺失报错。供 match_bbox_paths / match_region_weight_paths 复用；kind 仅为日志标签。"""
     sdir = Path(src_dir)
     assert sdir.is_dir(), f"{kind} dir not found: {sdir}"
 
@@ -235,7 +219,7 @@ def match_bbox_paths(
     bbox_dir: str,
     image_suffix: SuffixSpec,
     bbox_suffix: SuffixSpec) -> List[str]:
-    """Resolve per-sample bbox NIfTI paths 1:1 with ``image_paths``; raises on any miss."""
+    """与 image_paths 1:1 解析 bbox NIfTI 路径；缺失报错。"""
     return _match_per_sample_paths(
         image_paths, bbox_dir, image_suffix, bbox_suffix, kind="BBox")
 
@@ -245,10 +229,7 @@ def match_bbox_paths_lenient(
     bbox_dir: str,
     image_suffix: SuffixSpec,
     bbox_suffix: SuffixSpec) -> Tuple[List[str], List[str]]:
-    """Lenient bbox matcher for inference: samples without a bbox are dropped (warned), not raised.
-
-    Returns ``(matched_image_paths, matched_bbox_paths)`` aligned 1:1.
-    """
+    """宽容 bbox 匹配（推理专用）：无 bbox 的样本被丢弃并警告。返回 1:1 对齐的 (image, bbox) 路径。"""
     sdir = Path(bbox_dir)
     assert sdir.is_dir(), f"BBox dir not found: {sdir}"
 
@@ -297,17 +278,14 @@ def match_region_weight_paths(
     region_weight_dir: str,
     image_suffix: SuffixSpec,
     region_weight_suffix: SuffixSpec) -> List[str]:
-    """Resolve per-sample region-weight NIfTI paths 1:1 with ``image_paths``; raises on any miss.
-
-    File semantics: background=0, non-bg = weight; dataset adds +1 on load.
-    """
+    """与 image_paths 1:1 解析 region-weight NIfTI 路径；缺失报错。文件语义：bg=0、非 bg=权重；dataset 加载时 +1。"""
     return _match_per_sample_paths(
         image_paths, region_weight_dir, image_suffix, region_weight_suffix,
         kind="RegionWeight")
 
 
 def _default_label_loader(path: str) -> np.ndarray:
-    """Default int16 NIfTI label reader (npz mode swaps in ``load_npz_label_for_split``)."""
+    """默认 int16 NIfTI label reader；npz 模式使用 load_npz_label_for_split。"""
     return load_nifti(path, dtype=np.int16)
 
 
@@ -315,11 +293,7 @@ def detect_label_values(
     label_paths: List[str],
     max_scan: Optional[int] = None,
     label_loader_fn=None) -> List[int]:
-    """Auto-detect unique label values; scans all files by default.
-
-    ``max_scan`` enables a partial scan with a warning. ``label_loader_fn``
-    swaps the reader (NIfTI vs npz). Returns sorted ints starting with bg.
-    """
+    """自动探测标签取值；默认扫描全部。max_scan 指定部分扫描（会警告）；label_loader_fn 切换读器（NIfTI vs npz）。返按升序整数，含 bg。"""
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     n_total = len(label_paths)
@@ -332,7 +306,7 @@ def detect_label_values(
 
     all_labels = set()
     for path in scan_paths:
-        # int16 decode keeps the startup scan light on RAM.
+        # int16 解码减轻启动扫描内存。
         lbl    = label_loader_fn(path)
         unique = np.unique(lbl.astype(np.int32, copy=False)).tolist()
         all_labels.update(unique)
@@ -351,7 +325,7 @@ def detect_label_values(
 
 
 def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
-    """Random (non-stratified) train/val split by index."""
+    """随机（非分层）按索引划分 train/val。"""
     rng = np.random.RandomState(seed)
     indices = rng.permutation(n).tolist()
     n_val = max(1, int(n * val_ratio))
@@ -361,7 +335,7 @@ def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], Lis
 def _volume_primary_class(
     label_path: str, label_values: List[int],
     label_loader_fn=None) -> int:
-    """Label value with the highest voxel count (ties broken by smallest label)."""
+    """返回体素数最多的标签（同分取最小）。"""
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     lbl = label_loader_fn(label_path)
@@ -380,11 +354,7 @@ def stratified_train_val_split(
     seed: int,
     use_foreground_only: bool = True,
     label_loader_fn=None) -> Tuple[List[int], List[int]]:
-    """Stratify train/val by each volume's primary fg label; falls back to random if degenerate.
-
-    ``use_foreground_only=True`` ignores background frequency when picking
-    the primary class (typical for medical segmentation).
-    """
+    """按主前景标签分层划分；退化时回退随机。use_foreground_only=True 时忽略背景频率。"""
     n   = len(label_paths)
     rng = np.random.RandomState(seed)
 
@@ -392,7 +362,7 @@ def stratified_train_val_split(
     strata_vals = fg_vals if fg_vals else label_values
 
     strata: Dict[int, List[int]] = {v: [] for v in strata_vals}
-    fallback: List[int] = []  # volumes with no fg voxel
+    fallback: List[int] = []  # 无前景体素
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     for idx, path in enumerate(label_paths):
@@ -403,10 +373,10 @@ def stratified_train_val_split(
         if best == 0:
             fallback.append(idx)
         else:
-            primary = min(v for v, c in counts.items() if c == best)  # tie → smallest
+            primary = min(v for v, c in counts.items() if c == best)  # 同分取最小
             strata[primary].append(idx)
 
-    # Strata with <2 members go entirely to train (cannot fractionate cleanly).
+    # 成员<2 的层全入 train（无法干净划分）。
     train_idx: List[int] = []
     val_idx: List[int] = []
 
@@ -418,12 +388,12 @@ def stratified_train_val_split(
             train_idx.extend(members)
             continue
         n_val_k = max(1, int(round(len(members) * val_ratio)))
-        # Never put every member of a stratum into val.
+        # 避免整层都进 val。
         n_val_k = min(n_val_k, len(members) - 1)
         val_idx.extend(members[:n_val_k])
         train_idx.extend(members[n_val_k:])
 
-    # Empty-label volumes split by the same val_ratio (no stratification).
+    # 空 label 体同 val_ratio 划分（不分层）。
     rng.shuffle(fallback)
     n_val_f = int(round(len(fallback) * val_ratio))
     val_idx.extend(fallback[:n_val_f])
@@ -432,7 +402,7 @@ def stratified_train_val_split(
     rng.shuffle(train_idx)
     rng.shuffle(val_idx)
 
-    # Safety net: if either split is empty, fall back to random.
+    # 任一为空时回退随机。
     if not val_idx or not train_idx:
         logger.warning(
             "Stratified split produced degenerate sets "
@@ -449,7 +419,7 @@ def stratified_train_val_split(
 
 def discover_npz_samples(
     npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
-    """List ``make_data`` npz packages under ``npz_dir``; ignores ``_*`` / dot sidecars."""
+    """列出 npz_dir 下的 make_data npz 包；忽略 '_' / '.' 附件。"""
     d = Path(npz_dir)
     assert d.is_dir(), f"NPZ dir not found: {d}"
     paths = sorted(
@@ -464,88 +434,69 @@ def discover_npz_samples(
 
 
 def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
-    """Build train/val DataLoaders: discover → detect labels → split → dataset/loader.
-
-    NPZ vs. NIfTI modes are mutually exclusive: a non-empty ``data.npz_dir``
-    forces the npz path and ignores ``image_dir``/``label_dir``/``bbox_dir``/
-    ``region_weight_dir`` (logged loudly).
-    """
+    """构建 train/val DataLoader。训练仅读 npz：data.npz_dir 必须设。目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。所有逐体积 I/O 走 npz（bbox/fg 索引/区域权重 均预烘）。"""
     dc = cfg.data
 
-    # Source dispatch: npz packages vs. NIfTI.
     npz_dir = getattr(dc, "npz_dir", "")
-    if npz_dir:
-        npz_suffix = getattr(dc, "npz_suffix", ".npz")
-        # Auto-build npz cache when missing/empty (one-time cost; partial dir is
-        # treated as authoritative — user must re-run make_data with --overwrite).
-        npz_p       = Path(npz_dir)
-        npz_present = npz_p.is_dir() and any(
-            x for x in npz_p.glob(f"*{npz_suffix}") if not x.name.startswith(("_", ".")))
-        if not npz_present:
-            if not bool(getattr(dc, "npz_auto_build", True)):
-                raise FileNotFoundError(
-                    f"data.npz_dir={npz_dir!r} is empty/missing and "
-                    f"data.npz_auto_build is False. Run "
-                    f"`python -m segtask_v1.data.make_data --config "
-                    f"<yaml> --out {npz_dir}` first, or set "
-                    f"data.npz_auto_build: true to build inline.")
-            logger.info(
-                "data.npz_dir=%s is empty/missing — auto-building via "
-                "make_data.prepare_dataset (workers=%d). This is a "
-                "one-time cost; subsequent train runs will reuse the "
-                "npz cache.", npz_dir, max(dc.num_workers, 1))
-            # Local import: keeps the make_data deps off the loader.py path.
-            from .make_data import prepare_dataset
-            counters = prepare_dataset(
-                cfg, npz_dir,
-                workers=max(dc.num_workers, 1),
-                overwrite=False)
-            logger.info(
-                "Auto-build complete: written=%d, skipped=%d, "
-                "failed=%d / total=%d.",
-                counters["written"], counters["skipped"],
-                counters["failed"], counters["total"])
-            if counters["failed"] > 0:
-                logger.warning(
-                    "make_data reported %d failed sample(s). Inspect "
-                    "%s/_failures.txt; affected pids will be missing "
-                    "from the training set.",
-                    counters["failed"], npz_dir)
-            if counters["written"] + counters["skipped"] == 0:
-                raise RuntimeError(
-                    f"Auto-build produced 0 valid npz packages under "
-                    f"{npz_dir}. Check the input image_dir / "
-                    f"label_dir paths and the make_data error log.")
-        logger.info(
-            "DataConfig.npz_dir is set (%s, suffix=%s) — using "
-            "pre-computed npz pipeline. The following NIfTI fields "
-            "are IGNORED at runtime: image_dir=%r, label_dir=%r, "
-            "bbox_dir=%r, region_weight_dir=%r.",
-            npz_dir, npz_suffix,
-            dc.image_dir, dc.label_dir,
-            getattr(dc, "bbox_dir", ""),
-            getattr(dc, "region_weight_dir", ""))
-        npz_paths_all = discover_npz_samples(npz_dir, npz_suffix)
-        # In npz mode image_paths/label_paths alias the npz list (used only for len/cache keys);
-        # actual I/O routes through ``_npz_paths`` inside the dataset.
-        image_paths = list(npz_paths_all)
-        label_paths = list(npz_paths_all)
-        exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
-        image_paths, label_paths, keep_idx = _filter_by_exclude(
-            image_paths, label_paths, npz_suffix, exclude_pids)
-        if exclude_pids:
-            npz_paths_all = [npz_paths_all[i] for i in keep_idx]
-        label_loader_fn = load_npz_label_for_split
-    else:
-        npz_paths_all = None
-        image_paths, label_paths = discover_samples(
-            dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
+    if not npz_dir:
+        raise ValueError(
+            "data.npz_dir is required for training (npz-only data path). "
+            "Set it to the directory where pre-computed npz packages live "
+            "(or should be created); see segtask_v1.data.make_data.")
+    npz_suffix = getattr(dc, "npz_suffix", ".npz")
 
-        # Apply exclude_list before label scan/split so those stages skip bad files.
-        exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
-        image_paths, label_paths, _ = _filter_by_exclude(
-            image_paths, label_paths, dc.image_suffix, exclude_pids)
-        label_loader_fn = None  # default NIfTI int16 reader
+    # 缺失/空时自建 npz 缓存（一次性；部分目录被视为权威，重生请 make_data --overwrite）。
+    npz_p       = Path(npz_dir)
+    npz_present = npz_p.is_dir() and any(
+        x for x in npz_p.glob(f"*{npz_suffix}") if not x.name.startswith(("_", ".")))
+    if not npz_present:
+        if not bool(getattr(dc, "npz_auto_build", True)):
+            raise FileNotFoundError(
+                f"data.npz_dir={npz_dir!r} is empty/missing and "
+                f"data.npz_auto_build is False. Run "
+                f"`python -m segtask_v1.data.make_data --config "
+                f"<yaml> --out {npz_dir}` first, or set "
+                f"data.npz_auto_build: true to build inline.")
+        logger.info(
+            "data.npz_dir=%s is empty/missing — auto-building via "
+            "make_data.prepare_dataset (workers=%d). One-time cost; "
+            "subsequent runs reuse the cache.",
+            npz_dir, max(dc.num_workers, 1))
+        from .make_data import prepare_dataset  # 本地导入（重依赖）
+        counters = prepare_dataset(
+            cfg, npz_dir,
+            workers=max(dc.num_workers, 1),
+            overwrite=False)
+        logger.info(
+            "Auto-build complete: written=%d, skipped=%d, failed=%d / total=%d.",
+            counters["written"], counters["skipped"],
+            counters["failed"], counters["total"])
+        if counters["failed"] > 0:
+            logger.warning(
+                "make_data reported %d failed sample(s). Inspect "
+                "%s/_failures.txt; affected pids will be missing from the "
+                "training set.", counters["failed"], npz_dir)
+        if counters["written"] + counters["skipped"] == 0:
+            raise RuntimeError(
+                f"Auto-build produced 0 valid npz packages under "
+                f"{npz_dir}. Check input image_dir / label_dir paths "
+                f"and the make_data error log.")
+
+    logger.info(
+        "Training source: npz packages under %s (suffix=%s). "
+        "NIfTI fields image_dir/label_dir/bbox_dir/region_weight_dir are "
+        "consumed only by make_data when the npz cache must be built.",
+        npz_dir, npz_suffix)
+    npz_paths_all = discover_npz_samples(npz_dir, npz_suffix)
+    # image_paths/label_paths 仅为别名（计 len/缓存键）；实际 I/O 由 dataset._npz_paths。
+    image_paths = list(npz_paths_all)
+    label_paths = list(npz_paths_all)
+    exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
+    image_paths, label_paths, keep_idx = _filter_by_exclude(
+        image_paths, label_paths, npz_suffix, exclude_pids)
+    if exclude_pids:
+        npz_paths_all = [npz_paths_all[i] for i in keep_idx]
+    label_loader_fn = load_npz_label_for_split
 
     if not dc.label_values:
         dc.label_values = detect_label_values(
@@ -555,7 +506,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
-    # Stratified split by primary fg class (random fallback below).
+    # 按主前景类分层划分（不可行时回退随机）。
     if getattr(dc, "stratified_split", True) and dc.num_classes >= 2:
         train_idx, val_idx = stratified_train_val_split(
             label_paths, dc.label_values, dc.val_ratio, dc.split_seed,
@@ -568,8 +519,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
 
     cache = dc.cache_mode == "memory"
     rw    = cfg.loss.region_weights if cfg.loss.region_weights else None
-    # Train uses oversample ≥ 1.0 (extra slack absorbed by augmentation);
-    # val always uses 1.0 so patches match the physical patch_size verbatim.
+    # train oversample ≥ 1.0（多余留给增强）；val 始终 1.0 以完全对齐 patch_size。
     train_oversample = max(dc.aug_oversample_ratio, 1.0)
     common_kwargs = dict(
         label_values      = dc.label_values,
@@ -582,16 +532,16 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         cache_enabled     = cache,
         cache_max_volumes = getattr(dc, "cache_max_volumes", 0),
         region_weights    = rw)
-    # z_boundary_mode applies only to z_axis / 2.5d datasets.
+    # z_boundary_mode 仅 z_axis/2.5d 入参。
     z_kwargs = dict(z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"))
 
-    # 2.5D-only switch — single max-FOV cube path; trainer center-crops per view.
+    # 2.5D 专用：单 max-FOV cube，trainer 逐视图中心裁剪。
     aux_native_kwargs = dict(
         aux_keep_native_d = bool(getattr(dc, "aux_keep_native_d", False))
         and dc.patch_mode == "2_5d"
         and len(dc.multi_res_scales) > 1)
 
-    # 3D analogue of aux_keep_native_d for z_axis / cubic; defensively gated by mode.
+    # aux_keep_native_d 的 3D 对应（z_axis/cubic）；按模式防御门控。
     keep_native_kwargs_z = dict(
         keep_native_multi_res=bool(getattr(dc, "keep_native_multi_res", False))
         and dc.patch_mode == "z_axis"
@@ -601,43 +551,18 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         and dc.patch_mode == "cubic"
         and len(dc.multi_res_scales) > 1)
 
-    # Per-sample ROI bbox paths (NIfTI mode only; npz already has bbox baked in).
-    bbox_paths_all: Optional[List[str]] = None
-    if npz_paths_all is None and getattr(dc, "bbox_dir", ""):
-        bbox_paths_all = match_bbox_paths(
-            image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
-
-    # Per-sample region-weight NIfTI paths (NIfTI mode only; npz embeds rw).
-    # When set, overrides loss.region_weights inside the dataset.
-    rw_paths_all: Optional[List[str]] = None
-    if npz_paths_all is None and getattr(dc, "region_weight_dir", ""):
-        rw_paths_all = match_region_weight_paths(
-            image_paths, dc.region_weight_dir, dc.image_suffix,
-            getattr(dc, "region_weight_suffix", ".nii.gz"))
-
+    # NPZ-only 训练：bbox/region-weight 预烘在 npz 包中。
     train_paths = dict(
         image_paths=[image_paths[i] for i in train_idx],
-        label_paths=[label_paths[i] for i in train_idx])
+        label_paths=[label_paths[i] for i in train_idx],
+        npz_paths  =[npz_paths_all[i] for i in train_idx])
     val_paths = dict(
         image_paths=[image_paths[i] for i in val_idx],
-        label_paths=[label_paths[i] for i in val_idx])
-    if bbox_paths_all is not None:
-        train_paths["bbox_paths"] = [bbox_paths_all[i] for i in train_idx]
-        val_paths["bbox_paths"]   = [bbox_paths_all[i] for i in val_idx]
-    if rw_paths_all is not None:
-        train_paths["region_weight_paths"] = [rw_paths_all[i] for i in train_idx]
-        val_paths["region_weight_paths"]   = [rw_paths_all[i] for i in val_idx]
-    # NPZ mode: pass the per-sample npz path slice; dataset routes I/O via npz readers.
-    if npz_paths_all is not None:
-        train_paths["npz_paths"] = [npz_paths_all[i] for i in train_idx]
-        val_paths["npz_paths"]   = [npz_paths_all[i] for i in val_idx]
+        label_paths=[label_paths[i] for i in val_idx],
+        npz_paths  =[npz_paths_all[i] for i in val_idx])
 
     if dc.patch_mode == "2_5d":
-        # 2.5D reuses the z_axis dataset. Two layouts depending on aux_keep_native_d:
-        #   False (legacy): each scale extracts round(eD*s) slices, resized to (eD,pH,pW);
-        #     trainer collapses (B, n_views, D, H, W) → (B, n_views*D, H, W).
-        #   True: single max-FOV cube of depth round(eD*max_scale); trainer
-        #     center-crops per view at native depth before forward.
+        # 2.5D 复用 z_axis dataset。aux_keep_native_d=False 时逐 scale 抽切片、trainer 折叠 D 入通道；=True 时单 max-FOV cube，trainer 中心裁。
         n_views = max(len(dc.multi_res_scales), 1)
         if aux_native_kwargs["aux_keep_native_d"]:
             max_scale = max(dc.multi_res_scales)
@@ -681,7 +606,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     elif dc.patch_mode == "whole":
         logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
                     train_oversample)
-        # Whole mode ignores fg oversample / multi_res_scales (validated in Config).
+        # whole 忽略 fg oversample / multi_res_scales（Config 已校验）。
         train_ds = SegDataset3DWhole(
             **train_paths,
             aug_oversample_ratio=train_oversample,
@@ -760,7 +685,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             **z_kwargs,
             **keep_native_kwargs_z)
 
-    # persistent_workers / prefetch_factor only valid when num_workers > 0.
+    # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}
     if dc.num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(
@@ -792,39 +717,23 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         loader_kwargs.get("persistent_workers", "n/a"),
         loader_kwargs.get("prefetch_factor", "n/a"))
 
-    # Memory-cache footprint estimate (purely diagnostic; per-worker caches multiply).
+    # 内存缓存足迹估计（仅诊断；逐 worker 倍增）。
     if dc.cache_mode == "memory":
         try:
-            # Estimate realistic post-crop bytes/vol from train_ds bboxes when present.
-            bboxes = getattr(train_ds, "_bboxes", None)
-            npz_paths_train = getattr(train_ds, "_npz_paths", None)
-            has_rw_runtime = bool(getattr(dc, "region_weight_dir", ""))
-            if npz_paths_train is not None:
-                # NPZ: read shape + rw-key presence from the first npz, no NIfTI decode.
-                from .dataset import _open_npz as _peek_npz  # local alias
-                _f = _peek_npz(npz_paths_train[0])
-                _shape = _f["image"].shape
-                sample_voxels = int(np.prod(_shape))
-                has_rw_runtime = "rw" in _f.files
-            else:
-                def _cached_voxels(i: int) -> int:
-                    """Voxels per cached volume i (bbox-cropped when available)."""
-                    bb = bboxes[i] if bboxes and i < len(bboxes) else None
-                    if bb is not None:
-                        (d0, d1), (h0, h1), (w0, w1) = bb
-                        return (d1 - d0) * (h1 - h0) * (w1 - w0)
-                    # Fallback: decode a single header-only-ish scan.
-                    sample = load_nifti(image_paths[i])
-                    return int(sample.size)
-                sample_voxels = _cached_voxels(0)
-            # image fp32 (4B), label int16 (2B), rw fp32 (4B, when configured).
+            # NPZ-only：读首个 npz 的 shape 与 rw 存在性。
+            from .dataset import _open_npz as _peek_npz
+            npz_paths_train = train_ds._npz_paths
+            _f = _peek_npz(npz_paths_train[0])
+            sample_voxels  = int(np.prod(_f["image"].shape))
+            has_rw_runtime = "rw" in _f.files
+            # image fp32 (4B)、label int16 (2B)、rw fp32 (4B 可选)。
             bytes_per_img = sample_voxels * 4
             bytes_per_lbl = sample_voxels * 2
             bytes_per_rw = sample_voxels * 4 if has_rw_runtime else 0
             per_vol_bytes = bytes_per_img + bytes_per_lbl + bytes_per_rw
             n_train_vols = len(train_idx)
             cap = int(dc.cache_max_volumes)
-            # cap=0 means unbounded → worst-case: every volume cached.
+            # cap=0 为无上限 → 最坏情况缓存全部。
             eff_cap = cap if cap > 0 else n_train_vols
             eff_cap = min(eff_cap, n_train_vols)
             workers = max(dc.num_workers, 1)
@@ -840,7 +749,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 eff_cap, workers, total_gb,
                 bytes_per_img / (1024 ** 2))
             if cap == 0 and n_train_vols * workers >= 16:
-                # Recommend a cap that fits under an 8 GiB budget heuristic.
+                # 在 8 GiB 预算下建议一个合适的 cap。
                 budget_gb = 8.0
                 rec = max(
                     1,
@@ -854,7 +763,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                     "or `data.cache_mode: \"none\"` to rely on the OS "
                     "page cache (shared across workers).",
                     n_train_vols, workers, rec, budget_gb)
-        except Exception as exc:  # pragma: no cover — diagnostic only
+        except Exception as exc:  # pragma: no cover — 仅诊断
             logger.debug("Could not estimate volume cache size: %s", exc)
 
     return train_loader, val_loader

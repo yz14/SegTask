@@ -1,23 +1,9 @@
-"""Per-class binary loss functions for 2D/3D segmentation.
+"""2D/3D 分割逐类二值损失（per-class 独立 sigmoid）。
 
-All losses operate in per-class independent sigmoid mode:
-  pred:   (B, num_fg, *spatial) — raw logits, one channel per foreground class
-  target: (B, num_fg, *spatial) — binary masks, one channel per foreground class
-
-Each channel is an independent binary segmentation problem.
-Background is implicit (not predicted).
-
-Optional spatial weight map:
-  weight_map: (B, 1, *spatial) — per-voxel weight, broadcasts over channels.
-
-Provides:
-  - BinaryDiceLoss       (per-sample or batch-dice; optional ignore_empty)
-  - BCELoss              (with consistent class-weight normalization)
-  - BinaryFocalLoss      (proper alpha_t pos/neg balancing)
-  - BinaryTverskyLoss    (per-sample or batch mode)
-  - CompoundLoss         (weighted sum of losses)
-  - DeepSupervisionLoss  (downsamples target to each pred scale by default)
-  - build_loss(cfg)      (factory)
+pred/target：(B, num_fg, *spatial)，逐前景类独立二值任务。背景隐含。
+weight_map (可选)：(B, 1, *spatial)，逐体素权重，跨通道广播。
+包含 Dice/BCE/Focal/Tversky/GDL/FocalTversky/Lovasz/clDice + Compound + DeepSupervision
++ MultiResolutionLoss + SliceChannelLoss + build_loss 工厂。
 """
 
 from __future__ import annotations
@@ -41,7 +27,7 @@ EPS = 1e-8
 # ---------------------------------------------------------------------------
 def _check_inputs(
     pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Validate shapes and cast target to pred's dtype (AMP-safe)."""
+    """校验形状、将 target 转为 pred dtype（AMP 安全）。"""
     if pred.shape != target.shape:
         raise ValueError(
             f"pred and target shape mismatch: "
@@ -59,7 +45,7 @@ def _check_inputs(
 
 def _register_class_weights(
     module: nn.Module, class_weights: Optional[Sequence[float]]) -> None:
-    """Register class_weights as a buffer (or None) for consistent state_dict."""
+    """将 class_weights 注册为 buffer（保 state_dict 一致）。"""
     if class_weights:
         module.register_buffer(
             "class_weights",
@@ -70,10 +56,7 @@ def _register_class_weights(
 
 def _weighted_mean_over_classes(
     per_class: torch.Tensor, class_weights: Optional[torch.Tensor]) -> torch.Tensor:
-    """Weighted mean over the last (class) dim.
-
-    per_class: (..., C)  →  (...,)
-    """
+    """最后一维（类别）加权均值：(..., C) → (...,)。"""
     if class_weights is None:
         return per_class.mean(dim=-1)
     w = class_weights.to(per_class.device).to(per_class.dtype)
@@ -82,15 +65,7 @@ def _weighted_mean_over_classes(
 
 def _weighted_voxel_mean(
     per_voxel: torch.Tensor, weight_map: Optional[torch.Tensor], class_weights: Optional[torch.Tensor]) -> torch.Tensor:
-    """Normalized weighted mean of a per-voxel loss tensor.
-
-    per_voxel:     (B, C, *spatial)
-    weight_map:    (B, 1, *spatial) or None
-    class_weights: (C,) or None
-
-    Returns a scalar = sum(loss * w) / sum(w), so the loss magnitude is
-    invariant to the total weight.
-    """
+    """逐体素损失的归一化加权均值 = sum(loss*w)/sum(w)（幅值与总权重无关）。。"""
     if weight_map is None and class_weights is None:
         return per_voxel.mean()
 
@@ -113,21 +88,10 @@ def _interp_mode_smooth(spatial_ndim: int) -> str:
 # Binary Dice Loss
 # ---------------------------------------------------------------------------
 class BinaryDiceLoss(nn.Module):
-    """Per-channel binary Dice loss using sigmoid.
+    """逐通道二值 Dice (sigmoid)。
 
-    Args:
-        smooth: smoothing term added to numerator and denominator.
-        squared: V-Net style squared denominator (p**2 in denom). Target
-            is binary so t**2 == t; only p is squared.
-        batch_dice: if True, aggregate TP / denom across batch+spatial
-            before the division. More stable for patches with sparse or
-            empty foreground (nnU-Net default style).
-        ignore_empty: per-sample mode only — exclude classes with no GT
-            in the current sample from the mean. Prevents "correctly
-            predicting empty" (dice≈1) from masking errors on other
-            classes.
-        class_weights: per-class weights for the final class-level mean.
-    """
+    参数：smooth（平滑）; squared（V-Net 平方分母）; batch_dice（跨 batch+空间汇总后除，
+    稀疏前景更稳；nnU-Net 默认）; ignore_empty（仅 per-sample：排除无 GT 类避免 dice≈1 掩错）。。"""
 
     def __init__(
         self,
@@ -193,12 +157,8 @@ class BinaryDiceLoss(nn.Module):
 # Binary Cross-Entropy Loss
 # ---------------------------------------------------------------------------
 class BCELoss(nn.Module):
-    """Per-channel binary cross-entropy with logits.
-
-    class_weights are applied in a normalized weighted-mean fashion so the
-    loss magnitude stays comparable to the unweighted case (important when
-    combined with Dice in CompoundLoss).
-    """
+    """逐通道 BCE-with-logits。class_weights 以归一化加权均值作用，使幅值与无权一致
+    （与 Dice 复合时重要）。。"""
 
     def __init__(self, class_weights: Optional[Sequence[float]] = None):
         super().__init__()
@@ -216,16 +176,7 @@ class BCELoss(nn.Module):
 # Binary Focal Loss
 # ---------------------------------------------------------------------------
 class BinaryFocalLoss(nn.Module):
-    """Per-channel binary focal loss with proper positive/negative balancing.
-
-        FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    where
-        alpha_t = alpha         for positives (target=1)
-                = 1 - alpha     for negatives (target=0)
-
-    The original code used alpha_t = alpha for both classes, which amounts
-    to a constant scaling and provides no pos/neg balancing.
-    """
+    """逐通道二值 Focal。FL = -α_t (1-p_t)^γ log(p_t)；α_t 及 alpha (正) / 1-alpha (负)。。"""
 
     def __init__(
         self, alpha: float = 0.25, gamma: float = 2.0, class_weights: Optional[Sequence[float]] = None):
@@ -255,14 +206,7 @@ class BinaryFocalLoss(nn.Module):
 # Binary Tversky Loss
 # ---------------------------------------------------------------------------
 class BinaryTverskyLoss(nn.Module):
-    """Per-channel binary Tversky loss (asymmetric Dice).
-
-        TI = (TP + smooth) / (TP + alpha*FP + beta*FN + smooth)
-
-    Default alpha=0.3, beta=0.7 emphasizes recall (penalizes FN more
-    than FP). Useful for under-segmentation-sensitive tasks (small lesions,
-    thin vessels).
-    """
+    """逐通道 Tversky（不对称 Dice）：TI=(TP+s)/(TP+αFP+βFN+s)。默认 α=0.3 β=0.7 偏召回。。"""
 
     def __init__(
         self,
@@ -318,7 +262,7 @@ class BinaryTverskyLoss(nn.Module):
 # Compound Loss
 # ---------------------------------------------------------------------------
 class CompoundLoss(nn.Module):
-    """Weighted sum of multiple losses."""
+    """多损失加权和。"""
 
     def __init__(
         self, losses: Sequence[nn.Module], weights: Sequence[float]
@@ -348,24 +292,9 @@ class CompoundLoss(nn.Module):
 # Deep Supervision Wrapper
 # ---------------------------------------------------------------------------
 class DeepSupervisionLoss(nn.Module):
-    """Multi-scale loss for deep supervision.
-
-    Default behavior (nnU-Net-style):
-      - Downsample target (and weight_map) to each pred's resolution with
-        nearest-neighbor. Memory-efficient: no need to upsample low-res
-        logits back to full resolution.
-      - Weights are normalized to sum to 1 so the total loss magnitude
-        matches single-scale training when the main output has the
-        largest weight.
-
-    Args:
-        base_loss: loss to apply at each scale.
-        weights: one weight per prediction scale, highest-resolution first
-                 (i.e. the full-res main output gets weights[0]).
-        normalize_weights: if True, divide weights by their sum.
-        upsample_pred: if True, upsample preds to target resolution
-                       instead of downsampling target. Higher memory;
-                       keeps smooth label gradients at every scale.
+    """多尺度深监督。默认将 target 近邻下采样到每个 pred 尺寸（nnU-Net 风格，节存）。
+    weights 高分辨率优先；normalize_weights=True 时归一使总损失与单尺度可比。
+    upsample_pred=True 改为上采样 pred 到 target 分辨率（费内存但保连续梯度）。
     """
 
     def __init__(
@@ -392,7 +321,7 @@ class DeepSupervisionLoss(nn.Module):
         target: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Bypass: single tensor (e.g. DS disabled upstream, or at inference).
+        # 旁路：单 tensor（DS 上游禁用或推理时）。
         if isinstance(preds, torch.Tensor):
             return self.base_loss(preds, target, weight_map=weight_map)
 
@@ -430,29 +359,11 @@ class DeepSupervisionLoss(nn.Module):
 # Generalized Dice Loss  (Sudre et al., DLMIA 2017)
 # ---------------------------------------------------------------------------
 class GeneralizedDiceLoss(nn.Module):
-    """Generalized Dice Loss with automatic inverse-volume class weighting.
+    """Generalized Dice Loss（Sudre+ DLMIA 2017）：w_c = 1/(Σ t_c)^2、
+    GDL = 1 - 2Σ w_c TP_c / Σ w_c (P_c+T_c)；自动以体积倒数补偿类别不平衡。
 
-    Reference: Sudre et al., "Generalised Dice overlap as a deep learning
-    loss function for highly unbalanced segmentations." DLMIA 2017.
-
-        w_c  = 1 / (Σ t_c)^2                  (weight_type == "square")
-        GDL  = 1 - 2 * Σ_c w_c * TP_c / Σ_c w_c * (P_c + T_c)
-
-    The class weights compensate for volume imbalance automatically, making
-    this loss a strong default when `class_weights` are not tuned by hand
-    and the dataset has rare-class voxels.
-
-    Args:
-        smooth: numerator/denominator smoothing.
-        batch_dice: aggregate over batch+spatial before dividing (nnU-Net
-            default style, more stable for sparse patches).
-        weight_type: "square" (paper), "simple" (w=1/Σt), or "uniform"
-            (disables volume-based weighting; identical to batch_dice mode
-            of BinaryDiceLoss when class_weights is None).
-        class_weights: optional extra per-class multiplier applied AFTER
-            the volume-based weight.
-        w_max: clamp for 1/volume to avoid explosion on empty classes.
-    """
+    weight_type: 'square'（论文） / 'simple' (1/Σt) / 'uniform'（禁体积加权）。
+    class_weights 在体积权后额外叠加；w_max 夹住 1/volume 防爆炸。。"""
 
     def __init__(
         self,
@@ -518,25 +429,9 @@ class GeneralizedDiceLoss(nn.Module):
 # Focal Tversky Loss  (Abraham & Khan, ISBI 2019)
 # ---------------------------------------------------------------------------
 class BinaryFocalTverskyLoss(nn.Module):
-    """Focal Tversky Loss — amplifies hard (low-TI) classes.
-
-    Reference: Abraham & Khan, "A novel focal tversky loss function with
-    improved attention U-Net for lesion segmentation." ISBI 2019.
-
-        TI_c = (TP + s) / (TP + α FP + β FN + s)
-        FTL  = mean_c( (1 - TI_c)^gamma )
-
-    With α<β (default 0.3/0.7) the loss emphasises recall (penalises FN),
-    and gamma>1 further concentrates gradient on hard classes. Empirically
-    strong for small-lesion / thin-structure tasks.
-
-    Note on gamma convention: our formulation is ``(1 - TI)^gamma`` with
-    gamma >= 1 → harder classes dominate. Abraham & Khan's original paper
-    writes ``(1 - TI)^(1/γ_paper)`` with γ_paper ∈ [1, 3]; our ``gamma``
-    corresponds to ``1 / γ_paper`` of the paper inverted → the default
-    1.333 (= 4/3) matches γ_paper = 0.75 which the authors use in their
-    experiments.
-    """
+    """Focal Tversky（Abraham & Khan ISBI 2019）：FTL = mean_c((1-TI_c)^γ)。
+    α<β (默认0.3/0.7) 偏召回；γ>1 集中梯度于难类。
+    默认 γ=4/3 对应原论文 γ_paper=0.75（实验采用值）。。"""
 
     def __init__(
         self,
@@ -590,18 +485,12 @@ class BinaryFocalTverskyLoss(nn.Module):
 # Lovász-Hinge Loss  (Berman et al., CVPR 2018)
 # ---------------------------------------------------------------------------
 def _lovasz_grad_batched(gt_sorted: torch.Tensor) -> torch.Tensor:
-    """Gradient of the Lovász extension of the Jaccard loss — vectorised.
-
-    gt_sorted: (..., L) binary ground-truth, sorted by descending error.
-    Returns a tensor of the same shape whose dot-product with ReLU(errors)
-    yields the Lovász-hinge loss for each leading slice independently.
-    """
-    # Σ t for each leading slice (keepdim for broadcasting).
+    """向量化 Lovász 扩展梯度。gt_sorted (..., L) 按误差降序排列。。"""
     gts = gt_sorted.sum(dim=-1, keepdim=True)
     intersection = gts - gt_sorted.cumsum(dim=-1)
     union = gts + (1.0 - gt_sorted).cumsum(dim=-1)
     jaccard = 1.0 - intersection / union.clamp(min=EPS)
-    # Difference along L (the step-function gradient of Lovász extension).
+    # 沿 L 轴差分（Lovász 阶跃梯度）。
     if jaccard.shape[-1] > 1:
         shifted = jaccard[..., 1:] - jaccard[..., :-1]
         jaccard = torch.cat([jaccard[..., :1], shifted], dim=-1)
@@ -609,30 +498,9 @@ def _lovasz_grad_batched(gt_sorted: torch.Tensor) -> torch.Tensor:
 
 
 class LovaszHingeLoss(nn.Module):
-    """Per-class binary Lovász-Hinge loss — a direct IoU surrogate.
-
-    Reference: Berman et al., "The Lovász-Softmax Loss: a tractable
-    surrogate for the optimization of the intersection-over-union measure
-    in neural networks." CVPR 2018.
-
-    The Lovász-Hinge is the piecewise-linear convex surrogate of the
-    Jaccard (IoU) loss. Unlike Dice/BCE, it directly minimises IoU by
-    sorting per-voxel hinge errors and integrating the Jaccard gradient.
-
-    Operates on RAW LOGITS (no sigmoid); targets are binary {0, 1}.
-
-    weight_map is applied heuristically by multiplying the non-negative
-    portion of hinge errors by the per-voxel weight before sort — retains
-    the sort-based gradient structure while emphasising high-weight
-    regions. Use sparingly; for strict theoretical fidelity, disable
-    weight_map for this loss.
-
-    Args:
-        per_sample: if True, loss is averaged over (B, C) independent
-            sorts; if False, concatenate across batch per channel before
-            sort (batch-level Lovász — smoother for tiny patches).
-        class_weights: optional weighted mean across channels.
-    """
+    """逐类二值 Lovász-Hinge（Berman+ CVPR 2018）——IoU 直接代理。输入为原始 logits。
+    weight_map 启发式以逐体素权乘非负 hinge 项（保排序梯度结构）；严格理论使用时建议禁用。
+    per_sample：True 逐 (B,C) 独立排序取均；False 跨 batch 拼接后排序（小 patch 更平滑）。。"""
 
     def __init__(
         self, per_sample: bool = True,
@@ -649,21 +517,18 @@ class LovaszHingeLoss(nn.Module):
         logits = pred.reshape(B, C, -1)   # operate on logits
         t = target.reshape(B, C, -1)
 
-        # Hinge error in logit space: e_i = max(0, 1 - s_i * z_i)  where
-        # s_i = 2 t_i - 1 ∈ {-1, +1}. We keep the raw (1 - s*z) because
-        # Lovász requires the signed margin before ReLU.
+        # Hinge 误差（logit 空间）：e = 1 - s*z，s=2t-1∈{-1,+1}；Lovász 需 ReLU 前的有符号边际。
         signed = 2.0 * t - 1.0
         errors = 1.0 - signed * logits
 
         if weight_map is not None:
             w_vox = weight_map.reshape(B, 1, -1).clamp(min=0)
-            # Only scale the penalised side; negative margins mean correct
-            # with margin, which should remain safely zero under ReLU.
+            # 仅加权被惩罚侧；负边际 = 正确，ReLU 后为 0。
             errors = torch.where(
                 errors > 0, errors * w_vox, errors)
 
         if self.per_sample:
-            # Sort along spatial axis (dim=-1), gather targets with same perm.
+            # 沿空间轴排序，以同 perm 取 target。
             err_sorted, perm = torch.sort(errors, dim=-1, descending=True)
             gt_sorted = t.gather(dim=-1, index=perm)
             grad = _lovasz_grad_batched(gt_sorted)
@@ -671,7 +536,7 @@ class LovaszHingeLoss(nn.Module):
             return _weighted_mean_over_classes(
                 per_class, self.class_weights).mean()
 
-        # Batch-level Lovász: reshape (B*L) per channel, sort once.
+        # Batch-级 Lovász：逐通道 reshape 为 (B*L)，一次排序。
         errors_bc = errors.permute(1, 0, 2).reshape(C, -1)  # (C, B*L)
         t_bc = t.permute(1, 0, 2).reshape(C, -1)
         err_sorted, perm = torch.sort(errors_bc, dim=-1, descending=True)
@@ -685,7 +550,7 @@ class LovaszHingeLoss(nn.Module):
 # Soft clDice  (Shit et al., CVPR 2021) — topology-preserving
 # ---------------------------------------------------------------------------
 def _soft_erode(x: torch.Tensor, spatial_ndim: int) -> torch.Tensor:
-    """Differentiable morphological erosion via negated max-pool (kernel=3)."""
+    """可微形态学腐蚀（-max_pool，kernel=3）。"""
     if spatial_ndim == 3:
         return -F.max_pool3d(-x, kernel_size=3, stride=1, padding=1)
     if spatial_ndim == 2:
@@ -694,7 +559,7 @@ def _soft_erode(x: torch.Tensor, spatial_ndim: int) -> torch.Tensor:
 
 
 def _soft_dilate(x: torch.Tensor, spatial_ndim: int) -> torch.Tensor:
-    """Differentiable morphological dilation via max-pool (kernel=3)."""
+    """可微形态学膨胀（max_pool，kernel=3）。"""
     if spatial_ndim == 3:
         return F.max_pool3d(x, kernel_size=3, stride=1, padding=1)
     if spatial_ndim == 2:
@@ -704,11 +569,7 @@ def _soft_dilate(x: torch.Tensor, spatial_ndim: int) -> torch.Tensor:
 
 def _soft_skeletonize(
     img: torch.Tensor, n_iter: int, spatial_ndim: int) -> torch.Tensor:
-    """Iterative soft skeletonization (Shit et al., Algorithm 1).
-
-    img is expected in [0, 1] (e.g., sigmoid probabilities or binary mask).
-    Returns a soft skeleton of the same shape.
-    """
+    """迭代 soft skeletonization（Shit+ Alg. 1）；img 在 [0,1]，返同形 soft 骨架。。"""
     def _open(y: torch.Tensor) -> torch.Tensor:
         return _soft_dilate(_soft_erode(y, spatial_ndim), spatial_ndim)
 
@@ -716,34 +577,14 @@ def _soft_skeletonize(
     for _ in range(n_iter):
         img = _soft_erode(img, spatial_ndim)
         delta = F.relu(img - _open(img))
-        # (1 - skel) gates to prevent re-counting voxels already in skel.
+        # (1-skel) 门控：避免重复计入已在 skel 中的体素。
         skel = skel + (1.0 - skel).clamp(min=0.0) * delta
     return skel
 
 
 class SoftCLDiceLoss(nn.Module):
-    """Soft centerline (clDice) loss — topology-preserving.
-
-    Reference: Shit et al., "clDice — a Novel Topology-Preserving Loss
-    Function for Tubular Structure Segmentation." CVPR 2021.
-
-    Measures overlap between the SOFT skeletons of prediction and target:
-
-        Tprec = |skel_P ∩ T| / |skel_P|
-        Tsens = |skel_T ∩ P| / |skel_T|
-        clDice = 2 * Tprec * Tsens / (Tprec + Tsens)
-        loss   = 1 - clDice
-
-    Best used in compound with Dice (paper's recommendation):
-
-        L = (1 - α) * dice + α * (1 - clDice),    α ∈ [0, 1]
-
-    Use the `dice_cldice` builder for this canonical recipe.
-
-    `weight_map` is accepted for API uniformity but ignored: clDice is a
-    topological metric over whole-structure skeletons; voxel reweighting
-    does not have a consistent interpretation within it.
-    """
+    """Soft centerline (clDice) 保拓损失（Shit+ CVPR 2021）。与 Dice 复合使用（dice_cldice）最佳。
+    weight_map 仅 API 统一接受但忽略（clDice 为拓扑指标，逐体素权重无一致语义）。。"""
 
     def __init__(
         self,
@@ -760,7 +601,7 @@ class SoftCLDiceLoss(nn.Module):
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # weight_map intentionally ignored — see class docstring.
+        # 有意忽略 weight_map（见类 docstring）。
         del weight_map
         _check_inputs(pred, target)
         spatial_ndim = pred.ndim - 2
@@ -909,24 +750,8 @@ def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
 
 
 class MultiResolutionLoss(nn.Module):
-    """Wrapper that handles multi-resolution label format.
-
-    When multi-resolution input is enabled:
-      - Model output: (B, num_fg * C_res, D, H, W)
-      - Label:        (B, C_res, D, H, W) with raw integer labels per channel
-
-    This wrapper:
-      1. Splits model output into C_res groups of num_fg channels
-      2. Converts each label channel to per-fg binary masks (preprocess_label)
-      3. Computes base_loss for each resolution independently
-      4. Returns the average loss across resolutions
-
-    Args:
-        base_loss: The underlying loss function (e.g., CompoundLoss of Dice+BCE).
-        num_fg_classes: Number of foreground classes.
-        num_res: Number of resolution scales (C_res).
-        label_values: [bg, fg1, fg2, ...] for preprocess_label.
-    """
+    """多分辨率 label 格式包装。模型输出 (B, num_fg*C_res, D,H,W)、label (B, C_res, D,H,W) 整数。
+    按 C_res 拆 pred、逐尺度 binary 化 label、逐分辨率 base_loss 后取均。。"""
 
     def __init__(
         self,
@@ -948,16 +773,7 @@ class MultiResolutionLoss(nn.Module):
         label_raw: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute loss across all resolutions.
-
-        Args:
-            pred: (B, num_fg * C_res, D, H, W) model logits.
-            label_raw: (B, C_res, D, H, W) raw integer labels per resolution.
-            weight_map: (B, C_res, D, H, W) per-res spatial weights, or None.
-
-        Returns:
-            Scalar loss averaged over resolutions.
-        """
+        """跨全部分辨率计算损失并取均。pred (B,num_fg*C_res,*); label_raw (B,C_res,*) 整数。。"""
         total = pred.new_zeros(())
 
         for r in range(self.num_res):
@@ -965,7 +781,7 @@ class MultiResolutionLoss(nn.Module):
             lbl_r = label_raw[:, r]
             target_r = self._label_to_binary(lbl_r)
 
-            # Per-resolution weight_map: (B, D, H, W) → (B, 1, D, H, W)
+            # 逐分辨率 weight_map：(B,D,H,W) → (B,1,D,H,W)。
             wm_r = None
             if weight_map is not None:
                 wm_r = weight_map[:, r:r + 1]  # (B, 1, D, H, W)
@@ -975,14 +791,9 @@ class MultiResolutionLoss(nn.Module):
         return total / self.num_res
 
     def _label_to_binary(self, label: torch.Tensor) -> torch.Tensor:
-        """Convert integer label (B, D, H, W) to binary masks (B, num_fg, D, H, W).
-
-        Vectorized on GPU — no CPU round-trip.
-        """
-        # fg_values as tensor: (num_fg,)
+        """整数 label (B,D,H,W) → 二值掊叠 (B,num_fg,D,H,W)，GPU 向量化。。"""
         fg = torch.tensor(self.fg_values, device=label.device, dtype=label.dtype)
-        # label: (B, D, H, W) → (B, 1, D, H, W)
-        # fg:    (num_fg,)     → (1, num_fg, 1, 1, 1)
+        # label (B,D,H,W) → (B,1,D,H,W); fg (num_fg,) → (1,num_fg,1,1,1)。
         label_exp = label.unsqueeze(1)
         fg_exp = fg.reshape(1, -1, *([1] * (label.ndim - 1)))
         return (label_exp == fg_exp).float()
@@ -990,19 +801,7 @@ class MultiResolutionLoss(nn.Module):
     def split_for_metrics(
         self, pred: torch.Tensor, label_raw: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Convert (pred, multi-res raw label) into per-class binary form
-        suitable for ``compute_dice_per_class`` / ``dice_batch_stats``.
-
-        Uses only the FIRST resolution (highest fidelity) for metrics —
-        consistent with prior trainer behaviour.
-
-        Args:
-            pred:      (B, num_fg * C_res, *spatial) logits.
-            label_raw: (B, C_res, *spatial) raw integer labels.
-
-        Returns:
-            (pred_1x, target_1x): both with shape (B, num_fg, *spatial).
-        """
+        """为指标抽取首分辨率（3D）二值化：返 (pred_1x, target_1x)，均 (B,num_fg,*spatial)。。"""
         pred_1x = pred[:, :self.num_fg]
         target_1x = self._label_to_binary(label_raw[:, 0])
         return pred_1x, target_1x
@@ -1012,55 +811,15 @@ class MultiResolutionLoss(nn.Module):
 # 2.5D Slice-Channel Loss Wrapper
 # ---------------------------------------------------------------------------
 class SliceChannelLoss(nn.Module):
-    """Wrapper for the 2.5D patch mode.
+    """2.5D patch 模式包装。输入 (B, num_fg*D, H, W) logits + (B, D, H, W) 整数 label。
+    逐类 pred_c=pred[:, c*D:(c+1)*D]、target_c=(label==fg_values[c])，逐类平均为总损失。
 
-    Tensor contracts (after the trainer squeezes ``C_res=1`` away):
-      Model output : (B, num_fg * D, H, W) logits.
-      Raw label    : (B, D, H, W) integer labels (D slices stacked as channels).
-      Weight map   : (B, D, H, W) per-voxel weights, or None.
+    reduction：'per_slice' → (B*D,1,H,W) 逐切独立 2D Dice/Tversky；
+              'per_volume' → (B,1,D,H,W) 逐窗口 3D Dice/Tversky（空切与非空切共享分母）。
+              BCE/Focal/Lovász 下二者结果一致（逐体素均值）。
 
-    For each foreground class ``c ∈ [0, num_fg)``:
-      pred_c   = pred[:, c*D:(c+1)*D]                  # (B, D, H, W)
-      target_c = (label_raw == fg_values[c]).float()   # (B, D, H, W)
-
-    The wrapper supports two reduction regimes for the base loss
-    (``reduction`` constructor argument, mirrored from
-    ``LossConfig.slice_loss_reduction``):
-
-    ``"per_slice"`` (default, backward compatible)
-        pred / target are reshaped to ``(B*D, 1, H, W)`` so every slice is
-        a standalone 2D binary segmentation problem. Dice / Tversky
-        reduce only over (H, W), one denominator per slice.
-
-    ``"per_volume"``
-        pred / target are reshaped to ``(B, 1, D, H, W)`` so every window
-        is a standalone 3D binary segmentation problem. Dice / Tversky
-        reduce over (D, H, W) — a single volumetric Dice per window.
-        BCE / Focal / Lovász are mathematically equivalent to per-slice
-        because they are per-voxel-mean reductions over the same voxels.
-
-    The final scalar loss is averaged across all foreground classes.
-
-    ``class_weights`` semantics
-    ---------------------------
-    The wrapper iterates per-class and feeds ``base_loss`` ONE channel at
-    a time (``pred_c``, ``target_c`` both with C=1). In that single-channel
-    regime the base loss's internal ``class_weights`` reduces to a no-op
-    (the cw factor cancels in numerator and denominator of the normalised
-    weighted mean), so a user-supplied ``cfg.loss.class_weights`` would
-    silently fail to take effect.
-
-    To honour the user's intent, the wrapper re-reads the SAME cw buffer
-    from ``base_loss`` at the wrapper level and combines the per-class
-    losses as a normalised weighted mean::
-
-        if cw is None: L = mean_c(L_c)              # = old behaviour
-        else:          L = sum_c(cw[c] * L_c) / sum(cw)
-
-    With ``cw == [1.0, 1.0]`` (the current shipped default) the weighted
-    formula collapses to the simple mean, so this fix is bit-equivalent to
-    the previous implementation in that case (regression-safe).
-    """
+    class_weights：逐类迭代使 base_loss 内部 cw 折叠为无操作，因此在包装层重读 base_loss.class_weights
+    以归一化加权均合 per-class 损失；cw=None 时与简单均值位精确一致。。"""
 
     _VALID_REDUCTIONS = ("per_slice", "per_volume")
 
@@ -1086,12 +845,7 @@ class SliceChannelLoss(nn.Module):
         self.fg_values = label_values[1:]  # exclude background
         self.reduction = reduction
 
-        # ---- class_weights guard --------------------------------------
-        # The wrapper-level aggregator pulls ``class_weights`` from
-        # ``base_loss.class_weights`` at forward time (so device-moves
-        # follow the base loss naturally; no buffer duplication). Validate
-        # length here at construction so misconfigurations fail fast
-        # instead of silently producing wrong gradients.
+        # 构造时验长：forward 重读 base_loss.class_weights（跟随 device 定位，不复制 buffer）。
         cw_buf = getattr(base_loss, "class_weights", None)
         if cw_buf is not None and cw_buf.numel() != num_fg_classes:
             raise ValueError(
@@ -1105,11 +859,7 @@ class SliceChannelLoss(nn.Module):
     # Per-slice reshape helpers (rank-4 contract: (B*D, num_fg, H, W))
     # ------------------------------------------------------------------
     def _label_to_binary(self, label_raw: torch.Tensor) -> torch.Tensor:
-        """(B, D, H, W) raw labels → (B*D, num_fg, H, W) binary masks.
-
-        Vectorised on-device. The output rank is rank-4 so that the
-        underlying base loss can run as a 2D binary segmentation.
-        """
+        """(B,D,H,W) 整数 → (B*D, num_fg, H, W) 二值（rank-4 供 2D base loss）。。"""
         if label_raw.ndim != 4:
             raise ValueError(
                 f"SliceChannelLoss expects (B, D, H, W) raw label, "
@@ -1126,7 +876,7 @@ class SliceChannelLoss(nn.Module):
         return (flat == fg_b).float()                               # (B*D, num_fg, H, W)
 
     def _split_pred(self, pred: torch.Tensor) -> torch.Tensor:
-        """(B, num_fg*D, H, W) → (B*D, num_fg, H, W)."""
+        """(B, num_fg*D, H, W) → (B*D, num_fg, H, W)。"""
         if pred.ndim != 4:
             raise ValueError(
                 f"SliceChannelLoss expects (B, num_fg*D, H, W) pred, "
@@ -1146,7 +896,7 @@ class SliceChannelLoss(nn.Module):
     def _flatten_weight_map(
         weight_map: Optional[torch.Tensor], num_slices: int,
     ) -> Optional[torch.Tensor]:
-        """(B, D, H, W) → (B*D, 1, H, W) for base-loss broadcasting."""
+        """(B,D,H,W) → (B*D,1,H,W) 供 base loss 广播。"""
         if weight_map is None:
             return None
         if weight_map.ndim != 4:
@@ -1163,7 +913,7 @@ class SliceChannelLoss(nn.Module):
     # Per-volume reshape helpers (rank-5 contract: (B, num_fg, D, H, W))
     # ------------------------------------------------------------------
     def _split_pred_5d(self, pred: torch.Tensor) -> torch.Tensor:
-        """(B, num_fg*D, H, W) → (B, num_fg, D, H, W)."""
+        """(B, num_fg*D, H, W) → (B, num_fg, D, H, W)。"""
         if pred.ndim != 4:
             raise ValueError(
                 f"SliceChannelLoss expects (B, num_fg*D, H, W) pred, "
@@ -1177,7 +927,7 @@ class SliceChannelLoss(nn.Module):
         return pred.reshape(B, self.num_fg, D, H, W)
 
     def _label_to_binary_5d(self, label_raw: torch.Tensor) -> torch.Tensor:
-        """(B, D, H, W) raw labels → (B, num_fg, D, H, W) binary masks."""
+        """(B,D,H,W) 整数 → (B, num_fg, D, H, W) 二值。"""
         if label_raw.ndim != 4:
             raise ValueError(
                 f"SliceChannelLoss expects (B, D, H, W) raw label, "
@@ -1197,7 +947,7 @@ class SliceChannelLoss(nn.Module):
     def _wmap_to_5d(
         weight_map: Optional[torch.Tensor], num_slices: int,
     ) -> Optional[torch.Tensor]:
-        """(B, D, H, W) → (B, 1, D, H, W) for base-loss broadcasting."""
+        """(B,D,H,W) → (B,1,D,H,W) 供 base loss 广播。"""
         if weight_map is None:
             return None
         if weight_map.ndim != 4:
@@ -1215,21 +965,9 @@ class SliceChannelLoss(nn.Module):
     # ------------------------------------------------------------------
     def _aggregate_per_class(
         self, terms: List[torch.Tensor]) -> torch.Tensor:
-        """Combine the per-class scalar losses into the final scalar.
-
-        With ``base_loss.class_weights == None`` (or unset): simple mean
-        across classes — bit-identical to the legacy ``total / num_fg``.
-
-        With ``base_loss.class_weights = [w_0, ..., w_{C-1}]``: normalised
-        weighted mean ``Σ w_c · L_c / Σ w_c``. The denominator keeps the
-        loss magnitude comparable across cw choices (e.g. switching from
-        [1, 1] to [1, 2] does not double the loss scale, only redistributes
-        the per-class contributions).
-        """
+        """逐类损失汇总为最终标量：cw=None 时简单均值；否则 Σ w_c·L_c/Σ w_c（幅值与 cw 选择无关）。。"""
         if not terms:
-            # num_fg == 0 is rejected by Config.validate, but keep this
-            # branch so a degenerate construction returns a finite zero
-            # instead of crashing inside torch.stack on an empty list.
+            # num_fg==0 会被 Config.validate 拒；保留分支避免退化构造崩。
             raise RuntimeError(
                 "SliceChannelLoss._aggregate_per_class got 0 terms")
         stacked = torch.stack(terms)  # (num_fg,)
@@ -1245,17 +983,13 @@ class SliceChannelLoss(nn.Module):
         label_raw: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute the per-class averaged binary loss in the configured
-        reduction regime."""
+        """按配置的 reduction 计逐类均值损失。"""
         if self.reduction == "per_volume":
             pred_5d = self._split_pred_5d(pred)              # (B, num_fg, D, H, W)
             target_5d = self._label_to_binary_5d(label_raw)  # (B, num_fg, D, H, W)
             wm_5d = self._wmap_to_5d(weight_map, self.num_slices)
 
-            # Per-class loop in a 3D-binary-segmentation contract:
-            # Dice/Tversky now reduce over (D, H, W) so empty slices
-            # share a single window-level denominator with non-empty
-            # slices and stop "winning" at zero loss.
+            # 3D 二值分割逐类循环：Dice/Tversky 跨 (D,H,W) 汇总，空切与非空切共享分母。
             terms: List[torch.Tensor] = []
             for c in range(self.num_fg):
                 pred_c = pred_5d[:, c:c + 1]                 # (B, 1, D, H, W)
@@ -1264,15 +998,12 @@ class SliceChannelLoss(nn.Module):
                     pred_c, target_c, weight_map=wm_5d))
             return self._aggregate_per_class(terms)
 
-        # Default: per_slice (rank-4 contract, backward compatible).
+        # 默认 per_slice (rank-4)。
         pred_flat = self._split_pred(pred)                  # (B*D, num_fg, H, W)
         target_flat = self._label_to_binary(label_raw)      # (B*D, num_fg, H, W)
         wm_flat = self._flatten_weight_map(weight_map, self.num_slices)
 
-        # Per-class loop — mirrors MultiResolutionLoss but iterates over
-        # fg classes instead of resolution scales. We pass single-channel
-        # binary tensors per class so that base_loss treats each as a
-        # standalone 2D binary segmentation problem (rank-4 input).
+        # 逐 fg 类传单通道二值张量使 base_loss 作为独立 2D 二值分割。
         terms = []
         for c in range(self.num_fg):
             pred_c = pred_flat[:, c:c + 1]                  # (B*D, 1, H, W)
@@ -1284,22 +1015,9 @@ class SliceChannelLoss(nn.Module):
     def split_for_metrics(
         self, pred: torch.Tensor, label_raw: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return tensors suitable for ``compute_dice_per_class`` / \
-        ``dice_batch_stats`` AND for the validation-time direct base-loss
-        call (``trainer._compute_loss_fp32(self.base_loss, ...)``).
-
-        The shape mirrors the configured ``reduction`` so that the
-        validation-time loss is computed in the same regime as training:
-
-          ``per_slice``  → ``(B*D, num_fg, H, W)`` (per-2D-slice base loss).
-          ``per_volume`` → ``(B, num_fg, D, H, W)`` (per-3D-window base loss).
-
-        Both shapes are accepted by the per-class metric utilities
-        (`compute_dice_per_class`, `dice_batch_stats`) which use
-        ``reshape(B, C, -1)`` internally and are rank-agnostic; the
-        global pooled-Dice computed in ``Trainer._validate`` is the
-        same scalar regardless of regime since it sums over every voxel.
-        """
+        """返与 reduction 一致的形状供指标与验证损失：
+        per_slice → (B*D,num_fg,H,W)；per_volume → (B,num_fg,D,H,W)。
+        compute_dice_per_class / dice_batch_stats 均 rank 无关。。"""
         if self.reduction == "per_volume":
             return (self._split_pred_5d(pred),
                     self._label_to_binary_5d(label_raw))
@@ -1307,10 +1025,7 @@ class SliceChannelLoss(nn.Module):
 
 
 def build_loss(cfg: LossConfig) -> nn.Module:
-    """Build loss function from config.
-
-    All losses use per-class independent sigmoid (binary mode).
-    """
+    """按 cfg 构造损失（全部逐类独立 sigmoid 二值）。"""
     cw = list(cfg.class_weights) if cfg.class_weights else None
     name = cfg.name.lower()
 
