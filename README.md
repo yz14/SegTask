@@ -104,7 +104,8 @@ SegTask/
 │   │   ├── unet.py                    # 通用 UNet3D（spatial_dims=2 兼容 2.5D）
 │   │   ├── unetpp.py                  # UNet++ 嵌套稠密 decoder
 │   │   ├── unet3p.py                  # UNet3+ 全尺度跳连 decoder
-│   │   └── factory.py                 # 从 Config 装配 Encoder/Decoder/UNet3D
+│   │   ├── topology.py                # ModelTopology + build_topology（R5 引入）：派生量单一真相源
+│   │   └── factory.py                 # 从 Config 装配 Encoder/Decoder/UNet3D（读 topology）
 │   └── losses/                        # 损失函数（§3.6）
 │       ├── __init__.py
 │       └── losses.py                  # ~1270 行：基础 loss × wrapper × build_loss 工厂
@@ -303,7 +304,7 @@ config.py
                           # threshold / output_dir / save_probabilities
 ```
 
-- `Config.sync()`：把派生字段填齐（`num_classes ← len(label_values)`、`spatial_dims` / `in_channels` 根据 `patch_mode + multi_res_scales + lift_2_5d_to_3d + aux_keep_native_d` 自动算出、`resenc_preset` 展开成 `encoder_blocks_per_stage` / `decoder_blocks_per_stage`、自动把 `z_boundary_mode` 升级到 `edge_pad`）。
+- `Config.sync()`：把派生字段填齐——`num_classes ← len(label_values)`、`z_boundary_mode` 自动升级到 `edge_pad`、`resenc_preset` 展开成 `encoder_blocks_per_stage` / `decoder_blocks_per_stage`；**`spatial_dims` / `in_channels` 由 `models.topology.build_topology` 一次性算出再写回 `cfg.model`**（R5：单一真相源，避免与 `factory.build_model` 重复推导）。
 - `Config.validate()`：所有枚举字段全 `assert`；强制禁掉 `r2plus1d × 2.5D`、`lift_2_5d_to_3d × aux_keep_native_d` 等不合理组合。
 - `load_config(path)`：YAML → 嵌套 dict → `_dataclass_from_dict` 递归构造 → `sync()` + `validate()`。
 - `save_config(cfg, path)`：`asdict` → YAML 落盘到 `output_dir/resolved_config.yaml`。
@@ -444,7 +445,14 @@ segtask_v1/models/
 - `_resolve_blocks_per_stage` 调和 explicit 列表 vs fallback。
 - `_StatefulStageBuilder` —— 按调用顺序消费每个 stage 的 block 数。
 - `_make_resnet_stage_builder` / `_make_convnext_stage_builder` / `_make_convnext_downsample_builder` 构造对应工厂。
-- `build_model(cfg) -> UNet3D` —— 单入口：根据 `backbone`、`decoder_type`、`spatial_dims`、`multi_res_scales` 选 stage builder + downsample/upsample builder + stem，最后实例化 `UNet3D`。
+- `build_model(cfg) -> UNet3D` —— 单入口：**所有 mode 派生量（`out_classes` / `spatial_dims` / `context_n_views` / `in_ch_per_view_list` / `aux_head_out_channels` / `aux_seg_active` 门控）读 `ModelTopology`**（R5），本函数仅负责 backbone × decoder_type × stem 装配，不再做 patch_mode 分支。
+
+**`topology.py`**（R5 引入，~150 行）—— **训练几何 / 通道布局派生量的单一真相源**：
+
+- `@dataclass(frozen=True) ModelTopology` —— 一次性冻结 12 个派生字段：原始 mode flags（`patch_mode` / `lift_2_5d_to_3d` / `aux_keep_native_d` / `keep_native_multi_res`）+ 几何量（`n_views` / `num_res_groups` / `slab_depth` / `aux_view_depths`）+ I/O 通道（`in_channels` / `out_classes` / `spatial_dims` / `context_n_views` / `in_ch_per_view_list`）+ aux 拓扑（`aux_seg_active` / `aux_head_out_channels`）。
+- `build_topology(cfg) -> ModelTopology` —— **整个 codebase 唯一推导入口**。重构前同一组派生量被 `Config.sync` 与 `models.factory.build_model` 各算一遍；R5 后 `Config.sync` / `factory.build_model` / `trainer.pipelines.factory.build_pipeline` / `Config.aux_view_depths` 全部委托至此。
+- `aux_seg_active = aux_seg_supervision AND n_views > 1` —— 把原来散布于 `Config.validate` / `factory.py:255` / `unet.py:337` 的三处门控**合并到 topology 一处**；`UNet3D.__init__` 若收到 `aux_seg_supervision=True` 但 `n_views<=1` 现在会直接 `ValueError`。
+- 新增 patch_mode：仅需修改 `build_topology` 内决策树即可同步影响 dataset / model / pipeline 三方。
 
 ### 3.6 `losses/` —— 二元 sigmoid 损失库 + 多分辨率/2.5D 包装器
 
@@ -688,7 +696,11 @@ predict.py
 
 - **新增一种损失**：在 `@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py` 里加 `class XxxLoss(nn.Module)`，在 `build_loss` 工厂分支里注册名字，在 `Config.validate()` 的 `loss.name` 白名单里加上字符串，最后写一份回归测试到 `test_new_losses.py`。
 - **新增一种 backbone**：在 `models/` 下加 `xxx.py`（参考 `resnet.py` / `convnext.py`），实现一个 `XxxStage(in_ch, out_ch, n_blocks, ...)`，在 `models/factory.py` 添加 `_make_xxx_stage_builder` + 把 `cfg.model.backbone == "xxx"` 接进 `build_model`，并在 `ModelConfig.validate` 加白名单。
-- **新增一种 patch 模式**：在 `data/dataset.py` 加 `SegDataset3DXxx`；在 `data/specs.py` 加 `XxxSpec(DatasetSpec)` + 在 `build_data_spec` 决策树加 1 行（`build_dataloaders` 不动）；在 `Config.sync` / `validate` 决定 `spatial_dims` / `in_channels`；在 `trainer/pipelines/` 加对应 `ViewPipeline` + `factory.py` 决策树加 1 行；predictor 的 `_sliding_window_*` 需要镜像消费。注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
+- **新增一种 patch 模式**（R5 后大幅简化，仅 4 处改动）：
+  1. `data/dataset.py` 加 `SegDataset3DXxx`（如果几何抽取语义有别于现有 3 种）
+  2. `data/specs.py` 加 `XxxSpec(DatasetSpec)` 并在 `build_data_spec` 决策树追加 1 行（`build_dataloaders` 不动）
+  3. **`models/topology.py::build_topology` 内的决策树**追加 1 个分支以填写 `in_channels` / `out_classes` / `spatial_dims` 等派生量 —— **`Config.sync` / `factory.build_model` / `pipelines/factory.build_pipeline` 全部自动同步，无需修改**
+  4. `trainer/pipelines/` 加对应 `ViewPipeline(...)` 子类 + `factory.py` 决策树追加 1 行；predictor 的 `_sliding_window_*` 需要镜像消费。注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
 - **新增一个 stem 或多 FOV 融合策略**：在 `models/stem.py` 加类 + 在 `build_stem` / `build_context_stem` 注册；`Config.validate` 的 `stem_mode` / `context_fusion` 白名单。
 - **改命名/路径约定**：所有规则集中在 `data/loader._match_per_sample_paths` 和 `data/make_data._stem`，改一处即可。
 

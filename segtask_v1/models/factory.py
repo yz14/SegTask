@@ -12,6 +12,7 @@ from ..config import Config
 from .blocks import Downsample, Upsample
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .resnet import ResNetStage
+from .topology import ModelTopology, build_topology
 from .unet import Encoder, Decoder, UNet3D
 from .unet3p import UNet3PDecoder
 from .unetpp import UNetPPDecoder
@@ -143,36 +144,16 @@ def build_model(cfg: Config):
     enc_channels = list(mc.encoder_channels)
     num_fg       = cfg.num_fg_classes
     n_levels     = len(enc_channels)
-    spatial_dims = getattr(mc, "spatial_dims", 3)
 
-    # out_classes：3D = num_fg*num_res；2.5D 折叠 = num_fg*D；2.5D lift = num_fg。
-    lift = bool(getattr(mc, "lift_2_5d_to_3d", False))
-    if   cfg.data.patch_mode == "2_5d" and not lift:
-        num_res = 1
-        D = int(cfg.data.patch_size[0])
-        out_classes = num_fg * D
-    elif cfg.data.patch_mode == "2_5d" and lift:
-        num_res = 1
-        out_classes = num_fg
-    else:
-        num_res = len(cfg.data.multi_res_scales)
-        out_classes = num_fg * num_res
-
-    # 多 FOV 上下文仅 2.5D 有意义；3D stem 直接读取 scales。
-    if cfg.data.patch_mode == "2_5d":
-        context_n_views = max(len(cfg.data.multi_res_scales), 1)
-    else:
-        context_n_views = 1
-
-    # 2.5D + aux_keep_native_d 时按 view 拆分输入通道；否则 None 代表均分。
-    in_ch_per_view_list   = None
-    aux_head_out_channels = None
-    if (cfg.data.patch_mode == "2_5d"
-            and bool(getattr(cfg.data, "aux_keep_native_d", False))
-            and context_n_views > 1):
-        depths = list(cfg.aux_view_depths)
-        in_ch_per_view_list   = depths
-        aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]  # aux 头 k：num_fg*D_k
+    # R5：所有 mode 派生量（out_classes / spatial_dims / context_n_views /
+    # in_ch_per_view_list / aux_head_out_channels / aux 门控）来自 topology，
+    # 不再在本函数内重复推导。
+    topo = build_topology(cfg)
+    spatial_dims          = topo.spatial_dims
+    out_classes           = topo.out_classes
+    context_n_views       = topo.context_n_views
+    in_ch_per_view_list   = topo.in_ch_per_view_list
+    aux_head_out_channels = topo.aux_head_out_channels
 
     # decoder builder 调用次数：unet=n-1，unetpp=n*(n-1)/2，unet3p=0。
     enc_counts = _resolve_blocks_per_stage(
@@ -250,10 +231,8 @@ def build_model(cfg: Config):
             skip_attention   = mc.skip_attention,
             spatial_dims     = spatial_dims)
 
-    aux_seg_supervision = bool(getattr(mc, "aux_seg_supervision", False))
-    # aux 仅多 FOV 时有意义；镜像 UNet3D 内部门控以准确日志。
-    aux_seg_supervision = aux_seg_supervision and context_n_views > 1
-    # 逐 view aux 通道仅 2.5D native-D 时使用；否则 None=默认 num_fg_classes。
+    # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
+    aux_seg_supervision = topo.aux_seg_active
     aux_head_out_channels_arg = (
         aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels) else None)
     model = UNet3D(
@@ -282,7 +261,7 @@ def build_model(cfg: Config):
         enc_channels,
         enc_counts, dec_counts,
         out_classes, num_fg,
-        num_res if num_res > 0 else 1,
+        topo.num_res_groups if topo.num_res_groups > 0 else 1,
         mc.stem_mode, encoder.stem_stride,
         context_n_views, getattr(mc, "context_fusion", "shared_stem"),
         mc.downsample_mode, mc.upsample_mode, mc.skip_mode,

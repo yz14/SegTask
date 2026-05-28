@@ -334,7 +334,15 @@ class UNet3D(nn.Module):
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
         n_views = int(getattr(encoder, "context_n_views", 1))
         fusion  = str(getattr(encoder, "context_fusion", "shared_stem"))
-        self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
+        # R5：移除"aux_seg_supervision and n_views > 1"二次门控；统一由
+        # ``ModelTopology.aux_seg_active`` 上游决定。调用方传入不一致组合时直接报错。
+        if bool(aux_seg_supervision) and n_views <= 1:
+            raise ValueError(
+                f"UNet3D got aux_seg_supervision=True but encoder."
+                f"context_n_views={n_views} (<=1). The caller should "
+                "gate this via ModelTopology.aux_seg_active "
+                "(= aux_seg_supervision AND n_views > 1).")
+        self.aux_seg_supervision = bool(aux_seg_supervision)
         self.aux_n_views = n_views
         # aux_feat_indices[k-1]：aux 头 k 用的 decoder 特征索引（避免运行时分支）。
         self.aux_feat_indices: List[int] = []

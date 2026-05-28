@@ -486,46 +486,43 @@ class Config:
     predict: PredictConfig = field(default_factory=PredictConfig)
 
     def sync(self) -> None:
-        """同步跨子配置的对应字段。"""
+        """同步跨子配置的对应字段。
+
+        R5：所有"模型几何派生量"（``in_channels`` / ``spatial_dims``）改由
+        ``segtask_v1.models.topology.build_topology(self)`` 一次性算出再写回，
+        以保持旧 yaml / 旧外部代码读 ``cfg.model.in_channels`` 不破坏。
+        本方法仅保留"非派生"职责（``num_classes`` 推断、``z_boundary_mode``
+        自动升级、resenc preset、best-criterion 映射）。
+        """
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
 
+        # z_boundary_mode 自动升级（lazy multi-res 隐式要求 edge_pad）—— 此为
+        # *data 侧* 副作用，不属 ModelTopology 范畴。
+        n_views = max(len(self.data.multi_res_scales), 1)
         if self.data.patch_mode == "2_5d":
-            # 2.5D channel 布局：lift=True → n_views；aux_keep_native_d=True → sum_k round(D*s_k)；
-            # 其他 → D * n_views。
-            n_views = max(len(self.data.multi_res_scales), 1)
-            D       = int(self.data.patch_size[0])
-            lift    = bool(getattr(self.model, "lift_2_5d_to_3d", False))
-            if lift:
-                self.model.spatial_dims = 3
-                self.model.in_channels  = n_views
-            else:
-                self.model.spatial_dims = 2
-            if lift:
-                pass
-            elif self.data.aux_keep_native_d and n_views > 1:
-                if self.data.z_boundary_mode != "edge_pad":
-                    logger.info(
-                        "aux_keep_native_d=True implies z_boundary_mode='edge_pad'; "
-                        "auto-upgraded from %r.", self.data.z_boundary_mode)
-                    self.data.z_boundary_mode = "edge_pad"
-                depths    = [int(round(D * float(s))) for s in self.data.multi_res_scales]
-                depths[0] = D  # s_0 == 1.0
-                self.model.in_channels = int(sum(depths))
-            else:
-                self.model.in_channels = D * n_views
-        else:
-            # 3D：in_channels = len(multi_res_scales)。keep_native_multi_res 不改通道数，仅几何路径不同。
-            self.model.in_channels = len(self.data.multi_res_scales)
-            if (self.data.keep_native_multi_res
-                    and self.data.patch_mode == "z_axis"
-                    and len(self.data.multi_res_scales) > 1
+            if (self.data.aux_keep_native_d and n_views > 1
                     and self.data.z_boundary_mode != "edge_pad"):
                 logger.info(
-                    "keep_native_multi_res=True implies z_boundary_mode="
-                    "'edge_pad'; auto-upgraded from %r.",
-                    self.data.z_boundary_mode)
+                    "aux_keep_native_d=True implies z_boundary_mode='edge_pad'; "
+                    "auto-upgraded from %r.", self.data.z_boundary_mode)
                 self.data.z_boundary_mode = "edge_pad"
+        elif (self.data.keep_native_multi_res
+                and self.data.patch_mode == "z_axis"
+                and n_views > 1
+                and self.data.z_boundary_mode != "edge_pad"):
+            logger.info(
+                "keep_native_multi_res=True implies z_boundary_mode="
+                "'edge_pad'; auto-upgraded from %r.",
+                self.data.z_boundary_mode)
+            self.data.z_boundary_mode = "edge_pad"
+
+        # 单一真相源：所有通道/几何派生量在 build_topology 中一次算齐。
+        # 局部 import 避免 models 包顶层依赖 config（消除循环 import 风险）。
+        from .models.topology import build_topology
+        topo = build_topology(self)
+        self.model.in_channels = topo.in_channels
+        self.model.spatial_dims = topo.spatial_dims
 
         self._apply_resenc_preset()
         self._resolve_save_best_criterion()
@@ -850,15 +847,11 @@ class Config:
     def aux_view_depths(self) -> List[int]:
         """2.5D 下每视图原生深度 D_k = round(D * s_k)，强制 D_0 = D。非 2.5D 返回空列表。
 
-        仅形状计算，不依赖 data.aux_keep_native_d；调用方自行根据该标志决定是否使用。
+        R5：委托给 ``build_topology`` 以保持单一真相源；仅形状计算，不依赖
+        ``data.aux_keep_native_d``，调用方自行根据该标志决定是否使用。
         """
-        if self.data.patch_mode != "2_5d":
-            return []
-        D = int(self.data.patch_size[0])
-        depths = [int(round(D * float(s))) for s in self.data.multi_res_scales]
-        if depths:
-            depths[0] = D  # s_0 == 1.0
-        return depths
+        from .models.topology import build_topology
+        return list(build_topology(self).aux_view_depths)
 
 
 # ---------------------------------------------------------------------------
