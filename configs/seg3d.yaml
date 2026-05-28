@@ -121,7 +121,13 @@ model:
   # ResEnc 预设: 'none' | 'S' | 'M' | 'L' | 'XL'。非 none 且上面两列空时 sync() 自动填
   # resenc_preset: "none"
 
-  norm_type  : "instance"                # 'batch' | 'instance' | 'group'
+  # 'batch' | 'instance' | 'group'
+  # 'group' 相较 'instance':
+  #   (1) 不抹掉每 channel 的绝对强度尺度 → 保留 HU 信号 → 与 region_weight
+  #       (按 HU 区域加权) 的设计哲学兼容；
+  #   (2) 组内多通道联合统计 → 跨通道相对响应保留 → 利于深层 z-axis 上下文学习。
+  # resnet/basic backbone 下此设置作用于全网络。
+  norm_type  : "group"
   norm_groups: 8                         # 仅 group norm
 
   activation: "leakyrelu"                # 'relu' | 'leakyrelu' | 'gelu' | 'swish'

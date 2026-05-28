@@ -119,7 +119,12 @@ model:
   # 推荐组合: D=16, block_type='r2plus1d', lift=true, aux_seg_supervision=true
   lift_2_5d_to_3d: false
 
-  norm_type  : "instance"         # 'instance' | 'batch' | 'group'
+  # 'instance' | 'batch' | 'group'
+  # convnext backbone 下 block 内固定 LayerNorm，此项仅作用于 stem / 上下采样 /
+  # decoder skip 投影 / aux head。'group' 相较 'instance':
+  #   (1) 保留组内通道相对响应 → 避免 2.5D 折叠下 stem 把每张切片独立标准化；
+  #   (2) 不抹掉绝对强度尺度 → 与 region_weight 中按 HU 加权的设计兼容更好。
+  norm_type  : "group"
   norm_groups: 8
   activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
   dropout    : 0.0
