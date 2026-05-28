@@ -45,6 +45,111 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 3 最后2的数据基础上，彻底检查一遍损失函数，是否都正确实现了，对应我这样的数据是否可行，是否有问题。
 
-4 我在代码里面增加了很多的TODO，有的TODO可能需要你提供好的方案来解决，有的可能需要先增加debug信息，待一次完整的训练完成后再决定如何做。请你先把代码里面的TODO全部看一遍，看看哪些是要做，哪些需要加debug信息，或者哪些不需要做。
 
-5 trainer写的让人读起来非常的费劲，费劲的理由主要是，a 里面的判断条件非常的多，容易让人记混，b 里面关于多少个视图的参数非常容易让人混乱，例如在2.5D时，多分辨率时有几个分辨率，参数里面就是该数字，而当3D时，全部都设成1，这读起来非常容易让人混乱，c 里面代码太多了，没有功能模块化处理。我目前可以想到的是，先将trainer模块化重构，然后再写一个通用的trainer.py，然后在分别写trainer2_5d.py和trainer3d.py去继承trainer.py和调用公用的模块，这样应该可以少很多的判断条件，使得代码清晰。如果你有更好的方案，则不必严格遵守我的方案。  
+4 trainer写的让人读起来非常的费劲，费劲的理由主要是，a 里面的判断条件非常的多，容易让人记混，b 里面关于多少个视图的参数非常容易让人混乱，例如在2.5D时，多分辨率时有几个分辨率，参数里面就是该数字，而当3D时，全部都设成1，这读起来非常容易让人混乱，c 里面代码太多了，没有功能模块化处理。我目前可以想到的是，先将trainer模块化重构，然后再写一个通用的trainer.py，然后在分别写trainer2_5d.py和trainer3d.py去继承trainer.py和调用公用的模块，这样应该可以少很多的判断条件，使得代码清晰。如果你有更好的方案，则不必严格遵守我的方案。以下是我的分析：  
+1. 状态空间维度太多，且彼此正交叠加
+Trainer.__init__ 在 @d:/codes/work-projects/SegTask/segtask_v1/trainer.py:251-402 里同时维护 6 个布尔/枚举开关，它们两两组合就能产生 ~20 条有效分支：
+
+patch_mode: 2_5d / z_axis / cubic / whole（4 种几何）
+is_2_5d: 上面 2_5d 的派生快捷
+lift_2_5d_to_3d: 2.5D 子分支，强制 num_res=1
+aux_keep_native_d: 2.5D 子分支，aux 视图保原生 D_k
+keep_native_multi_res: 仅 3D（z_axis/cubic），懒抽取
+aux_seg_supervision: 仅 2.5D + n_views>1
+deep_supervision: 是否再包一层 DeepSupervisionLoss
+后果：例如训练步 _train_epoch @d:/codes/work-projects/SegTask/segtask_v1/trainer.py:806-832 里出现了 4 路嵌套 if 分发输入 + 3 路损失分发 @d:/codes/work-projects/SegTask/segtask_v1/trainer.py:842-854，再叠上 aux=on/off、lift=on/off、native_d=on/off 的笛卡尔积。代码本身没错，但读者必须同时记住 6 维状态。
+
+2. "视图/分辨率/切片"语义被三个词混用
+你在 TODO 里点到了痛点 b。代码中实际共存四套含义不同的"数量"：
+
+变量	含义	2.5D 单分辨率	2.5D 多分辨率	3D 单分辨率	3D 多分辨率
+len(multi_res_scales)	数据侧视图数	1	n	1	n
+num_res (loss)	损失复合的输出通道分组数	1 (slice)	1 (slice)	1	n
+n_aux = n_views-1	aux 监督数	0	n-1	0	0
+num_slices = D	切片通道数	D	D	–	–
+C_res (channel)	模型输入分辨率轴	1	n	1	n
+@d:/codes/work-projects/SegTask/segtask_v1/trainer.py:300 干脆注释 num_res = 1   # 仅日志用 —— 这一行就是"参数被强行复用导致语义滑动"的活证据。
+
+3. 单类承担了太多职责（God Class）
+Trainer 1659 行同时干了 9 件事：
+
+A. 工厂: build_optimizer / build_scheduler / WarmupScheduler (@d:/codes/work-projects/SegTask/segtask_v1/trainer.py:83-227)
+B. AMP/Scaler 适配: GradScaler shim、_resolve_auto_amp_dtype、_compute_loss_fp32（精度切换）
+C. EMA + compile + 编译探测
+D. 内存核算: _estimate_train_memory
+E. 损失组装: 4 种 inner loss 选择 + DS 外包 + aux inner 选择
+F. 数据视图重塑: _split_views_native_3d / _split_views_native_d / _squeeze_2_5d / _squeeze_2_5d_keep_views / _center_crop
+G. 训练循环 + 梯度累积 + breakdown 收集
+H. 验证循环 + pooled dice + surface dice
+I. Checkpoint I/O + pretrain 加载
+A、B、C、D、I 都与 2.5D/3D 无关，却挤在同一个文件里增加了"信号噪声比"。
+
+4. 控制流局部正确但全局难审计
+_train_epoch 的输入重塑、_compute_loss_* 的损失分派、_extract_main_pred 的输出解包各自独立判断同一组 flags。任何新增模式都要在 3-5 处保持同步。
+你自己留的 # TODO 不太懂 @d:/codes/work-projects/SegTask/segtask_v1/trainer.py:834 也是这个症状：尾批梯度累积折算与上文的视图重塑耦合在同一个 for-loop 里。
+二、重构蓝图
+核心思想：用"策略对象 (Strategy / Pipeline)" 替代 flags
+把"如何在一次 step 中把 dataset 给的 batch 变成 (model_input, supervision_pack)、再把 model_output 变成 loss + metrics"封装成一个 ViewPipeline 接口，按训练模式实例化一个具体子类。Trainer 本身不再判断模式。
+
+text
+ViewPipeline (ABC)
+├── prepare_batch(batch) → ModelInputs, SupervisionPack
+├── compute_loss(pred, sup) → loss, breakdown
+├── extract_main_for_metrics(pred, sup) → (pred_1x, label_1x)
+└── make_inner_loss(cfg) / make_aux_inner_loss(cfg)   # 注册期一次
+具体子类（一一对应你的方案，但更细化）：
+
+Whole3DPipeline — patch_mode=whole（单分辨率，无 aux，无重塑）
+Patch3DSinglePipeline — z_axis/cubic，单分辨率（即 keep_native_multi_res=False）
+Patch3DNativeMultiResPipeline — z_axis/cubic，keep_native_multi_res=True（含 _split_views_native_3d）
+Slab2_5DPipeline — 2.5D 单分辨率/折叠（含 _squeeze_2_5d）
+Slab2_5DAuxPipeline — 2.5D + aux_seg_supervision 且 aux_keep_native_d=False（含 _squeeze_2_5d_keep_views + _compute_loss_aux_fp32）
+Slab2_5DNativeDPipeline — 2.5D + aux_keep_native_d=True（含 _split_views_native_d + _compute_loss_aux_native_d_fp32）
+Lift2_5DPipeline — 2.5D + lift_2_5d_to_3d（含 [:, :1] 切片）
+Lift2_5DAuxPipeline — 2.5D + lift + aux
+各 pipeline 自己持有 inner_loss / aux_inner_loss(es) / aux_weights / target_patch_size 等"自己模式专属的"成员，Trainer 只持有一个 self.pipeline。
+
+效果：_train_epoch 主体压到 ~30 行：augment → pipeline.prepare_batch → forward → pipeline.compute_loss → backward → step → metrics，再也看不到 if self.is_2_5d 之类的判断。
+
+
+命名口径统一（解决 TODO 痛点 b）
+在重构期把所有"几"统一为以下命名，禁止再复用：
+
+n_views — 数据/模型几何视图数 = len(cfg.data.multi_res_scales)
+n_aux_views = n_views - 1
+num_res_groups — 损失里的"通道分组数"（2.5D=1，3D=n_views，lift=1）
+slab_depth — 2.5D 的 D
+aux_view_depths[k] — 仅 aux_keep_native_d 用
+凡是当前把 1 个量"借给"另一个语义的写法（如 @d:/codes/work-projects/SegTask/segtask_v1/trainer.py:300）一律替换。
+
+文件拆分建议
+下一轮动手时建议拆成（位置仍在 segtask_v1/）：
+
+trainer/
+├── __init__.py              # 暴露 build_trainer(cfg, model, loaders) 工厂
+├── trainer.py               # Trainer 主体 (~300 行)：fit / _train_epoch / _validate
+├── optim.py                 # build_optimizer / build_scheduler / WarmupScheduler
+├── amp.py                   # GradScaler shim / _resolve_auto_amp_dtype / _compute_loss_fp32
+├── memory.py                # _estimate_train_memory + peak 日志
+├── checkpoint.py            # _build_state_dict / save / load / pretrain / 前缀剥离
+├── breakdown.py             # _collect_multi_res_breakdown / _format_breakdown
+└── pipelines/
+    ├── base.py              # ViewPipeline ABC + ModelInputs / SupervisionPack dataclass
+    ├── factory.py           # 根据 cfg 选 pipeline（唯一的 if 集中地）
+    ├── whole3d.py
+    ├── patch3d.py           # 单 + native_multi_res 两子类
+    ├── slab25d.py           # 折叠 + aux + aux_native_d 三子类
+    └── lift25d.py           # lift + lift_aux
+factory.py 是整个 codebase 中唯一允许大段 if/elif 的地方，且它只 ~20 行。其他文件里看不到模式判断。
+
+数据结构：用 dataclass 给 SupervisionPack 上类型
+text
+@dataclass
+class SupervisionPack:
+    label_main:      Tensor              # 主监督
+    wmap_main:       Tensor | None
+    aux_labels:      list[Tensor] | None  # 仅 aux 路径
+    aux_wmaps:       list[Tensor | None] | None
+    label_all_views: Tensor | None        # 仅 lift+aux / squeeze_keep_views
+    wmap_all_views:  Tensor | None
+compute_loss(pred, sup) 内部按需取字段，调用方一目了然。当前那种"在 _train_epoch 里同时定义 label_all_views / aux_view_labels / aux_view_wmaps 三组 Optional 变量再传给某个分支" @d:/codes/work-projects/SegTask/segtask_v1/trainer.py:800-832 就消失了。
