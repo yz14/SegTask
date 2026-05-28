@@ -414,146 +414,66 @@ class VolumeCache:
 
 
 # ---------------------------------------------------------------------------
-# 3D Segmentation Dataset
+# Common npz-backed Dataset base
 # ---------------------------------------------------------------------------
-class SegDataset3D(Dataset):
-    """3D z 轴滑窗 dataset。z 轴滑动抖中心 z，折取 round(eD*s) 切片，
-    仅 z 过采样；H/W 全分辨率 resize 到 patch_size。与 predictor._sliding_window_z 一致。
+class SegDatasetNpzBase(Dataset):
+    """共用 npz I/O + 缓存基类。子类负责索引构建、采样与 __getitem__。
 
-    多分辨率 multi_res_scales=[1.0] 为单分辨率；s>1 强制 edge-replicate 以保留物理 z-FOV。
-    输出 shape：image/label/weight_map = (C_res, eD, pH, pW)。
+    抽出三类（z 轴 / cubic / whole）重复的 image/label/region-weight 读取、LRU 缓存、
+    强度归一化与 region_weights 形参。子类通过 super().__init__(...) 注入公用配置后，
+    只补充自己的 patch 抽取/采样/索引逻辑。
     """
 
     def __init__(
         self,
-        image_paths                : List[str],
-        label_paths                : List[str],
-        label_values               : List[int],
-        patch_size                 : Tuple[int, int, int] = (64, 128, 128),
-        aug_oversample_ratio       : float = 1.0,
-        multi_res_scales           : Optional[List[float]] = None,
-        intensity_min              : float = -1024.0,
-        intensity_max              : float = 3071.0,
-        normalize                  : str = "minmax",
-        global_mean                : float = 0.0,
-        global_std                 : float = 1.0,
-        foreground_oversample_ratio: float = 0.5,
-        samples_per_volume         : int = 8,
-        is_train                   : bool = True,
-        cache_enabled              : bool = True,
-        cache_max_volumes          : int = 0,
-        region_weights             : Optional[List[float]] = None,
-        z_boundary_mode            : str = "stretch",
-        aux_keep_native_d          : bool = False,
-        keep_native_multi_res      : bool = False,
-        npz_paths                  : Optional[List[str]] = None):
-
+        image_paths         : List[str],
+        label_paths         : List[str],
+        label_values        : List[int],
+        npz_paths           : List[str],
+        patch_size          : Tuple[int, int, int],
+        aug_oversample_ratio: float,
+        intensity_min       : float,
+        intensity_max       : float,
+        normalize           : str,
+        global_mean         : float,
+        global_std          : float,
+        samples_per_volume  : int,
+        is_train            : bool,
+        cache_enabled       : bool,
+        cache_max_volumes   : int,
+        region_weights      : Optional[List[float]]):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert npz_paths is not None and len(npz_paths) == len(image_paths), (
-            "SegDataset3D requires npz_paths (training is npz-only).")
+            f"{type(self).__name__} requires npz_paths (training is npz-only).")
         assert aug_oversample_ratio >= 1.0, (
             f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
-        if z_boundary_mode not in ("stretch", "edge_pad"):
-            raise ValueError(
-                f"z_boundary_mode must be 'stretch' or 'edge_pad', "
-                f"got {z_boundary_mode!r}")
-        self.image_paths  = image_paths
-        self.label_paths  = label_paths
-        self.label_values = label_values
-        self.patch_size   = tuple(patch_size)
-        self.oversample   = float(aug_oversample_ratio)
-        # 仅 z 轴过采样（供增强后中心裁减边街）；H/W 一次 resize 到 patch_size。
-        pD, pH, pW = self.patch_size
-        self.extract_size = (int(round(pD * self.oversample)), pH, pW)
-        # 多分辨率 z FOV：同中心抽 round(eD*s) 切片后 resize 回 eD；s=1.0 为单通道。
-        self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
-        assert all(s >= 1.0 for s in self.multi_res_scales), (
-            f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
+
+        self.image_paths        = image_paths
+        self.label_paths        = label_paths
+        self.label_values       = label_values
+        self.patch_size         = tuple(patch_size)
+        self.oversample         = float(aug_oversample_ratio)
         self.intensity_min      = intensity_min
         self.intensity_max      = intensity_max
         self.normalize          = normalize
         self.global_mean        = global_mean
         self.global_std         = global_std
-        self.fg_ratio           = foreground_oversample_ratio
         self.samples_per_volume = samples_per_volume
         self.is_train           = is_train
         self.region_weights     = region_weights
-        # s=1.0 边界处理：stretch=clamp+resize-stretch（可变物理对齐）；
-        # edge_pad 强制 extract_z_patch_padded（与 s>1 / inference 一致）。
-        self.z_boundary_mode    = z_boundary_mode
-
-        # ---- 2.5D 原生深度多 FOV 路径（aux_seg_supervision） ----
-        # 启用后 __getitem__ 发单 max-FOV cube（深度 round(eD*max_scale)），
-        # H/W resize 到 (eH,eW)，输出 shape (1, eD_max, eH, eW)。trainer 增强后逐视图中心裁。
-        # 估价：共享增强场 + aux 视图无 z 重采样 + 低内存（单 cube vs K 份拷贝）。
-        self.aux_keep_native_d = bool(aux_keep_native_d)
-        if self.aux_keep_native_d:
-            assert len(self.multi_res_scales) > 1, (
-                "aux_keep_native_d=True requires len(multi_res_scales) > 1; "
-                f"got {self.multi_res_scales}")
-            assert self.multi_res_scales[0] == 1.0, (
-                "aux_keep_native_d=True requires multi_res_scales[0] == 1.0 "
-                "(view 0 is the supervision target); got "
-                f"{self.multi_res_scales}")
-            assert self.z_boundary_mode == "edge_pad", (
-                "aux_keep_native_d=True requires z_boundary_mode='edge_pad'; "
-                f"got {self.z_boundary_mode!r}.")
-            self._max_scale = float(max(self.multi_res_scales))
-        else:
-            self._max_scale = 1.0
-
-        # ---- 3D z_axis 懒 max-FOV cube 路径 ---------------------------
-        # 启用后发单 cube (1, eD_max, eH, eW)；trainer (R2) 逐视图中心裁+resize 回 eD 生成
-        # 标准 (B, C_res, eD, eH, eW) 输入。与 aux_keep_native_d 互斥，共用 _max_scale。
-        self.keep_native_multi_res = bool(keep_native_multi_res)
-        if self.keep_native_multi_res:
-            assert not self.aux_keep_native_d, (
-                "keep_native_multi_res and aux_keep_native_d are mutually "
-                "exclusive (3D vs 2.5D analogues).")
-            assert len(self.multi_res_scales) > 1, (
-                "keep_native_multi_res=True requires len(multi_res_scales) > 1; "
-                f"got {self.multi_res_scales}")
-            assert self.multi_res_scales[0] == 1.0, (
-                "keep_native_multi_res=True requires multi_res_scales[0] == 1.0 "
-                f"(canonical view); got {self.multi_res_scales}")
-            assert self.z_boundary_mode == "edge_pad", (
-                "keep_native_multi_res=True (z_axis) requires "
-                f"z_boundary_mode='edge_pad'; got {self.z_boundary_mode!r}.")
-            self._max_scale = float(max(self.multi_res_scales))
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
 
-        # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw
-        self._npz_paths       : List[str] = list(npz_paths)
+        # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw。
+        self._npz_paths       : List[str]       = list(npz_paths)
         self._npz_has_rw_cache: Dict[int, bool] = {}
 
-        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样
-        self._vol_fg_slices : List[np.ndarray] = []
-        self._vol_all_slices: List[int] = []
-        self._build_index()
-
-    def _build_index(self) -> None:
-        """NPZ 模式 fg-slice 索引：make_data 预计算，此处仅读取。"""
-        logger.info(
-            "Loading pre-computed fg indices from %d npz packages...",
-            len(self._npz_paths))
-        total_fg     = 0
-        total_slices = 0
-        for path in self._npz_paths:
-            f  = _open_npz(path)
-            fg = np.asarray(f["fg_slices"], dtype=np.int32)
-            D  = int(f["image"].shape[0])
-            self._vol_fg_slices.append(fg)
-            self._vol_all_slices.append(D)
-            total_fg += len(fg)
-            total_slices += D
-        logger.info(
-            "NPZ index built: %d volumes, %d/%d foreground slices",
-            len(self._npz_paths), total_fg, total_slices)
-
+    # ------------------------------------------------------------------
+    # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
+    # ------------------------------------------------------------------
     def _load_image(self, vol_idx: int) -> np.ndarray:
         """加载+预处理 image（npz，带缓存）。"""
         path   = self._npz_paths[vol_idx]
@@ -583,9 +503,9 @@ class SegDataset3D(Dataset):
             self._npz_has_rw_cache[vol_idx] = cached
         return cached
 
-    def _load_region_weight(self, vol_idx: int) -> np.ndarray:
-        """加载区域权重（npz；+1 偏移由 make_data 加过）。"""
-        path = self._npz_paths[vol_idx]
+    def _load_region_weight(self, vol_idx: int) -> Optional[np.ndarray]:
+        """加载区域权重（npz；+1 偏移由 make_data 加过）；无 rw 返 None。"""
+        path   = self._npz_paths[vol_idx]
         cached = self._rw_cache.get(path)
         if cached is not None:
             return cached
@@ -597,34 +517,126 @@ class SegDataset3D(Dataset):
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
 
+
+# ---------------------------------------------------------------------------
+# 3D Segmentation Dataset (z-axis sliding window)
+# ---------------------------------------------------------------------------
+class SegDataset3D(SegDatasetNpzBase):
+    """3D z 轴滑窗 dataset。z 轴滑动抖中心 z，折取 round(eD*s) 切片，
+    仅 z 过采样；H/W 全分辨率 resize 到 patch_size。与 predictor._sliding_window_z 一致。
+
+    多分辨率 multi_res_scales=[1.0] 为单分辨率；s>1 强制 edge-replicate 以保留物理 z-FOV。
+    输出 shape：image/label/weight_map = (C_res, eD, pH, pW)。
+    """
+
+    def __init__(
+        self,
+        image_paths                : List[str],
+        label_paths                : List[str],
+        label_values               : List[int],
+        patch_size                 : Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio       : float = 1.0,
+        multi_res_scales           : Optional[List[float]] = None,
+        intensity_min              : float = -1024.0,
+        intensity_max              : float = 3071.0,
+        normalize                  : str = "minmax",
+        global_mean                : float = 0.0,
+        global_std                 : float = 1.0,
+        foreground_oversample_ratio: float = 0.5,
+        samples_per_volume         : int = 8,
+        is_train                   : bool = True,
+        cache_enabled              : bool = True,
+        cache_max_volumes          : int = 0,
+        region_weights             : Optional[List[float]] = None,
+        z_boundary_mode            : str = "stretch",
+        npz_paths                  : Optional[List[str]] = None):
+
+        super().__init__(
+            image_paths          = image_paths,
+            label_paths          = label_paths,
+            label_values         = label_values,
+            npz_paths            = npz_paths,
+            patch_size           = patch_size,
+            aug_oversample_ratio = aug_oversample_ratio,
+            intensity_min        = intensity_min,
+            intensity_max        = intensity_max,
+            normalize            = normalize,
+            global_mean          = global_mean,
+            global_std           = global_std,
+            samples_per_volume   = samples_per_volume,
+            is_train             = is_train,
+            cache_enabled        = cache_enabled,
+            cache_max_volumes    = cache_max_volumes,
+            region_weights       = region_weights)
+        if z_boundary_mode not in ("stretch", "edge_pad"):
+            raise ValueError(
+                f"z_boundary_mode must be 'stretch' or 'edge_pad', "
+                f"got {z_boundary_mode!r}")
+
+        # 仅 z 轴过采样（供增强后中心裁减边街）；H/W 一次 resize 到 patch_size。
+        pD, pH, pW = self.patch_size
+        self.extract_size = (int(round(pD * self.oversample)), pH, pW)
+        # 多分辨率 z FOV：multi_res_scales=[1.0] 单分辨率；len>1 时 view 0 必为 1.0（canonical）。
+        self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
+        assert all(s >= 1.0 for s in self.multi_res_scales), (
+            f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
+        assert self.multi_res_scales[0] == 1.0, (
+            "multi_res_scales[0] must be 1.0 (canonical view); got "
+            f"{self.multi_res_scales}")
+        self._max_scale = float(max(self.multi_res_scales))
+        self.fg_ratio = foreground_oversample_ratio
+
+        # 边界处理：max_scale==1.0 可选 stretch 或 edge_pad；
+        # max_scale>1.0 必须 edge_pad，否则跨 scale 物理 z-FOV 不一致。
+        self.z_boundary_mode = z_boundary_mode
+        if self._max_scale > 1.0 and self.z_boundary_mode != "edge_pad":
+            raise ValueError(
+                f"multi-res (max_scale={self._max_scale}) requires "
+                f"z_boundary_mode='edge_pad'; got {self.z_boundary_mode!r}.")
+
+        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样。
+        self._vol_fg_slices : List[np.ndarray] = []
+        self._vol_all_slices: List[int] = []
+        self._build_index()
+
+    def _build_index(self) -> None:
+        """NPZ 模式 fg-slice 索引：make_data 预计算，此处仅读取。"""
+        logger.info(
+            "Loading pre-computed fg indices from %d npz packages...",
+            len(self._npz_paths))
+        total_fg     = 0
+        total_slices = 0
+        for path in self._npz_paths:
+            f  = _open_npz(path)
+            fg = np.asarray(f["fg_slices"], dtype=np.int32)
+            D  = int(f["image"].shape[0])
+            self._vol_fg_slices.append(fg)
+            self._vol_all_slices.append(D)
+            total_fg += len(fg)
+            total_slices += D
+        logger.info(
+            "NPZ index built: %d volumes, %d/%d foreground slices",
+            len(self._npz_paths), total_fg, total_slices)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """总是发单 max-FOV z-cube (1, eD_max, eH, eW)，eD_max=round(eD*max_scale)。多分辨率交由
+        trainer 中心裁拆视图；2.5D / z_axis 在数据集侧抽取逻辑完全一致。单分辨率时
+        max_scale=1.0，eD_max==eD。"""
         vol_idx  = idx % len(self.image_paths)
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
         # extract_size = (eD,pH,pW)；仅 z 过采样，oversample=1 时 eD==pD，trainer 跳裁。
         eD, eH, eW = self.extract_size
 
-        # 选取中心 z（跨 scale 共享，使多 FOV 视图同锤点嵌套）。
         z = self._sample_z(vol_idx, D_vol)
 
-        # 样本区域权重文件 > 静态 region_weights 映射；加载一次后逐 scale 同步裁+resize。
+        # 样本区域权重文件 > 静态 region_weights 映射。
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
+        return self._getitem_max_fov(img, lbl, rw_vol, z, eD, eH, eW)
 
-
-        # TODO: _getitem_native_d和_getitem_native_multi_res_z是一样的功能，是否可以用一个来通用。现在必须是只输出最大分辨率那个，然后在train的过程中中心检查得到多个分辨率，所以这里需要改
-        # 原生深度多 FOV 简化路径（发单 max-FOV cube，trainer 增强后逐视图裁）。
-        if self.aux_keep_native_d:
-            return self._getitem_native_d(vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
-
-        # 3D 懒 max-FOV cube 路径（z_axis）：C_res 轴压为 1，深度 eD_max；
-        # trainer (R2) 逐视图裁+resize 产出 (B,C_res,eD,eH,eW) 输入。
-        if self.keep_native_multi_res:
-            return self._getitem_native_multi_res_z(vol_idx, img, lbl, rw_vol, z, eD, eH, eW)
-
-    def _getitem_native_d(
+    def _getitem_max_fov(
         self,
-        vol_idx: int,
         img    : np.ndarray,
         lbl    : np.ndarray,
         rw_vol : Optional[np.ndarray],
@@ -632,60 +644,23 @@ class SegDataset3D(Dataset):
         eD     : int,
         eH     : int,
         eW     : int) -> Dict[str, torch.Tensor]:
-        """原生深度多 FOV 路径发单 max-FOV cube (1, eD_max, eH, eW)，eD_max=round(eD*max_scale)。
-        trainer.augment+_split_views_native_d 逐视图裁。优点：共享增强/aux 无 z 重采样/低内存。"""
+        """抽单 max-FOV z-cube (1, eD_max, eH, eW)：edge-padded z 保证严格 eD_max，面内 resize 到 (eH,eW)。
+        eD_max==eD 时（单分辨率）表现为普通 patch；s>1 时为多 FOV 超尺寸 cube，trainer 拆视图。"""
         eD_max = int(round(eD * self._max_scale))
-        # edge-padded 保证严格 eD_max 切片以支持逐视图中心裁的统一间隔假设。
+        # edge-padded：跨 z 边界保物理 FOV，不走 stretch resize。
         img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, eD_max)
         rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
                 if rw_vol is not None else None)
 
-        # 面内 resize 到 (eH,eW)；D 轴保持 eD_max。
+        # 面内 resize 到 (eH,eW)；D 轴保持 eD_max（不重采样）。
         img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
         lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
         result = {
-            # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致；n_views 坍缩为单 cube。
+            # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
-            # int16 label（同 __getitem__）。
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
-        if rw_s is not None:  # TODO 这里也必须用nearest，检查下面代码是否正确
-            rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True)
-            result["weight_map"] = torch.from_numpy(
-                rw_s[None].astype(np.float32, copy=False))
-        elif self.region_weights:
-            rw_s = compute_region_weight_map(
-                lbl_s, self.label_values, self.region_weights)
-            result["weight_map"] = torch.from_numpy(
-                rw_s.astype(np.float32, copy=False))
-        return result
-
-    def _getitem_native_multi_res_z(
-        self,
-        vol_idx: int,
-        img: np.ndarray,
-        lbl: np.ndarray,
-        rw_vol: Optional[np.ndarray],
-        z: int,
-        eD: int,
-        eH: int,
-        eW: int,
-    ) -> Dict[str, torch.Tensor]:
-        """3D z_axis 懒路径发单 max-FOV cube (1, eD_max, eH, eW)。仅 z 轴表现为多 FOV：H/W 已统一
-        resize 到 (eH,eW)；z 总用 edge-padded 以保证逐视图中心裁的统一间隔。与旧逐视图抽取素阶等价。"""
-        eD_max = int(round(eD * self._max_scale))
-        # 总用 edge-padded，统一 1-slice z 间隔供 trainer 逐视图中心裁。
-        img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, eD_max)
-        rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
-                if rw_vol is not None else None)
-
-        img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
-        lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
-
-        result = {
-            "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
-            "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None])),
-        }
         if rw_s is not None:
+            # rw 是分级序权重（离散值），必须 nearest 避免产生伪连续值；resize_3d(is_label=True) = order=0。
             rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True)
             result["weight_map"] = torch.from_numpy(
                 rw_s[None].astype(np.float32, copy=False))
@@ -800,7 +775,7 @@ def _extract_cubic_patch(
     return patch
 
 
-class SegDataset3DCubic(Dataset):
+class SegDataset3DCubic(SegDatasetNpzBase):
     """3D cubic patch dataset：以 (d,h,w) 为中心抽 3D cube。支持增强过采样与
     多分辨率（同中心多 scale resize 后拼通道）。输出与 SegDataset3D 一致：(C_res, eD, eH, eW)，
     label 以原始整数传到损失处二值化。"""
@@ -824,59 +799,41 @@ class SegDataset3DCubic(Dataset):
         cache_enabled: bool = True,
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
-        keep_native_multi_res: bool = False,
         npz_paths: Optional[List[str]] = None):
-        super().__init__()
-        assert len(image_paths) == len(label_paths)
-        assert npz_paths is not None and len(npz_paths) == len(image_paths), (
-            "SegDataset3DCubic requires npz_paths (training is npz-only).")
-        assert aug_oversample_ratio >= 1.0, (
-            f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
-        self.image_paths = image_paths
-        self.label_paths = label_paths
-        self.label_values = label_values
-        self.patch_size = tuple(patch_size)
-        self.oversample = aug_oversample_ratio
-        # 有效抽取尺寸（含增强过采样余量）。
+        super().__init__(
+            image_paths          = image_paths,
+            label_paths          = label_paths,
+            label_values         = label_values,
+            npz_paths            = npz_paths,
+            patch_size           = patch_size,
+            aug_oversample_ratio = aug_oversample_ratio,
+            intensity_min        = intensity_min,
+            intensity_max        = intensity_max,
+            normalize            = normalize,
+            global_mean          = global_mean,
+            global_std           = global_std,
+            samples_per_volume   = samples_per_volume,
+            is_train             = is_train,
+            cache_enabled        = cache_enabled,
+            cache_max_volumes    = cache_max_volumes,
+            region_weights       = region_weights)
+        # 有效抽取尺寸（含增强过采样余量），3 轴同步过采样。
         self.extract_size = tuple(
-            int(round(p * aug_oversample_ratio)) for p in patch_size)
-        self.multi_res_scales = multi_res_scales or []
-        # 最大 scale 决定能在界内足扮不足越界填充的体积。
-        self._max_scale = max(self.multi_res_scales) if self.multi_res_scales else 1.0
-
-        # ---- 3D cubic 懒 max-FOV cube 路径 ---------------------------
-        # 启用后发单 cube (1, eD_max, eH_max, eW_max)；trainer (R2) 逐视图中心裁+resize 回
-        # extract_size 生成标准 (B, C_res, eD, eH, eW) 输入。相较旧多分辨率路径节省 K-1 次 zoom，
-        # 且共享增强 grid_sample。
-        self.keep_native_multi_res = bool(keep_native_multi_res)
-        if self.keep_native_multi_res:
-            assert len(self.multi_res_scales) > 1, (
-                "keep_native_multi_res=True requires len(multi_res_scales) > 1; "
-                f"got {self.multi_res_scales}")
-            assert self.multi_res_scales[0] == 1.0, (
-                "keep_native_multi_res=True requires multi_res_scales[0] == 1.0 "
-                f"(canonical view); got {self.multi_res_scales}")
-        self.intensity_min = intensity_min
-        self.intensity_max = intensity_max
-        self.normalize = normalize
-        self.global_mean = global_mean
-        self.global_std = global_std
+            int(round(p * self.oversample)) for p in self.patch_size)
+        # multi_res_scales=[1.0] 单分辨率；len>1 时 view 0 必为 1.0（canonical）。
+        self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
+        assert all(s >= 1.0 for s in self.multi_res_scales), (
+            f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
+        assert self.multi_res_scales[0] == 1.0, (
+            "multi_res_scales[0] must be 1.0 (canonical view); got "
+            f"{self.multi_res_scales}")
+        # 最大 scale 决定 cube 抽取尺寸；越轴体积过小时 _extract_cubic_patch edge-pad。
+        self._max_scale = float(max(self.multi_res_scales))
         self.fg_ratio = foreground_oversample_ratio
-        self.samples_per_volume = samples_per_volume
-        self.is_train = is_train
-        self.region_weights = region_weights
-
-        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
-        self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
-        self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
-
-        # NPZ 预计算包（make_data 产出）提供 bbox / fg 坐标 / 可选 rw。
-        self._npz_paths: List[str] = list(npz_paths)
-        self._npz_has_rw_cache: Dict[int, bool] = {}
 
         # 逐卷 3D fg 坐标索引（make_data 预抽：seed=42, cap=50000）驱动 _sample_center 过采样。
-        self._vol_shapes: List[Tuple[int, int, int]] = []
-        self._vol_fg_coords: List[np.ndarray] = []
+        self._vol_shapes   : List[Tuple[int, int, int]] = []
+        self._vol_fg_coords: List[np.ndarray]           = []
         self._build_index()
 
     def _build_index(self) -> None:
@@ -896,81 +853,30 @@ class SegDataset3DCubic(Dataset):
             "NPZ cubic index: %d volumes, %d fg voxels sampled",
             len(self._npz_paths), total_fg)
 
-    def _load_image(self, vol_idx: int) -> np.ndarray:
-        """加载+预处理 image（npz，带缓存）。"""
-        path = self._npz_paths[vol_idx]
-        cached = self._img_cache.get(path)
-        if cached is not None:
-            return cached
-        img = load_npz_image(
-            path, self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std)
-        self._img_cache.put(path, img)
-        return img
-
-    def _load_label(self, vol_idx: int) -> np.ndarray:
-        """加载原始 int16 label（npz，带缓存）。"""
-        path = self._npz_paths[vol_idx]
-        cached = self._lbl_cache.get(path)
-        if cached is not None:
-            return cached
-        lbl = load_npz_label(path)
-        self._lbl_cache.put(path, lbl)
-        return lbl
-
-    def _has_region_weight_file(self, vol_idx: int) -> bool:
-        cached = self._npz_has_rw_cache.get(vol_idx)
-        if cached is None:
-            cached = npz_has_rw(self._npz_paths[vol_idx])
-            self._npz_has_rw_cache[vol_idx] = cached
-        return cached
-
-    def _load_region_weight(self, vol_idx: int) -> np.ndarray:
-        """加载区域权重（npz；+1 偏移由 make_data 加过）。"""
-        path = self._npz_paths[vol_idx]
-        cached = self._rw_cache.get(path)
-        if cached is not None:
-            return cached
-        rw = load_npz_region_weight(path)
-        if rw is not None:
-            self._rw_cache.put(path, rw)
-        return rw
-
-    def __len__(self) -> int:
-        return len(self.image_paths) * self.samples_per_volume
-
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """多分辨率统一路径：逐 scale 抽 (scale*extract_size) cube → resize 到 extract_size；
-        按 scale 堆叠为通道。multi_res_scales=[1.0] 为单分辨率。"""
-        vol_idx = idx % len(self.image_paths)
-        img     = self._load_image(vol_idx)
-        lbl     = self._load_label(vol_idx)
-        D, H, W = img.shape
-
-        center = self._sample_center(vol_idx, D, H, W)
+        """总是发单 max-FOV cube (1, eD_max, eH_max, eW_max)，size = round(extract_size*max_scale)。
+        多分辨率交由 trainer 中心裁拆视图。单分辨率时 max_scale=1.0，cube == extract_size。"""
+        vol_idx    = idx % len(self.image_paths)
+        img        = self._load_image(vol_idx)
+        lbl        = self._load_label(vol_idx)
+        D, H, W    = img.shape
+        center     = self._sample_center(vol_idx, D, H, W)
         eD, eH, eW = self.extract_size
 
-        # 样本区域权重文件 > 静态 region_weights；加载一次后逐 scale 重抽。
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
+        return self._getitem_max_fov(center, img, lbl, rw_vol, eD, eH, eW)
 
-        # 3D cubic 懒 max-FOV cube：发单 cube，trainer (R2) 逐视图中心裁+resize 产出标准 5D 输入。
-        if self.keep_native_multi_res:  # TODO 现在必须是只输出最大分辨率那个，然后在train的过程中中心检查得到多个分辨率，所以这里需要改
-            return self._getitem_native_multi_res_cubic(
-                center, img, lbl, rw_vol, eD, eH, eW)
-
-    def _getitem_native_multi_res_cubic(
+    def _getitem_max_fov(
         self,
         center: Tuple[int, int, int],
-        img: np.ndarray,
-        lbl: np.ndarray,
+        img   : np.ndarray,
+        lbl   : np.ndarray,
         rw_vol: Optional[np.ndarray],
-        eD: int,
-        eH: int,
-        eW: int) -> Dict[str, torch.Tensor]:
-        """3D cubic 懒路径发单 max-FOV cube (1, eD_max, eH_max, eW_max)，
-        尺寸为 round(extract_size*max_scale)。差越轴体积过小时由 _extract_cubic_patch 边界填充。
-        与旧逐视图 “_extract_cubic_patch + resize_3d” 素阶等价。"""
+        eD    : int,
+        eH    : int,
+        eW    : int) -> Dict[str, torch.Tensor]:
+        """抽单 max-FOV cube；越轴体积过小时由 _extract_cubic_patch edge-pad 保证严格尺寸。"""
         eD_max   = int(round(eD * self._max_scale))
         eH_max   = int(round(eH * self._max_scale))
         eW_max   = int(round(eW * self._max_scale))
@@ -982,10 +888,11 @@ class SegDataset3DCubic(Dataset):
                 if rw_vol is not None else None)
 
         result = {
-            # 领头 "1" = 压叠 C_res 轴；trainer (R2) 逐视图裁+resize。
+            # 领头 "1" = 压叠 C_res 轴；trainer 逐视图裁+resize。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
         if rw_s is not None:
+            # rw 离散权重，_extract_cubic_patch 已是按位裁剪 + edge-pad，无重采样，无需 nearest。
             result["weight_map"] = torch.from_numpy(
                 rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
@@ -1040,7 +947,7 @@ class SegDataset3DCubic(Dataset):
 # ---------------------------------------------------------------------------
 # 3D Whole-Volume Dataset (no sliding window, no sub-cropping)
 # ---------------------------------------------------------------------------
-class SegDataset3DWhole(Dataset):
+class SegDataset3DWhole(SegDatasetNpzBase):
     """整体卷 dataset：全卷 resize 到 extract_size = round(patch_size*oversample)，
     不切块/不采中心。trainer 增强后中心裁为 patch_size。。
 
@@ -1066,86 +973,31 @@ class SegDataset3DWhole(Dataset):
         cache_max_volumes: int = 0,
         region_weights: Optional[List[float]] = None,
         npz_paths: Optional[List[str]] = None):
-        super().__init__()
-        assert len(image_paths) == len(label_paths)
-        assert npz_paths is not None and len(npz_paths) == len(image_paths), (
-            "SegDataset3DWhole requires npz_paths (training is npz-only).")
-        assert aug_oversample_ratio >= 1.0, (
-            f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
-        self.image_paths = image_paths
-        self.label_paths = label_paths
-        self.label_values = label_values
-        self.patch_size = tuple(patch_size)
-        self.oversample = float(aug_oversample_ratio)
-        # 3-axis oversample matches cubic mode: provides augmentation
-        # margin so rotation / elastic black corners get center-cropped
-        # away by the trainer.
+        super().__init__(
+            image_paths          = image_paths,
+            label_paths          = label_paths,
+            label_values         = label_values,
+            npz_paths            = npz_paths,
+            patch_size           = patch_size,
+            aug_oversample_ratio = aug_oversample_ratio,
+            intensity_min        = intensity_min,
+            intensity_max        = intensity_max,
+            normalize            = normalize,
+            global_mean          = global_mean,
+            global_std           = global_std,
+            samples_per_volume   = samples_per_volume,
+            is_train             = is_train,
+            cache_enabled        = cache_enabled,
+            cache_max_volumes    = cache_max_volumes,
+            region_weights       = region_weights)
+        # 3 轴同步过采样：与 cubic 一致，给增强（旋转/弹性）留中心裁余量。
         self.extract_size = tuple(
             int(round(p * self.oversample)) for p in self.patch_size)
-        self.intensity_min = intensity_min
-        self.intensity_max = intensity_max
-        self.normalize = normalize
-        self.global_mean = global_mean
-        self.global_std = global_std
-        self.samples_per_volume = samples_per_volume
-        self.is_train = is_train
-        self.region_weights = region_weights
-
-        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
-        self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
-        self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
-
-        # NPZ 预计算包（make_data 产出）提供 bbox 与可选 rw。
-        self._npz_paths: List[str] = list(npz_paths)
-        self._npz_has_rw_cache: Dict[int, bool] = {}
 
         logger.info(
             "Whole-volume dataset: %d volumes, extract_size=%s, "
             "samples_per_volume=%d [npz mode]",
             len(self.image_paths), self.extract_size, self.samples_per_volume)
-
-    def _load_image(self, vol_idx: int) -> np.ndarray:
-        """加载+预处理 image（npz，带缓存）。"""
-        path = self._npz_paths[vol_idx]
-        cached = self._img_cache.get(path)
-        if cached is not None:
-            return cached
-        img = load_npz_image(
-            path, self.intensity_min, self.intensity_max,
-            self.normalize, self.global_mean, self.global_std)
-        self._img_cache.put(path, img)
-        return img
-
-    def _load_label(self, vol_idx: int) -> np.ndarray:
-        """加载原始 int16 label（npz，带缓存）。"""
-        path = self._npz_paths[vol_idx]
-        cached = self._lbl_cache.get(path)
-        if cached is not None:
-            return cached
-        lbl = load_npz_label(path)
-        self._lbl_cache.put(path, lbl)
-        return lbl
-
-    def _has_region_weight_file(self, vol_idx: int) -> bool:
-        cached = self._npz_has_rw_cache.get(vol_idx)
-        if cached is None:
-            cached = npz_has_rw(self._npz_paths[vol_idx])
-            self._npz_has_rw_cache[vol_idx] = cached
-        return cached
-
-    def _load_region_weight(self, vol_idx: int) -> np.ndarray:
-        """加载区域权重（npz；+1 偏移由 make_data 加过）。"""
-        path = self._npz_paths[vol_idx]
-        cached = self._rw_cache.get(path)
-        if cached is not None:
-            return cached
-        rw = load_npz_region_weight(path)
-        if rw is not None:
-            self._rw_cache.put(path, rw)
-        return rw
-
-    def __len__(self) -> int:
-        return len(self.image_paths) * self.samples_per_volume
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         vol_idx    = idx % len(self.image_paths)

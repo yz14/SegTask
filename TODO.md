@@ -51,6 +51,4 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 6 D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py这里的不同数据的读取，里面有很多公用的函数，很多是可以复用的，是否可以写一个通用的读取方法类，然后不同的方法再去继承会好一些呢？
 
-7 torch的所有reshape的操作全部替换为einops
-
-8 验证集在挑选模型时只考虑了整体dice，对于大器官有时候挑选的不太准，需要加入surface dice供选择，即验证集评价标准的选项有loss, dice, dice+surface_dice组合，等等。surface dice需要在GPU运行，且容许N个像素误差。  
+7 trainer写的让人读起来非常的费劲，费劲的理由主要是，a 里面的判断条件非常的多，容易让人记混，b 里面关于多少个视图的参数非常容易让人混乱，例如在2.5D时，多分辨率时有几个分辨率，参数里面就是该数字，而当3D时，全部都设成1，这读起来非常容易让人混乱。我目前可以想到的是，先将trainer模块化重构，然后再写一个通用的trainer.py，然后在分别写trainer2_5d.py和trainer3d.py去继承trainer.py和调用公用的模块，这样应该可以少很多的判断条件，使得代码清晰。如果你有更好的方案，则不必严格遵守我的方案。  

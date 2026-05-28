@@ -533,22 +533,6 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     # z_boundary_mode 仅 z_axis/2.5d 入参。
     z_kwargs = dict(z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"))
 
-    # 2.5D 专用：单 max-FOV cube，trainer 逐视图中心裁剪。
-    aux_native_kwargs = dict(
-        aux_keep_native_d = bool(getattr(dc, "aux_keep_native_d", False))
-        and dc.patch_mode == "2_5d"
-        and len(dc.multi_res_scales) > 1)
-
-    # aux_keep_native_d 的 3D 对应（z_axis/cubic）；按模式防御门控。
-    keep_native_kwargs_z = dict(
-        keep_native_multi_res=bool(getattr(dc, "keep_native_multi_res", False))
-        and dc.patch_mode == "z_axis"
-        and len(dc.multi_res_scales) > 1)
-    keep_native_kwargs_cubic = dict(
-        keep_native_multi_res=bool(getattr(dc, "keep_native_multi_res", False))
-        and dc.patch_mode == "cubic"
-        and len(dc.multi_res_scales) > 1)
-
     # NPZ-only 训练：bbox/region-weight 预烘在 npz 包中。
     train_paths = dict(
         image_paths = [image_paths[i] for i in train_idx],
@@ -559,28 +543,17 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         label_paths = [label_paths[i] for i in val_idx],
         npz_paths   = [npz_paths_all[i] for i in val_idx])
 
-    if dc.patch_mode == "2_5d":
-        # 2.5D 复用 z_axis dataset。aux_keep_native_d=False 时逐 scale 抽切片、trainer 折叠 D 入通道；=True 时单 max-FOV cube，trainer 中心裁。
-        n_views = max(len(dc.multi_res_scales), 1)
-        if aux_native_kwargs["aux_keep_native_d"]:
-            max_scale = max(dc.multi_res_scales)
-            eD_max    = int(round(int(dc.patch_size[0]) * max_scale))
-            logger.info(
-                "Using 2.5D patch mode + aux_keep_native_d=True "
-                "(oversample=%.2f, scales=%s, n_views=%d, max_scale=%.2f) "
-                "— SINGLE max-FOV cube extraction (depth=%d), trainer "
-                "center-crops per view at native depth before forward.",
-                train_oversample, dc.multi_res_scales, n_views,
-                max_scale, eD_max)
-        else:
-            logger.info(
-                "Using 2.5D patch mode (oversample=%.2f, z_boundary=%s, "
-                "scales=%s, n_views=%d) — z_axis dataset; trainer reshapes "
-                "(B, %d, D=%d, H, W) → (B, %d, H, W) for the 2D model.",
-                train_oversample, z_kwargs["z_boundary_mode"],
-                dc.multi_res_scales, n_views,
-                n_views, int(dc.patch_size[0]),
-                n_views * int(dc.patch_size[0]))
+    # dataset 侧已统一只输出 max-FOV 3D cube；多分辨率拆视图全部交由 trainer/predictor 完成，
+    # 故 2.5D / z_axis 共用 SegDataset3D 构造路径，仅日志区分。
+    if dc.patch_mode in ("2_5d", "z_axis"):
+        n_views   = max(len(dc.multi_res_scales), 1)
+        max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
+        logger.info(
+            "Using %s patch mode (oversample=%.2f, scales=%s, n_views=%d, "
+            "max_scale=%.2f, z_boundary=%s) — SINGLE max-FOV z-cube extraction; "
+            "trainer crops+resizes per view before forward.",
+            dc.patch_mode.upper(), train_oversample, dc.multi_res_scales,
+            n_views, max_scale, z_kwargs["z_boundary_mode"])
         train_ds = SegDataset3D(
             **train_paths,
             aug_oversample_ratio        = train_oversample,
@@ -589,8 +562,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             samples_per_volume          = dc.samples_per_volume,
             is_train                    = True,
             **common_kwargs,
-            **z_kwargs,
-            **aux_native_kwargs)
+            **z_kwargs)
         val_ds = SegDataset3D(
             **val_paths,
             aug_oversample_ratio        = 1.0,
@@ -599,8 +571,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             samples_per_volume          = max(dc.samples_per_volume // 2, 1),
             is_train                    = False,
             **common_kwargs,
-            **z_kwargs,
-            **aux_native_kwargs)
+            **z_kwargs)
     elif dc.patch_mode == "whole":
         logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
                     train_oversample)
@@ -618,18 +589,12 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             is_train             = False,
             **common_kwargs)
     elif dc.patch_mode == "cubic":
-        if keep_native_kwargs_cubic["keep_native_multi_res"]:
-            logger.info(
-                "Using CUBIC patch mode + keep_native_multi_res=True "
-                "(oversample=%.2f, scales=%s, max_scale=%.2f) — SINGLE "
-                "max-FOV cube extraction; trainer crops+resizes per "
-                "view before the 3D forward.",
-                train_oversample, dc.multi_res_scales,
-                max(dc.multi_res_scales))
-        else:
-            logger.info(
-                "Using CUBIC patch mode (oversample=%.2f, scales=%s)",
-                train_oversample, dc.multi_res_scales)
+        max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
+        logger.info(
+            "Using CUBIC patch mode (oversample=%.2f, scales=%s, max_scale=%.2f) "
+            "— SINGLE max-FOV cube extraction; trainer crops+resizes per view "
+            "before the 3D forward.",
+            train_oversample, dc.multi_res_scales, max_scale)
         train_ds = SegDataset3DCubic(
             **train_paths,
             aug_oversample_ratio        = train_oversample,
@@ -637,8 +602,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio = dc.foreground_oversample_ratio,
             samples_per_volume          = dc.samples_per_volume,
             is_train                    = True,
-            **common_kwargs,
-            **keep_native_kwargs_cubic)
+            **common_kwargs)
         val_ds = SegDataset3DCubic(
             **val_paths,
             aug_oversample_ratio        = 1.0,
@@ -646,42 +610,9 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             foreground_oversample_ratio = 0.0,
             samples_per_volume          = max(dc.samples_per_volume // 2, 1),
             is_train                    = False,
-            **common_kwargs,
-            **keep_native_kwargs_cubic)
-    else:  # TODO 这里和2.5D是一样的处理，现在都必须是输出max_scale * oversample * extract_size，所以这里是否可以和2.5D合并了做一条判断语句
-        if keep_native_kwargs_z["keep_native_multi_res"]:
-            logger.info(
-                "Using Z_AXIS patch mode + keep_native_multi_res=True "
-                "(oversample=%.2f, scales=%s, max_scale=%.2f, "
-                "z_boundary=%s) — SINGLE max-FOV z-cube extraction; "
-                "trainer crops+resizes per view before the 3D forward.",
-                train_oversample, dc.multi_res_scales,
-                max(dc.multi_res_scales), z_kwargs["z_boundary_mode"])
-        else:
-            logger.info("Using Z_AXIS patch mode (oversample=%.2f, scales=%s, "
-                        "z_boundary=%s)",
-                        train_oversample, dc.multi_res_scales,
-                        z_kwargs["z_boundary_mode"])
-        train_ds = SegDataset3D(
-            **train_paths,
-            aug_oversample_ratio=train_oversample,
-            multi_res_scales=dc.multi_res_scales,
-            foreground_oversample_ratio=dc.foreground_oversample_ratio,
-            samples_per_volume=dc.samples_per_volume,
-            is_train=True,
-            **common_kwargs,
-            **z_kwargs,
-            **keep_native_kwargs_z)
-        val_ds = SegDataset3D(
-            **val_paths,
-            aug_oversample_ratio=1.0,
-            multi_res_scales=dc.multi_res_scales,
-            foreground_oversample_ratio=0.0,
-            samples_per_volume=max(dc.samples_per_volume // 2, 1),
-            is_train=False,
-            **common_kwargs,
-            **z_kwargs,
-            **keep_native_kwargs_z)
+            **common_kwargs)
+    else:
+        raise ValueError(f"Unknown patch_mode: {dc.patch_mode!r}")
 
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}
