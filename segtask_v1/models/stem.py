@@ -1,7 +1,7 @@
 """3D UNet 的 stem / patch-embed 构建器。
 
 stem 模式：conv3/conv7/dual stride=1；patch2/patch4 stride=N 降分辨率（UNet 末尾上采补回）。
-多 FOV 上下文融合 (2.5D, n_views>1)：示例 'multi_stem_proj' 逐 view stem+1×1 、'hierarchical' aux 逐级注入。还有 'shared_stem'（全部走同一 stem，最轻）。
+多 FOV 上下文融合 (2.5D, n_views>1)：示例 'multi_stem_proj' 逐 view stem + 3×3 融合、'hierarchical' aux 逐级注入。还有 'shared_stem'（全部走同一 stem，最轻）。
 """
 
 from __future__ import annotations
@@ -84,14 +84,17 @@ def build_stem(
         raise ValueError(f"Unknown stem mode: {mode!r}. Valid: {STEM_MODES}")
 
     if mode == "conv3":
-        stem = ConvNormAct(  # TODO 如果多加一层就是dual（可能不需要，因为enc第0层没有降采样）
+        # 单层 3×3：最薄方案。2.5D 折叠下 z 关系仅靠这一层非线性提取，
+        # 容量偏弱；多切片输入推荐改用 'dual'。
+        stem = ConvNormAct(
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
     if mode == "conv7":
-        stem = ConvNormAct(  # TODO 再加一层conv3会不会好？（可能不需要，因为enc第0层没有降采样，相对于多的conv）
+        # 单层 7×7：感受野大但只有一次非线性；与 conv3 同样容量受限。
+        stem = ConvNormAct(
             in_ch, out_ch, kernel_size=7, stride=1, padding=3,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
@@ -119,7 +122,12 @@ CONTEXT_FUSION_MODES = ("shared_stem", "multi_stem_proj", "hierarchical")
 
 
 class MultiStemProj(nn.Module):
-    """n_views 个独立 stem → 通道 cat → 1×1 融合为 out_ch；逐 view 学 FOV 专属滤波器。"""
+    """n_views 个独立 stem → 通道 cat → 3×3 融合为 out_ch；逐 view 学 FOV 专属滤波器。
+
+    融合层用 3×3 (而非 1×1) 是为给跨 view 的特征融合一次空间能力——多 FOV 的核心
+    差异是 z-axis 几何不同，1×1 仅做 per-pixel 通道线性投影，无法对齐/重组 view
+    间的空间结构。3×3 在 stem 后 (输入分辨率最高) 代价小但提供 3 邻域感受野，
+    与 nnU-Net stem block 的卷积核同构。"""
 
     def __init__(
         self,
@@ -164,10 +172,11 @@ class MultiStemProj(nn.Module):
         self.stems       = nn.ModuleList(stems)
         self.stem_stride = strides[0]
 
-        # 1×1 融合回 out_ch，保留下游通道契约。
+        # 3×3 融合回 out_ch：保留下游通道契约，同时给跨 view 一次空间感受野
+        # (1×1 仅做通道线性投影，无法对齐 view 间空间结构)。
         self.proj = ConvNormAct(
             n_views * out_ch, out_ch,
-            kernel_size=1, stride=1, padding=0,
+            kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
 
@@ -290,7 +299,7 @@ def build_context_stem(
     in_ch_per_view_list: List[int] = None) -> Tuple[nn.Module, int]:
     """分派 2.5D 多 FOV stem，返回 (module, stem_stride)。
 
-    n_views==1 或 'shared_stem'：单 stem。'multi_stem_proj'：逐 view stem + 1×1 融合。'hierarchical'：需 stage_channels，encoder 逐级 cat 融合。
+    n_views==1 或 'shared_stem'：单 stem。'multi_stem_proj'：逐 view stem + 3×3 融合。'hierarchical'：需 stage_channels，encoder 逐级 cat 融合。
     """
     if fusion not in CONTEXT_FUSION_MODES:
         raise ValueError(
@@ -329,7 +338,7 @@ def build_context_stem(
             f"hierarchical fusion: out_ch ({out_ch}) must equal "
             f"stage_channels[0] ({stage_channels[0]}).")
 
-    hier = HierarchicalStems(  # TODO: 需要检查是不是我想要的
+    hier = HierarchicalStems(
         mode=mode, n_views=n_views,
         in_ch_per_view=in_ch_per_view,
         stage_channels=stage_channels,

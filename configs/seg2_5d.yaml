@@ -130,10 +130,14 @@ model:
 
   deep_supervision: false
 
-  stem_mode    : "conv3"          # 'conv1' | 'conv3' | 'patchify'
+  # 'conv3'(单层 3×3) | 'conv7'(单层 7×7) | 'dual'(两层 3×3, nnU-Net 默认) |
+  # 'patch2'/'patch4'(stride-N PatchEmbed, ConvNeXt/ViT 风格)
+  # 2.5D 折叠下 stem 是 D→features 唯一的"跨切片+空间"非线性入口；
+  # 单层 conv3 容量不足以编码 z 关系，推荐 dual。
+  stem_mode    : "dual"
 
   # 多 FOV stem 融合 (仅 2_5d + n_views>1)。
-  #   'multi_stem_proj' — Plan A: 每 view 独立 stem + 1×1 融合 (早融合)
+  #   'multi_stem_proj' — Plan A: 每 view 独立 stem + 3×3 融合 (早融合)
   #   'hierarchical'    — Plan C: view k 经 stride-2^k stem 注入到 encoder stage k
   #                       需 n_views<=n_levels 且 patch_size[1:] 能被 2^(n_views-1) 整除
   #   'shared_stem'     — 单 stem 跑 n_views*D 通道 (省参但物理异质共享滤波器)
@@ -145,9 +149,13 @@ model:
   aux_seg_supervision: true
 
   # Aux head 拓扑 (仅 aux_seg_supervision=true)。
-  #   'linear' — 单层 1×1 (推荐 Plan A)
-  #   'conv'   — 3×3 ConvNormAct+1×1 (推荐 Plan C，低分辨率加空间聚合)
-  aux_head_mode: "linear"
+  #   'linear' — 单层 1×1
+  #   'conv'   — 3×3 ConvNormAct+1×1
+  # 注: Plan A 下所有 aux 头与 main 头共享 dec[-1]，多任务线性探针在端到端
+  # 训练里会让 aux 梯度回传到共享特征的能力被压扁，进而削弱 view-specific
+  # 学习。共享挂点时建议用 'conv' 给每个 aux 头一次非线性空间变换。
+  # Plan C aux 挂在低分辨率 decoder 特征上，'conv' 兼有空间聚合作用，同样推荐。
+  aux_head_mode: "conv"
 
   decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
   downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'

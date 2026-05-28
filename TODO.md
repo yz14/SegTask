@@ -45,3 +45,4 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 3 最后2的数据基础上，彻底检查一遍损失函数，是否都正确实现了，对应我这样的数据是否可行，是否有问题。
 
+4 在unet.py这里我有一个注释，是否用encoder_channels[n - 1 - i]会更好，因为out_ch=skip_ch会压缩更多，而out_ch=in_ch压缩的少一些，请分析。
