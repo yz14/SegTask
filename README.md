@@ -57,7 +57,7 @@
 | 注意力 | SE / ECA / CBAM / CoordAttention + AttentionGate (skip) | `@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:146-435` |
 | 上下采样 | conv / max / avg / **BlurPool** / PixelUnShuffle ↔ transpose / linear / nearest / PixelShuffle / **CARAFE** / **DySample** | `@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:611-948` |
 | 损失 | Dice / BCE / Focal / Tversky / **GDL** / **FocalTversky** / **Lovász-Hinge** / **clDice** + compound + DS + MultiRes + SliceChannel | `@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py` |
-| 推理 | z\_axis / cubic 滑窗 + Gaussian/uniform blend + TTA-flip + bbox crop | `@d:\codes\work-projects\SegTask\segtask_v1\predictor.py` |
+| 推理 | z\_axis / cubic / whole / z-interleave 滑窗 + Gaussian/uniform blend + TTA-flip + bbox crop | `@d:\codes\work-projects\SegTask\segtask_v1\predictor\` |
 
 ### 1.2 顶层目录结构
 
@@ -86,8 +86,17 @@ SegTask/
 │   ├── predict.py                     # 推理 CLI（单文件/目录、可选 bbox 裁剪）
 │   ├── config.py                      # ~1450 行的全部 @dataclass 配置系统（§3.2）
 │   ├── utils.py                       # AverageMeter / ModelEMA / Timer / Dice
-│   ├── trainer.py                     # ~2100 行训练循环（AMP / EMA / DS / 多FOV 聚合）
-│   ├── predictor.py                   # ~1500 行 z_axis / cubic 滑窗推理
+│   ├── trainer/                       # 训练循环（R1–R3 模块化包）
+│   │   ├── trainer.py                 # ~700 行 Trainer 类（控制流）
+│   │   ├── pipelines/                 # ViewPipeline 策略 + 5 个具体实现
+│   │   ├── views.py / optim.py / amp.py / memory.py / breakdown.py / checkpoint.py
+│   ├── predictor/                     # 滑动窗口推理（R6 模块化包）
+│   │   ├── predictor.py               # ~450 行 Predictor 类（shim + 入口）
+│   │   ├── sliding.py                 # 4 种 sliding 主循环（whole/z/z-interleave/cubic）
+│   │   ├── inputs.py                  # 6 个 window/batch builders
+│   │   ├── forwards.py                # forward + TTA + diag
+│   │   ├── blending.py                # 几何/概率 helpers
+│   │   └── io.py                      # run_inference + ckpt + precision
 │   ├── data/                          # 数据子系统（§3.4）
 │   │   ├── __init__.py
 │   │   ├── dataset.py                 # 3 个 Dataset + 所有 IO / patch / bbox / npz 工具
@@ -516,23 +525,38 @@ segtask_v1/trainer/
 
 > **新增模式怎么办？** 只需在 `pipelines/` 加一个 `XxxPipeline(ViewPipeline)`、在 `factory.py` 决策树里加一行 if，**`Trainer` 无需任何改动**。等价性请在 `test_pipelines.py::TestComputeLossEquivalence` 仿照现有用例补一条。
 
-### 3.8 `predictor.py` —— 滑动窗口推理
+### 3.8 `predictor/` —— 滑动窗口推理（R6 模块化包）
+
+原单文件 `predictor.py` (~1412 行) 已重构为 `predictor/` 包：mode 派生量改读 `ModelTopology`（与 trainer / build_model 共用同一真相源，R5 契约扩展），4 种 sliding 主循环 + 6 种 window/batch builders + 3 种 forward 变体 + 2 种 TTA 全部抽到模块级函数；`Predictor` 类保留 ~30 个 thin shim 方法以维持原私有 API（数百行单元测试通过 `Predictor.__new__(Predictor)` + 私有方法直调进行白盒测试，shim 让这些测试无需改一行）。
 
 ```text
-predictor.py
-├── Predictor                # 滑窗推理器（单类，封装 z_axis / cubic / whole 三种模式）
-│   ├── _build_z_window_input / _sliding_window_z   # z_axis 模式
-│   ├── _build_cubic_input / _sliding_window_cubic  # cubic 模式
-│   ├── _whole_volume                               # whole 模式
-│   ├── _gaussian_blend_kernel                      # 高斯/平均 blend 权重
-│   ├── _apply_tta_flip                             # 翻转 TTA
-│   ├── predict_volume(image_path, bbox_path=None)  # 单卷顶层入口
-│   └── ...
-├── _strip_compile_prefix    # 加载 torch.compile checkpoint 到普通模型
-├── _unwrap_ema_state        # ModelEMA.state_dict → 普通 state_dict
-├── _select_state_dict       # 按 --weights {auto, ema, online} 选权重
-└── run_inference(cfg, ckpt_path, image_paths, weight_variant, bbox_paths)
-                             # 顶层入口：build_model → load ckpt → for image_path: Predictor.predict_volume → 写 NIfTI
+segtask_v1/predictor/
+├── __init__.py        # 完整 re-export（外部 API 100% 兼容）
+├── predictor.py       # ~450 行：Predictor 类外壳 + __init__（topology 化）+ predict_volume 入口 + thin shims
+├── sliding.py         # ~280 行：whole / z / z_interleave / cubic 四种主循环
+├── inputs.py          # ~240 行：6 个 window/batch builders + 共享 padding helper
+├── forwards.py        # ~270 行：3 种 forward（3D / 2.5D folded / 2.5D lift）+ 2 种 TTA + diag
+├── blending.py        # ~100 行：compute_1d_positions / build_*_weight / prob_to_label（纯 numpy）
+└── io.py              # ~145 行：run_inference + checkpoint helpers + precision resolution
+
+Predictor                # 滑窗推理器（外壳；__init__ 读 ModelTopology 消除 ~80 行 R5 单一真相源违反）
+├── predict_volume       # 顶层入口：load → bbox → preprocess → dispatch → blend → label_map
+├── _build_z_window_*    # ──┐  3 个 z 轴 GPU + 1 个 CPU multi-res 窗口建造（thin shim → inputs.py）
+├── _build_batch_*       # ──┴─ 2 个 cubic batch builders
+├── _sliding_window_*    # ──── 4 种主循环（thin shim → sliding.py）
+├── _forward_batch_*     # ──── 3 种 forward 变体（thin shim → forwards.py）
+├── _tta_flip_ensemble*  # ──── 2 种 TTA（thin shim → forwards.py）
+├── _compute_1d_positions / _build_1d_weight / _build_3d_weight / _prob_to_label
+│                          # ──── 几何 / 概率 helpers（thin shim → blending.py）
+└── _save_predictions    # NIfTI 写出（保 affine / origin / spacing / direction）
+
+# Module-level helpers (in io.py)
+_strip_compile_prefix    # 剥 torch.compile 的 _orig_mod. 前缀
+_unwrap_ema_state        # ModelEMA shadow → 普通 state_dict
+_select_state_dict       # 按 --weights {auto, ema, online} 选权重
+_resolve_inference_precision   # auto → 跟随 cfg.train.amp_dtype
+run_inference(cfg, ckpt_path, image_paths, weight_variant, bbox_paths, precision)
+                         # 顶层入口：build_model → load ckpt → for image_path: Predictor.predict_volume → 写 NIfTI
 ```
 
 关键契约：
@@ -696,11 +720,14 @@ predict.py
 
 - **新增一种损失**：在 `@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py` 里加 `class XxxLoss(nn.Module)`，在 `build_loss` 工厂分支里注册名字，在 `Config.validate()` 的 `loss.name` 白名单里加上字符串，最后写一份回归测试到 `test_new_losses.py`。
 - **新增一种 backbone**：在 `models/` 下加 `xxx.py`（参考 `resnet.py` / `convnext.py`），实现一个 `XxxStage(in_ch, out_ch, n_blocks, ...)`，在 `models/factory.py` 添加 `_make_xxx_stage_builder` + 把 `cfg.model.backbone == "xxx"` 接进 `build_model`，并在 `ModelConfig.validate` 加白名单。
-- **新增一种 patch 模式**（R5 后大幅简化，仅 4 处改动）：
+- **新增一种 patch 模式**（R5–R6 后大幅简化，仅 5 处改动）：
   1. `data/dataset.py` 加 `SegDataset3DXxx`（如果几何抽取语义有别于现有 3 种）
   2. `data/specs.py` 加 `XxxSpec(DatasetSpec)` 并在 `build_data_spec` 决策树追加 1 行（`build_dataloaders` 不动）
-  3. **`models/topology.py::build_topology` 内的决策树**追加 1 个分支以填写 `in_channels` / `out_classes` / `spatial_dims` 等派生量 —— **`Config.sync` / `factory.build_model` / `pipelines/factory.build_pipeline` 全部自动同步，无需修改**
-  4. `trainer/pipelines/` 加对应 `ViewPipeline(...)` 子类 + `factory.py` 决策树追加 1 行；predictor 的 `_sliding_window_*` 需要镜像消费。注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
+  3. **`models/topology.py::build_topology` 内的决策树**追加 1 个分支以填写 `in_channels` / `out_classes` / `spatial_dims` 等派生量 —— **`Config.sync` / `factory.build_model` / `pipelines/factory.build_pipeline` / `Predictor.__init__` 全部自动同步，无需修改**
+  4. `trainer/pipelines/` 加对应 `ViewPipeline(...)` 子类 + `factory.py` 决策树追加 1 行
+  5. `predictor/inputs.py` 加对应 window builder + `predictor/sliding.py` 主循环 builder 分派加 1 行（如果几何不同于现有 6 种）；`predictor/forwards.py` 通常无需改动（forward 路径仅按 `patch_mode == '2_5d'` 与 `lift_2_5d_to_3d` 二分）
+  
+  注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
 - **新增一个 stem 或多 FOV 融合策略**：在 `models/stem.py` 加类 + 在 `build_stem` / `build_context_stem` 注册；`Config.validate` 的 `stem_mode` / `context_fusion` 白名单。
 - **改命名/路径约定**：所有规则集中在 `data/loader._match_per_sample_paths` 和 `data/make_data._stem`，改一处即可。
 
