@@ -7,6 +7,7 @@ from typing import Sequence, Tuple, Type
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 # spatial_dims 分派表。
@@ -120,8 +121,8 @@ class SqueezeExcite3D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # (B, C) -> (B, C, 1, 1[, 1])
-        scale = self.fc(x).view(x.shape[0], x.shape[1],
-                                *([1] * self.spatial_dims))
+        pat = 'b c -> b c' + ' 1' * self.spatial_dims
+        scale = rearrange(self.fc(x), pat)
         return x * scale
 
 
@@ -147,7 +148,8 @@ class ECA3D(nn.Module):
         # (B, C, 1, 1[, 1]) -> (B, 1, C) -> conv1d -> (B, 1, C) -> (B, C, 1, 1[, 1])
         y = self.avg(x).flatten(1).unsqueeze(1)
         y = self.sig(self.conv(y)).squeeze(1)
-        return x * y.view(y.size(0), y.size(1), *([1] * self.spatial_dims))
+        pat = 'b c -> b c' + ' 1' * self.spatial_dims
+        return x * rearrange(y, pat)
 
 
 # CBAM (Woo 2018)：通道 attention (MLP 于 GAP+GMP) → 空间 attention (在 avg+max cat 上的 k×k 卷积)。
@@ -166,10 +168,11 @@ class _CBAMChannelAttn(nn.Module):
         self.max = _AMAXPOOL[d](1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C = x.shape[:2]
-        avg = self.mlp(self.avg(x).view(B, C))
-        mx  = self.mlp(self.max(x).view(B, C))
-        w = torch.sigmoid(avg + mx).view(B, C, *([1] * self.spatial_dims))
+        # avg/max pool 后空间轴均为 1，flatten(1) 与 .view(B,C) 等价且不是 reshape。
+        avg = self.mlp(self.avg(x).flatten(1))
+        mx  = self.mlp(self.max(x).flatten(1))
+        pat = 'b c -> b c' + ' 1' * self.spatial_dims
+        w   = rearrange(torch.sigmoid(avg + mx), pat)
         return x * w
 
 
@@ -242,24 +245,25 @@ class CoordAttention3D(nn.Module):
         B, C = x.shape[:2]
         sizes = list(x.shape[2:])
 
-        # 逐轴 pool → reshape 到首空间位 → cat 供共享 1×1。
+        # 逐轴 pool → 把保留轴移到首空间位 → cat 供共享 1×1。
         descriptors = []
         for axis in range(d):
             p = self.pools[axis](x)  # 保留该轴，其余为 1
-            new_shape = [B, C, sizes[axis]] + [1] * (d - 1)
-            descriptors.append(p.reshape(new_shape))
+            # p 空间 shape 除 axis 轴 均 1；flatten(2) 集成 (B,C,size) 后补 (d-1) 个单位轴。
+            tail_pat = 'b c s -> b c s' + ' 1' * (d - 1)
+            descriptors.append(rearrange(p.flatten(2), tail_pat))
         y = torch.cat(descriptors, dim=2)
         y = self.act(self.norm1(self.conv1(y)))
         y_axes = torch.split(y, sizes, dim=2)
 
         out = x
         for axis in range(d):
-            # 广播回 (B, C, 1, ..., size_axis, ..., 1)。
-            broadcast_shape = [B, C] + [1] * d
-            broadcast_shape[2 + axis] = sizes[axis]
-            a = torch.sigmoid(self.axis_convs[axis](y_axes[axis])).reshape(
-                broadcast_shape)
-            out = out * a
+            # 从 (B,C,size,1,...,1) 转为 (B,C,1,...,size@axis,...,1)。
+            a = torch.sigmoid(self.axis_convs[axis](y_axes[axis])).flatten(2)
+            tail = ['1'] * d
+            tail[axis] = 's'
+            tail_pat = 'b c s -> b c ' + ' '.join(tail)
+            out = out * rearrange(a, tail_pat)
         return out
 
 
@@ -392,16 +396,13 @@ class PixelUnshuffle3d(nn.Module):
                 raise ValueError(
                     f"PixelUnshuffle3d(r={r}) needs spatial dims divisible "
                     f"by r, got {tuple(spatial)}")
-        # 每个空间轴拆为 (size/r, r) 交错。
-        view_shape = [B, C]
-        for s in spatial:
-            view_shape.extend([s // r, r])
-        y = x.view(view_shape)
-        # 重排：3D 为 (0,1,3,5,7,2,4,6)，即 r-axes 在前、size/r-axes 在后。
-        r_axes = [2 + 2 * i + 1 for i in range(d)]
-        s_axes = [2 + 2 * i     for i in range(d)]
-        y = y.permute(0, 1, *r_axes, *s_axes).contiguous()
-        return y.view(B, C * (r ** d), *(s // r for s in spatial))
+        # 每个空间轴拆为 (size/r, r) 交错，再将全部 r-axes 捏入通道。
+        if d == 2:
+            return rearrange(
+                x, 'b c (h r1) (w r2) -> b (c r1 r2) h w', r1=r, r2=r)
+        return rearrange(
+            x, 'b c (h r1) (w r2) (z r3) -> b (c r1 r2 r3) h w z',
+            r1=r, r2=r, r3=r)
 
 
 class PixelShuffle3d(nn.Module):
@@ -429,16 +430,13 @@ class PixelShuffle3d(nn.Module):
                 f"PixelShuffle3d(r={r}, spatial_dims={d}) needs channels "
                 f"divisible by r^d={rd}, got C={Crd}")
         C = Crd // rd
-        # view：(B,C,r,...,r,s0,...,sd)，先 d 个 r-axes 后 d 个 size-axes。
-        view_shape = [B, C] + [r] * d + spatial
-        y = x.view(view_shape)
-        # 交错 (size_axis, r_axis)。
-        perm = [0, 1]
-        for i in range(d):
-            perm.append(2 + d + i)   # size 轴 i
-            perm.append(2 + i)       # r 轴 i
-        y = y.permute(perm).contiguous()
-        return y.view(B, C, *(s * r for s in spatial))
+        # 从 (B, C*r^d, *spatial) 拆出 r-axes 并与原空间轴交错。
+        if d == 2:
+            return rearrange(
+                x, 'b (c r1 r2) h w -> b c (h r1) (w r2)', r1=r, r2=r)
+        return rearrange(
+            x, 'b (c r1 r2 r3) h w z -> b c (h r1) (w r2) (z r3)',
+            r1=r, r2=r, r3=r)
 
 
 def icnr_init_(weight: torch.Tensor, upscale: int,
@@ -549,14 +547,15 @@ class CARAFE3d(nn.Module):
         x_pad = F.pad(x, [self.pad] * 6, mode="replicate")
         x_unf = (x_pad
                  .unfold(2, k, 1).unfold(3, k, 1).unfold(4, k, 1)
-                 .contiguous()
-                 .view(B, C, D, H, W, k ** 3)
-                 .permute(0, 1, 5, 2, 3, 4)
-                 .reshape(B, C * k ** 3, D, H, W))
+                 .contiguous())
+        # unfold 输出末尾为 3 个 k 轴；将其捏入 (C,k^3) 通道。
+        x_unf = rearrange(
+            x_unf, 'b c d h w k1 k2 k3 -> b (c k1 k2 k3) d h w')
 
         # 3) 最近邻上采 patch，4) 沿 k^3 轴加权求和。
         x_up = F.interpolate(x_unf, scale_factor=s, mode="nearest")
-        x_up = x_up.view(B, C, k ** 3, D * s, H * s, W * s)
+        x_up = rearrange(
+            x_up, 'b (c kk) d h w -> b c kk d h w', c=C)
         out = (x_up * w.unsqueeze(1)).sum(dim=2)
         return self.proj(out)
 
@@ -616,8 +615,9 @@ class DySample3d(nn.Module):
             # DySample-S：可学 scope gate，范围 [0, 0.5]。
             off = off * self.scope(x).sigmoid() * 0.5
         off = self.shuffle(off)
-        off = off.view(B, g, 3, Du, Hu, Wu)
-        off = off.permute(0, 1, 3, 4, 5, 2)
+        # (B, g*3, Du, Hu, Wu) → (B, g, Du, Hu, Wu, 3)。
+        off = rearrange(
+            off, 'b (g c) d h w -> b g d h w c', g=g, c=3)
 
         # 2) 偏移归一化（像素→grid 坐标；末轴顺序 x,y,z = W,H,D）。
         norm = torch.tensor(
@@ -628,12 +628,14 @@ class DySample3d(nn.Module):
         # 3) 基础网格+偏移，4) 分组 grid_sample（合并 (B,g) 为 batch）。
         base = self._normalised_grid(Du, Hu, Wu, x.device, x.dtype)
         coord = base.unsqueeze(0).unsqueeze(0) + off
-        x_g = x.view(B, g, C // g, D, H, W).reshape(B * g, C // g, D, H, W)
-        coord = coord.reshape(B * g, Du, Hu, Wu, 3)
+        x_g = rearrange(
+            x, 'b (g c) d h w -> (b g) c d h w', g=g)
+        coord = rearrange(coord, 'b g d h w c -> (b g) d h w c')
         out = F.grid_sample(
             x_g, coord, mode="bilinear",
             padding_mode="border", align_corners=True)
-        out = out.view(B, C, Du, Hu, Wu)
+        out = rearrange(
+            out, '(b g) c d h w -> b (g c) d h w', g=g)
         return self.proj(out)
 
 

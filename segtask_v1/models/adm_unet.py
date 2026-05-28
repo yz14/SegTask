@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from .stem import build_context_stem
 from .unet import SegmentationHead, _build_aux_head
@@ -134,12 +135,15 @@ class _QKVAttentionLegacy(nn.Module):
         bs, width, length = qkv.shape
         assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
+        # (B, 3*h*ch, L) → (B*h, 3*ch, L) 后拆 q/k/v。
+        qkv_h = rearrange(
+            qkv, 'b (h c) l -> (b h) c l', h=self.n_heads)
+        q, k, v = qkv_h.split(ch, dim=1)
         scale = 1.0 / math.sqrt(math.sqrt(ch))
         weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
         weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = torch.einsum("bts,bcs->bct", weight, v)
-        return a.reshape(bs, -1, length)
+        return rearrange(a, '(b h) c l -> b (h c) l', h=self.n_heads)
 
 
 class _LinearAttention(nn.Module):
@@ -162,7 +166,8 @@ class _LinearAttention(nn.Module):
         b, _, h, w = x.shape
         qkv = self.to_qkv(x).chunk(3, dim=1)
         q, k, v = (
-            t.reshape(b, self.num_heads, -1, h * w) for t in qkv
+            rearrange(t, 'b (nh d) hh ww -> b nh d (hh ww)', nh=self.num_heads)
+            for t in qkv
         )  # 各 [B, H, head_dim, N]
         q = q.softmax(dim=-2)
         k = k.softmax(dim=-1)
@@ -170,7 +175,7 @@ class _LinearAttention(nn.Module):
         # context: [B, H, head_dim_v, head_dim_k]。
         context = torch.einsum("bhdn,bhen->bhde", k, v)
         out = torch.einsum("bhde,bhdn->bhen", context, q)
-        out = out.reshape(b, -1, h, w)
+        out = rearrange(out, 'b nh d (hh ww) -> b (nh d) hh ww', hh=h, ww=w)
         return self.to_out(out)
 
 
@@ -210,12 +215,12 @@ class _AttentionBlock(nn.Module):
         self.proj_out = _zero_(nn.Conv1d(channels, channels, 1))
 
     def forward(self, x):
-        b, c, *spatial = x.shape
-        h = x.reshape(b, c, -1)
-        qkv = self.qkv(self.norm(h))
+        x_flat = rearrange(x, 'b c ... -> b c (...)')
+        qkv = self.qkv(self.norm(x_flat))
         h = self.attention(qkv)
         h = self.proj_out(h)
-        return (x.reshape(b, c, -1) + h).reshape(b, c, *spatial)
+        # (B, C, prod(spatial)) → 原 shape；unflatten 非 reshape API。
+        return (x_flat + h).unflatten(-1, x.shape[2:])
 
 
 # ============================================================================

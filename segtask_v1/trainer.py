@@ -12,6 +12,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 # PyTorch ≥2.3：torch.amp.GradScaler 接受 device 首参；旧版需走 torch.cuda.amp。
 import inspect as _inspect
 try:
@@ -40,7 +41,7 @@ from .losses.losses import (
 from .models.unet import UNet3D
 from .utils import (
     AverageMeter, ModelEMA, Timer,
-    compute_dice_per_class, dice_batch_stats,
+    compute_dice_per_class, dice_batch_stats, surface_dice_batch_stats,
 )
 
 logger = logging.getLogger(__name__)
@@ -828,6 +829,22 @@ class Trainer:
                 else:
                     image, label, wmap = self._squeeze_2_5d(image, label, wmap)
 
+            import SimpleITK as sitk
+            debug_path = './debug1'
+            os.makedirs(debug_path, exist_ok=True)
+            imgs = torch.chunk(image, [12, 16, 24], dim=1)
+            for jj, (a,b,c) in enumerate(zip(imgs, [label]+aux_view_labels, [wmap]+aux_view_wmaps)):
+                aa = a.detach().cpu().numpy()
+                aa = sitk.GetImageFromArray(aa)
+                sitk.WriteImage(aa, f"{debug_path}/{jj}a.nii.gz")
+                aa = b.detach().cpu().numpy()
+                aa = sitk.GetImageFromArray(aa)
+                sitk.WriteImage(aa, f"{debug_path}/{jj}b.nii.gz")
+                aa = c.detach().cpu().numpy()
+                aa = sitk.GetImageFromArray(aa)
+                sitk.WriteImage(aa, f"{debug_path}/{jj}c.nii.gz")
+            raise
+            
             # 有效累积分母（尾巴 step 用真尾长）
             if remainder > 0 and step >= partial_start:  # TODO 不太懂
                 effective_accum = remainder
@@ -960,6 +977,15 @@ class Trainer:
         denom_sum: Optional[torch.Tensor] = None  # (C,)
         cov_sum:   Optional[torch.Tensor] = None  # (C,) 逐类有 GT 的样本数
 
+        # Surface Dice 仅在 criterion 需要时启用，避免不必要的 maxpool 开销。
+        tc = self.cfg.train
+        crit = str(tc.save_best_criterion).lower().strip()
+        compute_sd = (crit == "dice+surface_dice")
+        sd_tol = int(tc.surface_dice_tolerance)
+        sd_w   = float(tc.surface_dice_weight)
+        sd_num_sum:   Optional[torch.Tensor] = None  # (C,)
+        sd_denom_sum: Optional[torch.Tensor] = None  # (C,)
+
         n_samples = 0
 
         with self._ema_swapped():
@@ -1000,7 +1026,8 @@ class Trainer:
                     logger.warning(
                         "Non-finite val loss (%s) at epoch %d; skipping "
                         "meter update.", loss_val, epoch + 1)
-                stats = dice_batch_stats(pred_1x.float(), target_1x)
+                pred_1x_f = pred_1x.float()
+                stats = dice_batch_stats(pred_1x_f, target_1x)
                 if inter_sum is None:
                     inter_sum = stats["inter"].clone()
                     denom_sum = stats["denom"].clone()
@@ -1009,6 +1036,15 @@ class Trainer:
                     inter_sum += stats["inter"]
                     denom_sum += stats["denom"]
                     cov_sum   += stats["n_with_gt"]
+                if compute_sd:
+                    sd_stats = surface_dice_batch_stats(
+                        pred_1x_f, target_1x, tolerance=sd_tol)
+                    if sd_num_sum is None:
+                        sd_num_sum   = sd_stats["sd_num"].clone()
+                        sd_denom_sum = sd_stats["sd_denom"].clone()
+                    else:
+                        sd_num_sum   += sd_stats["sd_num"]
+                        sd_denom_sum += sd_stats["sd_denom"]
                 n_samples += image.shape[0]
 
         if inter_sum is None:
@@ -1025,14 +1061,31 @@ class Trainer:
             metrics[f"dice_class_{c}"] = dice_per_class[c].item()
         metrics["mean_dice"] = dice_per_class.mean().item()
 
+        # Surface Dice（pooled，逐类）。仅当 criterion 启用时计算并写入指标。
+        sd_msg = ""
+        if compute_sd and sd_num_sum is not None:
+            sd_per_class = (sd_num_sum + smooth) / (sd_denom_sum + smooth)
+            sd_per_class = sd_per_class.cpu()
+            for c in range(len(sd_per_class)):
+                metrics[f"surface_dice_class_{c}"] = sd_per_class[c].item()
+            metrics["mean_surface_dice"] = sd_per_class.mean().item()
+            metrics["mean_combined"] = (
+                (1.0 - sd_w) * metrics["mean_dice"]
+                + sd_w * metrics["mean_surface_dice"])
+            sd_msg = (
+                f", pooled_mean_surface_dice@{sd_tol}px="
+                f"{metrics['mean_surface_dice']:.4f}, "
+                f"per_class_sd={[f'{d:.4f}' for d in sd_per_class.tolist()]}, "
+                f"combined(w={sd_w:.2f})={metrics['mean_combined']:.4f}")
+
         # 逐类覆盖数助诊断“某类几乎不在 val 出现 vs 真实错误”。
         cov = cov_sum.cpu().tolist()
         logger.info(
             "  Val: loss=%.4f, pooled_mean_dice=%.4f, per_class=%s, "
-            "coverage=%s/%d samples",
+            "coverage=%s/%d samples%s",
             metrics["val_loss"], metrics["mean_dice"],
             [f"{d:.4f}" for d in dice_per_class.tolist()],
-            [int(c) for c in cov], n_samples)
+            [int(c) for c in cov], n_samples, sd_msg)
         return metrics
 
     # ------------------------------------------------------------------
@@ -1262,8 +1315,7 @@ class Trainer:
             raise ValueError(
                 f"image / label batch+C_res mismatch: image="
                 f"{tuple(image.shape)}, label={tuple(label.shape)}")
-        B, C_res, D, H, W = image.shape
-        image_2d = image.reshape(B, C_res * D, H, W).contiguous()
+        image_2d = rearrange(image, 'b c d h w -> b (c d) h w').contiguous()
         return image_2d, label, wmap
 
     def _compute_loss_aux_fp32(
@@ -1347,9 +1399,8 @@ class Trainer:
             raise ValueError(
                 f"image / label batch+C_res mismatch: image="
                 f"{tuple(image.shape)}, label={tuple(label.shape)}")
-        B, C_res, D, H, W = image.shape
         # contiguous 使下游 MultiStemProj.split 为零拷贝 view。
-        image = image.reshape(B, C_res * D, H, W).contiguous()
+        image = rearrange(image, 'b c d h w -> b (c d) h w').contiguous()
         # 仅以 1× FOV view 0 作监督；宽 FOV 重采样后的 label 与输出不对齐。
         label = label[:, 0]
         if wmap is not None:

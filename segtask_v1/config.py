@@ -397,8 +397,15 @@ class TrainConfig:
     # Checkpoint 保存。
     output_dir      : str = "outputs"
     save_every      : int = 10
+    # 选模标准: "loss" | "dice" | "dice+surface_dice"。覆盖下方 metric/mode（见 sync()）。
+    save_best_criterion: str = "dice"
+    # 内部解析字段（一般无需手动设）；sync() 会按 criterion 重写。
     save_best_metric: str = "mean_dice"
     save_best_mode  : str = "max"
+    # Surface Dice 容差（像素，Chebyshev 邻域；0=严格表面 Dice）。
+    surface_dice_tolerance: int = 1
+    # 组合标准下 combined = (1-w)*dice + w*surface_dice。
+    surface_dice_weight: float = 0.5
 
     # 提前停止（0=禁用）。
     early_stopping: int = 0
@@ -521,6 +528,18 @@ class Config:
                 self.data.z_boundary_mode = "edge_pad"
 
         self._apply_resenc_preset()
+        self._resolve_save_best_criterion()
+
+    def _resolve_save_best_criterion(self) -> None:
+        """criterion → (save_best_metric, save_best_mode) 映射；显式覆盖低层字段。"""
+        crit = str(self.train.save_best_criterion).lower().strip()
+        mapping = {
+            "loss": ("val_loss", "min"),
+            "dice": ("mean_dice", "max"),
+            "dice+surface_dice": ("mean_combined", "max"),
+        }
+        if crit in mapping:
+            self.train.save_best_metric, self.train.save_best_mode = mapping[crit]
 
     def _apply_resenc_preset(self) -> None:
         """将 model.resenc_preset 展开为逐级 block 数；用户显式传入优先。"""
@@ -788,6 +807,14 @@ class Config:
             "All multi_res_scales must be >= 1.0"
         assert self.train.save_best_mode in ("max", "min"), \
             f"Invalid save_best_mode: {self.train.save_best_mode}"
+        assert str(self.train.save_best_criterion).lower() in (
+            "loss", "dice", "dice+surface_dice"), (
+            f"Invalid save_best_criterion: {self.train.save_best_criterion!r}; "
+            f"expected one of 'loss' | 'dice' | 'dice+surface_dice'.")
+        assert int(self.train.surface_dice_tolerance) >= 0, \
+            f"surface_dice_tolerance must be >= 0; got {self.train.surface_dice_tolerance}"
+        assert 0.0 <= float(self.train.surface_dice_weight) <= 1.0, \
+            f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}"
         # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
             assert self.data.patch_mode == "2_5d", (

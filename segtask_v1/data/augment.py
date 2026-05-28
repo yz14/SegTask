@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 
 from ..config import AugConfig
 
@@ -150,7 +151,8 @@ def _build_rotation_matrices(
         s * r00, s * r01, s * r02, zeros,
         s * r10, s * r11, s * r12, zeros,
         s * r20, s * r21, s * r22, zeros,
-    ], dim=-1).reshape(N, 3, 4)
+    ], dim=-1)
+    mat = rearrange(mat, 'n (r c) -> n r c', r=3, c=4)
 
     return mat
 
@@ -180,13 +182,14 @@ def _elastic_deform(
     disp = F.interpolate(disp, size=(D, H, W), mode="trilinear", align_corners=False)
 
     # 体素位移→归一化 grid 坐标（1 voxel = 2/N）；permute 后通道 (0,1,2) 对应 grid 轴 (W,H,D)。
-    voxel_to_grid = torch.tensor(
-        [2.0 / W, 2.0 / H, 2.0 / D],
-        dtype=disp.dtype, device=device,
-    ).reshape(1, 3, 1, 1, 1)
+    voxel_to_grid = rearrange(
+        torch.tensor([2.0 / W, 2.0 / H, 2.0 / D],
+                     dtype=disp.dtype, device=device),
+        'c -> 1 c 1 1 1')
     disp = disp * alpha * voxel_to_grid
 
-    grid = _identity_grid(n, D, H, W, device) + disp.permute(0, 2, 3, 4, 1)
+    grid = _identity_grid(n, D, H, W, device) + rearrange(
+        disp, 'b c d h w -> b d h w c')
 
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
@@ -251,7 +254,7 @@ def _grid_dropout(
         ] = 0
 
     # effective = selected ? hole_mask : 1。
-    gate = selected.reshape(B, 1, 1, 1, 1).to(image.dtype)
+    gate = rearrange(selected, 'b -> b 1 1 1 1').to(image.dtype)
     effective = hole_mask * gate + (1.0 - gate)
     return image * effective, label, weight_map
 
@@ -310,8 +313,9 @@ def _random_gamma(
     # 未选中样本 gamma=1。
     gamma = torch.empty(B, device=device).uniform_(grange[0], grange[1])
     gamma = torch.where(mask, gamma, torch.ones_like(gamma))
-    gshape = (B,) + (1,) * (image.ndim - 1)
-    gamma = gamma.reshape(gshape).to(image.dtype)
+    # 动态阐 (B,) → (B, 1, 1, ..., 1) 以适应 image.ndim。
+    gpattern = 'b -> b' + ' 1' * (image.ndim - 1)
+    gamma = rearrange(gamma, gpattern).to(image.dtype)
 
     return normed.pow(gamma) * rng + mn
 
@@ -351,18 +355,18 @@ def _gaussian_blur_3d(
     # 将 (B,C) 折入 conv3d batch 轴，1D 核作用于每个 (样本, 通道) 切片。
     sub = image[idx]
     n, C = sub.shape[:2]
-    sub = sub.reshape(n * C, 1, *sub.shape[2:])
+    sub = rearrange(sub, 'n c d h w -> (n c) 1 d h w')
 
-    for k_shape, pad_arg in (
-        ((-1, 1, 1), [0, 0, 0, 0, pad, pad]),
-        ((1, -1, 1), [0, 0, pad, pad, 0, 0]),
-        ((1, 1, -1), [pad, pad, 0, 0, 0, 0]),
+    for axis_pat, pad_arg in (
+        ('k -> 1 1 k 1 1', [0, 0, 0, 0, pad, pad]),
+        ('k -> 1 1 1 k 1', [0, 0, pad, pad, 0, 0]),
+        ('k -> 1 1 1 1 k', [pad, pad, 0, 0, 0, 0]),
     ):
-        k = k1d.reshape(1, 1, *k_shape)
+        k = rearrange(k1d, axis_pat)
         sub = F.pad(sub, pad_arg, mode="replicate")
         sub = F.conv3d(sub, k)
 
-    image[idx] = sub.reshape(n, C, *sub.shape[2:])
+    image[idx] = rearrange(sub, '(n c) 1 d h w -> n c d h w', n=n, c=C)
     return image
 
 

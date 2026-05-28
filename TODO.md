@@ -52,3 +52,5 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 6 D:\codes\work-projects\SegTask\segtask_v1\data\dataset.py这里的不同数据的读取，里面有很多公用的函数，很多是可以复用的，是否可以写一个通用的读取方法类，然后不同的方法再去继承会好一些呢？
 
 7 torch的所有reshape的操作全部替换为einops
+
+8 验证集在挑选模型时只考虑了整体dice，对于大器官有时候挑选的不太准，需要加入surface dice供选择，即验证集评价标准的选项有loss, dice, dice+surface_dice组合，等等。surface dice需要在GPU运行，且容许N个像素误差。  

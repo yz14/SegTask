@@ -14,6 +14,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from ..config import LossConfig
 
@@ -74,8 +75,9 @@ def _weighted_voxel_mean(
         weight = weight * weight_map  # broadcast (B,1,*) → (B,C,*)
     if class_weights is not None:
         cw = class_weights.to(per_voxel.device).to(per_voxel.dtype)
-        cw_shape = [1, -1] + [1] * (per_voxel.ndim - 2)
-        weight = weight * cw.reshape(cw_shape)
+        # 动态阐 (C,) → (1, C, 1, ..., 1) 适应 per_voxel.ndim。
+        cw_pat = 'c -> 1 c' + ' 1' * (per_voxel.ndim - 2)
+        weight = weight * rearrange(cw, cw_pat)
 
     return (per_voxel * weight).sum() / weight.sum().clamp(min=EPS)
 
@@ -112,16 +114,16 @@ class BinaryDiceLoss(nn.Module):
         self, pred: torch.Tensor, target: torch.Tensor, weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         target    = _check_inputs(pred, target, weight_map)
         pred_prob = torch.sigmoid(pred)
-        B, C      = pred.shape[:2]
-        p, t      = pred_prob.reshape(B, C, -1), target.reshape(B, C, -1)
-        p_den     = p * p if self.squared else p  # 意义？
+        p = rearrange(pred_prob, 'b c ... -> b c (...)')
+        t = rearrange(target,    'b c ... -> b c (...)')
+        p_den = p * p if self.squared else p  # 意义？
 
         sum_dims: Tuple[int, ...] = (0, 2) if self.batch_dice else (2,)
 
         if weight_map is not None:
             # weight_map acts as a SUMMATION weight: each voxel's contribution
             # to numerator and denominator is scaled by w consistently.
-            w = weight_map.reshape(B, 1, -1)  # broadcasts over C
+            w = rearrange(weight_map, 'b ... -> b 1 (...)')  # broadcasts over C
             intersection = (w * p * t).sum(dim=sum_dims)
             denom = (w * p_den).sum(dim=sum_dims) + (w * t).sum(dim=sum_dims)
         else:
@@ -230,13 +232,12 @@ class BinaryTverskyLoss(nn.Module):
     ) -> torch.Tensor:
         target = _check_inputs(pred, target, weight_map)
         pred_prob = torch.sigmoid(pred)
-        B, C = pred.shape[:2]
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
+        p = rearrange(pred_prob, 'b c ... -> b c (...)')
+        t = rearrange(target,    'b c ... -> b c (...)')
         sum_dims: Tuple[int, ...] = (0, 2) if self.batch_dice else (2,)
 
         if weight_map is not None:
-            w = weight_map.reshape(B, 1, -1)
+            w = rearrange(weight_map, 'b ... -> b 1 (...)')
             tp = (w * p * t).sum(dim=sum_dims)
             fp = (w * p * (1 - t)).sum(dim=sum_dims)
             fn = (w * (1 - p) * t).sum(dim=sum_dims)
@@ -379,13 +380,12 @@ class GeneralizedDiceLoss(nn.Module):
         weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         target = _check_inputs(pred, target, weight_map)
         pred_prob = torch.sigmoid(pred)
-        B, C = pred.shape[:2]
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
+        p = rearrange(pred_prob, 'b c ... -> b c (...)')
+        t = rearrange(target,    'b c ... -> b c (...)')
         sum_dims: Tuple[int, ...] = (0, 2) if self.batch_dice else (2,)
 
         if weight_map is not None:
-            w_vox = weight_map.reshape(B, 1, -1)
+            w_vox = rearrange(weight_map, 'b ... -> b 1 (...)')
             t_vol = (w_vox * t).sum(dim=sum_dims)
             tp = (w_vox * p * t).sum(dim=sum_dims)
             denom = (w_vox * (p + t)).sum(dim=sum_dims)
@@ -447,13 +447,12 @@ class BinaryFocalTverskyLoss(nn.Module):
         weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         target = _check_inputs(pred, target, weight_map)
         pred_prob = torch.sigmoid(pred)
-        B, C = pred.shape[:2]
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
+        p = rearrange(pred_prob, 'b c ... -> b c (...)')
+        t = rearrange(target,    'b c ... -> b c (...)')
         sum_dims: Tuple[int, ...] = (0, 2) if self.batch_dice else (2,)
 
         if weight_map is not None:
-            w = weight_map.reshape(B, 1, -1)
+            w = rearrange(weight_map, 'b ... -> b 1 (...)')
             tp = (w * p * t).sum(dim=sum_dims)
             fp = (w * p * (1 - t)).sum(dim=sum_dims)
             fn = (w * (1 - p) * t).sum(dim=sum_dims)
@@ -504,16 +503,16 @@ class LovaszHingeLoss(nn.Module):
         self, pred: torch.Tensor, target: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         target = _check_inputs(pred, target, weight_map)
-        B, C = pred.shape[:2]
-        logits = pred.reshape(B, C, -1)   # operate on logits
-        t = target.reshape(B, C, -1)
+        logits = rearrange(pred,   'b c ... -> b c (...)')   # operate on logits
+        t      = rearrange(target, 'b c ... -> b c (...)')
+        B, C = logits.shape[:2]
 
         # Hinge 误差（logit 空间）：e = 1 - s*z，s=2t-1∈{-1,+1}；Lovász 需 ReLU 前的有符号边际。
         signed = 2.0 * t - 1.0
         errors = 1.0 - signed * logits
 
         if weight_map is not None:
-            w_vox = weight_map.reshape(B, 1, -1).clamp(min=0)
+            w_vox = rearrange(weight_map, 'b ... -> b 1 (...)').clamp(min=0)
             # 仅加权被惩罚侧；负边际 = 正确，ReLU 后为 0。
             errors = torch.where(
                 errors > 0, errors * w_vox, errors)
@@ -528,8 +527,8 @@ class LovaszHingeLoss(nn.Module):
                 per_class, self.class_weights).mean()
 
         # Batch-级 Lovász：逐通道 reshape 为 (B*L)，一次排序。
-        errors_bc = errors.permute(1, 0, 2).reshape(C, -1)  # (C, B*L)
-        t_bc = t.permute(1, 0, 2).reshape(C, -1)
+        errors_bc = rearrange(errors, 'b c l -> c (b l)')  # (C, B*L)
+        t_bc      = rearrange(t,      'b c l -> c (b l)')
         err_sorted, perm = torch.sort(errors_bc, dim=-1, descending=True)
         gt_sorted = t_bc.gather(dim=-1, index=perm)
         grad = _lovasz_grad_batched(gt_sorted)
@@ -606,11 +605,10 @@ class SoftCLDiceLoss(nn.Module):
         skel_pred = _soft_skeletonize(pred_prob, self.iter, spatial_ndim)
         skel_t = _soft_skeletonize(target, self.iter, spatial_ndim)
 
-        B, C = pred.shape[:2]
-        sp = skel_pred.reshape(B, C, -1)
-        st = skel_t.reshape(B, C, -1)
-        p = pred_prob.reshape(B, C, -1)
-        t = target.reshape(B, C, -1)
+        sp = rearrange(skel_pred, 'b c ... -> b c (...)')
+        st = rearrange(skel_t,    'b c ... -> b c (...)')
+        p  = rearrange(pred_prob, 'b c ... -> b c (...)')
+        t  = rearrange(target,    'b c ... -> b c (...)')
 
         tprec = ((sp * t).sum(dim=-1) + self.smooth) / (
             sp.sum(dim=-1) + self.smooth)
@@ -771,7 +769,8 @@ class MultiResolutionLoss(nn.Module):
         fg = torch.tensor(self.fg_values, device=label.device, dtype=label.dtype)
         # label (B,D,H,W) → (B,1,D,H,W); fg (num_fg,) → (1,num_fg,1,1,1)。
         label_exp = label.unsqueeze(1)
-        fg_exp    = fg.reshape(1, -1, *([1] * (label.ndim - 1)))
+        fg_pat    = 'c -> 1 c' + ' 1' * (label.ndim - 1)
+        fg_exp    = rearrange(fg, fg_pat)
         return (label_exp == fg_exp).float()
 
     def split_for_metrics(
@@ -843,8 +842,8 @@ class SliceChannelLoss(nn.Module):
                 f"{self.num_slices}")
 
         fg   = torch.tensor(self.fg_values, device=label_raw.device, dtype=label_raw.dtype)
-        fg_b = fg.reshape(1, -1, 1, 1)                              # (1, num_fg, 1, 1)
-        flat = label_raw.reshape(B * D, H, W).unsqueeze(1)          # (B*D, 1, H, W)
+        fg_b = rearrange(fg, 'c -> 1 c 1 1')                        # (1, num_fg, 1, 1)
+        flat = rearrange(label_raw, 'b d h w -> (b d) 1 h w')        # (B*D, 1, H, W)
         return (flat == fg_b).float()                               # (B*D, num_fg, H, W)
 
     def _split_pred(self, pred: torch.Tensor) -> torch.Tensor:
@@ -860,10 +859,10 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"pred channel count {total_c} != num_fg*D = "
                 f"{self.num_fg}*{D} = {self.num_fg * D}")
-        # (B, num_fg, D, H, W) → (B, D, num_fg, H, W) → (B*D, num_fg, H, W)
-        return (pred.reshape(B, self.num_fg, D, H, W)
-                    .permute(0, 2, 1, 3, 4)
-                    .reshape(B * D, self.num_fg, H, W))
+        # (B, num_fg*D, H, W) → (B*D, num_fg, H, W)
+        return rearrange(
+            pred, 'b (c d) h w -> (b d) c h w',
+            c=self.num_fg, d=D)
 
     @staticmethod
     def _flatten_weight_map(
@@ -881,7 +880,7 @@ class SliceChannelLoss(nn.Module):
         if D != num_slices:
             raise ValueError(
                 f"weight_map slice count {D} != num_slices {num_slices}")
-        return weight_map.reshape(B * D, 1, H, W)
+        return rearrange(weight_map, 'b d h w -> (b d) 1 h w')
 
     # ------------------------------------------------------------------
     # Per-volume reshape helpers (rank-5 contract: (B, num_fg, D, H, W))
@@ -899,7 +898,9 @@ class SliceChannelLoss(nn.Module):
             raise ValueError(
                 f"pred channel count {total_c} != num_fg*D = "
                 f"{self.num_fg}*{D} = {self.num_fg * D}")
-        return pred.reshape(B, self.num_fg, D, H, W)
+        return rearrange(
+            pred, 'b (c d) h w -> b c d h w',
+            c=self.num_fg, d=D)
 
     def _label_to_binary_5d(self, label_raw: torch.Tensor) -> torch.Tensor:
         """(B,D,H,W) 整数 → (B, num_fg, D, H, W) 二值。"""
@@ -915,7 +916,7 @@ class SliceChannelLoss(nn.Module):
                 f"{self.num_slices}")
 
         fg   = torch.tensor(self.fg_values, device=label_raw.device, dtype=label_raw.dtype)
-        fg_b = fg.reshape(1, -1, 1, 1, 1)                            # (1, num_fg, 1, 1, 1)
+        fg_b = rearrange(fg, 'c -> 1 c 1 1 1')                       # (1, num_fg, 1, 1, 1)
         flat = label_raw.unsqueeze(1)                                # (B, 1, D, H, W)
         return (flat == fg_b).float()                                # (B, num_fg, D, H, W)
 

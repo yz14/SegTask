@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 
 from .blocks import _CONV, make_attention
 
@@ -44,8 +45,9 @@ class LayerNorm3d(nn.Module):
         u = x.mean(dim=1, keepdim=True)
         s = (x - u).pow(2).mean(dim=1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
-        shape = (1, -1) + (1,) * (x.ndim - 2)
-        return x * self.weight.reshape(shape) + self.bias.reshape(shape)
+        # 动态阐广播形：(C,) → (1, C, 1, ..., 1)。
+        pat = 'c -> 1 c' + ' 1' * (x.ndim - 2)
+        return x * rearrange(self.weight, pat) + rearrange(self.bias, pat)
 
 
 class ConvNeXtBlock(nn.Module):
@@ -87,8 +89,8 @@ class ConvNeXtBlock(nn.Module):
         out = self.pwconv2(out)
         out = self.attn(out)
         if self.gamma is not None:
-            shape = (1, -1) + (1,) * self.spatial_dims
-            out   = out * self.gamma.reshape(shape)
+            pat = 'c -> 1 c' + ' 1' * self.spatial_dims
+            out = out * rearrange(self.gamma, pat)
         return res + self.drop_path(out)
 
 

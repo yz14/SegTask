@@ -11,6 +11,8 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +120,8 @@ def compute_dice_per_class(
 ) -> torch.Tensor:
     """(B,C,D,H,W) 逐类 sigmoid Dice。ignore_empty=True (nnU-Net)：空 GT 样本不入均；batch 全空类返 0。"""
     pred_bin = (torch.sigmoid(pred) > threshold).float()
-    B, C = pred.shape[:2]
-    p = pred_bin.reshape(B, C, -1)
-    t = target.reshape(B, C, -1)
+    p = rearrange(pred_bin, 'b c ... -> b c (...)')
+    t = rearrange(target, 'b c ... -> b c (...)')
 
     intersection = (p * t).sum(dim=2)
     denom = p.sum(dim=2) + t.sum(dim=2)
@@ -145,13 +146,61 @@ def dice_batch_stats(
 ) -> Dict[str, torch.Tensor]:
     """逐类汇汇 (inter, denom, n_with_gt)，供 nnU-Net pooled dice：final_dice[c]=2·Σinter[c]/Σdenom[c]。"""
     pred_bin = (torch.sigmoid(pred) > threshold).float()
-    B, C = pred.shape[:2]
-    p = pred_bin.reshape(B, C, -1)
-    t = target.reshape(B, C, -1)
+    p = rearrange(pred_bin, 'b c ... -> b c (...)')
+    t = rearrange(target, 'b c ... -> b c (...)')
     inter = (p * t).sum(dim=(0, 2))
     denom = p.sum(dim=(0, 2)) + t.sum(dim=(0, 2))
     n_with_gt = (t.sum(dim=2) > 0).sum(dim=0).float()
     return {"inter": inter, "denom": denom, "n_with_gt": n_with_gt}
+
+
+def _binary_erosion_pool(mask: torch.Tensor, ndim: int) -> torch.Tensor:
+    """3x3(x3) 二值腐蚀。外侧按背景 0 处理（先 zero-pad 再 maxpool 实现 minpool）。"""
+    pad_amt = [1] * (2 * ndim)
+    m = F.pad(mask, pad_amt, mode="constant", value=0.0)
+    pool = F.max_pool2d if ndim == 2 else F.max_pool3d
+    return -pool(-m, kernel_size=3, stride=1, padding=0)
+
+
+def _binary_dilate_pool(mask: torch.Tensor, ndim: int, tol: int) -> torch.Tensor:
+    """Chebyshev-τ 膨胀（kernel=2τ+1 maxpool）。τ=0 直接返回。"""
+    if tol <= 0:
+        return mask
+    k = 2 * int(tol) + 1
+    pool = F.max_pool2d if ndim == 2 else F.max_pool3d
+    return pool(mask, kernel_size=k, stride=1, padding=int(tol))
+
+
+@torch.no_grad()
+def surface_dice_batch_stats(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    tolerance: int = 1,
+    threshold: float = 0.5,
+) -> Dict[str, torch.Tensor]:
+    """逐类汇汇 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice@τ：
+    SD[c] = Σ(|B_p ∩ Dil_τ(B_t)| + |B_t ∩ Dil_τ(B_p)|) / Σ(|B_p|+|B_t|)。
+    支持 2D (B,C,H,W) 与 3D (B,C,D,H,W)；外侧体素按背景计入边界。"""
+    pred_bin = (torch.sigmoid(pred) > threshold).float()
+    target_f = target.float()
+    ndim = pred_bin.ndim - 2
+    assert ndim in (2, 3), f"surface_dice expects 2D/3D spatial, got rank {pred_bin.ndim}"
+
+    p_er = _binary_erosion_pool(pred_bin, ndim)
+    t_er = _binary_erosion_pool(target_f, ndim)
+    pb = pred_bin * (1.0 - p_er)
+    tb = target_f * (1.0 - t_er)
+
+    pb_dil = _binary_dilate_pool(pb, ndim, tolerance)
+    tb_dil = _binary_dilate_pool(tb, ndim, tolerance)
+
+    spatial_dims = tuple(range(2, pb.ndim))
+    reduce_dims = (0,) + spatial_dims
+
+    sd_num = (pb * tb_dil).sum(dim=reduce_dims) + (tb * pb_dil).sum(dim=reduce_dims)
+    sd_denom = pb.sum(dim=reduce_dims) + tb.sum(dim=reduce_dims)
+    n_with_gt = (target_f.flatten(2).sum(dim=2) > 0).sum(dim=0).float()
+    return {"sd_num": sd_num, "sd_denom": sd_denom, "n_with_gt": n_with_gt}
 
 
 def seed_everything(seed: int, deterministic: bool = False) -> None:

@@ -15,6 +15,7 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from torch.amp import autocast
 
 from .config import Config
@@ -487,7 +488,7 @@ class Predictor:
                     else:
                         w = torch.from_numpy(
                             self._build_1d_weight(ad)).to(self.device)
-                    w_4d = w.view(1, -1, 1, 1)
+                    w_4d = rearrange(w, 'c -> 1 c 1 1')
 
                     for j, i in enumerate(idxs):
                         zs, ze, _ = patch_metas[i]
@@ -685,7 +686,8 @@ class Predictor:
                     raise ValueError(
                         f"2.5D model output channels {pred.shape[1]} != "
                         f"num_fg*D = {self.num_fg}*{D} = {expected_c}")
-                pred_5d = pred.reshape(B, self.num_fg, D, H, W)
+                pred_5d = rearrange(
+                    pred, 'b (c d) h w -> b c d h w', c=self.num_fg, d=D)
                 prob = torch.sigmoid(pred_5d.float())
                 self._diag_log_first_batch(
                     "2.5D folded", x_2d, pred_5d, prob)
@@ -1082,7 +1084,8 @@ class Predictor:
                     f"2.5D model output channels {pred.shape[1]} != "
                     f"num_fg*D = {self.num_fg}*{D} = {expected_c}")
             # (B, num_fg*D, H, W) → (B, num_fg, D, H, W)
-            pred_5d = pred.reshape(B, self.num_fg, D, H, W)
+            pred_5d = rearrange(
+                pred, 'b (c d) h w -> b c d h w', c=self.num_fg, d=D)
             prob = torch.sigmoid(pred_5d.float())
 
             if self.tta_flip:
@@ -1101,7 +1104,7 @@ class Predictor:
             raise ValueError(
                 f"2.5D input D-axis ({D}) != patch_D ({self.patch_D}). "
                 "Window builder produced an unexpected slice count.")
-        return x.reshape(B, C_res * D, H, W).contiguous()
+        return rearrange(x, 'b c d h w -> b (c d) h w').contiguous()
 
     def _tta_flip_ensemble(
         self, x: torch.Tensor, base_prob: torch.Tensor,
@@ -1139,7 +1142,8 @@ class Predictor:
             if isinstance(pred_flip, list):
                 pred_flip = pred_flip[0]
             # (B, num_fg*D, H, W) → (B, num_fg, D, H, W)
-            pred_flip_5d = pred_flip.reshape(B, self.num_fg, D, H, W)
+            pred_flip_5d = rearrange(
+                pred_flip, 'b (c d) h w -> b c d h w', c=self.num_fg, d=D)
             prob_flip = torch.sigmoid(pred_flip_5d.float())
             prob_flip = torch.flip(prob_flip, flip_prob_dims)
             total = total + prob_flip

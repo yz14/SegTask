@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from .stem import HierarchicalStems  # only for the explicit reject branch
 
@@ -155,13 +156,20 @@ class _Block(nn.Module):
         # Self-attention.
         if self.num_heads != 0:
             y = self.attn_qkv(x)
-            y = y.reshape(y.shape[0], self.num_heads, -1, 3, y.shape[2] * y.shape[3])
+            # (B, h*d*3, H, W) → (B, h, d, 3, H*W)。
+            y = rearrange(
+                y, 'b (h d qkv) hh ww -> b h d qkv (hh ww)',
+                h=self.num_heads, qkv=3)
             q, k, v = _normalize(y, dim=2).unbind(3)
             w_attn = torch.einsum(
                 "nhcq,nhck->nhqk", q, k / float(np.sqrt(q.shape[2]))
             ).softmax(dim=3)
             y = torch.einsum("nhqk,nhck->nhcq", w_attn, v)
-            y = self.attn_proj(y.reshape(*x.shape))
+            # (B, h, d, H*W) → (B, h*d, H, W) ≡ x.shape。
+            y = rearrange(
+                y, 'b h d (hh ww) -> b (h d) hh ww',
+                hh=x.shape[2], ww=x.shape[3])
+            y = self.attn_proj(y)
             x = _mp_sum(x, y, t=self.attn_balance)
 
         if self.clip_act is not None:
