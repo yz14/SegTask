@@ -91,7 +91,8 @@ SegTask/
 │   ├── data/                          # 数据子系统（§3.4）
 │   │   ├── __init__.py
 │   │   ├── dataset.py                 # 3 个 Dataset + 所有 IO / patch / bbox / npz 工具
-│   │   ├── loader.py                  # 发现-匹配-切分-build_dataloaders
+│   │   ├── specs.py                   # DatasetSpec 策略对象（R4 引入）：模式选 dataset 类
+│   │   ├── loader.py                  # 发现-匹配-切分-build_dataloaders（已瘦身到 ~530 行）
 │   │   ├── augment.py                 # GPUAugmentor（共享 warp，多 FOV 安全）
 │   │   └── make_data.py               # 一次性把 NIfTI 打包成 bbox-cropped npz
 │   ├── models/                        # 网络结构（§3.5）
@@ -133,7 +134,8 @@ SegTask/
 │  data.loader.build_dataloaders(cfg)                                                  │
 │    │     discover_samples → exclude_list 过滤 → (可选) match_bbox / match_rw         │
 │    │     detect_label_values → stratified_train_val_split                            │
-│    │     根据 patch_mode 选 SegDataset3D / 3DCubic / 3DWhole（或 npz 路径）          │
+│    │     data.specs.build_data_spec(cfg) → spec.make_split(train|val, common)        │
+│    │     spec ∈ { ZCubeSpec | WholeSpec | CubicSpec }（唯一 patch_mode 决策点）      │
 │    ▼                                                                                 │
 │  __getitem__:  load_nifti_cropped → preprocess_image / label → 抽 patch              │
 │                 (z_axis = 沿 z 滑窗；cubic = 3D 立方；whole = 整卷 resize；          │
@@ -347,6 +349,14 @@ segtask_v1/data/
   - `SegDataset3DCubic`（`patch_mode="cubic"`）—— 3D 立方采样，前景过采样 + 三轴 multi-res。
   - `SegDataset3DWhole`（`patch_mode="whole"`）—— 整卷直接 resize 到 `patch_size`，最简但显存最大。
 
+**`specs.py`** —— **R4 引入的 data 侧策略层**。把"按 `patch_mode` 选 dataset 类 + 准备 split-dependent kwargs"从 `loader.py` 抽出：
+
+- `DatasetCommonCfg.from_cfg(cfg)` —— 把 11 个跨模式公共参数（`patch_size` / `intensity_min` / `cache_*` / `region_weights` / ...）冻结成一个不可变 dataclass；**避免 `loader.py` 重复构造 `common_kwargs` dict**。
+- `SplitPaths` —— 单 split 的路径三元组（image / label / npz）。
+- `DatasetSpec` ABC + 3 个子类：`WholeSpec` / `ZCubeSpec`（`z_axis` + `2_5d` 共用）/ `CubicSpec`。每个 spec 自己知道：要选哪个 dataset 类、需要哪些"模式专属 kwargs"（`multi_res_scales` / `z_boundary_mode` / `foreground_oversample_ratio`）、`is_train` 切换时如何调整 `aug_oversample_ratio` / `samples_per_volume` / `fg_ratio`。
+- `build_data_spec(cfg)` —— 整个 data 子包**唯一允许 patch_mode if/elif 的地方**，与 `trainer/pipelines/factory.py` 同节奏。
+- 新增一种 patch 模式：在 `dataset.py` 加 `SegDataset3DXxx` → 在 `specs.py` 加 `XxxSpec(DatasetSpec)` + `build_data_spec` 决策树加 1 行；**`loader.py` 完全不动**。
+
 **`loader.py`** 全部都是顶层函数：
 
 - `_load_exclude_pids / _filter_by_exclude`：读 `data.exclude_list` 把坏 pid 从配对列表里剔除。
@@ -462,33 +472,41 @@ segtask_v1/losses/losses.py    # 全部损失都在这里，~1270 行
 
 私有辅助：`_check_inputs / _register_class_weights / _weighted_mean_over_classes / _weighted_voxel_mean / _interp_mode_smooth / _jaccard_from_sorted_errors / _soft_skel`。
 
-### 3.7 `trainer.py` —— 训练循环
+### 3.7 `trainer/` —— 训练循环（Round 1–3 模块化）
 
-~2100 行，单类 `Trainer` 统辖全部状态。
+原单文件 `trainer.py` (~1700 行) 已重构为 `trainer/` 包：基础设施（AMP / 优化器 / 内存核算 / breakdown / checkpoint）按职责拆分成独立模块；模式分支（whole / patch3d / 2.5d folded / 2.5d aux / 2.5d native_d / 2.5d lift / 2.5d lift+aux）由 **`ViewPipeline` 策略对象**统一封装，`Trainer` 不再判断模式。
 
 ```text
-trainer.py
-├── GradScaler              # 版本无关包装（PyTorch ≥ 2.3 用 torch.amp.GradScaler，旧版 fallback torch.cuda.amp）
-├── _unwrap_compile         # 去掉 torch.compile 的 _orig_mod. 前缀，保证 state_dict 跨编译模式互通
-├── _cuda_supports_bf16     # 把 amp_dtype="auto" 解析成具体类型
-├── build_optimizer         # adam / adamw / sgd(+nesterov)
-├── build_scheduler         # cosine / cosine_warm_restarts / poly / step / plateau / one_cycle
-├── WarmupScheduler         # 线性 warmup + 委托到 base scheduler；step() 全局对齐
-└── Trainer                 # __init__ / fit / train_epoch / validate / save_ckpt / load_ckpt
-                            # 内部还有 _build_loss_stack / _split_views_* / _compute_loss_aux_fp32 / ...
+segtask_v1/trainer/
+├── __init__.py             # re-export Trainer / build_optimizer / build_scheduler / WarmupScheduler（旧 import 100% 兼容）
+├── trainer.py              # Trainer 主类：__init__ / fit / _train_epoch / _validate / checkpoint I/O
+├── optim.py                # build_optimizer / build_scheduler / WarmupScheduler
+├── amp.py                  # GradScaler shim / autocast / resolve_auto_amp_dtype / compute_loss_fp32
+├── memory.py               # estimate_train_memory（参数 + 梯度 + 优化器 + EMA 静态预算）
+├── breakdown.py            # collect_multi_res_breakdown / format_breakdown
+├── checkpoint.py           # unwrap_compile / extract_model_state_dict / strip_common_prefixes
+├── views.py                # 5 个无状态视图函数（center_crop / split_views_native_3d/d / squeeze_2_5d/_keep_views）
+└── pipelines/              # ViewPipeline 策略对象（7 类，1 个工厂；唯一允许的 if/elif 集中地）
+    ├── base.py             #   ViewPipeline ABC + SupervisionPack dataclass
+    ├── factory.py          #   build_pipeline(cfg, base_loss) — 由 cfg flag 选子类
+    ├── vanilla3d.py        #   Vanilla3DPipeline           (whole / 3D 单/eager 多分辨率)
+    ├── patch3d.py          #   Patch3DNativeMultiResPipeline (3D keep_native_multi_res)
+    ├── slab25d.py          #   Slab2_5DPipeline / Slab2_5DAuxPipeline / Slab2_5DNativeDPipeline
+    └── lift25d.py          #   Lift2_5DPipeline / Lift2_5DAuxPipeline
 ```
 
 `Trainer` 核心职责：
 
-- **损失栈构建** —— 根据 `model.deep_supervision / data.multi_res_scales / patch_mode / aux_seg_supervision / lift_2_5d_to_3d` 在 `_build_loss_stack` 里把 base loss 一层层包成 `MultiResolutionLoss(DeepSupervisionLoss(SliceChannelLoss(...)))`，aux 路径单独跑 `MultiResolutionLoss(num_res=1)`。
-- **多 FOV 视图切分** —— `_split_views_native_2_5d` / `_split_views_native_3d`：在 augment 之后、forward 之前对单 max-FOV cube 做 per-view 中心裁剪 + resize；保证训练时通过 augment 的几何信息只 warp 一次。
-- **AMP** —— `use_amp + amp_dtype=auto|fp16|bf16`，fp16 走 `GradScaler`，bf16 跳过 scaler；loss 计算强制升 fp32 防止 Dice 分母溢出。
-- **梯度积累 + 裁剪** —— `grad_accum_steps` 末尾自动补齐 partial-tail，`grad_clip_norm` 在 unscale 之后做。
-- **EMA** —— `ModelEMA` 用 in-place swap；验证时 `ema.apply_shadow → validate → ema.restore`，异常安全（context manager）。
-- **`torch.compile`** —— `compile_mode` ∈ `none/default/reduce-overhead/max-autotune`，存盘前自动 unwrap。
+- **Pipeline 选择** —— `__init__` 中 `self.pipeline = build_pipeline(cfg, base_loss)` 一次性决定模式；后续 `_train_epoch` / `_validate` 只调用 `pipeline.prepare_batch` / `pipeline.compute_loss` / `pipeline.prepare_val_batch`，不再有任何模式 if 分支。
+- **AMP** —— `use_amp + amp_dtype=auto|fp16|bf16`，fp16 走 `GradScaler`，bf16 跳过 scaler；损失计算强制升 fp32 防止 Dice 分母溢出（见 `trainer.amp.compute_loss_fp32`）。
+- **梯度累积 + 裁剪** —— `grad_accum_steps` 末尾自动补齐 partial-tail（`Trainer._effective_accum`），`grad_clip_norm` 在 unscale 之后做。
+- **EMA** —— `ModelEMA` 用 in-place swap；验证时 `ema.apply_shadow → validate → ema.restore`，异常安全（context manager `_ema_swapped`）。
+- **`torch.compile`** —— `compile_mode` ∈ `none/default/reduce-overhead/max-autotune`，存盘前自动 unwrap（`trainer.checkpoint.unwrap_compile`）。
 - **Checkpoint** —— full-state（model + EMA shadow + optimizer + scheduler + scaler + epoch + RNG + early-stop 计数器）；`resume` 完整恢复，`pretrain` 仅加载 model 权重（可选 `pretrain_load_ema=True` 用 EMA shadow 作为迁移起点；`pretrain_strict=False` 允许 head 形状不一致）。
 - **指标** —— 训练用 `compute_dice_per_class`（单 batch），验证使用 `dice_batch_stats` 跨 batch 池化 Dice（nnU-Net 约定）；best 默认按 `mean_dice` 取 max。
 - **Early stopping** —— `train.early_stopping=N` 启用，0 关闭。
+
+> **新增模式怎么办？** 只需在 `pipelines/` 加一个 `XxxPipeline(ViewPipeline)`、在 `factory.py` 决策树里加一行 if，**`Trainer` 无需任何改动**。等价性请在 `test_pipelines.py::TestComputeLossEquivalence` 仿照现有用例补一条。
 
 ### 3.8 `predictor.py` —— 滑动窗口推理
 
@@ -670,7 +688,7 @@ predict.py
 
 - **新增一种损失**：在 `@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py` 里加 `class XxxLoss(nn.Module)`，在 `build_loss` 工厂分支里注册名字，在 `Config.validate()` 的 `loss.name` 白名单里加上字符串，最后写一份回归测试到 `test_new_losses.py`。
 - **新增一种 backbone**：在 `models/` 下加 `xxx.py`（参考 `resnet.py` / `convnext.py`），实现一个 `XxxStage(in_ch, out_ch, n_blocks, ...)`，在 `models/factory.py` 添加 `_make_xxx_stage_builder` + 把 `cfg.model.backbone == "xxx"` 接进 `build_model`，并在 `ModelConfig.validate` 加白名单。
-- **新增一种 patch 模式**：在 `data/dataset.py` 加 `SegDataset3DXxx`；在 `data/loader.build_dataloaders` 加分支；在 `Config.sync` / `validate` 决定 `spatial_dims` / `in_channels`；trainer 的 `_split_views_*` / predictor 的 `_sliding_window_*` 需要镜像消费。注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
+- **新增一种 patch 模式**：在 `data/dataset.py` 加 `SegDataset3DXxx`；在 `data/specs.py` 加 `XxxSpec(DatasetSpec)` + 在 `build_data_spec` 决策树加 1 行（`build_dataloaders` 不动）；在 `Config.sync` / `validate` 决定 `spatial_dims` / `in_channels`；在 `trainer/pipelines/` 加对应 `ViewPipeline` + `factory.py` 决策树加 1 行；predictor 的 `_sliding_window_*` 需要镜像消费。注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
 - **新增一个 stem 或多 FOV 融合策略**：在 `models/stem.py` 加类 + 在 `build_stem` / `build_context_stem` 注册；`Config.validate` 的 `stem_mode` / `context_fusion` 白名单。
 - **改命名/路径约定**：所有规则集中在 `data/loader._match_per_sample_paths` 和 `data/make_data._stem`，改一处即可。
 

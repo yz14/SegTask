@@ -12,12 +12,8 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from ..config import Config
-from .dataset import (
-    SegDataset3D,
-    SegDataset3DCubic,
-    SegDataset3DWhole,
-    load_nifti,
-    load_npz_label_for_split)
+from .dataset import load_nifti, load_npz_label_for_split
+from .specs import DatasetCommonCfg, SplitPaths, build_data_spec
 
 logger = logging.getLogger(__name__)
 
@@ -515,104 +511,23 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         logger.info("Split (random): %d train, %d val",
                     len(train_idx), len(val_idx))
 
-    cache = dc.cache_mode == "memory"
-    rw    = cfg.loss.region_weights if cfg.loss.region_weights else None
-    # train oversample ≥ 1.0（多余留给增强）；val 始终 1.0 以完全对齐 patch_size。
-    train_oversample = max(dc.aug_oversample_ratio, 1.0)
-    common_kwargs = dict(
-        label_values      = dc.label_values,
-        patch_size        = tuple(dc.patch_size),
-        intensity_min     = dc.intensity_min,
-        intensity_max     = dc.intensity_max,
-        normalize         = dc.normalize,
-        global_mean       = dc.global_mean,
-        global_std        = dc.global_std,
-        cache_enabled     = cache,
-        cache_max_volumes = getattr(dc, "cache_max_volumes", 0),
-        region_weights    = rw)
-    # z_boundary_mode 仅 z_axis/2.5d 入参。
-    z_kwargs = dict(z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"))
+    # 模式无关的公共构造参数 + 单 split 路径包装。
+    common_cfg = DatasetCommonCfg.from_cfg(cfg)
+    train_paths = SplitPaths(
+        image_paths=[image_paths[i] for i in train_idx],
+        label_paths=[label_paths[i] for i in train_idx],
+        npz_paths=[npz_paths_all[i] for i in train_idx])
+    val_paths = SplitPaths(
+        image_paths=[image_paths[i] for i in val_idx],
+        label_paths=[label_paths[i] for i in val_idx],
+        npz_paths=[npz_paths_all[i] for i in val_idx])
 
-    # NPZ-only 训练：bbox/region-weight 预烘在 npz 包中。
-    train_paths = dict(
-        image_paths = [image_paths[i] for i in train_idx],
-        label_paths = [label_paths[i] for i in train_idx],
-        npz_paths   = [npz_paths_all[i] for i in train_idx])
-    val_paths = dict(
-        image_paths = [image_paths[i] for i in val_idx],
-        label_paths = [label_paths[i] for i in val_idx],
-        npz_paths   = [npz_paths_all[i] for i in val_idx])
-
-    # dataset 侧已统一只输出 max-FOV 3D cube；多分辨率拆视图全部交由 trainer/predictor 完成，
-    # 故 2.5D / z_axis 共用 SegDataset3D 构造路径，仅日志区分。
-    if dc.patch_mode in ("2_5d", "z_axis"):
-        n_views   = max(len(dc.multi_res_scales), 1)
-        max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
-        logger.info(
-            "Using %s patch mode (oversample=%.2f, scales=%s, n_views=%d, "
-            "max_scale=%.2f, z_boundary=%s) — SINGLE max-FOV z-cube extraction; "
-            "trainer crops+resizes per view before forward.",
-            dc.patch_mode.upper(), train_oversample, dc.multi_res_scales,
-            n_views, max_scale, z_kwargs["z_boundary_mode"])
-        train_ds = SegDataset3D(
-            **train_paths,
-            aug_oversample_ratio        = train_oversample,
-            multi_res_scales            = dc.multi_res_scales,
-            foreground_oversample_ratio = dc.foreground_oversample_ratio,
-            samples_per_volume          = dc.samples_per_volume,
-            is_train                    = True,
-            **common_kwargs,
-            **z_kwargs)
-        val_ds = SegDataset3D(
-            **val_paths,
-            aug_oversample_ratio        = 1.0,
-            multi_res_scales            = dc.multi_res_scales,
-            foreground_oversample_ratio = 0.0,
-            samples_per_volume          = max(dc.samples_per_volume // 2, 1),
-            is_train                    = False,
-            **common_kwargs,
-            **z_kwargs)
-    elif dc.patch_mode == "whole":
-        logger.info("Using WHOLE-VOLUME patch mode (oversample=%.2f)",
-                    train_oversample)
-        # whole 忽略 fg oversample / multi_res_scales（Config 已校验）。
-        train_ds = SegDataset3DWhole(
-            **train_paths,
-            aug_oversample_ratio = train_oversample,
-            samples_per_volume   = dc.samples_per_volume,
-            is_train             = True,
-            **common_kwargs)
-        val_ds = SegDataset3DWhole(
-            **val_paths,
-            aug_oversample_ratio = 1.0,
-            samples_per_volume   = max(dc.samples_per_volume // 2, 1),
-            is_train             = False,
-            **common_kwargs)
-    elif dc.patch_mode == "cubic":
-        max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
-        logger.info(
-            "Using CUBIC patch mode (oversample=%.2f, scales=%s, max_scale=%.2f) "
-            "— SINGLE max-FOV cube extraction; trainer crops+resizes per view "
-            "before the 3D forward.",
-            train_oversample, dc.multi_res_scales, max_scale)
-        train_ds = SegDataset3DCubic(
-            **train_paths,
-            aug_oversample_ratio        = train_oversample,
-            multi_res_scales            = dc.multi_res_scales,
-            foreground_oversample_ratio = dc.foreground_oversample_ratio,
-            samples_per_volume          = dc.samples_per_volume,
-            is_train                    = True,
-            **common_kwargs)
-        val_ds = SegDataset3DCubic(
-            **val_paths,
-            aug_oversample_ratio        = 1.0,
-            multi_res_scales            = dc.multi_res_scales,
-            foreground_oversample_ratio = 0.0,
-            samples_per_volume          = max(dc.samples_per_volume // 2, 1),
-            is_train                    = False,
-            **common_kwargs)
-    else:
-        raise ValueError(f"Unknown patch_mode: {dc.patch_mode!r}")
+    # 唯一的 patch_mode 决策点；所有"split-dependent kwargs"（aug_oversample
+    # / samples_per_volume / fg_ratio）由 spec 内部按 is_train 切换。
+    spec = build_data_spec(cfg)
+    spec.log_summary()
+    train_ds = spec.make_split(train_paths, is_train=True, common=common_cfg)
+    val_ds = spec.make_split(val_paths, is_train=False, common=common_cfg)
 
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}
