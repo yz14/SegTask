@@ -704,6 +704,7 @@ class Trainer:
                 k: v for k, v in train_metrics.items()
                 if k.startswith("L_main") or k.startswith("L_aux_")
                 or k.startswith("w_aux_")
+                or k.startswith("L_res_") or k.startswith("L_aux_res_")
             }
             aux_msg = self._format_breakdown(aux_summary_dict)
             logger.info(
@@ -829,22 +830,6 @@ class Trainer:
                 else:
                     image, label, wmap = self._squeeze_2_5d(image, label, wmap)
 
-            import SimpleITK as sitk
-            debug_path = './debug1'
-            os.makedirs(debug_path, exist_ok=True)
-            imgs = torch.chunk(image, [12, 16, 24], dim=1)
-            for jj, (a,b,c) in enumerate(zip(imgs, [label]+aux_view_labels, [wmap]+aux_view_wmaps)):
-                aa = a.detach().cpu().numpy()
-                aa = sitk.GetImageFromArray(aa)
-                sitk.WriteImage(aa, f"{debug_path}/{jj}a.nii.gz")
-                aa = b.detach().cpu().numpy()
-                aa = sitk.GetImageFromArray(aa)
-                sitk.WriteImage(aa, f"{debug_path}/{jj}b.nii.gz")
-                aa = c.detach().cpu().numpy()
-                aa = sitk.GetImageFromArray(aa)
-                sitk.WriteImage(aa, f"{debug_path}/{jj}c.nii.gz")
-            raise
-            
             # 有效累积分母（尾巴 step 用真尾长）
             if remainder > 0 and step >= partial_start:  # TODO 不太懂
                 effective_accum = remainder
@@ -867,6 +852,8 @@ class Trainer:
             else:
                 loss = self._compute_loss_fp32(
                     self.criterion, pred, label, weight_map=wmap)
+            # 多分辨率诊断：把每个分辨率的 base_loss 标量写到 breakdown，配合 TODO #1 排查。
+            self._collect_multi_res_breakdown(breakdown)
             if effective_accum > 1:
                 loss = loss / effective_accum
 
@@ -942,6 +929,34 @@ class Trainer:
             out[name] = meter.avg
         return out
 
+    def _collect_multi_res_breakdown(self, breakdown: Dict[str, float]) -> None:
+        """从 criterion / aux_inner_loss(es) 里抽 MultiResolutionLoss 的 per-res 诊断到 breakdown。
+
+        - 主路：键为 ``L_res_{r}``。
+        - aux 路（lift 时为 MultiResolutionLoss）：键为 ``L_aux{view_k}_res_{r}``。
+        非 MR criterion（如 2.5D 的 SliceChannelLoss）安静跳过。被 DS 多次调用时
+        ``pop_per_res_diag`` 已对 DS 尺度取均。
+        """
+        # 主路：DS 包过 → criterion.base_loss；否则即 criterion 本身。
+        main_inner = getattr(self.criterion, "base_loss", self.criterion)
+        if isinstance(main_inner, MultiResolutionLoss):
+            diag = main_inner.pop_per_res_diag()
+            if diag is not None:
+                for r, v in enumerate(diag):
+                    if math.isfinite(v):
+                        breakdown[f"L_res_{r}"] = v
+
+        # aux 路：仅当存在且为 MR（即 lift_2_5d_to_3d 路径）时收集。
+        aux_inner = getattr(self, "aux_inner_loss", None)
+        if isinstance(aux_inner, MultiResolutionLoss):
+            diag = aux_inner.pop_per_res_diag()
+            if diag is not None:
+                for r, v in enumerate(diag):
+                    if math.isfinite(v):
+                        breakdown[f"L_aux_res_{r}"] = v
+
+        # native_d 的 aux_inner_losses（list of SliceChannelLoss，无 MR）：跳过。
+
     @staticmethod
     def _format_breakdown(breakdown: Dict[str, float]) -> str:
         """渲染 " | L_main=... L_aux_k=...(w=...)"；空 breakdown 返 ""。"""
@@ -951,8 +966,11 @@ class Trainer:
         # L_main 优先，随后按 k 升序输出 L_aux_k。
         if "L_main" in breakdown:
             parts.append(f"L_main={breakdown['L_main']:.4f}")
+        # 仅取真正的 view-aux 键 L_aux_{k}（排除 L_aux_res_*）。
         aux_keys = sorted(
-            (k for k in breakdown if k.startswith("L_aux_")),
+            (k for k in breakdown
+             if k.startswith("L_aux_") and not k.startswith("L_aux_res_")
+             and k.split("_")[-1].isdigit()),
             key=lambda k: int(k.split("_")[-1]))
         for k in aux_keys:
             view_k = k.split("_")[-1]
@@ -961,6 +979,14 @@ class Trainer:
                 parts.append(
                     f"{k}={breakdown[k]:.4f}(w={breakdown[w_key]:.3g})")
             else:
+                parts.append(f"{k}={breakdown[k]:.4f}")
+        # 多分辨率诊断键：L_res_r / L_aux_res_r 按 r 升序输出。
+        for prefix in ("L_res_", "L_aux_res_"):
+            res_keys = sorted(
+                (k for k in breakdown
+                 if k.startswith(prefix) and k[len(prefix):].isdigit()),
+                key=lambda k, p=prefix: int(k[len(p):]))
+            for k in res_keys:
                 parts.append(f"{k}={breakdown[k]:.4f}")
         return " | " + " ".join(parts)
 

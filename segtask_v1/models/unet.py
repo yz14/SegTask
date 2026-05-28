@@ -174,10 +174,12 @@ class DecoderLevel(nn.Module):
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.upsample(x)
 
-        # 奇数尺寸下兜底重采样。
+        # 严格契约：上采样后必须与 skip 同尺寸；不匹配通常意味着输入空间维未按 stride 整除。
         if x.shape[2:] != skip.shape[2:]:
-            raise  # TODO 不允许有尺寸不匹配
-            x = _match_size(x, skip.shape[2:], self.spatial_dims)
+            raise RuntimeError(
+                f"DecoderLevel size mismatch after upsample: "
+                f"x={tuple(x.shape[2:])} vs skip={tuple(skip.shape[2:])}. "
+                f"Check input spatial dims are divisible by total encoder stride.")
 
         if self.attn_gate is not None:
             # 用上采样后的 decoder 特征作 gate。
@@ -390,11 +392,10 @@ class UNet3D(nn.Module):
 
         main_out = self.seg_head(dec_features[-1])
         if main_out.shape[2:] != target_size:
-            raise # TODO 不允许有尺寸不匹配
-            # 还原到输入分辨率。
-            main_out = F.interpolate(
-                main_out, size=target_size,
-                mode=INTERP_SMOOTH[self.spatial_dims], align_corners=False)
+            raise RuntimeError(
+                f"Main seg head output size mismatch: "
+                f"got {tuple(main_out.shape[2:])}, expected {tuple(target_size)}. "
+                f"Check stem_stride / encoder downsampling vs input spatial dims.")
 
         # aux 仅训练时输出；eval 保持原 tensor/list 协议。
         aux_outs: List[torch.Tensor] = []
@@ -402,11 +403,10 @@ class UNet3D(nn.Module):
             for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
                 ao = head(dec_features[feat_idx])
                 if ao.shape[2:] != target_size:
-                    raise  # TODO 不允许有尺寸不匹配
-                    ao = F.interpolate(
-                        ao, size=target_size,
-                        mode=INTERP_SMOOTH[self.spatial_dims],
-                        align_corners=False)
+                    raise RuntimeError(
+                        f"Aux seg head (feat_idx={feat_idx}) output size mismatch: "
+                        f"got {tuple(ao.shape[2:])}, expected {tuple(target_size)}. "
+                        f"Check stem_stride / encoder downsampling vs input spatial dims.")
                 aux_outs.append(ao)
 
         if self.deep_supervision and self.training:

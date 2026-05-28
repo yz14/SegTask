@@ -744,11 +744,30 @@ class MultiResolutionLoss(nn.Module):
         self.label_values = label_values
         self.fg_values    = label_values[1:]  # exclude background
 
+        # 诊断：每次 forward 把每个分辨率的标量损失追加到 history。
+        # 被 DeepSupervisionLoss 多次调用时，history 会累积多次（每个 DS 尺度一行）。
+        # 训练循环每个 step 末尾调用 pop_per_res_diag() 取行均值并清空。
+        self._per_res_history: List[List[float]] = []
+
+    def pop_per_res_diag(self) -> Optional[List[float]]:
+        """取 history 行均（对 DS 尺度做平均），清空并返回；history 为空返 None。"""
+        if not self._per_res_history:
+            return None
+        n_calls = len(self._per_res_history)
+        avg = [0.0] * self.num_res
+        for row in self._per_res_history:
+            for r in range(self.num_res):
+                avg[r] += row[r]
+        avg = [v / n_calls for v in avg]
+        self._per_res_history = []
+        return avg
+
     def forward(
         self, pred: torch.Tensor, label_raw: torch.Tensor, weight_map: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
         """跨全部分辨率计算损失并取均。pred (B,num_fg*C_res,*); label_raw (B,C_res,*) 。"""
         total = pred.new_zeros(())
+        per_res_row: List[float] = []
 
         for r in range(self.num_res):
             pred_r   = pred[:, r * self.num_fg:(r + 1) * self.num_fg]
@@ -760,8 +779,11 @@ class MultiResolutionLoss(nn.Module):
             if weight_map is not None:
                 wm_r = weight_map[:, r:r + 1]  # (B, 1, D, H, W)
 
-            total = total + self.base_loss(pred_r, target_r, weight_map=wm_r)  # TODO 主路径是否应该权重更大？
+            l_r = self.base_loss(pred_r, target_r, weight_map=wm_r)
+            total = total + l_r
+            per_res_row.append(float(l_r.detach().item()))
 
+        self._per_res_history.append(per_res_row)
         return total / self.num_res
 
     def _label_to_binary(self, label: torch.Tensor) -> torch.Tensor:
