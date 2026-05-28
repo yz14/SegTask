@@ -45,4 +45,4 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 3 最后2的数据基础上，彻底检查一遍损失函数，是否都正确实现了，对应我这样的数据是否可行，是否有问题。
 
-4 在unet.py这里我有一个注释，是否用encoder_channels[n - 1 - i]会更好，因为out_ch=skip_ch会压缩更多，而out_ch=in_ch压缩的少一些，请分析。
+4 在val挑选模型的时候，目前就是dice, loss, surface dice，有时候对于大目标，dice很高不一定能反应问题，所以我增加了surface dice，还有没有其它可靠，反应多维度的信息的指标可以来挑选模型，同时不要引入太多的时间消耗，所有的指标必须只能在gpu算

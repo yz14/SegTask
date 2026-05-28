@@ -122,8 +122,21 @@ train:
   ema_decay: 0.999
   output_dir: "outputs/lung_convnext"
   save_every: 10
-  save_best_metric: "mean_dice"
-  save_best_mode: "max"
+
+  # 任务化预设：肺实质场景 dice 易饱和（0.97+），用 dice+surface_dice 把
+  # 边界质量拉进选模。"lung" 预设展开为：
+  #   save_best_criterion: "dice+surface_dice"
+  #   surface_dice_tolerance: 1
+  #   surface_dice_weight: 0.5
+  # 改用其他预设：lung / vessel / airway / bone_multi / lymph_node /
+  #              lesion_small / oar_multi / heart_chamber / bone_lung_combined
+  # 留空 "" = 不启用，沿用下方三字段（默认 criterion=dice）。
+  save_best_preset: "lung"
+  # 以下三字段仅在 save_best_preset="" 时生效（被预设时会被覆盖）。
+  # save_best_criterion: "dice"
+  # surface_dice_tolerance: 1
+  # surface_dice_weight: 0.5
+
   early_stopping: 15
   log_every: 10
   val_every: 1

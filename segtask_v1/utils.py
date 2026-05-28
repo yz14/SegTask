@@ -6,7 +6,7 @@ import logging
 import os
 import random
 import time
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -144,14 +144,112 @@ def dice_batch_stats(
     target: torch.Tensor,
     threshold: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
-    """逐类汇汇 (inter, denom, n_with_gt)，供 nnU-Net pooled dice：final_dice[c]=2·Σinter[c]/Σdenom[c]。"""
+    """逐类汇汇 batch 级混淆量，供 nnU-Net 风格 pooled 指标（Σ分子/Σ分母）。
+
+    返回（每键为长度 C 的张量，``voxels`` 为标量）：
+      * ``inter``     = ΣTP                （= Σ(p·t)）
+      * ``denom``     = Σ(|p|+|t|)         （= 2·ΣTP + ΣFP + ΣFN）
+      * ``pred_sum``  = Σ|p|               （= ΣTP + ΣFP）
+      * ``target_sum``= Σ|t|               （= ΣTP + ΣFN）
+      * ``voxels``    = Σ每样本空间体素数 （= ΣTP + ΣFP + ΣFN + ΣTN，类共享）
+      * ``n_with_gt`` = 该 batch 中含正例 GT 的样本数（per-class）
+
+    由这五个量可零额外通信地导出 dice / iou / recall / precision /
+    volume_similarity / mcc 等指标，详见 ``derive_overlap_metrics``。
+    旧字段 ``inter``/``denom``/``n_with_gt`` 完全保留以兼容已有调用方。
+    """
     pred_bin = (torch.sigmoid(pred) > threshold).float()
     p = rearrange(pred_bin, 'b c ... -> b c (...)')
     t = rearrange(target, 'b c ... -> b c (...)')
-    inter = (p * t).sum(dim=(0, 2))
-    denom = p.sum(dim=(0, 2)) + t.sum(dim=(0, 2))
-    n_with_gt = (t.sum(dim=2) > 0).sum(dim=0).float()
-    return {"inter": inter, "denom": denom, "n_with_gt": n_with_gt}
+    pred_sum   = p.sum(dim=(0, 2))
+    target_sum = t.sum(dim=(0, 2))
+    inter      = (p * t).sum(dim=(0, 2))
+    denom      = pred_sum + target_sum
+    n_with_gt  = (t.sum(dim=2) > 0).sum(dim=0).float()
+    # 类共享：B * spatial_numel。用 float64 累加，防止超大体素数在长 val 集上
+    # 触及 float32 精度上限（>16M 后整数误差非零）。
+    voxels = torch.tensor(
+        float(p.shape[0]) * float(p.shape[2]),
+        dtype=torch.float64, device=p.device)
+    return {
+        "inter":      inter,
+        "denom":      denom,
+        "pred_sum":   pred_sum,
+        "target_sum": target_sum,
+        "voxels":     voxels,
+        "n_with_gt":  n_with_gt,
+    }
+
+
+@torch.no_grad()
+def derive_overlap_metrics(
+    inter:      torch.Tensor,
+    pred_sum:   torch.Tensor,
+    target_sum: torch.Tensor,
+    voxels:     torch.Tensor,
+    smooth:     float = 1e-5,
+) -> Dict[str, torch.Tensor]:
+    """由 pooled 混淆量闭式导出多维度逐类指标（全部为长度 C 的张量，GPU 上）。
+
+    参数对应 ``dice_batch_stats`` 累加后的总和；``voxels`` 为类共享标量
+    （B*spatial_numel 的总和），用于推算 TN。
+
+    返回键：
+      * ``dice``       = (2·TP+ε)/(2·TP+FP+FN+ε)        — 与现有 pooled dice 一致。
+      * ``iou``        = (TP+ε)/(TP+FP+FN+ε)            — Jaccard，比 Dice 更严格。
+      * ``recall``     = (TP+ε)/(TP+FN+ε)               — 灵敏度，反映欠分割。
+      * ``precision``  = (TP+ε)/(TP+FP+ε)               — PPV，反映过分割。
+      * ``vol_sim``    = 1 − |FP−FN|/(2·TP+FP+FN+ε)     — 与空间重叠解耦的体积一致性。
+      * ``mcc``        = (TP·TN−FP·FN)/√((TP+FP)(TP+FN)(TN+FP)(TN+FN)+ε)
+                                                          — 类极不平衡下最稳健的单指标，∈[−1,1]。
+
+    所有除法平滑过；分母全 0 的类（既无 GT 又无 pred）返回 0 而非 NaN。
+    """
+    inter      = inter.double()
+    pred_sum   = pred_sum.double()
+    target_sum = target_sum.double()
+    voxels_d   = voxels.double()
+
+    tp = inter
+    fp = (pred_sum - inter).clamp(min=0)
+    fn = (target_sum - inter).clamp(min=0)
+    tn = (voxels_d - tp - fp - fn).clamp(min=0)
+
+    eps = float(smooth)
+    dice      = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
+    iou       = (tp + eps) / (tp + fp + fn + eps)
+    recall    = (tp + eps) / (tp + fn + eps)
+    precision = (tp + eps) / (tp + fp + eps)
+    vol_sim   = 1.0 - (fp - fn).abs() / (2.0 * tp + fp + fn + eps)
+
+    # MCC：四个边际全部非零才有定义；任一为零按 0 处理（避免 NaN 影响选模）。
+    mcc_num   = tp * tn - fp * fn
+    mcc_den2  = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+    valid     = mcc_den2 > 0
+    mcc       = torch.where(
+        valid, mcc_num / torch.sqrt(mcc_den2.clamp(min=eps)),
+        torch.zeros_like(mcc_num))
+
+    return {
+        "dice":      dice.float(),
+        "iou":       iou.float(),
+        "recall":    recall.float(),
+        "precision": precision.float(),
+        "vol_sim":   vol_sim.float(),
+        "mcc":       mcc.float(),
+    }
+
+
+@torch.no_grad()
+def harmonic_mean_metrics(values: List[torch.Tensor], smooth: float = 1e-5) -> torch.Tensor:
+    """多个 [0,1] 标量指标的调和均值。任一指标接近 0 会强力拉低结果，
+    适合做"短板放大"的综合选模标准。所有输入需为同 device 的 0-d 张量。"""
+    if not values:
+        return torch.zeros((), dtype=torch.float32)
+    stacked = torch.stack([v.float().clamp(min=0.0, max=1.0) for v in values])
+    n = float(stacked.numel())
+    inv_mean = (1.0 / (stacked + smooth)).mean()
+    return (1.0 / inv_mean).clamp(min=0.0, max=1.0) if n > 0 else stacked.mean()
 
 
 def _binary_erosion_pool(mask: torch.Tensor, ndim: int) -> torch.Tensor:

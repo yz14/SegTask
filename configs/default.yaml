@@ -179,8 +179,30 @@ train:
 
   output_dir: "outputs"
   save_every: 10
-  save_best_metric: "mean_dice"
-  save_best_mode: "max"                  # 'max' | 'min'
+
+  # ---- 选模标准（任选其一思路）-----------------------------------------
+  # 方式 A（推荐）：用 criterion，sync() 自动派生 save_best_metric/mode：
+  #   "loss"              → val_loss ↓
+  #   "dice"              → mean_dice ↑              （单类/大目标默认）
+  #   "dice+surface_dice" → mean_combined ↑          （肺/大实质器官）
+  #   "iou"               → mean_iou ↑               （比 dice 更严格）
+  #   "mcc"               → mean_mcc ↑               （小目标/类极不平衡）
+  #   "min_dice"          → min_class_dice ↑         （多类，守最差类）
+  #   "balanced"          → mean_balanced ↑          （dice/sd/iou/mcc 调和均值）
+  save_best_criterion: "dice"
+  surface_dice_tolerance: 1              # τ 体素；仅 dice+surface_dice / balanced 用
+  surface_dice_weight: 0.5               # combined 中 sd 权重；仅 dice+surface_dice 用
+
+  # 方式 B（一键预设）：留空 = 不启用。非空时覆盖上述 criterion / tol / w：
+  #   lung / vessel / airway / bone_multi / lymph_node / lesion_small /
+  #   oar_multi / heart_chamber / bone_lung_combined
+  save_best_preset: ""
+
+  # 方式 C（手控底层字段）：仅在你完全清楚要绕过 criterion 解析时用。
+  # 当 save_best_criterion 已合法时无需手设；显式设了也会被 sync 覆盖。
+  # save_best_metric: "mean_dice"
+  # save_best_mode  : "max"              # 'max' | 'min'
+  # ---------------------------------------------------------------------
 
   early_stopping: 0                      # 0 = 禁用
 

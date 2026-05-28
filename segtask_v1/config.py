@@ -397,7 +397,15 @@ class TrainConfig:
     # Checkpoint 保存。
     output_dir      : str = "outputs"
     save_every      : int = 10
-    # 选模标准: "loss" | "dice" | "dice+surface_dice"。覆盖下方 metric/mode（见 sync()）。
+    # 选模标准（互斥）：
+    #   * "loss"              → val_loss ↓
+    #   * "dice"              → mean_dice ↑
+    #   * "dice+surface_dice" → mean_combined = (1−w)·dice + w·sd ↑
+    #   * "iou"               → mean_iou ↑                （Jaccard，对边界更严格）
+    #   * "mcc"               → mean_mcc ↑                （类不平衡稳健，∈[−1,1]）
+    #   * "min_dice"          → min_class_dice ↑          （短板：最差类 dice）
+    #   * "balanced"          → mean_balanced ↑           （dice/sd/iou/mcc01 调和均值）
+    # 任一选项均覆盖下方 metric/mode（见 _resolve_save_best_criterion）。
     save_best_criterion: str = "dice"
     # 内部解析字段（一般无需手动设）；sync() 会按 criterion 重写。
     save_best_metric: str = "mean_dice"
@@ -406,6 +414,12 @@ class TrainConfig:
     surface_dice_tolerance: int = 1
     # 组合标准下 combined = (1-w)*dice + w*surface_dice。
     surface_dice_weight: float = 0.5
+    # 任务化推荐预设：非空时由 sync() 覆盖上面三项 (criterion / tolerance / weight)。
+    # 仅作"任务名 → 经验上推荐组合"的一键映射，便于复用与切任务。空串 = 不启用，
+    # 完全沿用用户显式设置的三个字段。可选值见 ``_SAVE_BEST_PRESETS``：
+    #   lung / vessel / airway / bone_multi / lymph_node / lesion_small /
+    #   oar_multi / heart_chamber / bone_lung_combined
+    save_best_preset: str = ""
 
     # 提前停止（0=禁用）。
     early_stopping: int = 0
@@ -429,6 +443,75 @@ class TrainConfig:
 
     # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
+
+
+# ---------------------------------------------------------------------------
+# 任务化推荐预设：``train.save_best_preset`` → (criterion, sd_tol, sd_w)。
+# 设计来源详见 docs/选模标准建议（与 ``derive_overlap_metrics`` 引入的多维度
+# pooled 指标配套）。每个 preset 仅覆盖三个底层字段，下游 trainer / validate
+# 不感知 preset 本身的存在 —— 单一真相源仍是 (criterion, sd_tol, sd_w)。
+#
+# 用法（yaml）::
+#     train:
+#       save_best_preset: vessel    # 留空 / 删除 = 不启用，沿用显式三个字段
+# ---------------------------------------------------------------------------
+_SAVE_BEST_PRESETS: Dict[str, Dict[str, Any]] = {
+    # 大实质器官：dice 易饱和，需用表面 dice 把边界质量拉进选模。
+    "lung": {
+        "save_best_criterion": "dice+surface_dice",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+    # 薄管状（血管）：dice 对断裂极不敏感；用 balanced 综合 dice/sd/iou/mcc，
+    # tol=2 给重建几何留 1-2 体素余地。建议配合 dice_cldice 损失。
+    "vessel": {
+        "save_best_criterion": "balanced",
+        "surface_dice_tolerance": 2,
+        "surface_dice_weight": 0.5,
+    },
+    # 气道（拓扑敏感）：与血管同思路；建议配合 dice_cldice 损失。
+    "airway": {
+        "save_best_criterion": "balanced",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+    # 多块骨头：min_dice 守护最差类，防止漏一块被 mean_dice 掩盖。
+    "bone_multi": {
+        "save_best_criterion": "min_dice",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+    # 小淋巴结：极端类不平衡 + 小目标，MCC 最稳健（不可用 surface dice 作主指标）。
+    "lymph_node": {
+        "save_best_criterion": "mcc",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+    # 小病灶：同 lymph_node。
+    "lesion_small": {
+        "save_best_criterion": "mcc",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+    # 多器官 OAR（大小差异巨大）：min_dice 直接守底线；监控 balanced。
+    "oar_multi": {
+        "save_best_criterion": "min_dice",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+    # 心脏腔室 / 软组织块：表面质量与体积一致性都重要，sd 权重略低。
+    "heart_chamber": {
+        "save_best_criterion": "dice+surface_dice",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.4,
+    },
+    # 用户当前 lung+bone 多任务（带强 region weight）：balanced 是稳妥折中。
+    "bone_lung_combined": {
+        "save_best_criterion": "balanced",
+        "surface_dice_tolerance": 1,
+        "surface_dice_weight": 0.5,
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -525,15 +608,47 @@ class Config:
         self.model.spatial_dims = topo.spatial_dims
 
         self._apply_resenc_preset()
+        # 顺序：先用任务化预设覆盖三个底层字段，再由 criterion → metric/mode。
+        self._apply_save_best_preset()
         self._resolve_save_best_criterion()
+
+    def _apply_save_best_preset(self) -> None:
+        """``train.save_best_preset`` 非空时覆盖 (criterion, tolerance, weight)。
+
+        预设由 ``_SAVE_BEST_PRESETS`` 定义；空串表示不启用、保留用户显式设置。
+        非法预设名不在此处报错（避免 sync() 中产生 hard fail），由
+        ``validate()`` 给出可读错误。本方法仅做"已知则覆盖"。
+        """
+        name = str(self.train.save_best_preset or "").strip().lower()
+        if not name:
+            return
+        spec = _SAVE_BEST_PRESETS.get(name)
+        if spec is None:
+            return  # validate() 报错
+        tc = self.train
+        prev = (tc.save_best_criterion, tc.surface_dice_tolerance,
+                tc.surface_dice_weight)
+        tc.save_best_criterion    = str(spec["save_best_criterion"])
+        tc.surface_dice_tolerance = int(spec["surface_dice_tolerance"])
+        tc.surface_dice_weight    = float(spec["surface_dice_weight"])
+        new = (tc.save_best_criterion, tc.surface_dice_tolerance,
+               tc.surface_dice_weight)
+        if prev != new:
+            logger.info(
+                "save_best_preset=%r overrode (criterion, sd_tol, sd_w): "
+                "%s → %s.", name, prev, new)
 
     def _resolve_save_best_criterion(self) -> None:
         """criterion → (save_best_metric, save_best_mode) 映射；显式覆盖低层字段。"""
         crit = str(self.train.save_best_criterion).lower().strip()
         mapping = {
-            "loss": ("val_loss", "min"),
-            "dice": ("mean_dice", "max"),
-            "dice+surface_dice": ("mean_combined", "max"),
+            "loss":              ("val_loss",        "min"),
+            "dice":              ("mean_dice",       "max"),
+            "dice+surface_dice": ("mean_combined",   "max"),
+            "iou":               ("mean_iou",        "max"),
+            "mcc":               ("mean_mcc",        "max"),
+            "min_dice":          ("min_class_dice",  "max"),
+            "balanced":          ("mean_balanced",   "max"),
         }
         if crit in mapping:
             self.train.save_best_metric, self.train.save_best_mode = mapping[crit]
@@ -804,10 +919,20 @@ class Config:
             "All multi_res_scales must be >= 1.0"
         assert self.train.save_best_mode in ("max", "min"), \
             f"Invalid save_best_mode: {self.train.save_best_mode}"
-        assert str(self.train.save_best_criterion).lower() in (
-            "loss", "dice", "dice+surface_dice"), (
+        _valid_crits = (
+            "loss", "dice", "dice+surface_dice",
+            "iou", "mcc", "min_dice", "balanced",
+        )
+        assert str(self.train.save_best_criterion).lower() in _valid_crits, (
             f"Invalid save_best_criterion: {self.train.save_best_criterion!r}; "
-            f"expected one of 'loss' | 'dice' | 'dice+surface_dice'.")
+            f"expected one of: {' | '.join(repr(c) for c in _valid_crits)}.")
+        # save_best_preset 空串 = 不启用；非空必须是已知预设名。
+        preset = str(self.train.save_best_preset or "").strip().lower()
+        if preset:
+            assert preset in _SAVE_BEST_PRESETS, (
+                f"Invalid save_best_preset: {self.train.save_best_preset!r}; "
+                f"expected '' (disabled) or one of: "
+                f"{' | '.join(repr(k) for k in _SAVE_BEST_PRESETS)}.")
         assert int(self.train.surface_dice_tolerance) >= 0, \
             f"surface_dice_tolerance must be >= 0; got {self.train.surface_dice_tolerance}"
         assert 0.0 <= float(self.train.surface_dice_weight) <= 1.0, \
