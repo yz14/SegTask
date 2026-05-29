@@ -419,8 +419,7 @@ class Trainer:
             effective_accum = self._effective_accum(step, total_steps, accum)
 
             # Forward AMP / Loss fp32（Dice/BCE 在 fp16 下汇总易溢出 → NaN）
-            with autocast(device_type="cuda", enabled=self.use_amp,
-                          dtype=self.amp_dtype):
+            with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 pred = self.model(image)
             breakdown: Dict[str, float] = {}
             loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
@@ -432,8 +431,7 @@ class Trainer:
             self.scaler.scale(loss).backward()
 
             # 参数更新
-            is_step_boundary = ((step + 1) % accum == 0
-                                or (step + 1) == total_steps)
+            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_step_boundary:
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
@@ -538,12 +536,10 @@ class Trainer:
 
                 image, label = self.pipeline.prepare_val_batch(image, label)
 
-                with autocast(device_type="cuda", enabled=self.use_amp,
-                              dtype=self.amp_dtype):
+                with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                     pred = self.model(image)
                     pred = self.pipeline.extract_main_pred(pred)
-                    pred_1x, target_1x = self.pipeline.split_for_metrics(
-                        pred, label)
+                    pred_1x, target_1x = self.pipeline.split_for_metrics(pred, label)
                 # 损失 fp32
                 loss = compute_loss_fp32(self.base_loss, pred_1x, target_1x)
 
@@ -604,15 +600,29 @@ class Trainer:
             metrics[f"vol_sim_class_{c}"]   = vs_per_class[c].item()
             metrics[f"mcc_class_{c}"]       = mcc_per_class[c].item()
 
-        metrics["mean_dice"]      = dice_per_class.mean().item()
-        metrics["mean_iou"]       = iou_per_class.mean().item()
-        metrics["mean_recall"]    = rec_per_class.mean().item()
-        metrics["mean_precision"] = pre_per_class.mean().item()
-        metrics["mean_vol_sim"]   = vs_per_class.mean().item()
-        metrics["mean_mcc"]       = mcc_per_class.mean().item()
+        # nnU-Net ignore_empty：整个 val 集都无 GT 的类（cov==0）从 mean_* / min_*
+        # 中剔除——否则其退化值（无 GT 且无 pred 时 Dice=eps/eps=1.0；一旦有假阳
+        # 又跌到 0）会污染 mean_dice / min_class_dice 等选模指标。与
+        # ``compute_dice_per_class(ignore_empty=True)`` 的约定保持一致。
+        gt_mask = (cov_sum.cpu() > 0)
+        if not bool(gt_mask.any()):
+            gt_mask = torch.ones_like(gt_mask)  # 退化：val 全空，回退到全类
+
+        def _masked_mean(v: torch.Tensor) -> float:
+            return v[gt_mask].mean().item()
+
+        def _masked_min(v: torch.Tensor) -> float:
+            return v[gt_mask].min().item()
+
+        metrics["mean_dice"]      = _masked_mean(dice_per_class)
+        metrics["mean_iou"]       = _masked_mean(iou_per_class)
+        metrics["mean_recall"]    = _masked_mean(rec_per_class)
+        metrics["mean_precision"] = _masked_mean(pre_per_class)
+        metrics["mean_vol_sim"]   = _masked_mean(vs_per_class)
+        metrics["mean_mcc"]       = _masked_mean(mcc_per_class)
         # 短板：最差类 dice / iou — 反映"被均值掩盖的崩盘类"。
-        metrics["min_class_dice"] = dice_per_class.min().item()
-        metrics["min_class_iou"]  = iou_per_class.min().item()
+        metrics["min_class_dice"] = _masked_min(dice_per_class)
+        metrics["min_class_iou"]  = _masked_min(iou_per_class)
 
         smooth = 1e-5
         sd_msg = ""
@@ -621,7 +631,7 @@ class Trainer:
             sd_per_class = sd_per_class.cpu()
             for c in range(len(sd_per_class)):
                 metrics[f"surface_dice_class_{c}"] = sd_per_class[c].item()
-            metrics["mean_surface_dice"] = sd_per_class.mean().item()
+            metrics["mean_surface_dice"] = _masked_mean(sd_per_class)
             metrics["mean_combined"] = (
                 (1.0 - sd_w) * metrics["mean_dice"]
                 + sd_w * metrics["mean_surface_dice"])

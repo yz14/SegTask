@@ -573,10 +573,10 @@ class SegDataset3D(SegDatasetNpzBase):
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
                 f"got {z_boundary_mode!r}")
 
-        # 仅 z 轴过采样（供增强后中心裁减边街）；H/W 一次 resize 到 patch_size。
+        # 仅 z 轴过采样（供增强后中心裁减）；H/W 一次 resize 到 patch_size
         pD, pH, pW = self.patch_size
         self.extract_size = (int(round(pD * self.oversample)), pH, pW)
-        # 多分辨率 z FOV：multi_res_scales=[1.0] 单分辨率；len>1 时 view 0 必为 1.0（canonical）。
+        # 多分辨率 z FOV：multi_res_scales=[1.0] 单分辨率；len>1 时 view 0 必为 1.0
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
         assert all(s >= 1.0 for s in self.multi_res_scales), (
             f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")

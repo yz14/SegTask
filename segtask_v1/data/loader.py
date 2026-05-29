@@ -457,7 +457,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             "data.npz_dir=%s is empty/missing — auto-building via "
             "make_data.prepare_dataset (workers=%d). One-time cost; ",
             npz_dir, max(dc.num_workers, 1))
-        from .make_data import prepare_dataset  # 本地导入（重依赖）
+        from .make_data import prepare_dataset
         counters = prepare_dataset(
             cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
         logger.info(

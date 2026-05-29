@@ -225,6 +225,40 @@ train:
 
   output_dir      : "outputs/lung_bone_convnext"
   save_every      : 10
+
+  # ===== 选模标准（挑 best_model.pth 的依据）=====
+  # save_best_criterion：主开关，覆盖下方 save_best_metric/save_best_mode。可选：
+  #   'loss'              — val_loss ↓。最通用但对边界/碎点不敏感。
+  #   'dice'              — mean_dice ↑（各前景类等权均值）。大器官易饱和。
+  #   'iou'               — mean_iou ↑（Jaccard，比 dice 对边界更严格）。
+  #   'mcc'               — mean_mcc ↑（类极不平衡稳健；TN 主导时≈√(precision·recall)）。
+  #   'min_dice'          — min_class_dice ↑（短板：守最差类，防漏一块被均值掩盖）。
+  #   'dice+surface_dice' — mean_combined=(1-w)·dice + w·surface_dice ↑（把边界质量拉进选模）。
+  #   'balanced'          — mean_balanced ↑（dice/surface_dice/iou/mcc01 调和均值，短板放大）。
+  # 注：mean_*/min_* 均按"该类在 val 集是否出现 GT"做 ignore-empty 掩码。
+  save_best_criterion: "dice"
+
+  # surface_dice_tolerance：表面 Dice 容差（体素，Chebyshev 邻域；0=严格表面 Dice）。
+  #   仅 criterion ∈ {dice+surface_dice, balanced} 时生效。各向异性数据下 z 向物理
+  #   距离与 xy 不同，需酌情调大。
+  surface_dice_tolerance: 1
+  # surface_dice_weight：dice+surface_dice 组合中 surface_dice 的权重 w∈[0,1]。
+  surface_dice_weight: 0.5
+
+  # save_best_preset：任务化一键预设，非空时覆盖上面三项 (criterion/sd_tol/sd_w)。
+  # 留空 = 不启用，沿用上面显式设置。可选：
+  #   'lung'               — dice+surface_dice, tol=1, w=0.5（大实质器官，边界重要）
+  #   'vessel'             — balanced, tol=2, w=0.5（薄管状，建议配 dice_cldice 损失）
+  #   'airway'             — balanced, tol=1, w=0.5（气道拓扑敏感，建议配 dice_cldice）
+  #   'bone_multi'         — min_dice, tol=1, w=0.5（多块骨头，守最差类）
+  #   'lymph_node'         — mcc, tol=1, w=0.5（小淋巴结，极端不平衡）
+  #   'lesion_small'       — mcc, tol=1, w=0.5（小病灶，同上）
+  #   'oar_multi'          — min_dice, tol=1, w=0.5（多器官大小悬殊，守底线）
+  #   'heart_chamber'      — dice+surface_dice, tol=1, w=0.4（软组织块）
+  #   'bone_lung_combined' — balanced, tol=1, w=0.5（本任务 lung+bone 推荐稳妥折中）
+  save_best_preset: ""
+
+  # 内部解析字段：由 sync() 按 criterion/preset 自动重写，一般无需手动设。
   save_best_metric: "mean_dice"
   save_best_mode  : "max"
 

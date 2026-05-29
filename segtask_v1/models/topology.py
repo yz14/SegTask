@@ -93,7 +93,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
     lift           = bool(getattr(mc, "lift_2_5d_to_3d", False)) and is_2_5d
     native_d       = (bool(getattr(dc, "aux_keep_native_d", False)) 
                       and is_2_5d and n_views > 1)
-    keep_native_3d = (bool(getattr(dc, "keep_native_multi_res", False))
+    keep_native_3d = (bool(getattr(dc, "keep_native_multi_res", False))  # TODO 这个是？
                       and pm in ("z_axis", "cubic") and n_views > 1)
     aux_seg_active = (bool(getattr(mc, "aux_seg_supervision", False))
                       and n_views > 1)
@@ -129,7 +129,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
             ds[0] = D
         aux_view_depths = ds
 
-    context_n_views = n_views if is_2_5d else 1
+    context_n_views = n_views if is_2_5d else 1  # TODO 这个命名总是让人混淆，3D也有多分辨率输入，这个怎么才能让人区分2.5D和3D呢？
 
     # ---- native_d 专属 --------------------------------------------------
     in_ch_per_view_list  : Optional[List[int]] = None

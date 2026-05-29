@@ -44,8 +44,8 @@ def build_pipeline(cfg: Config, base_loss) -> ViewPipeline:
     is_2_5d = topo.patch_mode == "2_5d"
 
     if is_2_5d:
-        lift = topo.lift_2_5d_to_3d
-        aux = topo.aux_seg_active
+        lift     = topo.lift_2_5d_to_3d
+        aux      = topo.aux_seg_active
         native_d = topo.aux_keep_native_d
 
         if lift and aux:

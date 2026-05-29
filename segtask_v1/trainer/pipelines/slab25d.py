@@ -292,19 +292,16 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
             views.split_views_native_d(
                 image, label, wmap,
                 aux_view_depths=self.aux_view_depths,
-                target_patch_size=self.target_patch_size,
-            ))
+                target_patch_size=self.target_patch_size))
         return image, SupervisionPack(
             label_main=label_main, wmap_main=wmap_main,
-            aux_labels=aux_labels, aux_wmaps=aux_wmaps,
-        )
+            aux_labels=aux_labels, aux_wmaps=aux_wmaps)
 
     def prepare_val_batch(self, image, label):
         image, label_main, _, _, _ = views.split_views_native_d(
             image, label, None,
             aux_view_depths=self.aux_view_depths,
-            target_patch_size=self.target_patch_size,
-        )
+            target_patch_size=self.target_patch_size)
         return image, label_main
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
@@ -349,5 +346,4 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
 __all__ = [
     "Slab2_5DPipeline",
     "Slab2_5DAuxPipeline",
-    "Slab2_5DNativeDPipeline",
-]
+    "Slab2_5DNativeDPipeline"]

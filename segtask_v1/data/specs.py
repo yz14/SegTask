@@ -94,7 +94,7 @@ class SplitPaths:
 
     image_paths: List[str]
     label_paths: List[str]
-    npz_paths: List[str]
+    npz_paths  : List[str]
 
     def to_kwargs(self) -> dict:
         return dict(
