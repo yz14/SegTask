@@ -246,6 +246,18 @@ class ModelConfig:
     # 上采样："transpose" | "trilinear" | "nearest" | "pixelshuffle" | "carafe" | "dysample"。
     upsample_mode: str = "transpose"
 
+    # 各向异性下采样。True 时按 patch_size 自动推导逐级 per-axis stride：薄轴（如 z）
+    # 分辨率落后才不降采样，避免深层被压成 1（nnU-Net 思路，保持各轴分辨率 2× 以内）。
+    # 仅 decoder_type='unet' + downsample_mode∈{conv,maxpool,avgpool} +
+    # upsample_mode∈{transpose,trilinear,nearest} + 非 ConvNeXt LN-first 下采样时支持。
+    # 2.5D（spatial_dims=2）下 z 折进通道，仅作用于 H/W（通常各向同性，无实质变化）。
+    anisotropic_pooling: bool = False
+
+    # 显式逐级下采样 stride（非空时覆盖 anisotropic_pooling 自动推导）。
+    # 长度 = len(encoder_channels)-1，每项长度 = spatial_dims，值 ∈ {1,2}。
+    # 例（3D，5 级，保 z）：[[1,2,2],[1,2,2],[2,2,2],[2,2,2]]。
+    downsample_strides: List[List[int]] = field(default_factory=list)
+
     # skip："cat" 或 "add"。
     skip_mode: str = "cat"
 
@@ -766,6 +778,19 @@ class Config:
                 f"(= len(encoder_channels) - 1); got {len(dbps)}")
             assert all(b >= 1 for b in dbps), \
                 "decoder_blocks_per_stage entries must all be >= 1"
+        # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
+        sds = self.model.downsample_strides
+        if sds:
+            sd_dim = int(self.model.spatial_dims)
+            assert len(sds) == n_levels - 1, (
+                f"downsample_strides must have {n_levels - 1} entries "
+                f"(= len(encoder_channels) - 1); got {len(sds)}")
+            for s in sds:
+                assert len(s) == sd_dim, (
+                    f"each downsample_strides entry must have "
+                    f"spatial_dims={sd_dim} values; got {list(s)}")
+                assert all(int(v) in (1, 2) for v in s), (
+                    f"downsample_strides values must be 1 or 2; got {list(s)}")
         assert self.loss.name in (
             # 单损失
             "dice", "bce", "focal", "tversky",

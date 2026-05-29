@@ -438,7 +438,6 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     if not npz_dir:
         raise ValueError(
             "data.npz_dir is required for training (npz-only data path). "
-            "Set it to the directory where pre-computed npz packages live "
             "(or should be created); see segtask_v1.data.make_data.")
     npz_suffix = getattr(dc, "npz_suffix", ".npz")
 
@@ -493,8 +492,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     label_loader_fn = load_npz_label_for_split
 
     if not dc.label_values:
-        dc.label_values = detect_label_values(
-            label_paths, label_loader_fn=label_loader_fn)
+        dc.label_values = detect_label_values(label_paths, label_loader_fn=label_loader_fn)
         dc.num_classes  = len(dc.label_values)
         cfg.sync()
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
@@ -512,22 +510,22 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                     len(train_idx), len(val_idx))
 
     # 模式无关的公共构造参数 + 单 split 路径包装。
-    common_cfg = DatasetCommonCfg.from_cfg(cfg)
+    common_cfg  = DatasetCommonCfg.from_cfg(cfg)
     train_paths = SplitPaths(
-        image_paths=[image_paths[i] for i in train_idx],
-        label_paths=[label_paths[i] for i in train_idx],
-        npz_paths=[npz_paths_all[i] for i in train_idx])
+        image_paths = [image_paths[i] for i in train_idx],
+        label_paths = [label_paths[i] for i in train_idx],
+        npz_paths   = [npz_paths_all[i] for i in train_idx])
     val_paths = SplitPaths(
-        image_paths=[image_paths[i] for i in val_idx],
-        label_paths=[label_paths[i] for i in val_idx],
-        npz_paths=[npz_paths_all[i] for i in val_idx])
+        image_paths = [image_paths[i] for i in val_idx],
+        label_paths = [label_paths[i] for i in val_idx],
+        npz_paths   = [npz_paths_all[i] for i in val_idx])
 
     # 唯一的 patch_mode 决策点；所有"split-dependent kwargs"（aug_oversample
     # / samples_per_volume / fg_ratio）由 spec 内部按 is_train 切换。
     spec = build_data_spec(cfg)
     spec.log_summary()
     train_ds = spec.make_split(train_paths, is_train=True, common=common_cfg)
-    val_ds = spec.make_split(val_paths, is_train=False, common=common_cfg)
+    val_ds   = spec.make_split(val_paths, is_train=False, common=common_cfg)
 
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}

@@ -45,4 +45,20 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 3 最后2的数据基础上，彻底检查一遍损失函数，是否都正确实现了，对应我这样的数据是否可行，是否有问题。
 
-4 在val挑选模型的时候，目前就是dice, loss, surface dice，有时候对于大目标，dice很高不一定能反应问题，所以我增加了surface dice，还有没有其它可靠，反应多维度的信息的指标可以来挑选模型，同时不要引入太多的时间消耗，所有的指标必须只能在gpu算
+4 我做了一些对比实验，配置在D:\codes\work-projects\SegTask\configs\segtest0.yaml到segtest5.yaml这6个实验，我目前的分析是：
+探索 a 通道；b deep supervision；c norm layer的影响
+V1 base 通道[32, 64, 128, 256, 256]；no ds；instance
+V2 base 通道[64, 128, 256, 256, 256]；no ds；instance
+V3 在V1上只改ds为True
+V4 在V1上只改norm为batch
+V5 在V2上只改ds为True
+V6 在V2上只改norm为batch
+训练结果dice
+1	2	3	4	5	6
+99.39%	99.45%	99.44%	99.47%	99.46%	99.49%
++ 从val_dice来看增加通道数，增加ds和换batch norm都有提升，而且batch norm似乎提升最多
+! 由于dice没有反应全部，是否可以增加surface dice来提供更多的信息？
+! 需要主观评测，并在V1的结果中挑选典型样例
+从主观结果看：
+从以上结果来看也确实如此，batch norm提升最多，ds其次，增加通道提升有限。初步确定问题出在norm层。
+请你仔细的，详细的全面检查一遍所有代码，算法等等，看看是否有什么问题，需要认真，彻底的分析

@@ -32,7 +32,8 @@ class Encoder(nn.Module):
         context_n_views    : int = 1,
         context_fusion     : str = "shared_stem",
         in_ch_per_view_list: List[int] = None,
-        downsample_builder : Optional[Callable[[int, int], nn.Module]] = None):
+        downsample_builder : Optional[Callable[[int, int], nn.Module]] = None,
+        downsample_strides : Optional[List] = None):
         super().__init__()
         self.spatial_dims = spatial_dims
         # patchN stem 引入空间 stride，外层 UNet 用 stem_stride 补尾部上采样。
@@ -77,6 +78,15 @@ class Encoder(nn.Module):
         # Encoder stages and downsampling
         self.stages      = nn.ModuleList()
         self.downsamples = nn.ModuleList()
+        # 逐级下采样 stride（各向异性）。None → 全程各向同性 2。长度需 = 级数-1。
+        n_down = len(stage_channels) - 1
+        if downsample_strides is not None and len(downsample_strides) != n_down:
+            raise ValueError(
+                f"downsample_strides length ({len(downsample_strides)}) must "
+                f"equal len(stage_channels)-1 ({n_down}).")
+        self.downsample_strides: List = (
+            list(downsample_strides) if downsample_strides is not None
+            else [2] * n_down)
 
         for i, ch in enumerate(stage_channels):
             in_ch = stage_channels[i - 1] if i > 0 else stage_channels[0]
@@ -93,7 +103,8 @@ class Encoder(nn.Module):
                         Downsample(  # TODO 这里最后一层是norm，确定没有问题吗？需要加act吗？
                             ds_in, ds_out,
                             norm_type=norm_type, norm_groups=norm_groups,
-                            mode=downsample_mode, spatial_dims=spatial_dims))
+                            mode=downsample_mode, spatial_dims=spatial_dims,
+                            stride=self.downsample_strides[i - 1]))
 
         # 仅 hierarchical stem：每级 cat(main, aux) → 1×1 → stage_channels[k-1]。key 为 str(level)。
         self.aux_fuse = nn.ModuleDict()
@@ -118,7 +129,7 @@ class Encoder(nn.Module):
             x = self.stem(x)
             aux_feats = {}
 
-        features: List[torch.Tensor] = []  # TODO 需要加入stem的特征吗？这是一个全局特征，可以cat到seghead的输入特征（可能不需要因为enc第0层就是全局）
+        features: List[torch.Tensor] = []
         for i, stage in enumerate(self.stages):
             if i > 0:
                 x = self.downsamples[i - 1](x)
@@ -150,12 +161,14 @@ class DecoderLevel(nn.Module):
         upsample_mode : str = "transpose",
         skip_mode     : str = "cat",
         skip_attention: bool = False,
-        spatial_dims  : int = 3):
+        spatial_dims  : int = 3,
+        upsample_stride = 2):
         super().__init__()
         self.skip_mode    = skip_mode
         self.spatial_dims = spatial_dims
         self.upsample     = Upsample(in_ch, out_ch, mode=upsample_mode,
-                                  spatial_dims=spatial_dims)
+                                     spatial_dims=spatial_dims,
+                                     stride=upsample_stride)
 
         if skip_mode == "cat":
             fused_ch = out_ch + skip_ch
@@ -203,24 +216,38 @@ class Decoder(nn.Module):
         upsample_mode   : str = "transpose",
         skip_mode       : str = "cat",
         skip_attention  : bool = False,
-        spatial_dims    : int = 3):
+        spatial_dims    : int = 3,
+        downsample_strides: Optional[List] = None):
         super().__init__()
         self.levels = nn.ModuleList()
         self.spatial_dims = spatial_dims
         n = len(encoder_channels)
 
+        # 镜像 encoder 的逐级下采样 stride：decoder level i 还原 encoder
+        # downsample[n-2-i]（产生 encoder level n-1-i 的那一次下采样）。
+        n_down = n - 1
+        if downsample_strides is not None and len(downsample_strides) != n_down:
+            raise ValueError(
+                f"downsample_strides length ({len(downsample_strides)}) must "
+                f"equal len(encoder_channels)-1 ({n_down}).")
+        ds_strides: List = (
+            list(downsample_strides) if downsample_strides is not None
+            else [2] * n_down)
+
         # 自深至浅；level i 融合 encoder[n-2-i] 作为 skip。
         for i in range(n - 1):
             in_ch   = encoder_channels[n - 1 - i]  # from deeper level
             skip_ch = encoder_channels[n - 2 - i]  # skip connection
-            out_ch  = encoder_channels[n - 2 - i]  # symmetric output  # TODO: 是否换成 encoder_channels[n - 1 - i]压缩的少一些，效果会更好？
+            out_ch  = encoder_channels[n - 2 - i]  # symmetric output
+            up_stride = ds_strides[n - 2 - i]      # 镜像对应下采样 stride
 
             self.levels.append(
                 DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
                              upsample_mode  = upsample_mode,
                              skip_mode      = skip_mode,
                              skip_attention = skip_attention,
-                             spatial_dims   = spatial_dims))
+                             spatial_dims   = spatial_dims,
+                             upsample_stride = up_stride))
 
         # 各 decoder 层的输出通道（low-res → high-res）。
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
@@ -327,8 +354,7 @@ class UNet3D(nn.Module):
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
             for ch in reversed(decoder.out_channels[:-1]):
-                self.ds_heads.append(SegmentationHead(
-                    ch, num_fg_classes, spatial_dims=spatial_dims))
+                self.ds_heads.append(SegmentationHead(ch, num_fg_classes, spatial_dims=spatial_dims))
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
@@ -343,10 +369,10 @@ class UNet3D(nn.Module):
                 "gate this via ModelTopology.aux_seg_active "
                 "(= aux_seg_supervision AND n_views > 1).")
         self.aux_seg_supervision = bool(aux_seg_supervision)
-        self.aux_n_views = n_views
+        self.aux_n_views         = n_views
         # aux_feat_indices[k-1]：aux 头 k 用的 decoder 特征索引（避免运行时分支）。
-        self.aux_feat_indices: List[int] = []
-        self.aux_heads = nn.ModuleList()
+        self.aux_feat_indices = []
+        self.aux_heads        = nn.ModuleList()
         # aux 通道默认 num_fg；native-depth 路径显式传 [num_fg*D_1, ..., num_fg*D_{K-1}]。
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
         if aux_head_out_channels is None:
@@ -435,10 +461,3 @@ class UNet3D(nn.Module):
         head  = sum(p.numel() for p in self.seg_head.parameters())
         total = sum(p.numel() for p in self.parameters())
         return {"encoder": enc, "decoder": dec, "seg_head": head, "total": total}
-
-
-def _match_size(x: torch.Tensor, target_size, spatial_dims: int = 3) -> torch.Tensor:
-    """按 spatial_dims 重采样 x 到 target_size。"""
-    return F.interpolate(
-        x, size=target_size,
-        mode=INTERP_SMOOTH[spatial_dims], align_corners=False)

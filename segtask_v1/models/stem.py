@@ -30,7 +30,7 @@ class DualConvStem(nn.Module):
         spatial_dims: int = 3):
         super().__init__()
         self.block1 = ConvNormAct(
-            in_ch, out_ch, kernel_size=3, stride=1, padding=1,
+            in_ch, out_ch, kernel_size=3, stride=1, padding=1,  # 第一层用7x7x7会不会好？
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         self.block2 = ConvNormAct(
@@ -172,8 +172,7 @@ class MultiStemProj(nn.Module):
         self.stems       = nn.ModuleList(stems)
         self.stem_stride = strides[0]
 
-        # 3×3 融合回 out_ch：保留下游通道契约，同时给跨 view 一次空间感受野
-        # (1×1 仅做通道线性投影，无法对齐 view 间空间结构)。
+        # 3×3 融合多分辨率回 out_ch TODO: 用单层还是多层会好？
         self.proj = ConvNormAct(
             n_views * out_ch, out_ch,
             kernel_size=3, stride=1, padding=1,

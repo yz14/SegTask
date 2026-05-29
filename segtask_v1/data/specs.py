@@ -98,10 +98,9 @@ class SplitPaths:
 
     def to_kwargs(self) -> dict:
         return dict(
-            image_paths=self.image_paths,
-            label_paths=self.label_paths,
-            npz_paths=self.npz_paths,
-        )
+            image_paths = self.image_paths,
+            label_paths = self.label_paths,
+            npz_paths   = self.npz_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -117,11 +116,7 @@ class DatasetSpec(ABC):
 
     @abstractmethod
     def make_split(
-        self,
-        paths: SplitPaths,
-        is_train: bool,
-        common: DatasetCommonCfg,
-    ) -> Dataset:
+        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg) -> Dataset:
         """返回某一 split 对应的 dataset 实例。"""
 
     # ------------------------------------------------------------------
@@ -185,8 +180,8 @@ class ZCubeSpec(DatasetSpec):
     name = "z_axis|2_5d"
 
     def log_summary(self) -> None:
-        dc = self.cfg.data
-        n_views = max(len(dc.multi_res_scales), 1)
+        dc        = self.cfg.data
+        n_views   = max(len(dc.multi_res_scales), 1)
         max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
         logger.info(
             "Using %s patch mode (oversample=%.2f, scales=%s, n_views=%d, "
@@ -197,22 +192,18 @@ class ZCubeSpec(DatasetSpec):
             getattr(dc, "z_boundary_mode", "stretch"))
 
     def make_split(
-        self,
-        paths: SplitPaths,
-        is_train: bool,
-        common: DatasetCommonCfg,
-    ) -> Dataset:
+        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
+        ) -> Dataset:
         dc = self.cfg.data
         return SegDataset3D(
             **paths.to_kwargs(),
             **common.to_kwargs(),
-            aug_oversample_ratio=self._aug_oversample(is_train),
-            multi_res_scales=list(dc.multi_res_scales),
-            foreground_oversample_ratio=self._fg_ratio(is_train),
-            samples_per_volume=self._samples_per_volume(is_train),
-            is_train=is_train,
-            z_boundary_mode=getattr(dc, "z_boundary_mode", "stretch"),
-        )
+            aug_oversample_ratio        = self._aug_oversample(is_train),
+            multi_res_scales            = list(dc.multi_res_scales),
+            foreground_oversample_ratio = self._fg_ratio(is_train),
+            samples_per_volume          = self._samples_per_volume(is_train),
+            is_train                    = is_train,
+            z_boundary_mode             = getattr(dc, "z_boundary_mode", "stretch"))
 
 
 class CubicSpec(DatasetSpec):
@@ -270,5 +261,4 @@ __all__ = [
     "WholeSpec",
     "ZCubeSpec",
     "CubicSpec",
-    "build_data_spec",
-]
+    "build_data_spec"]

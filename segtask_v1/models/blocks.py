@@ -32,6 +32,25 @@ def _check_dims(spatial_dims: int) -> int:
     return spatial_dims
 
 
+def _as_stride_tuple(stride, spatial_dims: int) -> Tuple[int, ...]:
+    """把 int / 序列规整为长度 spatial_dims 的 per-axis stride 元组。
+
+    int → 各轴同 stride（各向同性）；序列 → 直接使用（各向异性）。
+    用于支持薄 z 轴的各向异性下采样（如 (1,2,2) 只降 H/W、保 z 分辨率）。
+    """
+    d = _check_dims(spatial_dims)
+    if isinstance(stride, int):
+        return (stride,) * d
+    s = tuple(int(x) for x in stride)
+    if len(s) != d:
+        raise ValueError(
+            f"stride tuple length {len(s)} must equal spatial_dims={d}; "
+            f"got {stride!r}")
+    if any(x < 1 for x in s):
+        raise ValueError(f"stride values must be >= 1; got {stride!r}")
+    return s
+
+
 def get_conv3d() -> Type[nn.Module]:
     """向后兼容别名：始终返回 nn.Conv3d。"""
     return nn.Conv3d
@@ -457,7 +476,12 @@ def icnr_init_(weight: torch.Tensor, upscale: int,
 
 
 class Downsample(nn.Module):
-    """×2 下采样 + in_ch→out_ch 投影 + norm。模式：'conv' 带步长 、'maxpool'/'avgpool'/'blurpool' (+1×1)、'pixelunshuffle'(s2d+1×1)。"""
+    """下采样 + in_ch→out_ch 投影 + norm。模式：'conv' 带步长 、'maxpool'/'avgpool'/'blurpool' (+1×1)、'pixelunshuffle'(s2d+1×1)。
+
+    ``stride`` 支持 int（各向同性，默认 2）或 per-axis 元组（各向异性，如 (1,2,2)
+    只降 H/W、保 z 分辨率）。各向异性仅 'conv'/'maxpool'/'avgpool' 支持；
+    'blurpool'/'pixelunshuffle' 因核结构限制只支持各向同性 stride 2。
+    """
 
     VALID_MODES = ("conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle")
 
@@ -468,31 +492,46 @@ class Downsample(nn.Module):
         norm_type   : str = "instance",
         norm_groups : int = 8,
         mode        : str = "conv",
-        spatial_dims: int = 3):
+        spatial_dims: int = 3,
+        stride      = 2):
         super().__init__()
         d = _check_dims(spatial_dims)
         if mode not in self.VALID_MODES:
             raise ValueError(
                 f"Unknown downsample mode: {mode}. "
                 f"Valid: {self.VALID_MODES}")
+        st = _as_stride_tuple(stride, d)
         self.mode         = mode
         self.spatial_dims = d
+        self.stride       = st
+        isotropic2        = all(s == 2 for s in st)
 
         if   mode == "conv":
-            self.op = _CONV[d](in_ch, out_ch, kernel_size=2, stride=2, bias=False)
+            # kernel_size == stride：非重叠 tile（per-axis stride=1 → 该轴 1×kernel，保分辨率）。
+            self.op = _CONV[d](in_ch, out_ch, kernel_size=st, stride=st, bias=False)
         elif mode == "maxpool":
             self.op = nn.Sequential(
-                _MAXPOOL[d](kernel_size=2, stride=2),
+                _MAXPOOL[d](kernel_size=st, stride=st),
                 _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
         elif mode == "avgpool":
             self.op = nn.Sequential(
-                _AVGPOOL[d](kernel_size=2, stride=2),
+                _AVGPOOL[d](kernel_size=st, stride=st),
                 _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
         elif mode == "blurpool":
+            if not isotropic2:
+                raise ValueError(
+                    f"downsample_mode='blurpool' only supports isotropic "
+                    f"stride 2; got {st}. Use 'conv'/'maxpool'/'avgpool' for "
+                    f"anisotropic downsampling.")
             self.op = nn.Sequential(
                 BlurPool3d(in_ch, stride=2, filt_size=3, spatial_dims=d),
                 _CONV[d](in_ch, out_ch, kernel_size=1, bias=False))
         else:  # pixelunshuffle：r=2，通道×2^d。
+            if not isotropic2:
+                raise ValueError(
+                    f"downsample_mode='pixelunshuffle' only supports "
+                    f"isotropic stride 2; got {st}. Use 'conv'/'maxpool'/"
+                    f"'avgpool' for anisotropic downsampling.")
             channel_mult = 2 ** d
             self.op = nn.Sequential(
                 PixelUnshuffle3d(r=2, spatial_dims=d),
@@ -640,7 +679,12 @@ class DySample3d(nn.Module):
 
 
 class Upsample(nn.Module):
-    """×2 上采样 + in_ch→out_ch 投影。模式：'transpose' 、'trilinear'/'nearest'(插值+3×3精修)、'pixelshuffle'(子像素+ICNR)、'carafe'/'dysample' 仅 3D。"""
+    """上采样 + in_ch→out_ch 投影。模式：'transpose' 、'trilinear'/'nearest'(插值+3×3精修)、'pixelshuffle'(子像素+ICNR)、'carafe'/'dysample' 仅 3D。
+
+    ``stride`` 支持 int（各向同性，默认 2）或 per-axis 元组（各向异性，须与对应
+    encoder Downsample 的 stride 镜像一致）。各向异性仅 'transpose'/'trilinear'/
+    'nearest' 支持；'pixelshuffle'/'carafe'/'dysample' 只支持各向同性 stride 2。
+    """
 
     VALID_MODES = ("transpose", "trilinear", "nearest", "pixelshuffle",
                    "carafe", "dysample")
@@ -652,6 +696,7 @@ class Upsample(nn.Module):
         out_ch: int,
         mode: str = "transpose",
         spatial_dims: int = 3,
+        stride = 2,
     ):
         super().__init__()
         d = _check_dims(spatial_dims)
@@ -663,23 +708,41 @@ class Upsample(nn.Module):
                 f"Upsample mode {mode!r} is only supported for spatial_dims=3."
                 f" For 2D, use one of: transpose | trilinear | nearest |"
                 f" pixelshuffle.")
+        st = _as_stride_tuple(stride, d)
         self.mode = mode
         self.spatial_dims = d
+        self.stride = st
+        isotropic2 = all(s == 2 for s in st)
 
         if mode == "transpose":
-            self.up = _CONV_T[d](in_ch, out_ch, kernel_size=2, stride=2)
+            self.up = _CONV_T[d](in_ch, out_ch, kernel_size=st, stride=st)
         elif mode in ("trilinear", "nearest"):
             self.up = _CONV[d](in_ch, out_ch, kernel_size=3, padding=1,
                                bias=False)
         elif mode == "pixelshuffle":
+            if not isotropic2:
+                raise ValueError(
+                    f"upsample_mode='pixelshuffle' only supports isotropic "
+                    f"stride 2; got {st}. Use 'transpose'/'trilinear'/"
+                    f"'nearest' for anisotropic upsampling.")
             channel_mult = 2 ** d
             self.expand = _CONV[d](in_ch, out_ch * channel_mult,
                                    kernel_size=1, bias=False)
             self.shuffle = PixelShuffle3d(r=2, spatial_dims=d)
             icnr_init_(self.expand.weight, upscale=2, spatial_dims=d)
         elif mode == "carafe":
+            if not isotropic2:
+                raise ValueError(
+                    f"upsample_mode='carafe' only supports isotropic stride 2; "
+                    f"got {st}. Use 'transpose'/'trilinear'/'nearest' for "
+                    f"anisotropic upsampling.")
             self.up = CARAFE3d(in_ch, out_ch, scale=2, k_up=3, k_enc=3, c_mid=64)
         else:  # dysample
+            if not isotropic2:
+                raise ValueError(
+                    f"upsample_mode='dysample' only supports isotropic stride 2; "
+                    f"got {st}. Use 'transpose'/'trilinear'/'nearest' for "
+                    f"anisotropic upsampling.")
             groups = _choose_groups(in_ch, preferred=4)
             self.up = DySample3d(in_ch, out_ch, scale=2,
                                  groups=groups, dyscope=True)
@@ -689,12 +752,12 @@ class Upsample(nn.Module):
             return self.up(x)
         if self.mode == "trilinear":
             x = F.interpolate(
-                x, scale_factor=2,
+                x, scale_factor=self.stride,
                 mode=INTERP_SMOOTH[self.spatial_dims],
                 align_corners=False)
             return self.up(x)
         if self.mode == "nearest":
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
+            x = F.interpolate(x, scale_factor=self.stride, mode="nearest")
             return self.up(x)
         if self.mode == "pixelshuffle":
             return self.shuffle(self.expand(x))

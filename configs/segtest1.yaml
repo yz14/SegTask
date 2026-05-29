@@ -5,6 +5,7 @@ data:
   region_weight_suffix: ".nii.gz"
 
   npz_dir: "/data0/yzhen/data/totalseg/body_prep"
+  image_dir: "F:/airway_segment_with_img/imgs"
 
   label_values: [0, 1]
   num_classes : 2

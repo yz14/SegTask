@@ -33,9 +33,9 @@ class ModelTopology:
     """模式无关地描述当前训练几何 / 通道布局。所有字段在 ``build_topology`` 中一次算齐。"""
 
     # ---- raw mode flags（mirror cfg；pipeline / dataset / model 决策直接读这里） ----
-    patch_mode: str                     # "whole" | "z_axis" | "cubic" | "2_5d"
-    lift_2_5d_to_3d: bool               # 仅 2.5D；其他模式恒 False
-    aux_keep_native_d: bool             # 2.5D 懒视图；其他模式恒 False
+    patch_mode           : str          # "whole" | "z_axis" | "cubic" | "2_5d"
+    lift_2_5d_to_3d      : bool         # 仅 2.5D；其他模式恒 False
+    aux_keep_native_d    : bool         # 2.5D 懒视图；其他模式恒 False
     keep_native_multi_res: bool         # 3D 懒视图；其他模式恒 False
 
     # ---- 几何派生量 ----
@@ -82,17 +82,17 @@ def build_topology(cfg: "Config") -> ModelTopology:
        c. otherwise                                → spatial_dims=2, in_ch=D×n_views, out_classes=num_fg×D, num_res_groups=1
     2. 3D ``patch_mode∈{whole, z_axis, cubic}``    → spatial_dims=3, in_ch=n_views, out_classes=num_fg×n_views, num_res_groups=n_views
     """
-    dc = cfg.data
-    mc = cfg.model
-    pm = str(dc.patch_mode).lower()
-    n_views = max(len(dc.multi_res_scales), 1)
-    D = int(dc.patch_size[0])
-    num_fg = cfg.num_fg_classes
+    dc      = cfg.data
+    mc      = cfg.model
+    pm      = str(dc.patch_mode).lower()
+    n_views = max(len(dc.multi_res_scales), 1)  # 多分辨率
+    D       = int(dc.patch_size[0])
+    num_fg  = cfg.num_fg_classes
 
-    is_2_5d = pm == "2_5d"
-    lift = bool(getattr(mc, "lift_2_5d_to_3d", False)) and is_2_5d
-    native_d = (bool(getattr(dc, "aux_keep_native_d", False))
-                and is_2_5d and n_views > 1)
+    is_2_5d        = pm == "2_5d"
+    lift           = bool(getattr(mc, "lift_2_5d_to_3d", False)) and is_2_5d
+    native_d       = (bool(getattr(dc, "aux_keep_native_d", False)) 
+                      and is_2_5d and n_views > 1)
     keep_native_3d = (bool(getattr(dc, "keep_native_multi_res", False))
                       and pm in ("z_axis", "cubic") and n_views > 1)
     aux_seg_active = (bool(getattr(mc, "aux_seg_supervision", False))
@@ -100,29 +100,29 @@ def build_topology(cfg: "Config") -> ModelTopology:
 
     # ---- 通道 / 输出几何 -------------------------------------------------
     if is_2_5d and not lift:
-        spatial_dims = 2
+        spatial_dims   = 2
         num_res_groups = 1
-        out_classes = num_fg * D
-        if native_d:
-            depths = [int(round(D * float(s))) for s in dc.multi_res_scales]
+        out_classes    = num_fg * D
+        if native_d:  # 多分辨率输入，保持原尺寸
+            depths    = [int(round(D * float(s))) for s in dc.multi_res_scales]
             depths[0] = D            # s_0 == 1.0
             in_channels = int(sum(depths))
         else:
             in_channels = D * n_views
     elif is_2_5d and lift:
-        spatial_dims = 3
+        spatial_dims   = 3
         num_res_groups = 1
-        out_classes = num_fg
-        in_channels = n_views          # rank-5 image, C_res = n_views
+        out_classes    = num_fg
+        in_channels    = n_views       # C_res = n_views
     else:                              # 3D（whole / z_axis / cubic）
-        spatial_dims = 3
+        spatial_dims   = 3
         num_res_groups = n_views
-        out_classes = num_fg * num_res_groups
-        in_channels = n_views          # 1 通道/视图（whole 时 n_views=1）
+        out_classes    = num_fg * num_res_groups
+        in_channels    = n_views       # 通道/视图（whole 时 n_views=1）
 
     # ---- 2.5D 专属 ------------------------------------------------------
-    slab_depth = D if is_2_5d else 0
-    aux_view_depths: List[int] = []
+    slab_depth      = D if is_2_5d else 0
+    aux_view_depths = []
     if is_2_5d:
         ds = [int(round(D * float(s))) for s in dc.multi_res_scales]
         if ds:
@@ -132,29 +132,28 @@ def build_topology(cfg: "Config") -> ModelTopology:
     context_n_views = n_views if is_2_5d else 1
 
     # ---- native_d 专属 --------------------------------------------------
-    in_ch_per_view_list: Optional[List[int]] = None
+    in_ch_per_view_list  : Optional[List[int]] = None
     aux_head_out_channels: Optional[List[int]] = None
     if native_d:
-        in_ch_per_view_list = list(aux_view_depths)
-        aux_head_out_channels = [num_fg * d_k for d_k in aux_view_depths[1:]]
+        in_ch_per_view_list   = list(aux_view_depths)
+        aux_head_out_channels = [num_fg * d_k for d_k in aux_view_depths[1:]]  # 多分辨率输入的监督
 
     return ModelTopology(
-        patch_mode=pm,
-        lift_2_5d_to_3d=lift,
-        aux_keep_native_d=native_d,
-        keep_native_multi_res=keep_native_3d,
-        n_views=n_views,
-        num_res_groups=num_res_groups,
-        slab_depth=slab_depth,
-        aux_view_depths=aux_view_depths,
-        in_channels=in_channels,
-        out_classes=out_classes,
-        spatial_dims=spatial_dims,
-        context_n_views=context_n_views,
-        in_ch_per_view_list=in_ch_per_view_list,
-        aux_seg_active=aux_seg_active,
-        aux_head_out_channels=aux_head_out_channels,
-    )
+        patch_mode            = pm,
+        lift_2_5d_to_3d       = lift,
+        aux_keep_native_d     = native_d,
+        keep_native_multi_res = keep_native_3d,
+        n_views               = n_views,
+        num_res_groups        = num_res_groups,
+        slab_depth            = slab_depth,
+        aux_view_depths       = aux_view_depths,
+        in_channels           = in_channels,
+        out_classes           = out_classes,
+        spatial_dims          = spatial_dims,
+        context_n_views       = context_n_views,
+        in_ch_per_view_list   = in_ch_per_view_list,
+        aux_seg_active        = aux_seg_active,
+        aux_head_out_channels = aux_head_out_channels)
 
 
 __all__ = ["ModelTopology", "build_topology"]

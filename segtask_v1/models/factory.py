@@ -127,6 +127,80 @@ def _make_convnext_downsample_builder(
     return build
 
 
+# 各向异性自动调度的最小特征边长（nnU-Net 默认 4）：降采样后某轴不小于此值才继续降。
+_MIN_FEATURE_SIZE = 4
+
+#: 各向异性下采样兼容的下/上采样模式（其余模式核结构要求各向同性 2）。
+_ANISO_DOWN_MODES = ("conv", "maxpool", "avgpool")
+_ANISO_UP_MODES   = ("transpose", "trilinear", "nearest")
+
+
+def _stem_stride_of(stem_mode: str) -> int:
+    """patchN stem 在进 encoder stage 前先各向同性降 N 倍；其余 stem stride=1。"""
+    if stem_mode == "patch2":
+        return 2
+    if stem_mode == "patch4":
+        return 4
+    return 1
+
+
+def _auto_anisotropic_strides(
+    spatial_sizes: List[int],
+    num_down     : int,
+    min_size     : int = _MIN_FEATURE_SIZE) -> List[tuple]:
+    """nnU-Net 式各向异性调度：逐级仅对"分辨率仍偏大"的轴降采样。
+
+    某轴本级降采样（stride 2）的条件：(a) 当前尺寸为偶数；(b) 减半后仍 >= min_size；
+    (c) 当前尺寸 > 本级最大轴尺寸的一半（即该轴分辨率落后不超过 2×）。这样各轴分辨率
+    始终保持在彼此 2× 以内，避免薄 z 轴被过早压成 1。
+    """
+    sizes = [int(s) for s in spatial_sizes]
+    nd = len(sizes)
+    schedule: List[tuple] = []
+    for _ in range(num_down):
+        ref = max(sizes)
+        stride = []
+        for ax in range(nd):
+            do_pool = (sizes[ax] % 2 == 0
+                       and sizes[ax] // 2 >= min_size
+                       and sizes[ax] * 2 > ref)  # sizes[ax] > ref/2
+            if do_pool:
+                stride.append(2)
+                sizes[ax] //= 2
+            else:
+                stride.append(1)
+        schedule.append(tuple(stride))
+    return schedule
+
+
+def compute_downsample_strides(
+    cfg: Config, spatial_dims: int, n_levels: int):
+    """决定逐级下采样 stride。
+
+    优先级：显式 ``model.downsample_strides`` > ``model.anisotropic_pooling``
+    自动推导 > None（各向同性，沿用历史行为）。返回 ``None`` 或长度 ``n_levels-1``
+    的 per-axis stride 元组列表。
+    """
+    mc = cfg.model
+    num_down = n_levels - 1
+    if num_down <= 0:
+        return None
+
+    explicit = list(getattr(mc, "downsample_strides", []) or [])
+    if explicit:
+        return [tuple(int(x) for x in s) for s in explicit]
+
+    if not bool(getattr(mc, "anisotropic_pooling", False)):
+        return None  # 各向同性默认：Downsample/Upsample 用 stride=2
+
+    # 自动推导：基于 patch 的"模型空间轴"尺寸（2.5D 的 D 折进通道，不计）。
+    patch = [int(x) for x in cfg.data.patch_size]  # [D, H, W]
+    spatial_sizes = patch[1:] if spatial_dims == 2 else patch
+    stem_stride = _stem_stride_of(getattr(mc, "stem_mode", "conv3"))
+    spatial_sizes = [max(1, s // stem_stride) for s in spatial_sizes]
+    return _auto_anisotropic_strides(spatial_sizes, num_down)
+
+
 def build_model(cfg: Config):
     """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'（后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
     arch = str(getattr(cfg.model, "arch", "unet")).lower()
@@ -189,6 +263,32 @@ def build_model(cfg: Config):
     else:
         raise ValueError(f"Unknown backbone: {mc.backbone}")
 
+    # 各向异性下采样 stride 调度（None = 各向同性，沿用历史行为）。
+    ds_strides = compute_downsample_strides(cfg, spatial_dims, n_levels)
+    if ds_strides is not None and any(
+            any(int(s) != 2 for s in stage) for stage in ds_strides):
+        # 仅对真正非各向同性的调度做兼容性校验；全 2 的调度等价于默认。
+        if downsample_builder is not None:
+            raise ValueError(
+                "Anisotropic downsampling is not supported with ConvNeXt "
+                "LN-first downsample. Set model.convnext_downsample_lnfirst="
+                "false to use the generic Downsample, or disable "
+                "anisotropic_pooling/downsample_strides.")
+        if mc.decoder_type != "unet":
+            raise ValueError(
+                f"Anisotropic downsampling currently supports only "
+                f"decoder_type='unet'; got {mc.decoder_type!r}. "
+                f"(unetpp/unet3p decoders use isotropic ×2 up/down.)")
+        if mc.downsample_mode not in _ANISO_DOWN_MODES:
+            raise ValueError(
+                f"Anisotropic downsampling requires downsample_mode in "
+                f"{_ANISO_DOWN_MODES}; got {mc.downsample_mode!r}.")
+        if mc.upsample_mode not in _ANISO_UP_MODES:
+            raise ValueError(
+                f"Anisotropic downsampling requires upsample_mode in "
+                f"{_ANISO_UP_MODES}; got {mc.upsample_mode!r}.")
+        logger.info("Anisotropic downsample strides (per level): %s", ds_strides)
+
     # Build encoder
     encoder = Encoder(
         in_channels         = mc.in_channels,
@@ -203,7 +303,8 @@ def build_model(cfg: Config):
         context_n_views     = context_n_views,
         context_fusion      = getattr(mc, "context_fusion", "shared_stem"),
         in_ch_per_view_list = in_ch_per_view_list,
-        downsample_builder  = downsample_builder)
+        downsample_builder  = downsample_builder,
+        downsample_strides  = ds_strides)
 
     # decoder: unet | unetpp | unet3p
     if   mc.decoder_type == "unet3p":
@@ -224,12 +325,13 @@ def build_model(cfg: Config):
             spatial_dims=spatial_dims)
     else:
         decoder = Decoder(
-            encoder_channels = enc_channels,
-            stage_builder    = dec_builder,
-            upsample_mode    = mc.upsample_mode,
-            skip_mode        = mc.skip_mode,
-            skip_attention   = mc.skip_attention,
-            spatial_dims     = spatial_dims)
+            encoder_channels   = enc_channels,
+            stage_builder      = dec_builder,
+            upsample_mode      = mc.upsample_mode,
+            skip_mode          = mc.skip_mode,
+            skip_attention     = mc.skip_attention,
+            spatial_dims       = spatial_dims,
+            downsample_strides = ds_strides)
 
     # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
     aux_seg_supervision = topo.aux_seg_active

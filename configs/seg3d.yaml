@@ -151,6 +151,16 @@ model:
   # 'transpose' | 'trilinear'(默认) | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
   upsample_mode: "trilinear"
 
+  # 各向异性下采样: 薄 z 轴(此处 patch z=32 << H/W=256)各向同性 ×2 会被压成 2,
+  # 深层几乎无 z 上下文(退化成准 2D)。开启后按 patch_size 自动推导逐级 per-axis stride,
+  # 让各轴分辨率保持彼此 2x 以内(nnU-Net 思路)。本配置 [32,256,256]/5 级 自动得:
+  #   [[1,2,2],[1,2,2],[1,2,2],[2,2,2]] → bottleneck z=16 (各向同性则为 2)。
+  # 仅支持 decoder_type='unet' + downsample_mode∈{conv,maxpool,avgpool}
+  #        + upsample_mode∈{transpose,trilinear,nearest} + 非 ConvNeXt LN-first 下采样。
+  anisotropic_pooling: true
+  # 显式覆盖自动推导(非空时优先): 长度=len(encoder_channels)-1, 每项长度=spatial_dims, 值∈{1,2}。
+  # downsample_strides: [[1,2,2],[1,2,2],[1,2,2],[2,2,2]]
+
   skip_mode: "cat"                       # 'cat' | 'add'
 
   drop_path_rate: 0.0                    # 仅 convnext
