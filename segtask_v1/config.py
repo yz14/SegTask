@@ -170,11 +170,10 @@ class ModelConfig:
     # Backbone："resnet" 或 "convnext"。
     backbone: str = "resnet"
 
-    # 3 = 3D UNet（z_axis/cubic/whole）；2 = 2D UNet（2.5D）。
-    spatial_dims: int = 3
-
-    # 输入通道数（单模态 3D 为 1）。
-    in_channels: int = 1
+    # 注：spatial_dims（2/3）与 in_channels 是由 patch_mode/multi_res_scales 等
+    # 决定的"几何派生量"，不再作为可写字段/YAML 接口暴露（避免设了却被 sync 静默
+    # 重写的困惑）。它们由 sync() 经 build_topology 算出，并以只读 property 暴露
+    # （见类末尾），读 cfg.model.in_channels / spatial_dims 不变。
 
     # 每级 encoder 通道数，决定深度。例：[32, 64, 128, 256, 512] = 5 级。
     encoder_channels: List[int] = field(
@@ -295,6 +294,22 @@ class ModelConfig:
 
     # 输出激活裁剪（论文 6.4）；<=0 禁用。
     edm2_clip_act: float = 256.0
+
+    # ---- 几何派生只读量（不暴露写接口；由 Config.sync() 经 build_topology 写入）----
+    # 用私有 backing 字段承载，sync() 前读到的是安全默认值（3D / 单通道）。
+    def __post_init__(self) -> None:
+        self._spatial_dims: int = 3
+        self._in_channels: int = 1
+
+    @property
+    def spatial_dims(self) -> int:
+        """3 = 3D UNet（z_axis/cubic/whole）；2 = 2D UNet（2.5D 折叠 D）。"""
+        return self._spatial_dims
+
+    @property
+    def in_channels(self) -> int:
+        """模型输入通道数（2.5D 多 FOV 为 n_views*D 等，见 build_topology）。"""
+        return self._in_channels
 
 
 # ---------------------------------------------------------------------------
@@ -417,11 +432,10 @@ class TrainConfig:
     #   * "mcc"               → mean_mcc ↑                （类不平衡稳健，∈[−1,1]）
     #   * "min_dice"          → min_class_dice ↑          （短板：最差类 dice）
     #   * "balanced"          → mean_balanced ↑           （dice/sd/iou/mcc01 调和均值）
-    # 任一选项均覆盖下方 metric/mode（见 _resolve_save_best_criterion）。
+    # 单一真相源：选模标准只暴露 save_best_criterion 一个接口。底层的
+    # (save_best_metric, save_best_mode) 由它派生（见类末尾的只读 property），
+    # 故不再作为可写字段/YAML 接口暴露，避免"设了却被静默重写"的困惑。
     save_best_criterion: str = "dice"
-    # 内部解析字段（一般无需手动设）；sync() 会按 criterion 重写。
-    save_best_metric: str = "mean_dice"
-    save_best_mode  : str = "max"
     # Surface Dice 容差（像素，Chebyshev 邻域；0=严格表面 Dice）。
     surface_dice_tolerance: int = 1
     # 组合标准下 combined = (1-w)*dice + w*surface_dice。
@@ -455,6 +469,19 @@ class TrainConfig:
 
     # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
+
+    # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
+    @property
+    def save_best_metric(self) -> str:
+        """被追踪的验证指标名（如 "mean_dice"）。由 save_best_criterion 派生。"""
+        return _CRITERION_TO_METRIC.get(_norm_crit(self.save_best_criterion),
+                                        _DEFAULT_CRIT_METRIC)[0]
+
+    @property
+    def save_best_mode(self) -> str:
+        """选模方向 "max"/"min"。由 save_best_criterion 派生。"""
+        return _CRITERION_TO_METRIC.get(_norm_crit(self.save_best_criterion),
+                                        _DEFAULT_CRIT_METRIC)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +554,29 @@ _SAVE_BEST_PRESETS: Dict[str, Dict[str, Any]] = {
 
 
 # ---------------------------------------------------------------------------
+# 选模标准 → (被追踪指标名, 选模方向) 的唯一映射表。
+# ``TrainConfig.save_best_metric / save_best_mode`` 是从此表派生的只读 property；
+# ``Config.validate()`` 也以本表的键作为合法 criterion 白名单。单一真相源。
+# ---------------------------------------------------------------------------
+_CRITERION_TO_METRIC: Dict[str, Tuple[str, str]] = {
+    "loss":              ("val_loss",        "min"),
+    "dice":              ("mean_dice",       "max"),
+    "dice+surface_dice": ("mean_combined",   "max"),
+    "iou":               ("mean_iou",        "max"),
+    "mcc":               ("mean_mcc",        "max"),
+    "min_dice":          ("min_class_dice",  "max"),
+    "balanced":          ("mean_balanced",   "max"),
+}
+# 未知 criterion 的兜底（validate() 会另行报错），保证 property 不抛异常。
+_DEFAULT_CRIT_METRIC: Tuple[str, str] = ("mean_dice", "max")
+
+
+def _norm_crit(crit: Any) -> str:
+    """归一化 criterion 字符串（小写 + 去空白），供映射查表使用。"""
+    return str(crit).lower().strip()
+
+
+# ---------------------------------------------------------------------------
 # Prediction / Inference configuration
 # ---------------------------------------------------------------------------
 @dataclass
@@ -583,11 +633,11 @@ class Config:
     def sync(self) -> None:
         """同步跨子配置的对应字段。
 
-        R5：所有"模型几何派生量"（``in_channels`` / ``spatial_dims``）改由
-        ``segtask_v1.models.topology.build_topology(self)`` 一次性算出再写回，
-        以保持旧 yaml / 旧外部代码读 ``cfg.model.in_channels`` 不破坏。
-        本方法仅保留"非派生"职责（``num_classes`` 推断、``z_boundary_mode``
-        自动升级、resenc preset、best-criterion 映射）。
+        所有"模型几何派生量"（``in_channels`` / ``spatial_dims``）由
+        ``segtask_v1.models.topology.build_topology(self)`` 一次性算出，写入
+        ``ModelConfig`` 的私有 backing 字段（对外是只读 property）。本方法仅保留
+        "非派生"职责（``num_classes`` 推断、``z_boundary_mode`` 自动升级、resenc
+        preset、save_best 预设）。
         """
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
@@ -616,13 +666,13 @@ class Config:
         # 局部 import 避免 models 包顶层依赖 config（消除循环 import 风险）。
         from .models.topology import build_topology
         topo = build_topology(self)
-        self.model.in_channels = topo.in_channels
-        self.model.spatial_dims = topo.spatial_dims
+        self.model._in_channels = topo.in_channels
+        self.model._spatial_dims = topo.spatial_dims
 
         self._apply_resenc_preset()
-        # 顺序：先用任务化预设覆盖三个底层字段，再由 criterion → metric/mode。
+        # 任务化预设（若启用）覆盖 (criterion, sd_tol, sd_w)；save_best_metric/mode
+        # 是 criterion 的派生只读 property，无需在此写回。
         self._apply_save_best_preset()
-        self._resolve_save_best_criterion()
 
     def _apply_save_best_preset(self) -> None:
         """``train.save_best_preset`` 非空时覆盖 (criterion, tolerance, weight)。
@@ -649,21 +699,6 @@ class Config:
             logger.info(
                 "save_best_preset=%r overrode (criterion, sd_tol, sd_w): "
                 "%s → %s.", name, prev, new)
-
-    def _resolve_save_best_criterion(self) -> None:
-        """criterion → (save_best_metric, save_best_mode) 映射；显式覆盖低层字段。"""
-        crit = str(self.train.save_best_criterion).lower().strip()
-        mapping = {
-            "loss":              ("val_loss",        "min"),
-            "dice":              ("mean_dice",       "max"),
-            "dice+surface_dice": ("mean_combined",   "max"),
-            "iou":               ("mean_iou",        "max"),
-            "mcc":               ("mean_mcc",        "max"),
-            "min_dice":          ("min_class_dice",  "max"),
-            "balanced":          ("mean_balanced",   "max"),
-        }
-        if crit in mapping:
-            self.train.save_best_metric, self.train.save_best_mode = mapping[crit]
 
     def _apply_resenc_preset(self) -> None:
         """将 model.resenc_preset 展开为逐级 block 数；用户显式传入优先。"""
@@ -942,15 +977,10 @@ class Config:
             "multi_res_scales must have at least one scale (e.g. [1.0])"
         assert all(s >= 1.0 for s in self.data.multi_res_scales), \
             "All multi_res_scales must be >= 1.0"
-        assert self.train.save_best_mode in ("max", "min"), \
-            f"Invalid save_best_mode: {self.train.save_best_mode}"
-        _valid_crits = (
-            "loss", "dice", "dice+surface_dice",
-            "iou", "mcc", "min_dice", "balanced",
-        )
-        assert str(self.train.save_best_criterion).lower() in _valid_crits, (
+        # save_best_mode/metric 现为 criterion 的派生只读量（恒合法），无需单独校验。
+        assert _norm_crit(self.train.save_best_criterion) in _CRITERION_TO_METRIC, (
             f"Invalid save_best_criterion: {self.train.save_best_criterion!r}; "
-            f"expected one of: {' | '.join(repr(c) for c in _valid_crits)}.")
+            f"expected one of: {' | '.join(repr(c) for c in _CRITERION_TO_METRIC)}.")
         # save_best_preset 空串 = 不启用；非空必须是已知预设名。
         preset = str(self.train.save_best_preset or "").strip().lower()
         if preset:
@@ -1027,18 +1057,42 @@ _FIELD_ALIASES: Dict[type, Dict[str, str]] = {
 }
 
 
+# 旧 YAML 中曾可手设、现已改为派生只读量的字段：读到时静默忽略（仅一次 info 提示），
+# 而非按 "Unknown config key" 处理。TODO #4：派生量不再暴露可写接口。
+#   train.save_best_metric / save_best_mode → 由 train.save_best_criterion 派生。
+#   model.in_channels / spatial_dims        → 由 patch_mode/multi_res_scales 等派生
+#                                             （sync() 经 build_topology 算出）。
+_DEPRECATED_DERIVED_KEYS: Dict[type, Dict[str, str]] = {
+    TrainConfig: {
+        "save_best_metric": "save_best_criterion",
+        "save_best_mode":   "save_best_criterion",
+    },
+    ModelConfig: {
+        "in_channels":  "data.patch_mode / data.multi_res_scales",
+        "spatial_dims": "data.patch_mode",
+    },
+}
+
+
 def _dataclass_from_dict(cls, d: Dict[str, Any]):
     """Recursively construct a dataclass from a dict.
 
     支持向后兼容别名（``_FIELD_ALIASES``）：旧 YAML 字段名会被自动改写成新名，
-    并打印一次弃用提示；若新旧名同时出现则报错。
+    并打印一次弃用提示；若新旧名同时出现则报错。``_DEPRECATED_DERIVED_KEYS``
+    列出的"曾可写、现派生只读"字段则直接忽略。
     """
     if not isinstance(d, dict):
         return d
     field_names = {f.name for f in fields(cls)}
     aliases = _FIELD_ALIASES.get(cls, {})
+    derived = _DEPRECATED_DERIVED_KEYS.get(cls, {})
     kwargs = {}
     for k, v in d.items():
+        if k in derived:
+            logger.info(
+                "Config key '%s' is now auto-derived from '%s' and no longer "
+                "settable; ignoring the value in YAML.", k, derived[k])
+            continue
         if k in aliases:
             new_key = aliases[k]
             if new_key in d:

@@ -258,9 +258,8 @@ train:
   #   'bone_lung_combined' — balanced, tol=1, w=0.5（本任务 lung+bone 推荐稳妥折中）
   save_best_preset: ""
 
-  # 内部解析字段：由 sync() 按 criterion/preset 自动重写，一般无需手动设。
-  save_best_metric: "mean_dice"
-  save_best_mode  : "max"
+  # 注：save_best_metric / save_best_mode 由 save_best_criterion 自动派生，
+  # 已不再是可设字段（设了也会被忽略）。
 
   early_stopping: 15
 

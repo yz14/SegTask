@@ -106,7 +106,8 @@ augment:
 model:
   backbone: "resnet"                     # 'resnet' | 'convnext'
 
-  in_channels: 1                         # = len(multi_res_scales), sync() 自动同步
+  # 注：in_channels / spatial_dims 由 patch_mode/multi_res_scales 自动派生，
+  # 已不是可设字段（设了也会被忽略）。
 
   encoder_channels: [32, 64, 128, 256, 256]   # 长 = 层数 (下采样次数+1)
   blocks_per_level: 2                    # 默认每级 block 数
@@ -248,8 +249,9 @@ train:
 
   output_dir: "outputs/lung_bone_zaxis"
   save_every: 10
-  save_best_metric: "mean_dice"
-  save_best_mode: "max"                  # 'max' | 'min'
+  # 选模标准：单一接口。可选 loss/dice/dice+surface_dice/iou/mcc/min_dice/balanced。
+  # save_best_metric / save_best_mode 由此自动派生，无需手设。
+  save_best_criterion: "dice"
 
   early_stopping: 15                     # 0 = 禁用
 

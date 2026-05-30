@@ -286,21 +286,24 @@ def test_bug4_ema_in_place_swap():
 
 
 def test_bug5_plateau_mode_from_config():
-    """build_scheduler should use plateau mode matching save_best_mode."""
+    """build_scheduler should use plateau mode matching the derived save_best_mode."""
     from segtask_v1.trainer import build_scheduler
     from segtask_v1.config import Config
 
     cfg = Config()
     cfg.train.scheduler = "plateau"
-    cfg.train.save_best_mode = "min"
+    # save_best_mode 现为 criterion 的派生只读量："loss" → min。
+    cfg.train.save_best_criterion = "loss"
+    assert cfg.train.save_best_mode == "min"
     opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=1e-3)
     sch = build_scheduler(opt, cfg, steps_per_epoch=10, post_warmup_steps=100)
     assert sch.mode == "min", f"Expected plateau mode=min, got {sch.mode}"
 
-    cfg.train.save_best_mode = "max"
+    cfg.train.save_best_criterion = "dice"  # → max
+    assert cfg.train.save_best_mode == "max"
     sch = build_scheduler(opt, cfg, steps_per_epoch=10, post_warmup_steps=100)
     assert sch.mode == "max", f"Expected plateau mode=max, got {sch.mode}"
-    print("[BUG-5] PASS — plateau mode tracks save_best_mode.")
+    print("[BUG-5] PASS — plateau mode tracks derived save_best_mode.")
 
 
 def test_bug6_config_validate_rejects_illegal_combo():
@@ -327,11 +330,11 @@ def test_bug6_config_validate_rejects_illegal_combo():
     cfg.data.multi_res_scales = [1.0, 1.5]
     cfg.validate()
 
-    # save_best_mode validation
-    cfg.train.save_best_mode = "bogus"
+    # save_best_criterion validation (mode/metric 是其派生只读量，不再单独校验)
+    cfg.train.save_best_criterion = "bogus"
     try:
         cfg.validate()
-        assert False, "Invalid save_best_mode must be rejected"
+        assert False, "Invalid save_best_criterion must be rejected"
     except AssertionError:
         pass
     print("[BUG-6] PASS — config validator rejects illegal z_axis+multi_res.")

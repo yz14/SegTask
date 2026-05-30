@@ -262,7 +262,7 @@ def _build_test_cfg(spatial_dims: int, decoder_type: str = "unet",
         cfg.data.patch_size = [16, 32, 32]
     else:
         cfg.data.patch_size = [12, 32, 32]   # D will become input channels
-    cfg.model.spatial_dims = spatial_dims
+        cfg.data.patch_mode = "2_5d"          # spatial_dims=2 由 sync() 派生
     cfg.model.backbone = backbone
     cfg.model.encoder_channels = [16, 32, 64, 128]   # 4 levels, fewer params
     cfg.model.decoder_type = decoder_type

@@ -78,7 +78,6 @@ class TestFactoryDispatch:
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0]
-        cfg.model.in_channels = 4
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         assert isinstance(p, Slab2_5DPipeline)
@@ -89,7 +88,6 @@ class TestFactoryDispatch:
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 8
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         assert isinstance(p, Slab2_5DAuxPipeline)
@@ -101,8 +99,6 @@ class TestFactoryDispatch:
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.data.keep_native_view_depth = True
         cfg.model.aux_seg_supervision = True
-        cfg.sync()
-        cfg.model.in_channels = sum(cfg.per_view_depths)
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         assert isinstance(p, Slab2_5DNativeDPipeline)
@@ -114,7 +110,6 @@ class TestFactoryDispatch:
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0]
         cfg.model.lift_2_5d_to_3d = True
-        cfg.model.in_channels = 1
         cfg.model.encoder_channels = [32, 64]   # 让 D=4 通过 lift 整除性
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -127,7 +122,6 @@ class TestFactoryDispatch:
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.lift_2_5d_to_3d = True
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 1
         cfg.model.encoder_channels = [32, 64]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -155,7 +149,6 @@ class TestPrepareBatch:
     def test_slab_2_5d_squeeze(self):
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0]
-        cfg.model.in_channels = 4
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
@@ -170,7 +163,6 @@ class TestPrepareBatch:
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 8
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
@@ -186,7 +178,6 @@ class TestPrepareBatch:
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0]
         cfg.model.lift_2_5d_to_3d = True
-        cfg.model.in_channels = 1
         cfg.model.encoder_channels = [32, 64]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -221,7 +212,6 @@ class TestComputeLossEquivalence:
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 8
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
@@ -242,7 +232,6 @@ class TestComputeLossEquivalence:
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.lift_2_5d_to_3d = True
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 1
         cfg.model.encoder_channels = [32, 64]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -264,8 +253,6 @@ class TestComputeLossEquivalence:
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.data.keep_native_view_depth = True
         cfg.model.aux_seg_supervision = True
-        cfg.sync()
-        cfg.model.in_channels = sum(cfg.per_view_depths)
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
@@ -293,7 +280,6 @@ class TestBackward:
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.lift_2_5d_to_3d = True
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 1
         cfg.model.encoder_channels = [32, 64]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -319,7 +305,6 @@ class TestBreakdown:
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
-        cfg.model.in_channels = 8
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16

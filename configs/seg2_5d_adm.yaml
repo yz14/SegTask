@@ -158,8 +158,8 @@ train:
 
   output_dir: "outputs/lung_adm"
   save_every: 10
-  save_best_metric: "mean_dice"
-  save_best_mode: "max"
+  # 选模标准：唯一接口；save_best_metric/mode 由此自动派生。
+  save_best_criterion: "dice"
 
   early_stopping: 15
 

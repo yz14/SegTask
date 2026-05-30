@@ -8,7 +8,7 @@ R5 引入。在此之前同一组派生量（``in_channels`` / ``out_classes`` /
 R5 后：
 
 * ``build_topology(cfg)`` —— 唯一推导入口（``patch_mode`` × 5 个 mode flag → 全部派生量）
-* ``Config.sync``         —— 调用 ``build_topology`` 写回 ``cfg.model.{in_channels, spatial_dims}``，保持旧 yaml / 旧外部代码读 ``cfg.model.in_channels`` 不破坏
+* ``Config.sync``         —— 调用 ``build_topology`` 写入 ``cfg.model`` 的私有 backing 字段；``cfg.model.{in_channels, spatial_dims}`` 对外是只读 property（不可写、不进 YAML）
 * ``Config.per_view_depths`` —— 委托 ``build_topology(self).per_view_depths``
 * ``models.factory.build_model`` —— 读 ``Topology`` 全字段，不再自行推导
 * ``trainer.pipelines.factory.build_pipeline`` —— 读 ``Topology`` 决策（不再自行 ``len(cfg.data.multi_res_scales)``）
