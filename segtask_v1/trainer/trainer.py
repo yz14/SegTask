@@ -8,7 +8,7 @@ Round 2 重构后，``Trainer`` 不再判断训练模式 —— 所有"如何把
 checkpoint I/O。
 
 为兼容现有测试与外部代码，部分历史属性（如 ``is_2_5d`` / ``keep_native_multi_res``
-/ ``aux_view_depths``）与方法（``_split_views_*`` / ``_squeeze_*`` / ``_center_crop``
+/ ``per_view_depths``）与方法（``_split_views_*`` / ``_squeeze_*`` / ``_center_crop``
 / ``_compute_loss_*``）以 thin shim 形式保留，全部从 ``self.pipeline`` 或
 ``trainer.views`` 模块取值/委托。
 """
@@ -105,16 +105,16 @@ class Trainer:
             getattr(cfg.model, "lift_2_5d_to_3d", False) and self.is_2_5d)
         self.keep_native_multi_res = isinstance(
             self.pipeline, Patch3DNativeMultiResPipeline)
-        self.aux_keep_native_d = isinstance(
+        self.keep_native_view_depth = isinstance(
             self.pipeline, Slab2_5DNativeDPipeline)
         self.aux_seg_supervision = (
             self.pipeline.n_aux_views > 0 and not self.lift_2_5d_to_3d
             or (self.lift_2_5d_to_3d and self.pipeline.n_aux_views > 0))
-        # mr_native_sizes / aux_view_depths：仅特定 pipeline 持有
+        # mr_native_sizes / per_view_depths：仅特定 pipeline 持有
         self._mr_native_sizes: List[Tuple[int, int, int]] = list(
             getattr(self.pipeline, "mr_native_sizes", []))
-        self.aux_view_depths: List[int] = list(
-            getattr(self.pipeline, "aux_view_depths", []))
+        self.per_view_depths: List[int] = list(
+            getattr(self.pipeline, "per_view_depths", []))
         # target_patch_size / needs_crop（增强后中心裁回）
         self.target_patch_size = self.pipeline.target_patch_size
         self.needs_crop = cfg.data.aug_oversample_ratio > 1.0
@@ -672,7 +672,7 @@ class Trainer:
     # Backward-compatibility shims for unit tests
     # 仅保留三个仍被现有测试直接调用的方法（其余 shim 已在 Round 3 移除）：
     #   * test_keep_native_multi_res_trainer.py → _split_views_native_3d
-    #   * test_aux_keep_native_d.py            → _split_views_native_d
+    #   * test_keep_native_view_depth.py            → _split_views_native_d
     #   * test_segtask_v1.py::TestTrainerCenterCrop → _center_crop
     # 所有逻辑委托至 ``segtask_v1.trainer.views``；新代码请直接用纯函数 / pipeline。
     # ==================================================================
@@ -695,12 +695,12 @@ class Trainer:
         self, image: torch.Tensor, label: torch.Tensor,
         wmap: Optional[torch.Tensor],
     ):
-        if not self.aux_keep_native_d:
+        if not self.keep_native_view_depth:
             raise RuntimeError(
-                "_split_views_native_d called but aux_keep_native_d=False")
+                "_split_views_native_d called but keep_native_view_depth=False")
         return views.split_views_native_d(
             image, label, wmap,
-            aux_view_depths=self.aux_view_depths,
+            per_view_depths=self.per_view_depths,
             target_patch_size=self.target_patch_size,
         )
 

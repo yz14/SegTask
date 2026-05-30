@@ -29,8 +29,8 @@ class Encoder(nn.Module):
         downsample_mode    : str = "conv",
         stem_mode          : str = "conv3",
         spatial_dims       : int = 3,
-        context_n_views    : int = 1,
-        context_fusion     : str = "shared_stem",
+        num_stem_fusion_views    : int = 1,
+        stem_fusion_mode     : str = "shared_stem",
         in_ch_per_view_list: List[int] = None,
         downsample_builder : Optional[Callable[[int, int], nn.Module]] = None,
         downsample_strides : Optional[List] = None):
@@ -38,36 +38,36 @@ class Encoder(nn.Module):
         self.spatial_dims = spatial_dims
         # patchN stem 引入空间 stride，外层 UNet 用 stem_stride 补尾部上采样。
         # 多 FOV (2.5D, n_views>1)：默认通道均分；in_ch_per_view_list 非空时按 view 分（native-depth）。
-        if context_n_views < 1:
+        if num_stem_fusion_views < 1:
             raise ValueError(
-                f"context_n_views must be >= 1, got {context_n_views}")
+                f"num_stem_fusion_views must be >= 1, got {num_stem_fusion_views}")
 
         if in_ch_per_view_list is not None:
-            if len(in_ch_per_view_list) != context_n_views:
+            if len(in_ch_per_view_list) != num_stem_fusion_views:
                 raise ValueError(
                     f"in_ch_per_view_list length "
                     f"({len(in_ch_per_view_list)}) must equal "
-                    f"context_n_views ({context_n_views})")
+                    f"num_stem_fusion_views ({num_stem_fusion_views})")
             if sum(in_ch_per_view_list) != in_channels:
                 raise ValueError(
                     f"sum(in_ch_per_view_list)={sum(in_ch_per_view_list)} "
                     f"must equal in_channels ({in_channels})")
             in_ch_per_view = int(in_ch_per_view_list[0])
         else:
-            if in_channels % context_n_views != 0:
+            if in_channels % num_stem_fusion_views != 0:
                 raise ValueError(
                     f"in_channels ({in_channels}) must be divisible by "
-                    f"context_n_views ({context_n_views})")
-            in_ch_per_view = in_channels // context_n_views
-        self.context_n_views = context_n_views
+                    f"num_stem_fusion_views ({num_stem_fusion_views})")
+            in_ch_per_view = in_channels // num_stem_fusion_views
+        self.num_stem_fusion_views = num_stem_fusion_views
         # UNet3D 构建 aux head 时需读此字段对齐 stem 拓扑。
-        self.context_fusion = context_fusion
+        self.stem_fusion_mode = stem_fusion_mode
         self.in_ch_per_view_list: List[int] = (
             list(in_ch_per_view_list) if in_ch_per_view_list is not None
-            else [in_ch_per_view] * context_n_views)
+            else [in_ch_per_view] * num_stem_fusion_views)
         self.stem, self.stem_stride = build_context_stem(
-            mode=stem_mode, fusion=context_fusion,
-            n_views=context_n_views,
+            mode=stem_mode, fusion=stem_fusion_mode,
+            n_views=num_stem_fusion_views,
             in_ch_per_view=in_ch_per_view,
             out_ch=stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
@@ -317,7 +317,7 @@ def _build_aux_head(
 
 
 class UNet3D(nn.Module):
-    """通用 UNet。aux_seg_supervision 在 context_n_views>1 时构建逐 FOV 辅助头
+    """通用 UNet。aux_seg_supervision 在 num_stem_fusion_views>1 时构建逐 FOV 辅助头
 
     forward 返回：
       - eval / 无 aux：Tensor 或 [main, ds1, ...]（深监督）。
@@ -358,14 +358,14 @@ class UNet3D(nn.Module):
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
-        n_views = int(getattr(encoder, "context_n_views", 1))
-        fusion  = str(getattr(encoder, "context_fusion", "shared_stem"))
+        n_views = int(getattr(encoder, "num_stem_fusion_views", 1))
+        fusion  = str(getattr(encoder, "stem_fusion_mode", "shared_stem"))
         # R5：移除"aux_seg_supervision and n_views > 1"二次门控；统一由
         # ``ModelTopology.aux_seg_active`` 上游决定。调用方传入不一致组合时直接报错。
         if bool(aux_seg_supervision) and n_views <= 1:
             raise ValueError(
                 f"UNet3D got aux_seg_supervision=True but encoder."
-                f"context_n_views={n_views} (<=1). The caller should "
+                f"num_stem_fusion_views={n_views} (<=1). The caller should "
                 "gate this via ModelTopology.aux_seg_active "
                 "(= aux_seg_supervision AND n_views > 1).")
         self.aux_seg_supervision = bool(aux_seg_supervision)

@@ -1,7 +1,7 @@
 """Pipeline 工厂：``cfg → ViewPipeline``。
 
 整个 codebase 中**唯一允许 trainer 侧大段 if/elif 的地方**——所有 mode 派生量
-（``n_views`` / ``aux_keep_native_d`` / ``keep_native_multi_res`` / ``aux_seg_active``
+（``n_views`` / ``keep_native_view_depth`` / ``keep_native_multi_res`` / ``aux_seg_active``
 等）由 ``ModelTopology`` 统一供给（R5），本工厂仅做策略对象选择。
 """
 
@@ -32,7 +32,7 @@ def build_pipeline(cfg: Config, base_loss) -> ViewPipeline:
 
     1. ``patch_mode == '2_5d'``
        a. ``lift_2_5d_to_3d``                     → ``Lift2_5DAuxPipeline`` / ``Lift2_5DPipeline``
-       b. ``aux_seg_active`` & ``aux_keep_native_d`` → ``Slab2_5DNativeDPipeline``
+       b. ``aux_seg_active`` & ``keep_native_view_depth`` → ``Slab2_5DNativeDPipeline``
        c. ``aux_seg_active``                       → ``Slab2_5DAuxPipeline``
        d. otherwise                                → ``Slab2_5DPipeline``
     2. 3D ``patch_mode∈{whole, z_axis, cubic}``
@@ -46,7 +46,7 @@ def build_pipeline(cfg: Config, base_loss) -> ViewPipeline:
     if is_2_5d:
         lift     = topo.lift_2_5d_to_3d
         aux      = topo.aux_seg_active
-        native_d = topo.aux_keep_native_d
+        native_d = topo.keep_native_view_depth
 
         if lift and aux:
             cls = Lift2_5DAuxPipeline

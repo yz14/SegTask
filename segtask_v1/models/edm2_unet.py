@@ -240,7 +240,7 @@ def _build_edm2_stem(
     """分派 MP stem 变体；hierarchical 拒绝。"""
     if fusion == "hierarchical":
         raise ValueError(
-            "model.arch='edm2' does not yet support context_fusion="
+            "model.arch='edm2' does not yet support stem_fusion_mode="
             "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj'.")
     per_view = (
         list(in_ch_per_view_list) if in_ch_per_view_list is not None
@@ -249,7 +249,7 @@ def _build_edm2_stem(
         return _MPSharedStem(int(sum(per_view)), out_ch)
     if fusion == "multi_stem_proj":
         return _MPMultiStemProj(n_views, per_view, out_ch)
-    raise ValueError(f"unknown context_fusion: {fusion!r}")
+    raise ValueError(f"unknown stem_fusion_mode: {fusion!r}")
 
 
 # ============================================================================
@@ -463,8 +463,8 @@ class EDM2SegModel(nn.Module):
         # Stem.
         stem: nn.Module,
         stem_stride: int,
-        context_n_views: int,
-        context_fusion: str,
+        num_stem_fusion_views: int,
+        stem_fusion_mode: str,
         # Encoder topology.
         encoder_channels: List[int],
         encoder_blocks_per_stage: List[int],
@@ -487,8 +487,8 @@ class EDM2SegModel(nn.Module):
         super().__init__()
         self.spatial_dims = 2
         self.stem_stride = int(stem_stride)
-        self.context_n_views = int(context_n_views)
-        self.context_fusion = context_fusion
+        self.num_stem_fusion_views = int(num_stem_fusion_views)
+        self.stem_fusion_mode = stem_fusion_mode
         self.deep_supervision = bool(deep_supervision)
         self.num_fg_classes = int(num_fg_classes)
 
@@ -525,7 +525,7 @@ class EDM2SegModel(nn.Module):
                 self.ds_heads.append(_MPSegHead(ch, num_fg_classes))
 
         # Aux seg supervision (Plan A only).
-        n_views = self.context_n_views
+        n_views = self.num_stem_fusion_views
         self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
         if aux_head_out_channels is None:
@@ -630,16 +630,16 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
     attn_levels = _resolve_attn_levels(
         n_levels, getattr(mc, "edm2_attention_levels", None))
 
-    if mc.context_fusion == "hierarchical":
+    if mc.stem_fusion_mode == "hierarchical":
         raise ValueError(
-            "model.arch='edm2' does not yet support context_fusion="
+            "model.arch='edm2' does not yet support stem_fusion_mode="
             "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj'.")
 
     in_ch_per_view_list = None
     aux_head_out_channels = None
-    if (bool(getattr(cfg.data, "aux_keep_native_d", False))
+    if (bool(getattr(cfg.data, "keep_native_view_depth", False))
             and n_views > 1):
-        depths = list(cfg.aux_view_depths)
+        depths = list(cfg.per_view_depths)
         in_ch_per_view_list = depths
         aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
         in_channels = sum(depths)
@@ -648,7 +648,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
     in_ch_per_view = D
 
     stem = _build_edm2_stem(
-        fusion=mc.context_fusion,
+        fusion=mc.stem_fusion_mode,
         n_views=n_views,
         in_ch_per_view=in_ch_per_view,
         out_ch=enc_channels[0],
@@ -661,8 +661,8 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
     model = EDM2SegModel(
         stem=stem,
         stem_stride=stem_stride,
-        context_n_views=n_views,
-        context_fusion=mc.context_fusion,
+        num_stem_fusion_views=n_views,
+        stem_fusion_mode=mc.stem_fusion_mode,
         encoder_channels=enc_channels,
         encoder_blocks_per_stage=enc_bps,
         decoder_blocks_per_stage=dec_bps_full,
@@ -694,7 +694,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         else [in_ch_per_view] * n_views,
         out_classes, num_fg, D,
         getattr(mc, "stem_mode", "conv3"), stem_stride, n_views,
-        mc.context_fusion,
+        mc.stem_fusion_mode,
         bool(mc.deep_supervision), aux_seg,
         len(model.aux_heads), getattr(mc, "aux_head_mode", "linear"))
 

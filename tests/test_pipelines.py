@@ -99,15 +99,15 @@ class TestFactoryDispatch:
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
-        cfg.data.aux_keep_native_d = True
+        cfg.data.keep_native_view_depth = True
         cfg.model.aux_seg_supervision = True
         cfg.sync()
-        cfg.model.in_channels = sum(cfg.aux_view_depths)
+        cfg.model.in_channels = sum(cfg.per_view_depths)
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         assert isinstance(p, Slab2_5DNativeDPipeline)
         assert len(p.aux_inner_losses) == 1
-        assert p.aux_view_depths == cfg.aux_view_depths
+        assert p.per_view_depths == cfg.per_view_depths
 
     def test_lift_no_aux(self):
         cfg = _base_cfg()
@@ -262,14 +262,14 @@ class TestComputeLossEquivalence:
     def test_native_d_aux(self):
         cfg = _base_cfg()
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
-        cfg.data.aux_keep_native_d = True
+        cfg.data.keep_native_view_depth = True
         cfg.model.aux_seg_supervision = True
         cfg.sync()
-        cfg.model.in_channels = sum(cfg.aux_view_depths)
+        cfg.model.in_channels = sum(cfg.per_view_depths)
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
-        D_aux = p.aux_view_depths[1]
+        D_aux = p.per_view_depths[1]
         pred_main = torch.randn(B, NUM_FG * D, H, W)
         pred_aux = torch.randn(B, NUM_FG * D_aux, H, W)
         pred = {"main": pred_main, "aux": [pred_aux]}

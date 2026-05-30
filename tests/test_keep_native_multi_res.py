@@ -12,7 +12,7 @@ Coverage
    - ``validate()`` rejects ON outside ``{'z_axis', 'cubic'}``.
    - ``validate()`` rejects ON with single-scale / non-1.0 view-0.
    - ``validate()`` rejects mutually-exclusive combo with
-     ``aux_keep_native_d``.
+     ``keep_native_view_depth``.
    - OFF mode is bit-identical to legacy (in_channels = n_views).
 
 2. Dataset layer (z_axis -- ``SegDataset3D``):
@@ -62,7 +62,7 @@ def _make_cfg(
     multi_res_scales=(1.0, 1.5, 2.0),
     keep_native_multi_res: bool = True,
     z_boundary_mode: str = "stretch",  # exercise auto-upgrade by default
-    aux_keep_native_d: bool = False,
+    keep_native_view_depth: bool = False,
     patch_size=(8, 32, 32),
 ):
     cfg = Config(
@@ -73,7 +73,7 @@ def _make_cfg(
             patch_mode=patch_mode,
             multi_res_scales=list(multi_res_scales),
             keep_native_multi_res=keep_native_multi_res,
-            aux_keep_native_d=aux_keep_native_d,
+            keep_native_view_depth=keep_native_view_depth,
             z_boundary_mode=z_boundary_mode,
         ),
         augment=AugConfig(enabled=False),
@@ -233,23 +233,23 @@ def test_config_validate_rejects_non_canonical_view0():
     raise AssertionError("validate() should reject non-1.0 view-0")
 
 
-def test_config_validate_rejects_mutex_with_aux_keep_native_d():
+def test_config_validate_rejects_mutex_with_keep_native_view_depth():
     """Two flags target different patch modes; setting both must be rejected
     even if the patch_mode side would silently make one of them inactive.
     """
     cfg = _make_cfg(
         patch_mode="z_axis", multi_res_scales=[1.0, 1.5],
-        keep_native_multi_res=True, aux_keep_native_d=True,
+        keep_native_multi_res=True, keep_native_view_depth=True,
     )
     try:
         cfg.validate()
     except AssertionError as e:
-        # Order-dependent: aux_keep_native_d's own check fires first
+        # Order-dependent: keep_native_view_depth's own check fires first
         # (rejects non-2_5d). Either message is acceptable as long as
         # validate() rejects the combo.
         msg = str(e)
         assert ("mutually exclusive" in msg
-                or "aux_keep_native_d" in msg
+                or "keep_native_view_depth" in msg
                 or "patch_mode" in msg), f"unexpected message: {e}"
         return
     raise AssertionError("validate() should reject the mutex combo")
@@ -521,7 +521,7 @@ if __name__ == "__main__":
         test_config_validate_rejects_on_in_2_5d,
         test_config_validate_rejects_single_scale,
         test_config_validate_rejects_non_canonical_view0,
-        test_config_validate_rejects_mutex_with_aux_keep_native_d,
+        test_config_validate_rejects_mutex_with_keep_native_view_depth,
         test_z_axis_on_shape_and_view0_equivalence,
         test_z_axis_on_aux_view_geometric_ground_truth,
         test_z_axis_on_weight_map_shape_and_geometry,

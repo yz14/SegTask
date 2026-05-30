@@ -4,7 +4,7 @@ CPU-only / 不构造真模型，仅校验派生字段。覆盖：
 
 1. 12 种 mode 组合下 ``build_topology`` 字段与重构前 ``Config.sync`` 行为等价
 2. ``Config.sync`` 之后 ``cfg.model.in_channels`` / ``spatial_dims`` 与 topology 一致
-3. ``Config.aux_view_depths`` property 等价于 ``build_topology(cfg).aux_view_depths``
+3. ``Config.per_view_depths`` property 等价于 ``build_topology(cfg).per_view_depths``
 4. ``aux_seg_active`` 已合并 ``aux_seg_supervision AND n_views>1`` 门控
 5. ``in_ch_per_view_list`` / ``aux_head_out_channels`` 仅在 native_d 启用
 6. ``models.factory.build_model`` 与 topology 派生量一致
@@ -30,7 +30,7 @@ def _cfg(pm="whole", scales=None, *, lift=False, native_d=False,
     c.data.patch_size = list(ps)
     c.data.patch_mode = pm
     c.data.multi_res_scales = list(scales)
-    c.data.aux_keep_native_d = native_d
+    c.data.keep_native_view_depth = native_d
     c.data.keep_native_multi_res = keep_native
     c.model.lift_2_5d_to_3d = lift
     c.model.aux_seg_supervision = aux
@@ -107,38 +107,38 @@ class TestNativeDFields:
     def test_native_d_populated(self):
         cfg = _cfg("2_5d", [1.0, 2.0], native_d=True, aux=True)
         topo = build_topology(cfg)
-        assert topo.aux_keep_native_d is True
-        assert topo.aux_view_depths == [4, 8]
+        assert topo.keep_native_view_depth is True
+        assert topo.per_view_depths == [4, 8]
         assert topo.in_ch_per_view_list == [4, 8]
         assert topo.aux_head_out_channels == [2 * 8]   # num_fg * D_1
 
-    def test_folded_aux_view_depths_present_but_not_used(self):
-        """非 native_d 路径下 aux_view_depths 仍按形状计算，但 in_ch_per_view_list=None。"""
+    def test_folded_per_view_depths_present_but_not_used(self):
+        """非 native_d 路径下 per_view_depths 仍按形状计算，但 in_ch_per_view_list=None。"""
         cfg = _cfg("2_5d", [1.0, 2.0], aux=True, native_d=False)
         topo = build_topology(cfg)
-        assert topo.aux_view_depths == [4, 8]
+        assert topo.per_view_depths == [4, 8]
         assert topo.in_ch_per_view_list is None
         assert topo.aux_head_out_channels is None
 
     def test_non_2_5d_no_depths(self):
         cfg = _cfg("whole", [1.0])
         topo = build_topology(cfg)
-        assert topo.aux_view_depths == []
+        assert topo.per_view_depths == []
         assert topo.slab_depth == 0
 
 
 # ===========================================================================
-# Config.aux_view_depths property delegates correctly
+# Config.per_view_depths property delegates correctly
 # ===========================================================================
 class TestPropertyDelegation:
-    def test_aux_view_depths_property(self):
+    def test_per_view_depths_property(self):
         cfg = _cfg("2_5d", [1.0, 2.0])
         topo = build_topology(cfg)
-        assert cfg.aux_view_depths == topo.aux_view_depths == [4, 8]
+        assert cfg.per_view_depths == topo.per_view_depths == [4, 8]
 
-    def test_aux_view_depths_non_2_5d(self):
+    def test_per_view_depths_non_2_5d(self):
         cfg = _cfg("z_axis", [1.0, 2.0])
-        assert cfg.aux_view_depths == []
+        assert cfg.per_view_depths == []
 
 
 # ===========================================================================

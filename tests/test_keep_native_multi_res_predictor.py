@@ -76,8 +76,8 @@ def _make_predictor_stub(
     stub.patch_D, stub.patch_H, stub.patch_W = patch_size
     stub.multi_res_scales = list(multi_res_scales)
     stub.z_boundary_mode = z_boundary_mode
-    stub.aux_keep_native_d = False
-    stub.aux_view_depths = []
+    stub.keep_native_view_depth = False
+    stub.per_view_depths = []
     stub._eD_max = pD
 
     stub.keep_native_multi_res = bool(

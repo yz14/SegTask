@@ -8,7 +8,7 @@
 * ``aux_inner_losses``—— 逐视图 aux 内损（仅 native_d 异深度路径）；否则 ``None``
 * ``aux_weights``     —— ``list[float]``，长度 = ``n_aux_views``
 * ``target_patch_size``——增强后中心裁回的目标尺寸
-* 若适用：``mr_native_sizes``（3D 懒多分辨率）/ ``aux_view_depths``（2.5D 异深 aux）
+* 若适用：``mr_native_sizes``（3D 懒多分辨率）/ ``per_view_depths``（2.5D 异深 aux）
 
 Pipeline 不持模型 / 优化器 / scaler / EMA —— 这些归 ``Trainer``。
 
@@ -65,7 +65,7 @@ class ViewPipeline(ABC):
 
     # 可选：仅特定 pipeline 用
     mr_native_sizes: List[Tuple[int, int, int]] = []
-    aux_view_depths: List[int] = []
+    per_view_depths: List[int] = []
 
     @abstractmethod
     def prepare_batch(

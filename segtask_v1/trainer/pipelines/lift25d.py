@@ -51,7 +51,7 @@ class Lift2_5DPipeline(ViewPipeline):
         self.aux_inner_losses = None
         self.aux_weights = []
         self.mr_native_sizes = []
-        self.aux_view_depths = []
+        self.per_view_depths = []
         self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
         logger.info(
             "Loss: %s, scales=%d, fg_classes=%d [2.5D LIFTED to 3D]",
@@ -118,12 +118,12 @@ class Lift2_5DAuxPipeline(ViewPipeline):
         self.aux_inner_losses = None
         self.aux_weights = _resolve_aux_weights(cfg, n_aux)
         self.mr_native_sizes = []
-        self.aux_view_depths = []
+        self.per_view_depths = []
         self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
         logger.info(
             "Aux seg supervision: ENABLED [LIFT], n_aux_views=%d, "
             "weights=%s, fusion=%s",
-            n_aux, self.aux_weights, cfg.model.context_fusion)
+            n_aux, self.aux_weights, cfg.model.stem_fusion_mode)
 
     def prepare_batch(self, image, label, wmap):
         # image 保 rank-5；label/wmap 整存以便逐视图 [:, k:k+1] 取出（rank-5）

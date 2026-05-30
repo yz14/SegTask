@@ -45,4 +45,13 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 3 最后2的数据基础上，彻底检查一遍损失函数，是否都正确实现了，对应我这样的数据是否可行，是否有问题。
 
-4 在利用val挑选模型的时候，我增加了很多的指标和预设，因为有时候仅仅靠mean dice是无法来挑选最好的模型的，比如当训练大器官的时候，dice很高，但是边缘细节不好，外部有碎点，假阳，假阴等等，这些情况mean dice无法体现出来。现在请你仔细检查这一块的代码，看看是否有问题，是否合理，是否都可以生效，是否有更好的建议。
+4 代码中参数的命名有些感觉让人读起来容易混乱，例如context_n_views，为什么它只能是2.5D专属，3D也有多分辨率的输入，多分辨率也提供了多context，只不过2.5D的多视图和3D的处理方式有稍微的区别，但是这个命名读到后面的时候特别容易让人混淆。例如aux_view_depths，aux_head_out_channels这类，aux指的是辅助输入信息，辅助监督等等，可是aux_view_depths包含了主路径，aux_head_out_channels不包含主路径，这样读起来特别容易让人混淆，以为只要是aux就不包括主路径。由于这类的命名的方式，和后续需要大量的判断条件，让人读代码几乎感到崩溃。请严格审查所有的代码，是否有更加清晰，明确，让人更加好理解的方式。不仅仅是参数，还有函数等等。如果你一次性检查完太吃力，可以分块检查，例如代码起点-->数据-->构建模型-->训练类似这样有隔离的块来依次检查。有些地方可能参数命名清晰，容易理解就可以解决，有些地方可能需要代码清晰化，模块化的重构等等。总之，让人容易理解，而不是读到后面的时候感到绕圈，感到命名歧义/不确认又得翻回去确认。
+
+5 失败分类清单（与命名无关的预存失败，供后续单独立项）
+全量 pytest tests/ = 510 passed / 51 failed。我本轮仅改测试文件与 README、未碰源码，以下失败分布在我未触碰的文件，属进行中的架构重构遗留：
+
+数据层 NPZ-only 重构（最大一类）：SegDataset* 现强制 npz_paths、不再接受 keep_native_* kwargs，视图切分移入 trainer/predictor。波及 test_keep_native_view_depth.py（2）、test_keep_native_multi_res.py（5）、test_keep_native_multi_res_trainer.py（2）、test_segtask_v1.py::TestCubicDataset（多个）、test_z_boundary_mode.py（3）、test_round2_fixes.py 部分。
+增强 API 变更：test_segtask_v1.py::TestAugmentation / TestNewAugmentation、test_round2_fixes.py::test_bug10b_grid_dropout_vectorized。
+patch-stem 分辨率恢复：test_blocks_2d_smoke.py、test_stem_and_unet3p.py（patch2/patch4/unet3p）、test_unetpp.py（patch2）。
+hierarchical 融合模型 bug：aux 头输出 (16,16) vs 期望 (32,32)，影响 test_keep_native_view_depth.py::test_model_native_d_hierarchical 与 test_aux_seg_supervision.py 两个 hierarchical 用例。
+配置加载：test_segtask_v1.py::TestConfig::test_load_config（断言 encoder_channels 列表，疑与 resenc 展开默认值有关）。

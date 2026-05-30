@@ -7,7 +7,7 @@ random forward pass in both eval and train mode, and asserts:
   * train mode with ``aux_seg_supervision`` returns a dict with
     ``main`` (tensor / list when DS is on) and ``aux`` (list of K-1
     tensors with the right per-view channel counts when
-    ``aux_keep_native_d=True``).
+    ``keep_native_view_depth=True``).
   * deep supervision returns the right number of DS heads in main.
 
 Usage (Windows powershell):
@@ -38,8 +38,8 @@ def _make_cfg(arch: str,
               encoder_channels=(16, 32, 64, 64, 64),
               aux: bool = True,
               ds: bool = False,
-              aux_keep_native_d: bool = True,
-              context_fusion: str = "multi_stem_proj",
+              keep_native_view_depth: bool = True,
+              stem_fusion_mode: str = "multi_stem_proj",
               adm_linear_attention_levels=None):
     """Build a minimal :class:`Config` for the requested arch.
 
@@ -58,9 +58,9 @@ def _make_cfg(arch: str,
     cfg.data.patch_size = [D, H, W]
     cfg.data.patch_mode = "2_5d"
     cfg.data.multi_res_scales = [1.0, 1.5, 2.0][:n_views] if n_views > 1 else [1.0]
-    cfg.data.aux_keep_native_d = bool(aux_keep_native_d) and n_views > 1
+    cfg.data.keep_native_view_depth = bool(keep_native_view_depth) and n_views > 1
     cfg.data.z_boundary_mode = (
-        "edge_pad" if cfg.data.aux_keep_native_d else "stretch")
+        "edge_pad" if cfg.data.keep_native_view_depth else "stretch")
     cfg.data.batch_size = 1
     cfg.data.num_workers = 0
     cfg.data.cache_mode = "memory"
@@ -72,7 +72,7 @@ def _make_cfg(arch: str,
     cfg.model.encoder_blocks_per_stage = [2] * len(encoder_channels)
     cfg.model.decoder_blocks_per_stage = [1] * (len(encoder_channels) - 1)
     cfg.model.stem_mode = "conv3"
-    cfg.model.context_fusion = context_fusion
+    cfg.model.stem_fusion_mode = stem_fusion_mode
     cfg.model.deep_supervision = bool(ds)
     cfg.model.aux_seg_supervision = bool(aux) and n_views > 1
     cfg.model.aux_head_mode = "linear"
@@ -128,20 +128,20 @@ def _check_main_shape(out, num_fg: int, D: int, H: int, W: int) -> torch.Tensor:
     return main_t
 
 
-def _run_arch(arch: str, *, ds: bool, aux: bool, aux_keep_native_d: bool,
-              context_fusion: str = "multi_stem_proj",
+def _run_arch(arch: str, *, ds: bool, aux: bool, keep_native_view_depth: bool,
+              stem_fusion_mode: str = "multi_stem_proj",
               adm_linear_attention_levels=None) -> None:
     cfg = _make_cfg(arch, ds=ds, aux=aux,
-                    aux_keep_native_d=aux_keep_native_d,
-                    context_fusion=context_fusion,
+                    keep_native_view_depth=keep_native_view_depth,
+                    stem_fusion_mode=stem_fusion_mode,
                     adm_linear_attention_levels=adm_linear_attention_levels)
     from segtask_v1.models.factory import build_model
 
     model = build_model(cfg)
     pc = model.param_count()
     logger.info("[%s] params total = %.2fM (ds=%s, aux=%s, native_d=%s, fusion=%s)",
-                arch, pc["total"] / 1e6, ds, aux, aux_keep_native_d,
-                context_fusion)
+                arch, pc["total"] / 1e6, ds, aux, keep_native_view_depth,
+                stem_fusion_mode)
 
     x, in_ch, H, W = _make_input(cfg)
     D = int(cfg.data.patch_size[0])
@@ -172,8 +172,8 @@ def _run_arch(arch: str, *, ds: bool, aux: bool, aux_keep_native_d: bool,
         aux_list = out_train["aux"]
         assert len(aux_list) == n_views - 1, (
             f"aux list length {len(aux_list)} != n_views-1 {n_views - 1}")
-        if cfg.data.aux_keep_native_d:
-            depths = list(cfg.aux_view_depths)
+        if cfg.data.keep_native_view_depth:
+            depths = list(cfg.per_view_depths)
             for k, ao in enumerate(aux_list, start=1):
                 expected_ch = num_fg * depths[k]
                 assert ao.shape == (2, expected_ch, H, W), (
@@ -237,8 +237,8 @@ def main() -> int:
     for arch, ds, aux, native_d, fusion in cases:
         try:
             _run_arch(arch, ds=ds, aux=aux,
-                      aux_keep_native_d=native_d,
-                      context_fusion=fusion)
+                      keep_native_view_depth=native_d,
+                      stem_fusion_mode=fusion)
         except Exception:
             failures += 1
             logger.error("FAIL: arch=%s ds=%s aux=%s native_d=%s fusion=%s\n%s",
@@ -254,8 +254,8 @@ def main() -> int:
     ]
     for label, lin_levels in lin_cases:
         try:
-            _run_arch("adm", ds=False, aux=True, aux_keep_native_d=True,
-                      context_fusion="multi_stem_proj",
+            _run_arch("adm", ds=False, aux=True, keep_native_view_depth=True,
+                      stem_fusion_mode="multi_stem_proj",
                       adm_linear_attention_levels=lin_levels)
             logger.info("[adm] linear-attn (%s, levels=%s) smoke OK",
                         label, lin_levels)
@@ -267,8 +267,8 @@ def main() -> int:
     # Single-FOV (n_views=1) smoke — aux disabled automatically.
     for arch in ("adm", "edm2"):
         try:
-            cfg = _make_cfg(arch, n_views=1, aux=False, aux_keep_native_d=False,
-                            context_fusion="multi_stem_proj")
+            cfg = _make_cfg(arch, n_views=1, aux=False, keep_native_view_depth=False,
+                            stem_fusion_mode="multi_stem_proj")
             from segtask_v1.models.factory import build_model
             model = build_model(cfg)
             x, _, _, _ = _make_input(cfg)

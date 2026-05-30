@@ -8,7 +8,7 @@
 #   model.block_type:         basic    → r2plus1d
 #   model.lift_2_5d_to_3d:    false    → true        (D 还原为真空间轴)
 #   model.aux_seg_supervision: true    → false       (本轮先跑主路径基线)
-#   data.aux_keep_native_d:   true     → false       (与 lift 互斥)
+#   data.keep_native_view_depth:   true     → false       (与 lift 互斥)
 #   data.patch_size:          [12,...] → [16,...]    (5 stages: D 需被 16 整除)
 #   data.z_boundary_mode:     stretch  → edge_pad    (lift 下 z 几何一致性)
 #   train.output_dir / resume / pretrain: 独立目录, 清空 (架构不兼容旧 ckpt)
@@ -39,7 +39,7 @@ data:
   aug_oversample_ratio: 1.5
 
   z_boundary_mode: "edge_pad"          # lift 下 z 几何需与中心窗一致 (R(2+1)D 偏置)
-  aux_keep_native_d: false             # 与 lift 互斥 (validate 强制)
+  keep_native_view_depth: false             # 与 lift 互斥 (validate 强制)
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -120,7 +120,7 @@ model:
   deep_supervision: false
 
   stem_mode    : "conv3"
-  context_fusion: "shared_stem"        # lift 下字段被忽略 (仅 2D-folded 生效)
+  stem_fusion_mode: "shared_stem"        # lift 下字段被忽略 (仅 2D-folded 生效)
 
   aux_seg_supervision: false           # 本轮跑 lift 主路径基线; 收敛后可开
   aux_head_mode: "linear"

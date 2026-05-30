@@ -46,7 +46,7 @@ class Vanilla3DPipeline(ViewPipeline):
         self.aux_inner_losses = None
         self.aux_weights = []
         self.mr_native_sizes = []
-        self.aux_view_depths = []
+        self.per_view_depths = []
 
         self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
 

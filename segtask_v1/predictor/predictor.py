@@ -87,14 +87,14 @@ class Predictor:
                 "expected 'stretch' or 'edge_pad'.")
 
         # ---- R6：所有 mode 派生量来自 ModelTopology ----------------------
-        # 重构前本 ``__init__`` 自行重算 ``lift_2_5d_to_3d`` / ``aux_keep_native_d``
+        # 重构前本 ``__init__`` 自行重算 ``lift_2_5d_to_3d`` / ``keep_native_view_depth``
         # / ``keep_native_multi_res`` / per-view depth / max-FOV target 等 ~80 行，
         # 与 Config.sync + models.factory.build_model 三处重复。R5 引入 ModelTopology
         # 之后这些应当只来自一处真相源。
         topo: ModelTopology = build_topology(cfg)
         self.topo = topo
         self.lift_2_5d_to_3d = topo.lift_2_5d_to_3d
-        self.aux_keep_native_d = topo.aux_keep_native_d
+        self.keep_native_view_depth = topo.keep_native_view_depth
         self.keep_native_multi_res = topo.keep_native_multi_res
 
         if self.lift_2_5d_to_3d:
@@ -107,24 +107,24 @@ class Predictor:
                 int(self.patch_H), int(self.patch_W))
 
         # 2.5D native_d 推理路径：(B, sum_k D_k, pH, pW)，D_k = round(pD*s_k)
-        if self.aux_keep_native_d:
-            self.aux_view_depths: List[int] = list(topo.aux_view_depths)
+        if self.keep_native_view_depth:
+            self.per_view_depths: List[int] = list(topo.per_view_depths)
             self._eD_max: int = int(round(
                 self.patch_D * float(max(self.multi_res_scales))))
             # 与模型实际 in_channels 一致性检查（topology 已保证，此处仅防御 stale-cfg）。
-            expect_in = sum(self.aux_view_depths)
+            expect_in = sum(self.per_view_depths)
             actual_in = int(getattr(cfg.model, "in_channels", expect_in))
             if actual_in != expect_in:
                 raise ValueError(
-                    f"aux_keep_native_d=True: model.in_channels={actual_in} "
-                    f"!= sum(aux_view_depths)={expect_in}. The model was "
+                    f"keep_native_view_depth=True: model.in_channels={actual_in} "
+                    f"!= sum(per_view_depths)={expect_in}. The model was "
                     "likely built with a stale Config — re-sync and rebuild.")
             logger.info(
-                "Predictor aux_keep_native_d=True: per-view depths=%s, "
+                "Predictor keep_native_view_depth=True: per-view depths=%s, "
                 "max-FOV cube depth=%d, in_channels=%d.",
-                self.aux_view_depths, self._eD_max, actual_in)
+                self.per_view_depths, self._eD_max, actual_in)
         else:
-            self.aux_view_depths = []
+            self.per_view_depths = []
             self._eD_max = int(self.patch_D)
 
         # 3D 懒 max-FOV cube 推理路径：(B, C_res, pD, pH, pW)；
@@ -375,7 +375,7 @@ class Predictor:
         return _inputs.build_z_window_native_d_gpu(
             vol_t, z0, z1,
             pH=self.patch_H, pW=self.patch_W,
-            eD_max=self._eD_max, view_depths=self.aux_view_depths)
+            eD_max=self._eD_max, view_depths=self.per_view_depths)
 
     # ==================================================================
     # Forward + TTA + diag (R6: thin shims delegating to predictor.forwards)

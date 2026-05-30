@@ -104,13 +104,13 @@ def split_views_native_3d(
 
 
 # ---------------------------------------------------------------------------
-# 2.5D lazy multi-resolution split (aux_keep_native_d)
+# 2.5D lazy multi-resolution split (keep_native_view_depth)
 # ---------------------------------------------------------------------------
 def split_views_native_d(
     image: torch.Tensor,
     label: torch.Tensor,
     wmap: Optional[torch.Tensor],
-    aux_view_depths: List[int],
+    per_view_depths: List[int],
     target_patch_size: Tuple[int, int, int],
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor],
@@ -131,7 +131,7 @@ def split_views_native_d(
             f"image={tuple(image.shape)}, label={tuple(label.shape)}")
 
     _, _, eD_max, _, _ = image.shape
-    depths = aux_view_depths
+    depths = per_view_depths
     D = depths[0]
     if eD_max != int(target_patch_size[0]):
         raise ValueError(
@@ -141,7 +141,7 @@ def split_views_native_d(
             "oversample margin.")
     if max(depths) > eD_max:
         raise ValueError(
-            f"max(aux_view_depths)={max(depths)} exceeds eD_max={eD_max}; "
+            f"max(per_view_depths)={max(depths)} exceeds eD_max={eD_max}; "
             "this indicates a multi_res_scales / patch_size mismatch.")
 
     def _slab(t: torch.Tensor, d_k: int) -> torch.Tensor:

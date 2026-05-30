@@ -38,7 +38,7 @@ def main() -> None:
     print(f"      data.patch_mode          = {cfg.data.patch_mode}")
     print(f"      data.patch_size          = {cfg.data.patch_size}")
     print(f"      data.multi_res_scales    = {cfg.data.multi_res_scales}")
-    print(f"      data.aux_keep_native_d   = {cfg.data.aux_keep_native_d}")
+    print(f"      data.keep_native_view_depth = {cfg.data.keep_native_view_depth}")
     print(f"      data.z_boundary_mode     = {cfg.data.z_boundary_mode}")
     print(f"      model.backbone           = {cfg.model.backbone}")
     print(f"      model.block_type         = {cfg.model.block_type}")

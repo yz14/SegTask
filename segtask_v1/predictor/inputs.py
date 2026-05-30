@@ -158,7 +158,7 @@ def build_z_window_native_d_gpu(
     vol_t: torch.Tensor, z0: int, z1: int,
     *, pH: int, pW: int, eD_max: int, view_depths: List[int],
 ) -> torch.Tensor:
-    """2.5D ``aux_keep_native_d=True`` 模式窗口建造：抽 ``eD_max`` max-FOV slab、
+    """2.5D ``keep_native_view_depth=True`` 模式窗口建造：抽 ``eD_max`` max-FOV slab、
     面内 resize 到 ``(pH, pW)``、逐视图中心抽 ``D_k`` 切片后拼通道。
 
     返 ``(sum(D_k), pH, pW)``。

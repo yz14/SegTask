@@ -8,7 +8,7 @@
 #   /use_se/decoder_type/unet3p_cat_channels/resenc_preset/skip_attention
 #   /skip_mode/upsample_mode/downsample_mode/drop_path_rate (论文固定)
 # 生效字段: data.*, encoder_channels/encoder_blocks_per_stage/decoder_blocks_per_stage,
-#   stem_mode/context_fusion, deep_supervision/aux_seg_supervision/aux_head_mode,
+#   stem_mode/stem_fusion_mode, deep_supervision/aux_seg_supervision/aux_head_mode,
 #   dropout (ResBlock), adm_attention_levels/adm_num_heads/adm_num_head_channels
 
 # DATA — 同 seg2_5d.yaml
@@ -37,9 +37,9 @@ data:
   multi_res_scales: [1.0, 1.5, 2.0]
   aug_oversample_ratio: 1.5
 
-  # Required when aux_keep_native_d=True (ADM consumes per-view native depths).
+  # Required when keep_native_view_depth=True (ADM consumes per-view native depths).
   z_boundary_mode: "edge_pad"
-  aux_keep_native_d: true
+  keep_native_view_depth: true
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -96,7 +96,7 @@ model:
   decoder_blocks_per_stage: [2, 2, 2, 2]
 
   stem_mode: "conv7"
-  context_fusion: "multi_stem_proj"     # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
+  stem_fusion_mode: "multi_stem_proj"     # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
 
   deep_supervision: false
   aux_seg_supervision: true

@@ -219,13 +219,13 @@ def build_model(cfg: Config):
     num_fg       = cfg.num_fg_classes
     n_levels     = len(enc_channels)
 
-    # R5：所有 mode 派生量（out_classes / spatial_dims / context_n_views /
+    # R5：所有 mode 派生量（out_classes / spatial_dims / num_stem_fusion_views /
     # in_ch_per_view_list / aux_head_out_channels / aux 门控）来自 topology，
     # 不再在本函数内重复推导。
     topo = build_topology(cfg)
     spatial_dims          = topo.spatial_dims
     out_classes           = topo.out_classes
-    context_n_views       = topo.context_n_views
+    num_stem_fusion_views       = topo.num_stem_fusion_views
     in_ch_per_view_list   = topo.in_ch_per_view_list
     aux_head_out_channels = topo.aux_head_out_channels
 
@@ -300,8 +300,8 @@ def build_model(cfg: Config):
         downsample_mode     = mc.downsample_mode,
         stem_mode           = mc.stem_mode,
         spatial_dims        = spatial_dims,
-        context_n_views     = context_n_views,
-        context_fusion      = getattr(mc, "context_fusion", "shared_stem"),
+        num_stem_fusion_views     = num_stem_fusion_views,
+        stem_fusion_mode      = getattr(mc, "stem_fusion_mode", "shared_stem"),
         in_ch_per_view_list = in_ch_per_view_list,
         downsample_builder  = downsample_builder,
         downsample_strides  = ds_strides)
@@ -365,7 +365,7 @@ def build_model(cfg: Config):
         out_classes, num_fg,
         topo.num_res_groups if topo.num_res_groups > 0 else 1,
         mc.stem_mode, encoder.stem_stride,
-        context_n_views, getattr(mc, "context_fusion", "shared_stem"),
+        num_stem_fusion_views, getattr(mc, "stem_fusion_mode", "shared_stem"),
         mc.downsample_mode, mc.upsample_mode, mc.skip_mode,
         mc.attention_type, mc.skip_attention,
         mc.deep_supervision, aux_seg_supervision, len(model.aux_heads),

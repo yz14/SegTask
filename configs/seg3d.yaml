@@ -35,7 +35,7 @@ data:
 
   # 3D 多分辨率 lazy 单 cube 提取 (仅 z_axis/cubic + n>1)。
   #   false — 默认: 每 scale 独立 scipy.zoom; aux 高频细节在增强前已损
-  #   true  — 只抽 max-FOV cube 增强 1 次，trainer per-view crop+interpolate; 锁 edge_pad; 与 aux_keep_native_d 互斥
+  #   true  — 只抽 max-FOV cube 增强 1 次，trainer per-view crop+interpolate; 锁 edge_pad; 与 keep_native_view_depth 互斥
   keep_native_multi_res: false
 
   # HU 窗 + 归一化。normalize: 'minmax' → [0,1] | 'zscore' → (x-mean)/std (需 global_mean/std)

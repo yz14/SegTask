@@ -47,7 +47,7 @@ data:
   #   true  — 抽 max_scale cube 增强; trainer 中心裁出各 view 原生 D_k
   #           拼接为 (B,sum(D_k),H,W); aux head k 预测 (B,num_fg*D_k,H,W) 对应原 D_k label
   # 锁定 z_boundary_mode='edge_pad'
-  aux_keep_native_d: true
+  keep_native_view_depth: true
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -115,7 +115,7 @@ model:
   # Plan A 升维: 2.5D 不折叠走真 3D UNet (spatial_dims=3)。
   #   false — 默认: D 折入通道， 2D UNet + SliceChannelLoss
   #   true  — 真 3D: 输入 (B,n_views,D,H,W) → 输出 (B,num_fg,D,H,W); 损失走 MultiResLoss(1)
-  #           限制: 与 aux_keep_native_d 互斥；D 需被 2^(n_levels-1) 整除
+  #           限制: 与 keep_native_view_depth 互斥；D 需被 2^(n_levels-1) 整除
   # 推荐组合: D=16, block_type='r2plus1d', lift=true, aux_seg_supervision=true
   lift_2_5d_to_3d: false
 
@@ -146,10 +146,10 @@ model:
   #   'hierarchical'    — Plan C: view k 经 stride-2^k stem 注入到 encoder stage k
   #                       需 n_views<=n_levels 且 patch_size[1:] 能被 2^(n_views-1) 整除
   #   'shared_stem'     — 单 stem 跑 n_views*D 通道 (省参但物理异质共享滤波器)
-  context_fusion: "multi_stem_proj"
+  stem_fusion_mode: "multi_stem_proj"
 
   # 多 FOV 辅助监督 (仅 2_5d + n_views>1)。为 aux view k 外接 head 用重采样后 label 监督。
-  # head 挂点随 context_fusion 自动选: Plan A并接顶语义层；Plan C 挂 dec_features[-1-k]。
+  # head 挂点随 stem_fusion_mode 自动选: Plan A并接顶语义层；Plan C 挂 dec_features[-1-k]。
   # 权重由 loss.aux_supervision_weights 控制；推理阶段 aux head 不使用。
   aux_seg_supervision: true
 

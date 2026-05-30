@@ -97,10 +97,10 @@ class DataConfig:
 
     # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
     # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
-    aux_keep_native_d: bool = False
+    keep_native_view_depth: bool = False
 
     # 3D 多 FOV 懒加载单 cube（z_axis/cubic）。True：dataset 发单 cube，trainer 逐视图裁剪/重采样。
-    # 约束：scales[0]==1.0；与 aux_keep_native_d 互斥；z_axis 强制 edge_pad。
+    # 约束：scales[0]==1.0；与 keep_native_view_depth 互斥；z_axis 强制 edge_pad。
     keep_native_multi_res: bool = False
 
 
@@ -224,7 +224,7 @@ class ModelConfig:
     aux_head_mode: str = "linear"
 
     # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
-    # 与 data.aux_keep_native_d 互斥，仅在 2.5D 生效。
+    # 与 data.keep_native_view_depth 互斥，仅在 2.5D 生效。
     lift_2_5d_to_3d: bool = False
 
     # Stem / patch-embed："conv3" | "conv7" | "dual" | "patch2" | "patch4"。patchN 降 N 倍分辨率（UNet3D 主输出加上采样）。
@@ -232,7 +232,7 @@ class ModelConfig:
 
     # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
     # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
-    context_fusion: str = "multi_stem_proj"
+    stem_fusion_mode: str = "multi_stem_proj"
 
     # Decoder 拓扑："unet" 对称（默认）；"unetpp" 嵌套稠密；"unet3p" 全尺度 skip。
     decoder_type: str = "unet"
@@ -596,10 +596,10 @@ class Config:
         # *data 侧* 副作用，不属 ModelTopology 范畴。
         n_views = max(len(self.data.multi_res_scales), 1)
         if self.data.patch_mode == "2_5d":
-            if (self.data.aux_keep_native_d and n_views > 1
+            if (self.data.keep_native_view_depth and n_views > 1
                     and self.data.z_boundary_mode != "edge_pad"):
                 logger.info(
-                    "aux_keep_native_d=True implies z_boundary_mode='edge_pad'; "
+                    "keep_native_view_depth=True implies z_boundary_mode='edge_pad'; "
                     "auto-upgraded from %r.", self.data.z_boundary_mode)
                 self.data.z_boundary_mode = "edge_pad"
         elif (self.data.keep_native_multi_res
@@ -722,11 +722,11 @@ class Config:
             # ADM / EDM2 仅支持 2.5D + Plan A（shared_stem / multi_stem_proj）。
             assert self.data.patch_mode == "2_5d", (
                 f"model.arch={arch!r} requires data.patch_mode='2_5d'; got {self.data.patch_mode!r}.")
-            assert self.model.context_fusion in (
+            assert self.model.stem_fusion_mode in (
                 "shared_stem", "multi_stem_proj",
             ), (
-                f"model.arch={arch!r} only supports context_fusion in "
-                f"('shared_stem','multi_stem_proj'); got {self.model.context_fusion!r}.")
+                f"model.arch={arch!r} only supports stem_fusion_mode in "
+                f"('shared_stem','multi_stem_proj'); got {self.model.stem_fusion_mode!r}.")
         assert self.model.spatial_dims in (2, 3), \
             f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)"
         assert self.augment.wmap_interp_mode in ("nearest", "bilinear"), (
@@ -736,9 +736,9 @@ class Config:
         assert self.model.stem_mode in (
             "conv3", "conv7", "dual", "patch2", "patch4",
         ), f"Invalid stem_mode: {self.model.stem_mode}"
-        assert self.model.context_fusion in (
+        assert self.model.stem_fusion_mode in (
             "shared_stem", "multi_stem_proj", "hierarchical",
-        ), f"Invalid context_fusion: {self.model.context_fusion!r}"
+        ), f"Invalid stem_fusion_mode: {self.model.stem_fusion_mode!r}"
         assert getattr(self.model, "aux_head_mode", "linear") in (
             "linear", "conv",
         ), f"Invalid aux_head_mode: {self.model.aux_head_mode!r}"
@@ -827,28 +827,28 @@ class Config:
             assert len(self.data.multi_res_scales) == 1 \
                 and self.data.multi_res_scales[0] == 1.0, (
                 f"whole-volume mode requires multi_res_scales=[1.0]; got {self.data.multi_res_scales}.")
-        # aux_keep_native_d：仅 2.5D + 多视图有意义。
-        if self.data.aux_keep_native_d:
+        # keep_native_view_depth：仅 2.5D + 多视图有意义。
+        if self.data.keep_native_view_depth:
             assert self.data.patch_mode == "2_5d", (
-                f"data.aux_keep_native_d=True requires patch_mode='2_5d'; got {self.data.patch_mode!r}.")
+                f"data.keep_native_view_depth=True requires patch_mode='2_5d'; got {self.data.patch_mode!r}.")
             assert len(self.data.multi_res_scales) > 1, (
-                "data.aux_keep_native_d=True requires len(multi_res_scales) > 1; "
+                "data.keep_native_view_depth=True requires len(multi_res_scales) > 1; "
                 f"got {self.data.multi_res_scales}.")
 
-        # keep_native_multi_res：aux_keep_native_d 的 3D 对应，dataset 发单 cube 后由 trainer 逐视图几何处理。
+        # keep_native_multi_res：keep_native_view_depth 的 3D 对应，dataset 发单 cube 后由 trainer 逐视图几何处理。
         if self.data.keep_native_multi_res:
             assert self.data.patch_mode in ("z_axis", "cubic"), (
                 "data.keep_native_multi_res=True requires patch_mode in "
                 f"('z_axis','cubic'); got {self.data.patch_mode!r}. Use "
-                "data.aux_keep_native_d for the 2.5D analogue.")
+                "data.keep_native_view_depth for the 2.5D analogue.")
             assert len(self.data.multi_res_scales) > 1, (
                 "data.keep_native_multi_res=True requires len(multi_res_scales) > 1; "
                 f"got {self.data.multi_res_scales}.")
             assert float(self.data.multi_res_scales[0]) == 1.0, (
                 "data.keep_native_multi_res=True requires multi_res_scales[0]==1.0; "
                 f"got {self.data.multi_res_scales}.")
-            assert not self.data.aux_keep_native_d, (
-                "keep_native_multi_res and aux_keep_native_d are mutually exclusive (3D vs 2.5D analogues).")
+            assert not self.data.keep_native_view_depth, (
+                "keep_native_multi_res and keep_native_view_depth are mutually exclusive (3D vs 2.5D analogues).")
             if self.data.patch_mode == "z_axis":
                 assert self.data.z_boundary_mode == "edge_pad", (
                     "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
@@ -870,8 +870,8 @@ class Config:
                 assert self.model.in_channels == n_views, (
                     f"lift_2_5d_to_3d=True requires in_channels == n_views ({n_views}); "
                     f"got {self.model.in_channels}.")
-                assert not self.data.aux_keep_native_d, (
-                    "lift_2_5d_to_3d and aux_keep_native_d are mutually exclusive.")
+                assert not self.data.keep_native_view_depth, (
+                    "lift_2_5d_to_3d and keep_native_view_depth are mutually exclusive.")
                 # 几何约束：D 需 % 2**(n_levels-1) == 0，且 >= 2**(n_levels-1)。
                 n_levels = len(self.model.encoder_channels)
                 D = int(self.data.patch_size[0])
@@ -885,18 +885,18 @@ class Config:
                 assert self.model.spatial_dims == 2, (
                     "2.5D mode requires model.spatial_dims=2 (auto-set by sync()). "
                     "For Plan A 3D lift, set model.lift_2_5d_to_3d=True.")
-            if (not lift) and self.data.aux_keep_native_d and n_views > 1:
-                depths = self.aux_view_depths
+            if (not lift) and self.data.keep_native_view_depth and n_views > 1:
+                depths = self.per_view_depths
                 expected_in = int(sum(depths))
                 assert self.model.in_channels == expected_in, (
-                    f"2.5D + aux_keep_native_d=True requires in_channels == sum(D_k) = "
+                    f"2.5D + keep_native_view_depth=True requires in_channels == sum(D_k) = "
                     f"sum({depths}) = {expected_in}; got {self.model.in_channels}.")
                 assert self.data.z_boundary_mode == "edge_pad", (
-                    f"aux_keep_native_d=True requires z_boundary_mode='edge_pad'; "
+                    f"keep_native_view_depth=True requires z_boundary_mode='edge_pad'; "
                     f"got {self.data.z_boundary_mode!r}.")
                 # 辅视图提供额外输入却无监督信号不合理。
                 assert getattr(self.model, "aux_seg_supervision", False), (
-                    "aux_keep_native_d=True requires model.aux_seg_supervision=True "
+                    "keep_native_view_depth=True requires model.aux_seg_supervision=True "
                     "(each native-depth view k drives an aux head).")
             elif not lift:
                 expected_in = int(self.data.patch_size[0]) * n_views
@@ -905,10 +905,10 @@ class Config:
                     f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
                     f"got {self.model.in_channels}.")
             # Plan C：aux view k 注入 encoder 第 k 级。
-            if self.model.context_fusion == "hierarchical" and n_views > 1:
+            if self.model.stem_fusion_mode == "hierarchical" and n_views > 1:
                 n_stages = len(self.model.encoder_channels)
                 assert n_views <= n_stages, (
-                    f"context_fusion='hierarchical' requires n_views <= n_stages; "
+                    f"stem_fusion_mode='hierarchical' requires n_views <= n_stages; "
                     f"got n_views={n_views}, n_stages={n_stages}.")
                 stem_stride_map = {
                     "conv3": 1, "conv7": 1, "dual": 1,
@@ -931,7 +931,7 @@ class Config:
                     assert all(w >= 0 for w in aw), (
                         f"aux_supervision_weights must be non-negative; got {aw}.")
                 # Plan C 需 n_views < n_levels，使每 aux 头走不同 decoder 特征。
-                if self.model.context_fusion == "hierarchical":
+                if self.model.stem_fusion_mode == "hierarchical":
                     n_levels = len(self.model.encoder_channels)
                     assert n_views < n_levels, (
                         f"aux_seg_supervision + hierarchical requires n_views < n_levels; "
@@ -994,14 +994,14 @@ class Config:
         return max(self.data.num_classes - 1, 1)
 
     @property
-    def aux_view_depths(self) -> List[int]:
+    def per_view_depths(self) -> List[int]:
         """2.5D 下每视图原生深度 D_k = round(D * s_k)，强制 D_0 = D。非 2.5D 返回空列表。
 
         R5：委托给 ``build_topology`` 以保持单一真相源；仅形状计算，不依赖
-        ``data.aux_keep_native_d``，调用方自行根据该标志决定是否使用。
+        ``data.keep_native_view_depth``，调用方自行根据该标志决定是否使用。
         """
         from .models.topology import build_topology
-        return list(build_topology(self).aux_view_depths)
+        return list(build_topology(self).per_view_depths)
 
 
 # ---------------------------------------------------------------------------
@@ -1017,13 +1017,38 @@ _SUB_CONFIGS = {
 }
 
 
+# 旧 YAML 字段名 → 新字段名的向后兼容别名。读到旧名时自动改写并提示一次。
+# 命名清晰化（TODO #4）：
+#   data.aux_keep_native_d  → data.keep_native_view_depth（'aux' 误导：含主视图）
+#   model.context_fusion    → model.stem_fusion_mode（与 num_stem_fusion_views 配对）
+_FIELD_ALIASES: Dict[type, Dict[str, str]] = {
+    DataConfig:  {"aux_keep_native_d": "keep_native_view_depth"},
+    ModelConfig: {"context_fusion": "stem_fusion_mode"},
+}
+
+
 def _dataclass_from_dict(cls, d: Dict[str, Any]):
-    """Recursively construct a dataclass from a dict."""
+    """Recursively construct a dataclass from a dict.
+
+    支持向后兼容别名（``_FIELD_ALIASES``）：旧 YAML 字段名会被自动改写成新名，
+    并打印一次弃用提示；若新旧名同时出现则报错。
+    """
     if not isinstance(d, dict):
         return d
     field_names = {f.name for f in fields(cls)}
+    aliases = _FIELD_ALIASES.get(cls, {})
     kwargs = {}
     for k, v in d.items():
+        if k in aliases:
+            new_key = aliases[k]
+            if new_key in d:
+                raise ValueError(
+                    f"{cls.__name__}: both deprecated '{k}' and its "
+                    f"replacement '{new_key}' are set; remove the deprecated one.")
+            logger.warning(
+                "Config key '%s' is deprecated; use '%s' instead "
+                "(auto-remapped for backward compatibility).", k, new_key)
+            k = new_key
         if k not in field_names:
             logger.warning("Unknown config key: %s", k)
             continue

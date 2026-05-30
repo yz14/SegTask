@@ -59,7 +59,7 @@ def test_config_2_5d_multi_fov_sync():
     cfg.data.label_values = [0, 1, 2]
     cfg.data.num_classes = 3
     cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
-    cfg.model.context_fusion = "multi_stem_proj"
+    cfg.model.stem_fusion_mode = "multi_stem_proj"
     cfg.sync()
     cfg.validate()
     assert cfg.model.spatial_dims == 2
@@ -231,7 +231,7 @@ def test_factory_2_5d_multi_fov_multi_stem_proj():
         cfg.data.num_classes = num_fg + 1
         cfg.data.multi_res_scales = list(scales)
         cfg.model.encoder_channels = list(encoder)
-        cfg.model.context_fusion = fusion
+        cfg.model.stem_fusion_mode = fusion
         cfg.sync()
         cfg.validate()
         return cfg, build_model(cfg).eval()
@@ -241,11 +241,11 @@ def test_factory_2_5d_multi_fov_multi_stem_proj():
     # Locate the underlying Encoder regardless of UNet wrapper attr names.
     encoder_mod = None
     for m in model_multi.modules():
-        if hasattr(m, "stem") and hasattr(m, "context_n_views"):
+        if hasattr(m, "stem") and hasattr(m, "num_stem_fusion_views"):
             encoder_mod = m
             break
     assert encoder_mod is not None, "could not locate Encoder in built model"
-    assert encoder_mod.context_n_views == n_views
+    assert encoder_mod.num_stem_fusion_views == n_views
     assert isinstance(encoder_mod.stem, MultiStemProj), (
         f"expected MultiStemProj, got {type(encoder_mod.stem).__name__}")
     assert len(encoder_mod.stem.stems) == n_views
@@ -300,7 +300,7 @@ def test_factory_2_5d_multi_fov_hierarchical():
     cfg.data.num_classes = 3
     cfg.data.multi_res_scales = [1.0, 1.5, 2.0]
     cfg.model.encoder_channels = list(encoder_channels)
-    cfg.model.context_fusion = "hierarchical"
+    cfg.model.stem_fusion_mode = "hierarchical"
     cfg.model.stem_mode = "conv3"
     cfg.sync()
     cfg.validate()
@@ -308,9 +308,9 @@ def test_factory_2_5d_multi_fov_hierarchical():
 
     encoder_mod = next(
         m for m in model.modules()
-        if hasattr(m, "stem") and hasattr(m, "context_n_views"))
+        if hasattr(m, "stem") and hasattr(m, "num_stem_fusion_views"))
     assert isinstance(encoder_mod.stem, HierarchicalStems)
-    assert encoder_mod.context_n_views == n_views
+    assert encoder_mod.num_stem_fusion_views == n_views
     assert len(encoder_mod.stem.aux_stems) == n_views - 1
     assert encoder_mod.stem.aux_levels == [1, 2]
     # stem_mode='conv3' → main_stem_stride=1; aux strides = 2, 4.
@@ -335,7 +335,7 @@ def test_factory_2_5d_multi_fov_hierarchical():
     # 4 views but only 3 stages → should fail.
     cfg_bad.data.multi_res_scales = [1.0, 1.25, 1.5, 2.0]
     cfg_bad.model.encoder_channels = [16, 32, 64]
-    cfg_bad.model.context_fusion = "hierarchical"
+    cfg_bad.model.stem_fusion_mode = "hierarchical"
     cfg_bad.sync()
     try:
         cfg_bad.validate()
@@ -352,7 +352,7 @@ def test_factory_2_5d_multi_fov_hierarchical():
     cfg_bad2.data.num_classes = 3
     cfg_bad2.data.multi_res_scales = [1.0, 1.5, 2.0]
     cfg_bad2.model.encoder_channels = [16, 32, 64]
-    cfg_bad2.model.context_fusion = "hierarchical"
+    cfg_bad2.model.stem_fusion_mode = "hierarchical"
     cfg_bad2.sync()
     try:
         cfg_bad2.validate()
@@ -382,14 +382,14 @@ def test_factory_2_5d_multi_fov_shared_stem():
     cfg.data.num_classes = 3
     cfg.data.multi_res_scales = [1.0, 2.0]
     cfg.model.encoder_channels = [16, 32, 64]
-    cfg.model.context_fusion = "shared_stem"
+    cfg.model.stem_fusion_mode = "shared_stem"
     cfg.sync()
     cfg.validate()
     model = build_model(cfg).eval()
 
     encoder_mod = next(
         m for m in model.modules()
-        if hasattr(m, "stem") and hasattr(m, "context_n_views"))
+        if hasattr(m, "stem") and hasattr(m, "num_stem_fusion_views"))
     # shared_stem path: single stem, NOT a MultiStemProj.
     assert not isinstance(encoder_mod.stem, MultiStemProj)
 
@@ -590,7 +590,7 @@ def test_end_to_end_2_5d_multi_fov_one_step():
         cfg.data.intensity_max = 200.0
         cfg.data.cache_mode = "memory"
         cfg.model.encoder_channels = [16, 32, 64]
-        cfg.model.context_fusion = "multi_stem_proj"
+        cfg.model.stem_fusion_mode = "multi_stem_proj"
         cfg.model.deep_supervision = False
         cfg.augment.enabled = False
         cfg.train.epochs = 1
@@ -640,7 +640,7 @@ def test_end_to_end_2_5d_multi_fov_one_step():
 def test_end_to_end_2_5d_hierarchical_one_step():
     """End-to-end Plan C: dataset → trainer → predictor with hierarchical fusion.
 
-    Uses 3 z-FOV views and `context_fusion='hierarchical'`. Verifies the
+    Uses 3 z-FOV views and `stem_fusion_mode='hierarchical'`. Verifies the
     multi-FOV channel-layout contract is preserved end-to-end and that
     aux features inject correctly through one full training step + a
     full sliding-window predict.
@@ -673,7 +673,7 @@ def test_end_to_end_2_5d_hierarchical_one_step():
         cfg.data.intensity_max = 200.0
         cfg.data.cache_mode = "memory"
         cfg.model.encoder_channels = [16, 32, 64]
-        cfg.model.context_fusion = "hierarchical"
+        cfg.model.stem_fusion_mode = "hierarchical"
         cfg.model.stem_mode = "conv3"
         cfg.model.deep_supervision = False
         cfg.augment.enabled = False
@@ -701,7 +701,7 @@ def test_end_to_end_2_5d_hierarchical_one_step():
         # Sanity: the encoder really uses HierarchicalStems.
         encoder_mod = next(
             m for m in model.modules()
-            if hasattr(m, "stem") and hasattr(m, "context_n_views"))
+            if hasattr(m, "stem") and hasattr(m, "num_stem_fusion_views"))
         assert isinstance(encoder_mod.stem, HierarchicalStems)
 
         trainer = Trainer(model, cfg, train_loader, val_loader, device)

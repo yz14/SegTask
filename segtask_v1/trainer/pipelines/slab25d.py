@@ -85,7 +85,7 @@ class Slab2_5DPipeline(ViewPipeline):
         self.aux_inner_losses = None
         self.aux_weights = []
         self.mr_native_sizes = []
-        self.aux_view_depths = []
+        self.per_view_depths = []
         self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
         logger.info(
             "Loss: %s [2.5D, reduction=%s], num_slices=%d, fg_classes=%d",
@@ -154,12 +154,12 @@ class Slab2_5DAuxPipeline(ViewPipeline):
         self.aux_inner_losses = None
         self.aux_weights = _resolve_aux_weights(cfg, n_aux)
         self.mr_native_sizes = []
-        self.aux_view_depths = []
+        self.per_view_depths = []
         self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
         logger.info(
             "Aux seg supervision: ENABLED, n_aux_views=%d, weights=%s, "
             "fusion=%s",
-            n_aux, self.aux_weights, cfg.model.context_fusion)
+            n_aux, self.aux_weights, cfg.model.stem_fusion_mode)
 
     def prepare_batch(self, image, label, wmap):
         # image 折叠；label/wmap 保 rank-5；主 label 取 view 0 用于 metrics。
@@ -215,7 +215,7 @@ class Slab2_5DAuxPipeline(ViewPipeline):
 # 2.5D folded + aux + native depths
 # ---------------------------------------------------------------------------
 class Slab2_5DNativeDPipeline(ViewPipeline):
-    """2.5D + aux + ``aux_keep_native_d``：逐视图深度 ``D_k`` 不同。"""
+    """2.5D + aux + ``keep_native_view_depth``：逐视图深度 ``D_k`` 不同。"""
 
     def __init__(self, cfg: Config, base_loss):
         self.cfg = cfg
@@ -229,19 +229,19 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
         n_aux = n_views - 1
         D = int(cfg.data.patch_size[0])
 
-        depths = list(cfg.aux_view_depths)
+        depths = list(cfg.per_view_depths)
         assert depths and depths[0] == D, (
-            "aux_view_depths[0] must equal patch_size[0]; "
+            "per_view_depths[0] must equal patch_size[0]; "
             f"got {depths[0] if depths else None} vs {D}.")
         assert sum(depths) == int(cfg.model.in_channels), (
-            f"sum(aux_view_depths)={sum(depths)} must equal "
+            f"sum(per_view_depths)={sum(depths)} must equal "
             f"model.in_channels={cfg.model.in_channels}.")
 
         self.n_views = n_views
         self.n_aux_views = n_aux
         self.num_res_groups = 1
         self.slab_depth = D
-        self.aux_view_depths = depths
+        self.per_view_depths = depths
 
         self.inner_loss = SliceChannelLoss(
             base_loss=base_loss,
@@ -281,9 +281,9 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
             "Aux seg supervision: ENABLED (native depth), "
             "n_aux_views=%d, per-view depths=%s, weights=%s, "
             "fusion=%s",
-            n_aux, depths[1:], self.aux_weights, cfg.model.context_fusion)
+            n_aux, depths[1:], self.aux_weights, cfg.model.stem_fusion_mode)
         logger.info(
-            "Trainer aux_keep_native_d=True: max-FOV crop D=%d, "
+            "Trainer keep_native_view_depth=True: max-FOV crop D=%d, "
             "per-view depths=%s, channel layout sum=%d.",
             target_d_native, depths, int(cfg.model.in_channels))
 
@@ -291,7 +291,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
         image, label_main, wmap_main, aux_labels, aux_wmaps = (
             views.split_views_native_d(
                 image, label, wmap,
-                aux_view_depths=self.aux_view_depths,
+                per_view_depths=self.per_view_depths,
                 target_patch_size=self.target_patch_size))
         return image, SupervisionPack(
             label_main=label_main, wmap_main=wmap_main,
@@ -300,7 +300,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
     def prepare_val_batch(self, image, label):
         image, label_main, _, _, _ = views.split_views_native_d(
             image, label, None,
-            aux_view_depths=self.aux_view_depths,
+            per_view_depths=self.per_view_depths,
             target_patch_size=self.target_patch_size)
         return image, label_main
 
@@ -323,7 +323,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
         if not (len(aux_preds) == len(self.aux_weights)
                 == len(self.aux_inner_losses) == len(sup.aux_labels)):
             raise RuntimeError(
-                "aux_keep_native_d arity mismatch: "
+                "keep_native_view_depth arity mismatch: "
                 f"preds={len(aux_preds)}, weights={len(self.aux_weights)}, "
                 f"losses={len(self.aux_inner_losses)}, "
                 f"labels={len(sup.aux_labels)}.")

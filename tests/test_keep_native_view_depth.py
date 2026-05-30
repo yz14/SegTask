@@ -1,4 +1,4 @@
-"""Smoke / unit tests for the ``data.aux_keep_native_d`` (R1 + R2) feature.
+"""Smoke / unit tests for the ``data.keep_native_view_depth`` (R1 + R2) feature.
 
 Scope (intentionally model-free — R3 will add stem/aux-head support for
 varying per-view depths, after which the end-to-end forward path can be
@@ -7,7 +7,7 @@ exercised). This module verifies:
 1. Config layer:
    - ``sync()`` derives ``in_channels = sum_k round(D * s_k)`` when ON.
    - ``sync()`` auto-upgrades ``z_boundary_mode`` to ``"edge_pad"``.
-   - ``aux_view_depths`` property has the right shape (D_0 == D).
+   - ``per_view_depths`` property has the right shape (D_0 == D).
    - ``validate()`` rejects misuse outside 2.5D and without aux supervision.
    - OFF path is bit-identical to legacy (in_channels = D * n_views).
 
@@ -26,7 +26,7 @@ exercised). This module verifies:
 
 Run:
     conda activate torch27_env
-    python test_aux_keep_native_d.py
+    python test_keep_native_view_depth.py
 """
 
 from __future__ import annotations
@@ -57,12 +57,12 @@ from segtask_v1.models.factory import build_model  # noqa: E402
 def _make_cfg(
     *,
     multi_res_scales=(1.0, 1.5, 2.0),
-    aux_keep_native_d: bool = True,
+    keep_native_view_depth: bool = True,
     aux_seg_supervision: bool = True,
     z_boundary_mode: str = "stretch",  # exercise auto-upgrade by default
     patch_size=(8, 32, 32),
     patch_mode: str = "2_5d",
-    context_fusion: str = "multi_stem_proj",
+    stem_fusion_mode: str = "multi_stem_proj",
     aux_head_mode: str = "linear",
     encoder_channels=(16, 32, 64, 128),
 ):
@@ -73,14 +73,14 @@ def _make_cfg(
             patch_size=list(patch_size),
             patch_mode=patch_mode,
             multi_res_scales=list(multi_res_scales),
-            aux_keep_native_d=aux_keep_native_d,
+            keep_native_view_depth=keep_native_view_depth,
             z_boundary_mode=z_boundary_mode,
         ),
         augment=AugConfig(enabled=False),
         model=ModelConfig(
             encoder_channels=list(encoder_channels),
             blocks_per_level=1,
-            context_fusion=context_fusion,
+            stem_fusion_mode=stem_fusion_mode,
             aux_seg_supervision=aux_seg_supervision,
             aux_head_mode=aux_head_mode,
             stem_mode="conv3",
@@ -146,15 +146,15 @@ def test_config_sync_on_mode():
     """ON mode: in_channels = sum(round(D*s)); z_boundary_mode auto-upgraded."""
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5, 2.0],
-        aux_keep_native_d=True,
+        keep_native_view_depth=True,
         aux_seg_supervision=True,
         z_boundary_mode="stretch",
         patch_size=(8, 32, 32),
     )
     cfg.validate()
     expected_depths = [8, 12, 16]
-    assert cfg.aux_view_depths == expected_depths, (
-        f"aux_view_depths={cfg.aux_view_depths}, want {expected_depths}")
+    assert cfg.per_view_depths == expected_depths, (
+        f"per_view_depths={cfg.per_view_depths}, want {expected_depths}")
     assert cfg.model.in_channels == sum(expected_depths) == 36, (
         f"in_channels={cfg.model.in_channels}")
     assert cfg.data.z_boundary_mode == "edge_pad", (
@@ -165,7 +165,7 @@ def test_config_sync_off_mode_unchanged():
     """OFF mode: legacy in_channels = D * n_views; no z_boundary_mode override."""
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5, 2.0],
-        aux_keep_native_d=False,
+        keep_native_view_depth=False,
         aux_seg_supervision=True,
         z_boundary_mode="stretch",
         patch_size=(8, 32, 32),
@@ -181,7 +181,7 @@ def test_config_validate_rejects_on_outside_2_5d():
     """ON mode outside 2.5D must be rejected."""
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5],
-        aux_keep_native_d=True,
+        keep_native_view_depth=True,
         aux_seg_supervision=False,
         patch_mode="z_axis",
     )
@@ -197,7 +197,7 @@ def test_config_validate_requires_aux_supervision():
     """ON mode without aux_seg_supervision must be rejected."""
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5],
-        aux_keep_native_d=True,
+        keep_native_view_depth=True,
         aux_seg_supervision=False,  # mis-config
         patch_size=(8, 32, 32),
     )
@@ -239,12 +239,12 @@ def test_dataset_native_d_shape_and_geometry():
         def _sample_z(self, vol_idx, D_vol):
             return D_vol // 2  # = 20 for our 40-deep volume
 
-    # ON-mode dataset (single max-FOV cube)
+    # Dataset always emits the single max-FOV cube (the per-view split now
+    # lives entirely in the trainer; there is no legacy OFF dataset path).
     ds_on = _FixedZ(
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
         z_boundary_mode="edge_pad",
-        aux_keep_native_d=True,
         **common,
     )
     out_on = ds_on[0]
@@ -254,37 +254,32 @@ def test_dataset_native_d_shape_and_geometry():
     assert tuple(out_on["label"].shape) == (1, eD_max, H, W), (
         f"ON label shape {tuple(out_on['label'].shape)}")
 
-    # OFF-mode (legacy) dataset for the same z-center, edge_pad — view 0
-    # must equal center-crop of the ON-mode cube.
-    ds_off = _FixedZ(
-        img_vol, lbl_vol,
-        multi_res_scales=multi_res_scales,
-        z_boundary_mode="edge_pad",
-        aux_keep_native_d=False,
-        **common,
-    )
-    out_off = ds_off[0]
-    # OFF: image shape (n_views, D, H, W)
-    assert tuple(out_off["image"].shape) == (3, D, H, W), (
-        f"OFF image shape {tuple(out_off['image'].shape)}")
+    # View-0 reference: an independent edge_pad extraction of exactly D
+    # slices around the same z-center, resized in-plane to (H, W). This is
+    # the geometric ground truth the trainer's view-0 center-crop must equal.
+    from segtask_v1.data.dataset import resize_3d
+    z = 40 // 2
+    img_pre = ds_on._load_image(0)   # already preprocessed (normalised)
+    lbl_pre = ds_on._load_label(0)
+    ref_img, ref_lbl = ds_on._extract_z_patch_padded(img_pre, lbl_pre, z, D)
+    ref_img = resize_3d(ref_img, D, H, W, is_label=False)
+    ref_lbl = resize_3d(ref_lbl, D, H, W, is_label=True)
 
-    # View-0 equivalence (centered D slices of the ON cube vs. OFF[0]).
+    # View-0 equivalence (centered D slices of the ON cube vs. reference).
     on_img = out_on["image"][0].numpy()  # (eD_max, H, W)
     on_lbl = out_on["label"][0].numpy()
     d0 = (eD_max - D) // 2
     on_view0_img = on_img[d0:d0 + D]
     on_view0_lbl = on_lbl[d0:d0 + D]
-    off_view0_img = out_off["image"][0].numpy()
-    off_view0_lbl = out_off["label"][0].numpy()
 
-    if not np.allclose(on_view0_img, off_view0_img, atol=1e-5):
-        diff = float(np.abs(on_view0_img - off_view0_img).max())
+    if not np.allclose(on_view0_img, ref_img, atol=1e-5):
+        diff = float(np.abs(on_view0_img - ref_img).max())
         raise AssertionError(
-            f"View-0 image mismatch between ON and OFF paths "
-            f"(max abs diff={diff:.6g}); ON center crop must equal "
-            f"legacy edge_pad view-0 voxel-for-voxel.")
-    if not np.array_equal(on_view0_lbl, off_view0_lbl):
-        raise AssertionError("View-0 label mismatch between ON and OFF paths")
+            f"View-0 image mismatch (max abs diff={diff:.6g}); the ON cube's "
+            f"centered-D crop must equal an independent edge_pad view-0 "
+            f"extraction voxel-for-voxel.")
+    if not np.array_equal(on_view0_lbl, ref_lbl):
+        raise AssertionError("View-0 label mismatch vs. reference extraction")
 
 
 def test_dataset_native_d_aux_view_geometry():
@@ -319,7 +314,6 @@ def test_dataset_native_d_aux_view_geometry():
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
         z_boundary_mode="edge_pad",
-        aux_keep_native_d=True,
         **common,
     )
     out = ds_on[0]
@@ -355,8 +349,8 @@ def test_trainer_split_views_native_d():
     """Trainer split utility shapes & layout (model-free; uses a stub Trainer)."""
     # Build a trainer-like stub holding only the attributes the helper reads.
     class _Stub:
-        aux_keep_native_d = True
-        aux_view_depths = [8, 12, 16]   # D, round(1.5D), round(2D)
+        keep_native_view_depth = True
+        per_view_depths = [8, 12, 16]   # D, round(1.5D), round(2D)
         target_patch_size = (16, 32, 32)
 
         # Bind the unbound method so we can call it on the stub.
@@ -419,7 +413,7 @@ def test_trainer_split_views_native_d():
     assert tuple(aux_wmaps[0].shape) == (B, 12, H, W)
 
 
-def _check_model_native_d(label, *, context_fusion: str, aux_head_mode: str = "linear",
+def _check_model_native_d(label, *, stem_fusion_mode: str, aux_head_mode: str = "linear",
                           encoder_channels=(16, 32, 64, 128)):
     """End-to-end model build + train-mode forward + backward in ON mode.
 
@@ -435,16 +429,16 @@ def _check_model_native_d(label, *, context_fusion: str, aux_head_mode: str = "l
     """
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5, 2.0],
-        aux_keep_native_d=True,
+        keep_native_view_depth=True,
         aux_seg_supervision=True,
         patch_size=(8, 32, 32),
-        context_fusion=context_fusion,
+        stem_fusion_mode=stem_fusion_mode,
         aux_head_mode=aux_head_mode,
         encoder_channels=encoder_channels,
     )
     cfg.validate()
     expected_depths = [8, 12, 16]
-    assert cfg.aux_view_depths == expected_depths
+    assert cfg.per_view_depths == expected_depths
     assert cfg.model.in_channels == sum(expected_depths) == 36
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -533,12 +527,12 @@ def _check_model_native_d(label, *, context_fusion: str, aux_head_mode: str = "l
 
 def test_model_native_d_multi_stem_proj():
     _check_model_native_d("Plan A (multi_stem_proj)",
-                          context_fusion="multi_stem_proj")
+                          stem_fusion_mode="multi_stem_proj")
 
 
 def test_model_native_d_shared_stem():
     _check_model_native_d("Plan A (shared_stem)",
-                          context_fusion="shared_stem")
+                          stem_fusion_mode="shared_stem")
 
 
 def test_model_native_d_hierarchical():
@@ -546,13 +540,13 @@ def test_model_native_d_hierarchical():
     # 2^(n_views-1). With n_views=3, stem_stride=1: deepest stride=4.
     # encoder_channels must have at least 4 stages (n_views < n_levels).
     _check_model_native_d("Plan C (hierarchical)",
-                          context_fusion="hierarchical",
+                          stem_fusion_mode="hierarchical",
                           encoder_channels=(16, 32, 64, 128, 256))
 
 
 def test_model_native_d_aux_head_conv():
     _check_model_native_d("Plan A (multi_stem_proj, aux_head_mode=conv)",
-                          context_fusion="multi_stem_proj",
+                          stem_fusion_mode="multi_stem_proj",
                           aux_head_mode="conv")
 
 
@@ -577,10 +571,10 @@ def test_predictor_native_d_end_to_end():
 
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5, 2.0],
-        aux_keep_native_d=True,
+        keep_native_view_depth=True,
         aux_seg_supervision=True,
         patch_size=(8, 32, 32),
-        context_fusion="multi_stem_proj",
+        stem_fusion_mode="multi_stem_proj",
         encoder_channels=(16, 32, 64, 128),
     )
     cfg.validate()
@@ -590,9 +584,9 @@ def test_predictor_native_d_end_to_end():
 
     # Sanity-check the per-window builder before invoking the full pipeline.
     predictor = Predictor(model, cfg, device)
-    expected_in = sum(cfg.aux_view_depths)
-    assert predictor.aux_keep_native_d
-    assert predictor.aux_view_depths == cfg.aux_view_depths
+    expected_in = sum(cfg.per_view_depths)
+    assert predictor.keep_native_view_depth
+    assert predictor.per_view_depths == cfg.per_view_depths
     # Direct builder call — must produce rank-3 (in_channels, pH, pW).
     D_vol = 40
     vol_t = torch.randn(D_vol, 32, 32, device=device)
@@ -633,10 +627,10 @@ def test_predictor_native_d_tta_flip():
 
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5],
-        aux_keep_native_d=True,
+        keep_native_view_depth=True,
         aux_seg_supervision=True,
         patch_size=(8, 32, 32),
-        context_fusion="multi_stem_proj",
+        stem_fusion_mode="multi_stem_proj",
         encoder_channels=(16, 32, 64, 128),
     )
     cfg.predict.tta_flip = True

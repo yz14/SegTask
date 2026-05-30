@@ -62,7 +62,7 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
 
     builder 分派（与重构前等价）：
 
-    * ``aux_keep_native_d=True``                                → 2.5D ON, rank-3 (sum(D_k), pH, pW)
+    * ``keep_native_view_depth=True``                                → 2.5D ON, rank-3 (sum(D_k), pH, pW)
     * ``keep_native_multi_res=True`` & ``patch_mode='z_axis'``  → 3D ON, rank-4 (C_res, pD, pH, pW)
     * 单分辨率 ``scales == [1.0]``                              → 单分辨率 GPU
     * 否则                                                     → 多分辨率 CPU 退化 + 一次性上 GPU
@@ -103,13 +103,13 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     n_windows = len(z_positions)
     for idx, (z0, z1) in enumerate(z_positions):
         actual_d = z1 - z0
-        if p.aux_keep_native_d:
+        if p.keep_native_view_depth:
             # 2.5D ON: rank-3 (sum(D_k), pH, pW)。
             window_inputs.append(
                 _inputs.build_z_window_native_d_gpu(
                     vol_t, z0, z1,
                     pH=pH, pW=pW,
-                    eD_max=p._eD_max, view_depths=p.aux_view_depths))
+                    eD_max=p._eD_max, view_depths=p.per_view_depths))
         elif keep_native_3d:
             # 3D ON: rank-4 (C_res, pD, pH, pW)。
             window_inputs.append(

@@ -173,9 +173,9 @@ SegTask/
 | `z_axis` | `(B, C_res, D, H, W)` | 沿 z 滑窗，H/W 取全分辨率 | 仅 z 轴缩放：scale=k 取 `round(D·k)` 切片后 resize 回 D | 3 |
 | `cubic` | `(B, C_res, D, H, W)` | 3D 立方滑窗，xyz 全可移动 | 三轴一起缩放：取 `extract_size·k` 后 resize 回 `extract_size` | 3 |
 | `whole` | `(B, 1, D, H, W)` | 整卷 resize 到 `patch_size` | 必须为 `[1.0]`（缩放无物理意义） | 3 |
-| `2_5d` | `(B, D·n_views, H, W)`（默认）<br/>或 `(B, Σ_k D_k, H, W)`（`aux_keep_native_d=True`） | 复用 z_axis 路径，aug 后 `squeeze(C_res=1)` 把 D 折入通道 | 每个 FOV 占 D 个通道；可选 aux 监督独立预测每个 view | 2（lift 模式恢复为 3） |
+| `2_5d` | `(B, D·n_views, H, W)`（默认）<br/>或 `(B, Σ_k D_k, H, W)`（`keep_native_view_depth=True`） | 复用 z_axis 路径，aug 后 `squeeze(C_res=1)` 把 D 折入通道 | 每个 FOV 占 D 个通道；可选 aux 监督独立预测每个 view | 2（lift 模式恢复为 3） |
 
-**单分辨率读取原则**（贯穿数据层）：数据集只按 *最大* FOV 提一份 cube，augmentation 也只跑一次共享 warp；按 view 的中心裁剪 + resize 推迟到 trainer 进入模型前一刻才做（`data.keep_native_multi_res=True` / `data.aux_keep_native_d=True`）。这样既消除多次 zoom 引入的高频损失，又保证多 view 之间的几何完全一致。
+**单分辨率读取原则**（贯穿数据层）：数据集只按 *最大* FOV 提一份 cube，augmentation 也只跑一次共享 warp；按 view 的中心裁剪 + resize 推迟到 trainer 进入模型前一刻才做（`data.keep_native_multi_res=True` / `data.keep_native_view_depth=True`）。这样既消除多次 zoom 引入的高频损失，又保证多 view 之间的几何完全一致。
 
 ### 1.5 文件命名约定与 pid
 
@@ -286,7 +286,7 @@ segtask_v1/
 ```text
 config.py
 ├── DataConfig            # 数据路径、patch_mode、multi_res_scales、bbox/rw、npz、aug_oversample、
-│                         # z_boundary_mode（stretch | edge_pad）、aux_keep_native_d、
+│                         # z_boundary_mode（stretch | edge_pad）、keep_native_view_depth、
 │                         # keep_native_multi_res、stratified_split、dataloader 参数…
 ├── AugConfig             # GPU 增强各类概率与范围（flip / affine / elastic / dropout / brightness …）
 ├── ModelConfig           # backbone (resnet | convnext) / spatial_dims / block_type
@@ -294,7 +294,7 @@ config.py
 │                         # / encoder_channels / blocks_per_stage / norm / activation / dropout
 │                         # / attention_type / skip_attention / deep_supervision
 │                         # / aux_seg_supervision + aux_head_mode + lift_2_5d_to_3d
-│                         # / stem_mode + context_fusion (shared_stem | multi_stem_proj | hierarchical)
+│                         # / stem_mode + stem_fusion_mode (shared_stem | multi_stem_proj | hierarchical)
 │                         # / decoder_type (unet | unetpp | unet3p) + unet3p_cat_channels
 │                         # / downsample_mode + upsample_mode + skip_mode + drop_path_rate
 │                         # / convnext_layer_scale_init + convnext_downsample_lnfirst
@@ -314,7 +314,7 @@ config.py
 ```
 
 - `Config.sync()`：把派生字段填齐——`num_classes ← len(label_values)`、`z_boundary_mode` 自动升级到 `edge_pad`、`resenc_preset` 展开成 `encoder_blocks_per_stage` / `decoder_blocks_per_stage`；**`spatial_dims` / `in_channels` 由 `models.topology.build_topology` 一次性算出再写回 `cfg.model`**（R5：单一真相源，避免与 `factory.build_model` 重复推导）。
-- `Config.validate()`：所有枚举字段全 `assert`；强制禁掉 `r2plus1d × 2.5D`、`lift_2_5d_to_3d × aux_keep_native_d` 等不合理组合。
+- `Config.validate()`：所有枚举字段全 `assert`；强制禁掉 `r2plus1d × 2.5D`、`lift_2_5d_to_3d × keep_native_view_depth` 等不合理组合。
 - `load_config(path)`：YAML → 嵌套 dict → `_dataclass_from_dict` 递归构造 → `sync()` + `validate()`。
 - `save_config(cfg, path)`：`asdict` → YAML 落盘到 `output_dir/resolved_config.yaml`。
 
@@ -355,7 +355,7 @@ segtask_v1/data/
 - *Patch 抽取（z 边界安全）*：`extract_z_patch_padded`（沿 z 边缘 replicate）、`_extract_cubic_patch`（3D 立方 + zero-pad）。
 - *Volume LRU 缓存*：`VolumeCache(max_volumes)` —— 线程安全 OrderedDict，按 `cache_mode=memory` + `cache_max_volumes` 配置。
 - *3 个 Dataset 类*
-  - `SegDataset3D`（`patch_mode in {"z_axis", "2_5d"}`）—— 沿 z 滑窗；2.5D 在此输出 `(C_res=1, D·n_views, H, W)` 由 trainer 后续 squeeze；支持 `aux_keep_native_d` 单 max-FOV cube 路径。
+  - `SegDataset3D`（`patch_mode in {"z_axis", "2_5d"}`）—— 沿 z 滑窗；2.5D 在此输出 `(C_res=1, D·n_views, H, W)` 由 trainer 后续 squeeze；支持 `keep_native_view_depth` 单 max-FOV cube 路径。
   - `SegDataset3DCubic`（`patch_mode="cubic"`）—— 3D 立方采样，前景过采样 + 三轴 multi-res。
   - `SegDataset3DWhole`（`patch_mode="whole"`）—— 整卷直接 resize 到 `patch_size`，最简但显存最大。
 
@@ -454,12 +454,12 @@ segtask_v1/models/
 - `_resolve_blocks_per_stage` 调和 explicit 列表 vs fallback。
 - `_StatefulStageBuilder` —— 按调用顺序消费每个 stage 的 block 数。
 - `_make_resnet_stage_builder` / `_make_convnext_stage_builder` / `_make_convnext_downsample_builder` 构造对应工厂。
-- `build_model(cfg) -> UNet3D` —— 单入口：**所有 mode 派生量（`out_classes` / `spatial_dims` / `context_n_views` / `in_ch_per_view_list` / `aux_head_out_channels` / `aux_seg_active` 门控）读 `ModelTopology`**（R5），本函数仅负责 backbone × decoder_type × stem 装配，不再做 patch_mode 分支。
+- `build_model(cfg) -> UNet3D` —— 单入口：**所有 mode 派生量（`out_classes` / `spatial_dims` / `num_stem_fusion_views` / `in_ch_per_view_list` / `aux_head_out_channels` / `aux_seg_active` 门控）读 `ModelTopology`**（R5），本函数仅负责 backbone × decoder_type × stem 装配，不再做 patch_mode 分支。
 
 **`topology.py`**（R5 引入，~150 行）—— **训练几何 / 通道布局派生量的单一真相源**：
 
-- `@dataclass(frozen=True) ModelTopology` —— 一次性冻结 12 个派生字段：原始 mode flags（`patch_mode` / `lift_2_5d_to_3d` / `aux_keep_native_d` / `keep_native_multi_res`）+ 几何量（`n_views` / `num_res_groups` / `slab_depth` / `aux_view_depths`）+ I/O 通道（`in_channels` / `out_classes` / `spatial_dims` / `context_n_views` / `in_ch_per_view_list`）+ aux 拓扑（`aux_seg_active` / `aux_head_out_channels`）。
-- `build_topology(cfg) -> ModelTopology` —— **整个 codebase 唯一推导入口**。重构前同一组派生量被 `Config.sync` 与 `models.factory.build_model` 各算一遍；R5 后 `Config.sync` / `factory.build_model` / `trainer.pipelines.factory.build_pipeline` / `Config.aux_view_depths` 全部委托至此。
+- `@dataclass(frozen=True) ModelTopology` —— 一次性冻结 12 个派生字段：原始 mode flags（`patch_mode` / `lift_2_5d_to_3d` / `keep_native_view_depth` / `keep_native_multi_res`）+ 几何量（`n_views` / `num_res_groups` / `slab_depth` / `per_view_depths`）+ I/O 通道（`in_channels` / `out_classes` / `spatial_dims` / `num_stem_fusion_views` / `in_ch_per_view_list`）+ aux 拓扑（`aux_seg_active` / `aux_head_out_channels`）。
+- `build_topology(cfg) -> ModelTopology` —— **整个 codebase 唯一推导入口**。重构前同一组派生量被 `Config.sync` 与 `models.factory.build_model` 各算一遍；R5 后 `Config.sync` / `factory.build_model` / `trainer.pipelines.factory.build_pipeline` / `Config.per_view_depths` 全部委托至此。
 - `aux_seg_active = aux_seg_supervision AND n_views > 1` —— 把原来散布于 `Config.validate` / `factory.py:255` / `unet.py:337` 的三处门控**合并到 topology 一处**；`UNet3D.__init__` 若收到 `aux_seg_supervision=True` 但 `n_views<=1` 现在会直接 `ValueError`。
 - 新增 patch_mode：仅需修改 `build_topology` 内决策树即可同步影响 dataset / model / pipeline 三方。
 
@@ -624,7 +624,7 @@ SegTask/
 ├── test_z_boundary_mode.py                     # z_boundary_mode stretch vs edge_pad
 ├── test_2_5d_smoke.py                          # 2.5D 端到端 smoke（dataset+model+loss）
 ├── test_aux_seg_supervision.py                 # 2.5D 多 FOV aux 监督完整通路
-├── test_aux_keep_native_d.py                   # aux_keep_native_d 单 max-FOV cube 路径
+├── test_keep_native_view_depth.py              # keep_native_view_depth 单 max-FOV cube 路径
 ├── test_keep_native_multi_res.py               # 3D 单 max-FOV cube（dataset 层 R1）
 ├── test_keep_native_multi_res_trainer.py       # 3D 单 cube 在 trainer 侧的 per-view 切分 (R2)
 ├── test_keep_native_multi_res_predictor.py     # 3D 单 cube 推理侧 (R3)
@@ -672,11 +672,11 @@ GPU
     GPUAugmentor (共享 grid_sample) → image / label / weight_map 同步 warp
     Trainer._split_views_native_2_5d                       ← 单 max-FOV cube → 多 view 张量
         for k in views: center_crop(D_k=round(D·s_k)) + resize(H, W)
-        concat → (B, sum_k D_k, H, W)  (aux_keep_native_d) OR (B, D·n_views, H, W)
+        concat → (B, sum_k D_k, H, W)  (keep_native_view_depth) OR (B, D·n_views, H, W)
 
 Model
     UNet3D(spatial_dims=2)
-        Stem(context_fusion = shared_stem | multi_stem_proj | hierarchical)
+        Stem(stem_fusion_mode = shared_stem | multi_stem_proj | hierarchical)
             └── multi_stem_proj: n_views 独立 stem → cat → 1×1 fuse
             └── hierarchical:    view 0 进主 stem；view k 进 stage-k 入口 cat
         Encoder / Decoder
@@ -728,7 +728,7 @@ predict.py
   5. `predictor/inputs.py` 加对应 window builder + `predictor/sliding.py` 主循环 builder 分派加 1 行（如果几何不同于现有 6 种）；`predictor/forwards.py` 通常无需改动（forward 路径仅按 `patch_mode == '2_5d'` 与 `lift_2_5d_to_3d` 二分）
   
   注意保持「数据集只产单分辨率最大 FOV cube；多分辨率在 trainer/predictor 入模型前做」的契约。
-- **新增一个 stem 或多 FOV 融合策略**：在 `models/stem.py` 加类 + 在 `build_stem` / `build_context_stem` 注册；`Config.validate` 的 `stem_mode` / `context_fusion` 白名单。
+- **新增一个 stem 或多 FOV 融合策略**：在 `models/stem.py` 加类 + 在 `build_stem` / `build_context_stem` 注册；`Config.validate` 的 `stem_mode` / `stem_fusion_mode` 白名单。
 - **改命名/路径约定**：所有规则集中在 `data/loader._match_per_sample_paths` 和 `data/make_data._stem`，改一处即可。
 
 > 任何带 `validate()` 报错信息的改动，请同步更新 `configs/default.yaml` 注释与本 README 的对应表格。

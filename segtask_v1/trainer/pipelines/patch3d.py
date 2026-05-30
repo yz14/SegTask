@@ -50,7 +50,7 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
         self.aux_inner_loss = None
         self.aux_inner_losses = None
         self.aux_weights = []
-        self.aux_view_depths = []
+        self.per_view_depths = []
 
         # 每视图的原始尺寸：z_axis 仅缩 D；cubic 缩 3 轴。
         pD, pH, pW = (int(x) for x in cfg.data.patch_size)

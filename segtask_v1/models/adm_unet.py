@@ -478,8 +478,8 @@ class ADMSegModel(nn.Module):
         # Stem / multi-FOV.
         stem: nn.Module,
         stem_stride: int,
-        context_n_views: int,
-        context_fusion: str,
+        num_stem_fusion_views: int,
+        stem_fusion_mode: str,
         # Encoder topology.
         encoder_channels: List[int],
         encoder_blocks_per_stage: List[int],
@@ -502,8 +502,8 @@ class ADMSegModel(nn.Module):
         super().__init__()
         self.spatial_dims = 2
         self.stem_stride = int(stem_stride)
-        self.context_n_views = int(context_n_views)
-        self.context_fusion = context_fusion
+        self.num_stem_fusion_views = int(num_stem_fusion_views)
+        self.stem_fusion_mode = stem_fusion_mode
         self.deep_supervision = bool(deep_supervision)
         self.num_fg_classes = int(num_fg_classes)
 
@@ -554,7 +554,7 @@ class ADMSegModel(nn.Module):
                 )
 
         # Aux 分割监督（仅 Plan A：所有 aux 头以最高分辨率 dec feat）。
-        n_views = self.context_n_views
+        n_views = self.num_stem_fusion_views
         self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
         if aux_head_out_channels is None:
@@ -695,18 +695,18 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     lin_head_dim = int(getattr(mc, "adm_linear_attention_head_dim", 32))
 
     # 仅支持 shared_stem / multi_stem_proj；hierarchical 需 mid-encoder 注入。
-    if mc.context_fusion == "hierarchical":
+    if mc.stem_fusion_mode == "hierarchical":
         raise ValueError(
-            "model.arch='adm' does not yet support context_fusion="
+            "model.arch='adm' does not yet support stem_fusion_mode="
             "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj' "
             "for ADM. (Hierarchical fusion will be added in a follow-up.)")
 
     # 原生深度 ON：逐视图 D_k 可变；OFF：统一 D。
     in_ch_per_view_list = None
     aux_head_out_channels = None
-    if (bool(getattr(cfg.data, "aux_keep_native_d", False))
+    if (bool(getattr(cfg.data, "keep_native_view_depth", False))
             and n_views > 1):
-        depths = list(cfg.aux_view_depths)
+        depths = list(cfg.per_view_depths)
         in_ch_per_view_list = depths
         aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
         in_channels = sum(depths)
@@ -716,7 +716,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
 
     stem, stem_stride = build_context_stem(
         mode=mc.stem_mode,
-        fusion=mc.context_fusion,
+        fusion=mc.stem_fusion_mode,
         n_views=n_views,
         in_ch_per_view=in_ch_per_view,
         out_ch=enc_channels[0],
@@ -733,8 +733,8 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     model = ADMSegModel(
         stem=stem,
         stem_stride=stem_stride,
-        context_n_views=n_views,
-        context_fusion=mc.context_fusion,
+        num_stem_fusion_views=n_views,
+        stem_fusion_mode=mc.stem_fusion_mode,
         encoder_channels=enc_channels,
         encoder_blocks_per_stage=enc_bps,
         decoder_blocks_per_stage=dec_bps_full,
@@ -768,7 +768,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         in_ch_per_view_list if in_ch_per_view_list is not None
         else [in_ch_per_view] * n_views,
         out_classes, num_fg, D,
-        mc.stem_mode, stem_stride, n_views, mc.context_fusion,
+        mc.stem_mode, stem_stride, n_views, mc.stem_fusion_mode,
         bool(mc.deep_supervision), aux_seg,
         len(model.aux_heads), getattr(mc, "aux_head_mode", "linear"))
 

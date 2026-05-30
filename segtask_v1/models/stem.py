@@ -118,7 +118,7 @@ def build_stem(
 
 
 # 2.5D 多 z-FOV 下上下文融合 stem。
-CONTEXT_FUSION_MODES = ("shared_stem", "multi_stem_proj", "hierarchical")
+STEM_FUSION_MODES = ("shared_stem", "multi_stem_proj", "hierarchical")
 
 
 class MultiStemProj(nn.Module):
@@ -300,9 +300,9 @@ def build_context_stem(
 
     n_views==1 或 'shared_stem'：单 stem。'multi_stem_proj'：逐 view stem + 3×3 融合。'hierarchical'：需 stage_channels，encoder 逐级 cat 融合。
     """
-    if fusion not in CONTEXT_FUSION_MODES:
+    if fusion not in STEM_FUSION_MODES:
         raise ValueError(
-            f"Unknown context_fusion: {fusion!r}. Valid: {CONTEXT_FUSION_MODES}")
+            f"Unknown stem_fusion_mode: {fusion!r}. Valid: {STEM_FUSION_MODES}")
     # 校验逐 view / 均分布局总通道一致。
     if in_ch_per_view_list is not None and len(in_ch_per_view_list) != n_views:
         raise ValueError(
