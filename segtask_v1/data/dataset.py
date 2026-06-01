@@ -783,24 +783,24 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
     def __init__(
         self,
-        image_paths: List[str],
-        label_paths: List[str],
-        label_values: List[int],
-        patch_size: Tuple[int, int, int] = (64, 128, 128),
-        aug_oversample_ratio: float = 1.0,
-        multi_res_scales: Optional[List[float]] = None,
-        intensity_min: float = -1024.0,
-        intensity_max: float = 3071.0,
-        normalize: str = "minmax",
-        global_mean: float = 0.0,
-        global_std: float = 1.0,
+        image_paths                : List[str],
+        label_paths                : List[str],
+        label_values               : List[int],
+        patch_size                 : Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio       : float = 1.0,
+        multi_res_scales           : Optional[List[float]] = None,
+        intensity_min              : float = -1024.0,
+        intensity_max              : float = 3071.0,
+        normalize                  : str = "minmax",
+        global_mean                : float = 0.0,
+        global_std                 : float = 1.0,
         foreground_oversample_ratio: float = 0.5,
-        samples_per_volume: int = 8,
-        is_train: bool = True,
-        cache_enabled: bool = True,
-        cache_max_volumes: int = 0,
-        region_weights: Optional[List[float]] = None,
-        npz_paths: Optional[List[str]] = None):
+        samples_per_volume         : int = 8,
+        is_train                   : bool = True,
+        cache_enabled              : bool = True,
+        cache_max_volumes          : int = 0,
+        region_weights             : Optional[List[float]] = None,
+        npz_paths                  : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -818,19 +818,18 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
             region_weights       = region_weights)
-        # 有效抽取尺寸（含增强过采样余量），3 轴同步过采样。
-        self.extract_size = tuple(
+        
+        self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
-        # multi_res_scales=[1.0] 单分辨率；len>1 时 view 0 必为 1.0（canonical）。
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
         assert all(s >= 1.0 for s in self.multi_res_scales), (
             f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
         assert self.multi_res_scales[0] == 1.0, (
             "multi_res_scales[0] must be 1.0 (canonical view); got "
             f"{self.multi_res_scales}")
-        # 最大 scale 决定 cube 抽取尺寸；越轴体积过小时 _extract_cubic_patch edge-pad。
+        # 最大 scale 决定 cube 抽取尺寸
         self._max_scale = float(max(self.multi_res_scales))
-        self.fg_ratio = foreground_oversample_ratio
+        self.fg_ratio   = foreground_oversample_ratio
 
         # 逐卷 3D fg 坐标索引（make_data 预抽：seed=42, cap=50000）驱动 _sample_center 过采样。
         self._vol_shapes   : List[Tuple[int, int, int]] = []
@@ -858,8 +857,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         """总是发单 max-FOV cube (1, eD_max, eH_max, eW_max)，size = round(extract_size*max_scale)。
         多分辨率交由 trainer 中心裁拆视图。单分辨率时 max_scale=1.0，cube == extract_size。"""
         vol_idx    = idx % len(self.image_paths)
-        img        = self._load_image(vol_idx)
-        lbl        = self._load_label(vol_idx)
+        img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         D, H, W    = img.shape
         center     = self._sample_center(vol_idx, D, H, W)
         eD, eH, eW = self.extract_size
@@ -958,22 +956,22 @@ class SegDataset3DWhole(SegDatasetNpzBase):
 
     def __init__(
         self,
-        image_paths: List[str],
-        label_paths: List[str],
-        label_values: List[int],
-        patch_size: Tuple[int, int, int] = (64, 128, 128),
+        image_paths         : List[str],
+        label_paths         : List[str],
+        label_values        : List[int],
+        patch_size          : Tuple[int, int, int] = (64, 128, 128),
         aug_oversample_ratio: float = 1.0,
-        intensity_min: float = -1024.0,
-        intensity_max: float = 3071.0,
-        normalize: str = "minmax",
-        global_mean: float = 0.0,
-        global_std: float = 1.0,
-        samples_per_volume: int = 1,
-        is_train: bool = True,
-        cache_enabled: bool = True,
-        cache_max_volumes: int = 0,
-        region_weights: Optional[List[float]] = None,
-        npz_paths: Optional[List[str]] = None):
+        intensity_min       : float = -1024.0,
+        intensity_max       : float = 3071.0,
+        normalize           : str = "minmax",
+        global_mean         : float = 0.0,
+        global_std          : float = 1.0,
+        samples_per_volume  : int = 1,
+        is_train            : bool = True,
+        cache_enabled       : bool = True,
+        cache_max_volumes   : int = 0,
+        region_weights      : Optional[List[float]] = None,
+        npz_paths           : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -1002,15 +1000,13 @@ class SegDataset3DWhole(SegDatasetNpzBase):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         vol_idx    = idx % len(self.image_paths)
-        img        = self._load_image(vol_idx)
-        lbl        = self._load_label(vol_idx)
+        img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         eD, eH, eW = self.extract_size
 
         # 全卷单次 3D zoom。
         img_r = resize_3d(img, eD, eH, eW, is_label=False)
         lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
 
-        # int16 label 原发；image 强制 fp32 供 autocast。
         result = {
             "image": torch.from_numpy(img_r[np.newaxis]).float(),
             "label": torch.from_numpy(np.ascontiguousarray(lbl_r[np.newaxis]))}

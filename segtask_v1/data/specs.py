@@ -143,7 +143,7 @@ class DatasetSpec(ABC):
 
 
 class WholeSpec(DatasetSpec):
-    """整体卷模式（``patch_mode='whole'``）。无 multi_res / 无 fg 过采样。"""
+    """整体模式，无 multi_res / 无 fg 过采样"""
 
     name = "whole"
 
@@ -153,19 +153,15 @@ class WholeSpec(DatasetSpec):
             self._aug_oversample(is_train=True))
 
     def make_split(
-        self,
-        paths: SplitPaths,
-        is_train: bool,
-        common: DatasetCommonCfg,
-    ) -> Dataset:
+        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
+        ) -> Dataset:
         # whole 在 Config.validate 中已强制 multi_res_scales=[1.0]、忽略 fg 过采样。
         return SegDataset3DWhole(
             **paths.to_kwargs(),
             **common.to_kwargs(),
-            aug_oversample_ratio=self._aug_oversample(is_train),
-            samples_per_volume=self._samples_per_volume(is_train),
-            is_train=is_train,
-        )
+            aug_oversample_ratio = self._aug_oversample(is_train),
+            samples_per_volume   = self._samples_per_volume(is_train),
+            is_train=is_train)
 
 
 class ZCubeSpec(DatasetSpec):
@@ -219,21 +215,17 @@ class CubicSpec(DatasetSpec):
             self._aug_oversample(is_train=True), dc.multi_res_scales, max_scale)
 
     def make_split(
-        self,
-        paths: SplitPaths,
-        is_train: bool,
-        common: DatasetCommonCfg,
-    ) -> Dataset:
+        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
+        ) -> Dataset:
         dc = self.cfg.data
         return SegDataset3DCubic(
             **paths.to_kwargs(),
             **common.to_kwargs(),
-            aug_oversample_ratio=self._aug_oversample(is_train),
-            multi_res_scales=list(dc.multi_res_scales),
-            foreground_oversample_ratio=self._fg_ratio(is_train),
-            samples_per_volume=self._samples_per_volume(is_train),
-            is_train=is_train,
-        )
+            aug_oversample_ratio        = self._aug_oversample(is_train),
+            multi_res_scales            = list(dc.multi_res_scales),
+            foreground_oversample_ratio = self._fg_ratio(is_train),
+            samples_per_volume          = self._samples_per_volume(is_train),
+            is_train=is_train)
 
 
 # ---------------------------------------------------------------------------
