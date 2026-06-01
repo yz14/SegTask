@@ -83,24 +83,21 @@ def build_stem(
     if mode not in STEM_MODES:
         raise ValueError(f"Unknown stem mode: {mode!r}. Valid: {STEM_MODES}")
 
-    if mode == "conv3":
-        # 单层 3×3：最薄方案。2.5D 折叠下 z 关系仅靠这一层非线性提取，
-        # 容量偏弱；多切片输入推荐改用 'dual'。
+    if mode == "conv3":  # 单层 3×3：最薄方案
         stem = ConvNormAct(
             in_ch, out_ch, kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
-    if mode == "conv7":
-        # 单层 7×7：感受野大但只有一次非线性；与 conv3 同样容量受限。
+    if mode == "conv7":  # 单层 7×7：感受野大
         stem = ConvNormAct(
             in_ch, out_ch, kernel_size=7, stride=1, padding=3,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
-    if mode == "dual":
+    if mode == "dual":  # 双层 3x3
         stem = DualConvStem(
             in_ch, out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
@@ -122,18 +119,13 @@ STEM_FUSION_MODES = ("shared_stem", "multi_stem_proj", "hierarchical")
 
 
 class MultiStemProj(nn.Module):
-    """n_views 个独立 stem → 通道 cat → 3×3 融合为 out_ch；逐 view 学 FOV 专属滤波器。
-
-    融合层用 3×3 (而非 1×1) 是为给跨 view 的特征融合一次空间能力——多 FOV 的核心
-    差异是 z-axis 几何不同，1×1 仅做 per-pixel 通道线性投影，无法对齐/重组 view
-    间的空间结构。3×3 在 stem 后 (输入分辨率最高) 代价小但提供 3 邻域感受野，
-    与 nnU-Net stem block 的卷积核同构。"""
+    """n_views个独立 stem (2.5D使用)→ 通道 cat → 3x3 融合为 out_ch"""
 
     def __init__(
         self,
         mode               : str,
         n_views            : int,
-        in_ch_per_view     : int,
+        base_ch_per_view   : int,
         out_ch             : int,
         norm_type          : str = "instance",
         norm_groups        : int = 8,
@@ -141,7 +133,7 @@ class MultiStemProj(nn.Module):
         spatial_dims       : int = 3,
         in_ch_per_view_list: List[int] = None):
         super().__init__()
-        if n_views < 1:
+        if n_views < 1:  # 多分辨率数量检查
             raise ValueError(f"n_views must be >= 1, got {n_views}")
         self.n_views = n_views
 
@@ -150,29 +142,28 @@ class MultiStemProj(nn.Module):
                 raise ValueError(
                     f"in_ch_per_view_list length ({len(in_ch_per_view_list)}) "
                     f"must equal n_views ({n_views})")
-            self.in_ch_per_view_list: List[int] = [int(c) for c in in_ch_per_view_list]
+            self.in_ch_per_view_list = [int(c) for c in in_ch_per_view_list]  # 保持原尺寸
         else:
-            self.in_ch_per_view_list = [int(in_ch_per_view)] * n_views
+            self.in_ch_per_view_list = [int(base_ch_per_view)] * n_views        # 尺寸都一样
         # 后兼容：仅首 view 计数（完整信息请读 in_ch_per_view_list）。
-        self.in_ch_per_view = self.in_ch_per_view_list[0]
+        self.base_ch_per_view = self.in_ch_per_view_list[0]
 
         stems  : List[nn.Module] = []
         strides: List[int]       = []
         for c_v in self.in_ch_per_view_list:
-            s, stride = build_stem(
+            s, stride = build_stem(  # 每个FOV一个stem
                 mode, c_v, out_ch,
                 norm_type=norm_type, norm_groups=norm_groups,
                 activation=activation, spatial_dims=spatial_dims)
             stems.append(s)
             strides.append(stride)
-        if len(set(strides)) != 1:
-            # 同 mode 下子 stem stride 应一致；防御性检查。
+        if len(set(strides)) != 1:  # stem stride 应一致；防御性检查
             raise RuntimeError(
                 f"MultiStemProj sub-stems disagree on stride: {strides}")
         self.stems       = nn.ModuleList(stems)
         self.stem_stride = strides[0]
 
-        # 3×3 融合多分辨率回 out_ch TODO: 用单层还是多层会好？
+        # 3×3 融合多分辨率回 out_ch；TODO: 用单层还是多层会好？
         self.proj = ConvNormAct(
             n_views * out_ch, out_ch,
             kernel_size=3, stride=1, padding=1,
@@ -182,12 +173,11 @@ class MultiStemProj(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, sum(in_ch_per_view_list), *spatial)。"""
         expected_c = sum(self.in_ch_per_view_list)
-        if x.shape[1] != expected_c:
+        if x.shape[1] != expected_c:  # 通道检查
             raise ValueError(
                 f"MultiStemProj expects {expected_c} input channels "
                 f"(per-view={self.in_ch_per_view_list}); got {x.shape[1]}")
-        # 逐 view 通道拆分（零拷贝）。
-        chunks = torch.split(x, self.in_ch_per_view_list, dim=1)
+        chunks = torch.split(x, self.in_ch_per_view_list, dim=1)  # 逐 view 通道拆分（零拷贝）
         feats  = [stem(c) for stem, c in zip(self.stems, chunks)]
         return self.proj(torch.cat(feats, dim=1))
 
@@ -199,7 +189,7 @@ class HierarchicalStems(nn.Module):
         self,
         mode: str,
         n_views: int,
-        in_ch_per_view: int,
+        base_ch_per_view: int,
         stage_channels: List[int],
         norm_type: str = "instance",
         norm_groups: int = 8,
@@ -225,9 +215,9 @@ class HierarchicalStems(nn.Module):
                     f"must equal n_views ({n_views})")
             self.in_ch_per_view_list: List[int] = [int(c) for c in in_ch_per_view_list]
         else:
-            self.in_ch_per_view_list = [int(in_ch_per_view)] * n_views
+            self.in_ch_per_view_list = [int(base_ch_per_view)] * n_views
         # 后兼容：仅首 view 计数。
-        self.in_ch_per_view = self.in_ch_per_view_list[0]
+        self.base_ch_per_view = self.in_ch_per_view_list[0]
 
         # Main stem (view 0)
         self.main_stem, self.stem_stride = build_stem(
@@ -272,9 +262,7 @@ class HierarchicalStems(nn.Module):
     def forward_main(self, x_view0: torch.Tensor) -> torch.Tensor:
         return self.main_stem(x_view0)
 
-    def forward_aux(
-        self, chunks: List[torch.Tensor],
-    ) -> "OrderedDict[int, torch.Tensor]":
+    def forward_aux(self, chunks: List[torch.Tensor]) -> "OrderedDict[int, torch.Tensor]":
         """逐 aux stem 作用于对应 view chunk；返回有序 {level: aux_feature}。"""
         from collections import OrderedDict
         out: "OrderedDict[int, torch.Tensor]" = OrderedDict()
@@ -288,7 +276,7 @@ def build_context_stem(
     mode               : str,
     fusion             : str,
     n_views            : int,
-    in_ch_per_view     : int,
+    base_ch_per_view   : int,
     out_ch             : int,
     norm_type          : str = "instance",
     norm_groups        : int = 8,
@@ -300,11 +288,10 @@ def build_context_stem(
 
     n_views==1 或 'shared_stem'：单 stem。'multi_stem_proj'：逐 view stem + 3×3 融合。'hierarchical'：需 stage_channels，encoder 逐级 cat 融合。
     """
-    if fusion not in STEM_FUSION_MODES:
+    if fusion not in STEM_FUSION_MODES:  # 名称检查
         raise ValueError(
             f"Unknown stem_fusion_mode: {fusion!r}. Valid: {STEM_FUSION_MODES}")
-    # 校验逐 view / 均分布局总通道一致。
-    if in_ch_per_view_list is not None and len(in_ch_per_view_list) != n_views:
+    if in_ch_per_view_list is not None and len(in_ch_per_view_list) != n_views:  # 2.5D多分辨率检查
         raise ValueError(
             f"in_ch_per_view_list length ({len(in_ch_per_view_list)}) "
             f"must equal n_views ({n_views})")
@@ -312,7 +299,7 @@ def build_context_stem(
     if n_views == 1 or fusion == "shared_stem":
         # 总输入通道：逐 view 列表求和 或 均分。
         total_in = (sum(in_ch_per_view_list)
-                    if in_ch_per_view_list is not None else n_views * in_ch_per_view)
+                    if in_ch_per_view_list is not None else n_views * base_ch_per_view)
         return build_stem(  # 一个stem
             mode, total_in, out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
@@ -320,7 +307,7 @@ def build_context_stem(
     if fusion == "multi_stem_proj":
         msp = MultiStemProj(  # 每个FOV一个stem
             mode=mode, n_views=n_views,
-            in_ch_per_view=in_ch_per_view, out_ch=out_ch,
+            base_ch_per_view=base_ch_per_view, out_ch=out_ch,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims,
             in_ch_per_view_list=in_ch_per_view_list)
@@ -339,7 +326,7 @@ def build_context_stem(
 
     hier = HierarchicalStems(
         mode=mode, n_views=n_views,
-        in_ch_per_view=in_ch_per_view,
+        base_ch_per_view=base_ch_per_view,
         stage_channels=stage_channels,
         norm_type=norm_type, norm_groups=norm_groups,
         activation=activation, spatial_dims=spatial_dims,

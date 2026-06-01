@@ -1,6 +1,6 @@
 # 2.5D 配置：z_axis 取片 → (B,1,D,H,W)
 # view 0 (前 D 通道) = 1× FOV 主线目标；输出 (B,num_fg*D,H,W) 由 SliceChannelLoss 拆分。
-# 与 seg3d.yaml 差异：patch_mode='2_5d'、model.spatial_dims=2 (sync 自动)。
+# 与 seg3d.yaml 差异：patch_mode='2_5d'
 
 data:
   image_suffix: ".nii.gz"
@@ -31,7 +31,7 @@ data:
   num_classes : 2
 
   patch_size: [12, 256, 256]  # 2.5D patch：D=切片数（2D 模型 in_channels）；典型 D=9/12/15, H/W=256/384
-  patch_mode: "2_5d"  # 'z_axis' (3D z轴滑块) | 'cubic' (3D xyz) | 'whole' (3D 整体) | '2_5d' (本配置必须)
+  patch_mode: "2_5d"          # 'z_axis' (3D z轴滑块) | 'cubic' (3D xyz) | 'whole' (3D 整体) | '2_5d' (本配置必须)
 
   # 多 z-FOV上下文。[0] 必须为 1.0 (主线)；典型 [1.0]/[1.0, 1.5, 2.0]
   multi_res_scales    : [1.0, 1.5, 2.0]
@@ -172,7 +172,7 @@ model:
 
 # LOSS — 2.5D 走 SliceChannelLoss 包装; base_loss 在 (B*D,1,H,W) 作为 2D 二值损失
 loss:
-  name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
+  name: "dice_focal"               # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
   compound_weights: [1.0, 1.0]
 
   class_weights : [1.0, 1.0]       # 长度 = num_fg_classes (不含 bg)

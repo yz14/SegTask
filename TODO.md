@@ -46,12 +46,3 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 3 最后2的数据基础上，彻底检查一遍损失函数，是否都正确实现了，对应我这样的数据是否可行，是否有问题。
 
 4 有些代码太大，逻辑绕口，让人读起来费劲，维护困难，例如config.py文件，如果某个参数会被自动重写或者更新，那么它就不应该暴露接口出来，例如save_best_metric。前全面检查代码其它地方是否有类似的问题。我需要的是让人读起来代码来不那么费劲，绕圈，甚至多个文件反复查看确认才能理解代码。
-
-5 失败分类清单（与命名无关的预存失败，供后续单独立项）
-全量 pytest tests/ = 510 passed / 51 failed。我本轮仅改测试文件与 README、未碰源码，以下失败分布在我未触碰的文件，属进行中的架构重构遗留：
-
-数据层 NPZ-only 重构（最大一类）：SegDataset* 现强制 npz_paths、不再接受 keep_native_* kwargs，视图切分移入 trainer/predictor。波及 test_keep_native_view_depth.py（2）、test_keep_native_multi_res.py（5）、test_keep_native_multi_res_trainer.py（2）、test_segtask_v1.py::TestCubicDataset（多个）、test_z_boundary_mode.py（3）、test_round2_fixes.py 部分。
-增强 API 变更：test_segtask_v1.py::TestAugmentation / TestNewAugmentation、test_round2_fixes.py::test_bug10b_grid_dropout_vectorized。
-patch-stem 分辨率恢复：test_blocks_2d_smoke.py、test_stem_and_unet3p.py（patch2/patch4/unet3p）、test_unetpp.py（patch2）。
-hierarchical 融合模型 bug：aux 头输出 (16,16) vs 期望 (32,32)，影响 test_keep_native_view_depth.py::test_model_native_d_hierarchical 与 test_aux_seg_supervision.py 两个 hierarchical 用例。
-配置加载：test_segtask_v1.py::TestConfig::test_load_config（断言 encoder_channels 列表，疑与 resenc 展开默认值有关）。

@@ -3,9 +3,9 @@
 每个子类对应 TODO #4 列出的一种训练模式。Pipeline 拥有：
 
 * ``criterion``       —— 主损失（必要时已被 ``DeepSupervisionLoss`` 包装）
-* ``inner_loss``      —— 内部 ``MultiResolutionLoss`` / ``SliceChannelLoss``，供 metrics ``split_for_metrics`` 共用
-* ``aux_inner_loss``  —— 共享 aux 内损（folded / lift+aux）；否则 ``None``
-* ``aux_inner_losses``—— 逐视图 aux 内损（仅 native_d 异深度路径）；否则 ``None``
+* ``main_loss_fn``    —— main path 底层 ``MultiResolutionLoss`` / ``SliceChannelLoss``，供 metrics ``split_for_metrics`` 共用
+* ``aux_loss_fn``     —— 共享 aux loss callable（folded / lift+aux）；否则 ``None``
+* ``aux_loss_fns``    —— 逐视图 aux loss callable（仅 native_d 异深度路径）；否则 ``None``
 * ``aux_weights``     —— ``list[float]``，长度 = ``n_aux_views``
 * ``target_patch_size``——增强后中心裁回的目标尺寸
 * 若适用：``mr_native_sizes``（3D 懒多分辨率）/ ``per_view_depths``（2.5D 异深 aux）
@@ -51,9 +51,9 @@ class ViewPipeline(ABC):
 
     # 子类必须设置（在 __init__ 中）：
     criterion: torch.nn.Module
-    inner_loss: torch.nn.Module
-    aux_inner_loss: Optional[torch.nn.Module] = None
-    aux_inner_losses: Optional[List[torch.nn.Module]] = None
+    main_loss_fn: torch.nn.Module
+    aux_loss_fn: Optional[torch.nn.Module] = None
+    aux_loss_fns: Optional[List[torch.nn.Module]] = None
     aux_weights: List[float]
     target_patch_size: Tuple[int, int, int]
 
@@ -100,14 +100,14 @@ class ViewPipeline(ABC):
     def extract_main_pred(pred):
         """提取主路输出：``dict→main → list[0]``；``list→[0]``；tensor 原返。"""
         if isinstance(pred, dict):
-            pred = pred["main"]
+            pred = pred["main"]  # 若有aux
         if isinstance(pred, list):
-            pred = pred[0]
+            pred = pred[0]       # 若有DS
         return pred
 
     def split_for_metrics(self, pred, label_main):
-        """与模式无关的 metrics reshape；委托给 ``inner_loss.split_for_metrics``。"""
-        return self.inner_loss.split_for_metrics(pred, label_main)
+        """与模式无关的 metrics reshape；委托给 ``main_loss_fn.split_for_metrics``。"""
+        return self.main_loss_fn.split_for_metrics(pred, label_main)
 
 
 __all__ = ["ViewPipeline", "SupervisionPack"]

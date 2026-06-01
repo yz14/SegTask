@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .stem import build_context_stem
-from .unet import SegmentationHead, _build_aux_head
+from .unet import SegmentationHead, build_head
 
 logger = logging.getLogger(__name__)
 
@@ -576,7 +576,7 @@ class ADMSegModel(nn.Module):
             for k in range(1, n_views):
                 self.aux_feat_indices.append(n_dec - 1)
                 self.aux_heads.append(
-                    _build_aux_head(
+                    build_head(
                         mode=aux_head_mode,
                         in_ch=in_ch,
                         num_classes=aux_out[k - 1],
@@ -712,13 +712,13 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         in_channels = sum(depths)
     else:
         in_channels = D * n_views
-    in_ch_per_view = D  # 统一退退
+    base_ch_per_view = D  # 统一深度（无列表时的默认值）
 
     stem, stem_stride = build_context_stem(
         mode=mc.stem_mode,
         fusion=mc.stem_fusion_mode,
         n_views=n_views,
-        in_ch_per_view=in_ch_per_view,
+        base_ch_per_view=base_ch_per_view,
         out_ch=enc_channels[0],
         # ADM 风格 stem：GroupNorm + SiLU。
         norm_type="group",
@@ -766,7 +766,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         lin_attn_levels, lin_num_heads, lin_head_dim,
         in_channels,
         in_ch_per_view_list if in_ch_per_view_list is not None
-        else [in_ch_per_view] * n_views,
+        else [base_ch_per_view] * n_views,
         out_classes, num_fg, D,
         mc.stem_mode, stem_stride, n_views, mc.stem_fusion_mode,
         bool(mc.deep_supervision), aux_seg,

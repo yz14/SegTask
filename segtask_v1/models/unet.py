@@ -20,55 +20,53 @@ class Encoder(nn.Module):
 
     def __init__(
         self,
-        in_channels        : int,
-        stage_channels     : List[int],
+        in_channels          : int,
+        stage_channels       : List[int],
         stage_builder,
-        norm_type          : str = "instance",
-        norm_groups        : int = 8,
-        activation         : str = "leakyrelu",
-        downsample_mode    : str = "conv",
-        stem_mode          : str = "conv3",
-        spatial_dims       : int = 3,
-        num_stem_fusion_views    : int = 1,
+        norm_type            : str = "instance",
+        norm_groups          : int = 8,
+        activation           : str = "leakyrelu",
+        downsample_mode      : str = "conv",
+        stem_mode            : str = "conv3",
+        spatial_dims         : int = 3,
+        num_stem_fusion_views: int = 1,
         stem_fusion_mode     : str = "shared_stem",
-        in_ch_per_view_list: List[int] = None,
-        downsample_builder : Optional[Callable[[int, int], nn.Module]] = None,
-        downsample_strides : Optional[List] = None):
+        in_ch_per_view_list  : List[int] = None,
+        downsample_builder   : Optional[Callable[[int, int], nn.Module]] = None,
+        downsample_strides   : Optional[List] = None):
         super().__init__()
+
         self.spatial_dims = spatial_dims
-        # patchN stem 引入空间 stride，外层 UNet 用 stem_stride 补尾部上采样。
-        # 多 FOV (2.5D, n_views>1)：默认通道均分；in_ch_per_view_list 非空时按 view 分（native-depth）。
-        if num_stem_fusion_views < 1:
+        if num_stem_fusion_views < 1:        # 输入不可为空
             raise ValueError(
                 f"num_stem_fusion_views must be >= 1, got {num_stem_fusion_views}")
-
-        if in_ch_per_view_list is not None:
+        if in_ch_per_view_list is not None:  # 2.5D多分辨率输入
             if len(in_ch_per_view_list) != num_stem_fusion_views:
                 raise ValueError(
                     f"in_ch_per_view_list length "
                     f"({len(in_ch_per_view_list)}) must equal "
                     f"num_stem_fusion_views ({num_stem_fusion_views})")
-            if sum(in_ch_per_view_list) != in_channels:
+            if sum(in_ch_per_view_list) != in_channels:  # 输入总通道数
                 raise ValueError(
                     f"sum(in_ch_per_view_list)={sum(in_ch_per_view_list)} "
                     f"must equal in_channels ({in_channels})")
-            in_ch_per_view = int(in_ch_per_view_list[0])
+            base_ch_per_view = int(in_ch_per_view_list[0])
         else:
             if in_channels % num_stem_fusion_views != 0:
                 raise ValueError(
                     f"in_channels ({in_channels}) must be divisible by "
                     f"num_stem_fusion_views ({num_stem_fusion_views})")
-            in_ch_per_view = in_channels // num_stem_fusion_views
+            base_ch_per_view = in_channels // num_stem_fusion_views
         self.num_stem_fusion_views = num_stem_fusion_views
         # UNet3D 构建 aux head 时需读此字段对齐 stem 拓扑。
         self.stem_fusion_mode = stem_fusion_mode
         self.in_ch_per_view_list: List[int] = (
             list(in_ch_per_view_list) if in_ch_per_view_list is not None
-            else [in_ch_per_view] * num_stem_fusion_views)
+            else [base_ch_per_view] * num_stem_fusion_views)
         self.stem, self.stem_stride = build_context_stem(
             mode=stem_mode, fusion=stem_fusion_mode,
             n_views=num_stem_fusion_views,
-            in_ch_per_view=in_ch_per_view,
+            base_ch_per_view=base_ch_per_view,
             out_ch=stage_channels[0],
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims,
@@ -92,19 +90,16 @@ class Encoder(nn.Module):
             in_ch = stage_channels[i - 1] if i > 0 else stage_channels[0]
             self.stages.append(stage_builder(in_ch, ch))
             if i > 0:
-                # stage 间下采样（通道不变，下一 stage 首 block 升通道）。
-                # downsample_builder 允许 backbone 注入自定义拓扑（如 ConvNeXt LN-first）。
-                ds_in  = stage_channels[i - 1]
-                ds_out = stage_channels[i - 1]
-                if downsample_builder is not None:
-                    self.downsamples.append(downsample_builder(ds_in, ds_out))
+                # stage 间下采样（通道不变，下一 stage 首 block 升通道）
+                ds_in = stage_channels[i - 1]
+                if downsample_builder is not None:  # 允许自定义
+                    self.downsamples.append(downsample_builder(ds_in, ds_in))
                 else:
-                    self.downsamples.append(
-                        Downsample(  # TODO 这里最后一层是norm，确定没有问题吗？需要加act吗？
-                            ds_in, ds_out,
-                            norm_type=norm_type, norm_groups=norm_groups,
-                            mode=downsample_mode, spatial_dims=spatial_dims,
-                            stride=self.downsample_strides[i - 1]))
+                    self.downsamples.append(Downsample(  # TODO 这里最后一层是norm，确定没有问题吗？需要加act吗？
+                        ds_in, ds_in,
+                        norm_type=norm_type, norm_groups=norm_groups,
+                        mode=downsample_mode, spatial_dims=spatial_dims,
+                        stride=self.downsample_strides[i - 1]))
 
         # 仅 hierarchical stem：每级 cat(main, aux) → 1×1 → stage_channels[k-1]。key 为 str(level)。
         self.aux_fuse = nn.ModuleDict()
@@ -122,11 +117,11 @@ class Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """返回 [level_0, ..., level_N]；hierarchical stem 在下采样后 cat 注入 aux 特征。"""
         if isinstance(self.stem, HierarchicalStems):
-            chunks = self.stem.split_views(x)
-            x = self.stem.forward_main(chunks[0])
+            chunks    = self.stem.split_views(x)
+            x         = self.stem.forward_main(chunks[0])
             aux_feats = self.stem.forward_aux(chunks)
         else:
-            x = self.stem(x)
+            x         = self.stem(x)
             aux_feats = {}
 
         features: List[torch.Tensor] = []
@@ -164,6 +159,7 @@ class DecoderLevel(nn.Module):
         spatial_dims  : int = 3,
         upsample_stride = 2):
         super().__init__()
+
         self.skip_mode    = skip_mode
         self.spatial_dims = spatial_dims
         self.upsample     = Upsample(in_ch, out_ch, mode=upsample_mode,
@@ -187,8 +183,7 @@ class DecoderLevel(nn.Module):
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.upsample(x)
 
-        # 严格契约：上采样后必须与 skip 同尺寸；不匹配通常意味着输入空间维未按 stride 整除。
-        if x.shape[2:] != skip.shape[2:]:
+        if x.shape[2:] != skip.shape[2:]:  # 上采样后必须与 skip 同尺寸
             raise RuntimeError(
                 f"DecoderLevel size mismatch after upsample: "
                 f"x={tuple(x.shape[2:])} vs skip={tuple(skip.shape[2:])}. "
@@ -211,20 +206,20 @@ class Decoder(nn.Module):
 
     def __init__(
         self,
-        encoder_channels: List[int],
+        encoder_channels  : List[int],
         stage_builder,
-        upsample_mode   : str = "transpose",
-        skip_mode       : str = "cat",
-        skip_attention  : bool = False,
-        spatial_dims    : int = 3,
+        upsample_mode     : str = "transpose",
+        skip_mode         : str = "cat",
+        skip_attention    : bool = False,
+        spatial_dims      : int = 3,
         downsample_strides: Optional[List] = None):
         super().__init__()
-        self.levels = nn.ModuleList()
+
+        self.levels       = nn.ModuleList()
         self.spatial_dims = spatial_dims
         n = len(encoder_channels)
 
         # 镜像 encoder 的逐级下采样 stride：decoder level i 还原 encoder
-        # downsample[n-2-i]（产生 encoder level n-1-i 的那一次下采样）。
         n_down = n - 1
         if downsample_strides is not None and len(downsample_strides) != n_down:
             raise ValueError(
@@ -234,20 +229,20 @@ class Decoder(nn.Module):
             list(downsample_strides) if downsample_strides is not None
             else [2] * n_down)
 
-        # 自深至浅；level i 融合 encoder[n-2-i] 作为 skip。
+        # 自深至浅
         for i in range(n - 1):
-            in_ch   = encoder_channels[n - 1 - i]  # from deeper level
-            skip_ch = encoder_channels[n - 2 - i]  # skip connection
-            out_ch  = encoder_channels[n - 2 - i]  # symmetric output
-            up_stride = ds_strides[n - 2 - i]      # 镜像对应下采样 stride
+            in_ch     = encoder_channels[n - 1 - i]  # from deeper level
+            skip_ch   = encoder_channels[n - 2 - i]  # skip connection
+            out_ch    = encoder_channels[n - 2 - i]  # symmetric output
+            up_stride = ds_strides[n - 2 - i]        # 镜像对应下采样 stride
 
-            self.levels.append(
-                DecoderLevel(in_ch, skip_ch, out_ch, stage_builder,
-                             upsample_mode  = upsample_mode,
-                             skip_mode      = skip_mode,
-                             skip_attention = skip_attention,
-                             spatial_dims   = spatial_dims,
-                             upsample_stride = up_stride))
+            self.levels.append(DecoderLevel(
+                in_ch, skip_ch, out_ch, stage_builder,
+                upsample_mode  = upsample_mode,
+                skip_mode      = skip_mode,
+                skip_attention = skip_attention,
+                spatial_dims   = spatial_dims,
+                upsample_stride = up_stride))
 
         # 各 decoder 层的输出通道（low-res → high-res）。
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]
@@ -296,7 +291,7 @@ class ConvSegmentationHead(nn.Module):
         return self.classifier(self.conv(x))
 
 
-def _build_aux_head(
+def build_head(
     mode        : str,
     in_ch       : int,
     num_classes : int,
@@ -304,7 +299,7 @@ def _build_aux_head(
     norm_type   : str = "instance",
     norm_groups : int = 8,
     activation  : str = "leakyrelu") -> nn.Module:
-    """Aux 头分派：'linear' (1×1) | 'conv' (3×3+1×1)。见 ModelConfig.aux_head_mode。"""
+    """分割头工厂：'linear' (1×1) | 'conv' (3×3+1×1)。"""
     if mode == "linear":
         return SegmentationHead(in_ch, num_classes, spatial_dims=spatial_dims)
     if mode == "conv":
@@ -333,12 +328,12 @@ class UNet3D(nn.Module):
         spatial_dims         : int = 3,
         aux_seg_supervision  : bool = False,
         aux_head_mode        : str = "linear",
-        # aux_head_mode=='conv' 时透传到 ConvSegmentationHead；与 encoder 默认对齐。
         norm_type            : str = "instance",
         norm_groups          : int = 8,
         activation           : str = "leakyrelu",
         aux_head_out_channels: List[int] = None):
         super().__init__()
+
         self.encoder          = encoder
         self.decoder          = decoder
         self.num_fg_classes   = num_fg_classes
@@ -354,15 +349,14 @@ class UNet3D(nn.Module):
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
             for ch in reversed(decoder.out_channels[:-1]):
-                self.ds_heads.append(SegmentationHead(ch, num_fg_classes, spatial_dims=spatial_dims))
+                self.ds_heads.append(SegmentationHead(ch, num_fg_classes, spatial_dims=spatial_dims))  # TODO 是否需要多层conv
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
         n_views = int(getattr(encoder, "num_stem_fusion_views", 1))
         fusion  = str(getattr(encoder, "stem_fusion_mode", "shared_stem"))
-        # R5：移除"aux_seg_supervision and n_views > 1"二次门控；统一由
-        # ``ModelTopology.aux_seg_active`` 上游决定。调用方传入不一致组合时直接报错。
-        if bool(aux_seg_supervision) and n_views <= 1:
+        
+        if bool(aux_seg_supervision) and n_views <= 1:  # 对多分辨率监督
             raise ValueError(
                 f"UNet3D got aux_seg_supervision=True but encoder."
                 f"num_stem_fusion_views={n_views} (<=1). The caller should "
@@ -385,8 +379,8 @@ class UNet3D(nn.Module):
                     f"n_views - 1 ({n_aux_expected}).")
             self.aux_head_out_channels = [int(c) for c in aux_head_out_channels]
         # 'conv' 含 norm/act；'linear' 仅 1×1。
-        def _head(in_ch: int, out_ch: int) -> nn.Module:
-            return _build_aux_head(
+        def _build_head(in_ch: int, out_ch: int) -> nn.Module:
+            return build_head(
                 mode         = aux_head_mode,
                 in_ch        = in_ch,
                 num_classes  = out_ch,
@@ -408,15 +402,14 @@ class UNet3D(nn.Module):
                     feat_idx = n_dec - 1 - k
                     self.aux_feat_indices.append(feat_idx)
                     self.aux_heads.append(
-                        _head(decoder.out_channels[feat_idx],
-                              self.aux_head_out_channels[k - 1]))
+                        _build_head(decoder.out_channels[feat_idx],
+                                    self.aux_head_out_channels[k - 1]))
             else:
-                # Plan A：所有 aux 头读最高分辨率 decoder 特征。
                 in_ch = decoder.out_channels[-1]
                 for k in range(1, n_views):
-                    self.aux_feat_indices.append(n_dec - 1)  # 用最后一个特征
+                    self.aux_feat_indices.append(n_dec - 1)  # 用最后一个dec特征
                     self.aux_heads.append(
-                        _head(in_ch, self.aux_head_out_channels[k - 1]))
+                        _build_head(in_ch, self.aux_head_out_channels[k - 1]))
 
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
         """x: (B, in_channels, *spatial)；2.5D 多 FOV 为 (B, n_views*D, H, W)。"""
@@ -431,7 +424,7 @@ class UNet3D(nn.Module):
                 f"got {tuple(main_out.shape[2:])}, expected {tuple(target_size)}. "
                 f"Check stem_stride / encoder downsampling vs input spatial dims.")
 
-        # aux 仅训练时输出；eval 保持原 tensor/list 协议。
+        # aux 仅训练时输出
         aux_outs: List[torch.Tensor] = []
         if self.aux_seg_supervision and self.training:
             for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):

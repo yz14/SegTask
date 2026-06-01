@@ -35,7 +35,7 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
         self.num_res_groups = n_views
         self.slab_depth = 0
 
-        self.inner_loss = MultiResolutionLoss(
+        self.main_loss_fn = MultiResolutionLoss(
             base_loss=base_loss,
             num_fg_classes=cfg.num_fg_classes,
             num_res=n_views,
@@ -43,12 +43,12 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
         )
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
-                self.inner_loss, cfg.loss.deep_supervision_weights)
+                self.main_loss_fn, cfg.loss.deep_supervision_weights)
         else:
-            self.criterion = self.inner_loss
+            self.criterion = self.main_loss_fn
 
-        self.aux_inner_loss = None
-        self.aux_inner_losses = None
+        self.aux_loss_fn = None
+        self.aux_loss_fns = None
         self.aux_weights = []
         self.per_view_depths = []
 

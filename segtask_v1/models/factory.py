@@ -202,7 +202,8 @@ def compute_downsample_strides(
 
 
 def build_model(cfg: Config):
-    """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'（后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
+    """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
+    （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
     arch = str(getattr(cfg.model, "arch", "unet")).lower()
     if arch == "adm":
         from .adm_unet import build_adm_seg_model
@@ -225,7 +226,7 @@ def build_model(cfg: Config):
     topo = build_topology(cfg)
     spatial_dims          = topo.spatial_dims
     out_classes           = topo.out_classes
-    num_stem_fusion_views       = topo.num_stem_fusion_views
+    num_stem_fusion_views = topo.num_stem_fusion_views
     in_ch_per_view_list   = topo.in_ch_per_view_list
     aux_head_out_channels = topo.aux_head_out_channels
 
@@ -291,20 +292,20 @@ def build_model(cfg: Config):
 
     # Build encoder
     encoder = Encoder(
-        in_channels         = mc.in_channels,
-        stage_channels      = enc_channels,
-        stage_builder       = enc_builder,
-        norm_type           = mc.norm_type,
-        norm_groups         = mc.norm_groups,
-        activation          = mc.activation,
-        downsample_mode     = mc.downsample_mode,
-        stem_mode           = mc.stem_mode,
-        spatial_dims        = spatial_dims,
-        num_stem_fusion_views     = num_stem_fusion_views,
+        in_channels           = mc.in_channels,
+        stage_channels        = enc_channels,
+        stage_builder         = enc_builder,
+        norm_type             = mc.norm_type,
+        norm_groups           = mc.norm_groups,
+        activation            = mc.activation,
+        downsample_mode       = mc.downsample_mode,
+        stem_mode             = mc.stem_mode,
+        spatial_dims          = spatial_dims,
+        num_stem_fusion_views = num_stem_fusion_views,
         stem_fusion_mode      = getattr(mc, "stem_fusion_mode", "shared_stem"),
-        in_ch_per_view_list = in_ch_per_view_list,
-        downsample_builder  = downsample_builder,
-        downsample_strides  = ds_strides)
+        in_ch_per_view_list   = in_ch_per_view_list,
+        downsample_builder    = downsample_builder,
+        downsample_strides    = ds_strides)
 
     # decoder: unet | unetpp | unet3p
     if   mc.decoder_type == "unet3p":
@@ -334,7 +335,7 @@ def build_model(cfg: Config):
             downsample_strides = ds_strides)
 
     # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
-    aux_seg_supervision = topo.aux_seg_active
+    aux_seg_supervision       = topo.aux_seg_active
     aux_head_out_channels_arg = (
         aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels) else None)
     model = UNet3D(

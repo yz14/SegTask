@@ -35,7 +35,7 @@ class Lift2_5DPipeline(ViewPipeline):
         self.num_res_groups = 1
         self.slab_depth = D
 
-        self.inner_loss = MultiResolutionLoss(
+        self.main_loss_fn = MultiResolutionLoss(
             base_loss=base_loss,
             num_fg_classes=cfg.num_fg_classes,
             num_res=1,
@@ -43,12 +43,12 @@ class Lift2_5DPipeline(ViewPipeline):
         )
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
-                self.inner_loss, cfg.loss.deep_supervision_weights)
+                self.main_loss_fn, cfg.loss.deep_supervision_weights)
         else:
-            self.criterion = self.inner_loss
+            self.criterion = self.main_loss_fn
 
-        self.aux_inner_loss = None
-        self.aux_inner_losses = None
+        self.aux_loss_fn = None
+        self.aux_loss_fns = None
         self.aux_weights = []
         self.mr_native_sizes = []
         self.per_view_depths = []
@@ -97,7 +97,7 @@ class Lift2_5DAuxPipeline(ViewPipeline):
         self.num_res_groups = 1
         self.slab_depth = D
 
-        self.inner_loss = MultiResolutionLoss(
+        self.main_loss_fn = MultiResolutionLoss(
             base_loss=base_loss,
             num_fg_classes=cfg.num_fg_classes,
             num_res=1,
@@ -105,17 +105,17 @@ class Lift2_5DAuxPipeline(ViewPipeline):
         )
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
-                self.inner_loss, cfg.loss.deep_supervision_weights)
+                self.main_loss_fn, cfg.loss.deep_supervision_weights)
         else:
-            self.criterion = self.inner_loss
+            self.criterion = self.main_loss_fn
 
-        self.aux_inner_loss = MultiResolutionLoss(
+        self.aux_loss_fn = MultiResolutionLoss(
             base_loss=base_loss,
             num_fg_classes=cfg.num_fg_classes,
             num_res=1,
             label_values=cfg.data.label_values,
         )
-        self.aux_inner_losses = None
+        self.aux_loss_fns = None
         self.aux_weights = _resolve_aux_weights(cfg, n_aux)
         self.mr_native_sizes = []
         self.per_view_depths = []
@@ -145,7 +145,7 @@ class Lift2_5DAuxPipeline(ViewPipeline):
             main_pred, aux_preds = pred, []
 
         total = _accumulate_main(self.criterion, main_pred, sup, breakdown)
-        if not aux_preds or self.aux_inner_loss is None:
+        if not aux_preds or self.aux_loss_fn is None:
             if breakdown is not None:
                 breakdown["L_total"] = float(total.detach().item())
             return total
@@ -162,7 +162,7 @@ class Lift2_5DAuxPipeline(ViewPipeline):
             wm_k = (wmap_all[:, view_k:view_k + 1]
                     if wmap_all is not None else None)
             aux_l = compute_loss_fp32(
-                self.aux_inner_loss, ap, lbl_k, weight_map=wm_k)
+                self.aux_loss_fn, ap, lbl_k, weight_map=wm_k)
             total = total + w_k * aux_l
             if breakdown is not None:
                 breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())

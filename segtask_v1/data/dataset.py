@@ -681,7 +681,8 @@ class SegDataset3D(SegDatasetNpzBase):
         return np.random.randint(0, D_vol)
 
     def _extract_z_patch(
-        self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int) -> Tuple[np.ndarray, np.ndarray]:
+        self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int
+        ) -> Tuple[np.ndarray, np.ndarray]:
         """clamp 模式抽 z-patch：越界裁短，后续由 resize_3d 伸缩。"""
         D_vol = img.shape[0]
         half  = D_patch // 2
@@ -695,16 +696,16 @@ class SegDataset3D(SegDatasetNpzBase):
         return img_patch.copy(), lbl_patch.copy()
 
     def _extract_z_patch_padded(
-        self, img: np.ndarray, lbl: np.ndarray, z_center: int,
-        D_patch: int) -> Tuple[np.ndarray, np.ndarray]:
+        self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int
+        ) -> Tuple[np.ndarray, np.ndarray]:
         """image+label 同步 edge-padded 抽取（语义见模块级 extract_z_patch_padded）。"""
         return (
             extract_z_patch_padded(img, z_center, D_patch),
             extract_z_patch_padded(lbl, z_center, D_patch))
 
     def _extract_z_single(
-        self, vol: np.ndarray, z_center: int, D_patch: int,
-        use_padded: bool) -> np.ndarray:
+        self, vol: np.ndarray, z_center: int, D_patch: int, use_padded: bool
+        ) -> np.ndarray:
         """单卷 z-patch 抽取（与 image+label 对齐），供区域权重体积复用。"""
         if use_padded:
             return extract_z_patch_padded(vol, z_center, D_patch)

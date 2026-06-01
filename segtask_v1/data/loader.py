@@ -537,19 +537,19 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=dc.batch_size,
-        shuffle=True,
-        num_workers=dc.num_workers,
-        pin_memory=dc.pin_memory,
-        drop_last=True,
+        batch_size  = dc.batch_size,
+        shuffle     = True,
+        num_workers = dc.num_workers,
+        pin_memory  = dc.pin_memory,
+        drop_last   = True,
         **loader_kwargs)
     val_loader = DataLoader(
         val_ds,
-        batch_size=dc.batch_size,
-        shuffle=False,
-        num_workers=dc.num_workers,
-        pin_memory=dc.pin_memory,
-        drop_last=False,
+        batch_size  = dc.batch_size,
+        shuffle     = False,
+        num_workers = dc.num_workers,
+        pin_memory  = dc.pin_memory,
+        drop_last   = False,
         **loader_kwargs)
 
     logger.info(

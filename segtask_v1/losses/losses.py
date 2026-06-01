@@ -262,26 +262,15 @@ class BinaryTverskyLoss(nn.Module):
 # Compound Loss
 # ---------------------------------------------------------------------------
 class CompoundLoss(nn.Module):
-    """多损失加权和。"""
+    """多损失加权和"""
 
-    def __init__(
-        self, losses: Sequence[nn.Module], weights: Sequence[float]
-    ):
+    def __init__(self, losses: Sequence[nn.Module], weights: Sequence[float]):
         super().__init__()
-        if len(losses) != len(weights):
-            raise ValueError(
-                f"losses and weights length mismatch: "
-                f"{len(losses)} vs {len(weights)}"
-            )
-        self.losses = nn.ModuleList(losses)
+
+        self.losses  = nn.ModuleList(losses)
         self.weights = list(weights)
 
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        weight_map: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def forward(self, pred, target, weight_map = None):
         total = pred.new_zeros(())
         for fn, w in zip(self.losses, self.weights):
             total = total + w * fn(pred, target, weight_map=weight_map)
@@ -301,6 +290,7 @@ class DeepSupervisionLoss(nn.Module):
         normalize_weights: bool = True,
         upsample_pred    : bool = False):
         super().__init__()
+
         self.base_loss = base_loss
         w = list(weights)
         if normalize_weights:
@@ -316,8 +306,8 @@ class DeepSupervisionLoss(nn.Module):
         preds     : Union[torch.Tensor, List[torch.Tensor]],
         target    : torch.Tensor,
         weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # 旁路：单 tensor（DS 上游禁用或推理时）。
-        if isinstance(preds, torch.Tensor):
+
+        if isinstance(preds, torch.Tensor):  # 单分辨率
             return self.base_loss(preds, target, weight_map=weight_map)
 
         if len(preds) != len(self.weights):
@@ -335,8 +325,7 @@ class DeepSupervisionLoss(nn.Module):
                         pred,
                         size=target.shape[2:],
                         mode=_interp_mode_smooth(spatial_ndim),
-                        align_corners=False,
-                    )
+                        align_corners=False)
                 else:
                     tgt_i = F.interpolate(
                         target, size=pred.shape[2:], mode="nearest")
@@ -722,12 +711,10 @@ _COMPOUND_BUILDERS = {
 def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
     ws = list(getattr(cfg, "compound_weights", None) or [])
     if len(ws) >= n:
-        return ws[:n]
+        return ws[:n]  # 自动适配长度
     logger.warning(
         "compound_weights has %d entries, need %d; defaulting missing to 1.0",
-        len(ws),
-        n,
-    )
+        len(ws), n)
     return (ws + [1.0] * n)[:n]
 
 
@@ -834,7 +821,7 @@ class SliceChannelLoss(nn.Module):
         self.num_fg       = num_fg_classes
         self.num_slices   = num_slices
         self.label_values = label_values
-        self.fg_values    = label_values[1:]  # exclude background
+        self.fg_values    = label_values[1:]
         self.reduction    = reduction
 
         # 构造时验长：forward 重读 base_loss.class_weights（跟随 device 定位，不复制 buffer）。
@@ -980,7 +967,7 @@ class SliceChannelLoss(nn.Module):
         self, pred: torch.Tensor, label_raw: torch.Tensor, weight_map: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
         """按配置的 reduction 计逐类均值损失。"""
-        if self.reduction == "per_volume":
+        if self.reduction == "per_volume":  # resize到(B, num_fg, D, H, W)再算
             pred_5d   = self._split_pred_5d(pred)              # (B, num_fg, D, H, W)
             target_5d = self._label_to_binary_5d(label_raw)    # (B, num_fg, D, H, W)
             wm_5d     = self._wmap_to_5d(weight_map, self.num_slices)

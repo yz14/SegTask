@@ -17,7 +17,7 @@ from ..losses.losses import MultiResolutionLoss
 
 def collect_multi_res_breakdown(
     criterion,
-    aux_inner_loss,
+    aux_loss_fn,
     breakdown: Dict[str, float],
 ) -> None:
     """从主/aux 损失里抽 per-res 诊断到 ``breakdown``；非 MR 安静跳过。"""
@@ -31,13 +31,13 @@ def collect_multi_res_breakdown(
                     breakdown[f"L_res_{r}"] = v
 
     # aux 路：仅当存在且为 MR（即 lift_2_5d_to_3d 路径）时收集。
-    if isinstance(aux_inner_loss, MultiResolutionLoss):
-        diag = aux_inner_loss.pop_per_res_diag()
+    if isinstance(aux_loss_fn, MultiResolutionLoss):
+        diag = aux_loss_fn.pop_per_res_diag()
         if diag is not None:
             for r, v in enumerate(diag):
                 if math.isfinite(v):
                     breakdown[f"L_aux_res_{r}"] = v
-    # native_d 的 aux_inner_losses（list of SliceChannelLoss，无 MR）：跳过。
+    # native_d 的 aux_loss_fns（list of SliceChannelLoss，无 MR）：跳过。
 
 
 def format_breakdown(breakdown: Optional[Dict[str, float]]) -> str:

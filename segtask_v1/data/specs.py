@@ -59,33 +59,31 @@ class DatasetCommonCfg:
     def from_cfg(cls, cfg: Config) -> "DatasetCommonCfg":
         dc = cfg.data
         return cls(
-            label_values=list(dc.label_values),
-            patch_size=tuple(int(x) for x in dc.patch_size),
-            intensity_min=float(dc.intensity_min),
-            intensity_max=float(dc.intensity_max),
-            normalize=str(dc.normalize),
-            global_mean=float(dc.global_mean),
-            global_std=float(dc.global_std),
-            cache_enabled=(str(dc.cache_mode) == "memory"),
-            cache_max_volumes=int(getattr(dc, "cache_max_volumes", 0)),
-            region_weights=(list(cfg.loss.region_weights)
-                            if cfg.loss.region_weights else None),
-        )
+            label_values      = list(dc.label_values),
+            patch_size        = tuple(int(x) for x in dc.patch_size),
+            intensity_min     = float(dc.intensity_min),
+            intensity_max     = float(dc.intensity_max),
+            normalize         = str(dc.normalize),
+            global_mean       = float(dc.global_mean),
+            global_std        = float(dc.global_std),
+            cache_enabled     = (str(dc.cache_mode) == "memory"),
+            cache_max_volumes = int(getattr(dc, "cache_max_volumes", 0)),
+            region_weights    = (list(cfg.loss.region_weights)
+                                 if cfg.loss.region_weights else None))
 
     def to_kwargs(self) -> dict:
         """直接展开为 ``SegDataset3D*.__init__`` 的 kwargs。"""
         return dict(
-            label_values=self.label_values,
-            patch_size=self.patch_size,
-            intensity_min=self.intensity_min,
-            intensity_max=self.intensity_max,
-            normalize=self.normalize,
-            global_mean=self.global_mean,
-            global_std=self.global_std,
-            cache_enabled=self.cache_enabled,
-            cache_max_volumes=self.cache_max_volumes,
-            region_weights=self.region_weights,
-        )
+            label_values      = self.label_values,
+            patch_size        = self.patch_size,
+            intensity_min     = self.intensity_min,
+            intensity_max     = self.intensity_max,
+            normalize         = self.normalize,
+            global_mean       = self.global_mean,
+            global_std        = self.global_std,
+            cache_enabled     = self.cache_enabled,
+            cache_max_volumes = self.cache_max_volumes,
+            region_weights    = self.region_weights)
 
 
 @dataclass(frozen=True)

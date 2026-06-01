@@ -107,15 +107,13 @@ def split_views_native_3d(
 # 2.5D lazy multi-resolution split (keep_native_view_depth)
 # ---------------------------------------------------------------------------
 def split_views_native_d(
-    image: torch.Tensor,
-    label: torch.Tensor,
-    wmap: Optional[torch.Tensor],
-    per_view_depths: List[int],
-    target_patch_size: Tuple[int, int, int],
-) -> Tuple[
+    image            : torch.Tensor,
+    label            : torch.Tensor,
+    wmap             : Optional[torch.Tensor],
+    per_view_depths  : List[int],
+    target_patch_size: Tuple[int, int, int]) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[torch.Tensor],
-    List[torch.Tensor], List[Optional[torch.Tensor]],
-]:
+    List[torch.Tensor], List[Optional[torch.Tensor]]]:
     """``(B,1,eD_max,H,W)`` 逐视图中心抽 ``D_k`` 切片。
 
     返回 ``(image_2d, label_main, wmap_main, aux_labels, aux_wmaps)``：
@@ -131,8 +129,8 @@ def split_views_native_d(
             f"image={tuple(image.shape)}, label={tuple(label.shape)}")
 
     _, _, eD_max, _, _ = image.shape
-    depths = per_view_depths
-    D = depths[0]
+    depths             = per_view_depths
+    D                  = depths[0]
     if eD_max != int(target_patch_size[0]):
         raise ValueError(
             f"native-d split expects depth axis == target_patch_size[0]"
@@ -148,7 +146,7 @@ def split_views_native_d(
         d0 = (eD_max - d_k) // 2
         return t[:, 0, d0:d0 + d_k].contiguous()  # (B, d_k, H, W)
 
-    view0_img  = _slab(image, D)
+    image_main = _slab(image, D)
     label_main = _slab(label, D)
     wmap_main  = _slab(wmap, D) if wmap is not None else None
 
@@ -161,9 +159,9 @@ def split_views_native_d(
         aux_wmaps.append(_slab(wmap, d_k) if wmap is not None else None)
 
     if aux_imgs:
-        image_2d = torch.cat([view0_img] + aux_imgs, dim=1).contiguous()
+        image_2d = torch.cat([image_main] + aux_imgs, dim=1).contiguous()
     else:
-        image_2d = view0_img.contiguous()
+        image_2d = image_main.contiguous()
     expected_in = sum(depths)
     if image_2d.shape[1] != expected_in:
         raise RuntimeError(
@@ -219,5 +217,4 @@ __all__ = [
     "split_views_native_3d",
     "split_views_native_d",
     "squeeze_2_5d",
-    "squeeze_2_5d_keep_views",
-]
+    "squeeze_2_5d_keep_views"]

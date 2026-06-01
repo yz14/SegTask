@@ -233,7 +233,7 @@ class _MPSharedStem(nn.Module):
 def _build_edm2_stem(
     fusion: str,
     n_views: int,
-    in_ch_per_view: int,
+    base_ch_per_view: int,
     out_ch: int,
     in_ch_per_view_list: Optional[List[int]] = None,
 ):
@@ -244,7 +244,7 @@ def _build_edm2_stem(
             "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj'.")
     per_view = (
         list(in_ch_per_view_list) if in_ch_per_view_list is not None
-        else [in_ch_per_view] * n_views)
+        else [base_ch_per_view] * n_views)
     if n_views == 1 or fusion == "shared_stem":
         return _MPSharedStem(int(sum(per_view)), out_ch)
     if fusion == "multi_stem_proj":
@@ -645,12 +645,12 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         in_channels = sum(depths)
     else:
         in_channels = D * n_views
-    in_ch_per_view = D
+    base_ch_per_view = D
 
     stem = _build_edm2_stem(
         fusion=mc.stem_fusion_mode,
         n_views=n_views,
-        in_ch_per_view=in_ch_per_view,
+        base_ch_per_view=base_ch_per_view,
         out_ch=enc_channels[0],
         in_ch_per_view_list=in_ch_per_view_list,
     )
@@ -691,7 +691,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         enc_channels, enc_bps, dec_bps_full, attn_levels,
         in_channels,
         in_ch_per_view_list if in_ch_per_view_list is not None
-        else [in_ch_per_view] * n_views,
+        else [base_ch_per_view] * n_views,
         out_classes, num_fg, D,
         getattr(mc, "stem_mode", "conv3"), stem_stride, n_views,
         mc.stem_fusion_mode,

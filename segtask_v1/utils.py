@@ -172,13 +172,12 @@ def dice_batch_stats(
         float(p.shape[0]) * float(p.shape[2]),
         dtype=torch.float64, device=p.device)
     return {
-        "inter":      inter,
-        "denom":      denom,
-        "pred_sum":   pred_sum,
+        "inter"     : inter,
+        "denom"     : denom,
+        "pred_sum"  : pred_sum,
         "target_sum": target_sum,
-        "voxels":     voxels,
-        "n_with_gt":  n_with_gt,
-    }
+        "voxels"    : voxels,
+        "n_with_gt" : n_with_gt}
 
 
 @torch.no_grad()
@@ -231,13 +230,12 @@ def derive_overlap_metrics(
         torch.zeros_like(mcc_num))
 
     return {
-        "dice":      dice.float(),
-        "iou":       iou.float(),
-        "recall":    recall.float(),
+        "dice"     : dice.float(),
+        "iou"      : iou.float(),
+        "recall"   : recall.float(),
         "precision": precision.float(),
-        "vol_sim":   vol_sim.float(),
-        "mcc":       mcc.float(),
-    }
+        "vol_sim"  : vol_sim.float(),
+        "mcc"      : mcc.float()}
 
 
 @torch.no_grad()

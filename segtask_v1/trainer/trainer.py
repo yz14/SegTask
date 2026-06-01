@@ -88,16 +88,15 @@ class Trainer:
         self.pipeline: ViewPipeline = build_pipeline(cfg, self.base_loss)
 
         # --- 兼容老代码 / 测试的属性镜像 -------------------------------
-        # 命名口径统一（TODO 痛点 b）：n_views / n_aux_views / num_res_groups / slab_depth
         self.n_views = self.pipeline.n_views
         self.n_aux_views = self.pipeline.n_aux_views
         self.num_res_groups = self.pipeline.num_res_groups
         self.slab_depth = self.pipeline.slab_depth
         # Loss / aux：直接转发 pipeline 持有的对象
         self.criterion = self.pipeline.criterion
-        self._inner_loss = self.pipeline.inner_loss
-        self.aux_inner_loss = self.pipeline.aux_inner_loss
-        self.aux_inner_losses = self.pipeline.aux_inner_losses
+        self._main_loss_fn = self.pipeline.main_loss_fn
+        self.aux_loss_fn = self.pipeline.aux_loss_fn
+        self.aux_loss_fns = self.pipeline.aux_loss_fns
         self.aux_weights = self.pipeline.aux_weights
         # 旧布尔 flags（仅用于日志/外部条件 / 向后兼容测试）
         self.is_2_5d = cfg.data.patch_mode == "2_5d"
@@ -300,8 +299,8 @@ class Trainer:
 
                 if is_best:
                     self.best_metric = tracked
-                    self.best_epoch = epoch
-                    self.has_best = True
+                    self.best_epoch  = epoch
+                    self.has_best    = True
                     self.patience_counter = 0
                     self._save_checkpoint(epoch, is_best=True)
                     best_metrics = val_metrics
@@ -317,8 +316,7 @@ class Trainer:
                 k: v for k, v in train_metrics.items()
                 if k.startswith("L_main") or k.startswith("L_aux_")
                 or k.startswith("w_aux_")
-                or k.startswith("L_res_") or k.startswith("L_aux_res_")
-            }
+                or k.startswith("L_res_") or k.startswith("L_aux_res_")}
             aux_msg = format_breakdown(aux_summary_dict)
             logger.info(
                 "Epoch %d/%d | LR=%.2e | loss=%.4f | val_dice=%.4f | "
@@ -393,8 +391,8 @@ class Trainer:
         loss_meter = AverageMeter()
         dice_meter = AverageMeter()
         component_meters: Dict[str, AverageMeter] = {}
-        tc = self.cfg.train
-        accum = self.grad_accum_steps
+        tc          = self.cfg.train
+        accum       = self.grad_accum_steps
         total_steps = len(self.train_loader)
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -413,7 +411,7 @@ class Trainer:
                 image, label, wmap = views.center_crop(
                     image, label, wmap, self.target_patch_size)
 
-            # 视图重塑 → SupervisionPack（pipeline 内部决定）
+            # 视图重塑（pipeline 内部决定）
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
 
             effective_accum = self._effective_accum(step, total_steps, accum)
@@ -423,8 +421,7 @@ class Trainer:
                 pred = self.model(image)
             breakdown: Dict[str, float] = {}
             loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
-            collect_multi_res_breakdown(
-                self.criterion, self.aux_inner_loss, breakdown)
+            collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
             if effective_accum > 1:
                 loss = loss / effective_accum
 
@@ -447,8 +444,7 @@ class Trainer:
                 if (not self._first_step_mem_logged
                         and self.device.type == "cuda"):
                     one_step_peak = (
-                        torch.cuda.max_memory_allocated(self.device)
-                        / (1 << 20))
+                        torch.cuda.max_memory_allocated(self.device) / (1 << 20))
                     logger.info(
                         "Actual one-step GPU peak: %.1f MiB "
                         "(forward + backward + optimizer.step + EMA "
@@ -460,10 +456,10 @@ class Trainer:
                     self._first_step_mem_logged = True
 
             # 记录未缩放损失，丢弃非有限值避免污染均值（GradScaler 会跳该 step）
-            loss_val = (loss.item() * effective_accum
-                        if effective_accum > 1 else loss.item())
-            if math.isfinite(loss_val):
-                loss_meter.update(loss_val, image.shape[0])
+            step_loss = (loss.item() * effective_accum
+                         if effective_accum > 1 else loss.item())
+            if math.isfinite(step_loss):
+                loss_meter.update(step_loss, image.shape[0])
                 for name, val in breakdown.items():
                     if not math.isfinite(val):
                         continue
@@ -475,7 +471,7 @@ class Trainer:
                     "Non-finite train loss (%s) at epoch %d step %d/%d; "
                     "skipping meter update. GradScaler will skip this "
                     "optimizer step.",
-                    loss_val, epoch + 1, step + 1, total_steps)
+                    step_loss, epoch + 1, step + 1, total_steps)
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
@@ -488,11 +484,10 @@ class Trainer:
                 aux_msg = format_breakdown(breakdown)
                 logger.debug(
                     "  [%d/%d] loss=%.4f dice=%.4f lr=%.2e%s",
-                    step + 1, total_steps,
-                    loss_val, mean_dice, self.scheduler.get_lr(),
-                    aux_msg)
+                    step + 1, total_steps, step_loss, mean_dice,
+                    self.scheduler.get_lr(), aux_msg)
 
-        out: Dict[str, float] = {"loss": loss_meter.avg, "dice": dice_meter.avg}
+        out = {"loss": loss_meter.avg, "dice": dice_meter.avg}
         for name, meter in component_meters.items():
             out[name] = meter.avg
         return out
@@ -511,24 +506,22 @@ class Trainer:
         与 ``mean_balanced`` 仅在所选 criterion 需要时才计算，避免额外开销。
         """
         self.model.eval()
-        loss_meter = AverageMeter()
-        inter_sum:      Optional[torch.Tensor] = None
-        pred_sum_acc:   Optional[torch.Tensor] = None
-        target_sum_acc: Optional[torch.Tensor] = None
-        voxels_acc:     Optional[torch.Tensor] = None
-        cov_sum:        Optional[torch.Tensor] = None
+        loss_meter     = AverageMeter()
+        inter_sum      = None
+        pred_sum_acc   = None
+        target_sum_acc = None
+        voxels_acc     = None
+        cov_sum        = None
 
-        tc = self.cfg.train
-        crit = str(tc.save_best_criterion).lower().strip()
-        # Surface Dice 在 dice+surface_dice / balanced 下都需要。
-        compute_sd = crit in ("dice+surface_dice", "balanced")
-        sd_tol = int(tc.surface_dice_tolerance)
-        sd_w   = float(tc.surface_dice_weight)
-        sd_num_sum:   Optional[torch.Tensor] = None
-        sd_denom_sum: Optional[torch.Tensor] = None
+        tc           = self.cfg.train
+        crit         = str(tc.save_best_criterion).lower().strip()
+        compute_sd   = crit in ("dice+surface_dice", "balanced")  # balanced也算Surface Dice
+        sd_tol       = int(tc.surface_dice_tolerance)
+        sd_w         = float(tc.surface_dice_weight)
+        sd_num_sum   = None
+        sd_denom_sum = None
 
         n_samples = 0
-
         with self._ema_swapped():
             for batch in self.val_loader:
                 image = batch["image"].to(self.device, non_blocking=True)
@@ -540,7 +533,6 @@ class Trainer:
                     pred = self.model(image)
                     pred = self.pipeline.extract_main_pred(pred)
                     pred_1x, target_1x = self.pipeline.split_for_metrics(pred, label)
-                # 损失 fp32
                 loss = compute_loss_fp32(self.base_loss, pred_1x, target_1x)
 
                 loss_val = loss.item()
