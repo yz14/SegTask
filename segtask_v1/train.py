@@ -4,35 +4,21 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 import torch
 
 from .config import load_config, save_config
 from .data.loader import build_dataloaders
+from .logging_utils import setup_logging as _setup_logging
 from .models.factory import build_model
 from .trainer import Trainer
 from .utils import seed_everything
 
 
 def setup_logging(output_dir: str, level: str = "INFO") -> None:
-    """同时输出控制台与文件日志。"""
-    fmt = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-
-    handlers = [logging.StreamHandler(sys.stdout)]
-
-    log_dir = Path(output_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(log_dir / "train.log", encoding="utf-8")
-    handlers.append(fh)
-
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format=fmt, datefmt=datefmt,
-        handlers=handlers,
-        force=True)
+    """同时输出控制台（彩色）与文件（纯文本）日志。"""
+    _setup_logging(output_dir=output_dir, level=level, log_filename="train.log")
 
 
 def apply_overrides(cfg, overrides: list) -> None:

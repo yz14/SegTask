@@ -404,13 +404,9 @@ def _short_exc(exc: BaseException, max_len: int = 200) -> str:
 
 
 def _setup_logging(level: str = "INFO") -> None:
-    fmt = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format=fmt, datefmt=datefmt,
-        handlers=[logging.StreamHandler(sys.stdout)],
-        force=True)
+    # 复用集中式日志配置；out_dir=None 表示只配控制台（彩色），不写文件。
+    from ..logging_utils import setup_logging
+    setup_logging(output_dir=None, level=level)
 
 
 def main() -> int:
