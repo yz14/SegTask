@@ -316,7 +316,7 @@ class DeepSupervisionLoss(nn.Module):
                 f"of DS weights ({len(self.weights)})")
 
         total = preds[0].new_zeros(())
-        for w, pred in zip(self.weights, preds):
+        for w, pred in zip(self.weights, preds):  # 依次对每个dec特征监督
             tgt_i, wm_i = target, weight_map
             if pred.shape[2:] != target.shape[2:]:
                 spatial_ndim = pred.ndim - 2
@@ -719,7 +719,7 @@ def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
 
 
 class MultiResolutionLoss(nn.Module):
-    """多分辨率损失。
+    """多分辨率损失 
     输入预测值 (B, num_fg*C_res, D,H,W)、标签 (B, C_res, D,H,W) 。
     按 C_res 拆 pred、逐尺度 binary 化 label、逐分辨率 base_loss 后取均。"""
 
@@ -756,7 +756,7 @@ class MultiResolutionLoss(nn.Module):
         total = pred.new_zeros(())
         per_res_row: List[float] = []
 
-        for r in range(self.num_res):
+        for r in range(self.num_res):  # 依次算每个分辨率的监督
             pred_r   = pred[:, r * self.num_fg:(r + 1) * self.num_fg]
             lbl_r    = label_raw[:, r]
             target_r = self._label_to_binary(lbl_r)

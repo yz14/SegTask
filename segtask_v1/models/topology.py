@@ -89,7 +89,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
 
     is_2_5d        = pm == "2_5d"
     lift           = bool(getattr(mc, "lift_2_5d_to_3d", False)) and is_2_5d
-    native_d       = (bool(getattr(dc, "keep_native_view_depth", False)) 
+    native_d       = (bool(getattr(dc, "keep_native_view_depth", False))
                       and is_2_5d and n_views > 1)  # 2.5D多分辨率输入保持原尺寸
     # keep_native_multi_res：3D 多 FOV 懒加载——dataset 只发一份最大 FOV cube，
     # 由 trainer 逐视图中心裁剪 + resize（避免数据层多次 zoom 引入高频损失）。

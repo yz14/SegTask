@@ -84,39 +84,29 @@ class Trainer:
         self.model = model.to(device)
 
         # --- Pipeline (criterion + view ops) -------------------------
-        self.base_loss = build_loss(cfg.loss)
+        self.base_loss = build_loss(cfg.loss)  # 预设dice/bce等等这些
         self.pipeline: ViewPipeline = build_pipeline(cfg, self.base_loss)
 
-        # --- 兼容老代码 / 测试的属性镜像 -------------------------------
-        self.n_views = self.pipeline.n_views
-        self.n_aux_views = self.pipeline.n_aux_views
-        self.num_res_groups = self.pipeline.num_res_groups
-        self.slab_depth = self.pipeline.slab_depth
-        # Loss / aux：直接转发 pipeline 持有的对象
-        self.criterion = self.pipeline.criterion
-        self._main_loss_fn = self.pipeline.main_loss_fn
-        self.aux_loss_fn = self.pipeline.aux_loss_fn
-        self.aux_loss_fns = self.pipeline.aux_loss_fns
-        self.aux_weights = self.pipeline.aux_weights
-        # 旧布尔 flags（仅用于日志/外部条件 / 向后兼容测试）
-        self.is_2_5d = cfg.data.patch_mode == "2_5d"
-        self.lift_2_5d_to_3d = bool(
-            getattr(cfg.model, "lift_2_5d_to_3d", False) and self.is_2_5d)
-        self.keep_native_multi_res = isinstance(
+        self.n_views        = self.pipeline.n_views         # 多分辨率输入
+        self.n_aux_views    = self.pipeline.n_aux_views     # 2.5D的多分辨率辅助输入
+        self.num_res_groups = self.pipeline.num_res_groups  # 3D的多分辨率辅助输入
+        self.slab_depth     = self.pipeline.slab_depth      # 2.5D | z-axis的depth
+
+        self.criterion   = self.pipeline.criterion
+        self.aux_loss_fn = self.pipeline.aux_loss_fn  # 2.5D多分辨率用aux损失
+
+        self.keep_native_multi_res  = isinstance(
             self.pipeline, Patch3DNativeMultiResPipeline)
         self.keep_native_view_depth = isinstance(
             self.pipeline, Slab2_5DNativeDPipeline)
-        self.aux_seg_supervision = (
-            self.pipeline.n_aux_views > 0 and not self.lift_2_5d_to_3d
-            or (self.lift_2_5d_to_3d and self.pipeline.n_aux_views > 0))
-        # mr_native_sizes / per_view_depths：仅特定 pipeline 持有
+
         self._mr_native_sizes: List[Tuple[int, int, int]] = list(
             getattr(self.pipeline, "mr_native_sizes", []))
         self.per_view_depths: List[int] = list(
             getattr(self.pipeline, "per_view_depths", []))
         # target_patch_size / needs_crop（增强后中心裁回）
-        self.target_patch_size = self.pipeline.target_patch_size
-        self.needs_crop = cfg.data.aug_oversample_ratio > 1.0
+        self.target_patch_size = self.pipeline.target_patch_size  # 模型输入尺寸
+        self.needs_crop         = cfg.data.aug_oversample_ratio > 1.0
 
         # --- Optimizer + scheduler ------------------------------------
         self.optimizer  = build_optimizer(self.model, cfg)
@@ -132,20 +122,17 @@ class Trainer:
                 "Set train.warmup_epochs=0 when using scheduler='one_cycle'.")
 
         base_scheduler = build_scheduler(
-            self.optimizer, cfg, steps_per_epoch,
-            post_warmup_steps=post_warmup)
+            self.optimizer, cfg, steps_per_epoch, post_warmup_steps=post_warmup)
         self.scheduler = WarmupScheduler(
-            self.optimizer, base_scheduler,
-            warmup_steps=warmup_steps,
+            self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
 
         # --- AMP -------------------------------------------------------
         amp_dtype_cfg = tc.amp_dtype
         if amp_dtype_cfg == "auto":
             amp_dtype_cfg = resolve_auto_amp_dtype(device)
-            logger.info(
-                "amp_dtype='auto' resolved to %r (device=%s).",
-                amp_dtype_cfg, device)
+            logger.info("amp_dtype='auto' resolved to %r (device=%s).",
+                        amp_dtype_cfg, device)
         if amp_dtype_cfg not in _AMP_DTYPES:
             raise ValueError(
                 f"Unknown amp_dtype: {tc.amp_dtype!r}. "
@@ -475,8 +462,8 @@ class Trainer:
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
-                    p = self.pipeline.extract_main_pred(pred)
-                    p_1x, lbl_1x = self.pipeline.split_for_metrics(
+                    p = self.pipeline.extract_main_pred(pred)        # 主路
+                    p_1x, lbl_1x = self.pipeline.split_for_metrics(  # 主路
                         p.detach(), sup.label_main)
                     dice = compute_dice_per_class(p_1x, lbl_1x)
                     mean_dice = dice.mean().item()
@@ -575,7 +562,7 @@ class Trainer:
         derived = derive_overlap_metrics(
             inter_sum, pred_sum_acc, target_sum_acc, voxels_acc)
         # 单一处搬到 CPU，避免逐项 .item() 触发多次同步。
-        derived_cpu = {k: v.cpu() for k, v in derived.items()}
+        derived_cpu    = {k: v.cpu() for k, v in derived.items()}
         dice_per_class = derived_cpu["dice"]
         iou_per_class  = derived_cpu["iou"]
         rec_per_class  = derived_cpu["recall"]
@@ -641,8 +628,7 @@ class Trainer:
                 torch.tensor(metrics["mean_dice"]),
                 torch.tensor(metrics["mean_surface_dice"]),
                 torch.tensor(metrics["mean_iou"]),
-                torch.tensor(mcc01),
-            ])
+                torch.tensor(mcc01)])
             metrics["mean_balanced"] = float(hm.item())
 
         cov = cov_sum.cpu().tolist()

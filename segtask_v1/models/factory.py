@@ -173,15 +173,14 @@ def _auto_anisotropic_strides(
     return schedule
 
 
-def compute_downsample_strides(
-    cfg: Config, spatial_dims: int, n_levels: int):
+def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
     """决定逐级下采样 stride。
 
     优先级：显式 ``model.downsample_strides`` > ``model.anisotropic_pooling``
     自动推导 > None（各向同性，沿用历史行为）。返回 ``None`` 或长度 ``n_levels-1``
     的 per-axis stride 元组列表。
     """
-    mc = cfg.model
+    mc       = cfg.model
     num_down = n_levels - 1
     if num_down <= 0:
         return None
@@ -194,9 +193,9 @@ def compute_downsample_strides(
         return None  # 各向同性默认：Downsample/Upsample 用 stride=2
 
     # 自动推导：基于 patch 的"模型空间轴"尺寸（2.5D 的 D 折进通道，不计）。
-    patch = [int(x) for x in cfg.data.patch_size]  # [D, H, W]
+    patch         = [int(x) for x in cfg.data.patch_size]  # [D, H, W]
     spatial_sizes = patch[1:] if spatial_dims == 2 else patch
-    stem_stride = _stem_stride_of(getattr(mc, "stem_mode", "conv3"))
+    stem_stride   = _stem_stride_of(getattr(mc, "stem_mode", "conv3"))
     spatial_sizes = [max(1, s // stem_stride) for s in spatial_sizes]
     return _auto_anisotropic_strides(spatial_sizes, num_down)
 
@@ -220,18 +219,14 @@ def build_model(cfg: Config):
     num_fg       = cfg.num_fg_classes
     n_levels     = len(enc_channels)
 
-    # R5：所有 mode 派生量（out_classes / spatial_dims / num_stem_fusion_views /
-    # in_ch_per_view_list / aux_head_out_channels / aux 门控）来自 topology，
-    # 不再在本函数内重复推导。
-    topo = build_topology(cfg)
+    topo                  = build_topology(cfg)
     spatial_dims          = topo.spatial_dims
     out_classes           = topo.out_classes
-    num_stem_fusion_views = topo.num_stem_fusion_views
-    in_ch_per_view_list   = topo.in_ch_per_view_list
-    aux_head_out_channels = topo.aux_head_out_channels
+    num_stem_fusion_views = topo.num_stem_fusion_views  # 2.5D才需要融合，3D是通道拼接
+    in_ch_per_view_list   = topo.in_ch_per_view_list    # 2.5D才有每个视图的in_ch=depth
+    aux_head_out_channels = topo.aux_head_out_channels  # 2.5D才有aux监督选项，3D是必须
 
-    # decoder builder 调用次数：unet=n-1，unetpp=n*(n-1)/2，unet3p=0。
-    enc_counts = _resolve_blocks_per_stage(
+    enc_counts = _resolve_blocks_per_stage(  # 确认enc各stage通道
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
 
     if   mc.decoder_type == "unet":
@@ -242,10 +237,9 @@ def build_model(cfg: Config):
         expected_dec_calls = 0
 
     if   mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
-        dec_counts = _resolve_blocks_per_stage(
+        dec_counts = _resolve_blocks_per_stage(  # 确认dec各stage通道
             mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
-    elif mc.decoder_blocks_per_stage:
-        # UNet++：首项广播到所有嵌套节点。
+    elif mc.decoder_blocks_per_stage:  # UNet++：首项广播到所有嵌套节点
         dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
     else:
         dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)

@@ -63,27 +63,26 @@ class Slab2_5DPipeline(ViewPipeline):
 
         n_views = len(cfg.data.multi_res_scales)
         D = int(cfg.data.patch_size[0])
-        self.n_views = n_views
-        self.n_aux_views = 0
+        self.n_views        = n_views
+        self.n_aux_views    = 0
         self.num_res_groups = 1
-        self.slab_depth = D
+        self.slab_depth     = D
 
         self.main_loss_fn = SliceChannelLoss(
-            base_loss=base_loss,
-            num_fg_classes=cfg.num_fg_classes,
-            num_slices=D,
-            label_values=cfg.data.label_values,
-            reduction=cfg.loss.slice_loss_reduction,
-        )
+            base_loss      = base_loss,
+            num_fg_classes = cfg.num_fg_classes,
+            num_slices     = D,
+            label_values   = cfg.data.label_values,
+            reduction      = cfg.loss.slice_loss_reduction)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
                 self.main_loss_fn, cfg.loss.deep_supervision_weights)
         else:
             self.criterion = self.main_loss_fn
 
-        self.aux_loss_fn = None
-        self.aux_loss_fns = None
-        self.aux_weights = []
+        self.aux_loss_fn     = None
+        self.aux_loss_fns    = None
+        self.aux_weights     = []
         self.mr_native_sizes = []
         self.per_view_depths = []
         self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
@@ -126,29 +125,29 @@ class Slab2_5DAuxPipeline(ViewPipeline):
         n_aux = n_views - 1
         D = int(cfg.data.patch_size[0])
 
-        self.n_views = n_views
-        self.n_aux_views = n_aux
+        self.n_views        = n_views
+        self.n_aux_views    = n_aux
         self.num_res_groups = 1
-        self.slab_depth = D
+        self.slab_depth     = D
 
         self.main_loss_fn = SliceChannelLoss(
-            base_loss=base_loss,
-            num_fg_classes=cfg.num_fg_classes,
-            num_slices=D,
-            label_values=cfg.data.label_values,
-            reduction=cfg.loss.slice_loss_reduction)
+            base_loss      = base_loss,
+            num_fg_classes = cfg.num_fg_classes,
+            num_slices     = D,
+            label_values   = cfg.data.label_values,
+            reduction      = cfg.loss.slice_loss_reduction)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
                 self.main_loss_fn, cfg.loss.deep_supervision_weights)
         else:
             self.criterion = self.main_loss_fn
 
-        self.aux_loss_fn = SliceChannelLoss(
-            base_loss=base_loss,
-            num_fg_classes=cfg.num_fg_classes,
-            num_slices=D,
-            label_values=cfg.data.label_values,
-            reduction=cfg.loss.slice_loss_reduction)
+        self.aux_loss_fn = SliceChannelLoss(  # FOV尺寸都一致，可以共享损失
+            base_loss      = base_loss,
+            num_fg_classes = cfg.num_fg_classes,
+            num_slices     = D,
+            label_values   = cfg.data.label_values,
+            reduction      = cfg.loss.slice_loss_reduction)
         self.aux_loss_fns = None
         self.aux_weights  = _resolve_aux_weights(cfg, n_aux)  # 确认aux监督权重
         self.mr_native_sizes = []
@@ -164,11 +163,10 @@ class Slab2_5DAuxPipeline(ViewPipeline):
         image, label_all, wmap_all = views.squeeze_2_5d_keep_views(
             image, label, wmap)
         return image, SupervisionPack(
-            label_main=label_all[:, 0],
-            wmap_main=wmap_all[:, 0] if wmap_all is not None else None,
-            label_all_views=label_all,
-            wmap_all_views=wmap_all,
-        )
+            label_main      = label_all[:, 0],
+            wmap_main       = wmap_all[:, 0] if wmap_all is not None else None,
+            label_all_views = label_all,
+            wmap_all_views  = wmap_all)
 
     def prepare_val_batch(self, image, label):
         # val 无 aux；折叠后仅 view-0 监督指标。
@@ -241,7 +239,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
         self.slab_depth      = D
         self.per_view_depths = depths
 
-        self.main_loss_fn = SliceChannelLoss(
+        self.main_loss_fn = SliceChannelLoss(  # 2.5D的逐channel损失
             base_loss      = base_loss,
             num_fg_classes = cfg.num_fg_classes,
             num_slices     = D,
@@ -254,7 +252,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
             self.criterion = self.main_loss_fn
 
         self.aux_loss_fn      = None
-        self.aux_loss_fns = [
+        self.aux_loss_fns = [  # 每个FOV都有监督
             SliceChannelLoss(
                 base_loss      = base_loss,
                 num_fg_classes = cfg.num_fg_classes,

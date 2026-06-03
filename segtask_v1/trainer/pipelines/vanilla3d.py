@@ -25,32 +25,30 @@ class Vanilla3DPipeline(ViewPipeline):
         self.base_loss = base_loss
 
         n_views = len(cfg.data.multi_res_scales)
-        self.n_views = n_views
-        self.n_aux_views = 0
+        self.n_views        = n_views
+        self.n_aux_views    = 0  # 3D的不叫aux，叫res_group
         self.num_res_groups = n_views
-        self.slab_depth = 0
+        self.slab_depth     = 0
 
         self.main_loss_fn = MultiResolutionLoss(
             base_loss=base_loss,
             num_fg_classes=cfg.num_fg_classes,
             num_res=n_views,
-            label_values=cfg.data.label_values,
-        )
+            label_values=cfg.data.label_values)
         if cfg.model.deep_supervision and cfg.loss.deep_supervision_weights:
             self.criterion = DeepSupervisionLoss(
                 self.main_loss_fn, cfg.loss.deep_supervision_weights)
         else:
             self.criterion = self.main_loss_fn
 
-        self.aux_loss_fn = None
-        self.aux_loss_fns = None
-        self.aux_weights = []
+        self.aux_loss_fn     = None
+        self.aux_loss_fns    = None
+        self.aux_weights     = []
         self.mr_native_sizes = []
         self.per_view_depths = []
 
-        self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
+        self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)  # 3D单个整体
 
-    # ------------------------------------------------------------------
     def prepare_batch(self, image, label, wmap):
         return image, SupervisionPack(label_main=label, wmap_main=wmap)
 
