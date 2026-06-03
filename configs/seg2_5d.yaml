@@ -9,11 +9,11 @@ data:
   region_weight_suffix: ".nii.gz"
 
   # #### 样例 ####
-  # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/nii"
-  # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/mask"
-  # bbox_dir : "F:/med_data/Totalsegmentator_dataset_v201/small_data/bbox"
-  # region_weight_dir : "F:/med_data/Totalsegmentator_dataset_v201/small_data/region_weight"
-  # npz_dir: "F:/med_data/Totalsegmentator_dataset_v201/small_data/npz"
+  image_dir: "F:/Totalsegmentator_dataset_v201/small_data/nii"
+  label_dir: "F:/Totalsegmentator_dataset_v201/small_data/mask"
+  bbox_dir : "F:/Totalsegmentator_dataset_v201/small_data/bbox"
+  region_weight_dir : "F:/Totalsegmentator_dataset_v201/small_data/region_weight"
+  npz_dir: "F:/Totalsegmentator_dataset_v201/small_data/npz"
 
   # #### Total Segmentator ####
   # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
@@ -270,7 +270,7 @@ train:
   seed: 42
   deterministic: false
 
-  resume: "D:/codes/work-projects/SegTask/outputs/lung_bone_convnext/best_model.pth"
+  resume: ""
 
   # 仅加载权重做迁移学习初始 (不恢复 optim/scheduler/epoch/RNG)。resume 优先。
   pretrain: ""

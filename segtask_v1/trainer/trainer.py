@@ -400,6 +400,25 @@ class Trainer:
 
             # 视图重塑（pipeline 内部决定）
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
+            
+            # import SimpleITK as sitk
+            # debug_dir = "./debug0603-1"
+            # os.makedirs(debug_dir, exist_ok=True)
+            # imgs = torch.split(image, [12, 18, 24], dim=1)
+            # lbls = [sup.label_main] + sup.aux_labels
+            # maps = [sup.wmap_main]  + sup.aux_wmaps
+            # for jj, (aa,bb,cc) in enumerate(zip(imgs, lbls, maps)): # n views
+            #     for j, (a,b,c) in enumerate(zip(aa, bb, cc)):
+            #         a = a.detach().cpu().numpy()
+            #         a = sitk.GetImageFromArray(a)
+            #         sitk.WriteImage(a, f'{debug_dir}/{j}-{jj}-a.nii.gz')
+            #         a = b.detach().cpu().numpy()
+            #         a = sitk.GetImageFromArray(a)
+            #         sitk.WriteImage(a, f'{debug_dir}/{j}-{jj}-b.nii.gz')
+            #         a = c.detach().cpu().numpy()
+            #         a = sitk.GetImageFromArray(a)
+            #         sitk.WriteImage(a, f'{debug_dir}/{j}-{jj}-c.nii.gz')
+            # raise
 
             effective_accum = self._effective_accum(step, total_steps, accum)
 
