@@ -30,7 +30,7 @@ class DualConvStem(nn.Module):
         spatial_dims: int = 3):
         super().__init__()
         self.block1 = ConvNormAct(
-            in_ch, out_ch, kernel_size=3, stride=1, padding=1,  # 第一层用7x7x7会不会好？
+            in_ch, out_ch, kernel_size=7, stride=1, padding=3,  # 第一层用7x7x7会不会好？
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         self.block2 = ConvNormAct(

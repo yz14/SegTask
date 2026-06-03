@@ -349,7 +349,7 @@ class UNet3D(nn.Module):
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
             for ch in reversed(decoder.out_channels[:-1]):
-                self.ds_heads.append(SegmentationHead(ch, num_fg_classes, spatial_dims=spatial_dims))  # TODO 是否需要多层conv
+                self.ds_heads.append(ConvSegmentationHead(ch, num_fg_classes, spatial_dims=spatial_dims))  # TODO 是否需要多层conv
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。

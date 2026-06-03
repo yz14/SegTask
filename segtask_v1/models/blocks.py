@@ -751,13 +751,23 @@ class Upsample(nn.Module):
         if self.mode == "transpose":
             return self.up(x)
         if self.mode == "trilinear":
+            orig_dtype = x.dtype
+            if orig_dtype in (torch.bfloat16, torch.float16):
+                x = x.float()
             x = F.interpolate(
                 x, scale_factor=self.stride,
                 mode=INTERP_SMOOTH[self.spatial_dims],
                 align_corners=False)
+            if x.dtype != orig_dtype:
+                x = x.to(orig_dtype)
             return self.up(x)
         if self.mode == "nearest":
+            orig_dtype = x.dtype
+            if orig_dtype in (torch.bfloat16, torch.float16):
+                x = x.float()
             x = F.interpolate(x, scale_factor=self.stride, mode="nearest")
+            if x.dtype != orig_dtype:
+                x = x.to(orig_dtype)
             return self.up(x)
         if self.mode == "pixelshuffle":
             return self.shuffle(self.expand(x))
