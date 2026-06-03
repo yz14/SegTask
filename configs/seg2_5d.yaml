@@ -258,8 +258,10 @@ train:
   #   'bone_lung_combined' — balanced, tol=1, w=0.5（本任务 lung+bone 推荐稳妥折中）
   save_best_preset: ""
 
-  # 注：save_best_metric / save_best_mode 由 save_best_criterion 自动派生，
-  # 已不再是可设字段（设了也会被忽略）。
+  # 选模严格度：'medium' (默认, 在随机切片/patch 上算指标, 快) | 'high' (对每个 val
+  # 整卷做与部署一致的滑窗推理后再算指标, 最可靠但更慢)。与 save_best_criterion 正交。
+  # 2.5D 下尤其推荐 high：medium 在随机切片上算指标无法反映整卷 z 向一致性。
+  val_metric_mode: "medium"
 
   early_stopping: 15
 

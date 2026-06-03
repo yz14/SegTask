@@ -1,33 +1,33 @@
-# 核心原则
+# 规则与要求
 
-## 质量第一
-- 宁可多花时间，也要保证代码质量
-- 充分思考、分析后再动手实现
-- 不要为了快速完成而牺牲代码质量
+## 一、任务启动(两阶段,强制)
+新任务必须**先调研规划、后编码执行**,二者分属不同轮次,不得在同一轮合并完成。
 
-## 分步完成
-- 如果当前对话无法完成所有功能，主动拆分为多轮对话
-- 每轮只专注完成一个清晰的目标
-- 不贪多，确保每一步都高质量完成
+- **第一轮(调研规划,禁止写实现代码)**:阅读相关现有代码与上下文,检索业界做法;明确目标、范围边界、约束与难点;产出一份**可拆分、各步骤可独立执行**的计划,每步含目标、预期产出、验收标准及依赖关系。本轮只输出结论与计划,等我确认后再动手。
+- **第二轮起(执行)**:计划确认后才开始编码,严格按步推进,每轮专注一步并保证质量。计划需调整时先说明原因,不擅自偏离。
 
-## 充分调研
-- 如有需要，充分、彻底地搜索和调研
-- 分析和掌握现有的高质量功能实现和算法
-- 借鉴业界最佳实践，不要闭门造车
+## 二、质量第一
+- 充分思考分析后再动手,宁可慢不可糙。
+- **单轮质量优先于单轮完整性**:宁可这轮少做做透,不贪多做糙。
 
-## 调试支持
-- 如有需要，可以加入 debug/logging 函数辅助开发
-- 通过日志输出帮助定位和解决问题
-- 调试代码可在功能稳定后标注或移除
+## 三、范围克制
+- 不擅自修改任务范围外的代码、不引入新依赖、不做无关重构;确有必要先说明并征得同意。
 
-## 代码质量  
-- 注意代码尽可能模块化设计，职责尽可能的分离，不要把所有代码写在一个文件里，不方便后续理解和维护  
-- 注意代码的复用性，不要写重复的代码  
+## 四、代码质量
+- 模块化设计,职责分离,不把所有代码堆在一个文件。
+- 复用优先,避免重复代码。
+- 涉及具体库/API 时以最新官方文档为准,不凭记忆臆断版本与用法。
 
-## 沟通规范
-- **开始前**：说明你理解的任务目标和将遵守的规则
-- **进行中**：如需拆分，明确告知本轮将完成什么
-- **完成后**：总结本轮成果，说明后续计划（如有）  
+## 五、调试支持
+- 需要时加入日志辅助定位:正式日志走 logging 并保留;临时调试代码统一加 `# DEBUG` 标记,便于稳定后清理。
+
+## 六、完成与自查
+- 完成后自查:是否真正达成目标、是否引入回归、边界情况是否处理,并说明如何验证(测试或运行命令)。
+
+## 七、沟通规范
+- **开始前**:复述你理解的目标与将遵守的规则。
+- **进行中**:如需拆分,明确告知本轮要完成什么。
+- **完成后**:总结本轮成果与后续计划。
 
 
 测试环境为: **D:\miniconda\envs\torch27_env\python.exe**。  
@@ -47,92 +47,4 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 4 有些代码太大，逻辑绕口，让人读起来费劲，维护困难，例如config.py文件，如果某个参数会被自动重写或者更新，那么它就不应该暴露接口出来，例如save_best_metric。前全面检查代码其它地方是否有类似的问题。我需要的是让人读起来代码来不那么费劲，绕圈，甚至多个文件反复查看确认才能理解代码。
 
-5 在服务器上运行报错
- python -m segtask_v1.train --config configs/segtest0.yaml
-Config key 'aux_keep_native_d' is deprecated; use 'keep_native_view_depth' instead (auto-remapped for backward compatibility).
-Config key 'context_fusion' is deprecated; use 'stem_fusion_mode' instead (auto-remapped for backward compatibility).
-[2026-06-03 09:49:01] INFO __main__: Config loaded from: configs/segtest0.yaml
-[2026-06-03 09:49:01] INFO segtask_v1.utils: Seed set to 42 (deterministic=False)
-[2026-06-03 09:49:02] INFO __main__: Device: cuda
-[2026-06-03 09:49:02] INFO __main__: GPU: NVIDIA GeForce RTX 4090 (25.3 GB)
-[2026-06-03 09:49:02] INFO segtask_v1.data.loader: Training source: npz packages under /data0/yzhen/data/totalseg/body_prep (suffix=.npz). NIfTI fields image_dir/label_dir/bbox_dir/region_weight_dir are consumed only by make_data when the npz cache must be built.
-[2026-06-03 09:49:02] INFO segtask_v1.data.loader: Discovered 404 npz package(s) under /data0/yzhen/data/totalseg/body_prep.
-[2026-06-03 09:49:02] INFO segtask_v1.data.loader: Label values: [0, 1], num_classes: 2, num_fg: 1
-[2026-06-03 09:50:13] INFO segtask_v1.data.loader: Stratified split: 323 train, 81 val (strata sizes: {'1': 404})
-[2026-06-03 09:50:13] INFO segtask_v1.data.specs: Using 2_5D patch mode (oversample=1.50, scales=[1.0, 1.5, 2.0], n_views=3, max_scale=2.00, z_boundary=edge_pad) — SINGLE max-FOV z-cube extraction; trainer crops+resizes per view before forward.
-[2026-06-03 09:50:13] INFO segtask_v1.data.dataset: Loading pre-computed fg indices from 323 npz packages...
-[2026-06-03 09:50:51] INFO segtask_v1.data.dataset: NPZ index built: 323 volumes, 75782/76530 foreground slices
-[2026-06-03 09:50:51] INFO segtask_v1.data.dataset: Loading pre-computed fg indices from 81 npz packages...
-[2026-06-03 09:51:01] INFO segtask_v1.data.dataset: NPZ index built: 81 volumes, 20154/20446 foreground slices
-[2026-06-03 09:51:01] INFO segtask_v1.data.loader: DataLoader: batch_size=8, num_workers=16, pin_memory=True, persistent_workers=True, prefetch_factor=8
-[2026-06-03 09:51:01] INFO segtask_v1.data.loader: Volume cache estimate: ~138.19 MiB per volume (image fp32 + label int16, bbox-cropped); effective cap=12, num_workers=16 => up to ~25.91 GiB RAM (all workers, caches only; transient decode peaks add ~92.13 MiB/worker).
-[2026-06-03 09:51:01] INFO segtask_v1.models.factory: Built UNet3D [resnet/basic, decoder=unet, preset=none]: enc=11.68M, dec=5.66M, total=18.14M, channels=[32, 64, 128, 256, 512], enc_blocks=[2, 2, 2, 2, 2], dec_blocks=[2, 2, 2, 2], out_classes=12 (fg=1, res=1), stem=dual(stride=1, n_views=3, fusion=multi_stem_proj), down=conv, up=trilinear, skip=cat, attn=none, skip_attn=False, ds=True, aux_seg=True(n_aux_heads=2, mode=conv)
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.pipelines.factory: ViewPipeline selected: Slab2_5DNativeDPipeline (patch_mode=2_5d, n_views=3)
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.pipelines.slab25d: Aux seg supervision: ENABLED (native depth), n_aux_views=2, per-view depths=[18, 24], weights=[0.5, 0.5], fusion=multi_stem_proj
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.pipelines.slab25d: Trainer keep_native_view_depth=True: max-FOV crop D=24, per-view depths=[12, 18, 24], channel layout sum=54.
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: amp_dtype='auto' resolved to 'bfloat16' (device=cuda).
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: ============================================================
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: Training: 100 epochs, device=cuda
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: Model params: 18.14M
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: Static GPU mem (persistent, excl. activations): param=69.2 + grad=69.2 + optim(AdamW,2x)=138.4 + ema=69.3 = 346.1 MiB (real peak reported per-epoch as 'GPU peak')
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: CUDA mem at training start: allocated=143.9 MiB, reserved=160.0 MiB (model already on device; activations/workspace will add on top during forward).
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: Train batches: 323, Val batches: 41
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: AMP=True (dtype=auto, resolved=bfloat16, scaler=False), EMA=True (decay=0.9990)
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: Grad accum=1, Effective batch=8
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: Pipeline=Slab2_5DNativeDPipeline | n_views=3, n_aux_views=2, num_res_groups=1, slab_depth=12 | fg_classes=1, Loss=dice_focal
-[2026-06-03 09:51:05] INFO segtask_v1.trainer.trainer: ============================================================
-Traceback (most recent call last):
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/runpy.py", line 196, in _run_module_as_main
-    return _run_code(code, main_globals, None,
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/runpy.py", line 86, in _run_code
-    exec(code, run_globals)
-  File "/data0/yzhen/timm_test/segtask_v1/train.py", line 112, in <module>
-    main()
-  File "/data0/yzhen/timm_test/segtask_v1/train.py", line 105, in main
-    best_metrics = trainer.fit()
-  File "/data0/yzhen/timm_test/segtask_v1/trainer/trainer.py", line 266, in fit
-    train_metrics = self._train_epoch(epoch)
-  File "/data0/yzhen/timm_test/segtask_v1/trainer/trainer.py", line 408, in _train_epoch
-    pred = self.model(image)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1194, in _call_impl
-    return forward_call(*input, **kwargs)
-  File "/data0/yzhen/timm_test/segtask_v1/models/unet.py", line 417, in forward
-    dec_features = self.decoder(enc_features)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1194, in _call_impl
-    return forward_call(*input, **kwargs)
-  File "/data0/yzhen/timm_test/segtask_v1/models/unet.py", line 256, in forward
-    x        = level(x, encoder_features[skip_idx])
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1194, in _call_impl
-    return forward_call(*input, **kwargs)
-  File "/data0/yzhen/timm_test/segtask_v1/models/unet.py", line 184, in forward
-    x = self.upsample(x)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1194, in _call_impl
-    return forward_call(*input, **kwargs)
-  File "/data0/yzhen/timm_test/segtask_v1/models/blocks.py", line 754, in forward
-    x = F.interpolate(
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/nn/functional.py", line 3950, in interpolate
-    return torch._C._nn.upsample_bilinear2d(input, output_size, align_corners, scale_factors)
-RuntimeError: "upsample_bilinear2d_out_frame" not implemented for 'BFloat16'
-Exception in thread Thread-1 (_pin_memory_loop):
-Traceback (most recent call last):
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/threading.py", line 1016, in _bootstrap_inner
-    self.run()
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/threading.py", line 953, in run
-    self._target(*self._args, **self._kwargs)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/utils/data/_utils/pin_memory.py", line 49, in _pin_memory_loop
-    do_one_step()
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/utils/data/_utils/pin_memory.py", line 26, in do_one_step
-    r = in_queue.get(timeout=MP_STATUS_CHECK_INTERVAL)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/multiprocessing/queues.py", line 122, in get
-    return _ForkingPickler.loads(res)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/site-packages/torch/multiprocessing/reductions.py", line 305, in rebuild_storage_fd
-    fd = df.detach()
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/multiprocessing/resource_sharer.py", line 57, in detach
-    with _resource_sharer.get_connection(self._id) as conn:
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/multiprocessing/resource_sharer.py", line 86, in get_connection
-    c = Client(address, authkey=process.current_process().authkey)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/multiprocessing/connection.py", line 502, in Client
-    c = SocketClient(address)
-  File "/data0/yzhen/py3/envs/py310/lib/python3.10/multiprocessing/connection.py", line 630, in SocketClient
-    s.connect(address)
-ConnectionRefusedError: [Errno 111] Connection refused
+5 现在的模型挑选感觉不太严格，例如在2.5D模式下在val数据中随机抽取切片计算指标，而最严格的挑选则是将每个val数据的3D都预测完，这样计算的指标才是最可靠的。所以我理解的现在的模型挑选仍然没有挑选严格意义上最优的模型。如果增加一个模型挑选选择开关，即有两种选择，一种是medium，也就是现在的挑选方式；另一种是high，即每个val样本都预测完整的3D后计算指标，这样是否可行，如果可行，如何最优优雅的插入代码，不是那种看起来像打补丁式的插入。

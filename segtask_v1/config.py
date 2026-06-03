@@ -447,6 +447,16 @@ class TrainConfig:
     #   oar_multi / heart_chamber / bone_lung_combined
     save_best_preset: str = ""
 
+    # 选模严格度（与 save_best_criterion 正交：criterion 决定"看哪个指标"，
+    # 本项决定"指标在什么预测上算"）：
+    #   * "medium" — 现状：在 val_loader 的随机 patch/切片上前向并算指标，快但
+    #                非整卷，z 向上下文被切断，指标偏乐观/抖动。
+    #   * "high"   — 严格：对每个 val 整卷做与部署一致的滑窗推理后再算指标，
+    #                最可靠但更慢（每次验证多一遍整卷推理）。npz 无物理 z-spacing，
+    #                故 high 不启用 predict.z_interleave，其余几何与推理一致。
+    # 默认 "medium" 保持既有行为不变。
+    val_metric_mode: str = "medium"
+
     # 提前停止（0=禁用）。
     early_stopping: int = 0
 
@@ -981,6 +991,20 @@ class Config:
         assert _norm_crit(self.train.save_best_criterion) in _CRITERION_TO_METRIC, (
             f"Invalid save_best_criterion: {self.train.save_best_criterion!r}; "
             f"expected one of: {' | '.join(repr(c) for c in _CRITERION_TO_METRIC)}.")
+        assert str(self.train.val_metric_mode).lower().strip() in ("medium", "high"), (
+            f"Invalid val_metric_mode: {self.train.val_metric_mode!r}; "
+            "expected 'medium' (patch-level) or 'high' (full-volume).")
+        # high 模式在整卷 blended 概率上算指标，无可逆 logits 故不产出 val_loss；
+        # 因此 'loss' criterion 与 high 互斥（否则永远选不出 best）。改用重叠类指标。
+        if (str(self.train.val_metric_mode).lower().strip() == "high"
+                and _norm_crit(self.train.save_best_criterion) == "loss"):
+            raise AssertionError(
+                "train.save_best_criterion='loss' is incompatible with "
+                "train.val_metric_mode='high' (full-volume inference produces "
+                "blended probabilities, not invertible logits, so no val_loss "
+                "is computed). Use an overlap-based criterion "
+                "(dice / iou / mcc / min_dice / dice+surface_dice / balanced) "
+                "or switch val_metric_mode to 'medium'.")
         # save_best_preset 空串 = 不启用；非空必须是已知预设名。
         preset = str(self.train.save_best_preset or "").strip().lower()
         if preset:

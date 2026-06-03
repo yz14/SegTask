@@ -277,17 +277,7 @@ class Predictor:
         # 重置诊断护孔使 forward 路径发一次 logits/prob 统计块。
         self._diag_first_batch_logged = False
 
-        if self.patch_mode == "whole":
-            prob_volume = self._whole_volume_forward(vol)
-        elif self.patch_mode == "cubic":
-            prob_volume = self._sliding_window_cubic(vol)
-        elif self.z_interleave_enabled:
-            # 2.5D z-交错；k≤1 时会退化为标准 _sliding_window_z。
-            prob_volume = self._sliding_window_z_interleaved(
-                vol, float(z_spacing))
-        else:
-            # z_axis / 2_5d 几何同，forward 侧区别。
-            prob_volume = self._sliding_window_z(vol)
+        prob_volume = self.predict_preprocessed_array(vol, z_spacing=z_spacing)
 
         # 诊断：blend 后概率统计（拼回原画布前计算，避免 ROI 外 0 偏移统计）。
         # frac_gt_thr ≈1.0 提示是模型输出本身饱和（训练侧问题），非后处理。
@@ -331,6 +321,31 @@ class Predictor:
             self._save_predictions(image_path, label_map, prob_volume,
                                    output_dir)
         return result
+
+    @torch.no_grad()
+    def predict_preprocessed_array(
+        self,
+        vol: np.ndarray,
+        z_spacing: Optional[float] = None,
+    ) -> np.ndarray:
+        """对**已预处理**（强度窗 + 归一化）的整卷数组做 patch_mode 滑窗推理。
+
+        纯 mode 派发核心，从 ``predict_volume`` 抽出以便复用（如训练时的整卷
+        验证 / 选模），不涉及 NIfTI I/O、bbox、保存与诊断重置。输入 ``vol`` 为
+        ``(D, H, W)`` fp32；返回概率体 ``(num_fg, D, H, W)`` fp32。
+
+        ``z_spacing`` 仅 2.5D z-交错需要；为 ``None`` 时即便 ``z_interleave_enabled``
+        也回退到标准 z 轴滑窗（npz 缓存无物理 spacing 的场景）。
+        """
+        if self.patch_mode == "whole":
+            return self._whole_volume_forward(vol)
+        if self.patch_mode == "cubic":
+            return self._sliding_window_cubic(vol)
+        if self.z_interleave_enabled and z_spacing is not None:
+            # 2.5D z-交错；k≤1 时会退化为标准 _sliding_window_z。
+            return self._sliding_window_z_interleaved(vol, float(z_spacing))
+        # z_axis / 2_5d 几何同，forward 侧区别。
+        return self._sliding_window_z(vol)
 
     # ==================================================================
     # Sliding loops (R6: thin shims delegating to predictor.sliding)

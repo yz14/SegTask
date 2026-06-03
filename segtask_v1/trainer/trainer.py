@@ -31,9 +31,7 @@ from ..data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from ..models.unet import UNet3D
 from ..utils import (
-    AverageMeter, ModelEMA, Timer,
-    compute_dice_per_class, derive_overlap_metrics, dice_batch_stats,
-    harmonic_mean_metrics, surface_dice_batch_stats,
+    AverageMeter, ModelEMA, Timer, compute_dice_per_class,
 )
 from . import views
 from .amp import (
@@ -57,6 +55,7 @@ from .pipelines import (
     ViewPipeline,
     build_pipeline,
 )
+from .validation import build_val_evaluator
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +178,13 @@ class Trainer:
         self.best_epoch       = 0
         self.start_epoch      = 0
         self.patience_counter = 0
+
+        # --- Validation / model-selection evaluator -------------------
+        # medium（随机 patch 指标）/ high（整卷滑窗指标）由 val_metric_mode 决定；
+        # 两者产出同结构 metrics dict，选模/调度/ckpt 逻辑无需分支。
+        self.evaluator = build_val_evaluator(self)
+        logger.info("Validation metric mode: %s (evaluator=%s)",
+                    tc.val_metric_mode, type(self.evaluator).__name__)
 
         # --- Output directory -----------------------------------------
         self.output_dir = Path(tc.output_dir)
@@ -506,164 +512,18 @@ class Trainer:
     def _validate(self, epoch: int) -> Dict[str, float]:
         """验证集评估（启用 EMA 时以 EMA 权重）。
 
-        累加 pooled 混淆量 (inter/pred_sum/target_sum/voxels) 与覆盖计数，并
-        在 epoch 末由 ``derive_overlap_metrics`` 闭式导出 dice/iou/recall/
-        precision/vol_sim/mcc 等多维度指标，全部在 GPU 上完成。Surface Dice
-        与 ``mean_balanced`` 仅在所选 criterion 需要时才计算，避免额外开销。
+        实际指标累加 / 导出与"指标在什么预测上算"的口径全部归口到
+        ``self.evaluator``（见 ``trainer.validation``）：
+
+        * ``medium`` → ``PatchValEvaluator``：遍历 ``val_loader`` 随机 patch。
+        * ``high``   → ``VolumeValEvaluator``：每个 val 整卷滑窗推理后算指标。
+
+        两者产出同结构 metrics dict，故下游选模 / 调度 / checkpoint 无需分支。
+        EMA 换入在此统一处理，保证两种模式都以 EMA 权重评估。
         """
         self.model.eval()
-        loss_meter     = AverageMeter()
-        inter_sum      = None
-        pred_sum_acc   = None
-        target_sum_acc = None
-        voxels_acc     = None
-        cov_sum        = None
-
-        tc           = self.cfg.train
-        crit         = str(tc.save_best_criterion).lower().strip()
-        compute_sd   = crit in ("dice+surface_dice", "balanced")  # balanced也算Surface Dice
-        sd_tol       = int(tc.surface_dice_tolerance)
-        sd_w         = float(tc.surface_dice_weight)
-        sd_num_sum   = None
-        sd_denom_sum = None
-
-        n_samples = 0
         with self._ema_swapped():
-            for batch in self.val_loader:
-                image = batch["image"].to(self.device, non_blocking=True)
-                label = batch["label"].to(self.device, non_blocking=True).float()
-
-                image, label = self.pipeline.prepare_val_batch(image, label)
-
-                with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                    pred = self.model(image)
-                    pred = self.pipeline.extract_main_pred(pred)
-                    pred_1x, target_1x = self.pipeline.split_for_metrics(pred, label)
-                loss = compute_loss_fp32(self.base_loss, pred_1x, target_1x)
-
-                loss_val = loss.item()
-                if math.isfinite(loss_val):
-                    loss_meter.update(loss_val, image.shape[0])
-                else:
-                    logger.warning(
-                        "Non-finite val loss (%s) at epoch %d; skipping "
-                        "meter update.", loss_val, epoch + 1)
-                pred_1x_f = pred_1x.float()
-                stats = dice_batch_stats(pred_1x_f, target_1x)
-                if inter_sum is None:
-                    inter_sum      = stats["inter"].clone()
-                    pred_sum_acc   = stats["pred_sum"].clone()
-                    target_sum_acc = stats["target_sum"].clone()
-                    voxels_acc     = stats["voxels"].clone()
-                    cov_sum        = stats["n_with_gt"].clone()
-                else:
-                    inter_sum      += stats["inter"]
-                    pred_sum_acc   += stats["pred_sum"]
-                    target_sum_acc += stats["target_sum"]
-                    voxels_acc     += stats["voxels"]
-                    cov_sum        += stats["n_with_gt"]
-                if compute_sd:
-                    sd_stats = surface_dice_batch_stats(
-                        pred_1x_f, target_1x, tolerance=sd_tol)
-                    if sd_num_sum is None:
-                        sd_num_sum   = sd_stats["sd_num"].clone()
-                        sd_denom_sum = sd_stats["sd_denom"].clone()
-                    else:
-                        sd_num_sum   += sd_stats["sd_num"]
-                        sd_denom_sum += sd_stats["sd_denom"]
-                n_samples += image.shape[0]
-
-        if inter_sum is None:
-            logger.warning("Validation loader yielded no batches.")
-            return {"val_loss": float("nan"), "mean_dice": 0.0}
-
-        # --- 闭式导出全部 overlap 类指标（仍在 GPU）。-----------------------
-        derived = derive_overlap_metrics(
-            inter_sum, pred_sum_acc, target_sum_acc, voxels_acc)
-        # 单一处搬到 CPU，避免逐项 .item() 触发多次同步。
-        derived_cpu    = {k: v.cpu() for k, v in derived.items()}
-        dice_per_class = derived_cpu["dice"]
-        iou_per_class  = derived_cpu["iou"]
-        rec_per_class  = derived_cpu["recall"]
-        pre_per_class  = derived_cpu["precision"]
-        vs_per_class   = derived_cpu["vol_sim"]
-        mcc_per_class  = derived_cpu["mcc"]
-
-        metrics: Dict[str, float] = {"val_loss": loss_meter.avg}
-        for c in range(len(dice_per_class)):
-            metrics[f"dice_class_{c}"]      = dice_per_class[c].item()
-            metrics[f"iou_class_{c}"]       = iou_per_class[c].item()
-            metrics[f"recall_class_{c}"]    = rec_per_class[c].item()
-            metrics[f"precision_class_{c}"] = pre_per_class[c].item()
-            metrics[f"vol_sim_class_{c}"]   = vs_per_class[c].item()
-            metrics[f"mcc_class_{c}"]       = mcc_per_class[c].item()
-
-        # nnU-Net ignore_empty：整个 val 集都无 GT 的类（cov==0）从 mean_* / min_*
-        # 中剔除——否则其退化值（无 GT 且无 pred 时 Dice=eps/eps=1.0；一旦有假阳
-        # 又跌到 0）会污染 mean_dice / min_class_dice 等选模指标。与
-        # ``compute_dice_per_class(ignore_empty=True)`` 的约定保持一致。
-        gt_mask = (cov_sum.cpu() > 0)
-        if not bool(gt_mask.any()):
-            gt_mask = torch.ones_like(gt_mask)  # 退化：val 全空，回退到全类
-
-        def _masked_mean(v: torch.Tensor) -> float:
-            return v[gt_mask].mean().item()
-
-        def _masked_min(v: torch.Tensor) -> float:
-            return v[gt_mask].min().item()
-
-        metrics["mean_dice"]      = _masked_mean(dice_per_class)
-        metrics["mean_iou"]       = _masked_mean(iou_per_class)
-        metrics["mean_recall"]    = _masked_mean(rec_per_class)
-        metrics["mean_precision"] = _masked_mean(pre_per_class)
-        metrics["mean_vol_sim"]   = _masked_mean(vs_per_class)
-        metrics["mean_mcc"]       = _masked_mean(mcc_per_class)
-        # 短板：最差类 dice / iou — 反映"被均值掩盖的崩盘类"。
-        metrics["min_class_dice"] = _masked_min(dice_per_class)
-        metrics["min_class_iou"]  = _masked_min(iou_per_class)
-
-        smooth = 1e-5
-        sd_msg = ""
-        if compute_sd and sd_num_sum is not None:
-            sd_per_class = (sd_num_sum + smooth) / (sd_denom_sum + smooth)
-            sd_per_class = sd_per_class.cpu()
-            for c in range(len(sd_per_class)):
-                metrics[f"surface_dice_class_{c}"] = sd_per_class[c].item()
-            metrics["mean_surface_dice"] = _masked_mean(sd_per_class)
-            metrics["mean_combined"] = (
-                (1.0 - sd_w) * metrics["mean_dice"]
-                + sd_w * metrics["mean_surface_dice"])
-            sd_msg = (
-                f", pooled_mean_surface_dice@{sd_tol}px="
-                f"{metrics['mean_surface_dice']:.4f}, "
-                f"per_class_sd={[f'{d:.4f}' for d in sd_per_class.tolist()]}, "
-                f"combined(w={sd_w:.2f})={metrics['mean_combined']:.4f}")
-
-        # Balanced：四指标调和均值。MCC ∈[−1,1] 重映射到 [0,1]：(mcc+1)/2。
-        # 仅在请求或具备 surface_dice 时计算（避免无 SD 时的退化）。
-        if crit == "balanced" and "mean_surface_dice" in metrics:
-            mcc01 = max(0.0, (metrics["mean_mcc"] + 1.0) * 0.5)
-            hm = harmonic_mean_metrics([
-                torch.tensor(metrics["mean_dice"]),
-                torch.tensor(metrics["mean_surface_dice"]),
-                torch.tensor(metrics["mean_iou"]),
-                torch.tensor(mcc01)])
-            metrics["mean_balanced"] = float(hm.item())
-
-        cov = cov_sum.cpu().tolist()
-        logger.info(
-            "  Val: loss=%.4f, pooled_mean_dice=%.4f, per_class=%s, "
-            "iou=%.4f, recall=%.4f, precision=%.4f, vol_sim=%.4f, "
-            "mcc=%.4f, min_class_dice=%.4f, coverage=%s/%d samples%s%s",
-            metrics["val_loss"], metrics["mean_dice"],
-            [f"{d:.4f}" for d in dice_per_class.tolist()],
-            metrics["mean_iou"], metrics["mean_recall"],
-            metrics["mean_precision"], metrics["mean_vol_sim"],
-            metrics["mean_mcc"], metrics["min_class_dice"],
-            [int(c) for c in cov], n_samples, sd_msg,
-            (f", balanced={metrics['mean_balanced']:.4f}"
-             if "mean_balanced" in metrics else ""))
-        return metrics
+            return self.evaluator.evaluate(epoch)
 
     # ==================================================================
     # Backward-compatibility shims for unit tests

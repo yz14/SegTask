@@ -253,6 +253,10 @@ train:
   # save_best_metric / save_best_mode 由此自动派生，无需手设。
   save_best_criterion: "dice"
 
+  # 选模严格度：'medium' (默认, 在随机 patch 上算指标, 快) | 'high' (对每个 val
+  # 整卷做滑窗推理后再算指标, 最可靠但更慢)。与 save_best_criterion 正交。
+  val_metric_mode: "medium"
+
   early_stopping: 15                     # 0 = 禁用
 
   log_every: 10                          # 训练 loss 记录 (micro-step)
