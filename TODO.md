@@ -47,96 +47,128 @@ F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。
 
 4 有些代码太大，逻辑绕口，让人读起来费劲，维护困难，例如config.py文件，如果某个参数会被自动重写或者更新，那么它就不应该暴露接口出来，例如save_best_metric。前全面检查代码其它地方是否有类似的问题。我需要的是让人读起来代码来不那么费劲，绕圈，甚至多个文件反复查看确认才能理解代码。
 
-5 我在服务器上用D:\codes\work-projects\SegTask\configs\segtest0.yaml训练body分割，训练数据集在本地也有：F:\Totalsegmentator_dataset_v201\nii，然后训练完成后在F:\airway_segment_with_img\imgs这个数据集推理，我发现推理的数据集效果一般般，假阳很多。我检查了一遍代码，感觉发现不了什么问题，你可以检查确认一遍。如果代码没有问题，那么是不是数据发布的问题，如果有较大可能是数据问题，你可否写一个脚本来给我允许，分析两个数据集究竟有什么差异（首先可以确定的是spacing肯定有差异的，但是我都resize到同样的尺寸了）。
-进度：我写了脚本分析脚本: @d:\codes\work-projects\SegTask\scripts\analyze_dataset_shift.py
+5 在推理阶段，如果开启z_interleave_enabled，adabn_enabled，tta_flip后，如何在不显著增加显存，不损害模型效果的情况下加速推理呢，我粗略的分析是：
+一、当前瓶颈量化
+我完整阅读了 predictor/ 包下的 predictor.py、forwards.py、sliding.py、adabn.py、io.py、inputs.py、blending.py 以及 config.py 的相关配置。三者叠加的耗时效应如下：
 
-全量运行命令:
+特性	当前实现	额外前向倍数
+tta_flip	串行循环：原始输入后逐个 flip 再逐个 model() 前向，3D 7 种 flip、2.5D 3 种 flip	8× (3D) / 4× (2.5D)
+z_interleave_enabled	串行处理 k 个子流：每子流独立走完整 sliding_window_z（含各自的 batching、interpolate、blend）	k × 整卷推理（默认 z≤1.0 时 k=3）
+adabn_enabled (per_volume)	整卷跑两遍：先完整 predict_preprocessed_array 估计 BN，再真实预测	2× 整卷推理
+最坏叠加：k=3 × AdaBN=2 × 3D TTA=8 = 48 倍原始单前向时间。这是本次优化的核心痛点。
 
+二、优化方案与业界做法
+方案 1：TTA 串行 → Batch 化（最核心、最安全）
+当前 TTA 在 forwards.py:50-90 中是对每个 flip 变体串行调用 p.model(...)。工业界标准做法（nnUNet、MONAI 等）是将多个翻转版本 concat 成一个更大的 batch 统一前向，再拆分反 flip 后平均。
 
+显存控制：不能一次性堆叠全部 8 个变体。引入 tta_batch_size 参数分块处理。例如 tta_batch_size=2 时，3D TTA 从 8 次前向降至 4 次，激活显存仅增加 2 倍。
+效果：逐像素严格等价，因为只是改变了计算顺序。
+方案 2：AdaBN per_volume → 稀疏采样（最减负）
+当前 per_volume 模式在 predictor.py:301-311 中，是对整卷跑完整 predict_preprocessed_array 来估计 BN。但 BN running stats 的收敛只需要足够样本量，不需要所有 patch。
 
-powershell
-D:\miniconda\envs\torch27_env\python.exe scripts/analyze_dataset_shift.py `
-    --train-dir F:/Totalsegmentator_dataset_v201/nii `
-    --infer-dir F:/airway_segment_with_img/imgs `
-    --out-dir   scripts/dataset_shift_report `
-    --workers 12
+优化：估计阶段只采样最多 adabn_max_patches（如 64）个代表性 patch（均匀或随机选 z 位置/cubic 中心）做 forward，跳过 blend、interpolate、保存等后续步骤。
+效果：估计时间从 ~1× 整卷推理降至 ~0.05–0.1×，且 BN 统计量已足够稳定。
+方案 3：z_interleave 串行子流 → 统一 batch（减少循环开销）
+当前 sliding_window_z_interleaved 在 sliding.py:207-248 中循环 for i in range(k): sub_prob = sliding_window_z(p, sub_vol)。k 个子流之间没有任何数据依赖，只是 blend 目标位置不同。
 
-结果跑出来在：
-Wrote scripts\dataset_shift_report\per_file_stats.csv (1930 rows)
-2026-06-04 10:53:57,240 INFO Wrote scripts\dataset_shift_report\summary_stats.csv (36 rows)
-2026-06-04 10:53:58,866 INFO Wrote scripts\dataset_shift_report\geometry_comparison.png
-2026-06-04 10:53:59,358 INFO Wrote scripts\dataset_shift_report\intensity_comparison.png
-2026-06-04 10:53:59,359 INFO ========================================================================
-2026-06-04 10:53:59,359 INFO VERDICT — median comparison (train(totalseg) vs infer(airway))
-2026-06-04 10:53:59,359 INFO ------------------------------------------------------------------------
-2026-06-04 10:53:59,361 INFO   slice spacing Z                            train=    1.500 mm     infer=    1.250  (infer/train=0.83x)
-2026-06-04 10:53:59,361 INFO   in-plane spacing X                         train=    1.500 mm     infer=    0.705  (infer/train=0.47x)
-2026-06-04 10:53:59,362 INFO   in-plane FOV X                             train=  354.000 mm     infer=  363.000  (infer/train=1.03x)
-2026-06-04 10:53:59,363 INFO   effective in-plane spacing after resize    train=    1.354 mm/vox infer=    1.418  (infer/train=1.05x)
-2026-06-04 10:53:59,364 INFO   physical z-thickness of patch_D slab       train=   18.000 mm     infer=   15.000  (infer/train=0.83x)
-2026-06-04 10:53:59,372 INFO   per-volume median intensity                train= -848.000 HU     infer= -896.000  (infer/train=1.06x)
-2026-06-04 10:53:59,372 INFO   frac voxels below window                   train=    0.004        infer=    0.000  (infer/train=0.00x)
-2026-06-04 10:53:59,373 INFO ========================================================================
-2026-06-04 10:53:59,373 INFO 解读：eff_spacing_h / slab_z_mm 的 infer/train 比值越偏离 1.0，说明进模型前的解剖体素尺度差异越大——这是 z_axis/2.5D 无 spacing 重采样导致跨域假阳的直接量化。
-2026-06-04 10:53:59,373 INFO Done. Report written to D:\codes\work-projects\SegTask\scripts\dataset_shift_report
+优化：不再串行调用 k 次 sliding_window_z，而是：
+统一计算所有子流的 z_positions；
+统一收集所有窗口输入（标记所属子流 id 和 z 位置）；
+按原有 batch_size 统一 batch forward；
+各子流分别 blend 到各自的 acc_pred/acc_weight；
+最后缝回原体积。
+效果：forward 总次数不变，但消除了 k 次重复的 Python 循环、kernel launch 和 CPU-GPU 同步，GPU 利用率更高。
+三、执行计划（可拆分、可独立执行）
+步骤 1：TTA Batch 化
+目标文件：forwards.py + config.py
+具体修改：
+在 PredictConfig 新增 tta_batch_size: Optional[int] = None（None 时退化为 batch_size）。
+重写 tta_flip_ensemble 和 tta_flip_ensemble_2_5d：将原始输入和所有 flip 变体按 tta_batch_size 分块，每块 torch.cat 成 (B*N, ...) 统一送入 p.model()，输出拆分、反 flip、累加后平均。
+预期产出：3D TTA 前向次数从 8 次降至 ceil(8/tta_batch_size) 次；2.5D 从 4 次降至 ceil(4/tta_batch_size) 次。
+验收标准：
+同一张图开启 TTA 后，输出概率体与原始实现逐像素 max abs diff < 1e-5。
+单测覆盖 3D 和 2.5D 两种 TTA 路径。
+显存承诺：激活显存增加不超过 tta_batch_size 倍（默认 batch_size=2，即最多 2 倍）。
+步骤 2：AdaBN per_volume 稀疏采样
+目标文件：predictor.py + config.py
+具体修改：
+在 PredictConfig 新增 adabn_per_volume_max_patches: int = 64（0 表示全卷）。
+在 predict_volume 的 per_volume AdaBN 估计分支中，不再调用完整 predict_preprocessed_array，而是：
+对 sliding_window_z：从 z_positions 中均匀/步长采样最多 max_patches 个，构建窗口、forward、直接丢弃输出（仅驱动 BN 统计）。
+对 cubic：从所有 cubic 窗口中均匀采样最多 max_patches 个。
+对 whole：仍走全卷（本身只一次 forward，无优化空间）。
+预期产出：per_volume 估计时间从 ~1× 整卷推理降至 ~0.05–0.1×。
+验收标准：
+稀疏采样后的 BN running_mean 与全卷估计的相对误差 < 1%。
+最终预测结果（Dice）与全卷估计的差异 < 0.1%。
+max_patches=0 时行为与现有实现逐像素等价。
+步骤 3：z_interleave 子流统一 batch
+目标文件：sliding.py + config.py（如有必要）
+具体修改：
+重写 sliding_window_z_interleaved：
+为 k 个子流分别计算 z_positions；
+统一收集所有子流的窗口输入，维护 (sub_stream_id, z0, z1, actual_d) 元数据列表；
+按 batch_size 统一 batch forward（调用 forward_batch_gpu）；
+每个子流维护独立的 acc_pred_sub[i] / acc_weight_sub[i]，interpolate 后按元数据写回；
+所有子流完成后，out[:, i::k] = acc_pred_sub[i] / acc_weight_sub[i]。
+预期产出：z-interleave 开启时，kernel launch 和循环同步开销从 k 倍压缩到 1 倍。
+验收标准：
+同一张图 z_interleave 开启时，输出概率体与原始实现逐像素 max abs diff < 1e-5。
+k=3 时推理速度提升 > 1.3×。
+四、依赖关系与执行顺序
+步骤 1 与步骤 2 互相独立，无代码冲突，可分属不同轮次或并行提交。
+步骤 3 涉及 sliding.py 较大面积重构，与步骤 1/2 无直接依赖，但建议作为单独轮次放在最后，以降低 review 难度。
 
-目标与规则
-目标:确认 segtest0.yaml(body 分割)跨数据集推理假阳偏多是代码问题还是数据问题,并解读已跑出的 analyze_dataset_shift.py 结果。
-遵守规则:本轮只做调研与分析,不改实现代码;给出结论与改进计划,等你确认后再动手(规则一/二/三)。
-一、代码核查结论:推理/预处理流程本身没有 bug
-我核对了训练 dataset 与推理 predictor 的全链路,关键事实:
+修订后的执行计划
+我建议按真实收益重排优先级,每步独立、可单独验收:
 
-全程不做物理 spacing 重采样。preprocess_image 只做强度窗 + minmax 归一化(@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:247-279);resize_3d 是按体素索引比例缩放,不是按 mm(@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:314-330)。
-推理侧 predict_volume 同样只 load_nifti + preprocess_image,无重采样(@d:\codes\work-projects\SegTask\segtask_v1\predictor\predictor.py:261-263);z_axis 走 _sliding_window_z,按体素取 patch_D 张切片。
-配置里 z_interleave_enabled: false(@d:\codes\work-projects\SegTask\configs\segtest0.yaml:181),所以即使有 z-spacing 也不会做 z 交错对齐。
-结论:代码逻辑自洽,训练/推理预处理完全一致,不是实现 bug。 但这套"无 spacing 重采样"的设计意味着模型学到的是训练集的体素级解剖尺度,跨域推理对 spacing/强度分布天然敏感——这正是假阳的根源所在。所以是数据域漂移问题,而漂移之所以能直接伤害模型,是因为流程不做尺度归一。
+步骤 A(原 step 1):TTA 批量化 — 通用最高价值
 
-二、报告结果解读(逐维度)
-1. 面内尺度:已对齐,不是问题
-指标	train(totalseg)	infer(airway)	infer/train
-面内 spacing X (中位)	1.5 mm	0.705 mm	0.47x
-面内 FOV X (中位)	354 mm	363 mm	1.03x
-resize→256 后有效 spacing	1.354 mm/vox	1.418 mm/vox	1.05x
-原始 spacing 差 2 倍,但物理 FOV 基本一致,resize 到 256 后有效像素尺度只差 5%。面内被 resize 自动归一了,不是假阳主因。
+文件:forwards.py + config.py
+新增 tta_batch_size: Optional[int];tta_flip_ensemble / tta_flip_ensemble_2_5d 把原图+flip 变体按 tta_batch_size 分块 torch.cat 统一前向、拆分、反 flip、平均。
+验收:纯 eval 下与原实现 max abs diff < 1e-5(3D+2.5D 两路);显存增幅 ≤ tta_batch_size×;AdaBN 估计期保持串行(规避上述陷阱)。
+步骤 B(原 step 3):z_interleave 统一 batch — 当前配置主要收益点
 
-2. Z 轴尺度:真实漂移,主要几何因素
-指标	train	infer	infer/train
-slice spacing Z (中位)	1.5 mm	1.25 mm	0.83x
-patch_D=12 slab 物理厚度 (中位)	18 mm	15 mm	0.83x
-模型在 ~18mm 的 z 上下文里训练,推理时一个 patch 只覆盖 ~15mm,z 解剖语境被压缩 ~17%。
-更关键的是方差:infer 的 slab_z_mm q05=8.4mm(train 紧贴 18mm),21.2%(150/707)的 infer 卷 slab<12mm。z 上下文严重不一致 → 模型在薄层卷上看到的结构比例失真,易产生假阳。
-3. 强度:整体直方图相近,但一大批 infer 卷的强度被污染
-窗内平均直方图 train/infer 几乎重合(HU 标定大体正常),但原始统计暴露严重离群:
+文件:sliding.py
+统一收集 k 个子流的所有窗口(带 (sub_id, z0, z1, actual_d) 元数据),按 batch_size 统一前向,各子流独立 blend 后 out[:, i::k] 缝回。
+验收:与原实现 max abs diff < 1e-5;凑满 batch 带来的提速(我会实测,不预设 1.3×)。
+步骤 C(原 step 2):AdaBN per_volume 稀疏采样 — 仅对 per_volume 有效
 
-15.0%(106/707)的 infer 卷 raw_max>5000(最高到 int16 上限 32767)。
-49.9%(353/707)raw_min<-2000(到 -32768)。
-42.6%(301/707)的 infer 卷有 >10% 体素低于 -1024 窗下限(train 仅 5.7%);直方图上 infer 在 frac≈0.21 处有一个 train 完全没有的尖峰。
-这说明 airway 数据里很大一部分卷的背景/填充值与 TotalSeg 不同(重建视野外大片空气被填成远低于 -1024 的值,或个别卷根本不是标准 HU)。窗裁剪到 [-1024,1024] 后这些区域全饱和成 0,在体内造成与训练分布不同的大面积"纯黑"边缘——模型没见过这种分布,正是假阳高发区。
+文件:predictor.py + config.py
+新增 adabn_per_volume_max_patches;估计期从 z_positions/cubic 中心均匀采样 ≤N 个窗口仅驱动 BN,跳过 blend/保存。
+验收:running_mean 相对误差 < 1%;最终 Dice 差异 < 0.1%;=0 时退化为现实现。
+依赖:三步互相独立。步骤 A 与 B 对你当前配置(tta off / adabn global / k=4)收益最大的是 B;A、C 是为开启对应开关时准备的通用能力。
 
-三、根因排序
-主因 A — Z 轴尺度/层厚漂移:slab 18→15mm 且方差大,21% 卷 slab<12mm。
-主因 B — 强度/背景填充域漂移:~43% infer 卷有大比例窗下饱和,部分卷强度非标准 HU(±32768)。
-底层设计:管线不做物理 spacing 重采样,放大了上述两类漂移的影响。
-面内尺度已被排除。
+需要你确认
+由于真实瓶颈与原分析有出入,我想先和你对齐范围再动手:
 
-四、改进计划(待你确认后执行)
-我建议分步,每步独立可验证:
+Q: 基于上述修正后的分析,本轮编码你希望我先做哪一步?(三步均独立,可分轮高质量完成)
+先做 A,再议 B/C
+Thought for 17s
+You chose A — TTA 批量化. This is the execution round; I'll implement step A with equivalence regression tests and the AdaBN-estimation trap avoidance. Let me first confirm how YAML populates PredictConfig so the new optional field plumbs correctly.
 
-步骤 1(无需重训,先验证):开启 z-interleave 对齐 z 尺度。segtest0.yaml 已有 z_interleave_thresholds/factors,把 z_interleave_enabled 设为 true,在 airway 上重跑推理对比假阳是否下降。预期产出:同一批 case 的假阳量对比;验收:假阳明显减少则确认 Z 是主因之一。
-步骤 2(数据侧定位):扩展现有分析脚本,列出"问题 infer 卷"清单(raw_max>5000 / frac_below>0.1),抽查几例确认是背景填充还是非 HU,决定是否需要重标定/清洗。验收:能区分"可修复填充值" vs "真·分布外"。
-步骤 3(训练侧增强,需重训):针对 Z 漂移加 z-spacing/层厚增强(模拟薄层),针对强度加更鲁棒的背景处理;或评估是否引入物理 spacing 重采样到固定 mm/vox。验收:在 airway 上 Dice/假阳改善且不损 TotalSeg 内验证。
+Searcheddef from_dict|def from_yaml|PredictConfig\(|_from_dict|fields\(|asdict|def load in work-projects/SegTask/segtask_v1/config.py (7)
+Thought for 1s
+Loader is field-name based with defaults — adding an optional field is safe. Let me set up the task plan and implement.
 
+Created Todo List5 tasks
+config.py
++8
+Thought for 2s
+The config field may have already existed (earlier search showed it). Let me verify there's no duplicate.
 
-我采取的措施：
-predict:
-  z_interleave_enabled: true
-  z_interleave_thresholds: [1.1, 1.6, 2.1, 2.6]
-  z_interleave_factors: [5, 4, 3, 2, 1]
-像这样改了后，假阳确实减少了（减少70%），但是仍然有30%假阳。之后我开启了TTA，假阳只剩10%不到。patch_mode: "2_5d"，所以走的是 @d:\codes\work-projects\SegTask\segtask_v1\predictor\forwards.py:67-90 的 tta_flip_ensemble_2_5d，而不是 3D 那套 7 组合。
-具体动作：
-只翻转 H / W 两个面内轴，做 3 种组合：H、W、H+W（@forwards.py:74-78）。
+Searchedtta_batch_size in work-projects/SegTask/segtask_v1/config.py (3)
+Thought for 3s
+Only one definition — good. The earlier search snippet was anticipatory. Let me verify whether predictor.py/forwards.py already reference tta_batch_size or _adabn_estimating to avoid conflicts.
 
-我后续还可能：
-测试时 AdaBN（自适应 BN）：推理前用目标域几卷重新估计 BatchNorm 的 running stats（model.train() 跑几个 forward 不回传，或重算 BN buffer）。针对 BatchNorm 域敏感，无需标签、不重训，常有立竿见影效果。
+Searchedtta_batch_size|_adabn_estimating|_tta_chunk in work-projects/SegTask/segtask_v1/predictor (0)
+No existing references. Now updating predictor.py — read tta_batch_size, add the _adabn_estimating flag, and wrap the per-volume AdaBN estimation.
 
-请你评估这个AdaBN方案是否可行，如果可以，则可以拟定实施计划（在推理配置加开关是否启用）
+predictor.py
++2
+Thought for 1s
+Now add the _adabn_estimating flag initialization and wrap the per-volume AdaBN estimation.
+
+predictor.py
++5
+Now wrap the per-volume AdaBN estimation block with the flag:

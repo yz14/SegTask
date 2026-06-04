@@ -605,6 +605,14 @@ class PredictConfig:
     # TTA flip。
     tta_flip: bool = False
 
+    # TTA flip 变体的批量化前向块大小（单卷推理提速；仅 tta_flip=True 时生效）。
+    #   将多个 flip 变体沿 batch 轴 torch.cat 成一次前向，逐像素等价于串行，仅减少
+    #   前向次数。3D 7 种 flip → ceil(7/tta_batch_size)+1 次前向；2.5D 3 种 → 同理。
+    # None  — 退化为 predict.batch_size。
+    # 显存提醒：单次前向样本数 ≈ batch_size * tta_batch_size，显存随之线性上升；
+    #   显存吃紧时调小（如 2）。AdaBN per_volume 估计阶段会自动退回串行以保 BN 统计一致。
+    tta_batch_size: Optional[int] = None
+
     # sigmoid 二值化阈值。
     threshold: float = 0.5
 

@@ -283,13 +283,17 @@ train:
 # PREDICT — 2.5D 推理 z 轴滑窗 (几何同 z_axis); 每窗口 squeeze+2D forward+reshape。
 # TTA 仅翻 H/W (D 是 channel 轴，翻转会破坏物理 slice 顺序)。
 predict:
-  z_interleave_enabled: true
+  z_interleave_enabled   : true
   z_interleave_thresholds: [1.0, 1.5, 3]   # 覆盖默认阈值/因子
-  z_interleave_factors: [4, 3, 2, 1]
+  z_interleave_factors   : [4, 3, 2, 1]
+  adabn_enabled    : true
+  adabn_mode       : "global"  # 或 "per_volume"
+  adabn_num_volumes: 8         # global 模式预热卷数
   z_overlap : 0.5
-  blend_mode: "gaussian"          # 'gaussian' | 'constant'
+  blend_mode: "gaussian"                   # 'gaussian' | 'constant'
   batch_size: 4
-  tta_flip  : false
-  threshold : 0.5
-  output_dir: "predictions"
+  tta_flip      : false
+  tta_batch_size: Optional[int] = None
+  threshold     : 0.5
+  output_dir: ""
   save_probabilities: false

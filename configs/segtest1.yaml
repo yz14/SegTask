@@ -82,7 +82,7 @@ model:
 
   lift_2_5d_to_3d: false
 
-  norm_type  : "batch"         # 'instance' | 'batch' | 'group'    ###################################################################################
+  norm_type  : "group"         # 'instance' | 'batch' | 'group'    ###################################################################################
   norm_groups: 8
   activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
   dropout    : 0.0
@@ -155,7 +155,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/body_resnet_bnorm"    ############################################################
+  output_dir      : "outputs/body_resnet_gnorm"    ############################################################
   save_every      : 10
   save_best_criterion: "dice+surface_dice"    ############################################################################
   surface_dice_tolerance: 1
@@ -174,7 +174,7 @@ train:
 
   resume: ""
 
-  pretrain: ""
+  pretrain: "/data0/yzhen/timm_test/outputs/body_resnet_gnorm/best_model.pth"
   pretrain_strict: false
   pretrain_load_ema: false
 
@@ -183,12 +183,12 @@ predict:
   z_interleave_thresholds: [0.8, 1.2, 1.6, 2.0]
   z_interleave_factors   : [5, 4, 3, 2, 1]
   adabn_enabled    : false
-  adabn_mode       : "per_volume"  # "global | per_volume"
+  adabn_mode       : "global"  # 或 "per_volume"
   adabn_num_volumes: 8         # global 模式预热卷数
   z_overlap : 0.5
   blend_mode: "gaussian"          # 'gaussian' | 'constant'
   batch_size: 4
-  tta_flip  : true
-  threshold : 0.6
-  output_dir: ""
+  tta_flip  : false
+  threshold : 0.5
+  output_dir: "predictions"
   save_probabilities: false

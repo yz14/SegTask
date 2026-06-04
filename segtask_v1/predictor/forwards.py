@@ -47,47 +47,82 @@ def reshape_2_5d_input(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # TTA — 3D (7 flip combos) and 2.5D (3 H/W combos)
 # ---------------------------------------------------------------------------
+# (flip_x_dims, flip_prob_dims) 规格表：x 与 prob 的轴布局可能不同，故分开记录。
+# 3D：x=(B,C,D,H,W)、prob=(B,num_fg,D,H,W) 同布局，flip 轴一致（2=D,3=H,4=W）。
+_FLIP_SPECS_3D = (
+    ([2], [2]), ([3], [3]), ([4], [4]),
+    ([2, 3], [2, 3]), ([2, 4], [2, 4]), ([3, 4], [3, 4]),
+    ([2, 3, 4], [2, 3, 4]),
+)
+# 2.5D：x_2d=(B,C_res*D,H,W) 仅 H/W 可 flip（2=H,3=W）；prob=(B,num_fg,D,H,W)（3=H,4=W）。
+# D 是输入通道轴，flip 会反转物理切片顺序 → 分布偏移，故不翻 D。
+_FLIP_SPECS_2_5D = (
+    ([2], [3]),        # H
+    ([3], [4]),        # W
+    ([2, 3], [3, 4]),  # H + W
+)
+
+
+def _tta_chunk_size(p: "Predictor") -> int:
+    """单次前向拼接的 flip 变体数：``tta_batch_size`` (None→batch_size)，下限 1。
+
+    AdaBN per_volume 估计期 (``p._adabn_estimating``) 强制返回 1（串行）：估计期 BN
+    处于 train+累积平均模式，把多个变体拼成大 batch 会改变 BN 见到的 batch 统计构成与
+    running stats 累积，破坏与逐变体串行实现的一致性。真实 eval 预测不受影响。
+    """
+    if getattr(p, "_adabn_estimating", False):
+        return 1
+    cs = getattr(p, "tta_batch_size", None) or p.batch_size
+    return max(1, int(cs))
+
+
+def _flip_tta_batched(p: "Predictor", x: torch.Tensor,
+                      base_prob: torch.Tensor, flip_specs, post_fn):
+    """通用 flip-TTA：``base_prob`` 为原图概率，``flip_specs`` 中各 flip 变体按
+    ``_tta_chunk_size`` 分块——每块沿 batch 轴 ``torch.cat`` 成 ``(B*g, ...)`` 一次
+    前向、``post_fn`` 转概率、逐变体反 flip 后累加，最后除以 ``1+len(flip_specs)``。
+
+    与逐变体串行实现严格等价（eval 下 BN 用 running stats、变体间无 batch 耦合；仅前向
+    顺序/批大小改变）；累加顺序也保持原图→变体序，浮点结果同序。
+    """
+    total = base_prob.clone()
+    count = float(1 + len(flip_specs))
+    B = x.shape[0]
+    chunk = _tta_chunk_size(p)
+    for start in range(0, len(flip_specs), chunk):
+        specs = flip_specs[start:start + chunk]
+        x_cat = torch.cat([torch.flip(x, fx) for fx, _ in specs], dim=0)
+        pred = p.model(x_cat.to(p.model_dtype))
+        if isinstance(pred, list):
+            pred = pred[0]
+        prob_cat = post_fn(pred)                  # (B*g, num_fg, ...)
+        for j, (_, fprob) in enumerate(specs):
+            prob_j = torch.flip(prob_cat[j * B:(j + 1) * B], fprob)
+            total = total + prob_j
+    return total / count
+
+
 def tta_flip_ensemble(p: "Predictor", x: torch.Tensor,
                       base_prob: torch.Tensor) -> torch.Tensor:
-    """3D TTA：原始 + 7 种轴 flip 组合取均；每次反 flip 后在原几何上累计。"""
-    total = base_prob.clone()
-    count = 1.0
-    for flip_dims in ([2], [3], [4], [2, 3], [2, 4], [3, 4], [2, 3, 4]):
-        x_flip = torch.flip(x, flip_dims)
-        pred_flip = p.model(x_flip.to(p.model_dtype))
-        if isinstance(pred_flip, list):
-            pred_flip = pred_flip[0]
-        prob_flip = torch.sigmoid(pred_flip.float())[:, :p.num_fg]
-        prob_flip = torch.flip(prob_flip, flip_dims)
-        total = total + prob_flip
-        count += 1.0
-    return total / count
+    """3D TTA：原始 + 7 种轴 flip 组合取均；变体按 ``tta_batch_size`` 批量化前向。"""
+    def _post(pred: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(pred.float())[:, :p.num_fg]
+
+    return _flip_tta_batched(p, x, base_prob, _FLIP_SPECS_3D, _post)
 
 
 def tta_flip_ensemble_2_5d(p: "Predictor", x_2d: torch.Tensor,
                            base_prob: torch.Tensor) -> torch.Tensor:
-    """2.5D TTA：仅 H/W flip（D 是输入通道轴，flip 会反转物理切片顺序 → 分布偏移）。"""
+    """2.5D TTA：仅 H/W flip；变体按 ``tta_batch_size`` 批量化前向。"""
     D = p.patch_D
-    total = base_prob.clone()
-    count = 1.0
-    # x_2d 轴：2=H,3=W；prob_5d 轴：3=H,4=W（D 插在 2）。
-    for flip_x_dims, flip_prob_dims in (
-        ([2], [3]),        # H
-        ([3], [4]),        # W
-        ([2, 3], [3, 4]),  # H + W
-    ):
-        x_flip = torch.flip(x_2d, flip_x_dims)
-        pred_flip = p.model(x_flip.to(p.model_dtype))
-        if isinstance(pred_flip, list):
-            pred_flip = pred_flip[0]
-        # (B, num_fg*D, H, W) → (B, num_fg, D, H, W)
-        pred_flip_5d = rearrange(
-            pred_flip, 'b (c d) h w -> b c d h w', c=p.num_fg, d=D)
-        prob_flip = torch.sigmoid(pred_flip_5d.float())
-        prob_flip = torch.flip(prob_flip, flip_prob_dims)
-        total = total + prob_flip
-        count += 1.0
-    return total / count
+
+    def _post(pred: torch.Tensor) -> torch.Tensor:
+        # (B*g, num_fg*D, H, W) → (B*g, num_fg, D, H, W)
+        pred_5d = rearrange(
+            pred, 'b (c d) h w -> b c d h w', c=p.num_fg, d=D)
+        return torch.sigmoid(pred_5d.float())
+
+    return _flip_tta_batched(p, x_2d, base_prob, _FLIP_SPECS_2_5D, _post)
 
 
 # ---------------------------------------------------------------------------

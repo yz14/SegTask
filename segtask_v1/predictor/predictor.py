@@ -53,6 +53,8 @@ class Predictor:
         self.blend_mode = pc.blend_mode
         self.batch_size = pc.batch_size
         self.tta_flip = pc.tta_flip
+        # TTA flip 变体批量化块大小（None → 退化为 batch_size）；见 forwards._tta_chunk_size。
+        self.tta_batch_size: Optional[int] = getattr(pc, "tta_batch_size", None)
         self.threshold = pc.threshold
         self.save_probs = pc.save_probabilities
         # 逐卷滑窗进度日志开关（运行期内部量，不暴露到配置）：CLI 推理默认 True；
@@ -216,6 +218,11 @@ class Predictor:
         # 逐卷“首 batch 已记录”护孔。predict_volume 顶部重置，_forward_batch* 消费。
         self._diag_first_batch_logged: bool = True
 
+        # AdaBN per_volume 估计期标志：置 True 时 TTA 强制退回串行前向，避免把多个 flip
+        # 变体拼成一个大 batch 改变 BN 统计构成（BN 估计期处于 train 模式 + 累积平均，
+        # batch 构成会影响 running stats）。真实 eval 预测路径不受影响、仍走批量化。
+        self._adabn_estimating: bool = False
+
         # 约定：输出通道 ↔ label_values[1:]
         if len(self.label_values) - 1 != self.num_fg:
             raise ValueError(
@@ -305,10 +312,15 @@ class Predictor:
                 "[AdaBN] per_volume: re-estimating BN stats from this "
                 "volume before prediction.")
             self._diag_first_batch_logged = True
-            _adabn.estimate_bn_stats(
-                self._adabn_bn_modules,
-                lambda: self.predict_preprocessed_array(
-                    vol, z_spacing=z_spacing))
+            # 估计期强制 TTA 串行（见 self._adabn_estimating 注释）。
+            self._adabn_estimating = True
+            try:
+                _adabn.estimate_bn_stats(
+                    self._adabn_bn_modules,
+                    lambda: self.predict_preprocessed_array(
+                        vol, z_spacing=z_spacing))
+            finally:
+                self._adabn_estimating = False
 
         # 重置诊断护孔使 forward 路径发一次 logits/prob 统计块。
         self._diag_first_batch_logged = False
