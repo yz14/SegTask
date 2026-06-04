@@ -40,9 +40,10 @@ def whole_volume_forward(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     D_orig, H_orig, W_orig = vol.shape
     pD, pH, pW = p.patch_D, p.patch_H, p.patch_W
 
-    logger.info(
-        "Whole-volume inference: orig=(%d,%d,%d) → model=(%d,%d,%d)",
-        D_orig, H_orig, W_orig, pD, pH, pW)
+    if p.log_progress:
+        logger.info(
+            "Whole-volume inference: orig=(%d,%d,%d) → model=(%d,%d,%d)",
+            D_orig, H_orig, W_orig, pD, pH, pW)
 
     vol_resized = resize_3d(vol, pD, pH, pW, is_label=False)
     batch = torch.from_numpy(vol_resized[np.newaxis, np.newaxis]) \
@@ -73,10 +74,11 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     stride = max(1, int(pD * (1 - p.overlap)))
     z_positions = _blending.compute_1d_positions(D_orig, pD, stride)
 
-    logger.info(
-        "Z-axis sliding window: D_patch=%d, stride=%d, num_windows=%d, "
-        "scales=%s, blend=%s",
-        pD, stride, len(z_positions), p.multi_res_scales, p.blend_mode)
+    if p.log_progress:
+        logger.info(
+            "Z-axis sliding window: D_patch=%d, stride=%d, num_windows=%d, "
+            "scales=%s, blend=%s",
+            pD, stride, len(z_positions), p.multi_res_scales, p.blend_mode)
 
     # GPU 常驻：体积 + 累加器都在 GPU，F.interpolate 替代 scipy.ndimage.zoom；
     # 仅最后 blend 后的概率体返 host。
@@ -181,7 +183,8 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             window_inputs.clear()
             patch_metas.clear()
 
-            if (idx + 1) % max(1, 10 * p.batch_size) == 0 or is_last:
+            if p.log_progress and (
+                    (idx + 1) % max(1, 10 * p.batch_size) == 0 or is_last):
                 logger.info("  z-window %d/%d", idx + 1, n_windows)
 
     acc_weight.clamp_(min=1e-8)
@@ -209,28 +212,31 @@ def sliding_window_z_interleaved(p: "Predictor", vol: np.ndarray,
     """
     k = choose_interleave_factor(p, z_spacing)
     if k <= 1:
-        logger.info(
-            "z-interleave: z_spacing=%.4f mm → k=1 (no split); "
-            "falling through to standard 2.5D z-sliding window.",
-            z_spacing)
+        if p.log_progress:
+            logger.info(
+                "z-interleave: z_spacing=%.4f mm → k=1 (no split); "
+                "falling through to standard 2.5D z-sliding window.",
+                z_spacing)
         return sliding_window_z(p, vol)
 
     D, H, W = vol.shape
-    logger.info(
-        "z-interleave: z_spacing=%.4f mm → k=%d. Splitting volume "
-        "(D=%d) into %d disjoint stride-%d sub-streams; per-stream "
-        "depths=%s.",
-        z_spacing, k, D, k, k,
-        [int(np.ceil((D - i) / k)) for i in range(k)])
+    if p.log_progress:
+        logger.info(
+            "z-interleave: z_spacing=%.4f mm → k=%d. Splitting volume "
+            "(D=%d) into %d disjoint stride-%d sub-streams; per-stream "
+            "depths=%s.",
+            z_spacing, k, D, k, k,
+            [int(np.ceil((D - i) / k)) for i in range(k)])
 
     out = np.zeros((p.num_fg, D, H, W), dtype=np.float32)
     for i in range(k):
         # vol[i::k] 为 view；copy 以免下游 in-place 错误。
         sub_vol = np.ascontiguousarray(vol[i::k])
         sub_D = sub_vol.shape[0]
-        logger.info(
-            "  z-interleave stream %d/%d: indices=%d::%d, sub_D=%d",
-            i + 1, k, i, k, sub_D)
+        if p.log_progress:
+            logger.info(
+                "  z-interleave stream %d/%d: indices=%d::%d, sub_D=%d",
+                i + 1, k, i, k, sub_D)
         sub_prob = sliding_window_z(p, sub_vol)
         # 防御：sliding_window_z 须保证输出深度 == 输入深度。
         if sub_prob.shape != (p.num_fg, sub_D, H, W):
@@ -264,11 +270,12 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     pos_w = _blending.compute_1d_positions(W_orig, pW, stride_w)
 
     total_windows = len(pos_d) * len(pos_h) * len(pos_w)
-    logger.info(
-        "Cubic sliding window: patch=(%d,%d,%d), strides=(%d,%d,%d), "
-        "windows=%d×%d×%d=%d, blend=%s",
-        pD, pH, pW, stride_d, stride_h, stride_w,
-        len(pos_d), len(pos_h), len(pos_w), total_windows, p.blend_mode)
+    if p.log_progress:
+        logger.info(
+            "Cubic sliding window: patch=(%d,%d,%d), strides=(%d,%d,%d), "
+            "windows=%d×%d×%d=%d, blend=%s",
+            pD, pH, pW, stride_d, stride_h, stride_w,
+            len(pos_d), len(pos_h), len(pos_w), total_windows, p.blend_mode)
 
     weight_3d = _blending.build_3d_weight(pD, pH, pW, p.blend_mode)
 
@@ -314,8 +321,9 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             acc_weight[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw] += (
                 w_trim[np.newaxis])
         processed += len(patches)
-        if processed % max(1, 10 * p.batch_size) == 0 \
-                or processed == total_windows:
+        if p.log_progress and (
+                processed % max(1, 10 * p.batch_size) == 0
+                or processed == total_windows):
             logger.info("  cubic window %d/%d", processed, total_windows)
         patches.clear()
         coords.clear()

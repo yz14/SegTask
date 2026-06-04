@@ -55,6 +55,9 @@ class Predictor:
         self.tta_flip = pc.tta_flip
         self.threshold = pc.threshold
         self.save_probs = pc.save_probabilities
+        # 逐卷滑窗进度日志开关（运行期内部量，不暴露到配置）：CLI 推理默认 True；
+        # 训练内整卷验证（VolumeValEvaluator）会置 False 以免每 epoch 刷屏 81 卷。
+        self.log_progress = True
 
         # 2.5D z 交错推理：按 stride k 将体积拆为 k 个子流，各自走 _sliding_window_z，
         # 后以 out[:, i::k]=stream_i 缝回。k 由 z spacing 挑选（见 _choose_interleave_factor）。

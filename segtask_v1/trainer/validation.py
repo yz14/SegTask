@@ -292,6 +292,9 @@ class VolumeValEvaluator(ValEvaluator):
             from ..predictor import Predictor
             self._predictor = Predictor(
                 self.trainer.model, self.trainer.cfg, self.trainer.device)
+            # 整卷验证每 epoch 对全部 val 卷滑窗推理，逐卷滑窗进度日志在此关闭，
+            # 避免刷屏（CLI 推理仍默认开启）。
+            self._predictor.log_progress = False
         return self._predictor
 
     @torch.no_grad()
