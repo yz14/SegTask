@@ -75,6 +75,25 @@ class Predictor:
                 "thresholds=%s mm, factors=%s",
                 self.z_interleave_thresholds, self.z_interleave_factors)
 
+        # 测试时自适应 BatchNorm — per_volume 模式：每卷推理前用该卷自身重估 BN，
+        # 再冻结预测（transductive BN）。global 模式在 run_inference 中处理，与此无关。
+        self.adabn_enabled = bool(getattr(pc, "adabn_enabled", False))
+        self.adabn_mode = getattr(pc, "adabn_mode", "global")
+        self._adabn_bn_modules: List[torch.nn.Module] = []
+        if self.adabn_enabled and self.adabn_mode == "per_volume":
+            from .adabn import collect_bn_modules
+            self._adabn_bn_modules = collect_bn_modules(self.model)
+            if not self._adabn_bn_modules:
+                logger.warning(
+                    "[AdaBN] per_volume enabled but model has no BatchNorm "
+                    "layers (norm_type != 'batch'); per-volume adaptation "
+                    "will be a no-op.")
+            else:
+                logger.info(
+                    "[AdaBN] per_volume enabled: %d BatchNorm layer(s) will "
+                    "be re-estimated from each volume before its prediction.",
+                    len(self._adabn_bn_modules))
+
         self.patch_mode = cfg.data.patch_mode
         self.patch_D, self.patch_H, self.patch_W = cfg.data.patch_size
         self.label_values = cfg.data.label_values
@@ -277,6 +296,20 @@ class Predictor:
                 dc.normalize, float(dc.intensity_min), float(dc.intensity_max))
         except Exception as _e:
             logger.warning("[diag] normalized-input stat failed: %s", _e)
+        # AdaBN per_volume：用该卷自身先跑一遍前向重估 BN running stats，再冻结预测。
+        # 估计期暂时抑制 forward 诊断（置护孔为已记录），随后再重置以让真实预测发一次。
+        if (self.adabn_enabled and self.adabn_mode == "per_volume"
+                and self._adabn_bn_modules):
+            from . import adabn as _adabn
+            logger.info(
+                "[AdaBN] per_volume: re-estimating BN stats from this "
+                "volume before prediction.")
+            self._diag_first_batch_logged = True
+            _adabn.estimate_bn_stats(
+                self._adabn_bn_modules,
+                lambda: self.predict_preprocessed_array(
+                    vol, z_spacing=z_spacing))
+
         # 重置诊断护孔使 forward 路径发一次 logits/prob 统计块。
         self._diag_first_batch_logged = False
 

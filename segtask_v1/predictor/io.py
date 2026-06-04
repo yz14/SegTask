@@ -157,6 +157,45 @@ def run_inference(
 
     predictor = Predictor(model, cfg, device)
 
+    # 测试时自适应 BatchNorm — global 模式：推理前用少量目标域整卷重估 BN running
+    # stats，全程复用。per_volume 模式不在此处理（见 Predictor.predict_volume）。
+    if getattr(cfg.predict, "adabn_enabled", False) and \
+            getattr(cfg.predict, "adabn_mode", "global") == "global":
+        from .adabn import collect_bn_modules, estimate_bn_stats
+
+        bn_modules = collect_bn_modules(model)
+        if not bn_modules:
+            logger.warning(
+                "[AdaBN] global enabled but model has no BatchNorm layers "
+                "(norm_type != 'batch'); skipping — predictions unchanged.")
+        else:
+            n_warm = min(int(cfg.predict.adabn_num_volumes), len(image_paths))
+            warm_paths = image_paths[:n_warm]
+            if resolved_precision == "fp16":
+                logger.warning(
+                    "[AdaBN] running BN re-estimation under fp16 weights; "
+                    "stat accumulation precision is reduced — prefer "
+                    "'bf16'/'fp32' if results look unstable.")
+            logger.info(
+                "[AdaBN] global: re-estimating BN stats over %d BatchNorm "
+                "layer(s) from %d target volume(s) before inference ...",
+                len(bn_modules), n_warm)
+
+            def _warmup() -> None:
+                for j, wp in enumerate(warm_paths, 1):
+                    logger.info("[AdaBN] warmup [%d/%d]: %s", j, n_warm, wp)
+                    try:
+                        # 整卷预热（不裁 bbox / 不落盘），仅为驱动前向更新 BN 统计。
+                        predictor.predict_volume(wp, output_dir=None,
+                                                  bbox_path=None)
+                    except Exception as e:  # 单卷失败不应中断整体预热。
+                        logger.warning(
+                            "[AdaBN] warmup failed on %s: %s", wp, e)
+
+            estimate_bn_stats(bn_modules, _warmup)
+            logger.info(
+                "[AdaBN] global: BN running stats updated from target domain.")
+
     n = len(image_paths)
     for i, path in enumerate(image_paths, 1):
         bbox_path = bbox_paths[i - 1] if bbox_paths is not None else None

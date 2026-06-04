@@ -625,6 +625,18 @@ class PredictConfig:
     z_interleave_factors: List[int] = field(
         default_factory=lambda: [3, 2, 1])
 
+    # 测试时自适应 BatchNorm (AdaBN)：推理阶段用目标域前向重估 BN running stats，
+    # 无需标签、不重训，针对跨数据集域漂移导致的假阳。仅当 model.norm_type=='batch'
+    # 时有效（instance/group norm 为 no-op）。
+    adabn_enabled: bool = False
+
+    # 'global'    — 用 adabn_num_volumes 卷目标域整卷预热一次 BN 统计，全程复用。
+    # 'per_volume'— 每卷推理前用该卷自身重估 BN，再冻结预测（transductive BN）。
+    adabn_mode: str = "global"
+
+    # global 模式预热用的目标域整卷数；per_volume 模式忽略。
+    adabn_num_volumes: int = 8
+
 
 # ---------------------------------------------------------------------------
 # Top-level configuration
@@ -1038,6 +1050,20 @@ class Config:
                     "z_interleave_enabled=True with z_boundary_mode=%r: "
                     "short sub-streams will be stretched along z. Prefer 'edge_pad'.",
                     self.data.z_boundary_mode)
+        # 测试时自适应 BatchNorm 检查（仅启用时）。
+        if self.predict.adabn_enabled:
+            assert self.predict.adabn_mode in ("global", "per_volume"), (
+                f"predict.adabn_mode must be 'global' or 'per_volume'; "
+                f"got {self.predict.adabn_mode!r}.")
+            assert int(self.predict.adabn_num_volumes) >= 1, (
+                f"predict.adabn_num_volumes must be >= 1; "
+                f"got {self.predict.adabn_num_volumes}.")
+            # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
+            if getattr(self.model, "norm_type", None) != "batch":
+                logger.warning(
+                    "predict.adabn_enabled=True but model.norm_type=%r != "
+                    "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
+                    getattr(self.model, "norm_type", None))
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)

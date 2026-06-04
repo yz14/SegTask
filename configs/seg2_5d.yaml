@@ -284,8 +284,8 @@ train:
 # TTA 仅翻 H/W (D 是 channel 轴，翻转会破坏物理 slice 顺序)。
 predict:
   z_interleave_enabled: true
-  z_interleave_thresholds: [1.0, 1.5]   # 覆盖默认阈值/因子
-  z_interleave_factors: [3, 2, 1]
+  z_interleave_thresholds: [1.0, 1.5, 3]   # 覆盖默认阈值/因子
+  z_interleave_factors: [4, 3, 2, 1]
   z_overlap : 0.5
   blend_mode: "gaussian"          # 'gaussian' | 'constant'
   batch_size: 4
