@@ -97,7 +97,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
     keep_native_3d = (bool(getattr(dc, "keep_native_multi_res", False))
                       and pm in ("z_axis", "cubic") and n_views > 1)  # 3D多分辨率输入保持原尺寸（3D只能全部尺寸一致）
     aux_seg_active = (bool(getattr(mc, "aux_seg_supervision", False))
-                      and n_views > 1)
+                      and is_2_5d and n_views > 1)
 
     # ---- 通道 / 输出几何 -------------------------------------------------
     if is_2_5d and not lift:

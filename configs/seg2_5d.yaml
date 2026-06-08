@@ -293,7 +293,7 @@ predict:
   blend_mode: "gaussian"                   # 'gaussian' | 'constant'
   batch_size: 4
   tta_flip      : false
-  tta_batch_size: Optional[int] = None
+  tta_batch_size: 1
   threshold     : 0.5
   output_dir: ""
   save_probabilities: false
