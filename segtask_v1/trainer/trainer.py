@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from colorama import Fore, Style
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -297,8 +299,10 @@ class Trainer:
                     self.patience_counter = 0
                     self._save_checkpoint(epoch, is_best=True)
                     best_metrics = val_metrics
-                    logger.info("★ New best: %s=%.4f at epoch %d",
-                                tc.save_best_metric, tracked, epoch + 1)
+                    logger.info(
+                        "★ New best: %s=%.4f at epoch %d",
+                        tc.save_best_metric, tracked, epoch + 1,
+                        extra={"msg_color": Fore.YELLOW + Style.BRIGHT})
                 else:
                     self.patience_counter += 1
 

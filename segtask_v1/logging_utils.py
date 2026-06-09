@@ -111,10 +111,22 @@ class ColorFormatter(logging.Formatter):
         try:
             record.levelname = f"{level_color}{orig_levelname}{Style.RESET_ALL}"
             record.name = f"{module_color}{orig_name}{Style.RESET_ALL}"
-            return super().format(record)
+            s = super().format(record)
         finally:
             record.levelname = orig_levelname
             record.name = orig_name
+
+        # 支持通过 extra={"msg_color": ...} 给日志消息内容上色
+        msg_color = getattr(record, "msg_color", None)
+        if msg_color:
+            msg = getattr(record, "message", None)
+            if msg:
+                # 只替换最后一次出现，避免误伤头部相同文本
+                parts = s.rsplit(msg, 1)
+                if len(parts) == 2:
+                    colored_msg = f"{msg_color}{msg}{Style.RESET_ALL}"
+                    s = colored_msg.join(parts)
+        return s
 
 
 # ---------------------------------------------------------------------------
