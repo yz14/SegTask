@@ -52,7 +52,7 @@ def build_scheduler(
     elif tc.scheduler == "poly":
         return torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            lr_lambda=lambda step: (1 - step / horizon) ** tc.poly_power)
+            lr_lambda=lambda step: max(1 - step / horizon, 0.0) ** tc.poly_power)
     elif tc.scheduler == "step":
         milestones = list(range(
             tc.step_size * steps_per_epoch, horizon,
@@ -73,9 +73,13 @@ def build_scheduler(
     elif tc.scheduler == "one_cycle":
         # 自带 warmup（pct_start）；不可与外层 WarmupScheduler 叠加。
         total_steps = tc.epochs * steps_per_epoch
+        # pct_start 直接按 warmup_epochs/epochs 配比；下限保证 warmup 段
+        # 至少 1 个 step（OneCycleLR 要求两段均非空），上限留出退火段。
+        pct_start = tc.warmup_epochs / max(tc.epochs, 1)
+        pct_start = min(max(pct_start, 2.0 / max(total_steps, 4)), 0.9)
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=tc.lr, total_steps=total_steps,
-            pct_start=max(tc.warmup_epochs, 1) / max(tc.epochs, 1))
+            pct_start=pct_start)
     raise ValueError(f"Unknown scheduler: {tc.scheduler}")
 
 

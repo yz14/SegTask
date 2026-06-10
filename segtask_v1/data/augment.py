@@ -34,6 +34,12 @@ class GPUAugmentor:
         if not self.enabled:
             return image, label, weight_map
 
+        # 克隆输入，避免原地修改污染调用方持有的张量。
+        image = image.clone()
+        label = label.clone()
+        if weight_map is not None:
+            weight_map = weight_map.clone()
+
         c = self.cfg
 
         # Spatial: flip / affine / elastic / grid-dropout
@@ -336,7 +342,7 @@ def _gaussian_noise(
 
 def _gaussian_blur_3d(
     image: torch.Tensor, prob: float, sigma_range: list) -> torch.Tensor:
-    """批量可分离 3D 高斯模糊；同一调用共享 sigma。"""
+    """可分离 3D 高斯模糊；逐样本独立采样 sigma。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -344,35 +350,33 @@ def _gaussian_blur_3d(
     if not mask.any():
         return image
 
-    idx = mask.nonzero(as_tuple=True)[0]
-    sigma = float(torch.empty(1).uniform_(sigma_range[0], sigma_range[1]))
-    ks = max(int(2 * round(3 * sigma) + 1), 3)
-    x = torch.arange(ks, dtype=image.dtype, device=image.device) - ks // 2
-    k1d = torch.exp(-0.5 * (x / sigma) ** 2)
-    k1d = k1d / k1d.sum()
-    pad = ks // 2
+    for i in mask.nonzero(as_tuple=True)[0].tolist():
+        sigma = float(torch.empty(1).uniform_(sigma_range[0], sigma_range[1]))
+        ks = max(int(2 * round(3 * sigma) + 1), 3)
+        x = torch.arange(ks, dtype=image.dtype, device=image.device) - ks // 2
+        k1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        k1d = k1d / k1d.sum()
+        pad = ks // 2
 
-    # 将 (B,C) 折入 conv3d batch 轴，1D 核作用于每个 (样本, 通道) 切片。
-    sub = image[idx]
-    n, C = sub.shape[:2]
-    sub = rearrange(sub, 'n c d h w -> (n c) 1 d h w')
+        # 将通道折入 conv3d batch 轴，1D 核作用于每个通道切片。
+        sub = rearrange(image[i:i + 1], 'n c d h w -> (n c) 1 d h w')
 
-    for axis_pat, pad_arg in (
-        ('k -> 1 1 k 1 1', [0, 0, 0, 0, pad, pad]),
-        ('k -> 1 1 1 k 1', [0, 0, pad, pad, 0, 0]),
-        ('k -> 1 1 1 1 k', [pad, pad, 0, 0, 0, 0]),
-    ):
-        k = rearrange(k1d, axis_pat)
-        sub = F.pad(sub, pad_arg, mode="replicate")
-        sub = F.conv3d(sub, k)
+        for axis_pat, pad_arg in (
+            ('k -> 1 1 k 1 1', [0, 0, 0, 0, pad, pad]),
+            ('k -> 1 1 1 k 1', [0, 0, pad, pad, 0, 0]),
+            ('k -> 1 1 1 1 k', [pad, pad, 0, 0, 0, 0]),
+        ):
+            k = rearrange(k1d, axis_pat)
+            sub = F.pad(sub, pad_arg, mode="replicate")
+            sub = F.conv3d(sub, k)
 
-    image[idx] = rearrange(sub, '(n c) 1 d h w -> n c d h w', n=n, c=C)
+        image[i:i + 1] = rearrange(sub, '(n c) 1 d h w -> n c d h w', n=1)
     return image
 
 
 def _simulate_lowres(
     image: torch.Tensor, prob: float, zoom_range: list) -> torch.Tensor:
-    """trilinear 下采→上采模拟低分辨率；同一调用共享 zoom。"""
+    """trilinear 下采→上采模拟低分辨率；逐样本独立采样 zoom。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -380,15 +384,14 @@ def _simulate_lowres(
     if not mask.any():
         return image
     _, _, D, H, W = image.shape
-    z = float(torch.empty(1).uniform_(zoom_range[0], zoom_range[1]))
-    if z >= 0.99:
-        return image
-    idx = mask.nonzero(as_tuple=True)[0]
-    sub = image[idx]
-    small = F.interpolate(
-        sub,
-        size=(max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z))),
-        mode="trilinear", align_corners=False)
-    image[idx] = F.interpolate(
-        small, size=(D, H, W), mode="trilinear", align_corners=False)
+    for i in mask.nonzero(as_tuple=True)[0].tolist():
+        z = float(torch.empty(1).uniform_(zoom_range[0], zoom_range[1]))
+        if z >= 0.99:
+            continue
+        small = F.interpolate(
+            image[i:i + 1],
+            size=(max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z))),
+            mode="trilinear", align_corners=False)
+        image[i:i + 1] = F.interpolate(
+            small, size=(D, H, W), mode="trilinear", align_corners=False)
     return image
