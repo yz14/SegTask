@@ -7,10 +7,6 @@ R6 抽自 ``predictor.py``：
 * ``build_3d_weight`` —— 可分离 3D blending 权重（三轴外积）
 * ``prob_to_label`` —— 概率体 → 整数 label map（NaN-safe，自动选最小 dtype）
 
-``Predictor`` 上的 ``_compute_1d_positions`` / ``_build_1d_weight`` /
-``_build_3d_weight`` / ``_prob_to_label`` 仍以 staticmethod / method 形式存在
-（很多单元测试直接调用），但实现委托至此。
-
 零外部 SegTask 依赖；可独立单元测试。
 """
 

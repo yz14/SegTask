@@ -116,7 +116,8 @@ class BinaryDiceLoss(nn.Module):
         pred_prob = torch.sigmoid(pred)
         p = rearrange(pred_prob, 'b c ... -> b c (...)')
         t = rearrange(target,    'b c ... -> b c (...)')
-        p_den = p * p if self.squared else p  # 意义？
+        # squared=True 时分母用 p²（V-Net 原文变体），梯度对低置信预测更平缓。
+        p_den = p * p if self.squared else p
 
         sum_dims: Tuple[int, ...] = (0, 2) if self.batch_dice else (2,)
 

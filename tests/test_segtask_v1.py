@@ -537,8 +537,8 @@ class TestNewAugmentation:
 # ---------------------------------------------------------------------------
 class TestPredictor:
     def test_z_positions_coverage(self):
-        from segtask_v1.predictor import Predictor
-        positions = Predictor._compute_1d_positions(length=200, patch=64, stride=32)
+        from segtask_v1.predictor.blending import compute_1d_positions
+        positions = compute_1d_positions(length=200, patch=64, stride=32)
         # Should cover entire volume
         assert positions[0][0] == 0
         assert positions[-1][1] >= 200
@@ -547,46 +547,40 @@ class TestPredictor:
             assert positions[i + 1][0] < positions[i][1]  # overlap
 
     def test_z_positions_small_volume(self):
-        from segtask_v1.predictor import Predictor
-        positions = Predictor._compute_1d_positions(length=30, patch=64, stride=32)
+        from segtask_v1.predictor.blending import compute_1d_positions
+        positions = compute_1d_positions(length=30, patch=64, stride=32)
         # Small volume: single window covering [0, 30]
         assert len(positions) == 1
         assert positions[0] == (0, 30)
 
     def test_gaussian_blend_weight(self):
-        # `_build_z_weight` was renamed to `_build_1d_weight` (static) when
-        # weight construction was unified across z_axis and cubic modes.
-        from segtask_v1.predictor import Predictor
-        w = Predictor._build_1d_weight(64, mode="gaussian")
+        # `_build_z_weight` became `blending.build_1d_weight` when weight
+        # construction was unified across z_axis and cubic modes.
+        from segtask_v1.predictor.blending import build_1d_weight
+        w = build_1d_weight(64, mode="gaussian")
         assert w.shape == (64,)
         # Center should have highest weight
         assert w[32] > w[0]
         assert w[32] > w[63]
 
     def test_prob_to_label(self):
-        from segtask_v1.predictor import Predictor
-        p = Predictor.__new__(Predictor)
-        p.label_values = [0, 1, 2]
-        p.num_fg = 2  # required by `_prob_to_label` (added to Predictor state)
-        p.threshold = 0.5
+        from segtask_v1.predictor.blending import prob_to_label
         # Create probability volume: class 0 (label 1) = 0.8, class 1 (label 2) = 0.3
         prob = np.zeros((2, 4, 4, 4), dtype=np.float32)
         prob[0] = 0.8  # fg class 0 (label 1) is confident
         prob[1] = 0.3  # fg class 1 (label 2) is not
-        label_map = p._prob_to_label(prob)
+        label_map = prob_to_label(
+            prob, label_values=[0, 1, 2], num_fg=2, threshold=0.5)
         assert label_map.shape == (4, 4, 4)
         # Should all be label 1 (since class 0 has max prob > threshold)
         assert (label_map == 1).all()
 
     def test_prob_to_label_background(self):
-        from segtask_v1.predictor import Predictor
-        p = Predictor.__new__(Predictor)
-        p.label_values = [0, 1, 2]
-        p.num_fg = 2
-        p.threshold = 0.5
+        from segtask_v1.predictor.blending import prob_to_label
         # All probabilities below threshold → background
         prob = np.ones((2, 4, 4, 4), dtype=np.float32) * 0.1
-        label_map = p._prob_to_label(prob)
+        label_map = prob_to_label(
+            prob, label_values=[0, 1, 2], num_fg=2, threshold=0.5)
         assert (label_map == 0).all()
 
 
@@ -815,58 +809,52 @@ class TestCubicDataset:
 
     def test_predictor_build_z_window_input_single_res(self):
         """Single-res (`[1.0]`): (1, pD, pH, pW), legacy resize path."""
-        from segtask_v1.predictor import Predictor
-        p = Predictor.__new__(Predictor)
-        p.patch_D, p.patch_H, p.patch_W = 8, 16, 16
-        p.multi_res_scales = [1.0]
+        from segtask_v1.predictor.inputs import build_z_window_cpu_multi_res
+        kw = dict(pD=8, pH=16, pW=16, multi_res_scales=[1.0],
+                  z_boundary_mode="stretch")
         vol = np.arange(40 * 24 * 24, dtype=np.float32).reshape(40, 24, 24)
         # Normal window
-        out = p._build_z_window_input(vol, 10, 18)
+        out = build_z_window_cpu_multi_res(vol, 10, 18, **kw)
         assert out.shape == (1, 8, 16, 16)
         # Tail window (short)
-        out_tail = p._build_z_window_input(vol, 36, 40)
+        out_tail = build_z_window_cpu_multi_res(vol, 36, 40, **kw)
         assert out_tail.shape == (1, 8, 16, 16)
 
     def test_predictor_build_z_window_input_multi_res(self):
         """Multi-res: (C_res, pD, pH, pW); scale>1 uses edge-padded z extraction
         centered on window center, preserving physical z-FOV at boundaries."""
-        from segtask_v1.predictor import Predictor
-        p = Predictor.__new__(Predictor)
-        p.patch_D, p.patch_H, p.patch_W = 8, 16, 16
-        p.multi_res_scales = [1.0, 1.5, 2.0]
+        from segtask_v1.predictor.inputs import build_z_window_cpu_multi_res
+        kw = dict(pD=8, pH=16, pW=16, multi_res_scales=[1.0, 1.5, 2.0],
+                  z_boundary_mode="stretch")
         vol = np.random.rand(40, 24, 24).astype(np.float32)
 
         # Window fully inside volume
-        out = p._build_z_window_input(vol, 10, 18)
+        out = build_z_window_cpu_multi_res(vol, 10, 18, **kw)
         assert out.shape == (3, 8, 16, 16)
 
         # Window at top boundary — scale=2 needs D_s=16 slices centered at
         # z_center=(0+8)//2=4, so lo=-4, hi=12 → 4 slices of edge pad.
-        out_top = p._build_z_window_input(vol, 0, 8)
+        out_top = build_z_window_cpu_multi_res(vol, 0, 8, **kw)
         assert out_top.shape == (3, 8, 16, 16)
 
         # Window at bottom boundary — verify no exceptions.
-        out_bot = p._build_z_window_input(vol, 32, 40)
+        out_bot = build_z_window_cpu_multi_res(vol, 32, 40, **kw)
         assert out_bot.shape == (3, 8, 16, 16)
 
     def test_predictor_z_window_scale1_matches_legacy(self):
         """Channel 0 of multi-res output must be pixel-identical to the
         scale-1.0-only path for an interior window (where boundary padding
         doesn't enter the picture)."""
-        from segtask_v1.predictor import Predictor
+        from segtask_v1.predictor.inputs import build_z_window_cpu_multi_res
         np.random.seed(7)
         vol = np.random.rand(40, 24, 24).astype(np.float32)
 
-        p_single = Predictor.__new__(Predictor)
-        p_single.patch_D, p_single.patch_H, p_single.patch_W = 8, 16, 16
-        p_single.multi_res_scales = [1.0]
-
-        p_multi = Predictor.__new__(Predictor)
-        p_multi.patch_D, p_multi.patch_H, p_multi.patch_W = 8, 16, 16
-        p_multi.multi_res_scales = [1.0, 1.5, 2.0]
-
-        out_single = p_single._build_z_window_input(vol, 12, 20)
-        out_multi  = p_multi._build_z_window_input(vol, 12, 20)
+        out_single = build_z_window_cpu_multi_res(
+            vol, 12, 20, pD=8, pH=16, pW=16,
+            multi_res_scales=[1.0], z_boundary_mode="stretch")
+        out_multi = build_z_window_cpu_multi_res(
+            vol, 12, 20, pD=8, pH=16, pW=16,
+            multi_res_scales=[1.0, 1.5, 2.0], z_boundary_mode="stretch")
         np.testing.assert_allclose(out_multi[0], out_single[0], rtol=0, atol=0)
 
     def test_whole_dataset_shape(self):
@@ -999,8 +987,8 @@ class TestCubicDataset:
 # ---------------------------------------------------------------------------
 class TestCubicPredictor:
     def test_3d_weight_gaussian(self):
-        from segtask_v1.predictor import Predictor
-        w = Predictor._build_3d_weight(16, 16, 16, "gaussian")
+        from segtask_v1.predictor.blending import build_3d_weight
+        w = build_3d_weight(16, 16, 16, "gaussian")
         assert w.shape == (16, 16, 16)
         # Center should have highest weight
         assert w[8, 8, 8] > w[0, 0, 0]
@@ -1009,14 +997,14 @@ class TestCubicPredictor:
         assert abs(w[0, 8, 8] - w[15, 8, 8]) < 1e-10
 
     def test_3d_weight_average(self):
-        from segtask_v1.predictor import Predictor
-        w = Predictor._build_3d_weight(8, 8, 8, "average")
+        from segtask_v1.predictor.blending import build_3d_weight
+        w = build_3d_weight(8, 8, 8, "average")
         assert w.shape == (8, 8, 8)
         assert (w == 1.0).all()
 
     def test_1d_positions_coverage(self):
-        from segtask_v1.predictor import Predictor
-        pos = Predictor._compute_1d_positions(200, 64, 32)
+        from segtask_v1.predictor.blending import compute_1d_positions
+        pos = compute_1d_positions(200, 64, 32)
         assert pos[0][0] == 0
         assert pos[-1][1] >= 200
         # No gaps
@@ -1024,8 +1012,8 @@ class TestCubicPredictor:
             assert pos[i + 1][0] < pos[i][1]
 
     def test_1d_positions_small(self):
-        from segtask_v1.predictor import Predictor
-        pos = Predictor._compute_1d_positions(30, 64, 32)
+        from segtask_v1.predictor.blending import compute_1d_positions
+        pos = compute_1d_positions(30, 64, 32)
         assert len(pos) == 1
         assert pos[0] == (0, 30)
 

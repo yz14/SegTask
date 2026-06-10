@@ -12,6 +12,22 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+class ConfigError(AssertionError, ValueError):
+    """配置校验错误。
+
+    同时继承 AssertionError（历史上 validate() 用裸 assert，调用方/测试捕
+    AssertionError）与 ValueError（语义上是非法输入），保证向后兼容的同时
+    不再依赖 assert 语句（``python -O`` 下不会被剥除）。新代码应捕
+    ConfigError 或 ValueError。
+    """
+
+
+def _require(cond: bool, msg: str) -> None:
+    """运行时配置校验：条件不成立时抛 ConfigError。"""
+    if not cond:
+        raise ConfigError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Data configuration
 # ---------------------------------------------------------------------------
@@ -152,7 +168,8 @@ class AugConfig:
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
 
-    # weight_map 插值模式："nearest" 保持离散权重（默认）；"bilinear" 仅在连续手标 wmap 时用。  TODO 连续手标 wmap 时也要用nearest
+    # weight_map 插值模式："nearest" 保持离散权重（默认，含连续手标 wmap）；
+    # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
     wmap_interp_mode: str = "nearest"
 
 
@@ -762,101 +779,155 @@ class Config:
             mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
 
     def validate(self) -> None:
-        """校验配置一致性。仅 arch=='unet' 时校验 backbone/block/norm 等旧字段。"""
+        """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。"""
+        self._validate_model()
+        self._validate_augment()
+        self._validate_loss()
+        self._validate_data()
+        self._validate_2_5d()
+        self._validate_train()
+        self._validate_predict()
+        if self.data.num_classes < 2:
+            logger.warning("num_classes=%d < 2, will auto-detect from data.",
+                           self.data.num_classes)
+
+    def _validate_model(self) -> None:
+        """model.* 架构选项与逐级拓扑长度校验。"""
         arch = str(getattr(self.model, "arch", "unet")).lower()
-        assert arch in ("unet", "adm", "edm2"), (
+        _require(
+            arch in ("unet", "adm", "edm2"),
             f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
         if arch == "unet":
-            assert self.model.backbone in ("resnet", "convnext"), \
-                f"Invalid backbone: {self.model.backbone}"
-            assert self.model.norm_type in ("batch", "instance", "group"), \
-                f"Invalid norm: {self.model.norm_type}"
-            assert self.model.activation in (
+            _require(
+                self.model.backbone in ("resnet", "convnext"),
+                f"Invalid backbone: {self.model.backbone}")
+            _require(
+                self.model.norm_type in ("batch", "instance", "group"),
+                f"Invalid norm: {self.model.norm_type}")
+            _require(
+                self.model.activation in (
                 "relu", "leakyrelu", "gelu", "swish",
-            ), f"Invalid activation: {self.model.activation}"
-            assert self.model.downsample_mode in (
+            ),
+                f"Invalid activation: {self.model.activation}")
+            _require(
+                self.model.downsample_mode in (
                 "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
-            ), f"Invalid downsample_mode: {self.model.downsample_mode}"
-            assert self.model.upsample_mode in (
+            ),
+                f"Invalid downsample_mode: {self.model.downsample_mode}")
+            _require(
+                self.model.upsample_mode in (
                 "transpose", "trilinear", "nearest", "pixelshuffle",
                 "carafe", "dysample",
-            ), f"Invalid upsample_mode: {self.model.upsample_mode}"
-            assert self.model.skip_mode in ("cat", "add"), \
-                f"Invalid skip_mode: {self.model.skip_mode}"
+            ),
+                f"Invalid upsample_mode: {self.model.upsample_mode}")
+            _require(
+                self.model.skip_mode in ("cat", "add"),
+                f"Invalid skip_mode: {self.model.skip_mode}")
         else:
             # ADM / EDM2 仅支持 2.5D + Plan A（shared_stem / multi_stem_proj）。
-            assert self.data.patch_mode == "2_5d", (
+            _require(
+                self.data.patch_mode == "2_5d",
                 f"model.arch={arch!r} requires data.patch_mode='2_5d'; got {self.data.patch_mode!r}.")
-            assert self.model.stem_fusion_mode in (
+            _require(
+                self.model.stem_fusion_mode in (
                 "shared_stem", "multi_stem_proj",
-            ), (
+            ),
                 f"model.arch={arch!r} only supports stem_fusion_mode in "
                 f"('shared_stem','multi_stem_proj'); got {self.model.stem_fusion_mode!r}.")
-        assert self.model.spatial_dims in (2, 3), \
-            f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)"
-        assert self.augment.wmap_interp_mode in ("nearest", "bilinear"), (
-            f"Invalid augment.wmap_interp_mode: {self.augment.wmap_interp_mode!r} "
-            "(expected 'nearest' or 'bilinear').")
+        _require(
+            self.model.spatial_dims in (2, 3),
+            f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)")
         # 下面三项适用于所有 arch（ADM/EDM2 也读取）。
-        assert self.model.stem_mode in (
+        _require(
+            self.model.stem_mode in (
             "conv3", "conv7", "dual", "patch2", "patch4",
-        ), f"Invalid stem_mode: {self.model.stem_mode}"
-        assert self.model.stem_fusion_mode in (
+        ),
+            f"Invalid stem_mode: {self.model.stem_mode}")
+        _require(
+            self.model.stem_fusion_mode in (
             "shared_stem", "multi_stem_proj", "hierarchical",
-        ), f"Invalid stem_fusion_mode: {self.model.stem_fusion_mode!r}"
-        assert getattr(self.model, "aux_head_mode", "linear") in (
+        ),
+            f"Invalid stem_fusion_mode: {self.model.stem_fusion_mode!r}")
+        _require(
+            getattr(self.model, "aux_head_mode", "linear") in (
             "linear", "conv",
-        ), f"Invalid aux_head_mode: {self.model.aux_head_mode!r}"
+        ),
+            f"Invalid aux_head_mode: {self.model.aux_head_mode!r}")
         # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
-            assert self.model.attention_type in (
+            _require(
+                self.model.attention_type in (
                 "none", "se", "eca", "cbam", "coord",
-            ), f"Invalid attention_type: {self.model.attention_type}"
-            assert self.model.decoder_type in ("unet", "unetpp", "unet3p"), \
-                f"Invalid decoder_type: {self.model.decoder_type}"
-            assert self.model.unet3p_cat_channels > 0, \
-                "unet3p_cat_channels must be > 0"
-            assert self.model.block_type in (
-                "basic", "preact", "bottleneck", "r2plus1d"), \
-                f"Invalid block_type: {self.model.block_type}"
+            ),
+                f"Invalid attention_type: {self.model.attention_type}")
+            _require(
+                self.model.decoder_type in ("unet", "unetpp", "unet3p"),
+                f"Invalid decoder_type: {self.model.decoder_type}")
+            _require(
+                self.model.unet3p_cat_channels > 0,
+                "unet3p_cat_channels must be > 0")
+            _require(
+                self.model.block_type in (
+                "basic", "preact", "bottleneck", "r2plus1d"),
+                f"Invalid block_type: {self.model.block_type}")
             # r2plus1d 需 D 为真空间轴；2.5D 下 D 在通道轴，拒绝。
             if self.model.block_type == "r2plus1d":
-                assert self.model.spatial_dims == 3, (
+                _require(
+                    self.model.spatial_dims == 3,
                     "model.block_type='r2plus1d' requires spatial_dims=3; "
                     "incompatible with 2.5D (D folded into channel axis). "
                     "Use patch_mode='z_axis' for Plan A on z-slab data.")
-            assert self.model.resenc_preset in ("none", "S", "M", "L", "XL"), \
-                f"Invalid resenc_preset: {self.model.resenc_preset}"
+            _require(
+                self.model.resenc_preset in ("none", "S", "M", "L", "XL"),
+                f"Invalid resenc_preset: {self.model.resenc_preset}")
         # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage
         dbps = self.model.decoder_blocks_per_stage
         if ebps:
-            assert len(ebps) == n_levels, (
+            _require(
+                len(ebps) == n_levels,
                 f"encoder_blocks_per_stage must have {n_levels} entries "
                 f"(= len(encoder_channels)); got {len(ebps)}")
-            assert all(b >= 1 for b in ebps), \
-                "encoder_blocks_per_stage entries must all be >= 1"
+            _require(
+                all(b >= 1 for b in ebps),
+                "encoder_blocks_per_stage entries must all be >= 1")
         if dbps:
-            assert len(dbps) == n_levels - 1, (
+            _require(
+                len(dbps) == n_levels - 1,
                 f"decoder_blocks_per_stage must have {n_levels - 1} entries "
                 f"(= len(encoder_channels) - 1); got {len(dbps)}")
-            assert all(b >= 1 for b in dbps), \
-                "decoder_blocks_per_stage entries must all be >= 1"
+            _require(
+                all(b >= 1 for b in dbps),
+                "decoder_blocks_per_stage entries must all be >= 1")
         # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
         sds = self.model.downsample_strides
         if sds:
             sd_dim = int(self.model.spatial_dims)
-            assert len(sds) == n_levels - 1, (
+            _require(
+                len(sds) == n_levels - 1,
                 f"downsample_strides must have {n_levels - 1} entries "
                 f"(= len(encoder_channels) - 1); got {len(sds)}")
             for s in sds:
-                assert len(s) == sd_dim, (
+                _require(
+                    len(s) == sd_dim,
                     f"each downsample_strides entry must have "
                     f"spatial_dims={sd_dim} values; got {list(s)}")
-                assert all(int(v) in (1, 2) for v in s), (
+                _require(
+                    all(int(v) in (1, 2) for v in s),
                     f"downsample_strides values must be 1 or 2; got {list(s)}")
-        assert self.loss.name in (
+
+    def _validate_augment(self) -> None:
+        """augment.* 校验。"""
+        _require(
+            self.augment.wmap_interp_mode in ("nearest", "bilinear"),
+            f"Invalid augment.wmap_interp_mode: {self.augment.wmap_interp_mode!r} "
+            "(expected 'nearest' or 'bilinear').")
+
+    def _validate_loss(self) -> None:
+        """loss.* 名称与参数校验。"""
+        _require(
+            self.loss.name in (
             # 单损失
             "dice", "bce", "focal", "tversky",
             "gdl", "focal_tversky", "lovasz", "cldice",
@@ -865,114 +936,151 @@ class Config:
             "focal_plus_tversky", "dice_cldice", "dice_focal_tversky",
             "dice_lovasz", "bce_lovasz",
             "gdl_bce", "gdl_focal",
-        ), f"Invalid loss: {self.loss.name}"
-        assert self.loss.gdl_weight_type in ("square", "simple", "uniform"), (
+        ),
+            f"Invalid loss: {self.loss.name}")
+        _require(
+            self.loss.gdl_weight_type in ("square", "simple", "uniform"),
             f"Invalid gdl_weight_type: {self.loss.gdl_weight_type}")
-        assert self.loss.focal_tversky_gamma > 0, (
+        _require(
+            self.loss.focal_tversky_gamma > 0,
             f"focal_tversky_gamma must be > 0, got {self.loss.focal_tversky_gamma}")
-        assert self.loss.cldice_iter >= 1, (
+        _require(
+            self.loss.cldice_iter >= 1,
             f"cldice_iter must be >= 1, got {self.loss.cldice_iter}")
-        assert self.loss.slice_loss_reduction in ("per_slice", "per_volume"), (
+        _require(
+            self.loss.slice_loss_reduction in ("per_slice", "per_volume"),
             f"Invalid slice_loss_reduction: {self.loss.slice_loss_reduction!r}; "
             "expected 'per_slice' or 'per_volume'.")
-        assert self.train.optimizer in ("adam", "adamw", "sgd"), \
-            f"Invalid optimizer: {self.train.optimizer}"
-        assert self.train.scheduler in (
-            "cosine", "cosine_warm_restarts", "poly", "step", "plateau", "one_cycle",
-        ), f"Invalid scheduler: {self.train.scheduler}"
-        assert len(self.data.patch_size) == 3, \
-            "patch_size must be [D, H, W]"
-        assert self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"), \
-            f"Invalid patch_mode: {self.data.patch_mode}"
-        assert self.data.z_boundary_mode in ("stretch", "edge_pad"), (
+
+    def _validate_data(self) -> None:
+        """data.* patch/multi-res/keep_native 校验。"""
+        _require(
+            len(self.data.patch_size) == 3,
+            "patch_size must be [D, H, W]")
+        _require(
+            self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"),
+            f"Invalid patch_mode: {self.data.patch_mode}")
+        _require(
+            self.data.z_boundary_mode in ("stretch", "edge_pad"),
             f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
             "expected 'stretch' or 'edge_pad'.")
         if self.data.patch_mode == "whole":
             # whole 模式下多分辨率无物理意义。
-            assert len(self.data.multi_res_scales) == 1 \
-                and self.data.multi_res_scales[0] == 1.0, (
+            _require(
+                len(self.data.multi_res_scales) == 1 \
+                and self.data.multi_res_scales[0] == 1.0,
                 f"whole-volume mode requires multi_res_scales=[1.0]; got {self.data.multi_res_scales}.")
         # keep_native_view_depth：仅 2.5D + 多视图有意义。
         if self.data.keep_native_view_depth:
-            assert self.data.patch_mode == "2_5d", (
+            _require(
+                self.data.patch_mode == "2_5d",
                 f"data.keep_native_view_depth=True requires patch_mode='2_5d'; got {self.data.patch_mode!r}.")
-            assert len(self.data.multi_res_scales) > 1, (
+            _require(
+                len(self.data.multi_res_scales) > 1,
                 "data.keep_native_view_depth=True requires len(multi_res_scales) > 1; "
                 f"got {self.data.multi_res_scales}.")
 
         # keep_native_multi_res：keep_native_view_depth 的 3D 对应，dataset 发单 cube 后由 trainer 逐视图几何处理。
         if self.data.keep_native_multi_res:
-            assert self.data.patch_mode in ("z_axis", "cubic"), (
+            _require(
+                self.data.patch_mode in ("z_axis", "cubic"),
                 "data.keep_native_multi_res=True requires patch_mode in "
                 f"('z_axis','cubic'); got {self.data.patch_mode!r}. Use "
                 "data.keep_native_view_depth for the 2.5D analogue.")
-            assert len(self.data.multi_res_scales) > 1, (
+            _require(
+                len(self.data.multi_res_scales) > 1,
                 "data.keep_native_multi_res=True requires len(multi_res_scales) > 1; "
                 f"got {self.data.multi_res_scales}.")
-            assert float(self.data.multi_res_scales[0]) == 1.0, (
+            _require(
+                float(self.data.multi_res_scales[0]) == 1.0,
                 "data.keep_native_multi_res=True requires multi_res_scales[0]==1.0; "
                 f"got {self.data.multi_res_scales}.")
-            assert not self.data.keep_native_view_depth, (
+            _require(
+                not self.data.keep_native_view_depth,
                 "keep_native_multi_res and keep_native_view_depth are mutually exclusive (3D vs 2.5D analogues).")
             if self.data.patch_mode == "z_axis":
-                assert self.data.z_boundary_mode == "edge_pad", (
+                _require(
+                    self.data.z_boundary_mode == "edge_pad",
                     "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
                     f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
 
+        _require(
+            self.data.aug_oversample_ratio >= 1.0,
+            "aug_oversample_ratio must be >= 1.0")
+        _require(
+            len(self.data.multi_res_scales) >= 1,
+            "multi_res_scales must have at least one scale (e.g. [1.0])")
+        _require(
+            all(s >= 1.0 for s in self.data.multi_res_scales),
+            "All multi_res_scales must be >= 1.0")
+
+    def _validate_2_5d(self) -> None:
+        """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。"""
         if self.data.patch_mode == "2_5d":
             # 2.5D 不变式重检（防手改后陈旧配置）。
-            assert len(self.data.multi_res_scales) >= 1, (
+            _require(
+                len(self.data.multi_res_scales) >= 1,
                 "2.5D mode requires at least one entry in multi_res_scales.")
-            assert self.data.multi_res_scales[0] == 1.0, (
+            _require(
+                self.data.multi_res_scales[0] == 1.0,
                 "2.5D mode requires multi_res_scales[0]==1.0 (view 0 = prediction target); "
                 f"got {self.data.multi_res_scales}.")
             n_views = len(self.data.multi_res_scales)
             lift = bool(getattr(self.model, "lift_2_5d_to_3d", False))
             if lift:
                 # lift：D 保留为空间轴（真 3D UNet），与折叠-D 布局互斥。
-                assert self.model.spatial_dims == 3, (
+                _require(
+                    self.model.spatial_dims == 3,
                     "lift_2_5d_to_3d=True requires model.spatial_dims=3 (auto-set by sync()).")
-                assert self.model.in_channels == n_views, (
+                _require(
+                    self.model.in_channels == n_views,
                     f"lift_2_5d_to_3d=True requires in_channels == n_views ({n_views}); "
                     f"got {self.model.in_channels}.")
-                assert not self.data.keep_native_view_depth, (
+                _require(
+                    not self.data.keep_native_view_depth,
                     "lift_2_5d_to_3d and keep_native_view_depth are mutually exclusive.")
                 # 几何约束：D 需 % 2**(n_levels-1) == 0，且 >= 2**(n_levels-1)。
                 n_levels = len(self.model.encoder_channels)
                 D = int(self.data.patch_size[0])
                 req = 1 << (n_levels - 1)
                 if D < req or D % req != 0:
-                    raise AssertionError(
+                    raise ConfigError(
                         f"lift_2_5d_to_3d=True with {n_levels} encoder stages requires "
                         f"patch_size[0] (D={D}) divisible by 2**(n_levels-1)={req}. "
                         f"Increase D to a multiple of {req}, or reduce len(encoder_channels).")
             else:
-                assert self.model.spatial_dims == 2, (
+                _require(
+                    self.model.spatial_dims == 2,
                     "2.5D mode requires model.spatial_dims=2 (auto-set by sync()). "
                     "For Plan A 3D lift, set model.lift_2_5d_to_3d=True.")
             if (not lift) and self.data.keep_native_view_depth and n_views > 1:
                 depths = self.per_view_depths
                 expected_in = int(sum(depths))
-                assert self.model.in_channels == expected_in, (
+                _require(
+                    self.model.in_channels == expected_in,
                     f"2.5D + keep_native_view_depth=True requires in_channels == sum(D_k) = "
                     f"sum({depths}) = {expected_in}; got {self.model.in_channels}.")
-                assert self.data.z_boundary_mode == "edge_pad", (
+                _require(
+                    self.data.z_boundary_mode == "edge_pad",
                     f"keep_native_view_depth=True requires z_boundary_mode='edge_pad'; "
                     f"got {self.data.z_boundary_mode!r}.")
                 # 辅视图提供额外输入却无监督信号不合理。
-                assert getattr(self.model, "aux_seg_supervision", False), (
+                _require(
+                    getattr(self.model, "aux_seg_supervision", False),
                     "keep_native_view_depth=True requires model.aux_seg_supervision=True "
                     "(each native-depth view k drives an aux head).")
             elif not lift:
                 expected_in = int(self.data.patch_size[0]) * n_views
-                assert self.model.in_channels == expected_in, (
+                _require(
+                    self.model.in_channels == expected_in,
                     f"2.5D requires in_channels == patch_size[0] * n_views = "
                     f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
                     f"got {self.model.in_channels}.")
             # Plan C：aux view k 注入 encoder 第 k 级。
             if self.model.stem_fusion_mode == "hierarchical" and n_views > 1:
                 n_stages = len(self.model.encoder_channels)
-                assert n_views <= n_stages, (
+                _require(
+                    n_views <= n_stages,
                     f"stem_fusion_mode='hierarchical' requires n_views <= n_stages; "
                     f"got n_views={n_views}, n_stages={n_stages}.")
                 stem_stride_map = {
@@ -982,43 +1090,55 @@ class Config:
                 s0 = stem_stride_map[self.model.stem_mode]
                 deepest = s0 * (2 ** (n_views - 1))
                 pH, pW = int(self.data.patch_size[1]), int(self.data.patch_size[2])
-                assert pH % deepest == 0 and pW % deepest == 0, (
+                _require(
+                    pH % deepest == 0 and pW % deepest == 0,
                     f"hierarchical fusion with n_views={n_views}, stem_mode={self.model.stem_mode!r} "
                     f"requires patch H/W divisible by {deepest}; got ({pH}, {pW}).")
             # aux 监督：仅在 n_views > 1 时有意义。
             if getattr(self.model, "aux_seg_supervision", False):
-                assert n_views > 1, (
+                _require(
+                    n_views > 1,
                     "aux_seg_supervision=True requires n_views > 1; got 1.")
                 aw = list(getattr(self.loss, "aux_supervision_weights", []))
                 if aw:
-                    assert len(aw) == n_views - 1, (
+                    _require(
+                        len(aw) == n_views - 1,
                         f"aux_supervision_weights length must = n_views-1 ({n_views-1}); got {aw}.")
-                    assert all(w >= 0 for w in aw), (
+                    _require(
+                        all(w >= 0 for w in aw),
                         f"aux_supervision_weights must be non-negative; got {aw}.")
                 # Plan C 需 n_views < n_levels，使每 aux 头走不同 decoder 特征。
                 if self.model.stem_fusion_mode == "hierarchical":
                     n_levels = len(self.model.encoder_channels)
-                    assert n_views < n_levels, (
+                    _require(
+                        n_views < n_levels,
                         f"aux_seg_supervision + hierarchical requires n_views < n_levels; "
                         f"got n_views={n_views}, n_levels={n_levels}.")
-        assert self.data.aug_oversample_ratio >= 1.0, \
-            "aug_oversample_ratio must be >= 1.0"
-        assert len(self.data.multi_res_scales) >= 1, \
-            "multi_res_scales must have at least one scale (e.g. [1.0])"
-        assert all(s >= 1.0 for s in self.data.multi_res_scales), \
-            "All multi_res_scales must be >= 1.0"
+
+    def _validate_train(self) -> None:
+        """train.* 优化器/调度器/选模标准校验。"""
+        _require(
+            self.train.optimizer in ("adam", "adamw", "sgd"),
+            f"Invalid optimizer: {self.train.optimizer}")
+        _require(
+            self.train.scheduler in (
+            "cosine", "cosine_warm_restarts", "poly", "step", "plateau", "one_cycle",
+        ),
+            f"Invalid scheduler: {self.train.scheduler}")
         # save_best_mode/metric 现为 criterion 的派生只读量（恒合法），无需单独校验。
-        assert _norm_crit(self.train.save_best_criterion) in _CRITERION_TO_METRIC, (
+        _require(
+            _norm_crit(self.train.save_best_criterion) in _CRITERION_TO_METRIC,
             f"Invalid save_best_criterion: {self.train.save_best_criterion!r}; "
             f"expected one of: {' | '.join(repr(c) for c in _CRITERION_TO_METRIC)}.")
-        assert str(self.train.val_metric_mode).lower().strip() in ("medium", "high"), (
+        _require(
+            str(self.train.val_metric_mode).lower().strip() in ("medium", "high"),
             f"Invalid val_metric_mode: {self.train.val_metric_mode!r}; "
             "expected 'medium' (patch-level) or 'high' (full-volume).")
         # high 模式在整卷 blended 概率上算指标，无可逆 logits 故不产出 val_loss；
         # 因此 'loss' criterion 与 high 互斥（否则永远选不出 best）。改用重叠类指标。
         if (str(self.train.val_metric_mode).lower().strip() == "high"
                 and _norm_crit(self.train.save_best_criterion) == "loss"):
-            raise AssertionError(
+            raise ConfigError(
                 "train.save_best_criterion='loss' is incompatible with "
                 "train.val_metric_mode='high' (full-volume inference produces "
                 "blended probabilities, not invertible logits, so no val_loss "
@@ -1028,29 +1148,40 @@ class Config:
         # save_best_preset 空串 = 不启用；非空必须是已知预设名。
         preset = str(self.train.save_best_preset or "").strip().lower()
         if preset:
-            assert preset in _SAVE_BEST_PRESETS, (
+            _require(
+                preset in _SAVE_BEST_PRESETS,
                 f"Invalid save_best_preset: {self.train.save_best_preset!r}; "
                 f"expected '' (disabled) or one of: "
                 f"{' | '.join(repr(k) for k in _SAVE_BEST_PRESETS)}.")
-        assert int(self.train.surface_dice_tolerance) >= 0, \
-            f"surface_dice_tolerance must be >= 0; got {self.train.surface_dice_tolerance}"
-        assert 0.0 <= float(self.train.surface_dice_weight) <= 1.0, \
-            f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}"
+        _require(
+            int(self.train.surface_dice_tolerance) >= 0,
+            f"surface_dice_tolerance must be >= 0; got {self.train.surface_dice_tolerance}")
+        _require(
+            0.0 <= float(self.train.surface_dice_weight) <= 1.0,
+            f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}")
+
+    def _validate_predict(self) -> None:
+        """predict.* z 交错与 AdaBN 校验。"""
         # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
-            assert self.data.patch_mode == "2_5d", (
+            _require(
+                self.data.patch_mode == "2_5d",
                 f"predict.z_interleave_enabled=True requires patch_mode='2_5d'; "
                 f"got {self.data.patch_mode!r}.")
             thr = self.predict.z_interleave_thresholds
             fac = self.predict.z_interleave_factors
-            assert len(fac) == len(thr) + 1, (
+            _require(
+                len(fac) == len(thr) + 1,
                 f"z_interleave_factors length must = len(thresholds)+1; "
                 f"got thresholds={thr}, factors={fac}.")
-            assert all(t > 0 for t in thr), (
+            _require(
+                all(t > 0 for t in thr),
                 f"z_interleave_thresholds must all > 0; got {thr}.")
-            assert thr == sorted(thr), (
+            _require(
+                thr == sorted(thr),
                 f"z_interleave_thresholds must be ascending; got {thr}.")
-            assert all(int(f) >= 1 for f in fac), (
+            _require(
+                all(int(f) >= 1 for f in fac),
                 f"z_interleave_factors must all >= 1; got {fac}.")
             # stretch 会拉伸短子流、冲淡交错收益，仅警告。
             if self.data.z_boundary_mode != "edge_pad":
@@ -1060,10 +1191,12 @@ class Config:
                     self.data.z_boundary_mode)
         # 测试时自适应 BatchNorm 检查（仅启用时）。
         if self.predict.adabn_enabled:
-            assert self.predict.adabn_mode in ("global", "per_volume"), (
+            _require(
+                self.predict.adabn_mode in ("global", "per_volume"),
                 f"predict.adabn_mode must be 'global' or 'per_volume'; "
                 f"got {self.predict.adabn_mode!r}.")
-            assert int(self.predict.adabn_num_volumes) >= 1, (
+            _require(
+                int(self.predict.adabn_num_volumes) >= 1,
                 f"predict.adabn_num_volumes must be >= 1; "
                 f"got {self.predict.adabn_num_volumes}.")
             # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
@@ -1072,9 +1205,7 @@ class Config:
                     "predict.adabn_enabled=True but model.norm_type=%r != "
                     "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
                     getattr(self.model, "norm_type", None))
-        if self.data.num_classes < 2:
-            logger.warning("num_classes=%d < 2, will auto-detect from data.",
-                           self.data.num_classes)
+
 
     @property
     def num_fg_classes(self) -> int:

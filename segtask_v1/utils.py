@@ -166,7 +166,7 @@ def dice_batch_stats(
     target: torch.Tensor,
     threshold: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
-    """逐类汇汇 batch 级混淆量，供 nnU-Net 风格 pooled 指标（Σ分子/Σ分母）。
+    """逐类汇总 batch 级混淆量，供 nnU-Net 风格 pooled 指标（Σ分子/Σ分母）。
 
     返回（每键为长度 C 的张量，``voxels`` 为标量）：
       * ``inter``     = ΣTP                （= Σ(p·t)）
@@ -267,9 +267,8 @@ def harmonic_mean_metrics(values: List[torch.Tensor], smooth: float = 1e-5) -> t
     if not values:
         return torch.zeros((), dtype=torch.float32)
     stacked = torch.stack([v.float().clamp(min=0.0, max=1.0) for v in values])
-    n = float(stacked.numel())
     inv_mean = (1.0 / (stacked + smooth)).mean()
-    return (1.0 / inv_mean).clamp(min=0.0, max=1.0) if n > 0 else stacked.mean()
+    return (1.0 / inv_mean).clamp(min=0.0, max=1.0)
 
 
 def _binary_erosion_pool(mask: torch.Tensor, ndim: int) -> torch.Tensor:
@@ -296,7 +295,7 @@ def surface_dice_batch_stats(
     tolerance: int = 1,
     threshold: float = 0.5,
 ) -> Dict[str, torch.Tensor]:
-    """逐类汇汇 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice@τ：
+    """逐类汇总 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice@τ：
     SD[c] = Σ(|B_p ∩ Dil_τ(B_t)| + |B_t ∩ Dil_τ(B_p)|) / Σ(|B_p|+|B_t|)。
     支持 2D (B,C,H,W) 与 3D (B,C,D,H,W)；外侧体素按背景计入边界。"""
     pred_bin = (torch.sigmoid(pred) > threshold).float()
