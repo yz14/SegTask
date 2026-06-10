@@ -555,9 +555,9 @@ def test_predictor_native_d_end_to_end():
 
     Builds a tiny synthetic volume, runs ``predict_volume`` in 2.5D + native
     depth mode, and verifies:
-      * The GPU window builder ``_build_z_window_input_native_d_gpu``
+      * The GPU window builder ``predictor.inputs.build_z_window_native_d_gpu``
         returns the correct ``(sum(D_k), pH, pW)`` shape per window.
-      * The forward path correctly bypasses ``_reshape_2_5d_input`` and
+      * The forward path correctly bypasses ``predictor.forwards.reshape_2_5d_input`` and
         feeds the rank-4 ``(B, in_channels, H, W)`` tensor straight to the
         model.
       * The aggregated probability map has shape ``(num_fg, D_orig, H, W)``
@@ -590,7 +590,10 @@ def test_predictor_native_d_end_to_end():
     # Direct builder call — must produce rank-3 (in_channels, pH, pW).
     D_vol = 40
     vol_t = torch.randn(D_vol, 32, 32, device=device)
-    win = predictor._build_z_window_input_native_d_gpu(vol_t, 16, 24)
+    from segtask_v1.predictor.inputs import build_z_window_native_d_gpu
+    win = build_z_window_native_d_gpu(
+        vol_t, 16, 24, pH=predictor.patch_H, pW=predictor.patch_W,
+        eD_max=predictor._eD_max, view_depths=predictor.per_view_depths)
     assert tuple(win.shape) == (expected_in, 32, 32), (
         f"native-d window shape {tuple(win.shape)}, want "
         f"{(expected_in, 32, 32)}")

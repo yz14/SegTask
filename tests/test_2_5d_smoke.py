@@ -560,7 +560,7 @@ def test_end_to_end_2_5d_multi_fov_one_step():
       - SegDataset3D yields (B, C_res=n_views, D, H, W) for `multi_res_scales` > [1.0].
       - Trainer._squeeze_2_5d collapses to (B, n_views*D, H, W) for the 2D model.
       - SliceChannelLoss receives (B, num_fg*D, H, W) head output and view-0 label.
-      - Predictor's _reshape_2_5d_input reproduces the same layout at inference.
+      - predictor.forwards.reshape_2_5d_input reproduces the same layout at inference.
     """
     from segtask_v1.config import Config
     from segtask_v1.data.loader import build_dataloaders

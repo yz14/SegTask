@@ -335,7 +335,7 @@ def build_model(cfg: Config):
     model = UNet3D(
         encoder               = encoder,
         decoder               = decoder,
-        num_fg_classes        = out_classes,
+        out_channels          = out_classes,
         deep_supervision      = mc.deep_supervision,
         spatial_dims          = spatial_dims,
         aux_seg_supervision   = aux_seg_supervision,

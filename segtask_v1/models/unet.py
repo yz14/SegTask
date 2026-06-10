@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
@@ -13,6 +14,8 @@ from .blocks import (
     _CONV, INTERP_SMOOTH,
     AttentionGate3D, ConvNormAct, Downsample, Upsample, get_norm)
 from .stem import HierarchicalStems, build_context_stem, build_stem
+
+logger = logging.getLogger(__name__)
 
 
 class Encoder(nn.Module):
@@ -323,7 +326,7 @@ class UNet3D(nn.Module):
         self,
         encoder              : Encoder,
         decoder,
-        num_fg_classes       : int,
+        out_channels         : Optional[int] = None,
         deep_supervision     : bool = False,
         spatial_dims         : int = 3,
         aux_seg_supervision  : bool = False,
@@ -331,25 +334,43 @@ class UNet3D(nn.Module):
         norm_type            : str = "instance",
         norm_groups          : int = 8,
         activation           : str = "leakyrelu",
-        aux_head_out_channels: List[int] = None):
+        aux_head_out_channels: List[int] = None,
+        num_fg_classes       : Optional[int] = None):
         super().__init__()
+        # 向后兼容：旧形参名 num_fg_classes 实为"主头输出通道数"（2.5D 折叠下
+        # = num_fg * D，并非类数），改名 out_channels；旧名仍接受但提示迁移。
+        if out_channels is None and num_fg_classes is None:
+            raise TypeError("UNet3D requires out_channels.")
+        if out_channels is not None and num_fg_classes is not None:
+            raise TypeError(
+                "UNet3D got both out_channels and deprecated num_fg_classes; "
+                "pass only out_channels.")
+        if out_channels is None:
+            logger.warning(
+                "UNet3D(num_fg_classes=...) is deprecated; use "
+                "out_channels=... (it is the main-head output channel "
+                "count, not the class count).")
+            out_channels = num_fg_classes
 
         self.encoder          = encoder
         self.decoder          = decoder
-        self.num_fg_classes   = num_fg_classes
+        self.out_channels     = int(out_channels)
+        # 旧属性名保留（语义同 out_channels），供存量调用方读取。
+        self.num_fg_classes   = self.out_channels
         self.deep_supervision = deep_supervision
         self.spatial_dims     = spatial_dims
 
         # 主头读最高分辨率 decoder 特征；stem_stride>1 时 forward 末尾上采回输入分辨率。DS 头保留各自分辨率。
         self.stem_stride = getattr(encoder, "stem_stride", 1)
         self.seg_head    = SegmentationHead(  # TODO 这里单层是否过于简单？是否可以选择多层？像ConvSegmentationHead
-            decoder.out_channels[-1], num_fg_classes, spatial_dims=spatial_dims)
+            decoder.out_channels[-1], self.out_channels,
+            spatial_dims=spatial_dims)
 
         # DS 头按分辨率递减：forward 返回 [main, 2nd, ..., lowest]，对齐 DeepSupervisionLoss。
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
             for ch in reversed(decoder.out_channels[:-1]):
-                self.ds_heads.append(ConvSegmentationHead(ch, num_fg_classes, spatial_dims=spatial_dims))  # TODO 是否需要多层conv
+                self.ds_heads.append(ConvSegmentationHead(ch, self.out_channels, spatial_dims=spatial_dims))  # TODO 是否需要多层conv
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
@@ -370,7 +391,7 @@ class UNet3D(nn.Module):
         # aux 通道默认 num_fg；native-depth 路径显式传 [num_fg*D_1, ..., num_fg*D_{K-1}]。
         n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
         if aux_head_out_channels is None:
-            self.aux_head_out_channels: List[int] = ([num_fg_classes] * n_aux_expected)
+            self.aux_head_out_channels: List[int] = ([self.out_channels] * n_aux_expected)
         else:
             if len(aux_head_out_channels) != n_aux_expected:
                 raise ValueError(

@@ -7,8 +7,6 @@ R6 抽自 ``predictor.py``：4 种 ``predict_volume`` 调度路径的主体循�
                                    keep_native / 单分辨率 / 多分辨率 5 种 builder 分派）
 * ``sliding_window_z_interleaved``  —— z-interleave wrapper（按 z spacing 拆 k 个互斥子流）
 * ``sliding_window_cubic``      —— 3 轴 cubic 滑窗（含 keep_native / CPU 双 builder 分派）
-
-类侧保 ``Predictor._sliding_window_*`` / ``_whole_volume_forward`` 同名 thin shim。
 """
 
 from __future__ import annotations

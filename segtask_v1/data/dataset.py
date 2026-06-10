@@ -191,27 +191,26 @@ def load_npz_image(
     global_mean: float = 0.0,
     global_std: float = 1.0) -> np.ndarray:
     """读 npz image（int16 HU）后运行 preprocess_image → owned fp32。"""
-    f = _open_npz(path)
-    img_int16 = f["image"]
-    img = preprocess_image(
-        img_int16, intensity_min, intensity_max,
-        normalize, global_mean, global_std,
-        inplace=False)
-    return img
+    with _open_npz(path) as f:
+        img_int16 = f["image"]
+        return preprocess_image(
+            img_int16, intensity_min, intensity_max,
+            normalize, global_mean, global_std,
+            inplace=False)
 
 
 def load_npz_label(path: str) -> np.ndarray:
     """返 npz 中 owned int16 label ndarray。"""
-    f = _open_npz(path)
-    return f["label"]
+    with _open_npz(path) as f:
+        return f["label"]
 
 
 def load_npz_region_weight(path: str) -> Optional[np.ndarray]:
-    """返 owned fp32 区域权重（+1 偏移已由 make_data 加过）；无 rw 返 None。。"""
-    f = _open_npz(path)
-    if "rw" not in f.files:
-        return None
-    rw = f["rw"]
+    """返 owned fp32 区域权重（+1 偏移已由 make_data 加过）；无 rw 返 None。"""
+    with _open_npz(path) as f:
+        if "rw" not in f.files:
+            return None
+        rw = f["rw"]
     if rw.dtype != np.float32:
         rw = rw.astype(np.float32, copy=False)
     return rw
@@ -219,26 +218,26 @@ def load_npz_region_weight(path: str) -> Optional[np.ndarray]:
 
 def npz_has_rw(path: str) -> bool:
     """仅查 npz 是否含 rw 键（不解码数据）。"""
-    f = _open_npz(path)
-    return "rw" in f.files
+    with _open_npz(path) as f:
+        return "rw" in f.files
 
 
 def load_npz_fg_slices(path: str) -> np.ndarray:
     """返 npz 内预计算的逐 z 前景切片索引（裁剪后坐标系）。"""
-    f = _open_npz(path)
-    return np.asarray(f["fg_slices"], dtype=np.int32)
+    with _open_npz(path) as f:
+        return np.asarray(f["fg_slices"], dtype=np.int32)
 
 
 def load_npz_fg_coords(path: str) -> np.ndarray:
     """返 npz 内预计算的 (N,3) 前景 voxel 坐标（裁剪后坐标系）。"""
-    f = _open_npz(path)
-    return np.asarray(f["fg_coords"], dtype=np.int32)
+    with _open_npz(path) as f:
+        return np.asarray(f["fg_coords"], dtype=np.int32)
 
 
 def load_npz_label_for_split(path: str) -> np.ndarray:
     """owned int16 label copy，供 loader.py 预扫描使用。强制 copy 以免父进程持有 mmap 句柄。"""
-    f = _open_npz(path)
-    return np.array(f["label"])
+    with _open_npz(path) as f:
+        return np.array(f["label"])
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +470,26 @@ class SegDatasetNpzBase(Dataset):
         self._npz_paths       : List[str]       = list(npz_paths)
         self._npz_has_rw_cache: Dict[int, bool] = {}
 
+        # 逐 worker 采样 RNG（惰性创建，见 _rng）。
+        self._rng_cache: Optional[np.random.Generator] = None
+        self._rng_wid  : Optional[int] = None
+
+    def _rng(self) -> np.random.Generator:
+        """逐 worker 采样 RNG。
+
+        DataLoader fork 后 numpy 全局 RNG 状态在各 worker 间复制，直接用
+        ``np.random.*`` 会导致跨 worker 重复采样。这里以 PyTorch 逐 worker
+        基种子（主进程则用 ``torch.initial_seed()``）惰性创建独立的
+        ``np.random.Generator``。
+        """
+        info = torch.utils.data.get_worker_info()
+        wid = -1 if info is None else info.id
+        if self._rng_cache is None or self._rng_wid != wid:
+            seed = torch.initial_seed() if info is None else info.seed
+            self._rng_cache = np.random.default_rng(seed % (2 ** 63))
+            self._rng_wid = wid
+        return self._rng_cache
+
     # ------------------------------------------------------------------
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
     # ------------------------------------------------------------------
@@ -523,7 +542,7 @@ class SegDatasetNpzBase(Dataset):
 # ---------------------------------------------------------------------------
 class SegDataset3D(SegDatasetNpzBase):
     """3D z 轴滑窗 dataset。z 轴滑动抖中心 z，折取 round(eD*s) 切片，
-    仅 z 过采样；H/W 全分辨率 resize 到 patch_size。与 predictor._sliding_window_z 一致。
+    仅 z 过采样；H/W 全分辨率 resize 到 patch_size。与 predictor.sliding.sliding_window_z 一致。
 
     多分辨率 multi_res_scales=[1.0] 为单分辨率；s>1 强制 edge-replicate 以保留物理 z-FOV。
     输出 shape：image/label/weight_map = (C_res, eD, pH, pW)。
@@ -674,11 +693,12 @@ class SegDataset3D(SegDatasetNpzBase):
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
         """采样中心 z：以 fg_ratio 概率从前景切片采样，否则均匀采样。"""
         fg_slices = self._vol_fg_slices[vol_idx]
+        rng = self._rng()
         if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
-            and np.random.random() < self.fg_ratio):
-            return int(np.random.choice(fg_slices))
-        return np.random.randint(0, D_vol)
+            and rng.random() < self.fg_ratio):
+            return int(rng.choice(fg_slices))
+        return int(rng.integers(0, D_vol))
 
     def _extract_z_patch(
         self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int
@@ -766,7 +786,7 @@ def _extract_cubic_patch(
     patch = vol[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]]
 
     # 越界时 mode='edge' 填充以保证准确 size；避免下游 resize_3d 各向异性拉伸，
-    # 也与 predictor._sliding_window_cubic 默认 pad 一致。
+    # 也与 predictor.sliding.sliding_window_cubic 默认 pad 一致。
     if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
         patch = np.pad(
             patch,
@@ -925,22 +945,23 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
         """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
-        导致>50% 体素来自边界复制（偏移训练分布）。。"""
+        导致>50% 体素来自边界复制（偏移训练分布）。"""
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
         fg_coords = self._vol_fg_coords[vol_idx]
+        rng = self._rng()
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
-                and np.random.random() < self.fg_ratio):
-            idx = np.random.randint(len(fg_coords))
+                and rng.random() < self.fg_ratio):
+            idx = int(rng.integers(len(fg_coords)))
             d, h, w = fg_coords[idx]
             # np.clip 上界含于，需 -1。
             d = int(np.clip(int(d), dlo, dhi - 1))
             h = int(np.clip(int(h), hlo, hhi - 1))
             w = int(np.clip(int(w), wlo, whi - 1))
             return (d, h, w)
-        return (int(np.random.randint(dlo, dhi)),
-                int(np.random.randint(hlo, hhi)),
-                int(np.random.randint(wlo, whi)))
+        return (int(rng.integers(dlo, dhi)),
+                int(rng.integers(hlo, hhi)),
+                int(rng.integers(wlo, whi)))
 
 
 # ---------------------------------------------------------------------------
