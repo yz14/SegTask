@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import List
 
 import torch
@@ -10,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks import INTERP_SMOOTH, AttentionGate3D, Upsample
+
+logger = logging.getLogger(__name__)
 
 
 class UNetPPDecoder(nn.Module):
@@ -32,6 +35,7 @@ class UNetPPDecoder(nn.Module):
         if n < 2:
             raise ValueError("UNetPPDecoder requires at least 2 encoder levels")
         self.n = n
+        self._size_mismatch_warned = False
         self.skip_attention = skip_attention
         self.spatial_dims = spatial_dims
 
@@ -77,6 +81,13 @@ class UNetPPDecoder(nn.Module):
                 key = f"{i}_{j}"
                 up = self.upsamples[key](x[i + 1][j - 1])
                 if up.shape[2:] != x[i][0].shape[2:]:
+                    if not self._size_mismatch_warned:
+                        self._size_mismatch_warned = True
+                        logger.warning(
+                            "UNet++ node %s: upsampled size %s != skip size "
+                            "%s — falling back to F.interpolate. 这通常意味着 "
+                            "patch_size 与 encoder stride 不整除，请检查配置。",
+                            key, tuple(up.shape[2:]), tuple(x[i][0].shape[2:]))
                     up = F.interpolate(
                         up, size=x[i][0].shape[2:],
                         mode=INTERP_SMOOTH[self.spatial_dims],

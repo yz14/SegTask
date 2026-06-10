@@ -277,10 +277,16 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             pD, pH, pW, stride_d, stride_h, stride_w,
             len(pos_d), len(pos_h), len(pos_w), total_windows, p.blend_mode)
 
-    weight_3d = _blending.build_3d_weight(pD, pH, pW, p.blend_mode)
+    # GPU 常驻累加：blend 权重与累加器均在 device 上，仅最后一次返 host
+    # （与 z 路径一致，避免逐窗 GPU→CPU 拷贝 + numpy 累加）。
+    weight_3d = torch.from_numpy(
+        _blending.build_3d_weight(pD, pH, pW, p.blend_mode)).to(p.device)
 
-    acc_pred = np.zeros((p.num_fg, D_orig, H_orig, W_orig), dtype=np.float32)
-    acc_weight = np.zeros((1, D_orig, H_orig, W_orig), dtype=np.float32)
+    acc_pred = torch.zeros(
+        (p.num_fg, D_orig, H_orig, W_orig),
+        dtype=torch.float32, device=p.device)
+    acc_weight = torch.zeros(
+        (1, D_orig, H_orig, W_orig), dtype=torch.float32, device=p.device)
 
     # 3D cubic ON 路径：体积一次上 GPU，builder 全程 on-device（逐视图一次 F.interpolate，
     # 零 scipy.ndimage.zoom）。OFF 路径保旧 CPU pipeline。
@@ -311,15 +317,14 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 pD=pD, pH=pH, pW=pW,
                 multi_res_scales=p.multi_res_scales,
                 device=p.device)
-        probs = _forwards.forward_batch_numpy(p, batch)   # (B, num_fg, pD, pH, pW)
+        probs = _forwards.forward_batch_gpu(p, batch)   # (B, num_fg, pD, pH, pW) on GPU
         for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw) in zip(probs, coords):
             # Trim prediction to actual (non-padded) size in each axis
             pred_trim = pred[:, :ad, :ah, :aw]
-            w_trim = weight_3d[:ad, :ah, :aw]
-            acc_pred[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw] += (
-                pred_trim * w_trim[np.newaxis])
-            acc_weight[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw] += (
-                w_trim[np.newaxis])
+            w_trim = weight_3d[:ad, :ah, :aw].unsqueeze(0)   # (1, ad, ah, aw)
+            acc_pred[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw].addcmul_(
+                pred_trim, w_trim, value=1.0)
+            acc_weight[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw].add_(w_trim)
         processed += len(patches)
         if p.log_progress and (
                 processed % max(1, 10 * p.batch_size) == 0
@@ -355,8 +360,8 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
 
     _flush()
 
-    np.maximum(acc_weight, 1e-8, out=acc_weight)
-    return acc_pred / acc_weight
+    acc_weight.clamp_(min=1e-8)
+    return (acc_pred / acc_weight).cpu().numpy()
 
 
 __all__ = [

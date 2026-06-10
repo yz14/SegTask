@@ -46,15 +46,29 @@ class ModelEMA:
         }
         self._backup: Dict[str, torch.Tensor] = {}
         self._swapped: bool = False
+        # update 热路径缓存：(shadow, live, is_float) 三元组，避免每 step
+        # 重建 state_dict。state_dict 返回的是参数/buffer 本体引用，
+        # 同一 model 实例下跨 step 稳定。
+        self._pairs: Optional[list] = None
+        self._pairs_model_id: Optional[int] = None
+
+    def _build_pairs(self, model: nn.Module) -> None:
+        self._pairs = [
+            (self.shadow[k], v, v.is_floating_point())
+            for k, v in model.state_dict().items()
+        ]
+        self._pairs_model_id = id(model)
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        for k, param in model.state_dict().items():
-            if param.is_floating_point():
-                self.shadow[k].mul_(self.decay).add_(param, alpha=1.0 - self.decay)
+        if self._pairs is None or self._pairs_model_id != id(model):
+            self._build_pairs(model)
+        for shadow, live, is_float in self._pairs:
+            if is_float:
+                shadow.mul_(self.decay).add_(live, alpha=1.0 - self.decay)
             else:
                 # 整型 buffer（如 BN num_batches_tracked）直接跟随最新。
-                self.shadow[k].copy_(param)
+                shadow.copy_(live)
 
     @torch.no_grad()
     def apply_shadow(self, model: nn.Module) -> None:
@@ -88,9 +102,17 @@ class ModelEMA:
                 self.shadow[k].copy_(v)
         else:
             # key 不一致：从零重建 shadow。
+            logger.warning(
+                "ModelEMA.load_state_dict: shadow keys mismatch current "
+                "model (loaded=%d, current=%d) — rebuilding shadow from "
+                "checkpoint. EMA history continuity is preserved only if "
+                "the checkpoint matches the intended architecture.",
+                len(loaded), len(self.shadow))
             self.shadow = {k: v.detach().clone() for k, v in loaded.items()}
             self._backup = {}
             self._swapped = False
+        self._pairs = None
+        self._pairs_model_id = None
         self.decay = state.get("decay", self.decay)
 
 

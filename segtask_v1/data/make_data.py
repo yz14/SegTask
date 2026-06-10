@@ -238,7 +238,7 @@ def prepare_dataset(
     out_dir     : str,
     workers     : int = 4,
     fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
-    compress    : bool = True,
+    compress    : bool = False,
     overwrite   : bool = False,
     limit       : int = 0) -> Dict[str, int]:
     """为 cfg.data 下的所有样本生成 npz。

@@ -64,7 +64,7 @@ def _filter_by_exclude(
         else:
             keep_idx.append(i)
 
-    if dropped:  # loggin
+    if dropped:  # logging
         head = ", ".join(dropped[:10])
         more = f", ... (+{len(dropped) - 10} more)" if len(dropped) > 10 else ""
         logger.warning(
@@ -288,8 +288,14 @@ def _default_label_loader(path: str) -> np.ndarray:
 def detect_label_values(
     label_paths: List[str],
     max_scan: Optional[int] = None,
-    label_loader_fn=None) -> List[int]:
-    """自动探测标签取值；默认扫描全部。max_scan 指定部分扫描（会警告）；label_loader_fn 切换读器（NIfTI vs npz）。返按升序整数，含 bg。"""
+    label_loader_fn=None,
+    *,
+    return_primaries: bool = False,
+) -> Union[List[int], Tuple[List[int], List[Dict[int, int]]]]:
+    """自动探测标签取值；默认扫描全部。max_scan 指定部分扫描（会警告）；label_loader_fn 切换读器（NIfTI vs npz）。返按升序整数，含 bg。
+
+    ``return_primaries=True`` 时额外返回每个样本的 ``{label_value: voxel_count}``
+    字典列表，供 ``stratified_train_val_split`` 直接使用，避免重复扫描。"""
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     n_total = len(label_paths)
@@ -300,12 +306,16 @@ def detect_label_values(
         scan_paths = label_paths[:max_scan]
         partial = True
 
-    all_labels = set()
+    all_labels: set = set()
+    per_sample_counts: List[Dict[int, int]] = []
     for path in scan_paths:
-        # int16 解码减轻启动扫描内存。
         lbl    = label_loader_fn(path)
-        unique = np.unique(lbl.astype(np.int32, copy=False)).tolist()
+        lbl_int = lbl.astype(np.int32, copy=False)
+        unique = np.unique(lbl_int).tolist()
         all_labels.update(unique)
+        if return_primaries:
+            per_sample_counts.append(
+                {int(v): int((lbl_int == v).sum()) for v in unique})
 
     result = sorted(all_labels)
     if partial:
@@ -317,6 +327,8 @@ def detect_label_values(
         logger.info(
             "Auto-detected label values (scanned %d files): %s",
             n_total, result)
+    if return_primaries:
+        return result, per_sample_counts
     return result
 
 
@@ -349,8 +361,13 @@ def stratified_train_val_split(
     val_ratio: float,
     seed: int,
     use_foreground_only: bool = True,
-    label_loader_fn=None) -> Tuple[List[int], List[int]]:
-    """按主前景标签分层划分；退化时回退随机。use_foreground_only=True 时忽略背景频率。"""
+    label_loader_fn=None,
+    per_sample_counts: Optional[List[Dict[int, int]]] = None,
+) -> Tuple[List[int], List[int]]:
+    """按主前景标签分层划分；退化时回退随机。use_foreground_only=True 时忽略背景频率。
+
+    ``per_sample_counts`` 可由 ``detect_label_values(return_primaries=True)``
+    预先生成，避免重复扫描标签文件。"""
     n   = len(label_paths)
     rng = np.random.RandomState(seed)
 
@@ -362,9 +379,12 @@ def stratified_train_val_split(
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     for idx, path in enumerate(label_paths):
-        lbl = label_loader_fn(path)
-        lbl_int = lbl.astype(np.int32, copy=False)
-        counts = {v: int((lbl_int == v).sum()) for v in strata_vals}
+        if per_sample_counts is not None and idx < len(per_sample_counts):
+            counts = {v: per_sample_counts[idx].get(v, 0) for v in strata_vals}
+        else:
+            lbl = label_loader_fn(path)
+            lbl_int = lbl.astype(np.int32, copy=False)
+            counts = {v: int((lbl_int == v).sum()) for v in strata_vals}
         best = max(counts.values())
         if best == 0:
             fallback.append(idx)
@@ -491,8 +511,12 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
         npz_paths_all = [npz_paths_all[i] for i in keep_idx]
     label_loader_fn = load_npz_label_for_split
 
+    # 自动探测时顺便记录逐样本体素计数，供分层划分复用（避免二次全量扫描）。
+    per_sample_counts: Optional[List[Dict[int, int]]] = None
     if not dc.label_values:
-        dc.label_values = detect_label_values(label_paths, label_loader_fn=label_loader_fn)
+        dc.label_values, per_sample_counts = detect_label_values(
+            label_paths, label_loader_fn=label_loader_fn,
+            return_primaries=True)
         dc.num_classes  = len(dc.label_values)
         cfg.sync()
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
@@ -502,7 +526,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     if getattr(dc, "stratified_split", True) and dc.num_classes >= 2:
         train_idx, val_idx = stratified_train_val_split(
             label_paths, dc.label_values, dc.val_ratio, dc.split_seed,
-            label_loader_fn=label_loader_fn)
+            label_loader_fn=label_loader_fn,
+            per_sample_counts=per_sample_counts)
     else:
         train_idx, val_idx = train_val_split(
             len(image_paths), dc.val_ratio, dc.split_seed)
