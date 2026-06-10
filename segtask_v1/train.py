@@ -34,7 +34,7 @@ def apply_overrides(cfg, overrides: list) -> None:
         attr = parts[-1]
         old_val = getattr(obj, attr)
         # 转为原类型。
-        if isinstance(old_val, bool):
+        if   isinstance(old_val, bool):
             new_val = val.lower() in ("true", "1", "yes")
         elif isinstance(old_val, int):
             new_val = int(val)

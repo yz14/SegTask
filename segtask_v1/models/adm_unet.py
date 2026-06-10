@@ -231,10 +231,10 @@ class _AttentionBlock(nn.Module):
 def _resolve_attention_levels(
     n_levels: int, attn_levels: Optional[Sequence[int]]
 ) -> List[int]:
-    """解析注意级别索引；默认最深两级（与 ADM 默认 attention_resolutions=[16,8] 一致）。。"""
+    """解析注意级别索引；默认最深两级（与 ADM 默认 attention_resolutions=[16,8] 一致）"""
     if attn_levels is None:
         if n_levels >= 2:
-            return [n_levels - 2, n_levels - 1]
+            return [n_levels - 2, n_levels - 1]  # 最后两层
         return [n_levels - 1]
     out = sorted({int(v) for v in attn_levels})
     for v in out:
@@ -284,17 +284,13 @@ class _ADMEncoder(nn.Module):
                     _ResBlockNoEmb(
                         ch_in if i == 0 else ch_out,
                         ch_out,
-                        dropout=dropout,
-                    )
-                )
+                        dropout=dropout))
                 if level in self.attention_levels:
                     blocks_this_level.append(
                         _AttentionBlock(
                             ch_out,
                             num_heads=num_heads,
-                            num_head_channels=num_head_channels,
-                        )
-                    )
+                            num_head_channels=num_head_channels))
                 self.skip_channels.append(ch_out)
             # 逐级末一个 LinearAttention（在 ResBlocks + softmax-attn 后），重写最后一个 skip。
             if level in self.linear_attention_levels:
@@ -302,9 +298,7 @@ class _ADMEncoder(nn.Module):
                     _LinearAttentionBlock(
                         ch_out,
                         num_heads=linear_attention_num_heads,
-                        head_dim=linear_attention_head_dim,
-                    )
-                )
+                        head_dim=linear_attention_head_dim))
             self.levels.append(nn.ModuleList(blocks_this_level))
             if level < n_levels - 1:
                 self.downsamples.append(_Downsample(ch_out, use_conv=True))
@@ -312,9 +306,7 @@ class _ADMEncoder(nn.Module):
             else:
                 self.downsamples.append(None)  # type: ignore[arg-type]
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
         """返 {enc_features, enc_skips}。"""
         x = self.stem(x)
         enc_skips: List[torch.Tensor] = [x]
@@ -333,10 +325,9 @@ class _ADMEncoder(nn.Module):
                 x = self.downsamples[level](x)
                 enc_skips.append(x)
         return {
-            "bottleneck": x,
+            "bottleneck"  : x,
             "enc_features": enc_features,
-            "enc_skips": enc_skips,
-        }
+            "enc_skips"   : enc_skips}
 
 
 class _ADMMiddle(nn.Module):
@@ -680,7 +671,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
             list(mc.decoder_blocks_per_stage), enc_bps)
     dec_bps_full = list(enc_bps)
 
-    attn_levels = _resolve_attention_levels(
+    attn_levels = _resolve_attention_levels(  # 确认attn，默认最后两层
         n_levels, getattr(mc, "adm_attention_levels", None))
 
     # 可选 lucidrains 式线性注意（默认关）。
