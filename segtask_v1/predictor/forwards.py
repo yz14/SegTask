@@ -3,12 +3,7 @@
 R6 抽自 ``predictor.py``：3 种 forward（3D / 2.5D folded / 2.5D lift）+ 2 种 TTA（3D
 轴 flip 7 种组合 / 2.5D 仅 H/W flip 3 种）+ 1 个首 batch 诊断日志器，全部改为
 **模块级函数**，显式接收 ``predictor`` 引用以读取模型 / dtype / num_fg / 阈值等
-状态。``Predictor`` 类侧保 ``_forward_batch_gpu`` / ``_forward_batch`` /
-``_forward_batch_2_5d`` / ``_tta_flip_ensemble`` / ``_tta_flip_ensemble_2_5d`` /
-``_diag_log_first_batch`` / ``_reshape_2_5d_input`` 同名 thin shim（许多单元测试
-通过类直调消费这些方法）。
-
-行为与重构前严格等价。
+状态。行为与重构前严格等价。
 """
 
 from __future__ import annotations
@@ -199,7 +194,7 @@ def diag_log_first_batch(p: "Predictor", tag: str,
 def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
     """Mode-aware forward；返 ``(B, num_fg, D, H, W)`` 概率张量（GPU 常驻，含 TTA）。
 
-    分派优先级（与重构前 ``Predictor._forward_batch_gpu`` 等价）：
+    分派优先级（与重构前 ``forward_batch_gpu`` 等价）：
 
     * ``patch_mode == '2_5d'`` & ``lift_2_5d_to_3d``    → rank-5 直送 3D 模型，3D TTA
     * ``patch_mode == '2_5d'`` & 否则                   → 折 ``C_res*D`` 走 2D 模型，2.5D TTA
@@ -281,7 +276,7 @@ def forward_batch_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
     """numpy-返版 forward：``(B, num_fg, D, H, W)`` fp32。等价于
     ``forward_batch_gpu(...).cpu().numpy()``，保留这个独立入口仅为类侧 shim 命名一致。
 
-    注意：与 ``forward_batch_gpu`` 的细微差别——重构前 ``_forward_batch`` / ``_forward_batch_2_5d``
+    注意：与 ``forward_batch_gpu`` 的细微差别——重构前的 numpy 返回版 forward
     *不* 调 diag logger（仅 GPU 路径调）。本函数复刻该行为，禁用 diag。
     """
     if p.patch_mode == "2_5d":

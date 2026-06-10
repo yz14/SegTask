@@ -21,8 +21,6 @@ from ..data.dataset import (
     compute_bbox_from_volume)
 from ..models.topology import ModelTopology, build_topology
 from . import blending as _blending
-from . import forwards as _forwards
-from . import inputs as _inputs
 from . import sliding as _sliding
 
 logger = logging.getLogger(__name__)
@@ -61,8 +59,8 @@ class Predictor:
         # 训练内整卷验证（VolumeValEvaluator）会置 False 以免每 epoch 刷屏 81 卷。
         self.log_progress = True
 
-        # 2.5D z 交错推理：按 stride k 将体积拆为 k 个子流，各自走 _sliding_window_z，
-        # 后以 out[:, i::k]=stream_i 缝回。k 由 z spacing 挑选（见 _choose_interleave_factor）。
+        # 2.5D z 交错推理：按 stride k 将体积拆为 k 个子流，各自走 sliding.sliding_window_z，
+        # 后以 out[:, i::k]=stream_i 缝回。k 由 z spacing 挑选（见 sliding.choose_interleave_factor）。
         # 仅 patch_mode=='2_5d' 生效；Config 验证。
         self.z_interleave_enabled = bool(
             getattr(pc, "z_interleave_enabled", False)
@@ -215,7 +213,7 @@ class Predictor:
         self.pad_value: Optional[float] = getattr(
             cfg.data, "pad_value", None)
 
-        # 逐卷“首 batch 已记录”护孔。predict_volume 顶部重置，_forward_batch* 消费。
+        # 逐卷“首 batch 已记录”护孔。predict_volume 顶部重置，forwards.forward_batch* 消费。
         self._diag_first_batch_logged: bool = True
 
         # AdaBN per_volume 估计期标志：置 True 时 TTA 强制退回串行前向，避免把多个 flip
@@ -362,7 +360,11 @@ class Predictor:
             full_prob[:, d0:d1, h0:h1, w0:w1] = prob_volume
             prob_volume = full_prob
 
-        label_map = self._prob_to_label(prob_volume)
+        label_map = _blending.prob_to_label(
+            prob_volume,
+            label_values=self.label_values,
+            num_fg=self.num_fg,
+            threshold=self.threshold)
         result = {"label_map": label_map, "probabilities": prob_volume}
 
         if output_dir:
@@ -386,180 +388,15 @@ class Predictor:
         也回退到标准 z 轴滑窗（npz 缓存无物理 spacing 的场景）。
         """
         if self.patch_mode == "whole":
-            return self._whole_volume_forward(vol)
+            return _sliding.whole_volume_forward(self, vol)
         if self.patch_mode == "cubic":
-            return self._sliding_window_cubic(vol)
+            return _sliding.sliding_window_cubic(self, vol)
         if self.z_interleave_enabled and z_spacing is not None:
-            # 2.5D z-交错；k≤1 时会退化为标准 _sliding_window_z。
-            return self._sliding_window_z_interleaved(vol, float(z_spacing))
+            # 2.5D z-交错；k≤1 时会退化为标准 sliding_window_z。
+            return _sliding.sliding_window_z_interleaved(
+                self, vol, float(z_spacing))
         # z_axis / 2_5d 几何同，forward 侧区别。
-        return self._sliding_window_z(vol)
-
-    # ==================================================================
-    # Sliding loops (R6: thin shims delegating to predictor.sliding)
-    # ==================================================================
-    def _choose_interleave_factor(self, z_spacing: float) -> int:
-        """z-interleave factor 选择；R6 委托至 ``predictor.sliding.choose_interleave_factor``。"""
-        return _sliding.choose_interleave_factor(self, z_spacing)
-
-    def _sliding_window_z_interleaved(
-        self, vol: np.ndarray, z_spacing: float,
-    ) -> np.ndarray:
-        """2.5D z-交错推理；R6 委托至 ``predictor.sliding.sliding_window_z_interleaved``。"""
-        return _sliding.sliding_window_z_interleaved(self, vol, z_spacing)
-
-    def _sliding_window_z(self, vol: np.ndarray) -> np.ndarray:
-        """z 轴滑窗推理；R6 委托至 ``predictor.sliding.sliding_window_z``。"""
         return _sliding.sliding_window_z(self, vol)
-
-    # ==================================================================
-    # Z-axis window builders (R6: thin shims delegating to predictor.inputs)
-    # ==================================================================
-    def _build_z_window_input_gpu(
-        self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
-        """单分辨率 GPU 窗口建造；R6 委托至 ``predictor.inputs.build_z_window_single_res_gpu``。"""
-        return _inputs.build_z_window_single_res_gpu(
-            vol_t, z0, z1,
-            pD=self.patch_D, pH=self.patch_H, pW=self.patch_W,
-            z_boundary_mode=self.z_boundary_mode)
-
-    def _build_z_window_input_native_multi_res_gpu(
-        self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
-        """3D ``z_axis`` ON 窗口建造；R6 委托至 ``predictor.inputs.build_z_window_native_multi_res_gpu``。"""
-        return _inputs.build_z_window_native_multi_res_gpu(
-            vol_t, z0, z1,
-            pD=self.patch_D, pH=self.patch_H, pW=self.patch_W,
-            target_shape=self._mr_target_shape,
-            native_sizes=self._mr_native_sizes)
-
-    def _build_z_window_input_native_d_gpu(
-        self, vol_t: torch.Tensor, z0: int, z1: int) -> torch.Tensor:
-        """2.5D ON 窗口建造；R6 委托至 ``predictor.inputs.build_z_window_native_d_gpu``。"""
-        return _inputs.build_z_window_native_d_gpu(
-            vol_t, z0, z1,
-            pH=self.patch_H, pW=self.patch_W,
-            eD_max=self._eD_max, view_depths=self.per_view_depths)
-
-    # ==================================================================
-    # Forward + TTA + diag (R6: thin shims delegating to predictor.forwards)
-    # ==================================================================
-    @torch.no_grad()
-    def _forward_batch_gpu(self, x: torch.Tensor) -> torch.Tensor:
-        """Mode-aware GPU forward；R6 委托至 ``predictor.forwards.forward_batch_gpu``。"""
-        return _forwards.forward_batch_gpu(self, x)
-
-    @torch.no_grad()
-    def _diag_log_first_batch(
-        self, tag: str,
-        x: torch.Tensor,
-        logits: torch.Tensor,
-        prob: torch.Tensor,
-    ) -> None:
-        """首 batch 诊断；R6 委托至 ``predictor.forwards.diag_log_first_batch``。"""
-        _forwards.diag_log_first_batch(self, tag, x, logits, prob)
-
-    def _build_z_window_input(
-        self, vol: np.ndarray, z0: int, z1: int) -> np.ndarray:
-        """多分辨率 z 窗口堆（CPU 退化路径）；R6 委托至 ``predictor.inputs.build_z_window_cpu_multi_res``。"""
-        return _inputs.build_z_window_cpu_multi_res(
-            vol, z0, z1,
-            pD=self.patch_D, pH=self.patch_H, pW=self.patch_W,
-            multi_res_scales=self.multi_res_scales,
-            z_boundary_mode=self.z_boundary_mode)
-
-    def _whole_volume_forward(self, vol: np.ndarray) -> np.ndarray:
-        """全卷 resize 单次 forward；R6 委托至 ``predictor.sliding.whole_volume_forward``。"""
-        return _sliding.whole_volume_forward(self, vol)
-
-    def _sliding_window_cubic(self, vol: np.ndarray) -> np.ndarray:
-        """3 轴 cubic 滑窗推理；R6 委托至 ``predictor.sliding.sliding_window_cubic``。"""
-        return _sliding.sliding_window_cubic(self, vol)
-
-    # ==================================================================
-    # Cubic batch builders (R6: thin shims delegating to predictor.inputs)
-    # ==================================================================
-    def _build_batch_native_multi_res_cubic_gpu(
-        self,
-        centers: List[Tuple[int, int, int]],
-        vol_t: torch.Tensor,
-    ) -> torch.Tensor:
-        """3D ``cubic`` ON 批建造；R6 委托至 ``predictor.inputs.build_cubic_batch_native_multi_res``。"""
-        return _inputs.build_cubic_batch_native_multi_res(
-            centers, vol_t,
-            pD=self.patch_D, pH=self.patch_H, pW=self.patch_W,
-            target_shape=self._mr_target_shape,
-            native_sizes=self._mr_native_sizes)
-
-    def _build_batch_multi_res(
-        self,
-        patches: List[np.ndarray],
-        centers: List[Tuple[int, int, int]],
-        vol: np.ndarray,
-    ) -> torch.Tensor:
-        """``cubic`` CPU 多分辨率批；R6 委托至 ``predictor.inputs.build_cubic_batch_cpu_multi_res``。"""
-        return _inputs.build_cubic_batch_cpu_multi_res(
-            patches, centers, vol,
-            pD=self.patch_D, pH=self.patch_H, pW=self.patch_W,
-            multi_res_scales=self.multi_res_scales,
-            device=self.device)
-
-    # ==================================================================
-    # Forward + TTA (R6: thin shims delegating to predictor.forwards)
-    # ==================================================================
-    def _forward_batch(self, x: torch.Tensor) -> np.ndarray:
-        """numpy-返版 forward；R6 委托至 ``predictor.forwards.forward_batch_numpy``。"""
-        return _forwards.forward_batch_numpy(self, x)
-
-    def _forward_batch_2_5d(self, x: torch.Tensor) -> np.ndarray:
-        """2.5D forward (numpy 返)；R6 委托至 ``predictor.forwards.forward_batch_2_5d_numpy``。"""
-        return _forwards.forward_batch_2_5d_numpy(self, x)
-
-    def _reshape_2_5d_input(self, x: torch.Tensor) -> torch.Tensor:
-        """2.5D rank-5 → rank-4；R6 委托至 ``predictor.forwards.reshape_2_5d_input``。"""
-        return _forwards.reshape_2_5d_input(self, x)
-
-    def _tta_flip_ensemble(
-        self, x: torch.Tensor, base_prob: torch.Tensor,
-    ) -> torch.Tensor:
-        """3D TTA；R6 委托至 ``predictor.forwards.tta_flip_ensemble``。"""
-        return _forwards.tta_flip_ensemble(self, x, base_prob)
-
-    def _tta_flip_ensemble_2_5d(
-        self, x_2d: torch.Tensor, base_prob: torch.Tensor,
-    ) -> torch.Tensor:
-        """2.5D TTA；R6 委托至 ``predictor.forwards.tta_flip_ensemble_2_5d``。"""
-        return _forwards.tta_flip_ensemble_2_5d(self, x_2d, base_prob)
-
-    # ==================================================================
-    # Geometry helpers (R6: thin shims delegating to predictor.blending)
-    # ==================================================================
-    @staticmethod
-    def _compute_1d_positions(
-        length: int, patch: int, stride: int,
-    ) -> List[Tuple[int, int]]:
-        """逐轴返 ``(start, end)`` 窗口；R6 委托至 ``predictor.blending.compute_1d_positions``。"""
-        return _blending.compute_1d_positions(length, patch, stride)
-
-    @staticmethod
-    def _build_1d_weight(n: int, mode: str = "gaussian") -> np.ndarray:
-        """对称 1D blending 窗；R6 委托至 ``predictor.blending.build_1d_weight``。"""
-        return _blending.build_1d_weight(n, mode)
-
-    @staticmethod
-    def _build_3d_weight(pD: int, pH: int, pW: int, mode: str) -> np.ndarray:
-        """可分离 3D blending 权重；R6 委托至 ``predictor.blending.build_3d_weight``。"""
-        return _blending.build_3d_weight(pD, pH, pW, mode)
-
-    # ==================================================================
-    # Probability → label map (R6: thin shim delegating to predictor.blending)
-    # ==================================================================
-    def _prob_to_label(self, prob_volume: np.ndarray) -> np.ndarray:
-        """概率体 → 整数 label map；R6 委托至 ``predictor.blending.prob_to_label``。"""
-        return _blending.prob_to_label(
-            prob_volume,
-            label_values=self.label_values,
-            num_fg=self.num_fg,
-            threshold=self.threshold)
 
     # ==================================================================
     # NIfTI I/O

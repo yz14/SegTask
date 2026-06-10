@@ -9,16 +9,16 @@ Coverage
    - 2.5D / single-scale / whole modes leave ``keep_native_multi_res``
      False (defensive — Config.validate already guards earlier).
 
-2. ``_build_z_window_input_native_multi_res_gpu`` (z_axis 3D ON):
+2. ``inputs.build_z_window_native_multi_res_gpu`` (z_axis 3D ON):
    - Output shape ``(C_res, pD, pH, pW)``.
    - View 0 voxel-for-voxel equal to the OFF-path
-     ``_build_z_window_input_gpu`` (single-res builder) for the same
+     ``inputs.build_z_window_single_res_gpu`` (single-res builder) for the same
      window — both extract the centred ``pD`` slices with
      ``edge_pad`` boundary.
    - Aux-view crops match an explicit numpy reference
      (``extract_z_patch_padded`` → resize to ``pD``).
 
-3. ``_build_batch_native_multi_res_cubic_gpu`` (cubic 3D ON):
+3. ``inputs.build_cubic_batch_native_multi_res`` (cubic 3D ON):
    - Output shape ``(B, C_res, pD, pH, pW)``.
    - View 0 voxel-for-voxel equal to ``_extract_cubic_patch`` of size
      ``patch_size`` around the same centre (no resize, edge-padded).
@@ -109,15 +109,25 @@ def _make_predictor_stub(
         stub._mr_native_sizes = []
         stub._mr_target_shape = (pD, pH, pW)
 
-    # Bind unbound methods so we can call them on the stub.
+    # Bind module-level builders so we can call them on the stub.
+    from segtask_v1.predictor import inputs as _inputs
     stub._build_z_window_input_gpu = (
-        Predictor._build_z_window_input_gpu.__get__(stub, _Stub))
+        lambda vol_t, z0, z1: _inputs.build_z_window_single_res_gpu(
+            vol_t, z0, z1,
+            pD=stub.patch_D, pH=stub.patch_H, pW=stub.patch_W,
+            z_boundary_mode=stub.z_boundary_mode))
     stub._build_z_window_input_native_multi_res_gpu = (
-        Predictor._build_z_window_input_native_multi_res_gpu
-        .__get__(stub, _Stub))
+        lambda vol_t, z0, z1: _inputs.build_z_window_native_multi_res_gpu(
+            vol_t, z0, z1,
+            pD=stub.patch_D, pH=stub.patch_H, pW=stub.patch_W,
+            target_shape=stub._mr_target_shape,
+            native_sizes=stub._mr_native_sizes))
     stub._build_batch_native_multi_res_cubic_gpu = (
-        Predictor._build_batch_native_multi_res_cubic_gpu
-        .__get__(stub, _Stub))
+        lambda centers, vol_t: _inputs.build_cubic_batch_native_multi_res(
+            centers, vol_t,
+            pD=stub.patch_D, pH=stub.patch_H, pW=stub.patch_W,
+            target_shape=stub._mr_target_shape,
+            native_sizes=stub._mr_native_sizes))
     return stub
 
 

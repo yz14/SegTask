@@ -12,13 +12,13 @@ predictor sides:
        PHYSICALLY STRETCHES the z spacing of boundary windows.
      - ``edge_pad`` produces an output where boundary slices have been
        edge-replicated and z spacing is uniform.
-  4. ``Predictor._build_z_window_input_gpu`` (the path 2.5D actually
+  4. ``predictor.inputs.build_z_window_single_res_gpu`` (the path 2.5D actually
      uses on GPU) honours the toggle:
      - ``stretch`` resizes a (4, H, W) input to (12, H, W) via
        trilinear, blending neighbouring slices.
      - ``edge_pad`` pads (4, H, W) → (12, H, W) by replicating the
        boundary slices, preserving the inner 4 slices verbatim.
-  5. ``Predictor._build_z_window_input`` (CPU multi-res path) honours
+  5. ``predictor.inputs.build_z_window_cpu_multi_res`` (CPU multi-res path) honours
      the toggle on the scale=1.0 channel.
   6. End-to-end ``predict_volume`` runs without error and yields
      correct output shape on a synthetic volume with ``D_orig < pD``
@@ -225,7 +225,7 @@ def test_dataset_dispatch_stretch_vs_edge_pad():
 
 
 # ---------------------------------------------------------------------------
-# 4. Predictor._build_z_window_input_gpu (the 2.5D path)
+# 4. predictor.inputs.build_z_window_single_res_gpu (the 2.5D path)
 # ---------------------------------------------------------------------------
 def _build_minimal_predictor(z_boundary_mode: str, D=12, H=8, W=8,
                              num_fg=1, label_values=(0, 1)):
@@ -256,7 +256,10 @@ def test_predictor_build_z_window_gpu_stretch():
     for z in range(4):
         vol[z] = float(z) * 10.0
 
-    out = pred._build_z_window_input_gpu(vol, 0, 4)
+    from segtask_v1.predictor.inputs import build_z_window_single_res_gpu
+    out = build_z_window_single_res_gpu(
+        vol, 0, 4, pD=pred.patch_D, pH=pred.patch_H, pW=pred.patch_W,
+        z_boundary_mode=pred.z_boundary_mode)
     assert out.shape == (1, 12, 8, 8), out.shape
     z_means = out[0].mean(dim=(1, 2)).cpu().numpy()
     # Stretch: first slice ≈ 0, last ≈ 30; no 5-long constant runs.
@@ -285,7 +288,10 @@ def test_predictor_build_z_window_gpu_edge_pad():
     for z in range(4):
         vol[z] = float(z) * 10.0
 
-    out = pred._build_z_window_input_gpu(vol, 0, 4)
+    from segtask_v1.predictor.inputs import build_z_window_single_res_gpu
+    out = build_z_window_single_res_gpu(
+        vol, 0, 4, pD=pred.patch_D, pH=pred.patch_H, pW=pred.patch_W,
+        z_boundary_mode=pred.z_boundary_mode)
     assert out.shape == (1, 12, 8, 8), out.shape
     z_means = out[0].mean(dim=(1, 2)).cpu().numpy()
     # Layout: [0]*4 + [0, 10, 20, 30] + [30]*4
@@ -297,7 +303,7 @@ def test_predictor_build_z_window_gpu_edge_pad():
 
 
 # ---------------------------------------------------------------------------
-# 5. Predictor._build_z_window_input (CPU multi-res path)
+# 5. predictor.inputs.build_z_window_cpu_multi_res (CPU multi-res path)
 # ---------------------------------------------------------------------------
 def test_predictor_build_z_window_cpu_scale_1_edge_pad():
     """The CPU multi-res path is invoked when scales > 1.0 are present.
@@ -325,7 +331,11 @@ def test_predictor_build_z_window_cpu_scale_1_edge_pad():
         vol[z] = float(z) * 10.0
 
     # z0=0, z1=4 → z_center = 2 in CPU path.
-    out = predictor._build_z_window_input(vol, 0, 4)
+    from segtask_v1.predictor.inputs import build_z_window_cpu_multi_res
+    out = build_z_window_cpu_multi_res(
+        vol, 0, 4, pD=predictor.patch_D, pH=predictor.patch_H,
+        pW=predictor.patch_W, multi_res_scales=predictor.multi_res_scales,
+        z_boundary_mode=predictor.z_boundary_mode)
     assert out.shape == (2, 12, 8, 8), out.shape  # (C_res=2, pD=12, ...)
 
     # Channel 0 (scale=1.0) under edge_pad: extract_z_patch_padded(vol,
@@ -409,7 +419,7 @@ def test_predict_volume_short_volume_both_modes():
 # ---------------------------------------------------------------------------
 def test_predict_volume_long_volume_modes_equivalent():
     """When ``D_orig >= pD`` the sliding-window machinery never sees
-    a short tail (``_compute_1d_positions`` pulls back the tail to keep
+    a short tail (``blending.compute_1d_positions`` pulls back the tail to keep
     length=pD). In that regime both modes must produce identical
     predictions because the edge_pad branch never activates.
     """
