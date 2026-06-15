@@ -10,15 +10,14 @@ data:
   label_values: [0, 1]
   num_classes : 2
 
-  patch_size: [12, 320, 400]  ##################################################################
-  patch_mode: "2_5d"          ##################################################################
+  patch_size: [16, 256, 320]  ##################################################################
+  patch_mode: "z_axis"        ##################################################################
 
   multi_res_scales    : [1.0, 1.5, 2.0]
   aug_oversample_ratio: 1.5
 
   z_boundary_mode: "edge_pad"
-
-  keep_native_view_depth: true
+  keep_native_multi_res: true  ##################################################################
 
   intensity_min: -1024.0
   intensity_max: 1024.0
@@ -28,7 +27,7 @@ data:
   split_seed      : 42
   stratified_split: true
 
-  batch_size     : 8
+  batch_size     : 2
   num_workers    : 16
   prefetch_factor: 8
   pin_memory     : true
@@ -37,7 +36,7 @@ data:
   samples_per_volume         : 8
 
   cache_mode       : "memory"
-  cache_max_volumes: 12
+  cache_max_volumes: 72
 
 
 augment:
@@ -75,7 +74,7 @@ augment:
 
 model:
   backbone: "resnet"
-  encoder_channels: [64, 128, 256, 512, 512]
+  encoder_channels: [64, 64, 128, 256, 512]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   decoder_blocks_per_stage: [2, 2, 2, 2]
   block_type: "basic"
@@ -144,10 +143,10 @@ train:
   warmup_lr    : 1.0e-6
   cosine_min_lr: 1.0e-6
 
-  grad_accum_steps: 1
+  grad_accum_steps: 4
   grad_clip_norm  : 12.0
 
-  use_amp  : true
+  use_amp  : false
   amp_dtype: "auto"
 
   compile_mode: "none"
@@ -155,7 +154,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/lung_resnet_bnorm"    ############################################################
+  output_dir      : "outputs/lung_resnet3d_bnorm"    ############################################################
   save_every      : 10
   save_best_criterion: "dice+surface_dice"
   surface_dice_tolerance: 1
@@ -172,9 +171,9 @@ train:
   seed: 42
   deterministic: false
 
-  resume: ""
+  resume: "/data0/yzhen/timm_test/outputs/lung_resnet3d_bnorm/best_model.pth"
 
-  pretrain: "/data0/yzhen/timm_test/outputs/lung_resnet_bnorm/best_model.pth"
+  pretrain: ""
   pretrain_strict: false
   pretrain_load_ema: false
 
