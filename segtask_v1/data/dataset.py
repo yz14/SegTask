@@ -354,14 +354,6 @@ def compute_bbox_from_volume(vol: np.ndarray) -> Optional[BBox]:
     return (_span(d_any), _span(h_any), _span(w_any))
 
 
-def apply_bbox(vol: np.ndarray, bbox: Optional[BBox]) -> np.ndarray:
-    """将 (D,H,W) 裁为 bbox；bbox=None 返原卷。"""
-    if bbox is None:
-        return vol
-    (d0, d1), (h0, h1), (w0, w1) = bbox
-    return vol[d0:d1, h0:h1, w0:w1]
-
-
 # ---------------------------------------------------------------------------
 # Volume cache
 # ---------------------------------------------------------------------------
@@ -700,21 +692,6 @@ class SegDataset3D(SegDatasetNpzBase):
             return int(rng.choice(fg_slices))
         return int(rng.integers(0, D_vol))
 
-    def _extract_z_patch(
-        self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int
-        ) -> Tuple[np.ndarray, np.ndarray]:
-        """clamp 模式抽 z-patch：越界裁短，后续由 resize_3d 伸缩。"""
-        D_vol = img.shape[0]
-        half  = D_patch // 2
-        # 夹匯到体积边界
-        d_start = max(0, z_center - half)
-        d_end   = min(D_vol, d_start + D_patch)
-
-        img_patch = img[d_start:d_end]
-        lbl_patch = lbl[d_start:d_end]
-
-        return img_patch.copy(), lbl_patch.copy()
-
     def _extract_z_patch_padded(
         self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int
         ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1035,7 +1012,9 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         # 区域权重优先级：样本文件 > 静态映射。
         if self._has_region_weight_file(vol_idx):
             rw_vol = self._load_region_weight(vol_idx)
-            rw_vol = resize_3d(rw_vol, eD, eH, eW, is_label=False)
+            # rw 是分级权重（离散），必须 nearest 避免产生伪连续值；与 z_axis/cubic
+            # 路径一致（resize_3d(is_label=True) = order=0）。
+            rw_vol = resize_3d(rw_vol, eD, eH, eW, is_label=True)
             result["weight_map"] = torch.from_numpy(rw_vol[np.newaxis]).float()
         elif self.region_weights:
             rw_vol = compute_region_weight_map(
