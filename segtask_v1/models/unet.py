@@ -34,7 +34,7 @@ class Encoder(nn.Module):
         spatial_dims         : int = 3,
         num_stem_fusion_views: int = 1,
         stem_fusion_mode     : str = "shared_stem",
-        in_ch_per_view_list  : List[int] = None,
+        in_ch_per_view_list  : Optional[List[int]] = None,
         downsample_builder   : Optional[Callable[[int, int], nn.Module]] = None,
         downsample_strides   : Optional[List] = None):
         super().__init__()
@@ -336,7 +336,7 @@ class UNet3D(nn.Module):
         norm_type            : str = "instance",
         norm_groups          : int = 8,
         activation           : str = "leakyrelu",
-        aux_head_out_channels: List[int] = None,
+        aux_head_out_channels: Optional[List[int]] = None,
         num_fg_classes       : Optional[int] = None):
         super().__init__()
         # 向后兼容：旧形参名 num_fg_classes 实为"主头输出通道数"（2.5D 折叠下

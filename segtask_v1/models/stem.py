@@ -6,7 +6,7 @@ stem 模式：conv3/conv7/dual stride=1；patch2/patch4 stride=N 降分辨率（
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -131,7 +131,7 @@ class MultiStemProj(nn.Module):
         norm_groups        : int = 8,
         activation         : str = "leakyrelu",
         spatial_dims       : int = 3,
-        in_ch_per_view_list: List[int] = None):
+        in_ch_per_view_list: Optional[List[int]] = None):
         super().__init__()
         if n_views < 1:  # 多分辨率数量检查
             raise ValueError(f"n_views must be >= 1, got {n_views}")
@@ -196,8 +196,8 @@ class HierarchicalStems(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         spatial_dims: int = 3,
-        aux_channels: List[int] = None,
-        in_ch_per_view_list: List[int] = None):
+        aux_channels: Optional[List[int]] = None,
+        in_ch_per_view_list: Optional[List[int]] = None):
         """通道布局同 MultiStemProj：均分或逐 view 列表。"""
         super().__init__()
         if n_views < 1:
@@ -283,8 +283,8 @@ def build_context_stem(
     norm_groups        : int = 8,
     activation         : str = "leakyrelu",
     spatial_dims       : int = 3,
-    stage_channels     : List[int] = None,
-    in_ch_per_view_list: List[int] = None) -> Tuple[nn.Module, int]:
+    stage_channels     : Optional[List[int]] = None,
+    in_ch_per_view_list: Optional[List[int]] = None) -> Tuple[nn.Module, int]:
     """分派 2.5D 多 FOV stem，返回 (module, stem_stride)。
 
     n_views==1 或 'shared_stem'：单 stem。'multi_stem_proj'：逐 view stem + 3×3 融合。'hierarchical'：需 stage_channels，encoder 逐级 cat 融合。

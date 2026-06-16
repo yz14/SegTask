@@ -45,7 +45,7 @@ from segtask_v1.config import (  # noqa: E402
 from segtask_v1.data.dataset import (  # noqa: E402
     SegDataset3D, SegDataset3DCubic, preprocess_image,
 )
-from segtask_v1.trainer import Trainer  # noqa: E402
+from segtask_v1.trainer import views  # noqa: E402
 
 
 # ===========================================================================
@@ -114,9 +114,14 @@ def _make_split_stub(cfg: Config):
             int(round(pH * max_scale)),
             int(round(pW * max_scale)))
 
-    # Bind unbound method
-    stub._split_views_native_3d = (
-        Trainer._split_views_native_3d.__get__(stub, _Stub))
+    # Call the pure view-split function directly (no Trainer instance needed).
+    def _split(image, label, wmap):
+        return views.split_views_native_3d(
+            image, label, wmap,
+            target_patch_size=stub.target_patch_size,
+            mr_native_sizes=stub._mr_native_sizes,
+            patch_size=tuple(int(x) for x in cfg.data.patch_size))
+    stub._split_views_native_3d = _split
     return stub
 
 

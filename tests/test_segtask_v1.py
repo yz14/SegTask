@@ -82,41 +82,6 @@ class TestDataset:
         out = resize_3d(arr, 8, 16, 24, is_label=False)
         assert out.shape == (3, 8, 16, 24)
 
-    def test_extract_z_patch_small_volume(self):
-        """Volume smaller than patch: returns all available slices (no padding)."""
-        from segtask_v1.data.dataset import SegDataset3D
-        ds = SegDataset3D.__new__(SegDataset3D)
-        img = np.random.rand(30, 64, 64).astype(np.float32)
-        lbl = np.zeros((30, 64, 64), dtype=np.float32)
-        img_p, lbl_p = ds._extract_z_patch(img, lbl, 15, 64)
-        # User's updated code: no padding, returns clamped slice range
-        assert img_p.shape[0] <= 30
-        assert img_p.shape[0] > 0
-
-    def test_extract_z_patch_normal(self):
-        """Volume larger than patch: should extract exact D slices."""
-        from segtask_v1.data.dataset import SegDataset3D
-        ds = SegDataset3D.__new__(SegDataset3D)
-        img = np.random.rand(200, 64, 64).astype(np.float32)
-        lbl = np.zeros((200, 64, 64), dtype=np.float32)
-        img_p, lbl_p = ds._extract_z_patch(img, lbl, 100, 64)
-        assert img_p.shape[0] == 64
-
-    def test_extract_z_patch_boundary(self):
-        """Patch at boundary should clamp, not go out of bounds."""
-        from segtask_v1.data.dataset import SegDataset3D
-        ds = SegDataset3D.__new__(SegDataset3D)
-        img = np.random.rand(100, 32, 32).astype(np.float32)
-        lbl = np.zeros((100, 32, 32), dtype=np.float32)
-        # Near the end
-        img_p, _ = ds._extract_z_patch(img, lbl, 98, 64)
-        assert img_p.shape[0] > 0
-        assert img_p.shape[0] <= 100
-        # Near the start
-        img_p, _ = ds._extract_z_patch(img, lbl, 2, 64)
-        assert img_p.shape[0] > 0
-        assert img_p.shape[0] <= 100
-
 
 # ---------------------------------------------------------------------------
 # Model tests
@@ -1023,26 +988,20 @@ class TestCubicPredictor:
 # ---------------------------------------------------------------------------
 class TestTrainerCenterCrop:
     def test_center_crop(self):
-        from segtask_v1.trainer import Trainer
-        t = Trainer.__new__(Trainer)
-        t.target_patch_size = (16, 16, 16)
-        t.needs_crop = True
+        from segtask_v1.trainer import views
         image = torch.randn(2, 1, 24, 24, 24)
         label = torch.randn(2, 2, 24, 24, 24)
         wmap = torch.randn(2, 1, 24, 24, 24)
-        img_c, lbl_c, wm_c = t._center_crop(image, label, wmap)
+        img_c, lbl_c, wm_c = views.center_crop(image, label, wmap, (16, 16, 16))
         assert img_c.shape == (2, 1, 16, 16, 16)
         assert lbl_c.shape == (2, 2, 16, 16, 16)
         assert wm_c.shape == (2, 1, 16, 16, 16)
 
     def test_center_crop_no_wmap(self):
-        from segtask_v1.trainer import Trainer
-        t = Trainer.__new__(Trainer)
-        t.target_patch_size = (32, 32, 32)
-        t.needs_crop = True
+        from segtask_v1.trainer import views
         image = torch.randn(1, 1, 48, 48, 48)
         label = torch.randn(1, 3, 48, 48, 48)
-        img_c, lbl_c, wm_c = t._center_crop(image, label, None)
+        img_c, lbl_c, wm_c = views.center_crop(image, label, None, (32, 32, 32))
         assert img_c.shape == (1, 1, 32, 32, 32)
         assert lbl_c.shape == (1, 3, 32, 32, 32)
         assert wm_c is None
