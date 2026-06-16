@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Volume I/O
 # ---------------------------------------------------------------------------
-# NIfTI 读取重试：网盘/虚拟路径偊尔报 nifti_image_load failed，重试可恢复。
+# NIfTI 读取重试：网盘/虚拟路径偶尔报 nifti_image_load failed，重试可恢复。
 # 环境变量：SEGTASK_NIFTI_READ_RETRIES（默认 4）、SEGTASK_NIFTI_READ_BACKOFF_S（默认 0.5）。
 _NIFTI_READ_RETRIES = max(1, int(os.environ.get("SEGTASK_NIFTI_READ_RETRIES", "4")))
 _NIFTI_READ_BACKOFF_S = max(0.0, float(os.environ.get("SEGTASK_NIFTI_READ_BACKOFF_S", "0.5")))
@@ -299,7 +299,7 @@ def load_region_weight_volume(
 
 
 def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
-    """整数 label → 逐前景类二值掊叠 (num_fg,D,H,W) fp32；label_values 首位为背景。"""
+    """整数 label → 逐前景类二值堆叠 (num_fg,D,H,W) fp32；label_values 首位为背景。"""
     vol = np.round(volume).astype(np.int32)
     fg_values = label_values[1:]
     # 向量化比较：(C,1,1,1) == (D,H,W) → (C,D,H,W)。

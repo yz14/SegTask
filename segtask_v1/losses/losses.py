@@ -271,7 +271,11 @@ class CompoundLoss(nn.Module):
         self.losses  = nn.ModuleList(losses)
         self.weights = list(weights)
 
-    def forward(self, pred, target, weight_map = None):
+    def forward(
+        self,
+        pred      : torch.Tensor,
+        target    : torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         total = pred.new_zeros(())
         for fn, w in zip(self.losses, self.weights):
             total = total + w * fn(pred, target, weight_map=weight_map)

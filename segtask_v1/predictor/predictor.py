@@ -230,6 +230,53 @@ class Predictor:
     # ==================================================================
     # Public API
     # ==================================================================
+    def _log_normalized_input_stats(self, vol: np.ndarray) -> None:
+        """诊断：归一化后输入统计（与训练不一致时 range/分位数会明显偏差）。"""
+        dc = self.cfg.data
+        try:
+            vmin = float(vol.min()); vmax = float(vol.max())
+            vmean = float(vol.mean()); vstd = float(vol.std())
+            q = np.quantile(vol, [0.01, 0.5, 0.99])
+            logger.info(
+                "[diag] normalized input: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, std=%.4f, q1=%.4f, q50=%.4f, q99=%.4f "
+                "(normalize=%s, intensity=[%.1f,%.1f])",
+                tuple(vol.shape), vmin, vmax, vmean, vstd,
+                float(q[0]), float(q[1]), float(q[2]),
+                dc.normalize, float(dc.intensity_min), float(dc.intensity_max))
+        except Exception as e:
+            logger.warning("[diag] normalized-input stat failed: %s", e)
+
+    def _log_inroi_prob_stats(self, prob_volume: np.ndarray) -> None:
+        """诊断：blend 后概率统计（拼回原画布前计算，避免 ROI 外 0 偏移统计）。
+
+        frac_gt_thr ≈1.0 提示是模型输出本身饱和（训练侧问题），非后处理。
+        """
+        try:
+            max_per_vox = prob_volume.max(axis=0)
+            frac_gt_thr = float((max_per_vox >= self.threshold).mean())
+            q = np.quantile(prob_volume, [0.5, 0.9, 0.99, 0.999])
+            logger.info(
+                "[diag] in-ROI prob volume: shape=%s, min=%.4f, max=%.4f, "
+                "mean=%.4f, q50=%.4f, q90=%.4f, q99=%.4f, q999=%.4f, "
+                "frac(max_prob>=%.2f)=%.4f",
+                tuple(prob_volume.shape), float(prob_volume.min()),
+                float(prob_volume.max()), float(prob_volume.mean()),
+                float(q[0]), float(q[1]), float(q[2]), float(q[3]),
+                self.threshold, frac_gt_thr)
+            if frac_gt_thr > 0.95:
+                logger.warning(
+                    "[diag] %.1f%% of in-ROI voxels exceed threshold — "
+                    "the model itself is outputting near-saturated "
+                    "foreground; this is a TRAINING-side issue (most "
+                    "likely: training bbox/label semantics differ from "
+                    "this run, OR region weights drove the model to a "
+                    "trivial 'all-fg' minimum). Re-check cfg.data.bbox_dir, "
+                    "label_dir and region_weight_dir USED ON THE SERVER.",
+                    100.0 * frac_gt_thr)
+        except Exception as e:
+            logger.warning("[diag] prob-volume stat failed: %s", e)
+
     @torch.no_grad()
     def predict_volume(
         self,
@@ -285,21 +332,7 @@ class Predictor:
             raw_vol, dc.intensity_min, dc.intensity_max,
             dc.normalize, dc.global_mean, dc.global_std)
 
-        # 诊断：归一化后输入统计（与训练不一致时 range/分位数会明显偏差）。
-        try:
-            _v = vol
-            _vmin = float(_v.min()); _vmax = float(_v.max())
-            _vmean = float(_v.mean()); _vstd = float(_v.std())
-            _q = np.quantile(_v, [0.01, 0.5, 0.99])
-            logger.info(
-                "[diag] normalized input: shape=%s, min=%.4f, max=%.4f, "
-                "mean=%.4f, std=%.4f, q1=%.4f, q50=%.4f, q99=%.4f "
-                "(normalize=%s, intensity=[%.1f,%.1f])",
-                tuple(_v.shape), _vmin, _vmax, _vmean, _vstd,
-                float(_q[0]), float(_q[1]), float(_q[2]),
-                dc.normalize, float(dc.intensity_min), float(dc.intensity_max))
-        except Exception as _e:
-            logger.warning("[diag] normalized-input stat failed: %s", _e)
+        self._log_normalized_input_stats(vol)
         # AdaBN per_volume：用该卷自身先跑一遍前向重估 BN running stats，再冻结预测。
         # 估计期暂时抑制 forward 诊断（置护孔为已记录），随后再重置以让真实预测发一次。
         if (self.adabn_enabled and self.adabn_mode == "per_volume"
@@ -324,32 +357,7 @@ class Predictor:
 
         prob_volume = self.predict_preprocessed_array(vol, z_spacing=z_spacing)
 
-        # 诊断：blend 后概率统计（拼回原画布前计算，避免 ROI 外 0 偏移统计）。
-        # frac_gt_thr ≈1.0 提示是模型输出本身饱和（训练侧问题），非后处理。
-        try:
-            _pv = prob_volume  # (num_fg, D, H, W) inside-ROI only
-            _max_per_vox = _pv.max(axis=0)
-            _frac_gt_thr = float((_max_per_vox >= self.threshold).mean())
-            _q = np.quantile(_pv, [0.5, 0.9, 0.99, 0.999])
-            logger.info(
-                "[diag] in-ROI prob volume: shape=%s, min=%.4f, max=%.4f, "
-                "mean=%.4f, q50=%.4f, q90=%.4f, q99=%.4f, q999=%.4f, "
-                "frac(max_prob>=%.2f)=%.4f",
-                tuple(_pv.shape), float(_pv.min()), float(_pv.max()),
-                float(_pv.mean()), float(_q[0]), float(_q[1]),
-                float(_q[2]), float(_q[3]), self.threshold, _frac_gt_thr)
-            if _frac_gt_thr > 0.95:
-                logger.warning(
-                    "[diag] %.1f%% of in-ROI voxels exceed threshold — "
-                    "the model itself is outputting near-saturated "
-                    "foreground; this is a TRAINING-side issue (most "
-                    "likely: training bbox/label semantics differ from "
-                    "this run, OR region weights drove the model to a "
-                    "trivial 'all-fg' minimum). Re-check cfg.data.bbox_dir, "
-                    "label_dir and region_weight_dir USED ON THE SERVER.",
-                    100.0 * _frac_gt_thr)
-        except Exception as _e:
-            logger.warning("[diag] prob-volume stat failed: %s", _e)
+        self._log_inroi_prob_stats(prob_volume)
 
         # 拼回原尺寸画布以保 NIfTI affine 一致；bbox 外体素保留 0 概率。
         if bbox is not None:
