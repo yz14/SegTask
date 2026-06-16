@@ -196,20 +196,20 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
     image_paths, label_paths = discover_samples(  # 配对
         dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
 
-    exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
+    exclude_pids = _load_exclude_pids(dc.exclude_list)
     image_paths, label_paths, _ = _filter_by_exclude(  # 过滤
         image_paths, label_paths, dc.image_suffix, exclude_pids)
 
     bbox_paths_all: Optional[List[str]] = None
-    if getattr(dc, "bbox_dir", ""):
+    if dc.bbox_dir:
         bbox_paths_all = match_bbox_paths(  # 匹配bbox(严格1:1)
             image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
 
     rw_paths_all: Optional[List[str]] = None
-    if getattr(dc, "region_weight_dir", ""):
+    if dc.region_weight_dir:
         rw_paths_all = match_region_weight_paths(  # 匹配region weight(严格1:1)
             image_paths, dc.region_weight_dir, dc.image_suffix,
-            getattr(dc, "region_weight_suffix", ".nii.gz"))
+            dc.region_weight_suffix)
 
     samples: List[Dict[str, Optional[str]]] = []
     for i, (img, lbl) in enumerate(zip(image_paths, label_paths)):
@@ -350,8 +350,8 @@ def prepare_dataset(
         "config_paths": {
             "image_dir": cfg.data.image_dir,
             "label_dir": cfg.data.label_dir,
-            "bbox_dir": getattr(cfg.data, "bbox_dir", ""),
-            "region_weight_dir": getattr(cfg.data, "region_weight_dir", ""),
+            "bbox_dir": cfg.data.bbox_dir,
+            "region_weight_dir": cfg.data.region_weight_dir,
         },
         "label_values": label_values,
         "n_total": counters["total"],

@@ -55,7 +55,7 @@ class _StatefulStageBuilder:
 def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
     """返回按逐级 block 数构建 ResNet stage 的有状态函数。"""
     mc = cfg.model
-    spatial_dims = getattr(mc, "spatial_dims", 3)
+    spatial_dims = mc.spatial_dims
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ResNetStage:
         return ResNetStage(
@@ -77,7 +77,7 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
 def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
     """ConvNeXt stage 构建器：块内硬编码 LN+GELU；用户设其他 norm/act 时警告。"""
     mc = cfg.model
-    spatial_dims = getattr(mc, "spatial_dims", 3)
+    spatial_dims = mc.spatial_dims
     non_default = []
     if mc.norm_type != "instance":
         non_default.append(f"norm_type={mc.norm_type!r}")
@@ -98,7 +98,7 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
     total_blocks = sum(counts)
     dp_rates     = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
     rate_idx     = [0]
-    ls_init      = float(getattr(mc, "convnext_layer_scale_init", 1e-6))  # <=0 禁用
+    ls_init      = float(mc.convnext_layer_scale_init)  # <=0 禁用
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
         start = rate_idx[0]
@@ -119,7 +119,7 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
 def _make_convnext_downsample_builder(
     cfg: Config) -> Callable[[int, int], ConvNeXtDownsample]:
     """论文风 ConvNeXt 阶间下采样 LN→Conv(s=2) 构建器。"""
-    spatial_dims = getattr(cfg.model, "spatial_dims", 3)
+    spatial_dims = cfg.model.spatial_dims
 
     def build(in_ch: int, out_ch: int) -> ConvNeXtDownsample:
         return ConvNeXtDownsample(in_ch, out_ch, spatial_dims=spatial_dims)
@@ -185,17 +185,17 @@ def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
     if num_down <= 0:
         return None
 
-    explicit = list(getattr(mc, "downsample_strides", []) or [])
+    explicit = list(mc.downsample_strides or [])
     if explicit:
         return [tuple(int(x) for x in s) for s in explicit]
 
-    if not bool(getattr(mc, "anisotropic_pooling", False)):
+    if not bool(mc.anisotropic_pooling):
         return None  # 各向同性默认：Downsample/Upsample 用 stride=2
 
     # 自动推导：基于 patch 的"模型空间轴"尺寸（2.5D 的 D 折进通道，不计）。
     patch         = [int(x) for x in cfg.data.patch_size]  # [D, H, W]
     spatial_sizes = patch[1:] if spatial_dims == 2 else patch
-    stem_stride   = _stem_stride_of(getattr(mc, "stem_mode", "conv3"))
+    stem_stride   = _stem_stride_of(mc.stem_mode)
     spatial_sizes = [max(1, s // stem_stride) for s in spatial_sizes]
     return _auto_anisotropic_strides(spatial_sizes, num_down)
 
@@ -203,7 +203,7 @@ def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
 def build_model(cfg: Config):
     """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
     （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
-    arch = str(getattr(cfg.model, "arch", "unet")).lower()
+    arch = str(cfg.model.arch).lower()
     if arch == "adm":
         from .adm_unet import build_adm_seg_model
         return build_adm_seg_model(cfg)
@@ -253,7 +253,7 @@ def build_model(cfg: Config):
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)
         # LN-first 下采样；置 False 回退通用 Downsample（消融实验）。
-        if bool(getattr(mc, "convnext_downsample_lnfirst", True)):
+        if bool(mc.convnext_downsample_lnfirst):
             downsample_builder = _make_convnext_downsample_builder(cfg)
     else:
         raise ValueError(f"Unknown backbone: {mc.backbone}")
@@ -296,7 +296,7 @@ def build_model(cfg: Config):
         stem_mode             = mc.stem_mode,
         spatial_dims          = spatial_dims,
         num_stem_fusion_views = num_stem_fusion_views,
-        stem_fusion_mode      = getattr(mc, "stem_fusion_mode", "shared_stem"),
+        stem_fusion_mode      = mc.stem_fusion_mode,
         in_ch_per_view_list   = in_ch_per_view_list,
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides)
@@ -339,7 +339,7 @@ def build_model(cfg: Config):
         deep_supervision      = mc.deep_supervision,
         spatial_dims          = spatial_dims,
         aux_seg_supervision   = aux_seg_supervision,
-        aux_head_mode         = getattr(mc, "aux_head_mode", "linear"),
+        aux_head_mode         = mc.aux_head_mode,
         aux_head_out_channels = aux_head_out_channels_arg,
         norm_type             = mc.norm_type,
         norm_groups           = mc.norm_groups,
@@ -360,10 +360,10 @@ def build_model(cfg: Config):
         out_classes, num_fg,
         topo.num_res_groups if topo.num_res_groups > 0 else 1,
         mc.stem_mode, encoder.stem_stride,
-        num_stem_fusion_views, getattr(mc, "stem_fusion_mode", "shared_stem"),
+        num_stem_fusion_views, mc.stem_fusion_mode,
         mc.downsample_mode, mc.upsample_mode, mc.skip_mode,
         mc.attention_type, mc.skip_attention,
         mc.deep_supervision, aux_seg_supervision, len(model.aux_heads),
-        getattr(mc, "aux_head_mode", "linear"))
+        mc.aux_head_mode)
 
     return model

@@ -20,7 +20,7 @@ class GPUAugmentor:
         self.enabled   = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
         # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。仅 affine/elastic 动 wmap。
-        wmode = getattr(cfg, "wmap_interp_mode", "nearest")
+        wmode = cfg.wmap_interp_mode
         if wmode not in ("nearest", "bilinear"):
             raise ValueError(
                 f"AugConfig.wmap_interp_mode={wmode!r}; expected "

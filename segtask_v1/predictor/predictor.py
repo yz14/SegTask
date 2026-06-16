@@ -52,7 +52,7 @@ class Predictor:
         self.batch_size = pc.batch_size
         self.tta_flip = pc.tta_flip
         # TTA flip 变体批量化块大小（None → 退化为 batch_size）；见 forwards._tta_chunk_size。
-        self.tta_batch_size: Optional[int] = getattr(pc, "tta_batch_size", None)
+        self.tta_batch_size: Optional[int] = pc.tta_batch_size
         self.threshold = pc.threshold
         self.save_probs = pc.save_probabilities
         # 逐卷滑窗进度日志开关（运行期内部量，不暴露到配置）：CLI 推理默认 True；
@@ -63,12 +63,12 @@ class Predictor:
         # 后以 out[:, i::k]=stream_i 缝回。k 由 z spacing 挑选（见 sliding.choose_interleave_factor）。
         # 仅 patch_mode=='2_5d' 生效；Config 验证。
         self.z_interleave_enabled = bool(
-            getattr(pc, "z_interleave_enabled", False)
+            pc.z_interleave_enabled
             and cfg.data.patch_mode == "2_5d")
         self.z_interleave_thresholds: List[float] = list(
-            getattr(pc, "z_interleave_thresholds", [1.0, 1.5]))
+            pc.z_interleave_thresholds)
         self.z_interleave_factors: List[int] = [
-            int(f) for f in getattr(pc, "z_interleave_factors", [3, 2, 1])]
+            int(f) for f in pc.z_interleave_factors]
         if self.z_interleave_enabled:
             logger.info(
                 "Predictor z_interleave_enabled=True (2.5D only): "
@@ -77,8 +77,8 @@ class Predictor:
 
         # 测试时自适应 BatchNorm — per_volume 模式：每卷推理前用该卷自身重估 BN，
         # 再冻结预测（transductive BN）。global 模式在 run_inference 中处理，与此无关。
-        self.adabn_enabled = bool(getattr(pc, "adabn_enabled", False))
-        self.adabn_mode = getattr(pc, "adabn_mode", "global")
+        self.adabn_enabled = bool(pc.adabn_enabled)
+        self.adabn_mode = pc.adabn_mode
         self._adabn_bn_modules: List[torch.nn.Module] = []
         if self.adabn_enabled and self.adabn_mode == "per_volume":
             from .adabn import collect_bn_modules
@@ -100,9 +100,8 @@ class Predictor:
         self.num_fg = cfg.num_fg_classes
         # 默认单分辨率，避免下游 np.stack 报错。
         self.multi_res_scales = cfg.data.multi_res_scales or [1.0]
-        # 与 DataConfig.z_boundary_mode 同步，使训/用几何一致；老配置默认 stretch。
-        self.z_boundary_mode = getattr(
-            cfg.data, "z_boundary_mode", "stretch")
+        # 与 DataConfig.z_boundary_mode 同步，使训/用边界处理几何一致。
+        self.z_boundary_mode = cfg.data.z_boundary_mode
         if self.z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"Unknown z_boundary_mode {self.z_boundary_mode!r}; "
@@ -135,7 +134,7 @@ class Predictor:
                 self.patch_D * float(max(self.multi_res_scales))))
             # 与模型实际 in_channels 一致性检查（topology 已保证，此处仅防御 stale-cfg）。
             expect_in = sum(self.per_view_depths)
-            actual_in = int(getattr(cfg.model, "in_channels", expect_in))
+            actual_in = int(cfg.model.in_channels)
             if actual_in != expect_in:
                 raise ValueError(
                     f"keep_native_view_depth=True: model.in_channels={actual_in} "
@@ -186,14 +185,14 @@ class Predictor:
                 int(self.patch_D), int(self.patch_H), int(self.patch_W))
 
         # AMP：与训练同 dtype。未知值退 bf16 避免静默切换。
-        amp_name = getattr(cfg.train, "amp_dtype", "bfloat16")
+        amp_name = cfg.train.amp_dtype
         if amp_name not in _AMP_DTYPES:
             logger.warning("Unknown amp_dtype=%r, falling back to bfloat16.",
                            amp_name)
             amp_name = "bfloat16"
         self.amp_dtype = _AMP_DTYPES[amp_name]
         self.use_amp = (
-            getattr(cfg.train, "use_amp", True) and device.type == "cuda")
+            cfg.train.use_amp and device.type == "cuda")
 
         # 推理 dtype：run_inference 可能将 model.half()，下面依据 model_dtype
         # 调节输入转型与是否启用 autocast（fp16/bf16 下不启 autocast）。

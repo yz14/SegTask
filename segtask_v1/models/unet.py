@@ -98,7 +98,9 @@ class Encoder(nn.Module):
                 if downsample_builder is not None:  # 允许自定义
                     self.downsamples.append(downsample_builder(ds_in, ds_in))
                 else:
-                    self.downsamples.append(Downsample(  # TODO 这里最后一层是norm，确定没有问题吗？需要加act吗？
+                    # Downsample = 投影 conv/pool + norm，末尾不接激活：激活由下一个
+                    # encoder stage 的 block 内部施加（norm→conv 衔接，避免紧邻两次激活冗余）。
+                    self.downsamples.append(Downsample(
                         ds_in, ds_in,
                         norm_type=norm_type, norm_groups=norm_groups,
                         mode=downsample_mode, spatial_dims=spatial_dims,
@@ -361,22 +363,27 @@ class UNet3D(nn.Module):
         self.spatial_dims     = spatial_dims
 
         # 主头读最高分辨率 decoder 特征；stem_stride>1 时 forward 末尾上采回输入分辨率。DS 头保留各自分辨率。
-        self.stem_stride = getattr(encoder, "stem_stride", 1)
-        self.seg_head    = SegmentationHead(  # TODO 这里单层是否过于简单？是否可以选择多层？像ConvSegmentationHead
+        self.stem_stride = encoder.stem_stride
+        # 主头用单层 1×1 conv 输出 logits（nnU-Net 标准做法）：特征加工已由 decoder
+        # 各级 block 完成，输出头只需将最精细特征逐体素线性映射到类别通道。
+        self.seg_head    = SegmentationHead(
             decoder.out_channels[-1], self.out_channels,
             spatial_dims=spatial_dims)
 
         # DS 头按分辨率递减：forward 返回 [main, 2nd, ..., lowest]，对齐 DeepSupervisionLoss。
         if deep_supervision:
             self.ds_heads = nn.ModuleList()
+            # DS 头用 ConvSegmentationHead（3×3 ConvNormAct + 1×1）：低分辨率 decoder
+            # 特征较粗，先 3×3 局部精修再分类；主头特征最精细故 1×1 足矣。
             for ch in reversed(decoder.out_channels[:-1]):
-                self.ds_heads.append(ConvSegmentationHead(ch, self.out_channels, spatial_dims=spatial_dims))  # TODO 是否需要多层conv
+                self.ds_heads.append(
+                    ConvSegmentationHead(ch, self.out_channels, spatial_dims=spatial_dims))
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
-        n_views = int(getattr(encoder, "num_stem_fusion_views", 1))
-        fusion  = str(getattr(encoder, "stem_fusion_mode", "shared_stem"))
-        
+        n_views = int(encoder.num_stem_fusion_views)
+        fusion  = str(encoder.stem_fusion_mode)
+
         if bool(aux_seg_supervision) and n_views <= 1:  # 对多分辨率监督
             raise ValueError(
                 f"UNet3D got aux_seg_supervision=True but encoder."
