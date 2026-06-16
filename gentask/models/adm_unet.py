@@ -86,7 +86,13 @@ class _Downsample(nn.Module):
         return self.op(x)
 
 
-class _ResBlockNoEmb(nn.Module):
+class _ResBlockBase(nn.Module):
+    """ADM ResBlock 基类。子类 ``_ResBlockNoEmb``（分割，无 emb）/ ``_ResBlockEmb``
+    （扩散，AdaGN time-embed）共享。``forward(x, emb=None)`` 统一签名，使
+    encoder/middle/decoder 的逐块循环对两种块一视同仁地传 ``emb``。"""
+
+
+class _ResBlockNoEmb(_ResBlockBase):
     """ADM ResBlock（去 time-embed）。
     in: norm→silu→conv3；out: norm→silu→dropout→conv3(zero-init)；skip: Identity / conv1 / conv3。。"""
 
@@ -118,10 +124,71 @@ class _ResBlockNoEmb(nn.Module):
         else:
             self.skip_connection = _conv2d(in_channels, out_channels, 1)
 
-    def forward(self, x):
+    def forward(self, x, emb=None):
         h = self.in_layers(x)
         h = self.out_layers(h)
         return self.skip_connection(x) + h
+
+
+class _ResBlockEmb(_ResBlockBase):
+    """ADM ResBlock（论文忠实 time-embed，AdaGN scale-shift）。
+
+    与 ``_ResBlockNoEmb`` 结构一致，仅在 out 分支的 GroupNorm 之后注入
+    ``h = norm(h) * (1 + scale) + shift``，其中 ``(scale, shift)`` 由
+    ``SiLU + Linear(emb)`` 给出（Dhariwal & Nichol 2021 的 ``use_scale_shift_norm``）。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        emb_channels: int,
+        dropout: float = 0.0,
+        use_conv_skip: bool = False,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.in_layers = nn.Sequential(
+            _norm(in_channels),
+            nn.SiLU(),
+            _conv2d(in_channels, out_channels, 3, padding=1),
+        )
+        # emb → 2*out_channels（scale, shift），AdaGN。
+        self.emb_layers = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(emb_channels, 2 * out_channels),
+        )
+        self.out_norm = _norm(out_channels)
+        self.out_rest = nn.Sequential(
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            _zero_(_conv2d(out_channels, out_channels, 3, padding=1)),
+        )
+        if in_channels == out_channels:
+            self.skip_connection = nn.Identity()
+        elif use_conv_skip:
+            self.skip_connection = _conv2d(in_channels, out_channels, 3, padding=1)
+        else:
+            self.skip_connection = _conv2d(in_channels, out_channels, 1)
+
+    def forward(self, x, emb=None):
+        if emb is None:
+            raise ValueError("_ResBlockEmb.forward requires emb.")
+        h = self.in_layers(x)
+        scale_shift = self.emb_layers(emb).type(h.dtype)
+        scale, shift = scale_shift[:, :, None, None].chunk(2, dim=1)
+        h = self.out_norm(h) * (1 + scale) + shift
+        h = self.out_rest(h)
+        return self.skip_connection(x) + h
+
+
+def _make_resblock(
+    in_channels: int, out_channels: int, dropout: float, emb_channels: int):
+    """按 ``emb_channels`` 选择 ResBlock：0→分割无 emb；>0→扩散 AdaGN。"""
+    if emb_channels and emb_channels > 0:
+        return _ResBlockEmb(in_channels, out_channels, emb_channels, dropout=dropout)
+    return _ResBlockNoEmb(in_channels, out_channels, dropout=dropout)
 
 
 class _QKVAttentionLegacy(nn.Module):
@@ -260,9 +327,11 @@ class _ADMEncoder(nn.Module):
         linear_attention_levels: Optional[List[int]] = None,
         linear_attention_num_heads: int = 4,
         linear_attention_head_dim: int = 32,
+        emb_channels: int = 0,
     ):
         super().__init__()
         self.stem = stem
+        self.emb_channels = int(emb_channels)
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
         self.n_levels = n_levels
@@ -281,10 +350,11 @@ class _ADMEncoder(nn.Module):
             n_blocks = encoder_blocks_per_stage[level]
             for i in range(n_blocks):
                 blocks_this_level.append(
-                    _ResBlockNoEmb(
+                    _make_resblock(
                         ch_in if i == 0 else ch_out,
                         ch_out,
-                        dropout=dropout))
+                        dropout,
+                        self.emb_channels))
                 if level in self.attention_levels:
                     blocks_this_level.append(
                         _AttentionBlock(
@@ -306,15 +376,15 @@ class _ADMEncoder(nn.Module):
             else:
                 self.downsamples.append(None)  # type: ignore[arg-type]
 
-    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """返 {enc_features, enc_skips}。"""
         x = self.stem(x)
         enc_skips: List[torch.Tensor] = [x]
         enc_features: List[torch.Tensor] = []
         for level, blocks in enumerate(self.levels):
             for blk in blocks:
-                if isinstance(blk, _ResBlockNoEmb):
-                    x = blk(x)
+                if isinstance(blk, _ResBlockBase):
+                    x = blk(x, emb)
                     enc_skips.append(x)
                 else:  # AttentionBlock
                     x = blk(x)
@@ -339,15 +409,16 @@ class _ADMMiddle(nn.Module):
         num_heads: int,
         num_head_channels: int,
         dropout: float,
+        emb_channels: int = 0,
     ):
         super().__init__()
-        self.r1 = _ResBlockNoEmb(channels, channels, dropout=dropout)
+        self.r1 = _make_resblock(channels, channels, dropout, emb_channels)
         self.a = _AttentionBlock(
             channels, num_heads=num_heads, num_head_channels=num_head_channels)
-        self.r2 = _ResBlockNoEmb(channels, channels, dropout=dropout)
+        self.r2 = _make_resblock(channels, channels, dropout, emb_channels)
 
-    def forward(self, x):
-        return self.r2(self.a(self.r1(x)))
+    def forward(self, x, emb: Optional[torch.Tensor] = None):
+        return self.r2(self.a(self.r1(x, emb)), emb)
 
 
 class _ADMDecoder(nn.Module):
@@ -366,8 +437,10 @@ class _ADMDecoder(nn.Module):
         linear_attention_levels: Optional[List[int]] = None,
         linear_attention_num_heads: int = 4,
         linear_attention_head_dim: int = 32,
+        emb_channels: int = 0,
     ):
         super().__init__()
+        self.emb_channels = int(emb_channels)
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
         self.n_levels = n_levels
@@ -390,10 +463,11 @@ class _ADMDecoder(nn.Module):
             for i in range(n_blocks):
                 ich = skip_stack.pop()
                 blocks_this_level.append(
-                    _ResBlockNoEmb(
+                    _make_resblock(
                         ch + ich,
                         encoder_channels[level],
-                        dropout=dropout,
+                        dropout,
+                        self.emb_channels,
                     )
                 )
                 ch = encoder_channels[level]
@@ -431,7 +505,8 @@ class _ADMDecoder(nn.Module):
         ]
 
     def forward(
-        self, bottleneck: torch.Tensor, enc_skips: List[torch.Tensor]
+        self, bottleneck: torch.Tensor, enc_skips: List[torch.Tensor],
+        emb: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """返 dec_features，长 n_levels-1，low→high。"""
         x = bottleneck
@@ -440,14 +515,14 @@ class _ADMDecoder(nn.Module):
         dec_features: List[torch.Tensor] = []
         for ridx, level in enumerate(reversed(range(self.n_levels))):
             for blk in self.levels[ridx]:
-                if isinstance(blk, _ResBlockNoEmb):
+                if isinstance(blk, _ResBlockBase):
                     skip = skip_stack.pop()
                     if skip.shape[2:] != x.shape[2:]:
                         # 防御：输入空间与 encoder stride 对齐时不会触发。
                         skip = F.interpolate(
                             skip, size=x.shape[2:],
                             mode="bilinear", align_corners=False)
-                    x = blk(torch.cat([x, skip], dim=1))
+                    x = blk(torch.cat([x, skip], dim=1), emb)
                 else:  # AttentionBlock
                     x = blk(x)
             # 除最深级外均抓取，以合 UNet3D 约定。
@@ -763,4 +838,136 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         bool(mc.deep_supervision), aux_seg,
         len(model.aux_heads), mc.aux_head_mode)
 
+    return model
+
+
+# ============================================================================
+# Diffusion backbone（论文忠实：重新启用 timestep / σ 条件，AdaGN scale-shift）
+# ============================================================================
+
+
+def _sinusoidal_embedding(values: torch.Tensor, dim: int, max_period: float = 10000.0):
+    """标准正弦时间步嵌入（Transformer / ADM）。``values`` 形如 ``(B,)``。"""
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(half, device=values.device, dtype=torch.float32) / half)
+    args = values.float()[:, None] * freqs[None]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
+
+
+class ADMDiffusionUNet(nn.Module):
+    """ADM U-Net 的条件扩散 backbone（2.5D）。
+
+    复用 ``_ADMEncoder / _ADMMiddle / _ADMDecoder``，但以 ``emb_channels>0`` 启用
+    每个 ResBlock 的 AdaGN scale-shift（Dhariwal & Nichol 2021）。输入为
+    ``cat([x_noisy, cond], dim=1)``（cond=低分条件图），输出 ``out_channels`` 通道的
+    原始网络预测 ``F_θ``（EDM/DDPM 预条件由 ``DiffusionTrainWrapper`` 在外层施加）。
+
+    forward(x_cat, c_noise)：``c_noise`` 形如 ``(B,)``（EDM 取 ``0.25*ln σ``，DDPM 取
+    时间步索引），内部正弦嵌入 + MLP 得到 ``emb`` 并贯穿编/中/解码器。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        encoder_channels: List[int],
+        encoder_blocks_per_stage: List[int],
+        attention_levels: List[int],
+        num_heads: int = 4,
+        num_head_channels: int = -1,
+        dropout: float = 0.0):
+        super().__init__()
+        self.spatial_dims = 2
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        model_ch = int(encoder_channels[0])
+        self.model_ch = model_ch
+        emb_ch = model_ch * 4
+        self.emb_ch = emb_ch
+
+        # 时间步 MLP（正弦嵌入 → 2 层 Linear）。
+        self.time_mlp = nn.Sequential(
+            nn.Linear(model_ch, emb_ch),
+            nn.SiLU(),
+            nn.Linear(emb_ch, emb_ch),
+        )
+        # 输入卷积充当 stem（ADM 原始即单 Conv）。
+        input_conv = _conv2d(self.in_channels, model_ch, 3, padding=1)
+
+        self.encoder = _ADMEncoder(
+            stem=input_conv,
+            encoder_channels=encoder_channels,
+            encoder_blocks_per_stage=encoder_blocks_per_stage,
+            attention_levels=attention_levels,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            dropout=dropout,
+            emb_channels=emb_ch)
+        self.middle = _ADMMiddle(
+            channels=encoder_channels[-1],
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            dropout=dropout,
+            emb_channels=emb_ch)
+        self.decoder = _ADMDecoder(
+            encoder_channels=encoder_channels,
+            skip_channels=self.encoder.skip_channels,
+            decoder_blocks_per_stage=list(encoder_blocks_per_stage),
+            attention_levels=attention_levels,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            dropout=dropout,
+            emb_channels=emb_ch)
+        # 输出：GroupNorm + SiLU + zero-init conv（ADM 风格）。
+        self.out_norm = _norm(self.decoder.out_channels[-1])
+        self.out_conv = _zero_(
+            _conv2d(self.decoder.out_channels[-1], self.out_channels, 3, padding=1))
+
+    def forward(self, x_cat: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
+        target_size = x_cat.shape[2:]
+        emb = self.time_mlp(_sinusoidal_embedding(c_noise, self.model_ch))
+        enc_out = self.encoder(x_cat, emb)
+        bottleneck = self.middle(enc_out["bottleneck"], emb)
+        dec_features = self.decoder(bottleneck, enc_out["enc_skips"], emb)
+        h = dec_features[-1]
+        out = self.out_conv(F.silu(self.out_norm(h)))
+        if out.shape[2:] != target_size:
+            out = F.interpolate(
+                out, size=target_size, mode="bilinear", align_corners=False)
+        return out
+
+    def param_count(self) -> Dict[str, int]:
+        return {"total": sum(p.numel() for p in self.parameters())}
+
+
+def build_adm_diffusion_unet(
+    cfg, in_channels: int, out_channels: int) -> ADMDiffusionUNet:
+    """从 Config 构造 ADM 扩散 backbone（2.5D）。``in/out_channels`` 已折叠 D。"""
+    mc = cfg.model
+    enc_channels = list(mc.encoder_channels)
+    n_levels = len(enc_channels)
+    enc_bps = list(mc.encoder_blocks_per_stage) or [int(mc.blocks_per_level)] * n_levels
+    if len(enc_bps) != n_levels:
+        raise ValueError(
+            f"encoder_blocks_per_stage length {len(enc_bps)} != {n_levels}")
+    attn_levels = _resolve_attention_levels(n_levels, mc.adm_attention_levels)
+    model = ADMDiffusionUNet(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        encoder_channels=enc_channels,
+        encoder_blocks_per_stage=enc_bps,
+        attention_levels=attn_levels,
+        num_heads=int(mc.adm_num_heads),
+        num_head_channels=int(mc.adm_num_head_channels),
+        dropout=float(mc.dropout))
+    logger.info(
+        "Built ADMDiffusionUNet: total=%.2fM, channels=%s, enc_blocks=%s, "
+        "attn_levels=%s, in_ch=%d, out_ch=%d",
+        model.param_count()["total"] / 1e6, enc_channels, enc_bps,
+        attn_levels, in_channels, out_channels)
     return model

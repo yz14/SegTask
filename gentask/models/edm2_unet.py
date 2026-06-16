@@ -105,6 +105,7 @@ class _Block(nn.Module):
         res_balance: float = 0.3,
         attn_balance: float = 0.3,
         clip_act: float = 256.0,
+        emb_channels: int = 0,
     ):
         super().__init__()
         assert flavor in ("enc", "dec")
@@ -112,6 +113,7 @@ class _Block(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.flavor = flavor
+        self.emb_channels = int(emb_channels)
         self.resample_filter = tuple(resample_filter)
         self.resample_mode = resample_mode
         self.num_heads = (out_channels // channels_per_head) if attention else 0
@@ -123,6 +125,13 @@ class _Block(nn.Module):
         self.conv_res0 = _MPConv(
             out_channels if flavor == "enc" else in_channels,
             out_channels, kernel=[3, 3])
+        # 论文忠实条件 FiLM（Karras 2024 edm2）：emb → 逐通道乘性 gain (c+1)。
+        # emb_channels==0 时不构建，退化为分割（去 FiLM）行为。
+        if self.emb_channels > 0:
+            self.emb_linear = _MPConv(self.emb_channels, out_channels, kernel=[])
+            self.emb_gain = nn.Parameter(torch.zeros([]))
+        else:
+            self.emb_linear = None
         self.conv_res1 = _MPConv(out_channels, out_channels, kernel=[3, 3])
         self.conv_skip = (
             _MPConv(in_channels, out_channels, kernel=[1, 1])
@@ -134,7 +143,7 @@ class _Block(nn.Module):
             _MPConv(out_channels, out_channels, kernel=[1, 1])
             if self.num_heads != 0 else None)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Main branch.
         x = _resample(x, f=self.resample_filter, mode=self.resample_mode)
         if self.flavor == "enc":
@@ -144,7 +153,12 @@ class _Block(nn.Module):
 
         # Residual branch.
         y = self.conv_res0(_mp_silu(x))
-        y = _mp_silu(y)  # emb FiLM removed
+        if self.emb_linear is not None and emb is not None:
+            # FiLM：c = emb_linear(emb) + 1，逐通道乘到 y（保幅）。
+            c = self.emb_linear(emb, gain=self.emb_gain) + 1.0
+            y = _mp_silu(y * c.unsqueeze(2).unsqueeze(3).to(y.dtype))
+        else:
+            y = _mp_silu(y)
         if self.training and self.dropout != 0:
             y = F.dropout(y, p=self.dropout)
         y = self.conv_res1(y)
@@ -323,17 +337,17 @@ class _EDM2Encoder(nn.Module):
                 self.skip_channels.append(cout)
             self.level_blocks.append(nn.ModuleList(blocks))
 
-    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         x = self.stem(x)
         enc_skips: List[torch.Tensor] = [x]
         enc_features: List[torch.Tensor] = []
         for level in range(self.n_levels):
             entry = self.level_entries[level]
             if not isinstance(entry, nn.Identity):
-                x = entry(x)
+                x = entry(x, emb)
                 enc_skips.append(x)
             for blk in self.level_blocks[level]:
-                x = blk(x)
+                x = blk(x, emb)
                 enc_skips.append(x)
             enc_features.append(x)
         return {
@@ -405,7 +419,8 @@ class _EDM2Decoder(nn.Module):
         ]
 
     def forward(
-        self, bottleneck: torch.Tensor, enc_skips: List[torch.Tensor]
+        self, bottleneck: torch.Tensor, enc_skips: List[torch.Tensor],
+        emb: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         x = bottleneck
         skip_stack = list(enc_skips)
@@ -413,9 +428,9 @@ class _EDM2Decoder(nn.Module):
         for ridx, level in enumerate(reversed(range(self.n_levels))):
             entry = self.level_entries[ridx]
             kind = self.level_entries_kind[ridx]
-            x = entry(x)
+            x = entry(x, emb)
             if kind == "in0_in1":
-                x = self._in1(x)
+                x = self._in1(x, emb)
             for blk in self.level_blocks[ridx]:
                 skip = skip_stack.pop()
                 if skip.shape[2:] != x.shape[2:]:
@@ -423,7 +438,7 @@ class _EDM2Decoder(nn.Module):
                         skip, size=x.shape[2:],
                         mode="bilinear", align_corners=False)
                 x = _mp_cat(x, skip, dim=1, t=self.concat_balance)
-                x = blk(x)
+                x = blk(x, emb)
             if level < self.n_levels - 1:
                 dec_features.append(x)
         if skip_stack:
@@ -698,4 +713,142 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         bool(mc.deep_supervision), aux_seg,
         len(model.aux_heads), mc.aux_head_mode)
 
+    return model
+
+
+# ============================================================================
+# Diffusion backbone（论文忠实：重新启用 noise-level 条件 FiLM，MP 保幅）
+# ============================================================================
+
+
+class _MPFourier(nn.Module):
+    """EDM2 magnitude-preserving Fourier 噪声嵌入（Karras 2024）。"""
+
+    def __init__(self, num_channels: int, bandwidth: float = 1.0):
+        super().__init__()
+        self.register_buffer(
+            "freqs", 2 * np.pi * torch.randn(num_channels) * bandwidth)
+        self.register_buffer("phases", 2 * np.pi * torch.rand(num_channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = x.float().ger(self.freqs.float()) + self.phases.float()
+        return (y.cos() * np.sqrt(2)).to(x.dtype)
+
+
+class _EDM2Stem(nn.Module):
+    """扩散输入 stem：单个 3×3 MPConv（保持分辨率）。"""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = _MPConv(in_channels, out_channels, kernel=[3, 3])
+        self.stem_stride = 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class EDM2DiffusionUNet(nn.Module):
+    """EDM2 U-Net 的条件扩散 backbone（2.5D）。
+
+    复用 ``_EDM2Encoder / _EDM2Decoder``，以 ``emb_channels>0`` 重新启用每个
+    ``_Block`` 的 magnitude-preserving FiLM（Karras 2024）。输入
+    ``cat([x_noisy, cond], dim=1)``，输出 ``out_channels`` 原始预测 ``F_θ``。
+
+    forward(x_cat, c_noise)：``c_noise``（B,）经 MP-Fourier + MP-Linear + mp_silu
+    得到 ``emb`` 贯穿编/解码器。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        encoder_channels: List[int],
+        encoder_blocks_per_stage: List[int],
+        attention_levels: List[int],
+        channels_per_head: int = 64,
+        dropout: float = 0.0,
+        res_balance: float = 0.3,
+        attn_balance: float = 0.3,
+        concat_balance: float = 0.5,
+        clip_act: float = 256.0):
+        super().__init__()
+        self.spatial_dims = 2
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        model_ch = int(encoder_channels[0])
+        emb_ch = model_ch
+        self.emb_ch = emb_ch
+
+        # 噪声水平嵌入：MP-Fourier → MP-Linear → mp_silu。
+        self.emb_fourier = _MPFourier(model_ch)
+        self.emb_linear = _MPConv(model_ch, emb_ch, kernel=[])
+
+        block_kwargs = dict(
+            channels_per_head=channels_per_head,
+            dropout=dropout,
+            res_balance=res_balance,
+            attn_balance=attn_balance,
+            clip_act=clip_act,
+            emb_channels=emb_ch)
+
+        stem = _EDM2Stem(self.in_channels, model_ch)
+        self.encoder = _EDM2Encoder(
+            stem=stem,
+            encoder_channels=encoder_channels,
+            encoder_blocks_per_stage=encoder_blocks_per_stage,
+            attention_levels=attention_levels,
+            block_kwargs=block_kwargs)
+        self.decoder = _EDM2Decoder(
+            encoder_channels=encoder_channels,
+            skip_channels=self.encoder.skip_channels,
+            decoder_blocks_per_stage=list(encoder_blocks_per_stage),
+            attention_levels=attention_levels,
+            concat_balance=concat_balance,
+            block_kwargs=block_kwargs)
+        self.out_conv = _MPConv(self.decoder.out_channels[-1], self.out_channels, kernel=[3, 3])
+        self.out_gain = nn.Parameter(torch.zeros([]))
+
+    def forward(self, x_cat: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
+        target_size = x_cat.shape[2:]
+        emb = _mp_silu(self.emb_linear(self.emb_fourier(c_noise)))
+        enc_out = self.encoder(x_cat, emb)
+        dec_features = self.decoder(enc_out["bottleneck"], enc_out["enc_skips"], emb)
+        out = self.out_conv(dec_features[-1], gain=self.out_gain)
+        if out.shape[2:] != target_size:
+            out = F.interpolate(
+                out, size=target_size, mode="bilinear", align_corners=False)
+        return out
+
+    def param_count(self) -> Dict[str, int]:
+        return {"total": sum(p.numel() for p in self.parameters())}
+
+
+def build_edm2_diffusion_unet(
+    cfg, in_channels: int, out_channels: int) -> EDM2DiffusionUNet:
+    """从 Config 构造 EDM2 扩散 backbone（2.5D）。``in/out_channels`` 已折叠 D。"""
+    mc = cfg.model
+    enc_channels = list(mc.encoder_channels)
+    n_levels = len(enc_channels)
+    enc_bps = list(mc.encoder_blocks_per_stage) or [int(mc.blocks_per_level)] * n_levels
+    if len(enc_bps) != n_levels:
+        raise ValueError(
+            f"encoder_blocks_per_stage length {len(enc_bps)} != {n_levels}")
+    attn_levels = _resolve_attn_levels(n_levels, mc.edm2_attention_levels)
+    model = EDM2DiffusionUNet(
+        in_channels=in_channels,
+        out_channels=out_channels,
+        encoder_channels=enc_channels,
+        encoder_blocks_per_stage=enc_bps,
+        attention_levels=attn_levels,
+        channels_per_head=int(mc.edm2_channels_per_head),
+        dropout=float(mc.dropout),
+        res_balance=float(mc.edm2_res_balance),
+        attn_balance=float(mc.edm2_attn_balance),
+        concat_balance=float(mc.edm2_concat_balance),
+        clip_act=float(mc.edm2_clip_act))
+    logger.info(
+        "Built EDM2DiffusionUNet: total=%.2fM, channels=%s, enc_blocks=%s, "
+        "attn_levels=%s, in_ch=%d, out_ch=%d",
+        model.param_count()["total"] / 1e6, enc_channels, enc_bps,
+        attn_levels, in_channels, out_channels)
     return model

@@ -1,0 +1,189 @@
+"""生成（超分）训练器。
+
+分割 ``Trainer`` / 评估器与 Dice 深度耦合，不适合直接承载生成任务；本模块提供
+独立但精简的 ``GenerationTrainer``，复用既有训练基建（优化器 / 调度器 / warmup /
+AMP / EMA），针对图像复原实现训练与验证：
+
+* 训练：从干净图 ``hr`` 在线退化得低分条件图，前向 → 回归 / 扩散损失 → 反传。
+* 验证：``model.restore(lr)`` 复原后算 PSNR / SSIM，并报告 LR 基线 PSNR 作参照。
+
+模型由 ``models.generation.build_generation_model`` 构造，对外暴露
+``forward(hr) / restore(lr) / degrade(hr)`` 统一接口（见该模块）。
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from pathlib import Path
+from typing import Dict
+
+import torch
+import torch.nn as nn
+
+from ..config import Config
+from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
+from ..utils import AverageMeter, ModelEMA
+from .amp import GradScaler, resolve_auto_amp_dtype
+from .checkpoint import unwrap_compile
+from .optim import WarmupScheduler, build_optimizer, build_scheduler
+
+logger = logging.getLogger(__name__)
+
+_AMP_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+               "float32": torch.float32}
+
+
+class GenerationTrainer:
+    """超分生成训练器（回归 / 扩散）。"""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: Config,
+        train_loader,
+        val_loader,
+        device: torch.device):
+        self.cfg = cfg
+        self.device = device
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.model = model.to(device)
+        tc = cfg.train
+
+        self.is_diffusion = str(cfg.task.algorithm).lower() == "diffusion"
+        self.spatial_dims = 2 if cfg.data.patch_mode == "2_5d" else 3
+        if self.is_diffusion:
+            self.loss_fn: nn.Module = DiffusionLoss()
+        else:
+            self.loss_fn = build_recon_loss(cfg)
+
+        self.optimizer = build_optimizer(self.model, cfg)
+        steps_per_epoch = max(len(train_loader), 1)
+        warmup_steps = tc.warmup_epochs * steps_per_epoch
+        total_steps = tc.epochs * steps_per_epoch
+        base_scheduler = build_scheduler(
+            self.optimizer, cfg, steps_per_epoch,
+            post_warmup_steps=total_steps - warmup_steps)
+        self.scheduler = WarmupScheduler(
+            self.optimizer, base_scheduler, warmup_steps=warmup_steps,
+            warmup_lr=tc.warmup_lr, base_lr=tc.lr)
+
+        amp_name = tc.amp_dtype
+        if amp_name == "auto":
+            amp_name = resolve_auto_amp_dtype(device)
+        self.amp_dtype = _AMP_DTYPES.get(amp_name, torch.float32)
+        self.use_amp = tc.use_amp and device.type == "cuda"
+        self.scaler = GradScaler(
+            "cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
+
+        self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
+        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
+
+        self.output_dir = Path(tc.output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # 选模指标：PSNR 越大越好。
+        self.best_metric = -math.inf
+        self.best_epoch = 0
+
+    # ------------------------------------------------------------------
+    def _hr_batch(self, batch) -> torch.Tensor:
+        """取干净高分图（忽略分割标签）。"""
+        return batch["image"].to(self.device, non_blocking=True).float()
+
+    def _step_loss(self, out: Dict[str, torch.Tensor], breakdown) -> torch.Tensor:
+        if self.is_diffusion:
+            return self.loss_fn(out, breakdown=breakdown)
+        return self.loss_fn(out["pred"], out["target"], breakdown=breakdown)
+
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        self.model.train()
+        loss_meter = AverageMeter()
+        accum = self.grad_accum_steps
+        total = len(self.train_loader)
+        self.optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(self.train_loader):
+            hr = self._hr_batch(batch)
+            with torch.autocast(device_type=self.device.type,
+                                enabled=self.use_amp, dtype=self.amp_dtype):
+                out = self.model(hr)
+            bd: Dict[str, float] = {}
+            loss = self._step_loss(out, bd)
+            loss_scaled = loss / accum if accum > 1 else loss
+            self.scaler.scale(loss_scaled).backward()
+
+            if (step + 1) % accum == 0 or (step + 1) == total:
+                if self.cfg.train.grad_clip_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.cfg.train.grad_clip_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scheduler.step()
+                if self.ema is not None:
+                    self.ema.update(self.model)
+
+            if math.isfinite(loss.item()):
+                loss_meter.update(loss.item(), hr.shape[0])
+            if (step + 1) % max(self.cfg.train.log_every, 1) == 0 or step == 0:
+                logger.debug("  [%d/%d] loss=%.4f lr=%.2e",
+                             step + 1, total, loss.item(), self.scheduler.get_lr())
+        return {"loss": loss_meter.avg}
+
+    @torch.no_grad()
+    def _validate(self, epoch: int) -> Dict[str, float]:
+        self.model.eval()
+        if self.ema is not None:
+            self.ema.apply_shadow(self.model)
+        psnr_m, ssim_m, base_m = AverageMeter(), AverageMeter(), AverageMeter()
+        try:
+            for batch in self.val_loader:
+                hr = self._hr_batch(batch)
+                bare = unwrap_compile(self.model)
+                lr = bare.degrade(hr)
+                rec = bare.restore(lr).clamp(0.0, 1.0)
+                psnr_m.update(float(psnr(rec, hr)), hr.shape[0])
+                ssim_m.update(
+                    float(ssim(rec, hr, self.spatial_dims)), hr.shape[0])
+                base_m.update(float(psnr(lr.clamp(0, 1), hr)), hr.shape[0])
+        finally:
+            if self.ema is not None:
+                self.ema.restore(self.model)
+        return {"psnr": psnr_m.avg, "ssim": ssim_m.avg, "psnr_lr": base_m.avg}
+
+    def _save_best(self, epoch: int) -> None:
+        bare = unwrap_compile(self.model)
+        state = {
+            "epoch": epoch,
+            "model_state_dict": bare.state_dict(),
+            "best_metric": self.best_metric,
+            "best_epoch": self.best_epoch,
+            "config": self.cfg,
+        }
+        if self.ema is not None:
+            state["ema_state_dict"] = self.ema.state_dict()
+        torch.save(state, self.output_dir / "best_model.pth")
+        logger.info("Best generation model saved (PSNR=%.3f) @ epoch %d",
+                    self.best_metric, epoch + 1)
+
+    def fit(self) -> Dict[str, float]:
+        last: Dict[str, float] = {}
+        for epoch in range(self.cfg.train.epochs):
+            tr = self._train_epoch(epoch)
+            val = self._validate(epoch)
+            self.scheduler.step_epoch(val.get("psnr"))
+            logger.info(
+                "Epoch %d/%d: train_loss=%.4f val_PSNR=%.3f (LR=%.3f) val_SSIM=%.4f",
+                epoch + 1, self.cfg.train.epochs, tr["loss"],
+                val["psnr"], val["psnr_lr"], val["ssim"])
+            if val["psnr"] > self.best_metric:
+                self.best_metric = val["psnr"]
+                self.best_epoch = epoch
+                self._save_best(epoch)
+            last = {**tr, **val}
+        return {"best_psnr": self.best_metric, "best_epoch": self.best_epoch,
+                **last}
+
+
+__all__ = ["GenerationTrainer"]

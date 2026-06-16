@@ -201,6 +201,18 @@ def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
 
 
 def build_model(cfg: Config):
+    """顶层模型工厂。
+
+    生成任务（``cfg.is_generation``）分派到回归 / 扩散生成模型；否则按
+    ``cfg.model.arch`` 构造分割 backbone（见 ``build_backbone``）。
+    """
+    if getattr(cfg, "is_generation", False):
+        from .generation import build_generation_model
+        return build_generation_model(cfg)
+    return build_backbone(cfg)
+
+
+def build_backbone(cfg: Config):
     """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
     （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
     arch = str(cfg.model.arch).lower()

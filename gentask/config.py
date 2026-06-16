@@ -664,6 +664,76 @@ class PredictConfig:
 
 
 # ---------------------------------------------------------------------------
+# Task configuration（分割 vs 生成）
+# ---------------------------------------------------------------------------
+@dataclass
+class TaskConfig:
+    """任务类型与生成任务设置。
+
+    ``type=='segmentation'``（默认）时本节其余字段全部忽略，旧配置零改动可跑。
+    ``type=='generation'`` 时启用图像复原（当前仅超分 super-resolution），由
+    ``algorithm`` 选择两类经典范式之一：
+
+      * ``'regression'`` —— 前馈回归复原（DnCNN / SRCNN / U-Net regression）。
+        模型一次前向把退化图映射回干净图；可选残差学习（预测 HR−LR）。
+      * ``'diffusion'``  —— 条件扩散（DDPM / EDM），以退化图为条件迭代去噪采样
+        （类 SR3 / Palette）。复用 ADM / EDM2 backbone（带 timestep/σ 条件）。
+
+    设计为扁平字段，便于 YAML 直接映射、避免嵌套 dataclass 递归构造的歧义。
+    """
+
+    # "segmentation" | "generation"
+    type: str = "segmentation"
+
+    # 生成算法："regression" | "diffusion"。
+    algorithm: str = "regression"
+
+    # 复原子任务（退化算子）。当前仅 "superres"。
+    degradation: str = "superres"
+
+    # 生成输出通道数（CT 灰度=1）。决定生成头/模型输出通道。
+    out_channels: int = 1
+
+    # --- 超分退化（degradation=="superres"）---
+    # 下采样倍率（各空间轴一致）。LR = down(HR, 1/scale) 再 up 回 HR 尺寸作输入。
+    sr_scale: int = 2
+    # 制作 LR 的下/上采样插值："trilinear" | "area" | "nearest"。area≈抗锯齿平均池化。
+    sr_kernel: str = "area"
+    # LR 上附加高斯噪声（模拟采集噪声）；0=禁用。
+    sr_noise_std: float = 0.0
+
+    # --- 回归算法（algorithm=="regression"）---
+    # 残差学习：模型预测 (HR − LR_up)，最终输出 = pred + LR_up（DnCNN/VDSR 思路）。
+    residual: bool = False
+    # 重建损失："charbonnier" | "l1" | "mse"。
+    recon_loss: str = "charbonnier"
+    charbonnier_eps: float = 1e-3
+    # SSIM 辅助损失权重（0=禁用）。总损失 = recon + ssim_weight*(1-SSIM) + grad_weight*grad。
+    ssim_weight: float = 0.0
+    ssim_window: int = 7
+    # 梯度（边缘）L1 损失权重（0=禁用）。
+    grad_weight: float = 0.0
+
+    # --- 扩散算法（algorithm=="diffusion"）---
+    # 参数化："edm"（Karras 2022 去噪预条件）| "ddpm_eps"（Ho 2020 ε-预测）。
+    parameterization: str = "edm"
+    # DDPM 训练步数与 β schedule（parameterization=="ddpm_eps"）。
+    num_train_timesteps: int = 1000
+    beta_schedule: str = "linear"  # "linear" | "cosine"
+    # EDM σ 采样分布与数据尺度（parameterization=="edm"）。
+    sigma_data: float = 0.5
+    p_mean: float = -1.2
+    p_std: float = 1.2
+    # 采样器："edm_heun"（EDM 二阶）| "ddpm"（祖先采样）| "ddim"。
+    sampler: str = "edm_heun"
+    sample_steps: int = 18
+    sigma_min: float = 0.002
+    sigma_max: float = 80.0
+    rho: float = 7.0
+    ddim_eta: float = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
 @dataclass
@@ -676,6 +746,7 @@ class Config:
     loss   : LossConfig    = field(default_factory=LossConfig)
     train  : TrainConfig   = field(default_factory=TrainConfig)
     predict: PredictConfig = field(default_factory=PredictConfig)
+    task   : TaskConfig    = field(default_factory=TaskConfig)
 
     def sync(self) -> None:
         """同步跨子配置的对应字段。
@@ -787,9 +858,64 @@ class Config:
         self._validate_2_5d()
         self._validate_train()
         self._validate_predict()
-        if self.data.num_classes < 2:
+        self._validate_task()
+        if not self.is_generation and self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)
+
+    def _validate_task(self) -> None:
+        """task.* 校验：仅 type=='generation' 时检查生成相关字段。"""
+        t = self.task
+        ttype = str(t.type).lower()
+        _require(
+            ttype in ("segmentation", "generation"),
+            f"Invalid task.type: {t.type!r}. Valid: 'segmentation' | 'generation'.")
+        if ttype != "generation":
+            return
+        _require(
+            str(t.algorithm).lower() in ("regression", "diffusion"),
+            f"Invalid task.algorithm: {t.algorithm!r}. Valid: 'regression' | 'diffusion'.")
+        _require(
+            str(t.degradation).lower() == "superres",
+            f"Invalid task.degradation: {t.degradation!r}. Only 'superres' supported.")
+        _require(t.out_channels >= 1, f"task.out_channels must be >= 1; got {t.out_channels}.")
+        _require(t.sr_scale >= 1, f"task.sr_scale must be >= 1; got {t.sr_scale}.")
+        _require(
+            str(t.sr_kernel).lower() in ("trilinear", "area", "nearest"),
+            f"Invalid task.sr_kernel: {t.sr_kernel!r}. Valid: 'trilinear' | 'area' | 'nearest'.")
+        _require(t.sr_noise_std >= 0.0, "task.sr_noise_std must be >= 0.")
+        if str(t.algorithm).lower() == "regression":
+            _require(
+                str(t.recon_loss).lower() in ("charbonnier", "l1", "mse"),
+                f"Invalid task.recon_loss: {t.recon_loss!r}. Valid: 'charbonnier' | 'l1' | 'mse'.")
+            _require(t.ssim_weight >= 0.0 and t.grad_weight >= 0.0,
+                     "task.ssim_weight / grad_weight must be >= 0.")
+            _require(t.ssim_window >= 3 and t.ssim_window % 2 == 1,
+                     f"task.ssim_window must be odd and >= 3; got {t.ssim_window}.")
+        else:  # diffusion
+            _require(
+                str(t.parameterization).lower() in ("edm", "ddpm_eps"),
+                f"Invalid task.parameterization: {t.parameterization!r}. Valid: 'edm' | 'ddpm_eps'.")
+            _require(
+                str(t.beta_schedule).lower() in ("linear", "cosine"),
+                f"Invalid task.beta_schedule: {t.beta_schedule!r}. Valid: 'linear' | 'cosine'.")
+            _require(
+                str(t.sampler).lower() in ("edm_heun", "ddpm", "ddim"),
+                f"Invalid task.sampler: {t.sampler!r}. Valid: 'edm_heun' | 'ddpm' | 'ddim'.")
+            _require(t.num_train_timesteps >= 1, "task.num_train_timesteps must be >= 1.")
+            _require(t.sample_steps >= 1, "task.sample_steps must be >= 1.")
+            _require(0.0 < t.sigma_min < t.sigma_max, "require 0 < sigma_min < sigma_max.")
+            _require(t.sigma_data > 0.0, "task.sigma_data must be > 0.")
+            _require(t.rho > 0.0, "task.rho must be > 0.")
+            # ddpm_eps 采样必须用 ddpm/ddim；edm_heun 仅适用于 edm 预条件。
+            if str(t.parameterization).lower() == "ddpm_eps":
+                _require(
+                    str(t.sampler).lower() in ("ddpm", "ddim"),
+                    "parameterization='ddpm_eps' requires sampler in ('ddpm','ddim').")
+            else:
+                _require(
+                    str(t.sampler).lower() == "edm_heun",
+                    "parameterization='edm' requires sampler='edm_heun'.")
 
     def _validate_model(self) -> None:
         """model.* 架构选项与逐级拓扑长度校验。"""
@@ -1208,8 +1334,24 @@ class Config:
 
 
     @property
+    def is_generation(self) -> bool:
+        """True 当 task.type=='generation'。"""
+        return str(self.task.type).lower() == "generation"
+
+    @property
+    def gen_out_channels(self) -> int:
+        """生成任务每空间位置的输出通道数（CT 灰度=1）。"""
+        return int(self.task.out_channels)
+
+    @property
     def num_fg_classes(self) -> int:
-        """Number of foreground classes (excluding background)."""
+        """Number of foreground classes (excluding background).
+
+        生成任务下没有"前景类"概念，复用该接口返回 ``out_channels``，使依赖它
+        推导输出通道数的下游（模型头 / 2.5D SliceChannel 重塑）保持统一口径。
+        """
+        if self.is_generation:
+            return int(self.task.out_channels)
         return max(self.data.num_classes - 1, 1)
 
     @property
@@ -1233,6 +1375,7 @@ _SUB_CONFIGS = {
     "loss": LossConfig,
     "train": TrainConfig,
     "predict": PredictConfig,
+    "task": TaskConfig,
 }
 
 
