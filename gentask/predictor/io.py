@@ -83,7 +83,7 @@ def _resolve_inference_precision(precision: str, cfg: Config) -> str:
             f"precision={precision!r} not in {_PRECISION_CHOICES}")
     if p != "auto":
         return p
-    amp = (getattr(cfg.train, "amp_dtype", "bfloat16") or "bfloat16").lower()
+    amp = (cfg.train.amp_dtype or "bfloat16").lower()
     if amp in ("float16", "fp16"):
         return "fp16"
     return "bf16"
@@ -159,8 +159,8 @@ def run_inference(
 
     # 测试时自适应 BatchNorm — global 模式：推理前用少量目标域整卷重估 BN running
     # stats，全程复用。per_volume 模式不在此处理（见 Predictor.predict_volume）。
-    if getattr(cfg.predict, "adabn_enabled", False) and \
-            getattr(cfg.predict, "adabn_mode", "global") == "global":
+    if cfg.predict.adabn_enabled and \
+            cfg.predict.adabn_mode == "global":
         from .adabn import collect_bn_modules, estimate_bn_stats
 
         bn_modules = collect_bn_modules(model)
