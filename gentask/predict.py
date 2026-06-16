@@ -113,6 +113,17 @@ def main():
                      "Exiting without running inference.")
         return
 
+    if cfg.is_generation:
+        from .predictor.gen_predictor import run_generation_inference
+        run_generation_inference(
+            cfg=cfg,
+            checkpoint_path=checkpoint_path,
+            image_paths=image_paths,
+            weight_variant=args.weights,
+            output_dir=cfg.predict.output_dir,
+        )
+        return
+
     run_inference(
         cfg=cfg,
         checkpoint_path=checkpoint_path,

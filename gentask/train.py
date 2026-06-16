@@ -86,8 +86,12 @@ def main():
     # Save resolved config
     save_config(cfg, Path(cfg.train.output_dir) / "resolved_config.yaml")
 
-    # Train
-    trainer      = Trainer(model, cfg, train_loader, val_loader, device)
+    # Train（生成任务走专用训练器，分割走原 Trainer）
+    if cfg.is_generation:
+        from .trainer.gen_trainer import GenerationTrainer
+        trainer = GenerationTrainer(model, cfg, train_loader, val_loader, device)
+    else:
+        trainer = Trainer(model, cfg, train_loader, val_loader, device)
     best_metrics = trainer.fit()
 
     logger.info("Best metrics: %s", best_metrics)

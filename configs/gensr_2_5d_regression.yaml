@@ -1,0 +1,105 @@
+# 2.5D 超分（生成任务）— 回归复原（DnCNN / SRCNN / U-Net regression）
+#
+# TODO #2：用经典生成算法改写 gentask。本配置走「前馈回归」范式：
+#   单次前向把低分图映射回高分图；task.residual=true 时学习残差 (HR−LR)。
+#
+# 关键：task.type='generation' + task.algorithm='regression'。复用分割 backbone
+# 作图到图网络（输出通道由 task.out_channels 决定，CT 灰度=1）。分割标签在生成
+# 任务中被忽略——训练目标是干净图自身，低分条件图由 task 的退化算子在线生成。
+
+data:
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+
+  # 训练 / 推理目录（按本机修改）
+  image_dir: "F:/med_data/imgs"
+  label_dir: "F:/med_data/lbls"   # 生成任务忽略标签，但 loader 仍需该字段
+
+  label_values: [0, 1]
+  num_classes : 2
+
+  patch_size: [12, 320, 400]
+  patch_mode: "2_5d"
+
+  # 生成任务单视图：multi_res_scales 必须为 [1.0]
+  multi_res_scales: [1.0]
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  val_ratio : 0.2
+  split_seed: 42
+
+  batch_size : 4
+  num_workers: 4
+  pin_memory : true
+
+  samples_per_volume: 8
+  cache_mode: "memory"
+  cache_max_volumes: 2
+
+
+augment:
+  enabled: true
+  random_flip_prob: 0.5
+  random_flip_axes: [2, 3, 4]
+  random_affine_prob : 0.0
+  elastic_deform_prob: 0.0
+
+
+model:
+  arch: "unet"
+  backbone: "resnet"
+  encoder_channels: [32, 64, 128, 256]
+  encoder_blocks_per_stage: [2, 2, 2, 2]
+  decoder_type: "unet"
+
+
+# ---- 生成任务设置 ----
+task:
+  type: "generation"
+  algorithm: "regression"
+  degradation: "superres"
+  out_channels: 1
+
+  # 超分退化：下采样倍率与插值核
+  sr_scale: 2
+  sr_kernel: "area"
+  sr_noise_std: 0.0
+
+  # 回归算法
+  residual: false            # true → 学习残差 (HR−LR)，要求 out_channels==patch_size[0]
+  recon_loss: "charbonnier"
+  charbonnier_eps: 1.0e-3
+  ssim_weight: 0.1           # 0 关闭；>0 加 (1−SSIM) 辅助
+  grad_weight: 0.0
+
+
+loss:        # 生成任务不使用分割损失，保留以满足配置结构
+  name: "dice"
+
+
+train:
+  epochs: 100
+  optimizer   : "adamw"
+  lr          : 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+  grad_clip_norm: 1.0
+  use_amp  : true
+  amp_dtype: "auto"
+  compile_mode: "none"
+  use_ema  : true
+  ema_decay: 0.999
+  output_dir: "outputs/gensr_regression"
+  log_every: 20
+  seed: 42
+
+
+predict:
+  output_dir: "predictions_sr"
