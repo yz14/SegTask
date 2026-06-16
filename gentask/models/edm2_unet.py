@@ -1,0 +1,701 @@
+"""EDM2 U-Net 分割 backbone (Karras 2024)。忠实 MP 块：MPConv、mp_silu/mp_sum/mp_cat、pixel-norm、Block (可选 resample/MHSA，去扩散 FiLM)。仅 2.5D；DS/aux 为附加扩展（_MPSegHead 1×1 代替论文 3×3）。Multi-FOV stem：shared_stem | multi_stem_proj（拒 hierarchical）。forward 合同与 UNet3D 一致。"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional, Sequence, Union
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+from .stem import HierarchicalStems  # only for the explicit reject branch
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Magnitude-preserving primitives (paper-faithful).
+# ============================================================================
+
+
+def _normalize(x: torch.Tensor, dim=None, eps: float = 1e-4) -> torch.Tensor:
+    if dim is None:
+        dim = list(range(1, x.ndim))
+    norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
+    norm = torch.add(eps, norm, alpha=float(np.sqrt(norm.numel() / x.numel())))
+    return x / norm.to(x.dtype)
+
+
+def _resample(x: torch.Tensor, f=(1, 1), mode: str = "keep") -> torch.Tensor:
+    if mode == "keep":
+        return x
+    f_arr = np.float32(f)
+    assert f_arr.ndim == 1 and len(f_arr) % 2 == 0
+    pad = (len(f_arr) - 1) // 2
+    f_arr = f_arr / f_arr.sum()
+    f2 = np.outer(f_arr, f_arr)[None, None, :, :]
+    f_t = x.new_tensor(f2)
+    c = x.shape[1]
+    if mode == "down":
+        return F.conv2d(
+            x, f_t.tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+    assert mode == "up"
+    return F.conv_transpose2d(
+        x, (f_t * 4).tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+
+
+def _mp_silu(x: torch.Tensor) -> torch.Tensor:
+    return F.silu(x) / 0.596
+
+
+def _mp_sum(a: torch.Tensor, b: torch.Tensor, t: float = 0.5) -> torch.Tensor:
+    return a.lerp(b, t) / float(np.sqrt((1 - t) ** 2 + t ** 2))
+
+
+def _mp_cat(a: torch.Tensor, b: torch.Tensor, dim: int = 1, t: float = 0.5) -> torch.Tensor:
+    Na = a.shape[dim]
+    Nb = b.shape[dim]
+    C = float(np.sqrt((Na + Nb) / ((1 - t) ** 2 + t ** 2)))
+    wa = C / float(np.sqrt(Na)) * (1 - t)
+    wb = C / float(np.sqrt(Nb)) * t
+    return torch.cat([wa * a, wb * b], dim=dim)
+
+
+class _MPConv(nn.Module):
+    """保幅 conv/FC，强制 weight-norm。kernel 为空 list 时 FC；否则 2D conv padding=k//2。"""
+
+    def __init__(self, in_channels: int, out_channels: int, kernel):
+        super().__init__()
+        self.out_channels = out_channels
+        self.weight = nn.Parameter(
+            torch.randn(out_channels, in_channels, *kernel))
+
+    def forward(self, x: torch.Tensor, gain: float = 1.0) -> torch.Tensor:
+        w = self.weight.to(torch.float32)
+        if self.training:
+            with torch.no_grad():
+                self.weight.copy_(_normalize(w))  # 强制 weight-norm
+        w = _normalize(w)  # 传统 weight-norm
+        # MP 缩放：除以 sqrt(fan_in)。
+        fan_in = float(w[0].numel())
+        w = w * (gain / float(np.sqrt(fan_in)))
+        w = w.to(x.dtype)
+        if w.ndim == 2:
+            return x @ w.t()
+        assert w.ndim == 4, f"unexpected weight ndim {w.ndim}"
+        return F.conv2d(x, w, padding=(w.shape[-1] // 2,))
+
+
+class _Block(nn.Module):
+    """EDM2 Block，去 FiLM。拓扑：resample→(可选 conv_skip + pixel_norm if enc)→conv_res0→mp_silu→conv_res1→mp_sum(主/残差)→(可选 attn)→clip。"""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        flavor: str = "enc",
+        resample_mode: str = "keep",
+        resample_filter=(1, 1),
+        attention: bool = False,
+        channels_per_head: int = 64,
+        dropout: float = 0.0,
+        res_balance: float = 0.3,
+        attn_balance: float = 0.3,
+        clip_act: float = 256.0,
+    ):
+        super().__init__()
+        assert flavor in ("enc", "dec")
+        assert resample_mode in ("keep", "up", "down")
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.flavor = flavor
+        self.resample_filter = tuple(resample_filter)
+        self.resample_mode = resample_mode
+        self.num_heads = (out_channels // channels_per_head) if attention else 0
+        self.dropout = float(dropout)
+        self.res_balance = float(res_balance)
+        self.attn_balance = float(attn_balance)
+        self.clip_act = clip_act
+
+        self.conv_res0 = _MPConv(
+            out_channels if flavor == "enc" else in_channels,
+            out_channels, kernel=[3, 3])
+        self.conv_res1 = _MPConv(out_channels, out_channels, kernel=[3, 3])
+        self.conv_skip = (
+            _MPConv(in_channels, out_channels, kernel=[1, 1])
+            if in_channels != out_channels else None)
+        self.attn_qkv = (
+            _MPConv(out_channels, out_channels * 3, kernel=[1, 1])
+            if self.num_heads != 0 else None)
+        self.attn_proj = (
+            _MPConv(out_channels, out_channels, kernel=[1, 1])
+            if self.num_heads != 0 else None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Main branch.
+        x = _resample(x, f=self.resample_filter, mode=self.resample_mode)
+        if self.flavor == "enc":
+            if self.conv_skip is not None:
+                x = self.conv_skip(x)
+            x = _normalize(x, dim=1)  # pixel norm
+
+        # Residual branch.
+        y = self.conv_res0(_mp_silu(x))
+        y = _mp_silu(y)  # emb FiLM removed
+        if self.training and self.dropout != 0:
+            y = F.dropout(y, p=self.dropout)
+        y = self.conv_res1(y)
+
+        if self.flavor == "dec" and self.conv_skip is not None:
+            x = self.conv_skip(x)
+        x = _mp_sum(x, y, t=self.res_balance)
+
+        # Self-attention.
+        if self.num_heads != 0:
+            y = self.attn_qkv(x)
+            # (B, h*d*3, H, W) → (B, h, d, 3, H*W)。
+            y = rearrange(
+                y, 'b (h d qkv) hh ww -> b h d qkv (hh ww)',
+                h=self.num_heads, qkv=3)
+            q, k, v = _normalize(y, dim=2).unbind(3)
+            w_attn = torch.einsum(
+                "nhcq,nhck->nhqk", q, k / float(np.sqrt(q.shape[2]))
+            ).softmax(dim=3)
+            y = torch.einsum("nhqk,nhck->nhcq", w_attn, v)
+            # (B, h, d, H*W) → (B, h*d, H, W) ≡ x.shape。
+            y = rearrange(
+                y, 'b h d (hh ww) -> b (h d) hh ww',
+                hh=x.shape[2], ww=x.shape[3])
+            y = self.attn_proj(y)
+            x = _mp_sum(x, y, t=self.attn_balance)
+
+        if self.clip_act is not None:
+            x = x.clip_(-float(self.clip_act), float(self.clip_act))
+        return x
+
+
+# ============================================================================
+# Multi-FOV MP stem.
+# ============================================================================
+
+
+class _MPMultiStemProj(nn.Module):
+    """n_views 个独立 MPConv stem → mp_cat → 1×1 MPConv 融合。全部 stride-1 3×3（同 EDM2 level0 _conv）；保留空间分辨率。"""
+
+    def __init__(
+        self,
+        n_views: int,
+        in_ch_per_view_list: List[int],
+        out_ch: int,
+    ):
+        super().__init__()
+        assert len(in_ch_per_view_list) == n_views
+        self.n_views = n_views
+        self.in_ch_per_view_list = [int(c) for c in in_ch_per_view_list]
+        self.stems = nn.ModuleList([
+            _MPConv(c_v, out_ch, kernel=[3, 3])
+            for c_v in self.in_ch_per_view_list
+        ])
+        # 1×1 融合回 out_ch；n_views≥3 时逐对 mp_cat 后一次 1×1。
+        self.proj = _MPConv(n_views * out_ch, out_ch, kernel=[1, 1])
+        self.stem_stride = 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        expected = sum(self.in_ch_per_view_list)
+        if x.shape[1] != expected:
+            raise ValueError(
+                f"_MPMultiStemProj expected {expected} input channels "
+                f"(per_view={self.in_ch_per_view_list}); got {x.shape[1]}")
+        chunks = torch.split(x, self.in_ch_per_view_list, dim=1)
+        feats = [_mp_silu(stem(c)) for stem, c in zip(self.stems, chunks)]
+        # 逐对 mp_cat (t=0.5) 近似保幅。
+        out = feats[0]
+        for f in feats[1:]:
+            out = _mp_cat(out, f, dim=1)
+        return self.proj(out)
+
+
+class _MPSharedStem(nn.Module):
+    """在全 n_views*D 输入上的单一 MPConv 3×3。"""
+
+    def __init__(self, in_channels: int, out_ch: int):
+        super().__init__()
+        self.conv = _MPConv(in_channels, out_ch, kernel=[3, 3])
+        self.stem_stride = 1
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def _build_edm2_stem(
+    fusion: str,
+    n_views: int,
+    base_ch_per_view: int,
+    out_ch: int,
+    in_ch_per_view_list: Optional[List[int]] = None,
+):
+    """分派 MP stem 变体；hierarchical 拒绝。"""
+    if fusion == "hierarchical":
+        raise ValueError(
+            "model.arch='edm2' does not yet support stem_fusion_mode="
+            "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj'.")
+    per_view = (
+        list(in_ch_per_view_list) if in_ch_per_view_list is not None
+        else [base_ch_per_view] * n_views)
+    if n_views == 1 or fusion == "shared_stem":
+        return _MPSharedStem(int(sum(per_view)), out_ch)
+    if fusion == "multi_stem_proj":
+        return _MPMultiStemProj(n_views, per_view, out_ch)
+    raise ValueError(f"unknown stem_fusion_mode: {fusion!r}")
+
+
+# ============================================================================
+# Encoder / Decoder.
+# ============================================================================
+
+
+def _resolve_attn_levels(
+    n_levels: int, attn_levels: Optional[Sequence[int]]
+) -> List[int]:
+    """默认仅最深级（同 EDM2 常见 attn_resolutions 为单一小分辨率）。"""
+    if attn_levels is None:
+        return [n_levels - 1]
+    out = sorted({int(v) for v in attn_levels})
+    for v in out:
+        if v < 0 or v >= n_levels:
+            raise ValueError(
+                f"edm2.attn_levels entry {v} out of range [0, {n_levels - 1}]")
+    return out
+
+
+class _EDM2Encoder(nn.Module):
+    """逐级 _conv (level 0) 或 _down (level>0) + num_blocks 个 enc Block。每块 push 一个 skip。"""
+
+    def __init__(
+        self,
+        stem: nn.Module,
+        encoder_channels: List[int],
+        encoder_blocks_per_stage: List[int],
+        attention_levels: List[int],
+        block_kwargs: Dict[str, Any],
+    ):
+        super().__init__()
+        self.stem = stem
+        self.encoder_channels = list(encoder_channels)
+        n_levels = len(encoder_channels)
+        self.n_levels = n_levels
+        self.attention_levels = list(attention_levels)
+        self.encoder_blocks_per_stage = list(encoder_blocks_per_stage)
+
+        self.level_blocks = nn.ModuleList()
+        # level 0 为 stem (已处理) → identity；level k>0 为 _down Block（通道不变、分辨率减半）。
+        self.level_entries = nn.ModuleList()
+        # skip-channel 布局供 decoder 算 cat-fusion。
+        self.skip_channels: List[int] = [encoder_channels[0]]  # stem feature
+
+        for level in range(n_levels):
+            ch = encoder_channels[level]
+            if level == 0:
+                self.level_entries.append(nn.Identity())
+            else:
+                # _down 保持 in/out=上一级通道。
+                prev_ch = encoder_channels[level - 1]
+                self.level_entries.append(
+                    _Block(prev_ch, prev_ch,
+                           flavor="enc", resample_mode="down",
+                           **block_kwargs))
+                self.skip_channels.append(prev_ch)
+            blocks: List[nn.Module] = []
+            cin = encoder_channels[0] if level == 0 else encoder_channels[level - 1]
+            n_blocks = encoder_blocks_per_stage[level]
+            for idx in range(n_blocks):
+                cout = ch
+                blocks.append(
+                    _Block(
+                        cin, cout,
+                        flavor="enc",
+                        attention=(level in self.attention_levels),
+                        **block_kwargs))
+                cin = cout
+                self.skip_channels.append(cout)
+            self.level_blocks.append(nn.ModuleList(blocks))
+
+    def forward(self, x: torch.Tensor) -> Dict[str, Any]:
+        x = self.stem(x)
+        enc_skips: List[torch.Tensor] = [x]
+        enc_features: List[torch.Tensor] = []
+        for level in range(self.n_levels):
+            entry = self.level_entries[level]
+            if not isinstance(entry, nn.Identity):
+                x = entry(x)
+                enc_skips.append(x)
+            for blk in self.level_blocks[level]:
+                x = blk(x)
+                enc_skips.append(x)
+            enc_features.append(x)
+        return {
+            "bottleneck": x,
+            "enc_features": enc_features,
+            "enc_skips": enc_skips,
+        }
+
+
+class _EDM2Decoder(nn.Module):
+    """逐级 entry（最深=_in0+_in1，其余=_up）+ (num_blocks+1) 个 dec Block；每块 mp_cat 一个 skip。"""
+
+    def __init__(
+        self,
+        encoder_channels: List[int],
+        skip_channels: List[int],
+        decoder_blocks_per_stage: List[int],
+        attention_levels: List[int],
+        concat_balance: float,
+        block_kwargs: Dict[str, Any],
+    ):
+        super().__init__()
+        self.encoder_channels = list(encoder_channels)
+        n_levels = len(encoder_channels)
+        self.n_levels = n_levels
+        self.concat_balance = float(concat_balance)
+        if len(decoder_blocks_per_stage) != n_levels:
+            raise ValueError(
+                f"decoder_blocks_per_stage length {len(decoder_blocks_per_stage)} "
+                f"!= expected {n_levels}")
+
+        skip_stack = list(skip_channels)
+        self.level_entries = nn.ModuleList()
+        self.level_entries_kind: List[str] = []
+        self.level_blocks = nn.ModuleList()
+        ch = encoder_channels[-1]  # entering deepest level
+        for ridx, level in enumerate(reversed(range(n_levels))):
+            attention = (level in attention_levels)
+            if level == n_levels - 1:
+                # 最深级：_in0 (attention=True) + _in1。
+                self.level_entries.append(
+                    _Block(ch, ch, flavor="dec", attention=True,
+                           **block_kwargs))
+                self.level_entries_kind.append("in0_in1")
+                self._in1 = _Block(ch, ch, flavor="dec", **block_kwargs)
+            else:
+                self.level_entries.append(
+                    _Block(ch, ch, flavor="dec", resample_mode="up",
+                           **block_kwargs))
+                self.level_entries_kind.append("up")
+            n_blocks = decoder_blocks_per_stage[level] + 1
+            blocks: List[nn.Module] = []
+            for idx in range(n_blocks):
+                ich = skip_stack.pop()
+                cin = ch + ich
+                cout = encoder_channels[level]
+                blocks.append(
+                    _Block(cin, cout, flavor="dec",
+                           attention=attention,
+                           **block_kwargs))
+                ch = cout
+            self.level_blocks.append(nn.ModuleList(blocks))
+        if skip_stack:
+            raise RuntimeError(
+                f"EDM2 decoder skip-stack mismatch: {len(skip_stack)} left")
+
+        self.out_channels: List[int] = [
+            encoder_channels[level] for level in reversed(range(n_levels - 1))
+        ]
+
+    def forward(
+        self, bottleneck: torch.Tensor, enc_skips: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        x = bottleneck
+        skip_stack = list(enc_skips)
+        dec_features: List[torch.Tensor] = []
+        for ridx, level in enumerate(reversed(range(self.n_levels))):
+            entry = self.level_entries[ridx]
+            kind = self.level_entries_kind[ridx]
+            x = entry(x)
+            if kind == "in0_in1":
+                x = self._in1(x)
+            for blk in self.level_blocks[ridx]:
+                skip = skip_stack.pop()
+                if skip.shape[2:] != x.shape[2:]:
+                    skip = F.interpolate(
+                        skip, size=x.shape[2:],
+                        mode="bilinear", align_corners=False)
+                x = _mp_cat(x, skip, dim=1, t=self.concat_balance)
+                x = blk(x)
+            if level < self.n_levels - 1:
+                dec_features.append(x)
+        if skip_stack:
+            raise RuntimeError(
+                f"EDM2 decoder leftover skips: {len(skip_stack)}")
+        return dec_features
+
+
+# ============================================================================
+# MP-aware seg head.
+# ============================================================================
+
+
+class _MPSegHead(nn.Module):
+    """1×1 MPConv 分类头，带可学 out_gain（同 EDM2 out_conv，仅 kernel 改为 1×1）。"""
+
+    def __init__(self, in_ch: int, num_classes: int):
+        super().__init__()
+        self.conv = _MPConv(in_ch, num_classes, kernel=[1, 1])
+        self.out_gain = nn.Parameter(torch.zeros([]))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # out_gain 为 0维可学标量；MPConv 以它 gain 乘权重。
+        return self.conv(x, gain=self.out_gain)
+
+
+# ============================================================================
+# Top-level wrapper.
+# ============================================================================
+
+
+class EDM2SegModel(nn.Module):
+    """EDM2 U-Net 适配为分割模型；forward 合同同 UNet3D。"""
+
+    def __init__(
+        self,
+        # Stem.
+        stem: nn.Module,
+        stem_stride: int,
+        num_stem_fusion_views: int,
+        stem_fusion_mode: str,
+        # Encoder topology.
+        encoder_channels: List[int],
+        encoder_blocks_per_stage: List[int],
+        decoder_blocks_per_stage: List[int],
+        attention_levels: List[int],
+        # Block hyperparams.
+        channels_per_head: int,
+        dropout: float,
+        res_balance: float,
+        attn_balance: float,
+        concat_balance: float,
+        clip_act: float,
+        # Output / heads.
+        num_fg_classes: int,
+        deep_supervision: bool,
+        aux_seg_supervision: bool,
+        aux_head_mode: str,  # 'linear' only for EDM2 (MP-style)
+        aux_head_out_channels: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.spatial_dims = 2
+        self.stem_stride = int(stem_stride)
+        self.num_stem_fusion_views = int(num_stem_fusion_views)
+        self.stem_fusion_mode = stem_fusion_mode
+        self.deep_supervision = bool(deep_supervision)
+        self.num_fg_classes = int(num_fg_classes)
+
+        block_kwargs = dict(
+            channels_per_head=channels_per_head,
+            dropout=dropout,
+            res_balance=res_balance,
+            attn_balance=attn_balance,
+            clip_act=clip_act,
+        )
+
+        self.encoder = _EDM2Encoder(
+            stem=stem,
+            encoder_channels=encoder_channels,
+            encoder_blocks_per_stage=encoder_blocks_per_stage,
+            attention_levels=attention_levels,
+            block_kwargs=block_kwargs,
+        )
+        self.decoder = _EDM2Decoder(
+            encoder_channels=encoder_channels,
+            skip_channels=self.encoder.skip_channels,
+            decoder_blocks_per_stage=decoder_blocks_per_stage,
+            attention_levels=attention_levels,
+            concat_balance=concat_balance,
+            block_kwargs=block_kwargs,
+        )
+
+        # Main + DS heads (MP-style).
+        self.seg_head = _MPSegHead(
+            self.decoder.out_channels[-1], num_fg_classes)
+        self.ds_heads = nn.ModuleList()
+        if self.deep_supervision:
+            for ch in reversed(self.decoder.out_channels[:-1]):
+                self.ds_heads.append(_MPSegHead(ch, num_fg_classes))
+
+        # Aux seg supervision (Plan A only).
+        n_views = self.num_stem_fusion_views
+        self.aux_seg_supervision = bool(aux_seg_supervision and n_views > 1)
+        n_aux_expected = max(n_views - 1, 0) if self.aux_seg_supervision else 0
+        if aux_head_out_channels is None:
+            aux_out = [num_fg_classes] * n_aux_expected
+        else:
+            if len(aux_head_out_channels) != n_aux_expected:
+                raise ValueError(
+                    f"aux_head_out_channels length "
+                    f"{len(aux_head_out_channels)} != expected "
+                    f"{n_aux_expected}")
+            aux_out = [int(c) for c in aux_head_out_channels]
+        self.aux_head_out_channels = aux_out
+        self.aux_head_mode = aux_head_mode
+        self.aux_heads = nn.ModuleList()
+        self.aux_feat_indices: List[int] = []
+        if self.aux_seg_supervision:
+            in_ch = self.decoder.out_channels[-1]
+            n_dec = len(self.decoder.out_channels)
+            for k in range(1, n_views):
+                self.aux_feat_indices.append(n_dec - 1)
+                self.aux_heads.append(_MPSegHead(in_ch, aux_out[k - 1]))
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
+        target_size = x.shape[2:]
+        enc_out = self.encoder(x)
+        dec_features = self.decoder(enc_out["bottleneck"], enc_out["enc_skips"])
+
+        main_out = self.seg_head(dec_features[-1])
+        if main_out.shape[2:] != target_size:
+            main_out = F.interpolate(
+                main_out, size=target_size,
+                mode="bilinear", align_corners=False)
+
+        aux_outs: List[torch.Tensor] = []
+        if self.aux_seg_supervision and self.training:
+            for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
+                ao = head(dec_features[feat_idx])
+                if ao.shape[2:] != target_size:
+                    ao = F.interpolate(
+                        ao, size=target_size,
+                        mode="bilinear", align_corners=False)
+                aux_outs.append(ao)
+
+        if self.deep_supervision and self.training:
+            main_path: Union[torch.Tensor, List[torch.Tensor]] = [main_out]
+            for i, head in enumerate(self.ds_heads):
+                main_path.append(head(dec_features[-2 - i]))
+        else:
+            main_path = main_out
+
+        if aux_outs:
+            return {"main": main_path, "aux": aux_outs}
+        return main_path
+
+    def param_count(self) -> Dict[str, int]:
+        enc = sum(p.numel() for p in self.encoder.parameters())
+        dec = sum(p.numel() for p in self.decoder.parameters())
+        head = sum(p.numel() for p in self.seg_head.parameters())
+        total = sum(p.numel() for p in self.parameters())
+        return {"encoder": enc, "decoder": dec, "seg_head": head,
+                "total": total}
+
+
+# ============================================================================
+# Public factory.
+# ============================================================================
+
+
+def build_edm2_seg_model(cfg) -> EDM2SegModel:
+    """从 Config 构造 EDM2SegModel。读取 EDM2 专有：edm2_attention_levels（默认 [L-1]）、edm2_channels_per_head(64)、edm2_res_balance/attn_balance(0.3)、edm2_concat_balance(0.5)、edm2_clip_act(256.0)。复用 model.dropout 为 Block dropout。"""
+    mc = cfg.model
+    enc_channels = list(mc.encoder_channels)
+    n_levels = len(enc_channels)
+    num_fg = cfg.num_fg_classes
+
+    assert cfg.data.patch_mode == "2_5d", (
+        "arch='edm2' is currently only wired for patch_mode='2_5d'.")
+    D = int(cfg.data.patch_size[0])
+    out_classes = num_fg * D
+    n_views = max(len(cfg.data.multi_res_scales), 1)
+
+    enc_bps = list(mc.encoder_blocks_per_stage)
+    if not enc_bps:
+        enc_bps = [int(mc.blocks_per_level)] * n_levels
+    if len(enc_bps) != n_levels:
+        raise ValueError(
+            f"encoder_blocks_per_stage length {len(enc_bps)} "
+            f"!= len(encoder_channels) {n_levels}")
+    # 与 ADM 同的 skip-stack 耦合：enc/dec 每级 nb+1 skip，用户 decoder_blocks_per_stage 被忽略（不一致告警）。
+    if mc.decoder_blocks_per_stage and (
+            list(mc.decoder_blocks_per_stage) != enc_bps[:-1]):
+        logger.warning(
+            "model.arch='edm2' ignores model.decoder_blocks_per_stage=%s; "
+            "EDM2's per-level decoder count is fixed by the encoder's "
+            "skip-stack topology (nb+1 dec Blocks per level, paper-faithful). "
+            "Using encoder_blocks_per_stage=%s instead.",
+            list(mc.decoder_blocks_per_stage), enc_bps)
+    dec_bps_full = list(enc_bps)
+
+    attn_levels = _resolve_attn_levels(
+        n_levels, getattr(mc, "edm2_attention_levels", None))
+
+    if mc.stem_fusion_mode == "hierarchical":
+        raise ValueError(
+            "model.arch='edm2' does not yet support stem_fusion_mode="
+            "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj'.")
+
+    in_ch_per_view_list = None
+    aux_head_out_channels = None
+    if (bool(getattr(cfg.data, "keep_native_view_depth", False))
+            and n_views > 1):
+        depths = list(cfg.per_view_depths)
+        in_ch_per_view_list = depths
+        aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
+        in_channels = sum(depths)
+    else:
+        in_channels = D * n_views
+    base_ch_per_view = D
+
+    stem = _build_edm2_stem(
+        fusion=mc.stem_fusion_mode,
+        n_views=n_views,
+        base_ch_per_view=base_ch_per_view,
+        out_ch=enc_channels[0],
+        in_ch_per_view_list=in_ch_per_view_list,
+    )
+    stem_stride = stem.stem_stride
+
+    aux_seg = bool(getattr(mc, "aux_seg_supervision", False)) and n_views > 1
+
+    model = EDM2SegModel(
+        stem=stem,
+        stem_stride=stem_stride,
+        num_stem_fusion_views=n_views,
+        stem_fusion_mode=mc.stem_fusion_mode,
+        encoder_channels=enc_channels,
+        encoder_blocks_per_stage=enc_bps,
+        decoder_blocks_per_stage=dec_bps_full,
+        attention_levels=attn_levels,
+        channels_per_head=int(getattr(mc, "edm2_channels_per_head", 64)),
+        dropout=float(getattr(mc, "dropout", 0.0)),
+        res_balance=float(getattr(mc, "edm2_res_balance", 0.3)),
+        attn_balance=float(getattr(mc, "edm2_attn_balance", 0.3)),
+        concat_balance=float(getattr(mc, "edm2_concat_balance", 0.5)),
+        clip_act=float(getattr(mc, "edm2_clip_act", 256.0)),
+        num_fg_classes=out_classes,
+        deep_supervision=bool(mc.deep_supervision),
+        aux_seg_supervision=aux_seg,
+        aux_head_mode=str(getattr(mc, "aux_head_mode", "linear")),
+        aux_head_out_channels=aux_head_out_channels,
+    )
+
+    pc = model.param_count()
+    logger.info(
+        "Built EDM2SegModel: enc=%.2fM, dec=%.2fM, total=%.2fM, "
+        "channels=%s, enc_blocks=%s, dec_blocks=%s, attn_levels=%s, "
+        "in_ch=%d (per_view=%s), out_classes=%d (fg=%d, D=%d), "
+        "stem=%s(stride=%d, n_views=%d, fusion=%s), ds=%s, aux_seg=%s "
+        "(n_aux=%d, mode=%s)",
+        pc["encoder"] / 1e6, pc["decoder"] / 1e6, pc["total"] / 1e6,
+        enc_channels, enc_bps, dec_bps_full, attn_levels,
+        in_channels,
+        in_ch_per_view_list if in_ch_per_view_list is not None
+        else [base_ch_per_view] * n_views,
+        out_classes, num_fg, D,
+        getattr(mc, "stem_mode", "conv3"), stem_stride, n_views,
+        mc.stem_fusion_mode,
+        bool(mc.deep_supervision), aux_seg,
+        len(model.aux_heads), getattr(mc, "aux_head_mode", "linear"))
+
+    return model
