@@ -617,8 +617,8 @@ def _build_dice(cfg: LossConfig, cw: Optional[List[float]]) -> BinaryDiceLoss:
     return BinaryDiceLoss(
         smooth        = cfg.dice_smooth,
         squared       = cfg.dice_squared,
-        batch_dice    = getattr(cfg, "batch_dice", False),
-        ignore_empty  = getattr(cfg, "ignore_empty", False),
+        batch_dice    = cfg.batch_dice,
+        ignore_empty  = cfg.ignore_empty,
         class_weights = cw)
 
 
@@ -641,7 +641,7 @@ def _build_tversky(
         alpha=cfg.tversky_alpha,
         beta=cfg.tversky_beta,
         smooth=cfg.dice_smooth,
-        batch_dice=getattr(cfg, "batch_dice", False),
+        batch_dice=cfg.batch_dice,
         class_weights=cw,
     )
 
@@ -650,10 +650,10 @@ def _build_gdl(
     cfg: LossConfig, cw: Optional[List[float]]) -> GeneralizedDiceLoss:
     return GeneralizedDiceLoss(
         smooth=cfg.dice_smooth,
-        batch_dice=getattr(cfg, "batch_dice", True),
-        weight_type=getattr(cfg, "gdl_weight_type", "square"),
+        batch_dice=cfg.batch_dice,
+        weight_type=cfg.gdl_weight_type,
         class_weights=cw,
-        w_max=getattr(cfg, "gdl_w_max", 1e5),
+        w_max=cfg.gdl_w_max,
     )
 
 
@@ -662,9 +662,9 @@ def _build_focal_tversky(
     return BinaryFocalTverskyLoss(
         alpha=cfg.tversky_alpha,
         beta=cfg.tversky_beta,
-        gamma=getattr(cfg, "focal_tversky_gamma", 4.0 / 3.0),
+        gamma=cfg.focal_tversky_gamma,
         smooth=cfg.dice_smooth,
-        batch_dice=getattr(cfg, "batch_dice", False),
+        batch_dice=cfg.batch_dice,
         class_weights=cw,
     )
 
@@ -672,7 +672,7 @@ def _build_focal_tversky(
 def _build_lovasz(
     cfg: LossConfig, cw: Optional[List[float]]) -> LovaszHingeLoss:
     return LovaszHingeLoss(
-        per_sample=getattr(cfg, "lovasz_per_sample", True),
+        per_sample=cfg.lovasz_per_sample,
         class_weights=cw,
     )
 
@@ -680,8 +680,8 @@ def _build_lovasz(
 def _build_cldice(
     cfg: LossConfig, cw: Optional[List[float]]) -> SoftCLDiceLoss:
     return SoftCLDiceLoss(
-        iter_=getattr(cfg, "cldice_iter", 3),
-        smooth=getattr(cfg, "cldice_smooth", 1.0),
+        iter_=cfg.cldice_iter,
+        smooth=cfg.cldice_smooth,
         class_weights=cw,
     )
 
@@ -710,7 +710,7 @@ _COMPOUND_BUILDERS = {
 
 
 def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
-    ws = list(getattr(cfg, "compound_weights", None) or [])
+    ws = list(cfg.compound_weights or [])
     if len(ws) >= n:
         return ws[:n]  # 自动适配长度
     logger.warning(

@@ -49,6 +49,7 @@ from segtask_v1.config import (  # noqa: E402
 from segtask_v1.data.dataset import SegDataset3D  # noqa: E402
 from segtask_v1.losses.losses import SliceChannelLoss, build_loss  # noqa: E402
 from segtask_v1.models.factory import build_model  # noqa: E402
+from segtask_v1.trainer import views  # noqa: E402
 
 
 # ===========================================================================
@@ -347,20 +348,19 @@ def test_dataset_native_d_aux_view_geometry():
 
 def test_trainer_split_views_native_d():
     """Trainer split utility shapes & layout (model-free; uses a stub Trainer)."""
-    # Build a trainer-like stub holding only the attributes the helper reads.
+    # Build a stub holding only the attributes the split helper reads.
     class _Stub:
         keep_native_view_depth = True
         per_view_depths = [8, 12, 16]   # D, round(1.5D), round(2D)
         target_patch_size = (16, 32, 32)
 
-        # Bind the unbound method so we can call it on the stub.
-        _split_views_native_d = (
-            __import__("segtask_v1.trainer", fromlist=["Trainer"])
-            .Trainer
-            ._split_views_native_d
-        )
-
     stub = _Stub()
+    # Call the pure view-split function directly (no Trainer instance needed).
+    stub._split_views_native_d = (
+        lambda image, label, wmap: views.split_views_native_d(
+            image, label, wmap,
+            per_view_depths=stub.per_view_depths,
+            target_patch_size=stub.target_patch_size))
     B = 2
     eD_max = 16
     H, W = 32, 32

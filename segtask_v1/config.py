@@ -793,7 +793,7 @@ class Config:
 
     def _validate_model(self) -> None:
         """model.* 架构选项与逐级拓扑长度校验。"""
-        arch = str(getattr(self.model, "arch", "unet")).lower()
+        arch = str(self.model.arch).lower()
         _require(
             arch in ("unet", "adm", "edm2"),
             f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
@@ -849,7 +849,7 @@ class Config:
         ),
             f"Invalid stem_fusion_mode: {self.model.stem_fusion_mode!r}")
         _require(
-            getattr(self.model, "aux_head_mode", "linear") in (
+            self.model.aux_head_mode in (
             "linear", "conv",
         ),
             f"Invalid aux_head_mode: {self.model.aux_head_mode!r}")
@@ -1026,7 +1026,7 @@ class Config:
                 "2.5D mode requires multi_res_scales[0]==1.0 (view 0 = prediction target); "
                 f"got {self.data.multi_res_scales}.")
             n_views = len(self.data.multi_res_scales)
-            lift = bool(getattr(self.model, "lift_2_5d_to_3d", False))
+            lift = bool(self.model.lift_2_5d_to_3d)
             if lift:
                 # lift：D 保留为空间轴（真 3D UNet），与折叠-D 布局互斥。
                 _require(
@@ -1066,7 +1066,7 @@ class Config:
                     f"got {self.data.z_boundary_mode!r}.")
                 # 辅视图提供额外输入却无监督信号不合理。
                 _require(
-                    getattr(self.model, "aux_seg_supervision", False),
+                    self.model.aux_seg_supervision,
                     "keep_native_view_depth=True requires model.aux_seg_supervision=True "
                     "(each native-depth view k drives an aux head).")
             elif not lift:
@@ -1095,11 +1095,11 @@ class Config:
                     f"hierarchical fusion with n_views={n_views}, stem_mode={self.model.stem_mode!r} "
                     f"requires patch H/W divisible by {deepest}; got ({pH}, {pW}).")
             # aux 监督：仅在 n_views > 1 时有意义。
-            if getattr(self.model, "aux_seg_supervision", False):
+            if self.model.aux_seg_supervision:
                 _require(
                     n_views > 1,
                     "aux_seg_supervision=True requires n_views > 1; got 1.")
-                aw = list(getattr(self.loss, "aux_supervision_weights", []))
+                aw = list(self.loss.aux_supervision_weights)
                 if aw:
                     _require(
                         len(aw) == n_views - 1,
@@ -1200,11 +1200,11 @@ class Config:
                 f"predict.adabn_num_volumes must be >= 1; "
                 f"got {self.predict.adabn_num_volumes}.")
             # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
-            if getattr(self.model, "norm_type", None) != "batch":
+            if self.model.norm_type != "batch":
                 logger.warning(
                     "predict.adabn_enabled=True but model.norm_type=%r != "
                     "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
-                    getattr(self.model, "norm_type", None))
+                    self.model.norm_type)
 
 
     @property
