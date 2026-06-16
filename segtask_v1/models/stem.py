@@ -163,7 +163,8 @@ class MultiStemProj(nn.Module):
         self.stems       = nn.ModuleList(stems)
         self.stem_stride = strides[0]
 
-        # 3×3 融合多分辨率回 out_ch；TODO: 用单层还是多层会好？
+        # 单层 3×3 ConvNormAct 将多 FOV 特征 (n_views*out_ch) 融合回 out_ch：stem 处做
+        # 轻量融合即可，后续 encoder 各 stage 提供深度，更深的 stem 融合收益有限故不堆叠。
         self.proj = ConvNormAct(
             n_views * out_ch, out_ch,
             kernel_size=3, stride=1, padding=1,

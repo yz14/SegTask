@@ -88,15 +88,15 @@ def build_topology(cfg: "Config") -> ModelTopology:
     num_fg  = cfg.num_fg_classes
 
     is_2_5d        = pm == "2_5d"
-    lift           = bool(getattr(mc, "lift_2_5d_to_3d", False)) and is_2_5d
-    native_d       = (bool(getattr(dc, "keep_native_view_depth", False))
+    lift           = bool(mc.lift_2_5d_to_3d) and is_2_5d
+    native_d       = (bool(dc.keep_native_view_depth)
                       and is_2_5d and n_views > 1)  # 2.5D多分辨率输入保持原尺寸
     # keep_native_multi_res：3D 多 FOV 懒加载——dataset 只发一份最大 FOV cube，
     # 由 trainer 逐视图中心裁剪 + resize（避免数据层多次 zoom 引入高频损失）。
     # 是 keep_native_view_depth(2.5D) 的 3D 对应物，二者互斥。
-    keep_native_3d = (bool(getattr(dc, "keep_native_multi_res", False))
+    keep_native_3d = (bool(dc.keep_native_multi_res)
                       and pm in ("z_axis", "cubic") and n_views > 1)  # 3D多分辨率输入保持原尺寸（3D只能全部尺寸一致）
-    aux_seg_active = (bool(getattr(mc, "aux_seg_supervision", False))
+    aux_seg_active = (bool(mc.aux_seg_supervision)
                       and is_2_5d and n_views > 1)
 
     # ---- 通道 / 输出几何 -------------------------------------------------

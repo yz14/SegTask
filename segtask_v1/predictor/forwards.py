@@ -65,9 +65,9 @@ def _tta_chunk_size(p: "Predictor") -> int:
     处于 train+累积平均模式，把多个变体拼成大 batch 会改变 BN 见到的 batch 统计构成与
     running stats 累积，破坏与逐变体串行实现的一致性。真实 eval 预测不受影响。
     """
-    if getattr(p, "_adabn_estimating", False):
+    if p._adabn_estimating:
         return 1
-    cs = getattr(p, "tta_batch_size", None) or p.batch_size
+    cs = p.tta_batch_size or p.batch_size
     return max(1, int(cs))
 
 

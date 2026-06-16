@@ -68,21 +68,21 @@ def main():
     # 默认解析：ckpt=<train_out>/best_model.pth；input=cfg.data.image_dir；output=<input_parent>/<task_name>_pred (task_name=basename(train_out))。
     checkpoint_path = args.checkpoint
     if not checkpoint_path:
-        train_out = getattr(cfg.train, "output_dir", "") or ""
+        train_out = cfg.train.output_dir or ""
         if not train_out:
             parser.error("--checkpoint not given and cfg.train.output_dir is empty.")
         checkpoint_path = str(Path(train_out) / "best_model.pth")
 
     input_path = args.input
     if not input_path:
-        input_path = getattr(cfg.data, "image_dir", "") or ""
+        input_path = cfg.data.image_dir or ""
         if not input_path:
             parser.error("--input not given and cfg.data.image_dir is empty.")
 
     if args.output:
         cfg.predict.output_dir = args.output
     else:
-        train_out = getattr(cfg.train, "output_dir", "") or ""
+        train_out = cfg.train.output_dir or ""
         if not train_out:
             parser.error("--output not given and cfg.train.output_dir is empty; "
                          "cannot derive task name for default output dir.")
@@ -140,7 +140,7 @@ def _resolve_bbox_paths(
             raise FileNotFoundError(f"--bbox path not found: {p}")
         bbox_dir = str(p)
     else:
-        bbox_dir = getattr(cfg.data, "bbox_dir", "") or ""
+        bbox_dir = cfg.data.bbox_dir or ""
         if not bbox_dir:
             return image_paths, None
 
@@ -148,7 +148,7 @@ def _resolve_bbox_paths(
         image_paths,
         bbox_dir,
         cfg.data.image_suffix,
-        getattr(cfg.data, "bbox_suffix", ".nii.gz"))
+        cfg.data.bbox_suffix)
     return matched_images, matched_bboxes
 
 
