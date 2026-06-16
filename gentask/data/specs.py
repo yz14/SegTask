@@ -67,7 +67,7 @@ class DatasetCommonCfg:
             global_mean       = float(dc.global_mean),
             global_std        = float(dc.global_std),
             cache_enabled     = (str(dc.cache_mode) == "memory"),
-            cache_max_volumes = int(getattr(dc, "cache_max_volumes", 0)),
+            cache_max_volumes = int(dc.cache_max_volumes),
             region_weights    = (list(cfg.loss.region_weights)
                                  if cfg.loss.region_weights else None))
 
@@ -183,7 +183,7 @@ class ZCubeSpec(DatasetSpec):
             "trainer crops+resizes per view before forward.",
             dc.patch_mode.upper(), self._aug_oversample(is_train=True),
             dc.multi_res_scales, n_views, max_scale,
-            getattr(dc, "z_boundary_mode", "stretch"))
+            dc.z_boundary_mode)
 
     def make_split(
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
@@ -197,7 +197,7 @@ class ZCubeSpec(DatasetSpec):
             foreground_oversample_ratio = self._fg_ratio(is_train),
             samples_per_volume          = self._samples_per_volume(is_train),
             is_train                    = is_train,
-            z_boundary_mode             = getattr(dc, "z_boundary_mode", "stretch"))
+            z_boundary_mode             = dc.z_boundary_mode)
 
 
 class CubicSpec(DatasetSpec):

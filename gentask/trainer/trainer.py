@@ -5,12 +5,9 @@ Round 2 重构后，``Trainer`` 不再判断训练模式 —— 所有"如何把
 归口到 ``self.pipeline: ViewPipeline``（见 ``trainer.pipelines``）。
 
 ``Trainer`` 仅协调：模型 / 优化器 / 调度器 / scaler / EMA / 增强 / 训练循环 /
-checkpoint I/O。
-
-为兼容现有测试与外部代码，部分历史属性（如 ``is_2_5d`` / ``keep_native_multi_res``
-/ ``per_view_depths``）与方法（``_split_views_*`` / ``_squeeze_*`` / ``_center_crop``
-/ ``_compute_loss_*``）以 thin shim 形式保留，全部从 ``self.pipeline`` 或
-``trainer.views`` 模块取值/委托。
+checkpoint I/O。视图拆分 / 中心裁剪等纯张量操作位于 ``trainer.views``，损失
+fp32 计算与 breakdown 格式化位于 ``trainer.amp`` / ``trainer.breakdown``，
+``Trainer`` 直接调用这些纯函数，不再保留供测试用的 thin shim。
 """
 
 from __future__ import annotations
@@ -18,12 +15,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 from colorama import Fore, Style
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -40,7 +39,6 @@ from .amp import (
     _AMP_DTYPES,
     GradScaler,
     autocast,
-    compute_loss_fp32,
     resolve_auto_amp_dtype,
 )
 from .breakdown import collect_multi_res_breakdown, format_breakdown
@@ -489,10 +487,6 @@ class Trainer:
             out[name] = meter.avg
         return out
 
-    # 类级别静态别名：保持 ``self._compute_loss_fp32`` / ``self._format_breakdown`` 旧调用约定不破坏。
-    _compute_loss_fp32 = staticmethod(compute_loss_fp32)
-    _format_breakdown = staticmethod(format_breakdown)
-
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
         """验证集评估（启用 EMA 时以 EMA 权重）。
@@ -510,48 +504,6 @@ class Trainer:
         with self._ema_swapped():
             return self.evaluator.evaluate(epoch)
 
-    # ==================================================================
-    # Backward-compatibility shims for unit tests
-    # 仅保留三个仍被现有测试直接调用的方法（其余 shim 已在 Round 3 移除）：
-    #   * test_keep_native_multi_res_trainer.py → _split_views_native_3d
-    #   * test_keep_native_view_depth.py            → _split_views_native_d
-    #   * test_segtask_v1.py::TestTrainerCenterCrop → _center_crop
-    # 所有逻辑委托至 ``segtask_v1.trainer.views``；新代码请直接用纯函数 / pipeline。
-    # ==================================================================
-    def _split_views_native_3d(
-        self, image: torch.Tensor, label: torch.Tensor,
-        wmap: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if not self.keep_native_multi_res:
-            raise RuntimeError(
-                "_split_views_native_3d called but "
-                "keep_native_multi_res=False")
-        return views.split_views_native_3d(
-            image, label, wmap,
-            target_patch_size=self.target_patch_size,
-            mr_native_sizes=self._mr_native_sizes,
-            patch_size=tuple(int(x) for x in self.cfg.data.patch_size),
-        )
-
-    def _split_views_native_d(
-        self, image: torch.Tensor, label: torch.Tensor,
-        wmap: Optional[torch.Tensor],
-    ):
-        if not self.keep_native_view_depth:
-            raise RuntimeError(
-                "_split_views_native_d called but keep_native_view_depth=False")
-        return views.split_views_native_d(
-            image, label, wmap,
-            per_view_depths=self.per_view_depths,
-            target_patch_size=self.target_patch_size,
-        )
-
-    def _center_crop(
-        self, image: torch.Tensor, label: torch.Tensor,
-        wmap: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        return views.center_crop(image, label, wmap, self.target_patch_size)
-
     # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)
     # ------------------------------------------------------------------
@@ -566,8 +518,8 @@ class Trainer:
             "torch_cpu": torch.get_rng_state(),
             "torch_cuda": (torch.cuda.get_rng_state_all()
                            if torch.cuda.is_available() else None),
-            "numpy": __import__("numpy").random.get_state(),
-            "python": __import__("random").getstate(),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
         }
 
         state: Dict = {
@@ -644,11 +596,9 @@ class Trainer:
                 if rng.get("torch_cuda") is not None and torch.cuda.is_available():
                     torch.cuda.set_rng_state_all(rng["torch_cuda"])
                 if rng.get("numpy") is not None:
-                    import numpy as _np
-                    _np.random.set_state(rng["numpy"])
+                    np.random.set_state(rng["numpy"])
                 if rng.get("python") is not None:
-                    import random as _rnd
-                    _rnd.setstate(rng["python"])
+                    random.setstate(rng["python"])
                 logger.info("Restored RNG state from checkpoint.")
             except Exception as e:  # pragma: no cover
                 logger.warning("Failed to restore RNG state: %s", e)

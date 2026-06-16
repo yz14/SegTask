@@ -671,19 +671,20 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
             list(mc.decoder_blocks_per_stage), enc_bps)
     dec_bps_full = list(enc_bps)
 
-    attn_levels = _resolve_attention_levels(  # 确认attn，默认最后两层
-        n_levels, getattr(mc, "adm_attention_levels", None))
+    # 显式空列表 [] = 不加注意力（保持历史默认行为）；传 None 才会用"最深两级"默认。
+    attn_levels = _resolve_attention_levels(
+        n_levels, mc.adm_attention_levels)
 
     # 可选 lucidrains 式线性注意（默认关）。
-    raw_lin = getattr(mc, "adm_linear_attention_levels", None) or []
+    raw_lin = mc.adm_linear_attention_levels or []
     lin_attn_levels: List[int] = sorted({int(v) for v in raw_lin})
     for v in lin_attn_levels:
         if v < 0 or v >= n_levels:
             raise ValueError(
                 f"adm_linear_attention_levels entry {v} out of range "
                 f"[0, {n_levels - 1}]")
-    lin_num_heads = int(getattr(mc, "adm_linear_attention_num_heads", 4))
-    lin_head_dim = int(getattr(mc, "adm_linear_attention_head_dim", 32))
+    lin_num_heads = int(mc.adm_linear_attention_num_heads)
+    lin_head_dim = int(mc.adm_linear_attention_head_dim)
 
     # 仅支持 shared_stem / multi_stem_proj；hierarchical 需 mid-encoder 注入。
     if mc.stem_fusion_mode == "hierarchical":
@@ -695,8 +696,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     # 原生深度 ON：逐视图 D_k 可变；OFF：统一 D。
     in_ch_per_view_list = None
     aux_head_out_channels = None
-    if (bool(getattr(cfg.data, "keep_native_view_depth", False))
-            and n_views > 1):
+    if bool(cfg.data.keep_native_view_depth) and n_views > 1:
         depths = list(cfg.per_view_depths)
         in_ch_per_view_list = depths
         aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
@@ -719,7 +719,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         stage_channels=enc_channels,
         in_ch_per_view_list=in_ch_per_view_list)
 
-    aux_seg = bool(getattr(mc, "aux_seg_supervision", False)) and n_views > 1
+    aux_seg = bool(mc.aux_seg_supervision) and n_views > 1
 
     model = ADMSegModel(
         stem=stem,
@@ -730,16 +730,16 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         encoder_blocks_per_stage=enc_bps,
         decoder_blocks_per_stage=dec_bps_full,
         attention_levels=attn_levels,
-        num_heads=int(getattr(mc, "adm_num_heads", 4)),
-        num_head_channels=int(getattr(mc, "adm_num_head_channels", -1)),
-        dropout=float(getattr(mc, "dropout", 0.0)),
+        num_heads=int(mc.adm_num_heads),
+        num_head_channels=int(mc.adm_num_head_channels),
+        dropout=float(mc.dropout),
         linear_attention_levels=lin_attn_levels,
         linear_attention_num_heads=lin_num_heads,
         linear_attention_head_dim=lin_head_dim,
         num_fg_classes=out_classes,
         deep_supervision=bool(mc.deep_supervision),
         aux_seg_supervision=aux_seg,
-        aux_head_mode=str(getattr(mc, "aux_head_mode", "linear")),
+        aux_head_mode=str(mc.aux_head_mode),
         aux_head_out_channels=aux_head_out_channels,
     )
 
@@ -761,6 +761,6 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         out_classes, num_fg, D,
         mc.stem_mode, stem_stride, n_views, mc.stem_fusion_mode,
         bool(mc.deep_supervision), aux_seg,
-        len(model.aux_heads), getattr(mc, "aux_head_mode", "linear"))
+        len(model.aux_heads), mc.aux_head_mode)
 
     return model

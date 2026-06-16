@@ -627,8 +627,9 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
             list(mc.decoder_blocks_per_stage), enc_bps)
     dec_bps_full = list(enc_bps)
 
+    # 显式空列表 [] = 不加注意力（保持历史默认行为）；传 None 才会用默认。
     attn_levels = _resolve_attn_levels(
-        n_levels, getattr(mc, "edm2_attention_levels", None))
+        n_levels, mc.edm2_attention_levels)
 
     if mc.stem_fusion_mode == "hierarchical":
         raise ValueError(
@@ -637,8 +638,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
 
     in_ch_per_view_list = None
     aux_head_out_channels = None
-    if (bool(getattr(cfg.data, "keep_native_view_depth", False))
-            and n_views > 1):
+    if bool(cfg.data.keep_native_view_depth) and n_views > 1:
         depths = list(cfg.per_view_depths)
         in_ch_per_view_list = depths
         aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
@@ -656,7 +656,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
     )
     stem_stride = stem.stem_stride
 
-    aux_seg = bool(getattr(mc, "aux_seg_supervision", False)) and n_views > 1
+    aux_seg = bool(mc.aux_seg_supervision) and n_views > 1
 
     model = EDM2SegModel(
         stem=stem,
@@ -667,16 +667,16 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         encoder_blocks_per_stage=enc_bps,
         decoder_blocks_per_stage=dec_bps_full,
         attention_levels=attn_levels,
-        channels_per_head=int(getattr(mc, "edm2_channels_per_head", 64)),
-        dropout=float(getattr(mc, "dropout", 0.0)),
-        res_balance=float(getattr(mc, "edm2_res_balance", 0.3)),
-        attn_balance=float(getattr(mc, "edm2_attn_balance", 0.3)),
-        concat_balance=float(getattr(mc, "edm2_concat_balance", 0.5)),
-        clip_act=float(getattr(mc, "edm2_clip_act", 256.0)),
+        channels_per_head=int(mc.edm2_channels_per_head),
+        dropout=float(mc.dropout),
+        res_balance=float(mc.edm2_res_balance),
+        attn_balance=float(mc.edm2_attn_balance),
+        concat_balance=float(mc.edm2_concat_balance),
+        clip_act=float(mc.edm2_clip_act),
         num_fg_classes=out_classes,
         deep_supervision=bool(mc.deep_supervision),
         aux_seg_supervision=aux_seg,
-        aux_head_mode=str(getattr(mc, "aux_head_mode", "linear")),
+        aux_head_mode=str(mc.aux_head_mode),
         aux_head_out_channels=aux_head_out_channels,
     )
 
@@ -693,9 +693,9 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         in_ch_per_view_list if in_ch_per_view_list is not None
         else [base_ch_per_view] * n_views,
         out_classes, num_fg, D,
-        getattr(mc, "stem_mode", "conv3"), stem_stride, n_views,
+        mc.stem_mode, stem_stride, n_views,
         mc.stem_fusion_mode,
         bool(mc.deep_supervision), aux_seg,
-        len(model.aux_heads), getattr(mc, "aux_head_mode", "linear"))
+        len(model.aux_heads), mc.aux_head_mode)
 
     return model

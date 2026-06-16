@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Common helpers
 # ---------------------------------------------------------------------------
 def _resolve_aux_weights(cfg: Config, n_aux: int) -> List[float]:
-    user_w = list(getattr(cfg.loss, "aux_supervision_weights", []))
+    user_w = list(cfg.loss.aux_supervision_weights)
     if not user_w:
         # 几何衰减：越宽 FOV 对齐越差，权重越小。
         user_w = [0.5 ** (k + 1) for k in range(n_aux)]

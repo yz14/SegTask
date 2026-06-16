@@ -454,19 +454,19 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。"""
     dc = cfg.data
 
-    npz_dir = getattr(dc, "npz_dir", "")
+    npz_dir = dc.npz_dir
     if not npz_dir:
         raise ValueError(
             "data.npz_dir is required for training (npz-only data path). "
             "(or should be created); see segtask_v1.data.make_data.")
-    npz_suffix = getattr(dc, "npz_suffix", ".npz")
+    npz_suffix = dc.npz_suffix
 
     # 缺失/空时自建 npz 缓存（一次性；部分目录被视为权威，重生请 make_data --overwrite）。
     npz_p       = Path(npz_dir)
     npz_present = npz_p.is_dir() and any(
         x for x in npz_p.glob(f"*{npz_suffix}") if not x.name.startswith(("_", ".")))
     if not npz_present:
-        if not bool(getattr(dc, "npz_auto_build", True)):
+        if not bool(dc.npz_auto_build):
             raise FileNotFoundError(
                 f"data.npz_dir={npz_dir!r} is empty/missing and "
                 f"data.npz_auto_build is False. Run "
@@ -504,7 +504,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     # image_paths/label_paths 仅为别名（计 len/缓存键）；实际 I/O 由 dataset._npz_paths。
     image_paths  = list(npz_paths_all)
     label_paths  = list(npz_paths_all)
-    exclude_pids = _load_exclude_pids(getattr(dc, "exclude_list", ""))
+    exclude_pids = _load_exclude_pids(dc.exclude_list)
     image_paths, label_paths, keep_idx = _filter_by_exclude(
         image_paths, label_paths, npz_suffix, exclude_pids)
     if exclude_pids:
@@ -523,7 +523,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
     # 按主前景类分层划分（不可行时回退随机）。
-    if getattr(dc, "stratified_split", True) and dc.num_classes >= 2:
+    if dc.stratified_split and dc.num_classes >= 2:
         train_idx, val_idx = stratified_train_val_split(
             label_paths, dc.label_values, dc.val_ratio, dc.split_seed,
             label_loader_fn=label_loader_fn,
@@ -555,10 +555,8 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}
     if dc.num_workers > 0:
-        loader_kwargs["persistent_workers"] = bool(
-            getattr(dc, "persistent_workers", True))
-        loader_kwargs["prefetch_factor"] = int(
-            getattr(dc, "prefetch_factor", 4))
+        loader_kwargs["persistent_workers"] = bool(dc.persistent_workers)
+        loader_kwargs["prefetch_factor"] = int(dc.prefetch_factor)
 
     train_loader = DataLoader(
         train_ds,
