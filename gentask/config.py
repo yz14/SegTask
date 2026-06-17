@@ -697,6 +697,9 @@ class TaskConfig:
     # --- 超分退化（degradation=="superres"）---
     # 下采样倍率（各空间轴一致）。LR = down(HR, 1/scale) 再 up 回 HR 尺寸作输入。
     sr_scale: int = 2
+    # 各向异性逐空间轴倍率（覆盖 sr_scale）；空=各向同性。
+    # 顺序按空间轴：3D 为 (D,H,W)，2.5D 为 (H,W)。CT 厚层→薄层用 [2,1,1] 只超分 z 轴。
+    sr_scale_per_axis: List[int] = field(default_factory=list)
     # 制作 LR 的下/上采样插值："trilinear" | "area" | "nearest"。area≈抗锯齿平均池化。
     sr_kernel: str = "area"
     # LR 上附加高斯噪声（模拟采集噪声）；0=禁用。
@@ -884,6 +887,19 @@ class Config:
             str(t.sr_kernel).lower() in ("trilinear", "area", "nearest"),
             f"Invalid task.sr_kernel: {t.sr_kernel!r}. Valid: 'trilinear' | 'area' | 'nearest'.")
         _require(t.sr_noise_std >= 0.0, "task.sr_noise_std must be >= 0.")
+        if t.sr_scale_per_axis:
+            sdims = 2 if str(self.data.patch_mode).lower() == "2_5d" else 3
+            _require(
+                len(t.sr_scale_per_axis) == sdims,
+                f"task.sr_scale_per_axis length must equal spatial_dims ({sdims}) "
+                f"for patch_mode={self.data.patch_mode!r}; got {t.sr_scale_per_axis}.")
+            _require(
+                all(int(s) >= 1 for s in t.sr_scale_per_axis),
+                f"each task.sr_scale_per_axis entry must be >= 1; got {t.sr_scale_per_axis}.")
+            _require(
+                any(int(s) > 1 for s in t.sr_scale_per_axis) or t.sr_noise_std > 0.0,
+                "task.sr_scale_per_axis must have at least one axis with scale > 1 "
+                f"(else the degradation is a no-op); got {t.sr_scale_per_axis}.")
         if str(t.algorithm).lower() == "regression":
             _require(
                 str(t.recon_loss).lower() in ("charbonnier", "l1", "mse"),

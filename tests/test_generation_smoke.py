@@ -66,6 +66,33 @@ def test_degradation_shape_and_smoothing():
     assert lr.var().item() <= hr.var().item() + 1e-4
 
 
+def test_anisotropic_degradation_zaxis():
+    """各向异性退化：``axis_scales=[2,1,1]`` 只对 z 轴（D）超分，H,W 原样保留。"""
+    from gentask.data.degradation import SuperResDegradation
+
+    deg = SuperResDegradation(scale=1, spatial_dims=3, kernel="area",
+                              axis_scales=[2, 1, 1])
+    assert deg.axis_scales == (2, 1, 1)
+    D, H, W = 8, 16, 16
+    # 仅沿 W 变化（z/H 上恒定）→ 只退化 z 时应为恒等变换。
+    along_w = torch.arange(W).float().view(1, 1, 1, 1, W).expand(2, 1, D, H, W).contiguous()
+    assert torch.allclose(deg.degrade(along_w), along_w, atol=1e-5)
+    # 仅沿 z 变化→ z 轴被模糊，方差下降。
+    along_z = torch.arange(D).float().view(1, 1, D, 1, 1).expand(2, 1, D, H, W).contiguous()
+    assert deg.degrade(along_z).var().item() < along_z.var().item()
+    # 全 1 且无噪声 → 恒等。
+    noop = SuperResDegradation(scale=1, spatial_dims=2, axis_scales=[1, 1])
+    x = torch.rand(2, 4, 16, 16)
+    assert torch.equal(noop.degrade(x), x)
+    # 长度不匹配 spatial_dims 报错。
+    try:
+        SuperResDegradation(scale=2, spatial_dims=3, axis_scales=[2, 1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("axis_scales 长度与 spatial_dims 不符应报错")
+
+
 # ---------------------------------------------------------------------------
 # S3 损失与指标
 # ---------------------------------------------------------------------------
@@ -172,6 +199,41 @@ def test_regression_model_end_to_end():
     assert tuple(rec.shape) == (2, 4, 16, 16)
 
 
+def test_zaxis_sr_regression_3d_end_to_end():
+    """3D 厚→薄 z 轴超分回归：退化仅作用 z，模型输出与 HR 同形、可反传。"""
+    from gentask.losses.recon import build_recon_loss
+    from gentask.models.factory import build_model
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.num_classes = 2
+    cfg.data.label_values = [0, 1]
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.multi_res_scales = [1.0]
+    cfg.model.arch = "unet"
+    cfg.model.encoder_channels = [16, 32, 48]
+    cfg.model.encoder_blocks_per_stage = [1, 1, 1]
+    cfg.task.type = "generation"
+    cfg.task.algorithm = "regression"
+    cfg.task.degradation = "superres"
+    cfg.task.out_channels = 1
+    cfg.task.sr_scale_per_axis = [2, 1, 1]
+    cfg.sync()
+    cfg.validate()
+
+    model = build_model(cfg)
+    hr = torch.rand(2, 1, 8, 16, 16)
+    out = model(hr)
+    assert tuple(out["pred"].shape) == (2, 1, 8, 16, 16), out["pred"].shape
+    loss = build_recon_loss(cfg)(out["pred"], out["target"])
+    loss.backward()
+    assert any(p.grad is not None for p in model.parameters())
+    # 退化只动 z：x,y 恒定体不变。
+    along_z_const = torch.arange(16).float().view(1, 1, 1, 1, 16).expand(2, 1, 8, 16, 16).contiguous()
+    with torch.no_grad():
+        assert torch.allclose(model.degrade(along_z_const), along_z_const, atol=1e-5)
+
+
 def test_diffusion_model_end_to_end():
     from gentask.losses.recon import DiffusionLoss
     from gentask.models.factory import build_model
@@ -254,11 +316,13 @@ def test_generation_predictor_restore_volume():
 def main() -> int:
     tests = [
         test_degradation_shape_and_smoothing,
+        test_anisotropic_degradation_zaxis,
         test_recon_loss_backprop,
         test_diffusion_loss_backprop,
         test_seg_backbone_unchanged,
         test_diffusion_backbone_forward_backward,
         test_regression_model_end_to_end,
+        test_zaxis_sr_regression_3d_end_to_end,
         test_diffusion_model_end_to_end,
         test_diffusion_requires_adm_or_edm2,
         test_generation_trainer_runs,
