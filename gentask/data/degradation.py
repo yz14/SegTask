@@ -46,12 +46,23 @@ def _interp_mode(sr_kernel: str, spatial_dims: int) -> str:
     return table[sr_kernel]
 
 
+# VFI（插帧）上采样用线性插值在保留帧之间补片。
+_LINEAR_MODES = {2: "bilinear", 3: "trilinear"}
+
+
 class SuperResDegradation:
     """超分退化：HR → LR（同尺寸，已上采样回原大小）。
 
     倍率可按轴配置：``axis_scales`` 为长度 ``spatial_dims`` 的逐轴倍率（为
     ``None`` 时退化为各轴同倍的标量 ``scale``）。某轴倍率为 1 表示该轴不退化。
-    下采样尺寸由原尺寸除以倍率取整得到，上采样时显式还原到原尺寸，避免 ±1 偏差。
+
+    ``sampling`` 选退化方式：
+
+    * ``"blur"``（SISR）：下采样到 ``1/scale`` 再上采样回原尺寸，造成同尺寸模糊。
+      下采样尺寸由原尺寸除以倍率取整，上采样显式还原原尺寸避免 ±1 偏差。
+    * ``"decimate"``（VFI 插帧）：沿退化轴按 ``scale`` 抽稀保留帧（``[::sc]``），再用
+      线性插值填回原尺寸（在保留帧之间插出中间片）。对应「取稀疏厚层切片、
+      模型补足中间薄层」的帧插值设定（线性插值作为天真 baseline，模型学残差）。
     """
 
     def __init__(
@@ -60,9 +71,14 @@ class SuperResDegradation:
         spatial_dims: int,
         kernel: str = "area",
         noise_std: float = 0.0,
-        axis_scales: Optional[Sequence[int]] = None):
+        axis_scales: Optional[Sequence[int]] = None,
+        sampling: str = "blur"):
         if spatial_dims not in (2, 3):
             raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}.")
+        sampling = str(sampling).lower()
+        if sampling not in ("blur", "decimate"):
+            raise ValueError(
+                f"sampling must be 'blur' | 'decimate'; got {sampling!r}.")
         if axis_scales is None:
             if scale < 1:
                 raise ValueError(f"sr_scale must be >= 1; got {scale}.")
@@ -78,10 +94,13 @@ class SuperResDegradation:
         self.axis_scales = axes
         self.scale = max(axes)
         self.spatial_dims = int(spatial_dims)
+        self.sampling = sampling
         self.mode = _interp_mode(kernel, spatial_dims)
         self.noise_std = float(noise_std)
         # area / nearest 不支持 align_corners；线性族传 False 保持几何一致。
         self._align = None if self.mode in ("area", "nearest") else False
+        # decimate 用线性上采样在保留帧间插值。
+        self._up_mode = _LINEAR_MODES[spatial_dims]
         self._is_identity = all(s == 1 for s in axes)
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
@@ -89,21 +108,35 @@ class SuperResDegradation:
         if self._is_identity and self.noise_std == 0.0:
             return hr.clone()
 
-        spatial = hr.shape[-self.spatial_dims:]
+        spatial = tuple(int(s) for s in hr.shape[-self.spatial_dims:])
         if not self._is_identity:
-            low = [max(int(round(int(s) / sc)), 1)
-                   for s, sc in zip(spatial, self.axis_scales)]
-            down = F.interpolate(
-                hr, size=tuple(low), mode=self.mode, align_corners=self._align)
-            lr = F.interpolate(
-                down, size=tuple(int(s) for s in spatial),
-                mode=self.mode, align_corners=self._align)
+            if self.sampling == "decimate":
+                lr = self._decimate_interp(hr, spatial)
+            else:
+                low = [max(int(round(s / sc)), 1)
+                       for s, sc in zip(spatial, self.axis_scales)]
+                down = F.interpolate(
+                    hr, size=tuple(low), mode=self.mode, align_corners=self._align)
+                lr = F.interpolate(
+                    down, size=spatial, mode=self.mode, align_corners=self._align)
         else:
             lr = hr.clone()
 
         if self.noise_std > 0.0:
             lr = lr + torch.randn_like(lr) * self.noise_std
         return lr
+
+    def _decimate_interp(
+        self, hr: torch.Tensor, spatial: Tuple[int, ...]) -> torch.Tensor:
+        """沿倍率>1 的轴抽稀保留帧，再线性插值填回原尺寸（VFI 输入）。"""
+        first = hr.ndim - self.spatial_dims
+        idx = [slice(None)] * hr.ndim
+        for i, sc in enumerate(self.axis_scales):
+            if sc > 1:
+                idx[first + i] = slice(0, None, sc)
+        kept = hr[tuple(idx)]
+        return F.interpolate(
+            kept, size=spatial, mode=self._up_mode, align_corners=False)
 
 
 def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegradation:
@@ -121,7 +154,8 @@ def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegrad
         spatial_dims=spatial_dims,
         kernel=str(cfg_task.sr_kernel).lower(),
         noise_std=float(cfg_task.sr_noise_std),
-        axis_scales=per_axis if per_axis else None)
+        axis_scales=per_axis if per_axis else None,
+        sampling=str(cfg_task.sr_sampling).lower())
 
 
 def make_pair(

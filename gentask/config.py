@@ -702,6 +702,8 @@ class TaskConfig:
     sr_scale_per_axis: List[int] = field(default_factory=list)
     # 制作 LR 的下/上采样插值："trilinear" | "area" | "nearest"。area≈抗锯齿平均池化。
     sr_kernel: str = "area"
+    # 退化采样方式："blur"（SISR，降采样模糊）| "decimate"（VFI 插帧，抽稀帧+线性插值填补）。
+    sr_sampling: str = "blur"
     # LR 上附加高斯噪声（模拟采集噪声）；0=禁用。
     sr_noise_std: float = 0.0
 
@@ -887,6 +889,9 @@ class Config:
             str(t.sr_kernel).lower() in ("trilinear", "area", "nearest"),
             f"Invalid task.sr_kernel: {t.sr_kernel!r}. Valid: 'trilinear' | 'area' | 'nearest'.")
         _require(t.sr_noise_std >= 0.0, "task.sr_noise_std must be >= 0.")
+        _require(
+            str(t.sr_sampling).lower() in ("blur", "decimate"),
+            f"Invalid task.sr_sampling: {t.sr_sampling!r}. Valid: 'blur' | 'decimate'.")
         if t.sr_scale_per_axis:
             sdims = 2 if str(self.data.patch_mode).lower() == "2_5d" else 3
             _require(
