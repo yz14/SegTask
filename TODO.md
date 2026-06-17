@@ -33,17 +33,36 @@
 测试环境为: **D:\miniconda\envs\torch27_env\python.exe**。  
 
 
-这是我写的2.5D/3D分割项目代码D:\codes\work-projects\SegTask\README.md，训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py。这里有3个3D方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动中心切块）；whole（直接输入整个图像）。一个2.5D方案，它和z轴滑块的单分辨率/感受野方案非常的相似，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D模型。计算损失也和现有框架一致，模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。这里有一份小数据集作为测试：F:\med_data\Totalsegmentator_dataset_v201\small_data\nii，F:\med_data\Totalsegmentator_dataset_v201\small_data\mask，
+segtask_v1是2.5D/3D分割项目代码D:\codes\work-projects\SegTask\README.md；训练入口在D:\codes\work-projects\SegTask\segtask_v1\train.py。
+这里有3个3D方案，z轴滑块（只在z轴滑动切块，x,y为全尺寸）；cubic滑块（在x,y,z轴滑动中心切块）；whole（直接输入整个图像）和1个2.5D方案，它和z轴滑块的单分辨率/感受野方案非常的相似，区别是：a 在train的时候，当数据增强结束后，将3D数据B,1,D,H,W变为B,D,H,W作为2D输入,D张切片代表D个通道；b 模型采用2D模型。
+计算损失统一为模型输出为B,num_fgxD,H,W然后拆分为num_fg个B,D,H,W单标签预测，各自计算单标签损失。
+这里有一份小数据集作为测试：F:\med_data\Totalsegmentator_dataset_v201\small_data\nii，F:\med_data\Totalsegmentator_dataset_v201\small_data\mask，
 F:\med_data\Totalsegmentator_dataset_v201\small_data\bbox，
 F:\med_data\Totalsegmentator_dataset_v201\small_data\region_weihgt。  
-数据流：只接受npz输入，所有多分辨率方案必须都只取max FOV后，带数据增强结束后通过中心截取制作成多分辨率。  
+数据流：只接受npz输入，所有多分辨率方案必须都只取max FOV后，待数据增强结束后通过中心截取制作成多分辨率。  
+
+
+gentask是基于segtask_v1是适配的超分项目。模型只能是2D，自然图像公认的经典、关键、高质量超分算法（SISR/VFI）。数据流只接受npz输入（必须先制作好）。
 
 
 # TODO  
-1 先仔细检查一遍分割任务segtask_v1里面所有代码的质量，是否符合以上要求，是否规范，清晰，正确，命名是否清晰，是否有大量的if else逻辑判断让人读起来费劲等等，不要那种看起来像是在打补丁式代码逻辑等等。  
+1 修改和优化gentask里面的代码，这里的代码主要用于医学影像超分，先针对CT超分进行修改、适配和优化，主要沿用分割的2.5D方案：  
+image_dir: 低分辨率输入可能缺失，label_dir: 高分辨率GT，bbox_dir : 可能有，region_weight_dir : 可能有，npz_dir: 制作好的路径  
 
-2 我现在要涉及gentask里面的代码，这个目录里面的代码主要用于医学影像生成：a 超分辨率（例如厚层生成薄层，仅仅对x,y切片从低分辨率变为高分辨率，或者2D图像例如超声/内镜的超分）；b 模态转换（例如从一个模态或者多个模态转为制定的一个模态）。首先针对超分任务来改吧，超分输入如果是2D图像，那么算法就和自然图像的超分一致了，如果是3D图像，那么目前就集中适配z轴滑块和2.5D方案（这样也和2D自然图像一致了）。
-a 如果是2D数据，处理很简单
-b 如果是3D数据，且是厚层生成薄层，那么薄层数据可能有/无对应的厚层，如果没有对应厚层，需要从薄层里面就行数据增强来模拟厚层（所以只有label_dir提供）
-c 如果是3D数据，且是切片的x,y的高分辨率生成，那么对应的低分辨率数据可能也会确实，那样也需要从label里面就行数据增强来模拟低分辨率（所以只有label_dir提供）
-d 只允许npz训练，也就是训练前必须用make data
+a 厚层生成薄层  
+GT是薄层，对于的厚层可能缺失，需要针对性的用数据增强算法从薄层模拟出厚层（一张厚层切片是层厚范围内体素的平均(部分容积效应)）  
+
+输入可以是对厚层的z轴滑块，例如取连续两张切片作为起始和终点，然后模型往中间插切片2x,4x，类似这样，模型对应的可能需要采用VFI；输入还可以是在厚层的x或者y进行滑块，由于只有z轴是低分辨率，所以模型对应的可能采用SISR只对z轴2x,4x，类似这样超分。  
+
+输入可以输入更多FOV来帮助模型，例如薄层是1,2,3,4,5,6,7切片，厚层是1,3,5,7，对z轴滑块的基本输入是，例如3,5(1x FOV)->3,4,5，多FOV就是3,5(1x)+1,3,5,7(2x)->3,4,5；如果是在x轴取切片，那么输入就和分割的2.5D方案非常类似，例如C(x轴),H(y),w(z)->C,H,W，在x轴上取更多的切片，例如Cx1.5，Cx2个切片作为多个FOV  
+
+数据读取部分几乎可以沿用分割任务中2.5D方案，例如保留oversample这样数据增强后边界的异常可以通用中心剪裁去掉；只在数据增强结束后才做成2D数据等等；我理解的就是把输入图像换成低分辨率，标签换成高分辨率，区域权重可能是重要的器官等等；只对oversample的max FOV处理，然后中心剪裁出多FOV等等。    
+
+模型对应的用自然图像公认的经典、关键、高质量超分算法（SISR/VFI）；安装分割的代码风格来写(虽然不能统一UNet框架，但是构造模型的过程的block, stage, encoder, decoder这些可以参考)。  
+
+输出对应的就是插帧/超分。  
+
+需要针对性的适配各种技巧（例如在分割中有很多的技巧，例如EMA，deep supervision, 多个输出头来辅助监督等等）
+
+b 面内超分（x,y是低分辨率，D,h,w -> D,H,W）
+这个更加直观，也更加容易在分割的2.5D方案上适配(类似a中的在x轴取切片，然后超分z轴，只不过现在是在z轴取切片然后需要同时超分x,y轴)，和自然图像任务最接近。
