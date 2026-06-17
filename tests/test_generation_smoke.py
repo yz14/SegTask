@@ -260,6 +260,81 @@ def test_zaxis_sr_regression_3d_end_to_end():
         assert torch.allclose(model.degrade(along_z_const), along_z_const, atol=1e-5)
 
 
+def test_deep_supervision_regression():
+    """深监督回归：forward 返回多尺度头（head0 全分辨率），残差头可加下采样基线。"""
+    from gentask.models.factory import build_model
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.num_classes = 2
+    cfg.data.label_values = [0, 1]
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.multi_res_scales = [1.0]
+    cfg.model.arch = "unet"
+    cfg.model.encoder_channels = [16, 32, 48]
+    cfg.model.encoder_blocks_per_stage = [1, 1, 1]
+    cfg.model.deep_supervision = True
+    cfg.task.type = "generation"
+    cfg.task.algorithm = "regression"
+    cfg.task.degradation = "superres"
+    cfg.task.out_channels = 1
+    cfg.task.residual = True
+    cfg.sync()
+    cfg.validate()
+
+    model = build_model(cfg)
+    hr = torch.rand(2, 1, 8, 16, 16)
+    out = model(hr)
+    preds = out["ds_preds"]
+    assert len(preds) >= 2, len(preds)
+    assert tuple(preds[0].shape) == (2, 1, 8, 16, 16)        # 全分辨率头
+    assert preds[1].shape[-1] < preds[0].shape[-1]            # 后续头更小
+    assert out["pred"] is preds[0]
+    # 推理只取全分辨率头。
+    model.eval()
+    with torch.no_grad():
+        assert tuple(model.restore(model.degrade(hr)).shape) == (2, 1, 8, 16, 16)
+    # 深监督与算法='diffusion' 互斥（校验报错）。
+    cfg2 = Config()
+    cfg2.data.patch_mode = "2_5d"
+    cfg2.data.num_classes = 2
+    cfg2.data.label_values = [0, 1]
+    cfg2.data.patch_size = [4, 16, 16]
+    cfg2.data.multi_res_scales = [1.0]
+    cfg2.model.arch = "adm"
+    cfg2.model.deep_supervision = True
+    cfg2.task.type = "generation"
+    cfg2.task.algorithm = "diffusion"
+    cfg2.task.degradation = "superres"
+    try:
+        cfg2.sync(); cfg2.validate()
+    except Exception:
+        pass
+    else:
+        raise AssertionError("deep_supervision + diffusion 应被校验拒绝")
+
+
+def test_deep_supervision_trainer_runs():
+    """深监督回归经 GenerationTrainer 跑通一个 epoch（多尺度损失可反传）。"""
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    cfg = _cfg("regression")
+    cfg.model.deep_supervision = True
+    cfg.sync()
+    cfg.validate()
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_amp = False
+    cfg.train.output_dir = "/tmp/gen_test_ds_regression"
+    D = cfg.data.patch_size[0]
+    model = build_model(cfg)
+    tr = GenerationTrainer(model, cfg, _loader(D), _loader(D), torch.device("cpu"))
+    res = tr.fit()
+    assert np.isfinite(res["best_psnr"])
+    assert (Path(cfg.train.output_dir) / "best_model.pth").exists()
+
+
 def test_diffusion_model_end_to_end():
     from gentask.losses.recon import DiffusionLoss
     from gentask.models.factory import build_model
@@ -350,6 +425,8 @@ def main() -> int:
         test_diffusion_backbone_forward_backward,
         test_regression_model_end_to_end,
         test_zaxis_sr_regression_3d_end_to_end,
+        test_deep_supervision_regression,
+        test_deep_supervision_trainer_runs,
         test_diffusion_model_end_to_end,
         test_diffusion_requires_adm_or_edm2,
         test_generation_trainer_runs,

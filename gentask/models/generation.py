@@ -17,6 +17,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..data.degradation import build_degradation
 from .diffusion import build_diffusion
@@ -28,35 +29,53 @@ class RegressionModel(nn.Module):
 
     复用分割工厂构造的图到图网络（输出通道已按 ``out_channels`` 配置），一次前向把
     低分图映射回高分图；``residual=True`` 时学习残差 ``HR−LR``（DnCNN / VDSR）。
+
+    深监督（``model.deep_supervision=True``）：训练时 backbone 输出多尺度头
+    ``[full, /2, ...]``，``forward`` 经 ``ds_preds`` 全部返回，由训练器对每个尺度
+    与下采样后的 HR 算重建损失并加权聚合；推理（``restore``）只取全分辨率头。
     """
 
-    def __init__(self, net: nn.Module, degradation, residual: bool = False):
+    def __init__(self, net: nn.Module, degradation, residual: bool = False,
+                 spatial_dims: int = 2):
         super().__init__()
         self.net = net
         self.degradation = degradation
         self.residual = bool(residual)
+        self.spatial_dims = int(spatial_dims)
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
         return self.degradation.degrade(hr)
 
-    def restore(self, lr: torch.Tensor) -> torch.Tensor:
+    def _add_residual(self, out: torch.Tensor, lr: torch.Tensor) -> torch.Tensor:
+        """残差基线：全分辨率头加 ``lr``；下采样头加 ``lr`` 缩放到该头尺寸。"""
+        base = lr
+        if out.shape[-self.spatial_dims:] != lr.shape[-self.spatial_dims:]:
+            base = F.interpolate(
+                lr, size=tuple(out.shape[-self.spatial_dims:]), mode="area")
+        if out.shape[1] != base.shape[1]:
+            raise ValueError(
+                "residual=True requires net out channels == lr channels "
+                f"({out.shape[1]} != {base.shape[1]}); set task.residual=False "
+                "or match out_channels to input depth.")
+        return out + base
+
+    def _heads(self, lr: torch.Tensor) -> list:
+        """返回多尺度输出头列表（深监督关时为单元素）；head[0] 为全分辨率。"""
         out = self.net(lr)
-        if isinstance(out, (list, tuple)):
-            out = out[0]
-        elif isinstance(out, dict):
-            out = out["main"][0] if isinstance(out["main"], list) else out["main"]
+        if isinstance(out, dict):
+            out = out["main"]
+        heads = list(out) if isinstance(out, (list, tuple)) else [out]
         if self.residual:
-            if out.shape[1] != lr.shape[1]:
-                raise ValueError(
-                    "residual=True requires net out channels == lr channels "
-                    f"({out.shape[1]} != {lr.shape[1]}); set task.residual=False "
-                    "or match out_channels to input depth.")
-            out = out + lr
-        return out
+            heads = [self._add_residual(h, lr) for h in heads]
+        return heads
+
+    def restore(self, lr: torch.Tensor) -> torch.Tensor:
+        return self._heads(lr)[0]
 
     def forward(self, hr: torch.Tensor) -> Dict[str, torch.Tensor]:
         lr = self.degrade(hr)
-        return {"pred": self.restore(lr), "target": hr}
+        heads = self._heads(lr)
+        return {"pred": heads[0], "ds_preds": heads, "target": hr}
 
 
 class DiffusionModel(nn.Module):
@@ -99,7 +118,8 @@ def build_generation_model(cfg) -> nn.Module:
 
     if algo == "regression":
         net = build_backbone(cfg)  # 复用图到图 backbone（输出通道按 out_channels）
-        return RegressionModel(net, degradation, residual=bool(task.residual))
+        return RegressionModel(net, degradation, residual=bool(task.residual),
+                               spatial_dims=spatial_dims)
 
     if algo == "diffusion":
         arch = str(cfg.model.arch).lower()
