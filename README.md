@@ -751,6 +751,7 @@ predict.py
   - **各向异性**：`sr_scale_per_axis`（顺序按空间轴，3D 为 `(D,H,W)`、2.5D 为 `(H,W)`）逐轴单独配置。CT **厚层→薄层**用 `[2,1,1]` —— 仅 z 轴是低分辨率，故只对 z 下/上采样（z-SISR），x,y 保原分辨率（`area` 核沿 z 即层厚范围内体素的区域均值，近似部分容积效应）。见 `configs/gensr_3d_zaxis_regression.yaml`。
   - **退化采样方式** `sr_sampling`：`blur`（SISR，默认）降采样再上采样造成同尺寸模糊；`decimate`（**VFI 插帧**）沿退化轴抽稀保留帧（`[::s]`）再线性插值填回原尺寸，对应 TODO 1a「取稀疏厚层切片、模型补足中间薄层」的帧插值设定（线性插值作天真 baseline，模型学残差）。见 `configs/gensr_3d_zaxis_vfi.yaml`。
 - **损失** `losses/recon.py`：`ReconstructionLoss`（Charbonnier / L1 / MSE + 可选 (1−SSIM) + 梯度 L1）用于回归；`DiffusionLoss`（逐样本加权 MSE）用于扩散；`psnr` / `ssim` 作验证指标。
+- **深监督（回归）** `model.deep_supervision=true`：复用分割 backbone 的多尺度解码头，`RegressionModel.forward` 经 `ds_preds` 返回 `[full, /2, ...]` 各头，`GenerationTrainer` 对每个尺度与 `area` 下采样后的 HR 算重建损失、按 `loss.deep_supervision_weights`（归一化）加权聚合（`residual=true` 时各头加 `lr` 缩放到该尺寸的基线）；推理只取全分辨率头。仅 `algorithm=regression` 支持（扩散用 ADM/EDM2 网络、无多尺度头，校验会拒绝）。开启方式：`--override model.deep_supervision=true`。
 - **条件 backbone**：ADM/EDM2 原作分割时**移除了** timestep 条件；扩散路径将其按论文忠实复原——
   - ADM：`AdaGN` scale-shift，`h = norm(h)·(1+scale) + shift`，由正弦时间嵌入经 MLP 得到（`models/adm_unet.py::ADMDiffusionUNet`）；
   - EDM2：幅度保持 FiLM，`y = y·(emb_linear(emb)+1)`，由 MP-Fourier 噪声嵌入得到（`models/edm2_unet.py::EDM2DiffusionUNet`）。

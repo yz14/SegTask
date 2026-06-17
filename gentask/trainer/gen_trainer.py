@@ -20,6 +20,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..config import Config
 from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
@@ -94,7 +95,28 @@ class GenerationTrainer:
     def _step_loss(self, out: Dict[str, torch.Tensor], breakdown) -> torch.Tensor:
         if self.is_diffusion:
             return self.loss_fn(out, breakdown=breakdown)
+        preds = out.get("ds_preds")
+        if preds is not None and len(preds) > 1:
+            return self._ds_recon_loss(preds, out["target"], breakdown)
         return self.loss_fn(out["pred"], out["target"], breakdown=breakdown)
+
+    def _ds_recon_loss(self, preds, hr: torch.Tensor, breakdown) -> torch.Tensor:
+        """深监督重建损失：逐尺度与下采样后的 HR 算 recon，按归一化权重聚合。"""
+        raw = list(self.cfg.loss.deep_supervision_weights[:len(preds)])
+        if not raw:
+            raw = [0.5 ** k for k in range(len(preds))]
+        denom = float(sum(raw)) or 1.0
+        weights = [w / denom for w in raw]
+        total = hr.new_zeros(())
+        for k, (w, p) in enumerate(zip(weights, preds)):
+            if tuple(p.shape[-self.spatial_dims:]) == tuple(hr.shape[-self.spatial_dims:]):
+                tgt = hr
+            else:
+                tgt = F.interpolate(
+                    hr, size=tuple(p.shape[-self.spatial_dims:]), mode="area")
+            bd = breakdown if k == 0 else None
+            total = total + w * self.loss_fn(p, tgt, breakdown=bd)
+        return total
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()

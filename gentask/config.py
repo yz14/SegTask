@@ -915,6 +915,11 @@ class Config:
                      f"task.ssim_window must be odd and >= 3; got {t.ssim_window}.")
         else:  # diffusion
             _require(
+                not self.model.deep_supervision,
+                "model.deep_supervision is only supported for generation "
+                "algorithm='regression' (diffusion uses adm/edm2 nets without "
+                "multi-scale heads); set deep_supervision=False or algorithm='regression'.")
+            _require(
                 str(t.parameterization).lower() in ("edm", "ddpm_eps"),
                 f"Invalid task.parameterization: {t.parameterization!r}. Valid: 'edm' | 'ddpm_eps'.")
             _require(
