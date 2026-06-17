@@ -1,0 +1,106 @@
+# 3D 厚层→薄层超分（生成任务）— z 轴各向异性回归复原
+#
+# TODO #1（1a）：CT 「厚层→薄层」。仅 z 轴是低分辨率，故退化只对 z 轴下采样/
+# 上采样（z-SISR），x,y 保持原分辨率。用 3D backbone 在整 z 轴上下文里复原薄层。
+#
+# 关键：task.type='generation' + task.algorithm='regression' + 3D patch_mode。
+# task.sr_scale_per_axis=[s_z,1,1] 走各向异性退化（顺序按空间轴 D,H,W）。
+# 分割标签被忽略——目标是干净（薄层）体自身，厚层条件由退化算子在线生成。
+
+data:
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+
+  # 训练 / 推理目录（按本机修改）
+  image_dir: "F:/med_data/imgs"
+  label_dir: "F:/med_data/lbls"   # 生成任务忽略标签，但 loader 仍需该字段
+
+  label_values: [0, 1]
+  num_classes : 2
+
+  patch_size: [32, 256, 256]      # [D, H, W]
+  patch_mode: "z_axis"            # 沿 z 轴滑块，保留 x,y 全分辨率上下文
+
+  # 生成任务单视图：multi_res_scales 必须为 [1.0]
+  multi_res_scales: [1.0]
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  val_ratio : 0.2
+  split_seed: 42
+
+  batch_size : 2
+  num_workers: 4
+  pin_memory : true
+
+  samples_per_volume: 8
+  cache_mode: "memory"
+  cache_max_volumes: 1
+
+
+augment:
+  enabled: true
+  random_flip_prob: 0.5
+  random_flip_axes: [2, 3, 4]
+  random_affine_prob : 0.0
+  elastic_deform_prob: 0.0
+
+
+model:
+  arch: "unet"
+  backbone: "resnet"
+  encoder_channels: [32, 64, 128, 256]
+  encoder_blocks_per_stage: [2, 2, 2, 2]
+  decoder_type: "unet"
+
+
+# ---- 生成任务设置 ----
+task:
+  type: "generation"
+  algorithm: "regression"
+  degradation: "superres"
+  out_channels: 1
+
+  # 各向异性超分退化：仅 z 轴（D）2x，H,W 保持原分辨率。
+  # 顺序按空间轴 (D, H, W)；覆盖标量 sr_scale。
+  sr_scale_per_axis: [2, 1, 1]
+  sr_kernel: "area"              # area≈层厚范围内体素平均（部分容积效应）
+  sr_noise_std: 0.0
+
+  # 回归算法
+  residual: false
+  recon_loss: "charbonnier"
+  charbonnier_eps: 1.0e-3
+  ssim_weight: 0.1              # 0 关闭；>0 加 (1−SSIM) 辅助
+  grad_weight: 0.0
+
+
+loss:        # 生成任务不使用分割损失，保留以满足配置结构
+  name: "dice"
+
+
+train:
+  epochs: 100
+  optimizer   : "adamw"
+  lr          : 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+  grad_clip_norm: 1.0
+  use_amp  : true
+  amp_dtype: "auto"
+  compile_mode: "none"
+  use_ema  : true
+  ema_decay: 0.999
+  output_dir: "outputs/gensr_zaxis_regression"
+  log_every: 20
+  seed: 42
+
+
+predict:
+  output_dir: "predictions_sr_zaxis"
