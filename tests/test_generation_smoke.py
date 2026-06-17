@@ -93,6 +93,32 @@ def test_anisotropic_degradation_zaxis():
         raise AssertionError("axis_scales 长度与 spatial_dims 不符应报错")
 
 
+def test_vfi_decimate_degradation():
+    """VFI 抽稀+线性插值：仅退化轴受影响、形状不变、去高频，非法 sampling 报错。"""
+    from gentask.data.degradation import SuperResDegradation
+
+    deg = SuperResDegradation(scale=1, spatial_dims=3, axis_scales=[2, 1, 1],
+                              sampling="decimate")
+    assert deg.sampling == "decimate"
+    D, H, W = 8, 16, 16
+    # 沿 W 变化、z 上恒定 → 只动 z 的抽稀+插值为恒等（W 全分辨率保留）。
+    along_w = torch.arange(W).float().view(1, 1, 1, 1, W).expand(2, 1, D, H, W).contiguous()
+    assert torch.allclose(deg.degrade(along_w), along_w, atol=1e-5)
+    # 沿 z 变化 → 抽稀丢中间帧信息，结果改变、形状不变、方差不增（去高频）。
+    along_z = torch.rand(2, 1, D, H, W)
+    out = deg.degrade(along_z)
+    assert out.shape == along_z.shape
+    assert not torch.allclose(out, along_z, atol=1e-3)
+    assert out.var().item() <= along_z.var().item() + 1e-4
+    # 非法 sampling 报错。
+    try:
+        SuperResDegradation(scale=2, spatial_dims=3, sampling="bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非法 sampling 应报错")
+
+
 # ---------------------------------------------------------------------------
 # S3 损失与指标
 # ---------------------------------------------------------------------------
@@ -317,6 +343,7 @@ def main() -> int:
     tests = [
         test_degradation_shape_and_smoothing,
         test_anisotropic_degradation_zaxis,
+        test_vfi_decimate_degradation,
         test_recon_loss_backprop,
         test_diffusion_loss_backprop,
         test_seg_backbone_unchanged,

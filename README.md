@@ -749,6 +749,7 @@ predict.py
 - **退化算子** `data/degradation.py::SuperResDegradation`：HR→下采样→上采样回 HR 网格得低分输入，支持 `sr_kernel ∈ {area, trilinear, nearest}`、可选高斯噪声。仅作用空间轴；2.5D 下 D 折叠为通道、逐通道退化。
   - **各向同性**：标量 `sr_scale` 各空间轴同倍（面内 2.5D 默认）。
   - **各向异性**：`sr_scale_per_axis`（顺序按空间轴，3D 为 `(D,H,W)`、2.5D 为 `(H,W)`）逐轴单独配置。CT **厚层→薄层**用 `[2,1,1]` —— 仅 z 轴是低分辨率，故只对 z 下/上采样（z-SISR），x,y 保原分辨率（`area` 核沿 z 即层厚范围内体素的区域均值，近似部分容积效应）。见 `configs/gensr_3d_zaxis_regression.yaml`。
+  - **退化采样方式** `sr_sampling`：`blur`（SISR，默认）降采样再上采样造成同尺寸模糊；`decimate`（**VFI 插帧**）沿退化轴抽稀保留帧（`[::s]`）再线性插值填回原尺寸，对应 TODO 1a「取稀疏厚层切片、模型补足中间薄层」的帧插值设定（线性插值作天真 baseline，模型学残差）。见 `configs/gensr_3d_zaxis_vfi.yaml`。
 - **损失** `losses/recon.py`：`ReconstructionLoss`（Charbonnier / L1 / MSE + 可选 (1−SSIM) + 梯度 L1）用于回归；`DiffusionLoss`（逐样本加权 MSE）用于扩散；`psnr` / `ssim` 作验证指标。
 - **条件 backbone**：ADM/EDM2 原作分割时**移除了** timestep 条件；扩散路径将其按论文忠实复原——
   - ADM：`AdaGN` scale-shift，`h = norm(h)·(1+scale) + shift`，由正弦时间嵌入经 MLP 得到（`models/adm_unet.py::ADMDiffusionUNet`）；
@@ -769,8 +770,10 @@ python -m gentask.train --config configs/gensr_2_5d_regression.yaml
 # 训练（条件扩散，ADM backbone）
 python -m gentask.train --config configs/gensr_2_5d_diffusion_adm.yaml \
     --override task.parameterization=ddpm_eps task.sampler=ddpm
-# 训练（3D 厚层→薄层，z 轴各向异性超分）
+# 训练（3D 厚层→薄层，z 轴各向异性 SISR）
 python -m gentask.train --config configs/gensr_3d_zaxis_regression.yaml
+# 训练（3D 厚层→薄层，z 轴帧插值 VFI）
+python -m gentask.train --config configs/gensr_3d_zaxis_vfi.yaml
 # 推理：逐卷复原写出 <output_dir>/<pid>_sr.nii.gz
 python -m gentask.predict --config configs/gensr_2_5d_regression.yaml \
     --checkpoint outputs/gensr_regression/best_model.pth --input F:/med_data/lr_imgs
@@ -780,6 +783,6 @@ python -m gentask.predict --config configs/gensr_2_5d_regression.yaml \
 
 ### 10.3 配置与测试
 
-- 示例配置：`configs/gensr_2_5d_regression.yaml`（面内超分）、`configs/gensr_3d_zaxis_regression.yaml`（厚层→薄层 z 轴超分）、`configs/gensr_2_5d_diffusion_adm.yaml`（含逐字段注释）。
+- 示例配置：`configs/gensr_2_5d_regression.yaml`（面内超分）、`configs/gensr_3d_zaxis_regression.yaml`（厚层→薄层 z 轴 SISR）、`configs/gensr_3d_zaxis_vfi.yaml`（厚层→薄层 z 轴 VFI 插帧）、`configs/gensr_2_5d_diffusion_adm.yaml`（含逐字段注释）。
 - 冒烟测试（无数据、CPU、小张量，验证「跑通 / 形状对 / 可反传 / 能出图」）：`python tests/test_generation_smoke.py`。
 - 真实训练效果（收敛、PSNR/SSIM 提升）需在本机带数据与 GPU 跑。
