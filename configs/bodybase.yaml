@@ -4,7 +4,7 @@ data:
   bbox_suffix : ".nii.gz"
   region_weight_suffix: ".nii.gz"
 
-  image_dir: "F:/lung/imgs"
+  image_dir: "F:/lung_vessel/imgs"
 
   label_values: [0, 1]
   num_classes : 2

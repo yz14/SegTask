@@ -1,11 +1,11 @@
 data:
   image_suffix: ".nii.gz"
-  label_suffix: ".nii.gz"
+  label_suffix: "-seg.nii.gz"
   bbox_suffix : "_pred.nii.gz"
   region_weight_suffix: ".nii.gz"
 
-  image_dir: "F:/lung/imgs"
-  bbox_dir:  "F:/lung/body_base_pred"
+  image_dir: "F:/lung_paired/imgs"
+  bbox_dir : "F:/lung_paired/lung_resnet_bnorm_pred"
 
   label_values: [0, 1]
   num_classes : 2
@@ -133,7 +133,7 @@ loss:
 
 
 train:
-  epochs: 200
+  epochs: 400
 
   optimizer   : "adamw"
   lr          : 1.0e-3
@@ -155,9 +155,9 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/lung_resnet_bnorm"    ############################################################
+  output_dir      : "outputs/ves_resnet_bnorm"    ############################################################
   save_every      : 10
-  save_best_criterion: "dice+surface_dice"
+  save_best_criterion: "dice"
   surface_dice_tolerance: 1
   surface_dice_weight: 0.5
   save_best_preset: ""
@@ -174,7 +174,7 @@ train:
 
   resume: ""
 
-  pretrain: "/data0/yzhen/timm_test/outputs/lung_resnet_bnorm/best_model.pth"
+  pretrain: ""
   pretrain_strict: false
   pretrain_load_ema: false
 
@@ -184,8 +184,8 @@ predict:
   z_interleave_factors   : [5, 4, 3, 2, 1]
   z_overlap : 0.5
   blend_mode: "gaussian"          # 'gaussian' | 'constant'
-  batch_size: 4
-  tta_flip  : false
-  threshold : 0.6
+  batch_size: 2
+  tta_flip  : true
+  threshold : 0.5
   output_dir: ""
   save_probabilities: false

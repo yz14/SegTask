@@ -408,6 +408,51 @@ class Trainer:
 
             # 视图重塑（pipeline 内部决定）
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
+            
+            # ==== debug ====
+            DEBUG_DATA = False
+            import SimpleITK as sitk
+            if DEBUG_DATA:
+                debug_path = './debug_0618-1'
+                os.makedirs(debug_path, exist_ok=True)
+                B = image.shape[0]
+                label_values = self.cfg.data.label_values
+                for i in range(B):
+                    prefix = f'epoch{epoch}_step{step:04d}_smp{i}'
+
+                    # ---- image（prepare_batch 之后） ----
+                    img_np = image[i].cpu().numpy()
+                    print(f'[{prefix}] image shape: {img_np.shape}')
+                    if img_np.ndim == 4 and img_np.shape[0] == 1:
+                        img_np = img_np[0]
+                    sitk.WriteImage(sitk.GetImageFromArray(img_np),
+                                    os.path.join(debug_path, f'{prefix}_image.nii.gz'))
+
+                    # ---- label（取 prepare_batch 之后的 sup.label_main，保持一致） ----
+                    lbl_t = sup.label_main[i]
+                    lbl_np = lbl_t.cpu().numpy()
+                    print(f'[{prefix}] label raw shape: {lbl_np.shape}')
+                    if lbl_np.ndim == 4:
+                        if lbl_np.shape[0] == 1:
+                            lbl_np = lbl_np[0]
+                        else:
+                            # one-hot (num_fg, D, H, W) → integer (D, H, W)
+                            lbl_int = np.zeros(lbl_np.shape[1:], dtype=np.uint8)
+                            for ch in range(lbl_np.shape[0]):
+                                lbl_int[lbl_np[ch] > 0.5] = label_values[ch + 1]
+                            lbl_np = lbl_int
+                    sitk.WriteImage(sitk.GetImageFromArray(lbl_np.astype(np.uint8)),
+                                    os.path.join(debug_path, f'{prefix}_label.nii.gz'))
+
+                    # ---- weight map ----
+                    if sup.wmap_main is not None:
+                        w_np = sup.wmap_main[i].cpu().numpy()
+                        print(f'[{prefix}] wmap shape: {w_np.shape}')
+                        if w_np.ndim == 4 and w_np.shape[0] == 1:
+                            w_np = w_np[0]
+                        sitk.WriteImage(sitk.GetImageFromArray(w_np),
+                                        os.path.join(debug_path, f'{prefix}_wmap.nii.gz'))
+            
 
             effective_accum = self._effective_accum(step, total_steps, accum)
 
