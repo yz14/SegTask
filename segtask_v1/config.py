@@ -53,6 +53,15 @@ class DataConfig:
     npz_dir   : str = ""
     npz_suffix: str = ".npz"
 
+    # 第二批（粗标）预生成 npz 包目录。空=单批金标准（现有行为）。
+    # 非空时与第一批（金标准）按 mix_ratio 在每个 train batch 内混合；
+    # 副源仅用于训练，验证集始终仅取金标准。
+    npz_dir_secondary: str = ""
+
+    # 每个 train batch 内 [金标准, 粗标] 的整数权重比；仅 npz_dir_secondary 非空时生效。
+    # 要求 batch_size 能被 sum(mix_ratio) 整除、两元素均 >= 1（保证每 batch 同时含两源）。
+    mix_ratio: List[int] = field(default_factory=lambda: [1, 1])
+
     # True=启动时自动调用 make_data 生成；False=要求手动预生成。
     npz_auto_build: bool = True
 
@@ -1013,6 +1022,21 @@ class Config:
         _require(
             all(s >= 1.0 for s in self.data.multi_res_scales),
             "All multi_res_scales must be >= 1.0")
+
+        # 双批混合：仅 npz_dir_secondary 非空时校验 mix_ratio。
+        if self.data.npz_dir_secondary:
+            mr = self.data.mix_ratio
+            _require(
+                len(mr) == 2,
+                f"mix_ratio must be [gold, coarse] (length 2); got {mr}.")
+            _require(
+                all(isinstance(x, int) and x >= 1 for x in mr),
+                f"mix_ratio elements must be integers >= 1 (each batch must "
+                f"contain both sources); got {mr}.")
+            _require(
+                self.data.batch_size % sum(mr) == 0,
+                f"batch_size ({self.data.batch_size}) must be divisible by "
+                f"sum(mix_ratio) ({sum(mr)}) for integer per-batch counts.")
 
     def _validate_2_5d(self) -> None:
         """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。"""

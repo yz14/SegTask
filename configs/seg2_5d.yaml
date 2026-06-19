@@ -15,6 +15,15 @@ data:
   region_weight_dir : "F:/Totalsegmentator_dataset_v201/small_data/region_weight"
   npz_dir: "F:/Totalsegmentator_dataset_v201/small_data/npz"
 
+  # 第二批(粗标)预生成 npz 目录。空 => 单批金标准(现有行为)。
+  # 非空 => 训练时金/粗按 mix_ratio 在每个 batch 内混合(副源仅训练; val 始终仅金标准)。
+  # 副源必须事先离线生成: python -m segtask_v1.data.make_data --config <yaml> --out <dir>
+  npz_dir_secondary: ""
+  # 每 batch [金标准, 粗标] 整数权重比; 仅 npz_dir_secondary 非空时生效。
+  # 要求 batch_size 能被 sum(mix_ratio) 整除、两元素均 >=1 (保证每 batch 同含两源)。
+  # 例: batch_size=4, [1,1] => 2金+2粗; [1,3] => 1金+3粗。
+  mix_ratio: [1, 1]
+
   # #### Total Segmentator ####
   # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/lung"
