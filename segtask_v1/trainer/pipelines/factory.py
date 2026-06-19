@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from ...config import Config
+from ...losses.topo_aux import build_aux_topo_loss
 from ...models.topology import ModelTopology, build_topology
 from .base import ViewPipeline
 from .lift25d import Lift2_5DAuxPipeline, Lift2_5DPipeline
@@ -64,7 +65,17 @@ def build_pipeline(cfg: Config, base_loss) -> ViewPipeline:
 
     logger.info("ViewPipeline selected: %s (patch_mode=%s, n_views=%d)",
                 cls.__name__, topo.patch_mode, topo.n_views)
-    return cls(cfg, base_loss)
+    pipeline = cls(cfg, base_loss)
+
+    # 中心线/距离场辅助头损失：与具体 pipeline 无关，统一注入（compute_loss 内各加一项）。
+    if cfg.model.aux_topo_head:
+        pipeline.aux_topo_loss_fn = build_aux_topo_loss(cfg.model, cfg.loss)
+        pipeline.aux_topo_weight = float(cfg.loss.aux_topo_weight)
+        logger.info(
+            "Aux topo head: ENABLED (target=%s, loss=%s, iter=%d, weight=%.3f)",
+            cfg.model.aux_topo_target, pipeline.aux_topo_loss_fn.loss_name,
+            cfg.loss.aux_topo_iter, pipeline.aux_topo_weight)
+    return pipeline
 
 
 __all__ = ["build_pipeline"]

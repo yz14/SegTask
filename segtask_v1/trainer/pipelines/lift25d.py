@@ -67,8 +67,10 @@ class Lift2_5DPipeline(ViewPipeline):
         return image, label[:, :1].contiguous()
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
+        main_pred, _aux, topo_pred = self.split_pred(pred)
         loss = compute_loss_fp32(
-            self.criterion, pred, sup.label_main, weight_map=sup.wmap_main)
+            self.criterion, main_pred, sup.label_main, weight_map=sup.wmap_main)
+        loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
         if breakdown is not None:
             breakdown["L_total"] = float(loss.detach().item())
         return loss
@@ -138,14 +140,11 @@ class Lift2_5DAuxPipeline(ViewPipeline):
         return image, label[:, :1].contiguous()
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
-        if isinstance(pred, dict):
-            main_pred = pred["main"]
-            aux_preds = pred.get("aux", []) or []
-        else:
-            main_pred, aux_preds = pred, []
+        main_pred, aux_preds, topo_pred = self.split_pred(pred)
 
         total = _accumulate_main(self.criterion, main_pred, sup, breakdown)
         if not aux_preds or self.aux_loss_fn is None:
+            total = self.add_topo_loss(total, topo_pred, sup, breakdown)
             if breakdown is not None:
                 breakdown["L_total"] = float(total.detach().item())
             return total
@@ -167,6 +166,7 @@ class Lift2_5DAuxPipeline(ViewPipeline):
             if breakdown is not None:
                 breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())
                 breakdown[f"w_aux_{view_k}"] = float(w_k)
+        total = self.add_topo_loss(total, topo_pred, sup, breakdown)
         if breakdown is not None:
             breakdown["L_total"] = float(total.detach().item())
         return total

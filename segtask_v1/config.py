@@ -248,6 +248,15 @@ class ModelConfig:
     # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
     aux_head_mode: str = "linear"
 
+    # 中心线/距离场辅助头（拓扑感知多任务监督，仅 arch=='unet'）。与多 FOV aux_seg_supervision 相互独立，
+    # 可同时开启。该头与主分割头同形（out_channels 相同、读最高分辨率 decoder 特征），仅训练期前向，
+    # eval 不输出（零推理开销）。target 由 label 即时派生：见 aux_topo_target。
+    aux_topo_head: bool = False
+    # 辅助目标："centerline" 软骨架（clDice 同款，保拓扑）；"distance" 形态学到边界距离/血管半径场。
+    aux_topo_target: str = "centerline"
+    # 辅助头拓扑："linear" 1×1；"conv" ConvNormAct(3×3)→1×1（细结构推荐）。
+    aux_topo_head_mode: str = "conv"
+
     # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
     # 与 data.keep_native_view_depth 互斥，仅在 2.5D 生效。
     lift_2_5d_to_3d: bool = False
@@ -398,6 +407,14 @@ class LossConfig:
 
     # 2.5D 多 FOV 辅助头权重（仅 model.aux_seg_supervision=True）：长度 = n_views-1。空 = trainer 自填 0.5^k。
     aux_supervision_weights: List[float] = field(default_factory=list)
+
+    # 中心线/距离场辅助头损失（仅 model.aux_topo_head=True）。
+    # 权重：总损失 += aux_topo_weight * topo_loss。
+    aux_topo_weight: float = 0.3
+    # soft-skeleton 迭代 / 距离场最大腐蚀步数：2D 用 3，3D 取 3–10。
+    aux_topo_iter: int = 3
+    # 损失类型："auto"（centerline→soft-dice，distance→smooth_l1）| "dice" | "bce" | "smooth_l1" | "mse"。
+    aux_topo_loss: str = "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +879,30 @@ class Config:
             "linear", "conv",
         ),
             f"Invalid aux_head_mode: {self.model.aux_head_mode!r}")
+        # 中心线/距离场辅助头校验。
+        if self.model.aux_topo_head:
+            _require(
+                arch == "unet",
+                "aux_topo_head=True is only supported with model.arch=='unet'; "
+                f"got arch={arch!r}.")
+            _require(
+                self.model.aux_topo_target in ("centerline", "distance"),
+                f"Invalid aux_topo_target: {self.model.aux_topo_target!r}. "
+                "Valid: 'centerline' | 'distance'.")
+            _require(
+                self.model.aux_topo_head_mode in ("linear", "conv"),
+                f"Invalid aux_topo_head_mode: {self.model.aux_topo_head_mode!r}")
+            _require(
+                self.loss.aux_topo_weight >= 0.0,
+                f"loss.aux_topo_weight must be >= 0; got {self.loss.aux_topo_weight}.")
+            _require(
+                self.loss.aux_topo_iter >= 1,
+                f"loss.aux_topo_iter must be >= 1; got {self.loss.aux_topo_iter}.")
+            _require(
+                self.loss.aux_topo_loss in (
+                "auto", "dice", "bce", "smooth_l1", "mse"),
+                f"Invalid loss.aux_topo_loss: {self.loss.aux_topo_loss!r}. "
+                "Valid: 'auto' | 'dice' | 'bce' | 'smooth_l1' | 'mse'.")
         # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
             _require(

@@ -337,7 +337,9 @@ class UNet3D(nn.Module):
         norm_groups          : int = 8,
         activation           : str = "leakyrelu",
         aux_head_out_channels: Optional[List[int]] = None,
-        num_fg_classes       : Optional[int] = None):
+        num_fg_classes       : Optional[int] = None,
+        aux_topo_head        : bool = False,
+        aux_topo_head_mode   : str = "conv"):
         super().__init__()
         # 向后兼容：旧形参名 num_fg_classes 实为"主头输出通道数"（2.5D 折叠下
         # = num_fg * D，并非类数），改名 out_channels；旧名仍接受但提示迁移。
@@ -439,6 +441,19 @@ class UNet3D(nn.Module):
                     self.aux_heads.append(
                         _build_head(in_ch, self.aux_head_out_channels[k - 1]))
 
+        # 中心线/距离场辅助头：与主头同形（读最高分辨率 dec 特征 → out_channels），仅训练期前向。
+        # 与多 FOV aux 独立；监督目标由 label 在损失侧即时派生（见 losses.topo_aux）。
+        self.aux_topo_head = bool(aux_topo_head)
+        if self.aux_topo_head:
+            self.topo_head = build_head(
+                mode         = aux_topo_head_mode,
+                in_ch        = decoder.out_channels[-1],
+                num_classes  = self.out_channels,
+                spatial_dims = spatial_dims,
+                norm_type    = norm_type,
+                norm_groups  = norm_groups,
+                activation   = activation)
+
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor], Dict[str, Any]]:
         """x: (B, in_channels, *spatial)；2.5D 多 FOV 为 (B, n_views*D, H, W)。"""
         enc_features = self.encoder(x)
@@ -464,6 +479,16 @@ class UNet3D(nn.Module):
                         f"Check stem_stride / encoder downsampling vs input spatial dims.")
                 aux_outs.append(ao)
 
+        # 中心线/距离场辅助头：仅训练时输出，与主头同形（读最高分辨率 dec 特征）。
+        topo_out: Optional[torch.Tensor] = None
+        if self.aux_topo_head and self.training:
+            topo_out = self.topo_head(dec_features[-1])
+            if topo_out.shape[2:] != target_size:
+                raise RuntimeError(
+                    f"Topo aux head output size mismatch: "
+                    f"got {tuple(topo_out.shape[2:])}, expected {tuple(target_size)}. "
+                    f"Check stem_stride / encoder downsampling vs input spatial dims.")
+
         if self.deep_supervision and self.training:
             # dec_features=[low,...,high]；main 用 [-1]，DS 头用 [-2]..[low]。
             main_path: Union[torch.Tensor, List[torch.Tensor]] = [main_out]
@@ -472,8 +497,13 @@ class UNet3D(nn.Module):
         else:
             main_path = main_out
 
-        if aux_outs:
-            return {"main": main_path, "aux": aux_outs}
+        if aux_outs or topo_out is not None:
+            out: Dict[str, Any] = {"main": main_path}
+            if aux_outs:
+                out["aux"] = aux_outs
+            if topo_out is not None:
+                out["topo"] = topo_out
+            return out
         return main_path
 
     def param_count(self) -> Dict[str, int]:
