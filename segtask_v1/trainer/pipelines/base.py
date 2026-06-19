@@ -23,9 +23,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
+
+from ..amp import compute_loss_fp32
 
 
 @dataclass
@@ -67,6 +70,10 @@ class ViewPipeline(ABC):
     mr_native_sizes: List[Tuple[int, int, int]] = []
     per_view_depths: List[int] = []
 
+    # 中心线/距离场辅助头（由 build_pipeline 注入；None 表示未启用）。与多 FOV aux 独立。
+    aux_topo_loss_fn: Optional[nn.Module] = None
+    aux_topo_weight: float = 0.0
+
     @abstractmethod
     def prepare_batch(
         self,
@@ -104,6 +111,36 @@ class ViewPipeline(ABC):
         if isinstance(pred, list):
             pred = pred[0]       # 若有DS
         return pred
+
+    @staticmethod
+    def split_pred(pred) -> Tuple[Any, List, Optional[torch.Tensor]]:
+        """统一拆分模型输出 → ``(main_path, aux_list, topo_pred)``。
+
+        ``main_path`` 可为 tensor（无 DS）或 list（深监督）；``aux_list`` 为多 FOV aux 预测；
+        ``topo_pred`` 为中心线/距离场辅助头预测（无则 None）。tensor/list 直接透传，
+        与历史 ``dict→main`` 行为一致。
+        """
+        if isinstance(pred, dict):
+            return pred["main"], (pred.get("aux") or []), pred.get("topo")
+        return pred, [], None
+
+    def add_topo_loss(self, total, topo_pred, sup, breakdown):
+        """若启用中心线/距离场辅助头：``total += w_topo * topo_loss``，并写 breakdown。
+
+        辅助头输出与主头同形；整数 ``label_main`` 经 ``main_loss_fn.binarize_full``
+        转为同形二值前景图（layout 与主头一致），再由 ``AuxTopoLoss`` 即时派生
+        软骨架 / 距离场目标。
+        """
+        if self.aux_topo_loss_fn is None or topo_pred is None:
+            return total
+        with torch.no_grad():
+            topo_target = self.main_loss_fn.binarize_full(sup.label_main)
+        topo_l = compute_loss_fp32(self.aux_topo_loss_fn, topo_pred, topo_target)
+        total = total + float(self.aux_topo_weight) * topo_l
+        if breakdown is not None:
+            breakdown["L_topo"] = float(topo_l.detach().item())
+            breakdown["w_topo"] = float(self.aux_topo_weight)
+        return total
 
     def split_for_metrics(self, pred, label_main):
         """与模式无关的 metrics reshape；委托给 ``main_loss_fn.split_for_metrics``。"""

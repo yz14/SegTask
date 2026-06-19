@@ -1,0 +1,204 @@
+data:
+  image_suffix: ".nii.gz"
+  label_suffix: "-seg.nii.gz"
+  bbox_suffix : "_pred.nii.gz"
+  region_weight_suffix: ".nii.gz"
+
+  image_dir: "F:/LUNA25/imgs"
+  bbox_dir : "F:/LUNA25/lung_base"
+
+  label_values: [0, 1]
+  num_classes : 2
+
+  patch_size: [96, 112, 112]  ##################################################################
+  patch_mode: "cubic"        ##################################################################
+
+  multi_res_scales    : [1.0, 1.5, 2.0]
+  aug_oversample_ratio: 1.5
+
+  z_boundary_mode: "edge_pad"
+  keep_native_multi_res: true  ##################################################################
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  val_ratio       : 0.2
+  split_seed      : 42
+  stratified_split: true
+
+  batch_size     : 2
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  foreground_oversample_ratio: 0.5
+  samples_per_volume         : 8
+
+  cache_mode       : "memory"
+  cache_max_volumes: 24
+
+
+augment:
+  enabled: true
+
+  random_flip_prob: 0.2
+  random_flip_axes: [2, 3, 4]
+
+  random_affine_prob : 0.3
+  random_rotate_range: [-20.0, 20.0]
+  random_scale_range : [0.80, 1.2]
+
+  elastic_deform_prob : 0.0
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 1.0
+
+  random_brightness_prob : 0.3
+  random_brightness_range: [-0.1, 0.1]
+
+  random_contrast_prob : 0.3
+  random_contrast_range: [0.8, 1.2]
+
+  random_gamma_prob : 0.2
+  random_gamma_range: [0.8, 1.2]
+
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std : 0.09
+
+  gaussian_blur_prob : 0.2
+  gaussian_blur_sigma: [0.5, 1.5]
+
+  simulate_lowres_prob: 0.2
+  simulate_lowres_zoom: [0.5, 1.0]
+
+
+model:
+  backbone: "resnet"
+  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type: "basic"
+
+  lift_2_5d_to_3d: false
+
+  norm_type  : "batch"            # 'instance' | 'batch' | 'group'
+  norm_groups: 8
+  activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
+  dropout    : 0.0
+
+  use_se        : false    # SE attn
+  attention_type: "none"
+  skip_attention: true            # 细血管：skip 上加注意力门控，抑制无关 skip 激活
+
+  deep_supervision: true
+
+  stem_mode    : "dual"
+
+  stem_fusion_mode: "multi_stem_proj"
+
+  aux_seg_supervision: true
+
+  aux_head_mode: "conv"
+
+  # 中心线/距离场辅助头（拓扑感知多任务监督，与多 FOV aux 相互独立）。
+  # cubic 3D 用 distance（形态学到边界距离 / 血管半径场），3D 体素回归更自然。
+  aux_topo_head      : true
+  aux_topo_target    : "distance"
+  aux_topo_head_mode : "conv"
+
+  decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
+  downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
+  upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
+  skip_mode      : "cat"          # 'cat' | 'add'
+
+  drop_path_rate : 0.0
+
+
+loss:
+  name: "dice_cldice"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
+  compound_weights: [1.0, 1.0]
+
+  class_weights : [1.0]       # 长度 = num_fg_classes (不含 bg)
+  region_weights: [1.0, 5.0]  # 按 label_values 全长 (含 bg)
+
+  dice_smooth : 1.0e-5
+  dice_squared: false
+  batch_dice  : true             # 全 batch 汇总 TP/分母（nnU-Net Dice）：稀疏前景下梯度更稳
+
+  cldice_iter  : 5               # 3D 软骨架迭代（Shit+ 推荐 3D 取 3–10）
+  cldice_smooth: 1.0
+
+  focal_alpha: 0.5
+  focal_gamma: 2.0
+
+  tversky_alpha: 0.3
+  tversky_beta : 0.7
+
+  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+
+  slice_loss_reduction: "per_volume"
+
+  aux_supervision_weights: [0.5, 0.5]
+
+  # 距离场辅助头损失：total += aux_topo_weight * smooth_l1(distance field)。
+  aux_topo_weight: 0.3
+  aux_topo_iter  : 5             # 距离场最大腐蚀步（3D）
+  aux_topo_loss  : "auto"        # distance → smooth_l1
+
+
+train:
+  epochs: 400
+
+  optimizer   : "adamw"
+  lr          : 1.0e-3
+  weight_decay: 1.0e-4
+
+  scheduler    : "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4
+  grad_clip_norm  : 12.0
+
+  use_amp  : false
+  amp_dtype: "auto"
+
+  compile_mode: "none"
+
+  use_ema  : true
+  ema_decay: 0.999
+
+  output_dir      : "outputs/segves3d"    ############################################################
+  save_every      : 10
+  save_best_preset: "vessel"      # balanced(dice/sd/iou/mcc) + sd_tol=2：断裂不敏感的纯 dice 选模不再适用
+  surface_dice_tolerance: 1
+  surface_dice_weight: 0.5
+  val_metric_mode: "high"         # 整卷滑窗 blended 概率上算指标（与训练期 patch 指标口径分离）
+
+  early_stopping: 0
+
+  log_every: 10
+  val_every: 1
+  vis_every: 10
+
+  seed: 42
+  deterministic: false
+
+  resume: ""
+
+  pretrain: ""
+  pretrain_strict: false
+  pretrain_load_ema: false
+
+predict:
+  z_interleave_enabled   : false
+  z_interleave_thresholds: [0.8, 1.2, 1.6, 2.0]
+  z_interleave_factors   : [5, 4, 3, 2, 1]
+  z_overlap : 0.5
+  blend_mode: "gaussian"          # 'gaussian' | 'constant'
+  batch_size: 2
+  tta_flip  : true
+  threshold : 0.6
+  output_dir: ""
+  save_probabilities: false
