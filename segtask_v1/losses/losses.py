@@ -793,6 +793,15 @@ class MultiResolutionLoss(nn.Module):
         target_1x = self._label_to_binary(label_raw[:, 0])
         return pred_1x, target_1x
 
+    def binarize_full(self, label_raw: torch.Tensor) -> torch.Tensor:
+        """整数 label (B,C_res,*spatial) → 与主头输出同形二值 (B,num_fg*C_res,*spatial)。
+
+        逐分辨率二值化后按通道拼接，layout 与 ``forward`` 中
+        ``pred[:, r*num_fg:(r+1)*num_fg]`` 切片一致；供中心线/距离场辅助头构造目标。
+        """
+        parts = [self._label_to_binary(label_raw[:, r]) for r in range(self.num_res)]
+        return torch.cat(parts, dim=1)
+
 
 # ---------------------------------------------------------------------------
 # 2.5D Slice-Channel Loss Wrapper
@@ -931,6 +940,15 @@ class SliceChannelLoss(nn.Module):
         fg_b = rearrange(fg, 'c -> 1 c 1 1 1')                       # (1, num_fg, 1, 1, 1)
         flat = label_raw.unsqueeze(1)                                # (B, 1, D, H, W)
         return (flat == fg_b).float()                                # (B, num_fg, D, H, W)
+
+    def binarize_full(self, label_raw: torch.Tensor) -> torch.Tensor:
+        """整数 label (B,D,H,W) → 与主头输出同形二值 (B,num_fg*D,H,W)，layout ``b (c d) h w``。
+
+        与 ``_split_pred_5d`` 的折叠口径一致（class-major, slice-minor）；
+        供中心线/距离场辅助头在折叠 2.5D 表示上逐 (类,切片) 构造 2D 目标。
+        """
+        bin5d = self._label_to_binary_5d(label_raw)                  # (B, num_fg, D, H, W)
+        return rearrange(bin5d, 'b c d h w -> b (c d) h w')
 
     @staticmethod
     def _wmap_to_5d(

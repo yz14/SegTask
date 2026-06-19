@@ -341,6 +341,8 @@ def build_model(cfg: Config):
         aux_seg_supervision   = aux_seg_supervision,
         aux_head_mode         = mc.aux_head_mode,
         aux_head_out_channels = aux_head_out_channels_arg,
+        aux_topo_head         = mc.aux_topo_head,
+        aux_topo_head_mode    = mc.aux_topo_head_mode,
         norm_type             = mc.norm_type,
         norm_groups           = mc.norm_groups,
         activation            = mc.activation)

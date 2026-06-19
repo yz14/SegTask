@@ -107,8 +107,10 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
         return image, label
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
+        main_pred, _aux, topo_pred = self.split_pred(pred)
         loss = compute_loss_fp32(
-            self.criterion, pred, sup.label_main, weight_map=sup.wmap_main)
+            self.criterion, main_pred, sup.label_main, weight_map=sup.wmap_main)
+        loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
         if breakdown is not None:
             breakdown["L_total"] = float(loss.detach().item())
         return loss
