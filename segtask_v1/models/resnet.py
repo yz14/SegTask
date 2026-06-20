@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 
 from .blocks import (
-    _CONV, _DROP, ConvNormAct, get_activation, get_norm, make_attention)
+    _CONV, _DROP, ConvNormAct, SqueezeExcite3D,
+    get_activation, get_norm, make_attention)
 
 
 class ResNetBlock(nn.Module):
@@ -250,6 +251,173 @@ def _make_block(block_type: str, in_ch: int, out_ch: int, **kwargs) -> nn.Module
         raise ValueError(
             f"Unknown block_type: {block_type!r}. Valid: {BLOCK_TYPES}")
     return _BLOCK_REGISTRY[block_type](in_ch, out_ch, **kwargs)
+
+
+def _mrf_dilation_padding(dilation: int, spatial_dims: int, axes: str):
+    """3×3(×3) 卷积在给定膨胀率/作用轴下的 per-axis (dilation, padding)。
+
+    kernel=3 时 padding=dilation 可保持空间尺寸不变。``axes='hw'`` 时 3D 的 z 轴
+    （首空间轴）恒 dilation=1，仅在 H/W 膨胀；2.5D（spatial_dims=2）天然只有 H/W。
+    """
+    if spatial_dims == 2:
+        return (dilation, dilation), (dilation, dilation)
+    if axes == "hw":
+        return (1, dilation, dilation), (1, dilation, dilation)
+    return (dilation, dilation, dilation), (dilation, dilation, dilation)
+
+
+class MultiRFBlock(nn.Module):
+    """多感受野残差块：第一卷积换成「多膨胀率并行分支 → 融合」，再接一层标准 3×3。
+
+    分支永远包含一条 dilation=1 支路（守门，抗网格效应/保细管）。``mode='split'`` 时各
+    分支均分 ``out_ch``（≈等成本）；``'parallel'`` 时各分支均为 ``out_ch``（≈N×成本）。
+    融合：``concat_proj``（concat→1×1）/ ``sum``（需 parallel）/ ``se``（concat→SE→1×1）。
+    其余（norm/act/dropout/attention/残差）与 ``ResNetBlock`` 一致（后置激活）。
+    """
+
+    def __init__(
+        self,
+        in_ch         : int,
+        out_ch        : int,
+        dilations     : List[int],
+        mode          : str = "split",
+        fusion        : str = "concat_proj",
+        axes          : str = "hw",
+        norm_type     : str = "instance",
+        norm_groups   : int = 8,
+        activation    : str = "leakyrelu",
+        dropout       : float = 0.0,
+        use_se        : bool = False,
+        se_reduction  : int = 16,
+        attention_type: str = "none",
+        spatial_dims  : int = 3):
+        super().__init__()
+        d = spatial_dims
+        dils = [int(x) for x in dilations]
+        n = len(dils)
+        if n < 1:
+            raise ValueError("MultiRFBlock requires at least one dilation.")
+        if 1 not in dils:
+            raise ValueError(
+                "MultiRFBlock requires a dilation=1 branch (anti-gridding).")
+        if mode not in ("split", "parallel"):
+            raise ValueError(f"Unknown MultiRF mode: {mode!r}.")
+        if fusion not in ("concat_proj", "sum", "se"):
+            raise ValueError(f"Unknown MultiRF fusion: {fusion!r}.")
+        if fusion == "sum" and mode != "parallel":
+            raise ValueError(
+                "MultiRF fusion='sum' requires mode='parallel' "
+                "(branches must share channel count).")
+        self.fusion = fusion
+
+        # 各分支输出通道数。
+        if mode == "split":
+            base = out_ch // n
+            if base < 1:
+                raise ValueError(
+                    f"MultiRF mode='split' needs out_ch ({out_ch}) >= number "
+                    f"of branches ({n}).")
+            branch_ch = [base] * n
+            rem = out_ch - base * n
+            # 余数补给 dilation=1 支路（守门支路最厚）。
+            id1 = dils.index(1)
+            branch_ch[id1] += rem
+        else:  # parallel
+            branch_ch = [out_ch] * n
+
+        self.branches = nn.ModuleList()
+        for dil, c in zip(dils, branch_ch):
+            dilation, padding = _mrf_dilation_padding(dil, d, axes)
+            self.branches.append(
+                _CONV[d](in_ch, c, kernel_size=3, padding=padding,
+                         dilation=dilation, bias=False))
+        total = sum(branch_ch)
+
+        # 融合层。
+        if fusion == "sum":
+            self.se = None
+            self.fuse = None  # 逐元素相加，各分支均 out_ch
+        elif fusion == "se":
+            self.se = SqueezeExcite3D(total, reduction=se_reduction,
+                                      spatial_dims=d)
+            self.fuse = _CONV[d](total, out_ch, kernel_size=1, bias=False)
+        else:  # concat_proj
+            self.se = None
+            self.fuse = _CONV[d](total, out_ch, kernel_size=1, bias=False)
+
+        self.norm1 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
+        self.act1  = get_activation(activation)
+        self.drop  = _DROP[d](dropout) if dropout > 0 else nn.Identity()
+
+        # 第二层标准 3×3（dilation=1），守细节、与 ResNetBlock 对齐。
+        self.conv2 = _CONV[d](out_ch, out_ch, 3, padding=1, bias=False)
+        self.norm2 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
+
+        if attention_type == "none" and use_se:
+            attention_type = "se"
+        self.attn = make_attention(attention_type, out_ch, spatial_dims=d,
+                                   reduction=se_reduction)
+        self.act2 = get_activation(activation)
+
+        self.shortcut = (
+            nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
+                          get_norm(norm_type, out_ch, norm_groups, spatial_dims=d))
+            if in_ch != out_ch else nn.Identity())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        res = self.shortcut(x)
+        feats = [branch(x) for branch in self.branches]
+        if self.fusion == "sum":
+            out = feats[0]
+            for f in feats[1:]:
+                out = out + f
+        else:
+            out = torch.cat(feats, dim=1)
+            if self.se is not None:
+                out = self.se(out)
+            out = self.fuse(out)
+        out = self.act1(self.norm1(out))
+        out = self.drop(out)
+        out = self.norm2(self.conv2(out))
+        out = self.attn(out)
+        return self.act2(out + res)
+
+
+class MultiRFStage(nn.Module):
+    """同分辨率下的 N 个 ``MultiRFBlock``，首块可变通道（与 ``ResNetStage`` 等价接口）。"""
+
+    def __init__(
+        self,
+        in_ch         : int,
+        out_ch        : int,
+        num_blocks    : int,
+        dilations     : List[int],
+        mode          : str = "split",
+        fusion        : str = "concat_proj",
+        axes          : str = "hw",
+        norm_type     : str = "instance",
+        norm_groups   : int = 8,
+        activation    : str = "leakyrelu",
+        dropout       : float = 0.0,
+        use_se        : bool = False,
+        se_reduction  : int = 16,
+        attention_type: str = "none",
+        spatial_dims  : int = 3):
+        super().__init__()
+        if num_blocks < 1:
+            raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
+        kwargs = dict(
+            dilations=dilations, mode=mode, fusion=fusion, axes=axes,
+            norm_type=norm_type, norm_groups=norm_groups, activation=activation,
+            dropout=dropout, use_se=use_se, se_reduction=se_reduction,
+            attention_type=attention_type, spatial_dims=spatial_dims)
+        blocks = [MultiRFBlock(in_ch, out_ch, **kwargs)]
+        for _ in range(1, num_blocks):
+            blocks.append(MultiRFBlock(out_ch, out_ch, **kwargs))
+        self.blocks = nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks(x)
 
 
 class ResNetStage(nn.Module):

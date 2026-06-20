@@ -11,7 +11,7 @@ import numpy as np
 from ..config import Config
 from .blocks import Downsample, Upsample
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
-from .resnet import ResNetStage
+from .resnet import MultiRFStage, ResNetStage
 from .topology import ModelTopology, build_topology
 from .unet import Encoder, Decoder, UNet3D
 from .unet3p import UNet3PDecoder
@@ -52,12 +52,40 @@ class _StatefulStageBuilder:
         return self._fn(in_ch, out_ch, n_blocks)
 
 
-def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
-    """返回按逐级 block 数构建 ResNet stage 的有状态函数。"""
+def _make_resnet_stage_builder(
+    cfg: Config,
+    counts: List[int],
+    multirf_mask: List[bool] = None) -> _StatefulStageBuilder:
+    """返回按逐级 block 数构建 ResNet stage 的有状态函数。
+
+    ``multirf_mask`` 非空时，逐 stage 决定该 stage 是否用 ``MultiRFStage``（多感受野
+    空洞分支块）替代标准 ``ResNetStage``；长度须与 ``counts`` 对齐。``None``/全 False
+    时行为与历史一致（全部 ``ResNetStage``）。
+    """
     mc = cfg.model
     spatial_dims = mc.spatial_dims
+    mask = list(multirf_mask) if multirf_mask else []
 
-    def factory(in_ch: int, out_ch: int, num_blocks: int) -> ResNetStage:
+    def factory(in_ch: int, out_ch: int, num_blocks: int):
+        # _StatefulStageBuilder 顺序调用，下方按"已构建数"取 mask。
+        use_mrf = bool(mask[factory_idx[0]]) if factory_idx[0] < len(mask) else False
+        factory_idx[0] += 1
+        if use_mrf:
+            return MultiRFStage(
+                in_ch, out_ch,
+                num_blocks     = num_blocks,
+                dilations      = list(mc.multirf_dilations),
+                mode           = mc.multirf_mode,
+                fusion         = mc.multirf_fusion,
+                axes           = mc.multirf_axes,
+                norm_type      = mc.norm_type,
+                norm_groups    = mc.norm_groups,
+                activation     = mc.activation,
+                dropout        = mc.dropout,
+                use_se         = mc.use_se,
+                se_reduction   = mc.se_reduction,
+                attention_type = mc.attention_type,
+                spatial_dims   = spatial_dims)
         return ResNetStage(
             in_ch, out_ch,
             num_blocks     = num_blocks,
@@ -71,6 +99,7 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
             block_type     = mc.block_type,
             spatial_dims   = spatial_dims)
 
+    factory_idx = [0]
     return _StatefulStageBuilder(factory, counts)
 
 
@@ -244,11 +273,28 @@ def build_model(cfg: Config):
     else:
         dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)
 
+    # MultiRF 逐 stage mask（默认空 = 全关，逐位兼容历史）。
+    # encoder mask 对齐 enc stage 顺序（浅→深，末位为 bottleneck）；
+    # decoder mask 对齐 decoder level 顺序（深→浅，见 Decoder 构造），仅 unet decoder。
+    enc_mrf_mask: List[bool] = []
+    dec_mrf_mask: List[bool] = []
+    if mc.multirf_enabled:
+        enc_mrf_mask = [bool(int(v)) for v in mc.multirf_encoder_stages]
+        if mc.decoder_type == "unet":
+            dec_mrf_mask = [bool(int(v)) for v in mc.multirf_decoder_stages]
+
     # enc/dec 分别构建以使计数独立。
     downsample_builder = None
     if   mc.backbone == "resnet":
-        enc_builder = _make_resnet_stage_builder(cfg, enc_counts)
-        dec_builder = _make_resnet_stage_builder(cfg, dec_counts)
+        enc_builder = _make_resnet_stage_builder(cfg, enc_counts, enc_mrf_mask)
+        dec_builder = _make_resnet_stage_builder(cfg, dec_counts, dec_mrf_mask)
+        if mc.multirf_enabled and (any(enc_mrf_mask) or any(dec_mrf_mask)):
+            logger.info(
+                "MultiRF ENABLED: dilations=%s, mode=%s, fusion=%s, axes=%s, "
+                "enc_stages=%s, dec_stages=%s",
+                list(mc.multirf_dilations), mc.multirf_mode, mc.multirf_fusion,
+                mc.multirf_axes,
+                [int(b) for b in enc_mrf_mask], [int(b) for b in dec_mrf_mask])
     elif mc.backbone == "convnext":
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)
