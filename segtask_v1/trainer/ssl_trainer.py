@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 
 from ..config import Config
 from ..data.ssl_transforms import GenesisCorruptor
+from ..data.vesselness import frangi_vesselness
 from ..utils import AverageMeter, ModelEMA, Timer
 from .amp import _AMP_DTYPES, GradScaler, autocast, resolve_auto_amp_dtype
 from .checkpoint import unwrap_compile
@@ -64,7 +65,9 @@ class SSLTrainer:
         self.train_loader = train_loader
         tc = cfg.train
 
-        self.corruptor = GenesisCorruptor(cfg.ssl, int(cfg.model.spatial_dims))
+        self.method = cfg.ssl.method
+        self.spatial_dims = int(cfg.model.spatial_dims)
+        self.corruptor = GenesisCorruptor(cfg.ssl, self.spatial_dims)
         self.recon_loss_fn = _RECON_LOSSES[cfg.ssl.recon_loss]
         self.target_spatial = tuple(
             int(s) for s in cfg.data.patch_size[-int(cfg.model.spatial_dims):])
@@ -103,6 +106,24 @@ class SSLTrainer:
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.best_loss = math.inf
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _make_io(self, clean: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """按 method 构造 (model_input, target)。
+
+        - genesis: input = 破坏图, target = 干净图（重建）。
+        - prior  : input = 干净图(可选破坏), target = 干净图的 Frangi vesselness（回归）。
+        """
+        s = self.cfg.ssl
+        if self.method == "genesis":
+            return self.corruptor(clean), clean
+        target = frangi_vesselness(
+            clean, scales=s.prior_scales, spatial_dims=self.spatial_dims,
+            alpha=s.prior_alpha, beta=s.prior_beta,
+            black_vessels=s.prior_black_vessels)
+        model_input = self.corruptor(clean) if s.prior_corrupt_input else clean
+        return model_input, target
 
     # ------------------------------------------------------------------
     def _state_dict(self) -> Dict:
@@ -175,13 +196,13 @@ class SSLTrainer:
             clean = batch["image"].to(self.device, non_blocking=True).float()
             if self.needs_crop:
                 clean = _center_crop_spatial(clean, self.target_spatial)
-            corrupted = self.corruptor(clean)
+            model_input, target = self._make_io(clean)
 
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):
-                pred = self.model(corrupted)
-            # 重建损失在 fp32 计算，避免 fp16 汇总误差。
-            loss = self.recon_loss_fn(pred.float(), clean.float())
+                pred = self.model(model_input)
+            # 重建/回归损失在 fp32 计算，避免 fp16 汇总误差。
+            loss = self.recon_loss_fn(pred.float(), target.float())
             if accum > 1:
                 loss = loss / accum
             self.scaler.scale(loss).backward()
