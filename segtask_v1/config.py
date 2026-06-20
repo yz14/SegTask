@@ -300,6 +300,24 @@ class ModelConfig:
     convnext_layer_scale_init: float = 1e-6  # <=0 禁用
     convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
 
+    # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone=='resnet'） ----
+    # 把选定 stage 的标准 ResNet 块替换为「多膨胀率并行分支 → 融合」的残差块，
+    # 在同一分辨率下同时获得多个感受野（类 ASPP/Res2Net）。默认全关，逐位兼容现状。
+    multirf_enabled: bool = False
+    # 各并行分支的膨胀率，必须含 1（守门支路，抗网格效应/保细管）。建议 HDC 互质组如 [1,2,3]。
+    multirf_dilations: List[int] = field(default_factory=lambda: [1, 2, 3])
+    # 通道处理："split"（各分支均分 out_ch，≈等成本，推荐）| "parallel"（各分支全宽 out_ch，≈N×成本）。
+    multirf_mode: str = "split"
+    # 分支融合："concat_proj"（concat→1×1，推荐）| "sum"（逐元素相加，需 parallel）| "se"（concat→SE→1×1）。
+    multirf_fusion: str = "concat_proj"
+    # 膨胀作用轴（仅 3D 有区别）："all" D/H/W 都膨胀；"hw" 只在 H/W 膨胀、z 恒 dilation=1（各向异性数据推荐）。
+    # 2.5D（spatial_dims=2）下 z 已折进通道，自动等价 "hw"。
+    multirf_axes: str = "hw"
+    # 编码器逐 stage 开关（0/1）。长度须 == len(encoder_channels)。空=该侧全关。
+    multirf_encoder_stages: List[int] = field(default_factory=list)
+    # 解码器逐 level 开关（0/1）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
+    multirf_decoder_stages: List[int] = field(default_factory=list)
+
     # ---- ADM 专用（arch=="adm"） ----
     # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空=默认最深两级。
     adm_attention_levels: List[int] = field(default_factory=list)
@@ -966,6 +984,83 @@ class Config:
                 _require(
                     all(int(v) in (1, 2) for v in s),
                     f"downsample_strides values must be 1 or 2; got {list(s)}")
+        # MultiRF（多感受野空洞分支）校验。默认关闭时完全跳过，逐位兼容现状。
+        if self.model.multirf_enabled:
+            self._validate_multirf(n_levels)
+
+    def _validate_multirf(self, n_levels: int) -> None:
+        """model.multirf_* 校验（仅 multirf_enabled=True 时调用）。"""
+        mc = self.model
+        _require(
+            str(self.model.arch).lower() == "unet",
+            "model.multirf_enabled=True is only supported for model.arch='unet'.")
+        _require(
+            mc.backbone == "resnet",
+            f"model.multirf_enabled=True requires backbone='resnet'; "
+            f"got {mc.backbone!r}.")
+        dils = list(mc.multirf_dilations)
+        _require(
+            len(dils) >= 1 and all(int(d) >= 1 for d in dils),
+            f"model.multirf_dilations must be non-empty positive ints; got {dils}.")
+        _require(
+            1 in [int(d) for d in dils],
+            f"model.multirf_dilations must contain 1 (the anti-gridding "
+            f"identity branch); got {dils}.")
+        _require(
+            mc.multirf_mode in ("split", "parallel"),
+            f"Invalid model.multirf_mode: {mc.multirf_mode!r}; "
+            "expected 'split' or 'parallel'.")
+        _require(
+            mc.multirf_fusion in ("concat_proj", "sum", "se"),
+            f"Invalid model.multirf_fusion: {mc.multirf_fusion!r}; "
+            "expected 'concat_proj' | 'sum' | 'se'.")
+        _require(
+            mc.multirf_axes in ("all", "hw"),
+            f"Invalid model.multirf_axes: {mc.multirf_axes!r}; "
+            "expected 'all' or 'hw'.")
+        # sum 融合要求各分支通道相同 → 仅 parallel 模式可用。
+        if mc.multirf_fusion == "sum":
+            _require(
+                mc.multirf_mode == "parallel",
+                "model.multirf_fusion='sum' requires multirf_mode='parallel' "
+                "(branches must share channel count to sum).")
+        # split 模式下每分支至少 1 通道：最小 stage 通道数须 >= 分支数。
+        if mc.multirf_mode == "split":
+            min_ch = min(int(c) for c in mc.encoder_channels)
+            _require(
+                min_ch >= len(dils),
+                f"model.multirf_mode='split' needs every stage channel >= "
+                f"number of branches ({len(dils)}); smallest encoder_channels="
+                f"{min_ch}. Reduce dilations or use mode='parallel'.")
+        enc_st = list(mc.multirf_encoder_stages)
+        dec_st = list(mc.multirf_decoder_stages)
+        if enc_st:
+            _require(
+                len(enc_st) == n_levels,
+                f"model.multirf_encoder_stages must have {n_levels} entries "
+                f"(= len(encoder_channels)); got {len(enc_st)}.")
+            _require(
+                all(int(v) in (0, 1) for v in enc_st),
+                f"model.multirf_encoder_stages values must be 0 or 1; got {enc_st}.")
+        if dec_st:
+            _require(
+                len(dec_st) == n_levels - 1,
+                f"model.multirf_decoder_stages must have {n_levels - 1} entries "
+                f"(= len(encoder_channels) - 1); got {len(dec_st)}.")
+            _require(
+                all(int(v) in (0, 1) for v in dec_st),
+                f"model.multirf_decoder_stages values must be 0 or 1; got {dec_st}.")
+            if any(int(v) == 1 for v in dec_st):
+                _require(
+                    mc.decoder_type == "unet",
+                    f"model.multirf_decoder_stages is only supported for "
+                    f"decoder_type='unet'; got {mc.decoder_type!r}.")
+        if not (any(int(v) == 1 for v in enc_st)
+                or any(int(v) == 1 for v in dec_st)):
+            logger.warning(
+                "model.multirf_enabled=True but neither multirf_encoder_stages "
+                "nor multirf_decoder_stages has an active (1) entry; MultiRF is "
+                "effectively a no-op.")
 
     def _validate_augment(self) -> None:
         """augment.* 校验。"""
