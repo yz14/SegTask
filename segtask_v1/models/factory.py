@@ -7,9 +7,10 @@ from functools import partial
 from typing import Callable, List
 
 import numpy as np
+import torch.nn as nn
 
 from ..config import Config
-from .blocks import Downsample, Upsample
+from .blocks import Downsample, SelfAttentionBlock, Upsample
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .resnet import MultiRFStage, ResNetStage
 from .topology import ModelTopology, build_topology
@@ -55,21 +56,24 @@ class _StatefulStageBuilder:
 def _make_resnet_stage_builder(
     cfg: Config,
     counts: List[int],
-    multirf_mask: List[bool] = None) -> _StatefulStageBuilder:
+    multirf_mask: List[bool] = None,
+    selfattn_mask: List[bool] = None) -> _StatefulStageBuilder:
     """返回按逐级 block 数构建 ResNet stage 的有状态函数。
 
     ``multirf_mask`` 非空时，逐 stage 决定该 stage 是否用 ``MultiRFStage``（多感受野
     空洞分支块）替代标准 ``ResNetStage``；长度须与 ``counts`` 对齐。``None``/全 False
     时行为与历史一致（全部 ``ResNetStage``）。
+
+    ``selfattn_mask`` 非空时，逐 stage 决定是否在该 stage 末尾追加一个
+    ``SelfAttentionBlock``（内容寻址自注意力残差块）；与 ``multirf_mask`` 正交可叠加。
     """
     mc = cfg.model
     spatial_dims = mc.spatial_dims
     mask = list(multirf_mask) if multirf_mask else []
+    sa_mask = list(selfattn_mask) if selfattn_mask else []
 
-    def factory(in_ch: int, out_ch: int, num_blocks: int):
-        # _StatefulStageBuilder 顺序调用，下方按"已构建数"取 mask。
+    def _build_stage(in_ch: int, out_ch: int, num_blocks: int):
         use_mrf = bool(mask[factory_idx[0]]) if factory_idx[0] < len(mask) else False
-        factory_idx[0] += 1
         if use_mrf:
             return MultiRFStage(
                 in_ch, out_ch,
@@ -98,6 +102,23 @@ def _make_resnet_stage_builder(
             attention_type = mc.attention_type,
             block_type     = mc.block_type,
             spatial_dims   = spatial_dims)
+
+    def factory(in_ch: int, out_ch: int, num_blocks: int):
+        # _StatefulStageBuilder 顺序调用，下方按"已构建数"取 mask。
+        idx = factory_idx[0]
+        stage = _build_stage(in_ch, out_ch, num_blocks)
+        use_sa = bool(sa_mask[idx]) if idx < len(sa_mask) else False
+        factory_idx[0] += 1
+        if use_sa:
+            return nn.Sequential(stage, SelfAttentionBlock(
+                out_ch,
+                attn_type    = mc.selfattn_type,
+                num_heads    = mc.selfattn_num_heads,
+                head_dim     = mc.selfattn_head_dim,
+                norm_groups  = mc.norm_groups,
+                zero_init    = mc.selfattn_zero_init,
+                spatial_dims = spatial_dims))
+        return stage
 
     factory_idx = [0]
     return _StatefulStageBuilder(factory, counts)
@@ -283,11 +304,21 @@ def build_model(cfg: Config):
         if mc.decoder_type == "unet":
             dec_mrf_mask = [bool(int(v)) for v in mc.multirf_decoder_stages]
 
+    # SelfAttention 逐 stage mask（默认空 = 全关，逐位兼容历史）。对齐顺序同 MultiRF。
+    enc_sa_mask: List[bool] = []
+    dec_sa_mask: List[bool] = []
+    if mc.selfattn_enabled:
+        enc_sa_mask = [bool(int(v)) for v in mc.selfattn_encoder_stages]
+        if mc.decoder_type == "unet":
+            dec_sa_mask = [bool(int(v)) for v in mc.selfattn_decoder_stages]
+
     # enc/dec 分别构建以使计数独立。
     downsample_builder = None
     if   mc.backbone == "resnet":
-        enc_builder = _make_resnet_stage_builder(cfg, enc_counts, enc_mrf_mask)
-        dec_builder = _make_resnet_stage_builder(cfg, dec_counts, dec_mrf_mask)
+        enc_builder = _make_resnet_stage_builder(
+            cfg, enc_counts, enc_mrf_mask, enc_sa_mask)
+        dec_builder = _make_resnet_stage_builder(
+            cfg, dec_counts, dec_mrf_mask, dec_sa_mask)
         if mc.multirf_enabled and (any(enc_mrf_mask) or any(dec_mrf_mask)):
             logger.info(
                 "MultiRF ENABLED: dilations=%s, mode=%s, fusion=%s, axes=%s, "
@@ -295,6 +326,13 @@ def build_model(cfg: Config):
                 list(mc.multirf_dilations), mc.multirf_mode, mc.multirf_fusion,
                 mc.multirf_axes,
                 [int(b) for b in enc_mrf_mask], [int(b) for b in dec_mrf_mask])
+        if mc.selfattn_enabled and (any(enc_sa_mask) or any(dec_sa_mask)):
+            logger.info(
+                "SelfAttention ENABLED: type=%s, num_heads=%s, head_dim=%s, "
+                "zero_init=%s, enc_stages=%s, dec_stages=%s",
+                mc.selfattn_type, mc.selfattn_num_heads, mc.selfattn_head_dim,
+                mc.selfattn_zero_init,
+                [int(b) for b in enc_sa_mask], [int(b) for b in dec_sa_mask])
     elif mc.backbone == "convnext":
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)

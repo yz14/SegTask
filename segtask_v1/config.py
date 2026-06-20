@@ -318,6 +318,23 @@ class ModelConfig:
     # 解码器逐 level 开关（0/1）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
     multirf_decoder_stages: List[int] = field(default_factory=list)
 
+    # ---- 内容寻址自注意力 SelfAttention（仅 backbone=='resnet' + arch=='unet'） ----
+    # 在选定 stage 末尾追加一个自注意力残差块（拍平空间轴 → 多头 QKV → 残差），2.5D/3D 通用。
+    # 提供真正的全局 token 交互（区别于 SE/ECA/CBAM/Coord 的通道/轴向重标定）。默认全关。
+    selfattn_enabled: bool = False
+    # 'softmax' 标准多头自注意力 O(N²)（全保真，放最深/瓶颈层）；'linear' O(N) 线性注意力（放次深层）。
+    selfattn_type: str = "softmax"
+    # 头数（selfattn_head_dim==-1 时使用）。
+    selfattn_num_heads: int = 4
+    # !=-1 时 num_heads = channels // head_dim（覆盖 selfattn_num_heads）。
+    selfattn_head_dim: int = -1
+    # 输出投影 zero-init：训练初始注意力分支输出≈0、整块为恒等残差，几乎不扰动已调好的基线（强烈建议 true）。
+    selfattn_zero_init: bool = True
+    # 编码器逐 stage 开关（0/1）。长度须 == len(encoder_channels)。空=该侧全关。
+    selfattn_encoder_stages: List[int] = field(default_factory=list)
+    # 解码器逐 level 开关（0/1）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
+    selfattn_decoder_stages: List[int] = field(default_factory=list)
+
     # ---- ADM 专用（arch=="adm"） ----
     # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空=默认最深两级。
     adm_attention_levels: List[int] = field(default_factory=list)
@@ -987,6 +1004,127 @@ class Config:
         # MultiRF（多感受野空洞分支）校验。默认关闭时完全跳过，逐位兼容现状。
         if self.model.multirf_enabled:
             self._validate_multirf(n_levels)
+        # SelfAttention（内容寻址自注意力）校验。默认关闭时完全跳过。
+        if self.model.selfattn_enabled:
+            self._validate_selfattn(n_levels)
+
+    #: softmax 自注意力 O(N²)，token 数超过此阈值时直接报错（防 3D 高分辨率层误 OOM）。
+    _SELFATTN_MAX_SOFTMAX_TOKENS = 32768
+
+    def _est_stage_tokens(self, stage_idx: int) -> int:
+        """估算编码器 stage_idx 处特征图的 token（体素）数，best-effort（用于 softmax 护栏）。
+
+        3D 用 patch [D,H,W]；2.5D（spatial_dims=2）用 [H,W]（D 已折进通道）。
+        逐级下采样按 downsample_strides（若设）否则各轴 2；stem 下采样按 stem_mode 估。
+        各向异性自动派生 stride 未显式给出时按 2 估，故为近似值。
+        """
+        mc = self.model
+        sd = mc.spatial_dims
+        ps = [int(v) for v in self.data.patch_size]
+        axes = ps if sd == 3 else ps[1:]            # 2.5D 只算 H/W
+        stem_stride_map = {"conv3": 1, "conv7": 1, "dual": 1,
+                           "patch2": 2, "patch4": 4}
+        s0 = stem_stride_map.get(mc.stem_mode, 1)
+        factor = [s0] * len(axes)
+        ds = list(mc.downsample_strides) if mc.downsample_strides else []
+        for lvl in range(stage_idx):
+            if lvl < len(ds):
+                st = ds[lvl]
+                st = [int(st)] * len(axes) if isinstance(st, int) else [int(v) for v in st]
+            else:
+                st = [2] * len(axes)
+            for a in range(len(axes)):
+                factor[a] *= st[a]
+        n = 1
+        for axis, f in zip(axes, factor):
+            n *= max(1, axis // f)
+        return n
+
+    def _validate_selfattn(self, n_levels: int) -> None:
+        """model.selfattn_* 校验（仅 selfattn_enabled=True 时调用）。"""
+        mc = self.model
+        _require(
+            str(mc.arch).lower() == "unet",
+            "model.selfattn_enabled=True is only supported for model.arch='unet'.")
+        _require(
+            mc.backbone == "resnet",
+            f"model.selfattn_enabled=True requires backbone='resnet'; "
+            f"got {mc.backbone!r}.")
+        _require(
+            mc.selfattn_type in ("softmax", "linear"),
+            f"Invalid model.selfattn_type: {mc.selfattn_type!r}; "
+            "expected 'softmax' or 'linear'.")
+        _require(
+            int(mc.selfattn_num_heads) >= 1,
+            f"model.selfattn_num_heads must be >= 1; got {mc.selfattn_num_heads}.")
+        hd = int(mc.selfattn_head_dim)
+        _require(
+            hd == -1 or hd >= 1,
+            f"model.selfattn_head_dim must be -1 or >= 1; got {hd}.")
+        enc_st = list(mc.selfattn_encoder_stages)
+        dec_st = list(mc.selfattn_decoder_stages)
+        if enc_st:
+            _require(
+                len(enc_st) == n_levels,
+                f"model.selfattn_encoder_stages must have {n_levels} entries "
+                f"(= len(encoder_channels)); got {len(enc_st)}.")
+            _require(
+                all(int(v) in (0, 1) for v in enc_st),
+                f"model.selfattn_encoder_stages values must be 0 or 1; got {enc_st}.")
+        if dec_st:
+            _require(
+                len(dec_st) == n_levels - 1,
+                f"model.selfattn_decoder_stages must have {n_levels - 1} entries "
+                f"(= len(encoder_channels) - 1); got {len(dec_st)}.")
+            _require(
+                all(int(v) in (0, 1) for v in dec_st),
+                f"model.selfattn_decoder_stages values must be 0 or 1; got {dec_st}.")
+            if any(int(v) == 1 for v in dec_st):
+                _require(
+                    mc.decoder_type == "unet",
+                    f"model.selfattn_decoder_stages is only supported for "
+                    f"decoder_type='unet'; got {mc.decoder_type!r}.")
+        # 每个被选中 stage 的通道须能被头数/head_dim 整除（建块时也会查，这里提前给清晰报错）。
+        chans = [int(c) for c in mc.encoder_channels]
+        active_enc = [i for i, v in enumerate(enc_st) if int(v) == 1]
+        active_dec = [j for j, v in enumerate(dec_st) if int(v) == 1]
+        # decoder level j（深→浅）输出通道 = encoder_channels[n-2-j]。
+        dec_ch_idx = [n_levels - 2 - j for j in active_dec]
+        for ch in [chans[i] for i in active_enc] + [chans[i] for i in dec_ch_idx]:
+            if hd != -1:
+                _require(
+                    ch % hd == 0,
+                    f"model.selfattn_head_dim={hd} must divide every selected "
+                    f"stage's channels; offending channels={ch}.")
+            else:
+                _require(
+                    ch % int(mc.selfattn_num_heads) == 0,
+                    f"model.selfattn_num_heads={mc.selfattn_num_heads} must divide "
+                    f"every selected stage's channels; offending channels={ch}.")
+        # softmax O(N²) 护栏：token 数过大直接报错，提示改 linear 或只放更深层。
+        if mc.selfattn_type == "softmax":
+            cap = self._SELFATTN_MAX_SOFTMAX_TOKENS
+            for i in active_enc:
+                n_tok = self._est_stage_tokens(i)
+                _require(
+                    n_tok <= cap,
+                    f"model.selfattn_type='softmax' at encoder stage {i} would "
+                    f"attend over ~{n_tok} tokens (> {cap}); O(N^2) risks OOM. "
+                    f"Use selfattn_type='linear' or place attention only at "
+                    f"deeper stages.")
+            for j, ci in zip(active_dec, dec_ch_idx):
+                n_tok = self._est_stage_tokens(ci)
+                _require(
+                    n_tok <= cap,
+                    f"model.selfattn_type='softmax' at decoder level {j} "
+                    f"(resolution of encoder stage {ci}) would attend over "
+                    f"~{n_tok} tokens (> {cap}); O(N^2) risks OOM. Use "
+                    f"selfattn_type='linear' or place attention only deeper.")
+        if not (active_enc or active_dec):
+            logger.warning(
+                "model.selfattn_enabled=True but neither selfattn_encoder_stages "
+                "nor selfattn_decoder_stages has an active (1) entry; "
+                "SelfAttention is effectively a no-op.")
 
     def _validate_multirf(self, n_levels: int) -> None:
         """model.multirf_* 校验（仅 multirf_enabled=True 时调用）。"""
