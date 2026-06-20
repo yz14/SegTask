@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Sequence, Tuple, Type
 
 import torch
@@ -309,6 +310,123 @@ def make_attention(name: str, channels: int,
 
 
 ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord")
+
+
+# ---------------------------------------------------------------------------
+# Content-based self-attention (QKV / linear QKV)，2.5D/3D 通用。
+# 将空间轴拍平为 token 序列后用 Conv1d 做 QKV，故与 spatial_dims 无关。
+# softmax：标准多头自注意力 O(N²)，全保真，放最深/瓶颈层；
+# linear ：Shen 2021 O(N) 线性注意力（KᵀV 技巧），放次深层。
+# 输出投影可 zero-init → 训练初始为恒等残差，几乎不扰动已调好的基线。
+# ---------------------------------------------------------------------------
+SELFATTN_TYPES = ("softmax", "linear")
+
+
+def _resolve_attn_heads(channels: int, num_heads: int, head_dim: int) -> int:
+    """head_dim != -1 时按 channels//head_dim 推导头数，否则用 num_heads。"""
+    if head_dim is not None and head_dim != -1:
+        if channels % head_dim != 0:
+            raise ValueError(
+                f"SelfAttention: channels ({channels}) not divisible by "
+                f"head_dim ({head_dim}).")
+        return channels // head_dim
+    if num_heads < 1:
+        raise ValueError(f"SelfAttention: num_heads must be >= 1, got {num_heads}.")
+    if channels % num_heads != 0:
+        raise ValueError(
+            f"SelfAttention: channels ({channels}) not divisible by "
+            f"num_heads ({num_heads}).")
+    return num_heads
+
+
+class _SoftmaxQKVAttention(nn.Module):
+    """标准多头 softmax 自注意力，输入 qkv=(B, 3*C, N)，输出 (B, C, N)。O(N²)。"""
+
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+
+    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+        bs, width, length = qkv.shape
+        ch = width // (3 * self.num_heads)
+        qkv_h = rearrange(qkv, "b (h c) l -> (b h) c l", h=self.num_heads)
+        q, k, v = qkv_h.split(ch, dim=1)
+        scale = 1.0 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v)
+        return rearrange(a, "(b h) c l -> b (h c) l", h=self.num_heads)
+
+
+class _LinearQKVAttention(nn.Module):
+    """O(N) 线性注意力（Shen 2021），输入 qkv=(B, 3*C, N)，输出 (B, C, N)。
+
+    Q 在 head_dim 维 softmax、K 在 token 维 softmax，先算 context=KᵀV 再乘 Q，
+    复杂度 O(N·d²) 而非 O(N²·d)。
+    """
+
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+
+    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+        h = self.num_heads
+        ch = qkv.shape[1] // (3 * h)
+        qkv_h = rearrange(qkv, "b (h c) l -> b h c l", h=h)
+        q, k, v = qkv_h.split(ch, dim=2)
+        q = q.softmax(dim=2)               # 在 head_dim 维
+        k = k.softmax(dim=-1)              # 在 token 维
+        q = q * (float(ch) ** -0.5)
+        context = torch.einsum("bhdn,bhen->bhde", k, v)
+        out = torch.einsum("bhde,bhdn->bhen", context, q)
+        return rearrange(out, "b h c l -> b (h c) l")
+
+
+class SelfAttentionBlock(nn.Module):
+    """内容寻址自注意力残差块（2.5D/3D 通用）。
+
+    结构：x → GroupNorm(PreNorm) → flatten → Conv1d-QKV → {softmax|linear} attn
+    → Conv1d-proj(可 zero-init) → unflatten → + x（残差）。
+    """
+
+    def __init__(
+        self,
+        channels    : int,
+        attn_type   : str = "softmax",
+        num_heads   : int = 4,
+        head_dim    : int = -1,
+        norm_groups : int = 32,
+        zero_init   : bool = True,
+        spatial_dims: int = 3):
+        super().__init__()
+        _check_dims(spatial_dims)
+        if attn_type not in SELFATTN_TYPES:
+            raise ValueError(
+                f"Unknown self-attention type: {attn_type!r}; "
+                f"expected one of {SELFATTN_TYPES}.")
+        self.spatial_dims = spatial_dims
+        self.num_heads = _resolve_attn_heads(channels, num_heads, head_dim)
+        g = norm_groups
+        while channels % g != 0 and g > 1:
+            g //= 2
+        self.norm = nn.GroupNorm(g, channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, 1)
+        self.attn = (
+            _SoftmaxQKVAttention(self.num_heads) if attn_type == "softmax"
+            else _LinearQKVAttention(self.num_heads))
+        self.proj = nn.Conv1d(channels, channels, 1)
+        if zero_init:
+            nn.init.zeros_(self.proj.weight)
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial = x.shape[2:]
+        h = rearrange(self.norm(x), "b c ... -> b c (...)")
+        h = self.qkv(h)
+        h = self.attn(h)
+        h = self.proj(h)
+        h = h.unflatten(-1, spatial)
+        return x + h
 
 
 class AttentionGate3D(nn.Module):
