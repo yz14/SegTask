@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from segtask_v1.config import Config, ConfigError
 from segtask_v1.data.ssl_transforms import GenesisCorruptor
+from segtask_v1.data.vesselness import frangi_vesselness
 from segtask_v1.models.factory import build_model, build_ssl_model
 from segtask_v1.models.ssl import SSLReconModel
 from segtask_v1.trainer.checkpoint import strip_common_prefixes
@@ -84,6 +85,57 @@ def test_ssl_validate_rejects_bad_paint_range():
     cfg.sync()
     with pytest.raises(ConfigError):
         cfg.validate()
+
+
+def test_ssl_validate_prior_ok():
+    cfg = _cfg()
+    cfg.ssl.method = "prior"
+    cfg.sync(); cfg.validate()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("prior_scales", []),
+    ("prior_scales", [0.0, 1.0]),
+    ("prior_alpha", 0.0),
+])
+def test_ssl_validate_prior_rejects_bad(field, value):
+    cfg = _cfg()
+    cfg.ssl.method = "prior"
+    setattr(cfg.ssl, field, value)
+    cfg.sync()
+    with pytest.raises(ConfigError):
+        cfg.validate()
+
+
+# ---------------------------------------------------------------------------
+# Frangi vesselness target (label-free)
+# ---------------------------------------------------------------------------
+def test_frangi_vesselness_3d_highlights_tube():
+    vol = torch.zeros(1, 1, 24, 32, 32)
+    vol[0, 0, :, 16, 16] = 1.0
+    vol[0, 0, :, 16, 17] = 1.0
+    vol[0, 0, :, 17, 16] = 1.0
+    out = frangi_vesselness(vol, scales=[1.0, 2.0], spatial_dims=3)
+    assert out.shape == vol.shape
+    assert 0.0 <= float(out.min()) and float(out.max()) <= 1.0 + 1e-5
+    tube = out[0, 0, :, 15:19, 15:19].mean().item()
+    bg = out[0, 0, :, 0:4, 0:4].mean().item()
+    assert tube > bg + 0.05
+
+
+def test_frangi_vesselness_2d_per_channel_shape():
+    im = torch.zeros(2, 3, 32, 32)
+    im[:, :, 16, :] = 1.0
+    out = frangi_vesselness(im, scales=[1.0, 2.0], spatial_dims=2)
+    assert out.shape == im.shape
+    assert out[:, :, 15:18, :].mean() > out[:, :, 0:3, :].mean()
+
+
+def test_frangi_vesselness_rejects_bad_rank():
+    with pytest.raises(ValueError):
+        frangi_vesselness(torch.rand(2, 1, 16, 16), scales=[1.0], spatial_dims=3)
+    with pytest.raises(ValueError):
+        frangi_vesselness(torch.rand(2, 1, 8, 16, 16), scales=[], spatial_dims=3)
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +250,12 @@ class _ImgDataset(Dataset):
         return {"image": self.x[i]}
 
 
-def test_ssl_trainer_one_epoch_smoke(tmp_path):
+@pytest.mark.parametrize("method", ["genesis", "prior"])
+def test_ssl_trainer_one_epoch_smoke(tmp_path, method):
     from segtask_v1.trainer.ssl_trainer import SSLTrainer
 
     cfg = _cfg("cubic")
+    cfg.ssl.method = method
     cfg.train.epochs = 1
     cfg.train.warmup_epochs = 0
     cfg.train.use_ema = True

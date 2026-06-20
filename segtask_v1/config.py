@@ -759,10 +759,12 @@ class SSLConfig:
 
     enabled: bool = False
 
-    # 预训练方法。目前支持 "genesis"（Models Genesis 式重建）。
+    # 预训练方法：
+    #   "genesis" — Models Genesis 式破坏→重建原图（学图像/结构先验）。
+    #   "prior"   — 回归经典 Frangi vesselness（免标注管状先验，直击 precision）。
     method: str = "genesis"
 
-    # 重建损失："l1" | "smooth_l1" | "mse"。
+    # 重建/回归损失："l1" | "smooth_l1" | "mse"。
     recon_loss: str = "l1"
 
     # --- Genesis 破坏（image-only，GPU 逐样本即时施加）---
@@ -782,6 +784,17 @@ class SSLConfig:
     # 补全盒子边长占该轴比例区间。
     paint_block_range: List[float] = field(
         default_factory=lambda: [0.1, 0.25])
+
+    # --- method='prior'：Frangi vesselness 回归目标（label-free）---
+    # 多尺度 sigma（覆盖你血管口径跨度；细管用小 sigma、粗管用大 sigma）。
+    prior_scales: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
+    # Frangi 形状/blob 抑制系数（Frangi'98 默认 0.5）。
+    prior_alpha: float = 0.5
+    prior_beta : float = 0.5
+    # 血管相对背景的明暗：CT 增强血管偏亮 → False（亮管）。
+    prior_black_vessels: bool = False
+    # 是否对输入也施加 Genesis 破坏（目标仍是干净图的 vesselness）；默认纯净输入。
+    prior_corrupt_input: bool = False
 
     # 周期性保存 SSL ckpt 的 epoch 间隔（best-by-train-recon 始终单独保存）。
     save_every: int = 10
@@ -1574,8 +1587,17 @@ class Config:
             return
         s = self.ssl
         _require(
-            s.method in ("genesis",),
-            f"Invalid ssl.method: {s.method!r}. Valid: 'genesis'.")
+            s.method in ("genesis", "prior"),
+            f"Invalid ssl.method: {s.method!r}. Valid: 'genesis' | 'prior'.")
+        if s.method == "prior":
+            _require(
+                len(s.prior_scales) >= 1 and all(float(v) > 0 for v in s.prior_scales),
+                f"ssl.prior_scales must be a non-empty list of positive sigmas; "
+                f"got {s.prior_scales}.")
+            _require(
+                float(s.prior_alpha) > 0 and float(s.prior_beta) > 0,
+                f"ssl.prior_alpha/prior_beta must be > 0; "
+                f"got {s.prior_alpha}, {s.prior_beta}.")
         _require(
             s.recon_loss in ("l1", "smooth_l1", "mse"),
             f"Invalid ssl.recon_loss: {s.recon_loss!r}. "
