@@ -113,13 +113,15 @@ model:
   # 提供真正的全局上下文（利于沿血管长程连通、抑制孤立假阳）。zero_init=true 保证初始为恒等
   # 残差、几乎不扰动现有基线。先验证有效，再考虑次深级用 linear 或开解码器侧。
   selfattn_enabled       : true
-  selfattn_type          : "softmax"   # 'softmax'(放最深) | 'linear'(O(N),放次深)
+  selfattn_type          : "softmax"   # 全局默认类型（逐层写 1 时沿用）：'softmax'(放最深) | 'linear'(O(N),放次深)
   selfattn_num_heads     : 4
   selfattn_head_dim      : -1          # !=-1 时 num_heads = channels // head_dim
   selfattn_zero_init     : true
   # 编码器逐 stage（长度=len(encoder_channels)=5；浅→深，末位=bottleneck）。默认仅瓶颈。
-  selfattn_encoder_stages: [0, 0, 0, 0, 1]
-  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅）。默认关，作为第二轮对照。
+  # 每个元素可写：0/none=该层关；'softmax'=标准 QKV；'linear'=线性 QKV；1=沿用全局 selfattn_type。
+  # 例：瓶颈 softmax + 次深 linear（分层选型）→ [0, 0, 0, linear, softmax]
+  selfattn_encoder_stages: [0, 0, 0, 0, softmax]
+  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅，取值同上）。默认关，作为第二轮对照。
   selfattn_decoder_stages: [0, 0, 0, 0]
 
 

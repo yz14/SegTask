@@ -13,9 +13,16 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.config import Config, ConfigError
-from segtask_v1.models.blocks import SelfAttentionBlock
+from segtask_v1.config import Config, ConfigError, resolve_selfattn_stage
+from segtask_v1.models.blocks import (
+    SelfAttentionBlock, _LinearQKVAttention, _SoftmaxQKVAttention)
 from segtask_v1.models.factory import build_model
+
+
+def _count_attn(model):
+    soft = sum(isinstance(m, _SoftmaxQKVAttention) for m in model.modules())
+    lin = sum(isinstance(m, _LinearQKVAttention) for m in model.modules())
+    return soft, lin
 
 
 def _nparams(m) -> int:
@@ -171,6 +178,73 @@ def test_softmax_guard_allows_linear_on_shallow():
     cfg.model.selfattn_encoder_stages = [1, 0, 0]  # shallow, huge token count
     cfg.sync()
     cfg.validate()  # must not raise
+
+
+def test_resolve_selfattn_stage():
+    assert resolve_selfattn_stage(0, "softmax") is None
+    assert resolve_selfattn_stage("none", "softmax") is None
+    assert resolve_selfattn_stage(1, "linear") == "linear"      # 1 -> default
+    assert resolve_selfattn_stage("default", "softmax") == "softmax"
+    assert resolve_selfattn_stage("softmax", "linear") == "softmax"
+    assert resolve_selfattn_stage("linear", "softmax") == "linear"
+    with pytest.raises(ConfigError):
+        resolve_selfattn_stage("bogus", "softmax")
+
+
+def test_per_level_mixed_types_build():
+    """Different layers use different attention types in one network."""
+    cfg = _cfg("z_axis")
+    cfg.model.selfattn_enabled = True
+    # stage1 (8192 tok) linear, stage2 bottleneck (1024 tok) softmax.
+    cfg.model.selfattn_encoder_stages = [0, "linear", "softmax"]
+    cfg.model.selfattn_decoder_stages = ["linear", 0]
+    cfg.sync()
+    cfg.validate()
+    model = build_model(cfg).eval()
+    soft, lin = _count_attn(model)
+    assert soft == 1 and lin == 2          # 1 softmax (enc), 2 linear (enc+dec)
+    x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)
+    with torch.no_grad():
+        y = model(x)
+    out = y[0] if isinstance(y, (list, tuple)) else y
+    assert out.shape[-3:] == (16, 64, 64)
+
+
+def test_per_level_softmax_guard_only_hits_softmax_layers():
+    """Shallow 'linear' is fine, but shallow 'softmax' is rejected."""
+    ok = _cfg("z_axis")
+    ok.model.selfattn_enabled = True
+    ok.model.selfattn_encoder_stages = ["linear", 0, "softmax"]  # shallow=linear
+    ok.sync()
+    ok.validate()  # must not raise
+    bad = _cfg("z_axis")
+    bad.model.selfattn_enabled = True
+    bad.model.selfattn_encoder_stages = ["softmax", 0, "softmax"]  # shallow=softmax
+    bad.sync()
+    with pytest.raises((ConfigError, ValueError)):
+        bad.validate()
+
+
+def test_legacy_0_1_still_works():
+    """Old 0/1 masks keep working: 1 means the global selfattn_type."""
+    cfg = _cfg("z_axis")
+    cfg.model.selfattn_enabled = True
+    cfg.model.selfattn_type = "linear"
+    cfg.model.selfattn_encoder_stages = [1, 1, 1]   # all -> linear
+    cfg.sync()
+    cfg.validate()
+    model = build_model(cfg)
+    soft, lin = _count_attn(model)
+    assert soft == 0 and lin == 3
+
+
+def test_config_rejects_invalid_stage_string():
+    cfg = _cfg("z_axis")
+    cfg.model.selfattn_enabled = True
+    cfg.model.selfattn_encoder_stages = [0, 0, "bogus"]
+    cfg.sync()
+    with pytest.raises((ConfigError, ValueError)):
+        cfg.validate()
 
 
 def test_config_accepts_disabled_with_garbage():
