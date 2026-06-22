@@ -746,6 +746,60 @@ class PredictConfig:
     adabn_num_volumes: int = 8
 
 
+@dataclass
+class SSLConfig:
+    """自监督预训练（SSL）。**独立 task**：由 `python -m segtask_v1.pretrain` 入口
+    驱动，与分割训练互不污染。SSL 用与分割同构的 UNet（enc+dec），仅把分割头换成
+    重建头（out_channels=in_channels）；产出的 ckpt 经分割侧已有的 `train.pretrain`
+    非严格加载衔接（enc+dec 命中、seg head 随机）。
+
+    优化器/调度器/AMP/EMA/输出目录/epochs/lr 全部复用 `train.*`，此处只放 SSL 专有项。
+    `enabled` 仅作 pretrain 入口的显式确认与 validate 门控；分割训练读不到本段（默认关）。
+    """
+
+    enabled: bool = False
+
+    # 预训练方法：
+    #   "genesis" — Models Genesis 式破坏→重建原图（学图像/结构先验）。
+    #   "prior"   — 回归经典 Frangi vesselness（免标注管状先验，直击 precision）。
+    method: str = "genesis"
+
+    # 重建/回归损失："l1" | "smooth_l1" | "mse"。
+    recon_loss: str = "l1"
+
+    # --- Genesis 破坏（image-only，GPU 逐样本即时施加）---
+    # 非线性强度变换（随机 Bézier 单调/非单调曲线；学 HU/对比剂不变性）。
+    nonlinear_prob: float = 0.9
+    # 局部像素打乱（随机小窗内重排；学局部纹理/结构）。
+    local_shuffle_prob  : float = 0.5
+    local_shuffle_blocks: int = 100
+    # 打乱窗口最大边长（每轴）；2D 仅用末两项。
+    local_shuffle_max_block: List[int] = field(
+        default_factory=lambda: [4, 8, 8])
+    # 内/外补全（painting）。paint_prob 命中后，inner_paint_prob 决定内补 vs 外补。
+    paint_prob      : float = 0.9
+    inner_paint_prob: float = 0.5
+    # 补全时随机盒子的迭代次数（仅内补）。
+    paint_count: int = 5
+    # 补全盒子边长占该轴比例区间。
+    paint_block_range: List[float] = field(
+        default_factory=lambda: [0.1, 0.25])
+
+    # --- method='prior'：Frangi vesselness 回归目标（label-free）---
+    # 多尺度 sigma（覆盖你血管口径跨度；细管用小 sigma、粗管用大 sigma）。
+    prior_scales: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
+    # Frangi 形状/blob 抑制系数（Frangi'98 默认 0.5）。
+    prior_alpha: float = 0.5
+    prior_beta : float = 0.5
+    # 血管相对背景的明暗：CT 增强血管偏亮 → False（亮管）。
+    prior_black_vessels: bool = False
+    # 是否对输入也施加 Genesis 破坏（目标仍是干净图的 vesselness）；默认纯净输入。
+    prior_corrupt_input: bool = False
+
+    # 周期性保存 SSL ckpt 的 epoch 间隔（best-by-train-recon 始终单独保存）。
+    save_every: int = 10
+
+
 # ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
@@ -759,6 +813,7 @@ class Config:
     loss   : LossConfig    = field(default_factory=LossConfig)
     train  : TrainConfig   = field(default_factory=TrainConfig)
     predict: PredictConfig = field(default_factory=PredictConfig)
+    ssl    : SSLConfig     = field(default_factory=SSLConfig)
 
     def sync(self) -> None:
         """同步跨子配置的对应字段。
@@ -870,6 +925,7 @@ class Config:
         self._validate_2_5d()
         self._validate_train()
         self._validate_predict()
+        self._validate_ssl()
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)
@@ -1525,6 +1581,58 @@ class Config:
                     "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
                     self.model.norm_type)
 
+    def _validate_ssl(self) -> None:
+        """ssl.* 自监督预训练校验（仅 ssl.enabled 时生效；分割训练默认关，跳过）。"""
+        if not self.ssl.enabled:
+            return
+        s = self.ssl
+        _require(
+            s.method in ("genesis", "prior"),
+            f"Invalid ssl.method: {s.method!r}. Valid: 'genesis' | 'prior'.")
+        if s.method == "prior":
+            _require(
+                len(s.prior_scales) >= 1 and all(float(v) > 0 for v in s.prior_scales),
+                f"ssl.prior_scales must be a non-empty list of positive sigmas; "
+                f"got {s.prior_scales}.")
+            _require(
+                float(s.prior_alpha) > 0 and float(s.prior_beta) > 0,
+                f"ssl.prior_alpha/prior_beta must be > 0; "
+                f"got {s.prior_alpha}, {s.prior_beta}.")
+        _require(
+            s.recon_loss in ("l1", "smooth_l1", "mse"),
+            f"Invalid ssl.recon_loss: {s.recon_loss!r}. "
+            "Valid: 'l1' | 'smooth_l1' | 'mse'.")
+        # SSL 重建路径走单视图（与分割同构 UNet，只换重建头）；多 FOV/扩散架构暂不支持。
+        _require(
+            str(self.model.arch).lower() == "unet",
+            f"ssl.enabled=True requires model.arch=='unet'; got {self.model.arch!r}.")
+        _require(
+            len(self.data.multi_res_scales) == 1,
+            f"ssl.enabled=True requires a single view "
+            f"(len(data.multi_res_scales)==1); got {self.data.multi_res_scales}.")
+        for name in ("nonlinear_prob", "local_shuffle_prob",
+                     "paint_prob", "inner_paint_prob"):
+            v = float(getattr(s, name))
+            _require(0.0 <= v <= 1.0,
+                     f"ssl.{name} must be in [0,1]; got {v}.")
+        _require(
+            int(s.local_shuffle_blocks) >= 0,
+            f"ssl.local_shuffle_blocks must be >= 0; got {s.local_shuffle_blocks}.")
+        _require(
+            int(s.paint_count) >= 0,
+            f"ssl.paint_count must be >= 0; got {s.paint_count}.")
+        _require(
+            all(int(b) >= 1 for b in s.local_shuffle_max_block),
+            f"ssl.local_shuffle_max_block must all be >= 1; "
+            f"got {s.local_shuffle_max_block}.")
+        pr = s.paint_block_range
+        _require(
+            len(pr) == 2 and 0.0 < float(pr[0]) <= float(pr[1]) < 1.0,
+            f"ssl.paint_block_range must be [lo,hi] with 0<lo<=hi<1; got {pr}.")
+        _require(
+            int(s.save_every) >= 1,
+            f"ssl.save_every must be >= 1; got {s.save_every}.")
+
 
     @property
     def num_fg_classes(self) -> int:
@@ -1552,6 +1660,7 @@ _SUB_CONFIGS = {
     "loss": LossConfig,
     "train": TrainConfig,
     "predict": PredictConfig,
+    "ssl": SSLConfig,
 }
 
 
