@@ -6,6 +6,12 @@
 #   3) mask - 细血管 = 主干; 主干 - erode(主干) = 主干边缘 (W=9)
 #   4) erode(主干) = 主干内部 (W=4)
 # 对标签1、2分别处理后合并（空间不重叠，直接叠加）。
+#
+# 此外，对血管外的背景按“离血管表面的距离”再分两层（难负样本加权，
+# 抑制血管周围假阳），仅赋给真正的背景体素、不覆盖任何前景：
+#   5) 紧贴血管表面 1~INNER_SHELL_R voxel 的背景 = 内壳 (W=3)
+#   6) 再往外 INNER_SHELL_R~OUTER_SHELL_R voxel 的背景 = 外壳 (W=1)
+# 更远的背景保持 W=0。（注：加载时整体 +1 偏移，故实际进损失的权重为此处值+1。）
 
 import os
 import sys
@@ -34,12 +40,16 @@ os.makedirs(OUT_DIR, exist_ok=True)
 OPEN_RADIUS      = 4      # 开运算核半径：决定“细血管”阈值
 ERODE_RADIUS     = 4      # 主干腐蚀半径：决定边缘厚度
 SKEL_DILATE_R    = 3      # 分叉点膨胀半径：覆盖分叉周围区域
+INNER_SHELL_R    = 2      # 内壳半径：紧贴血管表面的背景带（1~INNER_SHELL_R voxel）
+OUTER_SHELL_R    = 6      # 外壳半径：内壳之外、本半径之内的背景带
 
 # ==== 权重 ====
 W_JUNCTION       = 19     # 血管分叉点
 W_THIN_VESSEL    = 14     # 细血管
 W_TRUNK_EDGE     = 9      # 主干边缘
 W_TRUNK_INTERIOR = 4      # 主干内部
+W_INNER_SHELL    = 3      # 血管外·内壳（紧贴血管表面的背景）
+W_OUTER_SHELL    = 1      # 血管外·外壳（内壳之外的背景）
 W_DEFAULT        = 0      # 背景/其它
 
 # ==== 标签值 ====
@@ -120,6 +130,27 @@ def process_single_label(mask_bool: np.ndarray, label_value: int) -> np.ndarray:
     return weight
 
 
+def compute_bg_shells(fg_union: np.ndarray) -> tuple:
+    """由全部前景的并集，按离血管表面的距离生成两层“背景壳”掩码。
+    返回 (inner_shell, outer_shell)，均为 bool 且仅落在背景（fg 之外）；二者互斥。
+    inner_shell: fg 之外、距表面 1~INNER_SHELL_R voxel。
+    outer_shell: fg 之外、距表面 (INNER_SHELL_R, OUTER_SHELL_R] voxel。
+    """
+    bg = ~fg_union
+    fg_u8 = fg_union.astype(np.uint8)
+
+    dil_inner = morph_dilate_gpu(
+        fg_u8, kernel_size=2 * INNER_SHELL_R + 1
+    ).astype(bool)
+    dil_outer = morph_dilate_gpu(
+        fg_u8, kernel_size=2 * OUTER_SHELL_R + 1
+    ).astype(bool)
+
+    inner_shell = dil_inner & bg                 # 紧贴表面的背景环
+    outer_shell = dil_outer & (~dil_inner) & bg  # 再往外的背景环
+    return inner_shell, outer_shell
+
+
 def main():
     lbl_files = sorted(glob(os.path.join(LBL_DIR, '*.nii.gz')))
     print(f'Found {len(lbl_files)} label files')
@@ -156,6 +187,17 @@ def main():
 
             # 两标签空间互斥，直接叠加（取最大，因同位置不应有冲突）
             final_weight = np.maximum(final_weight, w)
+
+        # ---- 背景壳（难负样本加权）：仅赋给前景之外的背景，不覆盖任何前景 ----
+        fg_union = np.zeros(lbl_arr.shape, dtype=bool)
+        for lab in LABELS:
+            fg_union |= (lbl_arr == lab)
+
+        if fg_union.any():
+            inner_shell, outer_shell = compute_bg_shells(fg_union)
+            # 先外后内（二者已互斥，顺序仅为稳妥）；只写入背景体素。
+            final_weight[outer_shell] = W_OUTER_SHELL
+            final_weight[inner_shell] = W_INNER_SHELL
 
         # 保存
         weight_img = sitk.GetImageFromArray(final_weight)
