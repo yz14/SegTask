@@ -2,10 +2,14 @@ data:
   image_suffix: ".nii.gz"
   label_suffix: "-seg.nii.gz"
   bbox_suffix : "_pred.nii.gz"
-  region_weight_suffix: ".nii.gz"
+  region_weight_suffix: "-seg.nii.gz"
 
-  image_dir: "F:/lung_paired/imgs"
-  bbox_dir : "F:/lung_paired/lung_resnet_bnorm_pred"
+  image_dir: "/data0/yzhen/data/tx_ves/nii"
+  label_dir: "/data0/yzhen/data/tx_ves/seg_bin"
+  bbox_dir : "/data0/yzhen/data/tx_ves/lung_resnet_bnorm_pred"
+  region_weight_dir : "/data0/yzhen/data/tx_ves/weight"
+
+  npz_dir: "/data0/yzhen/data/tx_ves/npz_data"
 
   label_values: [0, 1]
   num_classes : 2
@@ -27,7 +31,7 @@ data:
   split_seed      : 42
   stratified_split: true
 
-  batch_size     : 2
+  batch_size     : 1
   num_workers    : 16
   prefetch_factor: 8
   pin_memory     : true
@@ -36,7 +40,7 @@ data:
   samples_per_volume         : 8
 
   cache_mode       : "memory"
-  cache_max_volumes: 24
+  cache_max_volumes: 36
 
 
 augment:
@@ -81,14 +85,14 @@ model:
 
   lift_2_5d_to_3d: false
 
-  norm_type  : "batch"            # 'instance' | 'batch' | 'group'
+  norm_type  : "group"            # 'instance' | 'batch' | 'group'
   norm_groups: 8
   activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
   dropout    : 0.0
 
   use_se        : false    # SE attn
   attention_type: "none"
-  skip_attention: false
+  skip_attention: true            # 细血管：skip 上加注意力门控，抑制无关 skip 激活
 
   deep_supervision: true
 
@@ -100,6 +104,12 @@ model:
 
   aux_head_mode: "conv"
 
+  # 中心线/距离场辅助头（拓扑感知多任务监督，与多 FOV aux 相互独立）。
+  # cubic 3D 用 distance（形态学到边界距离 / 血管半径场），3D 体素回归更自然。
+  aux_topo_head      : true
+  aux_topo_target    : "distance"
+  aux_topo_head_mode : "conv"
+
   decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
   downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
   upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
@@ -109,7 +119,7 @@ model:
 
 
 loss:
-  name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
+  name: "dice_cldice"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
   compound_weights: [1.0, 1.0]
 
   class_weights : [1.0]       # 长度 = num_fg_classes (不含 bg)
@@ -117,6 +127,10 @@ loss:
 
   dice_smooth : 1.0e-5
   dice_squared: false
+  batch_dice  : true             # 全 batch 汇总 TP/分母（nnU-Net Dice）：稀疏前景下梯度更稳
+
+  cldice_iter  : 5               # 3D 软骨架迭代（Shit+ 推荐 3D 取 3–10）
+  cldice_smooth: 1.0
 
   focal_alpha: 0.5
   focal_gamma: 2.0
@@ -129,6 +143,11 @@ loss:
   slice_loss_reduction: "per_volume"
 
   aux_supervision_weights: [0.5, 0.5]
+
+  # 距离场辅助头损失：total += aux_topo_weight * smooth_l1(distance field)。
+  aux_topo_weight: 0.3
+  aux_topo_iter  : 5             # 距离场最大腐蚀步（3D）
+  aux_topo_loss  : "auto"        # distance → smooth_l1
 
 
 train:
@@ -143,7 +162,7 @@ train:
   warmup_lr    : 1.0e-6
   cosine_min_lr: 1.0e-6
 
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   grad_clip_norm  : 12.0
 
   use_amp  : false
@@ -154,12 +173,11 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/ves_resnet3d_bnorm"    ############################################################
+  output_dir      : "outputs/ves3d"    ############################################################
   save_every      : 10
-  save_best_criterion: "dice"
+  save_best_preset: "vessel"      # balanced(dice/sd/iou/mcc) + sd_tol=2：断裂不敏感的纯 dice 选模不再适用
   surface_dice_tolerance: 1
   surface_dice_weight: 0.5
-  save_best_preset: ""
   val_metric_mode: "medium"
 
   early_stopping: 0
