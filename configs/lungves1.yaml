@@ -4,8 +4,8 @@ data:
   bbox_suffix : "_pred.nii.gz"
   region_weight_suffix: ".nii.gz"
 
-  image_dir: "F:/LUNA25/imgs"
-  bbox_dir : "F:/LUNA25/lung_base"
+  image_dir: "F:/lung_paired/imgs"
+  bbox_dir : "F:/lung_paired/lung_resnet_bnorm_pred"
 
   label_values: [0, 1]
   num_classes : 2

@@ -335,7 +335,7 @@ class MultiRFBlock(nn.Module):
 
         # 融合层。
         if fusion == "sum":
-            self.se = None
+            self.se   = None
             self.fuse = None  # 逐元素相加，各分支均 out_ch
         elif fusion == "se":
             self.se = SqueezeExcite3D(total, reduction=se_reduction,

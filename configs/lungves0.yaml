@@ -2,10 +2,14 @@ data:
   image_suffix: ".nii.gz"
   label_suffix: "-seg.nii.gz"
   bbox_suffix : "_pred.nii.gz"
-  region_weight_suffix: ".nii.gz"
+  region_weight_suffix: "-seg.nii.gz"
 
-  image_dir: "F:/LUNA25/imgs"
-  bbox_dir : "F:/LUNA25/lung_base"
+  image_dir: "/data0/yzhen/data/tx_ves/nii"
+  label_dir: "/data0/yzhen/data/tx_ves/seg_bin"
+  bbox_dir : "/data0/yzhen/data/tx_ves/lung_resnet_bnorm_pred"
+  region_weight_dir : "/data0/yzhen/data/tx_ves/weight"
+
+  npz_dir: "/data0/yzhen/data/tx_ves/npz_data"
 
   label_values: [0, 1]
   num_classes : 2
@@ -28,7 +32,7 @@ data:
   split_seed      : 42
   stratified_split: true
 
-  batch_size     : 8
+  batch_size     : 4
   num_workers    : 16
   prefetch_factor: 8
   pin_memory     : true
@@ -101,6 +105,14 @@ model:
 
   aux_head_mode: "conv"
 
+  # 中心线/距离场辅助头（拓扑感知多任务监督，与多 FOV aux 相互独立）。
+  # 2.5D 用 centerline（软骨架，逐切片 2D，保连通），训练期前向、eval 零开销。
+  aux_topo_head      : true
+  aux_topo_target    : "centerline"
+  aux_topo_head_mode : "conv"
+
+  drop_path_rate : 0.0
+
   decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
   downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
   upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
@@ -108,9 +120,20 @@ model:
 
   drop_path_rate : 0.0
 
+  # ---- 多感受野（空洞卷积多分支融合）MultiRF 示例 ----
+  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合、
+  # axes=hw 只在 H/W 膨胀（肺 CT z 各向异性）。先验证有效再往更多 stage / 解码器铺开。
+  multirf_enabled       : true
+  multirf_dilations     : [1, 2, 3]        # 必须含 1（守门支路）
+  multirf_mode          : "split"          # 'split'(≈等成本) | 'parallel'(≈N×)
+  multirf_fusion        : "concat_proj"    # 'concat_proj' | 'sum'(需 parallel) | 'se'
+  multirf_axes          : "hw"             # 'hw'(保 z, 推荐) | 'all'
+  multirf_encoder_stages: [0, 0, 1, 1, 1]  # 编码器逐 stage；浅→深，末位=bottleneck
+  multirf_decoder_stages: [0, 0, 0, 0]     # 解码器逐 level；深→浅）
+
 
 loss:
-  name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
+  name: "dice_cldice"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
   compound_weights: [1.0, 1.0]
 
   class_weights : [1.0]       # 长度 = num_fg_classes (不含 bg)
@@ -118,6 +141,10 @@ loss:
 
   dice_smooth : 1.0e-5
   dice_squared: false
+  batch_dice  : true             # 全 batch 汇总 TP/分母（nnU-Net Dice）：稀疏前景下梯度更稳
+
+  cldice_iter  : 3               # 2D 软骨架迭代（Shit+ 推荐 2D 用 3）
+  cldice_smooth: 1.0
 
   focal_alpha: 0.5
   focal_gamma: 2.0
@@ -130,6 +157,11 @@ loss:
   slice_loss_reduction: "per_volume"
 
   aux_supervision_weights: [0.5, 0.5]
+
+  # 中心线辅助头损失：total += aux_topo_weight * soft-dice(skeleton)。
+  aux_topo_weight: 0.3
+  aux_topo_iter  : 3             # 软骨架迭代步（2D）
+  aux_topo_loss  : "auto"        # centerline → soft-dice
 
 
 train:
@@ -155,12 +187,12 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/ves_resnet_bnorm"    ############################################################
+  output_dir      : "outputs/ves_resnet_multirf"    ############################################################
   save_every      : 10
-  save_best_criterion: "dice"
+  save_best_criterion: ""
   surface_dice_tolerance: 1
   surface_dice_weight: 0.5
-  save_best_preset: ""
+  save_best_preset: "vessel"
   val_metric_mode: "medium"
 
   early_stopping: 0
