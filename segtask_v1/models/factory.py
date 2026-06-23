@@ -301,7 +301,7 @@ def build_model(cfg: Config):
     dec_mrf_mask: List[bool] = []
     if mc.multirf_enabled:
         enc_mrf_mask = [bool(int(v)) for v in mc.multirf_encoder_stages]
-        if mc.decoder_type == "unet":
+        if mc.decoder_type == "unet":  # TODO 只有unet才支持吗？
             dec_mrf_mask = [bool(int(v)) for v in mc.multirf_decoder_stages]
 
     # SelfAttention 逐 stage 类型（默认空 = 全关，逐位兼容历史）。对齐顺序同 MultiRF；
