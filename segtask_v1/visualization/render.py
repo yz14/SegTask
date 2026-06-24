@@ -94,7 +94,7 @@ svg.edges { position: absolute; left: 0; top: 0; width: 100%; height: 100%;
 /* stage container */
 .stage {
   background: var(--c-stage-bg); border: 1px dashed var(--c-stage);
-  border-radius: 12px; min-width: 280px; max-width: 760px;
+  border-radius: 12px; min-width: 280px; max-width: 1024px;
 }
 .stage > .stage-head {
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
@@ -105,9 +105,14 @@ svg.edges { position: absolute; left: 0; top: 0; width: 100%; height: 100%;
 .stage > .stage-head .s-kv { color: var(--muted); font-weight: 500;
   font-size: 11px; margin-left: auto; }
 
-/* row: side-by-side grouping (e.g. multi-resolution inputs) */
+/* row: side-by-side grouping (并联分支 / 多分辨率输入) */
 .row { display: flex; flex-direction: row; align-items: flex-start;
   justify-content: center; gap: 26px; flex-wrap: wrap; }
+
+/* edge legend (线型说明) */
+.legend .eline { display: inline-block; width: 22px; height: 0;
+  border-top-width: 2px; border-top-style: solid; margin-right: 4px;
+  vertical-align: middle; }
 
 /* color by kind */
 .k-data   { border-left-color: var(--c-data);   background: var(--c-data-bg); }
@@ -167,6 +172,12 @@ _JS = r"""
 const DATA = __DATA__;
 const KINDS = ["data","process","input","conv","norm","act","op","head",
   "output","loss","model"];
+// 连边线型/配色：forward 主流（实线灰）、skip 跳连（蓝虚线）、residual 残差（琥珀虚线）。
+const EDGE_STYLE = {
+  forward:  { color: "#94a3b8", width: "1.6", dash: null,  marker: "arrow" },
+  skip:     { color: "#2563eb", width: "1.8", dash: "6 4", marker: "arrow-skip" },
+  residual: { color: "#d97706", width: "1.8", dash: "3 3", marker: "arrow-res" },
+};
 
 function el(tag, cls, txt) {
   const e = document.createElement(tag);
@@ -210,7 +221,7 @@ function buildStage(node, childrenOf) {
   if (sk) head.appendChild(el("span", "s-kv", sk));
   box.appendChild(head);
   const body = el("div", "children" + (node.collapsed ? " collapsed" : ""));
-  (childrenOf[node.id] || []).forEach(ch => body.appendChild(render(ch, childrenOf)));
+  layoutInto(body, childrenOf[node.id] || [], childrenOf);
   box.appendChild(body);
   head.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -219,6 +230,47 @@ function buildStage(node, childrenOf) {
     requestAnimationFrame(drawEdges);
   });
   return box;
+}
+
+// Lay a set of sibling nodes into `container`. If their `rank` values differ,
+// group same-rank siblings into a horizontal `.row` (并联分支 side-by-side);
+// otherwise fall back to vertical flow with consecutive `input` nodes rowed.
+function layoutInto(container, nodes, childrenOf) {
+  if (!nodes.length) return;
+  const ranks = new Set(nodes.map(n => n.rank || 0));
+  if (ranks.size > 1) {
+    const arr = nodes.slice().sort((a, b) => (a.rank || 0) - (b.rank || 0));
+    let i = 0;
+    while (i < arr.length) {
+      let j = i;
+      while (j < arr.length && (arr[j].rank || 0) === (arr[i].rank || 0)) j++;
+      if (j - i > 1) {
+        const row = el("div", "row");
+        for (let k = i; k < j; k++) row.appendChild(render(arr[k], childrenOf));
+        container.appendChild(row);
+      } else {
+        container.appendChild(render(arr[i], childrenOf));
+      }
+      i = j;
+    }
+    return;
+  }
+  // single rank → preserve order; row consecutive multi-resolution inputs
+  let i = 0;
+  while (i < nodes.length) {
+    if (nodes[i].kind === "input") {
+      let j = i;
+      while (j < nodes.length && nodes[j].kind === "input") j++;
+      if (j - i > 1) {
+        const row = el("div", "row");
+        for (let k = i; k < j; k++) row.appendChild(render(nodes[k], childrenOf));
+        container.appendChild(row);
+        i = j; continue;
+      }
+    }
+    container.appendChild(render(nodes[i], childrenOf));
+    i++;
+  }
 }
 
 function render(node, childrenOf) {
@@ -300,31 +352,39 @@ function drawEdges() {
     const key = Math.round(x1) + "," + Math.round(y1) + ">" +
                 Math.round(x2) + "," + Math.round(y2);
     if (seen.has(key)) return; seen.add(key);
+    const kind = ed.kind || "forward";
     const down = y2 >= y1 - 2;
+    // forward & adjacent → vertical bezier; residual / skip / backward → side arc
+    const side = (kind === "skip" || kind === "residual" || !down);
+    const style = EDGE_STYLE[kind] || EDGE_STYLE.forward;
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    let d;
-    if (down) {
+    let d, lx, ly;
+    if (!side) {
       const my = (y1 + y2) / 2;
       d = `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
+      lx = (x1 + x2) / 2 + 6; ly = my - 2;
     } else {
-      // backward edge (skip connection): route to the side
-      const off = 40 + Math.abs(x2 - x1) * 0.15;
+      const off = 44 + Math.abs(x2 - x1) * 0.12 + (kind === "skip" ? 30 : 0);
       const sx = Math.max(x1, x2) + off;
-      d = `M ${x1} ${y1 - ra.height/2} C ${sx} ${y1}, ${sx} ${y2}, ${x2} ${y2 + rb.height/2}`;
+      const ya = down ? y1 : (y1 - ra.height / 2);
+      const yb = down ? y2 : (y2 + rb.height / 2);
+      d = `M ${x1} ${ya} C ${sx} ${ya}, ${sx} ${yb}, ${x2} ${yb}`;
+      lx = sx + 4; ly = (ya + yb) / 2;
     }
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
-    path.setAttribute("stroke", down ? "var(--edge)" : "#cbd5e1");
-    path.setAttribute("stroke-width", "1.6");
-    if (!down) path.setAttribute("stroke-dasharray", "4 3");
-    path.setAttribute("marker-end", "url(#arrow)");
+    path.setAttribute("stroke", style.color);
+    path.setAttribute("stroke-width", style.width);
+    if (style.dash) path.setAttribute("stroke-dasharray", style.dash);
+    path.setAttribute("marker-end", "url(#" + style.marker + ")");
     svg.appendChild(path);
     if (ed.label) {
       const tx = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      tx.setAttribute("x", (x1 + x2) / 2 + 6);
-      tx.setAttribute("y", (y1 + y2) / 2 - 2);
-      tx.setAttribute("fill", "var(--muted)");
+      tx.setAttribute("x", lx);
+      tx.setAttribute("y", ly);
+      tx.setAttribute("fill", style.color);
       tx.setAttribute("font-size", "10.5");
+      tx.setAttribute("font-weight", kind === "forward" ? "400" : "700");
       tx.textContent = ed.label;
       svg.appendChild(tx);
     }
@@ -333,10 +393,17 @@ function drawEdges() {
   svg.setAttribute("width", canvas.scrollWidth);
   svg.setAttribute("height", canvas.scrollHeight);
 }
-function svgDefs() {
-  return '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" ' +
+function marker(id, color) {
+  return '<marker id="' + id + '" viewBox="0 0 10 10" refX="9" refY="5" ' +
     'markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
-    '<path d="M 0 1 L 9 5 L 0 9 z" fill="var(--edge)"/></marker></defs>';
+    '<path d="M 0 1 L 9 5 L 0 9 z" fill="' + color + '"/></marker>';
+}
+function svgDefs() {
+  return '<defs>' +
+    marker("arrow", EDGE_STYLE.forward.color) +
+    marker("arrow-skip", EDGE_STYLE.skip.color) +
+    marker("arrow-res", EDGE_STYLE.residual.color) +
+    '</defs>';
 }
 
 function buildFlow(flowKey) {
@@ -363,23 +430,9 @@ function buildFlow(flowKey) {
     const p = n.parent_id;
     if (p != null && p !== "") { (childrenOf[p] = childrenOf[p] || []).push(n); }
   });
-  // group consecutive top-level "input" nodes into a row (multi-resolution)
+  // top-level layout: rank-aware (并联横排) with multi-res input fallback
   const tops = g.nodes.filter(n => !n.parent_id);
-  let i = 0;
-  while (i < tops.length) {
-    if (tops[i].kind === "input") {
-      let j = i;
-      while (j < tops.length && tops[j].kind === "input") j++;
-      if (j - i > 1) {
-        const row = el("div", "row");
-        for (let k = i; k < j; k++) row.appendChild(render(tops[k], childrenOf));
-        col.appendChild(row);
-        i = j; continue;
-      }
-    }
-    col.appendChild(render(tops[i], childrenOf));
-    i++;
-  }
+  layoutInto(col, tops, childrenOf);
   return flow;
 }
 
@@ -437,6 +490,18 @@ def _legend_html() -> str:
         spans.append(
             f'<span><i class="dot" style="background:var(--c-{kind})"></i>'
             f'{html.escape(name)}</span>')
+    # 连边线型说明（与 EDGE_STYLE 对应）。
+    edges = [
+        ("#94a3b8", "solid", "前向 forward"),
+        ("#2563eb", "dashed", "跳连 skip"),
+        ("#d97706", "dashed", "残差 residual"),
+    ]
+    spans.append('<span style="width:1px;height:14px;background:var(--line)">'
+                 '</span>')
+    for color, style, name in edges:
+        spans.append(
+            f'<span><i class="eline" style="border-top-color:{color};'
+            f'border-top-style:{style}"></i>{html.escape(name)}</span>')
     return '<div class="legend">' + "".join(spans) + "</div>"
 
 

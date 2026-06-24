@@ -40,6 +40,8 @@ class VisNode:
     * ``detail``    —— 双击详情抽屉里的完整参数（有序 dict）。
     * ``parent_id`` —— 所属容器节点 id（如 stage）；顶层节点为 ``None``。
     * ``collapsed`` —— 容器默认是否折叠（仅对有子节点的容器有意义）。
+    * ``rank``      —— 同一父容器内的纵向层级（0 起）；同 rank 的兄弟节点横向并排（并联分支），
+      不同 rank 自上而下排列。renderer 据此把并联结构排成一行。
     """
 
     id: str
@@ -49,18 +51,30 @@ class VisNode:
     detail: Dict[str, str] = field(default_factory=dict)
     parent_id: Optional[str] = None
     collapsed: bool = True
+    rank: int = 0
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
 
 
+# 连边语义类别 —— renderer 据此选线型 / 颜色。
+#   forward  —— 主数据流（实线箭头，自上而下）。
+#   residual —— 残差捷径 ``out + shortcut(x)``（弧线侧引，标注 ``+``）。
+#   skip     —— encoder→decoder 跳连 / 长程上下文注入（虚线侧引）。
+EDGE_KINDS = ("forward", "residual", "skip")
+
+
 @dataclass
 class VisEdge:
-    """有向连边：``src → dst``，``label`` 可选（如标注张量形状 / 分支条件）。"""
+    """有向连边：``src → dst``，``label`` 可选（如标注张量形状 / 分支条件）。
+
+    * ``kind`` —— 连边语义类别（见 ``EDGE_KINDS``），决定线型 / 颜色。
+    """
 
     src: str
     dst: str
     label: str = ""
+    kind: str = "forward"
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -88,6 +102,7 @@ class VisGraph:
         detail: Optional[Dict[str, object]] = None,
         parent_id: Optional[str] = None,
         collapsed: bool = True,
+        rank: int = 0,
     ) -> VisNode:
         """新增节点并返回（键值统一转字符串，避免 JSON 序列化歧义）。"""
         node = VisNode(
@@ -98,12 +113,18 @@ class VisGraph:
             detail=_stringify(detail),
             parent_id=parent_id,
             collapsed=collapsed,
+            rank=int(rank),
         )
         self.nodes.append(node)
         return node
 
-    def add_edge(self, src: str, dst: str, label: object = "") -> VisEdge:
-        edge = VisEdge(src=src, dst=dst, label="" if label is None else str(label))
+    def add_edge(
+        self, src: str, dst: str, label: object = "", kind: str = "forward",
+    ) -> VisEdge:
+        edge = VisEdge(
+            src=src, dst=dst,
+            label="" if label is None else str(label),
+            kind=kind)
         self.edges.append(edge)
         return edge
 
@@ -142,4 +163,5 @@ def _fmt_value(v: object) -> str:
     return str(v)
 
 
-__all__ = ["VisNode", "VisEdge", "VisGraph", "NODE_KINDS", "shape_str"]
+__all__ = ["VisNode", "VisEdge", "VisGraph", "NODE_KINDS", "EDGE_KINDS",
+           "shape_str"]
