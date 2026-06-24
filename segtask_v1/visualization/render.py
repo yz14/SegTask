@@ -24,6 +24,13 @@ _CSS = """
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --ink: #1f2430; --muted: #6b7280;
   --line: #c7ccd6; --edge: #94a3b8; --accent: #2563eb;
+  /* 字体栈：无衬线优先现代 UI 字体，逐级回退到系统字体与 CJK；技术令牌
+     （形状元组/类型/ops）走等宽字体并启用等宽数字，使数字纵向对齐更整齐。 */
+  --font-sans: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", SFMono-Regular, ui-monospace,
+    "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
   --c-data: #0e7490; --c-data-bg: #ecfeff;
   --c-process: #b45309; --c-process-bg: #fffbeb;
   --c-input: #4338ca; --c-input-bg: #eef2ff;
@@ -40,17 +47,21 @@ _CSS = """
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg); color: var(--ink); font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
 }
 header {
   background: var(--panel); border-bottom: 1px solid var(--line);
   padding: 12px 20px; position: sticky; top: 0; z-index: 30;
 }
-header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 650; }
+header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 680;
+  letter-spacing: -.01em; }
 .meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted);
-  font-size: 12px; }
+  font-size: 12px; font-variant-numeric: tabular-nums; }
 .meta b { color: var(--ink); font-weight: 600; }
 .tabs { display: flex; gap: 6px; padding: 10px 20px 0; background: var(--bg);
   position: sticky; top: 62px; z-index: 20; }
@@ -84,12 +95,14 @@ svg.edges-top { z-index: 3; }
 }
 .node:hover { box-shadow: 0 2px 10px rgba(37,99,235,.18); }
 .node .title { font-weight: 650; font-size: 12.5px; display: flex;
-  justify-content: space-between; gap: 10px; align-items: baseline; }
+  justify-content: space-between; gap: 10px; align-items: baseline;
+  letter-spacing: -.005em; }
 .node .badge { font-size: 10px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: .04em; opacity: .8; }
+  letter-spacing: .06em; opacity: .8; font-family: var(--font-mono); }
 .node .kv { margin-top: 4px; font-size: 11.5px; color: var(--muted);
-  line-height: 1.5; }
-.node .kv span { color: var(--ink); }
+  line-height: 1.55; }
+.node .kv span { color: var(--ink); font-family: var(--font-mono);
+  font-size: 11px; font-variant-numeric: tabular-nums; }
 .node .hint { position: absolute; right: 8px; bottom: 4px; font-size: 9.5px;
   color: var(--muted); opacity: 0; }
 .node:hover .hint { opacity: .7; }
@@ -106,7 +119,9 @@ svg.edges-top { z-index: 3; }
 .stage > .stage-head .caret { transition: transform .15s; font-size: 11px; }
 .stage > .stage-head.collapsed .caret { transform: rotate(-90deg); }
 .stage > .stage-head .s-kv { color: var(--muted); font-weight: 500;
-  font-size: 11px; margin-left: auto; }
+  font-size: 10.5px; margin-left: auto; font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.stage > .stage-head > span:not(.caret):not(.s-kv) { letter-spacing: -.005em; }
 
 /* row: side-by-side grouping (并联分支 / 多分辨率输入)。**不换行**：并联分支必须
    同处一行，否则会被误读成串联（如 multi-stem 三路输入被拆成两行会让人以为
@@ -163,7 +178,7 @@ svg.edges-top { z-index: 3; }
   border-bottom: 1px solid #eef0f3; }
 .drawer-body td.k { color: var(--muted); white-space: nowrap; width: 42%; }
 .drawer-body td.v { color: var(--ink); word-break: break-word;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .legend { display: flex; flex-wrap: wrap; gap: 10px; padding: 6px 20px 0;
   color: var(--muted); font-size: 11px; }
 .legend .dot { display: inline-block; width: 10px; height: 10px;
