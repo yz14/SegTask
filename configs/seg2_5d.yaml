@@ -178,6 +178,19 @@ model:
 
   drop_path_rate : 0.0
 
+  # ---- 多感受野（空洞卷积多分支融合）MultiRF 示例 ----
+  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合、
+  # axes=hw 只在 H/W 膨胀（肺 CT z 各向异性）。先验证有效再往更多 stage / 解码器铺开。
+  multirf_enabled       : true
+  multirf_dilations     : [1, 2, 3]      # 必须含 1（守门支路）
+  multirf_mode          : "split"        # 'split'(≈等成本) | 'parallel'(≈N×)
+  multirf_fusion        : "concat_proj"  # 'concat_proj' | 'sum'(需 parallel) | 'se'
+  multirf_axes          : "hw"           # 'hw'(保 z, 推荐) | 'all'
+  # 编码器逐 stage（长度=len(encoder_channels)=5；浅→深，末位=bottleneck）。
+  multirf_encoder_stages: [0, 0, 1, 1, 1]
+  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅）。默认关，作为第二轮对照。
+  multirf_decoder_stages: [1, 1, 0, 0]
+
 
 # LOSS — 2.5D 走 SliceChannelLoss 包装; base_loss 在 (B*D,1,H,W) 作为 2D 二值损失
 loss:
