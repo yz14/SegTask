@@ -1,15 +1,9 @@
 data:
   image_suffix: ".nii.gz"
-  label_suffix: "-seg.nii.gz"
   bbox_suffix : "_pred.nii.gz"
-  region_weight_suffix: "-seg.nii.gz"
 
-  image_dir: "/data0/yzhen/data/tx_ves/nii"
-  label_dir: "/data0/yzhen/data/tx_ves/seg_bin"
-  bbox_dir : "/data0/yzhen/data/tx_ves/lung_resnet_bnorm_pred"
-  region_weight_dir : "/data0/yzhen/data/tx_ves/weight"
-
-  npz_dir: "/data0/yzhen/data/tx_ves/npz_data"
+  image_dir: "F:/lung_paired/imgs"
+  bbox_dir : "F:/lung_paired/lung_resnet_bnorm_pred"
 
   label_values: [0, 1]
   num_classes : 2
@@ -135,7 +129,7 @@ model:
 
 
 loss:
-  name: "dice_cldice"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
+  name: "dice_focal"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
   compound_weights: [1.0, 1.0]
 
   class_weights : [1.0]       # 长度 = num_fg_classes (不含 bg)
@@ -189,7 +183,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/ves_resnet_multirf"    ############################################################
+  output_dir      : "outputs/ves_multirf"    ############################################################
   save_every      : 10
   save_best_criterion: ""
   surface_dice_tolerance: 1

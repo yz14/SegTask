@@ -114,9 +114,9 @@ augment:
 
 # MODEL — 2D UNet (spatial_dims=2)
 model:
-  backbone: "convnext"           # 'resnet' | 'convnext'
+  backbone: "resnet"           # 'resnet' | 'convnext'
   encoder_channels: [32, 64, 128, 256, 256]
-  encoder_blocks_per_stage: [3, 3, 9, 3, 3]    # 长度 == len(encoder_channels)
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]    # 长度 == len(encoder_channels)
   decoder_blocks_per_stage: [2, 2, 2, 2]       # 长度 == len(encoder_channels) - 1
   # 'basic'(默认) | 'preact' | 'bottleneck' | 'r2plus1d'(需 lift_2_5d_to_3d=true)
   block_type: "basic"
@@ -133,16 +133,16 @@ model:
   # decoder skip 投影 / aux head。'group' 相较 'instance':
   #   (1) 保留组内通道相对响应 → 避免 2.5D 折叠下 stem 把每张切片独立标准化；
   #   (2) 不抹掉绝对强度尺度 → 与 region_weight 中按 HU 加权的设计兼容更好。
-  norm_type  : "group"
+  norm_type  : "batch"
   norm_groups: 8
   activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
   dropout    : 0.0
 
-  use_se        : true    # SE attn
+  use_se        : false    # SE attn
   attention_type: "none"
   skip_attention: false
 
-  deep_supervision: false
+  deep_supervision: true
 
   # 'conv3'(单层 3×3) | 'conv7'(单层 7×7) | 'dual'(两层 3×3, nnU-Net 默认) |
   # 'patch2'/'patch4'(stride-N PatchEmbed, ConvNeXt/ViT 风格)
@@ -209,7 +209,7 @@ loss:
 
 
 train:
-  epochs: 100
+  epochs: 1
 
   optimizer   : "adamw"
   lr          : 1.0e-3
@@ -232,7 +232,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/lung_bone_convnext"
+  output_dir      : "outputs/base"
   save_every      : 10
 
   # ===== 选模标准（挑 best_model.pth 的依据）=====
@@ -312,7 +312,7 @@ predict:
 # 默认关闭、零开销；打开后训练启动时导出到 train.output_dir/visualization/。
 # CPU dummy 张量推导，不读盘、不依赖 GPU/真实数据。详见 README §3.9。
 vis:
-  enabled          : false                 # 设 true 即生成 HTML
+  enabled          : true                 # 设 true 即生成 HTML
   output_dir       : ""                    # 空 => train.output_dir/visualization/
   filename         : "pipeline_vis.html"
   flows            : ["data", "model", "predict"]   # 视图子集 + 标签页顺序
