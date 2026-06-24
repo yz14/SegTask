@@ -391,7 +391,7 @@ function drawEdges() {
   ["R", "L"].forEach(side => {
     const grp = items.filter(it => it.band === side);
     grp.sort((p, q) => Math.abs(p.yt2 - p.yb1) - Math.abs(q.yt2 - q.yb1));
-    grp.forEach((it, i) => { it.lane = i; });
+    grp.forEach((it, i) => { it.lane = i; it.laneN = grp.length; });
   });
   let maxX = contentR;
 
@@ -400,18 +400,31 @@ function drawEdges() {
     const style = EDGE_STYLE[kind] || EDGE_STYLE.forward;
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     let d, lx, ly;
-    if (it.band === "R" || it.band === "L") {
-      // 从两端框侧沿引出，绕到内容外缘的车道线（右/左）再折回，全程在框外。
-      const right = it.band === "R";
-      const x1 = (right ? ra.right : ra.left) - cr.left;
-      const x2 = (right ? rb.right : rb.left) - cr.left;
+    if (it.band === "R") {
+      // encoder→decoder 跳连：从两框右缘引出，绕到内容右外缘的同心车道再折回，
+      // 跨度最大者最外圈，平滑嵌套不交叉，全程在框右侧之外。
+      const x1 = ra.right - cr.left, x2 = rb.right - cr.left;
       const y1 = ra.top + ra.height / 2 - cr.top;
       const y2 = rb.top + rb.height / 2 - cr.top;
-      const sx = right ? (contentR + GAP + it.lane * STEP)
-                       : Math.max(8, contentL - GAP - it.lane * STEP);
+      const sx = contentR + GAP + it.lane * STEP;
       maxX = Math.max(maxX, sx);
       d = `M ${x1} ${y1} C ${sx} ${y1}, ${sx} ${y2}, ${x2} ${y2}`;
-      lx = right ? sx + 4 : sx - 4; ly = (y1 + y2) / 2;
+      lx = sx + 4; ly = (y1 + y2) / 2;
+    } else if (it.band === "L") {
+      // deep-supervision 头 → loss：正交走线（贴最左竖轨）。loss 居中、其左缘紧邻
+      // Seg Head(main) 右缘，平滑弧会回弯穿过 seg head 框；故改为：左行到最左竖轨
+      // → 竖直下行 → 在 seg/aux 头行**下方**水平进入 loss 左缘，彻底避开各框。
+      const x1 = ra.left - cr.left;
+      const y1 = ra.top + ra.height / 2 - cr.top;
+      const x2 = rb.left - cr.left;
+      const lossTop = rb.top - cr.top, lossH = rb.height;
+      const railX = Math.max(8, contentL - GAP - it.lane * STEP);
+      const spread = Math.min(8, (lossH - 8) / Math.max(1, it.laneN));
+      const ey = lossTop + lossH / 2 + (it.lane - (it.laneN - 1) / 2) * spread;
+      const r = Math.min(7, Math.max(0, (ey - y1) / 2 - 1));
+      d = `M ${x1} ${y1} L ${railX + r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + r} `
+        + `L ${railX} ${ey - r} Q ${railX} ${ey} ${railX + r} ${ey} L ${x2} ${ey}`;
+      lx = railX - 4; ly = (y1 + ey) / 2;
     } else if (kind === "residual" || yt2 < yb1 - 2) {
       // 残差捷径 / 回流：就近的局部右侧小弧（不进外缘车道）。
       const off = 44 + Math.abs(cx2 - cx1) * 0.12 + (kind === "residual" ? 16 : 0);
