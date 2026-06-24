@@ -379,7 +379,10 @@ class UNet3D(nn.Module):
             # 特征较粗，先 3×3 局部精修再分类；主头特征最精细故 1×1 足矣。
             for ch in reversed(decoder.out_channels[:-1]):
                 self.ds_heads.append(
-                    ConvSegmentationHead(ch, self.out_channels, spatial_dims=spatial_dims))
+                    ConvSegmentationHead(
+                        ch, self.out_channels, spatial_dims=spatial_dims,
+                        norm_type=norm_type, norm_groups=norm_groups,
+                        activation=activation))
 
         # Aux 头镜像 stem 拓扑：Plan A (shared_stem/multi_stem_proj) 全部读 dec[-1]；
         # Plan C (hierarchical) aux k 读 dec[-1-k]（对齐 view k 注入的 encoder 深度）。aux 上采到 main 尺寸。
