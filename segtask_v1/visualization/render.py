@@ -431,20 +431,18 @@ function drawEdges() {
         + `L ${railX} ${ey - r} Q ${railX} ${ey} ${railX + r} ${ey} L ${x2} ${ey}`;
       lx = railX - 4; ly = (y1 + ey) / 2;
     } else if (kind === "residual") {
-      // 残差捷径（block 内 shortcut → act2）：走该 block 的左侧空白栏（gutter）正交下行。
-      // 边层绘制在子框之下，block 内子框密排会把斜跨的弧线整条遮住（看不到残差线）；
-      // 故从 shortcut 左缘引出 → 贴最左框之左的竖轨下行 → 在目标行水平进入其左缘，
-      // 全程位于子框之外的清空区，无论层叠次序都可见。
-      const ax1 = ra.left - cr.left;
-      const y1 = ra.top + ra.height / 2 - cr.top;
+      // 残差捷径（block 内 shortcut → act2）：从 shortcut 底缘引出，沿子框列左侧的空白栏
+      // 竖直下行，再水平进入目标左缘。竖轨落在「block 左边框」与「子框列」之间的空隙里
+      // （取 子框左缘-30，并夹在 shortcut 宽度内），既不压住 block 的灰色虚线边框、
+      // 也不压住子框；本边由 svgTop 顶层绘制，保证可见。
+      const aL = ra.left - cr.left, aR = ra.right - cr.left, aB = ra.bottom - cr.top;
       const x2 = rb.left - cr.left;
       const y2 = rb.top + rb.height / 2 - cr.top;
-      const railX = Math.max(2, Math.min(ax1, x2) - 14);
-      const dn = y2 >= y1 ? 1 : -1;
-      const r = Math.min(7, Math.max(0, Math.abs(y2 - y1) / 2 - 1));
-      d = `M ${ax1} ${y1} L ${railX + r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + dn * r} `
-        + `L ${railX} ${y2 - dn * r} Q ${railX} ${y2} ${railX + r} ${y2} L ${x2} ${y2}`;
-      lx = railX - 4; ly = (y1 + y2) / 2;
+      let railX = Math.max(aL + 10, x2 - 30);
+      railX = Math.min(railX, aR - 10, x2 - 10);
+      const r = Math.min(7, Math.max(0, (y2 - aB) / 2 - 1));
+      d = `M ${railX} ${aB} L ${railX} ${y2 - r} Q ${railX} ${y2} ${railX + r} ${y2} L ${x2} ${y2}`;
+      lx = railX - 4; ly = (aB + y2) / 2;
     } else if (yt2 < yb1 - 2) {
       // 回流（上行反馈）：就近的局部右侧小弧（不进外缘车道）。
       const off = 44 + Math.abs(cx2 - cx1) * 0.12;
