@@ -731,21 +731,46 @@ def _emit(b: _ModelGraphBuilder, cfg: Config) -> None:
     _assign_ranks_and_skip(b, backbone, heads)
 
 
+def _called_direct_children(
+    b: _ModelGraphBuilder, key: str,
+) -> List[_ModuleRec]:
+    """``key`` 的**直接子模块**中真正被前向调用过（有 order/形状）的那些，按执行序排序。
+    ``nn.ModuleList`` 这类容器自身不被调用（无形状），但其子 block 会被逐个调用并记录到
+    经过内部 functional reshape 之后的真实 in/out——比最深叶子更能代表容器的对外形状。"""
+    pre = key + "."
+    kids: List[_ModuleRec] = []
+    for nm, r in b.recs.items():
+        if nm.startswith(pre) and "." not in nm[len(pre):] and r.order >= 0:
+            kids.append(r)
+    kids.sort(key=lambda r: r.order)
+    return kids
+
+
 def _container_io(
     b: _ModelGraphBuilder, key: str, members: Sequence[_ModuleRec],
 ) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]]]:
-    """容器/block 的 in/out 形状：**优先取容器模块自身**被直接调用时记录的真实
-    in/out，再退化到成员叶子。容器内常有 functional 上/下采样（如
-    ``F.interpolate``、``cat``）不产生 module——若仅看叶子形状，会把"上采样框"显示成
-    输入输出同分辨率（采样发生在 functional 算子里、叶子只看到采样后的张量），从而
-    看不出分辨率变化。读容器模块自身的输入/输出即可还原真实的空间尺度变化。"""
+    """容器/block 的 in/out 形状，按可信度逐级回退：
+    ① **容器模块自身**被直接调用时记录的真实 in/out（如上采样容器 ``_Upsample`` 内含
+       ``F.interpolate`` 这类 functional 算子，只有读容器自身才看得出分辨率变化）；
+    ② 容器自身未被直接调用（如 ``nn.ModuleList`` 的 levels）时，取其**直接子模块**记录的
+       in/out——子 block 的形状已包含其内部 functional reshape 的还原（如注意力块内把
+       ``(B,C,H,W)`` 摊平成 ``(B,C,H·W)`` 做 ``Conv1d`` 再 reshape 回去，最深叶子 ``proj_out``
+       只看到摊平后的 ``(B,C,H·W)``，而子 block 自身的 out 已是 reshape 回来的 ``(B,C,H,W)``）；
+    ③ 最后才退化到最深成员叶子。"""
     crec = b.recs.get(key)
     ins = [r.in_shape for r in members if r.in_shape]
     outs = [r.out_shape for r in members if r.out_shape]
-    in_sh = (crec.in_shape if crec and crec.in_shape
-             else (ins[0] if ins else None))
-    out_sh = (crec.out_shape if crec and crec.out_shape
-              else (outs[-1] if outs else None))
+    in_sh = crec.in_shape if crec and crec.in_shape else None
+    out_sh = crec.out_shape if crec and crec.out_shape else None
+    if in_sh is None or out_sh is None:
+        kids = _called_direct_children(b, key)
+        if in_sh is None:
+            kin = next((r.in_shape for r in kids if r.in_shape), None)
+            in_sh = kin if kin is not None else (ins[0] if ins else None)
+        if out_sh is None:
+            kout = next(
+                (r.out_shape for r in reversed(kids) if r.out_shape), None)
+            out_sh = kout if kout is not None else (outs[-1] if outs else None)
     return in_sh, out_sh
 
 
