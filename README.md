@@ -115,9 +115,16 @@ SegTask/
 │   │   ├── unet3p.py                  # UNet3+ 全尺度跳连 decoder
 │   │   ├── topology.py                # ModelTopology + build_topology（R5 引入）：派生量单一真相源
 │   │   └── factory.py                 # 从 Config 装配 Encoder/Decoder/UNet3D（读 topology）
-│   └── losses/                        # 损失函数（§3.6）
-│       ├── __init__.py
-│       └── losses.py                  # ~1270 行：基础 loss × wrapper × build_loss 工厂
+│   ├── losses/                        # 损失函数（§3.6）
+│   │   ├── __init__.py
+│   │   └── losses.py                  # ~1270 行：基础 loss × wrapper × build_loss 工厂
+│   └── visualization/                 # 全流程可视化分析工具（§3.7，vis.enabled 守卫）
+│       ├── __init__.py                # generate_visualization 入口：构建三视图 → 自包含 HTML
+│       ├── graph.py                   # IR：VisNode / VisEdge / VisGraph（与渲染解耦）
+│       ├── render.py                  # 渲染器：IR → 零依赖自包含 HTML（三标签页）
+│       ├── data_flow.py               # 数据流 builder（npz → 取块 → 增强 → 裁剪 → 模型输入）
+│       ├── model_flow.py              # 模型流 builder（CPU dummy 前向 + hook 追踪真实形状）
+│       └── predict_flow.py            # 预测流 builder（预处理 → 滑窗/TTA → 模型 → 融合 → 输出）
 │
 ├── tools/                             # 数据集体检脚本（§5）
 │   ├── scan_bad_nifti.py              # 扫描 SimpleITK 读不开的非正交 NIfTI
@@ -564,6 +571,36 @@ run_inference(cfg, ckpt_path, image_paths, weight_variant, bbox_paths, precision
 - 假设 channel 排序：前 `num_fg` 个 1× 分辨率通道严格对齐 `cfg.data.label_values[1:]`，在构造和每 batch 都 assert。
 - 几何一致 —— `z_boundary_mode`、`multi_res_scales`、`keep_native_multi_res` 等所有训练侧 toggle 都被 Predictor 镜像消费，避免训练-推理几何错位。
 - 输出 —— 保留原 NIfTI 的 affine / origin / spacing / direction；`--save-probs` 额外保存 per-class sigmoid 概率图。
+
+---
+
+### 3.9 `visualization/` —— 全流程可视化分析工具
+
+把「数据流 / 模型流 / 预测流」三视图导出为一份**自包含 HTML**（零外部依赖、可离线打开），用于人工核对"数据如何一步步变成模型输入、模型架构是否符合 yaml、推理用法是否与训练一致"。生成过程仅用 CPU dummy 张量，**不读盘、不依赖 GPU 与真实数据**，对训练零侵入。
+
+```text
+visualization/
+├── graph.py         # IR：VisNode / VisEdge / VisGraph（与渲染解耦，改流程只动 builder）
+├── render.py        # 渲染器：IR → 自包含 HTML（CSS/JS 内嵌，三标签页 + 可折叠 stage + 双击详情）
+├── data_flow.py     # 数据流：npz → Dataset 取块 → GPU 增强 → 中心裁剪 → 视图重塑 → 模型输入（静态推导形状）
+├── model_flow.py    # 模型流：CPU dummy 前向 + hook 采集每个叶子真实形状；按 stage 聚合；末端损失节点
+├── predict_flow.py  # 预测流：预处理 → 滑窗/TTA → 模型(抽象单框) → 融合 → 阈值 → 输出
+└── __init__.py      # generate_visualization(cfg, model) → 写出 HTML，返回路径
+```
+
+启用方式（默认关闭，零开销）：在 YAML 里打开开关，训练启动时（`train.py` 一处守卫调用）自动导出。
+
+```yaml
+vis:
+  enabled: true            # 总开关；false 时完全跳过
+  output_dir: ""           # 空 → 落到 train.output_dir/visualization/
+  filename: "pipeline_vis.html"
+  flows: [data, model, predict]   # 生成哪些视图，顺序即标签页顺序
+  trace_shapes: true       # 模型流是否 dummy 前向追踪真实形状；false → 纯结构图
+  max_detail_params: 200   # 单节点详情面板最多条数（防爆）
+```
+
+HTML 交互：顶部标签页切换三视图；纵向流式布局 + 箭头表流向；stage 大框可点击折叠/展开内部算子；任意节点**双击**弹出详情抽屉（完整参数 / 形状 / 模块路径）。模型流的形状追踪若失败会优雅降级为纯结构图，不影响其余视图。
 
 ---
 

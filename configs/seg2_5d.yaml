@@ -306,3 +306,15 @@ predict:
   threshold     : 0.5
   output_dir: ""
   save_probabilities: false
+
+
+# VIS — 全流程可视化（数据流 / 模型流 / 预测流 → 自包含 HTML）。
+# 默认关闭、零开销；打开后训练启动时导出到 train.output_dir/visualization/。
+# CPU dummy 张量推导，不读盘、不依赖 GPU/真实数据。详见 README §3.9。
+vis:
+  enabled          : false                 # 设 true 即生成 HTML
+  output_dir       : ""                    # 空 => train.output_dir/visualization/
+  filename         : "pipeline_vis.html"
+  flows            : ["data", "model", "predict"]   # 视图子集 + 标签页顺序
+  trace_shapes     : true                  # 模型流 dummy 前向追踪真实形状
+  max_detail_params: 200                   # 单节点详情最多条数
