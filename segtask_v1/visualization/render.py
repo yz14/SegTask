@@ -172,10 +172,11 @@ _JS = r"""
 const DATA = __DATA__;
 const KINDS = ["data","process","input","conv","norm","act","op","head",
   "output","loss","model"];
-// 连边线型/配色：forward 主流（实线灰）、skip 跳连（蓝虚线）、residual 残差（琥珀虚线）。
+// 连边线型/配色：forward 主流（实线灰）、skip 跳连（实线蓝，走侧缘嵌套车道）、
+// residual 残差（琥珀虚线，就近局部弧）。
 const EDGE_STYLE = {
   forward:  { color: "#94a3b8", width: "1.6", dash: null,  marker: "arrow" },
-  skip:     { color: "#2563eb", width: "1.8", dash: "6 4", marker: "arrow-skip" },
+  skip:     { color: "#2563eb", width: "1.8", dash: null,  marker: "arrow-skip" },
   residual: { color: "#d97706", width: "1.8", dash: "3 3", marker: "arrow-res" },
 };
 
@@ -246,7 +247,11 @@ function layoutInto(container, nodes, childrenOf) {
       while (j < arr.length && (arr[j].rank || 0) === (arr[i].rank || 0)) j++;
       if (j - i > 1) {
         const row = el("div", "row");
-        for (let k = i; k < j; k++) row.appendChild(render(arr[k], childrenOf));
+        // 同行内 head（如 deep-supervision 头）靠左摆，使其对应 decoder level 的
+        // 右侧边留出给 encoder→decoder 跳连进框（不被旁分支遮挡）。
+        const seg = arr.slice(i, j).sort((a, b) =>
+          (a.kind === "head" ? 0 : 1) - (b.kind === "head" ? 0 : 1));
+        for (const nd of seg) row.appendChild(render(nd, childrenOf));
         container.appendChild(row);
       } else {
         container.appendChild(render(arr[i], childrenOf));
@@ -340,36 +345,88 @@ function drawEdges() {
   const canvas = flow.querySelector(".canvas");
   svg.innerHTML = svgDefs();
   const cr = canvas.getBoundingClientRect();
-  const edges = DATA.flows[flow.dataset.flow].edges || [];
+  const g = DATA.flows[flow.dataset.flow] || {};
+  const edges = g.edges || [];
+  const topIds = new Set((g.nodes || [])
+    .filter(n => !n.parent_id).map(n => n.id));
   const seen = new Set();
+
+  // 内容横向边界（所有可见框的并集）：外缘车道据此排到所有框之外，杜绝压框。
+  let contentL = Infinity, contentR = -Infinity;
+  flow.querySelectorAll(".node, .stage").forEach(elx => {
+    const r = elx.getBoundingClientRect();
+    if (r.width === 0) return;
+    contentL = Math.min(contentL, r.left - cr.left);
+    contentR = Math.max(contentR, r.right - cr.left);
+  });
+  if (!isFinite(contentL)) { contentL = 0; contentR = canvas.scrollWidth; }
+
+  // 预解析每条边的几何 + 去重 + 归入侧边车道。
+  //  band 'R'：顶层 encoder→decoder 跳连（同心嵌套环，最长跨度最外圈）。
+  //  band 'L'：顶层 head→loss 汇聚束（ds 头上移后其 loss 边变长，单列左侧避免压框）。
+  const items = [];
   edges.forEach(ed => {
     const a = visibleAnchor(ed.src), b = visibleAnchor(ed.dst);
     if (!a || !b || a === b) return;
     const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-    const x1 = ra.left + ra.width / 2 - cr.left, y1 = ra.bottom - cr.top;
-    const x2 = rb.left + rb.width / 2 - cr.left, y2 = rb.top - cr.top;
-    // skip duplicate visual edges (after collapse multiple may coincide)
-    const key = Math.round(x1) + "," + Math.round(y1) + ">" +
-                Math.round(x2) + "," + Math.round(y2);
-    if (seen.has(key)) return; seen.add(key);
+    const cx1 = ra.left + ra.width / 2 - cr.left, yb1 = ra.bottom - cr.top;
+    const cx2 = rb.left + rb.width / 2 - cr.left, yt2 = rb.top - cr.top;
     const kind = ed.kind || "forward";
-    const down = y2 >= y1 - 2;
-    // forward & adjacent → vertical bezier; residual / skip / backward → side arc
-    const side = (kind === "skip" || kind === "residual" || !down);
+    const key = Math.round(cx1) + "," + Math.round(yb1) + ">" +
+                Math.round(cx2) + "," + Math.round(yt2) + ">" + kind;
+    if (seen.has(key)) return; seen.add(key);
+    let band = null;
+    if (topIds.has(ed.src) && topIds.has(ed.dst)) {
+      // 仅把"跨多行"的 head→loss（deep-supervision 头）引到左侧外缘束；
+      // 与 loss 相邻的 seg/aux 头照常竖向短接，避免无谓绕到最左、标签挤叠。
+      if (ed.dst === "loss") { if (yt2 - yb1 > 70) band = "L"; }
+      else if (kind === "skip") band = "R";
+    }
+    items.push({ ed, ra, rb, cx1, yb1, cx2, yt2, kind, band });
+  });
+
+  // 车道分配：同侧按纵向跨度升序 → 跨度最大者拿最高车道（最外圈），
+  // 从而嵌套区间同心不交叉（如 enc0→dec3 包含 enc1→dec2）。
+  const STEP = 22, GAP = 26;
+  ["R", "L"].forEach(side => {
+    const grp = items.filter(it => it.band === side);
+    grp.sort((p, q) => Math.abs(p.yt2 - p.yb1) - Math.abs(q.yt2 - q.yb1));
+    grp.forEach((it, i) => { it.lane = i; });
+  });
+  let maxX = contentR;
+
+  items.forEach(it => {
+    const { ed, ra, rb, cx1, yb1, cx2, yt2, kind } = it;
     const style = EDGE_STYLE[kind] || EDGE_STYLE.forward;
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     let d, lx, ly;
-    if (!side) {
-      const my = (y1 + y2) / 2;
-      d = `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
-      lx = (x1 + x2) / 2 + 6; ly = my - 2;
-    } else {
-      const off = 44 + Math.abs(x2 - x1) * 0.12 + (kind === "skip" ? 30 : 0);
-      const sx = Math.max(x1, x2) + off;
-      const ya = down ? y1 : (y1 - ra.height / 2);
-      const yb = down ? y2 : (y2 + rb.height / 2);
-      d = `M ${x1} ${ya} C ${sx} ${ya}, ${sx} ${yb}, ${x2} ${yb}`;
+    if (it.band === "R" || it.band === "L") {
+      // 从两端框侧沿引出，绕到内容外缘的车道线（右/左）再折回，全程在框外。
+      const right = it.band === "R";
+      const x1 = (right ? ra.right : ra.left) - cr.left;
+      const x2 = (right ? rb.right : rb.left) - cr.left;
+      const y1 = ra.top + ra.height / 2 - cr.top;
+      const y2 = rb.top + rb.height / 2 - cr.top;
+      const sx = right ? (contentR + GAP + it.lane * STEP)
+                       : Math.max(8, contentL - GAP - it.lane * STEP);
+      maxX = Math.max(maxX, sx);
+      d = `M ${x1} ${y1} C ${sx} ${y1}, ${sx} ${y2}, ${x2} ${y2}`;
+      lx = right ? sx + 4 : sx - 4; ly = (y1 + y2) / 2;
+    } else if (kind === "residual" || yt2 < yb1 - 2) {
+      // 残差捷径 / 回流：就近的局部右侧小弧（不进外缘车道）。
+      const off = 44 + Math.abs(cx2 - cx1) * 0.12 + (kind === "residual" ? 16 : 0);
+      const sx = Math.max(cx1, cx2) + off;
+      maxX = Math.max(maxX, sx);
+      const up = yt2 < yb1 - 2;
+      const ya = up ? (yb1 - ra.height / 2) : yb1;
+      const yb = up ? (yt2 + rb.height / 2) : yt2;
+      d = `M ${cx1} ${ya} C ${sx} ${ya}, ${sx} ${yb}, ${cx2} ${yb}`;
       lx = sx + 4; ly = (ya + yb) / 2;
+    } else {
+      // 前向相邻：竖向贝塞尔。
+      const my = (yb1 + yt2) / 2;
+      d = `M ${cx1} ${yb1} C ${cx1} ${my}, ${cx2} ${my}, ${cx2} ${yt2}`;
+      lx = (cx1 + cx2) / 2 + 6; ly = my - 2;
     }
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
@@ -385,12 +442,13 @@ function drawEdges() {
       tx.setAttribute("fill", style.color);
       tx.setAttribute("font-size", "10.5");
       tx.setAttribute("font-weight", kind === "forward" ? "400" : "700");
+      if (it.band === "L") tx.setAttribute("text-anchor", "end");
       tx.textContent = ed.label;
       svg.appendChild(tx);
     }
   });
-  // size svg to canvas
-  svg.setAttribute("width", canvas.scrollWidth);
+  // size svg to canvas（含外缘车道）
+  svg.setAttribute("width", Math.max(canvas.scrollWidth, maxX + 12));
   svg.setAttribute("height", canvas.scrollHeight);
 }
 function marker(id, color) {
@@ -493,7 +551,7 @@ def _legend_html() -> str:
     # 连边线型说明（与 EDGE_STYLE 对应）。
     edges = [
         ("#94a3b8", "solid", "前向 forward"),
-        ("#2563eb", "dashed", "跳连 skip"),
+        ("#2563eb", "solid", "跳连 skip（侧缘嵌套）"),
         ("#d97706", "dashed", "残差 residual"),
     ]
     spans.append('<span style="width:1px;height:14px;background:var(--line)">'

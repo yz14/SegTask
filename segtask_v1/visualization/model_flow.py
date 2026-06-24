@@ -905,13 +905,20 @@ def _assign_ranks_and_skip(
                     queue.append(nx)
         node_rank.update(rank)
 
-    # 顶层：heads 并排到同一行、loss 殿后。
+    # 顶层 head 分层：
+    #   * 主输出头（seg_head / aux_heads）从最后一个 decoder level 分叉，拍到同一末行；
+    #   * deep-supervision 头（ds_heads.*）保留最长路径自然层级，从而与其分叉来源
+    #     decoder level 的下一层**并列一行**（dec_k 同时发出 →dec_{k+1} 与 →ds_k），
+    #     避免硬拍到底排后再拉长线自上而下穿过解码器框。loss 殿后。
     if heads:
-        head_rank = max((node_rank.get(h, 0) for h in heads), default=0)
-        for h in heads:
-            node_rank[h] = head_rank
+        final_heads = [h for h in heads if not h.startswith("ds_heads.")]
+        if final_heads:
+            fr = max((node_rank.get(h, 0) for h in final_heads), default=0)
+            for h in final_heads:
+                node_rank[h] = fr
         if "loss" in node_rank:
-            node_rank["loss"] = head_rank + 1
+            node_rank["loss"] = max(
+                (node_rank.get(h, 0) for h in heads), default=0) + 1
     # 应用 rank。
     rankmap = {n.id: node_rank.get(n.id, 0) for n in g.nodes}
     for n in g.nodes:
