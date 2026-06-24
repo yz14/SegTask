@@ -484,23 +484,78 @@ def _trace_modules(
 # ---------------------------------------------------------------------------
 # 损失节点
 # ---------------------------------------------------------------------------
-def _loss_node_detail(cfg: Config) -> Dict[str, object]:
-    detail: Dict[str, object] = {
-        "loss.name": cfg.loss.name,
-        "deep_supervision": bool(cfg.model.deep_supervision),
-        "aux_seg_supervision": bool(cfg.model.aux_seg_supervision),
-        "aux_topo_head": bool(getattr(cfg.model, "aux_topo_head", False)),
-    }
+# 各损失分量 → 其真正消费的关键超参字段（顺序即展示顺序）。与 losses.factory 的
+# 各 ``_build_*`` 构造器逐一对应；详情抽屉据此只展示与当前损失相关的参数。
+_LOSS_COMPONENT_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "dice":          ("dice_smooth", "dice_squared", "batch_dice", "ignore_empty"),
+    "bce":           (),
+    "focal":         ("focal_alpha", "focal_gamma"),
+    "tversky":       ("tversky_alpha", "tversky_beta", "dice_smooth", "batch_dice"),
+    "gdl":           ("gdl_weight_type", "gdl_w_max", "dice_smooth", "batch_dice"),
+    "focal_tversky": ("tversky_alpha", "tversky_beta", "focal_tversky_gamma",
+                      "dice_smooth", "batch_dice"),
+    "lovasz":        ("lovasz_per_sample",),
+    "cldice":        ("cldice_iter", "cldice_smooth"),
+}
+
+
+def _loss_components(name: str) -> List[str]:
+    """损失名 → 分量名列表（单一或复合）。从 losses.factory 反推，缺失则空。"""
     try:
-        from ..losses.losses import build_loss
-        from ..trainer.pipelines.factory import build_pipeline
-        pipe = build_pipeline(cfg, build_loss(cfg.loss))
-        detail["pipeline"] = type(pipe).__name__
-        detail["criterion"] = type(getattr(pipe, "criterion", "")).__name__
-        if getattr(pipe, "aux_weights", None):
-            detail["aux_weights"] = list(pipe.aux_weights)
-    except Exception as e:  # pipeline 构造失败仅缺补充信息，不致命
-        logger.debug("model_flow: loss 详情 pipeline 构造失败: %s", e)
+        from ..losses.losses import _COMPOUND_BUILDERS, _SINGLE_BUILDERS
+    except Exception:  # pragma: no cover - 仅日志
+        return []
+    pfx, nm = "_build_", name.lower()
+    if nm in _SINGLE_BUILDERS:
+        return [_SINGLE_BUILDERS[nm].__name__[len(pfx):]]
+    if nm in _COMPOUND_BUILDERS:
+        return [b.__name__[len(pfx):] for b in _COMPOUND_BUILDERS[nm]]
+    return []
+
+
+def _fmt_num(v: object) -> object:
+    """浮点统一保留有效位，避免 1.3333333333 这类长尾。"""
+    return round(v, 6) if isinstance(v, float) else v
+
+
+def _loss_node_detail(cfg: Config) -> Dict[str, object]:
+    """损失节点详情：展示**该损失实际使用的超参**（dice 平滑、focal α/γ、复合权重、
+    深监督权重等），而非 pipeline/criterion 等与损失数值无关的元信息。"""
+    lc = cfg.loss
+    comps = _loss_components(lc.name)
+    detail: Dict[str, object] = {"loss": lc.name}
+    if comps:
+        detail["components"] = " + ".join(comps)
+        if len(comps) > 1:  # 复合损失：各分量相对权重
+            try:
+                from ..losses.losses import _compound_weights
+                ws = _compound_weights(lc, len(comps))
+            except Exception:  # pragma: no cover
+                ws = list(getattr(lc, "compound_weights", []) or [])[:len(comps)]
+            if ws:
+                detail["compound_weights"] = ", ".join(
+                    f"{c}={_fmt_num(w)}" for c, w in zip(comps, ws))
+        seen: Set[str] = set()
+        for c in comps:                  # 仅展示相关分量的关键超参（去重保序）
+            for field in _LOSS_COMPONENT_FIELDS.get(c, ()):
+                if field in seen or not hasattr(lc, field):
+                    continue
+                seen.add(field)
+                detail[field] = _fmt_num(getattr(lc, field))
+    if getattr(lc, "class_weights", None):
+        detail["class_weights"] = list(lc.class_weights)
+    # 监督结构相关的权重（仅在开启时展示）。
+    if cfg.model.deep_supervision:
+        detail["deep_supervision"] = True
+        if getattr(lc, "deep_supervision_weights", None):
+            detail["deep_supervision_weights"] = list(lc.deep_supervision_weights)
+    if cfg.model.aux_seg_supervision:
+        detail["aux_seg_supervision"] = True
+        if getattr(lc, "aux_supervision_weights", None):
+            detail["aux_supervision_weights"] = list(lc.aux_supervision_weights)
+    if getattr(cfg.model, "aux_topo_head", False):
+        detail["aux_topo_head"] = True
+        detail["aux_topo_weight"] = _fmt_num(getattr(lc, "aux_topo_weight", 0.0))
     return detail
 
 
@@ -676,6 +731,24 @@ def _emit(b: _ModelGraphBuilder, cfg: Config) -> None:
     _assign_ranks_and_skip(b, backbone, heads)
 
 
+def _container_io(
+    b: _ModelGraphBuilder, key: str, members: Sequence[_ModuleRec],
+) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]]]:
+    """容器/block 的 in/out 形状：**优先取容器模块自身**被直接调用时记录的真实
+    in/out，再退化到成员叶子。容器内常有 functional 上/下采样（如
+    ``F.interpolate``、``cat``）不产生 module——若仅看叶子形状，会把"上采样框"显示成
+    输入输出同分辨率（采样发生在 functional 算子里、叶子只看到采样后的张量），从而
+    看不出分辨率变化。读容器模块自身的输入/输出即可还原真实的空间尺度变化。"""
+    crec = b.recs.get(key)
+    ins = [r.in_shape for r in members if r.in_shape]
+    outs = [r.out_shape for r in members if r.out_shape]
+    in_sh = (crec.in_shape if crec and crec.in_shape
+             else (ins[0] if ins else None))
+    out_sh = (crec.out_shape if crec and crec.out_shape
+              else (outs[-1] if outs else None))
+    return in_sh, out_sh
+
+
 def _emit_top(b: _ModelGraphBuilder, key: str) -> None:
     """发射一个顶层容器，及其内部 block / 叶子节点与容器内连边。"""
     g = b.g
@@ -683,13 +756,12 @@ def _emit_top(b: _ModelGraphBuilder, key: str) -> None:
                   key=lambda r: r.order if r.order >= 0 else 1 << 30)
     kind = "head" if _is_head(key) else "stage"
 
-    ins = [r.in_shape for r in recs if r.in_shape]
-    outs = [r.out_shape for r in recs if r.out_shape]
+    in_sh, out_sh = _container_io(b, key, recs)
     s_key: Dict[str, object] = {"ops": str(len(recs))}
-    if ins:
-        s_key["in"] = shape_str(ins[0])
-    if outs:
-        s_key["out"] = shape_str(outs[-1])
+    if in_sh:
+        s_key["in"] = shape_str(in_sh)
+    if out_sh:
+        s_key["out"] = shape_str(out_sh)
     g.add_node(key, _top_label(key), kind=kind, key_info=s_key, collapsed=True)
 
     # 容器内按 block 分组。
@@ -721,9 +793,11 @@ def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
     members = sorted(members, key=lambda r: r.order if r.order >= 0 else 1 << 30)
     mod = b.recs[block_key].module if block_key in b.recs else members[0].module
     ki: Dict[str, object] = {"type": type(mod).__name__}
-    outs = [r.out_shape for r in members if r.out_shape]
-    if outs:
-        ki["out"] = shape_str(outs[-1])
+    in_sh, out_sh = _container_io(b, block_key, members)
+    if in_sh:
+        ki["in"] = shape_str(in_sh)
+    if out_sh:
+        ki["out"] = shape_str(out_sh)
     residual = _has_residual(mod, b.residual_types)
     if residual:
         ki["skip"] = "residual (+)"
@@ -760,7 +834,12 @@ def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
             if cid == out_leaf:
                 continue
             if cid in shortcut_ids:
-                b._add_edge(cid, out_leaf, "+", kind="residual")
+                # 仅 shortcut 的**末叶**接入残差加法：当 shortcut 为
+                # ``Sequential(conv, norm)`` 时，conv→norm 已由块内前向边连好，
+                # 只有 norm（其输出）参与 ``act(out + shortcut(x))``；不可让中间的
+                # conv 也直连 act（否则一条捷径会画出两条入边）。
+                if cid not in has_succ:
+                    b._add_edge(cid, out_leaf, "+", kind="residual")
             elif cid not in has_succ:        # 悬空主路末端 → 输出叶子
                 b._add_edge(cid, out_leaf)
         if not shortcut_ids:                 # 无显式 shortcut（如 ConvNeXt 恒等残差）
