@@ -23,6 +23,7 @@ DAG**，从而正确呈现：并联分支（如 multi-stem 三路并行）、残
 from __future__ import annotations
 
 import logging
+import weakref
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
@@ -101,29 +102,34 @@ def _leaf_params(m: nn.Module) -> Dict[str, object]:
 _WRAPPER_SEGS = {"stage"}
 
 
+# encoder/decoder 下"按索引切分"的 ModuleList 容器段：每个索引各成一个顶层框。
+# 覆盖标准 UNet（stages/downsamples/levels/upsamples）、ADM（levels）、
+# EDM2（level_blocks/level_entries）、UNet++/UNet3+（blocks/upsamples/gates/
+# branches/fusions，键可为 i_j 复合）。
+_INDEXED_SEGS = {
+    "stages", "downsamples", "levels", "upsamples", "level_blocks",
+    "level_entries", "blocks", "gates", "branches", "fusions",
+}
+
+
 def _top_key(name: str) -> str:
     """叶子限定名 → 所属**顶层容器**键（encoder.stem / encoder.stages.k / …）。
 
     与旧 ``_stage_key`` 的关键区别：``encoder.stem.stems.k`` 不再各自成顶层框，而是
-    统一归到单一 ``encoder.stem`` 容器（其内部三路并联另由 block 分组呈现）。
+    统一归到单一 ``encoder.stem`` 容器（其内部三路并联另由 block 分组呈现）；并对各
+    decoder 变体（UNet/UNet++/UNet3+/ADM/EDM2）按索引切分出每级一框。
     """
     parts = name.split(".")
     p0 = parts[0]
-    if p0 == "encoder":
-        if len(parts) >= 2 and parts[1] == "stem":
+    if p0 in ("encoder", "decoder"):
+        if p0 == "encoder" and len(parts) >= 2 and parts[1] == "stem":
             return "encoder.stem"
-        if (len(parts) >= 3 and parts[1] in ("stages", "downsamples")
-                and parts[2].isdigit()):
-            return f"encoder.{parts[1]}.{parts[2]}"
-        if len(parts) >= 2 and parts[1] == "aux_fuse":
+        if p0 == "encoder" and len(parts) >= 2 and parts[1] == "aux_fuse":
             return "encoder.aux_fuse"
-        return ".".join(parts[:2]) if len(parts) >= 2 else p0
-    if p0 == "decoder":
-        if len(parts) >= 3 and parts[1] == "levels" and parts[2].isdigit():
-            return f"decoder.levels.{parts[2]}"
-        # UNet++/UNet3+ 的 ModuleDict（blocks/upsamples/gates，键形如 i_j）：按节点键聚合。
-        if len(parts) >= 3 and parts[1] in ("blocks", "upsamples", "gates"):
-            return f"decoder.{parts[1]}.{parts[2]}"
+        # 按索引切分的 ModuleList 段：索引可为数字或 i_j 复合键。
+        if (len(parts) >= 3 and parts[1] in _INDEXED_SEGS
+                and (parts[2].isdigit() or "_" in parts[2])):
+            return f"{p0}.{parts[1]}.{parts[2]}"
         return ".".join(parts[:2]) if len(parts) >= 2 else p0
     if p0 in ("seg_head", "topo_head", "recon_head"):
         return p0
@@ -173,14 +179,24 @@ def _top_label(key: str) -> str:
     }
     if key in pretty:
         return pretty[key]
-    if len(parts) == 3 and parts[0] == "encoder" and parts[1] == "stages":
-        return f"Encoder Stage {parts[2]}"
-    if len(parts) == 3 and parts[0] == "encoder" and parts[1] == "downsamples":
-        return f"Downsample {parts[2]}"
-    if len(parts) == 3 and parts[0] == "decoder" and parts[1] == "levels":
-        return f"Decoder Level {parts[2]}"
-    if len(parts) == 3 and parts[0] == "decoder":
-        return f"Decoder X[{parts[2]}]"
+    if len(parts) == 3:
+        p0, seg, idx = parts
+        enc = p0 == "encoder"
+        seg_label = {
+            "stages": "Encoder Stage", "downsamples": "Downsample",
+            "levels": ("Encoder Level" if enc else "Decoder Level"),
+            "upsamples": "Upsample",
+            "level_blocks": ("Enc Blocks" if enc else "Dec Blocks"),
+            "level_entries": ("Enc Entry" if enc else "Dec Entry"),
+            "branches": "Dec Branches", "fusions": "Dec Fuse",
+        }.get(seg)
+        if seg_label:
+            return f"{seg_label} {idx}"
+        if p0 == "decoder" and seg in ("blocks", "gates"):
+            # UNet++ 嵌套节点 X[i,j]（键形如 i_j）。
+            return f"Decoder X[{idx.replace('_', ',')}]"
+        if p0 == "decoder":
+            return f"Decoder {seg} {idx}"
     if len(parts) == 2 and parts[0] == "ds_heads":
         return f"DS Head {parts[1]}"
     if len(parts) == 2 and parts[0] == "aux_heads":
@@ -231,15 +247,29 @@ def _residual_block_types() -> Tuple[type, ...]:
         types.append(ConvNeXtBlock)
     except Exception as e:  # pragma: no cover
         logger.debug("model_flow: 导入 convnext 残差块类型失败: %s", e)
+    try:  # 扩散系 backbone 的残差块（输出 = 残差支 + skip(输入)）
+        from ..models.adm_unet import _ResBlockNoEmb
+        types.append(_ResBlockNoEmb)
+    except Exception as e:  # pragma: no cover
+        logger.debug("model_flow: 导入 adm 残差块类型失败: %s", e)
+    try:
+        from ..models.edm2_unet import _Block as _EDM2Block
+        types.append(_EDM2Block)
+    except Exception as e:  # pragma: no cover
+        logger.debug("model_flow: 导入 edm2 残差块类型失败: %s", e)
     return tuple(types)
 
 
+# 残差捷径子模块的常见命名（不同 backbone 各异）。
+_SHORTCUT_ATTRS = ("shortcut", "skip_connection", "conv_skip")
+
+
 def _has_residual(m: nn.Module, residual_types: Tuple[type, ...]) -> bool:
-    """该 block 是否含残差捷径（``out + shortcut(x)`` 形态）。"""
+    """该 block 是否含残差捷径（``out = 残差支 + skip(x)`` 形态）。"""
     if residual_types and isinstance(m, residual_types):
         return True
-    # 通用启发：含名为 shortcut 的子模块即视为残差块。
-    return hasattr(m, "shortcut") and isinstance(m.shortcut, nn.Module)
+    # 通用启发：含名为 shortcut / skip_connection / conv_skip 的子模块即视为残差块。
+    return any(isinstance(getattr(m, a, None), nn.Module) for a in _SHORTCUT_ATTRS)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +279,7 @@ class _ModuleRec:
     """单个模块一次前向的输入/输出张量 id 与形状记录。"""
 
     __slots__ = ("name", "module", "order", "in_ids", "out_ids",
-                 "in_shape", "out_shape")
+                 "in_shape", "out_shape", "in_prov", "in_src")
 
     def __init__(self, name: str, module: nn.Module):
         self.name = name
@@ -259,6 +289,13 @@ class _ModuleRec:
         self.out_ids: Tuple[int, ...] = ()
         self.in_shape: Optional[Tuple[int, ...]] = None
         self.out_shape: Optional[Tuple[int, ...]] = None
+        # 各输入张量在 pre_hook 时刻解析出的血缘（上游叶子名集合），与 in_ids 对齐。
+        # 在 pre_hook 解析可保证此刻输入张量仍存活、id 唯一，从而 prov 命中正确，
+        # 既免去张量钉住（省内存），又杜绝 id 复用导致的 build 期陈旧读。
+        self.in_prov: Tuple["frozenset[str]", ...] = ()
+        # 各输入张量的**直接产出叶子**名（weakref 校验，非直接产出则为 None），
+        # 供 block 内叶子流式连边；同样在 pre_hook 解析以规避 id 复用。
+        self.in_src: Tuple[Optional[str], ...] = ()
 
 
 def _iter_tensors(obj) -> List[torch.Tensor]:
@@ -275,39 +312,132 @@ def _iter_tensors(obj) -> List[torch.Tensor]:
     return out
 
 
+# 张量血缘（provenance）：tensor id → 产出它的上游叶子名集合（含哨兵 "input"）。
+# functional 算子（cat / +/ interpolate / pool …）不产生 module，纯靠 module hook
+# 无法连边；用 TorchFunctionMode 拦截这些算子，把输出张量的血缘并为各输入血缘之并，
+# 从而下游 module 的输入张量能反查到真实的多个上游叶子（多输入融合 / 跳连 / 残差）。
+Provenance = Dict[int, "frozenset[str]"]
+
+
+def _make_prov_mode(prov: Provenance):
+    """构造一个累积张量血缘的 TorchFunctionMode（torch 不支持时返回 None）。
+
+    每个流经模块/算子之间的张量在产生时都会被写入血缘（functional 输出在此累积，
+    叶子输出在 forward hook 覆盖），因此 ``id()`` 复用不会留下被读取到的陈旧项，
+    无需钉住全部张量（钉住会在大体积 3D 前向时撑爆内存）。
+    """
+    try:
+        from torch.overrides import TorchFunctionMode
+    except Exception:  # pragma: no cover - 老版本 torch
+        return None
+
+    class _ProvMode(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            ins = _iter_tensors(args) + _iter_tensors(kwargs)
+            out = func(*args, **kwargs)
+            try:
+                srcs: "frozenset[str]" = frozenset()
+                for t in ins:
+                    s = prov.get(id(t))
+                    if s:
+                        srcs |= s
+                in_ids = {id(t) for t in ins}
+                for o in _iter_tensors(out):
+                    if id(o) in in_ids:
+                        # in-place / 透传：在该（存活）张量已有血缘上累加。
+                        prov[id(o)] = prov.get(id(o), frozenset()) | srcs
+                    else:
+                        # 新张量：直接覆盖，杜绝其 id 命中已释放张量的陈旧血缘
+                        # （陈旧读是 id 追踪下不确定性的根源）。
+                        prov[id(o)] = srcs
+            except Exception:  # pragma: no cover - 血缘累积尽力而为
+                pass
+            return out
+
+    return _ProvMode()
+
+
 def _trace_modules(
     model: nn.Module, in_shape: Tuple[int, ...],
-) -> Tuple[Dict[str, _ModuleRec], Set[int], bool]:
-    """注册全模块 hook 跑一次 dummy 前向，回填张量 id 与形状。
+) -> Tuple[Dict[str, _ModuleRec], bool]:
+    """注册全模块 hook 跑一次 dummy 前向，回填张量 id / 形状 / 输入血缘。
 
-    返回 ``(recs, input_ids, traced)``；``traced=False`` 表示前向失败、流图不可用。
+    返回 ``(recs, traced)``；``traced=False`` 表示前向失败。每个 rec 的 ``in_prov``
+    在 pre_hook 时刻已解析好上游血缘，故无需把 ``prov`` 透出到 build 阶段。
     """
     recs: Dict[str, _ModuleRec] = {
         name: _ModuleRec(name, m)
         for name, m in model.named_modules() if name
     }
+    leaf_names: Set[str] = {
+        name for name, m in model.named_modules()
+        if name and not list(m.children())
+    }
+    # 残差 block 容器：其输出 = 主路 + shortcut(输入)，会把"该 block 的输入血缘"
+    # 经 identity 捷径透传到输出，污染同级/下游连边。这里在 block 出口把血缘**重封**
+    # 为该 block 自身，使其对外只表现为单一产出单元（块内残差另由结构化残差边表达）。
+    residual_types = _residual_block_types()
+    reseal_names: Set[str] = {
+        name for name, m in model.named_modules()
+        if name and list(m.children()) and _has_residual(m, residual_types)
+    }
+    prov: Provenance = {}
+    # 叶子输出张量 id → (产出叶子名, 该张量弱引用)。weakref 用于在 pre_hook 查询时
+    # 辨别"id 是否被复用"：若弱引用已失效或不指向当前输入张量，则该 id 实为陈旧项。
+    live_out: Dict[int, Tuple[str, "weakref.ref"]] = {}
 
     counter = {"i": 0}
     handles: List[torch.utils.hooks.RemovableHandle] = []
+
+    def _src_of(t: torch.Tensor) -> Optional[str]:
+        entry = live_out.get(id(t))
+        if entry is None:
+            return None
+        name, ref = entry
+        return name if ref() is t else None  # 弱引用校验：防 id 复用误连
 
     def _mk_pre_hook(rec: _ModuleRec):
         def pre_hook(_mod, args, kwargs=None):
             if rec.order < 0:  # 仅记首次调用
                 tensors = _iter_tensors(args) + _iter_tensors(kwargs or {})
                 rec.in_ids = tuple(id(t) for t in tensors)
+                # 此刻输入张量存活、id 唯一 → 立即快照血缘与直接产出叶子。
+                rec.in_prov = tuple(prov.get(id(t), frozenset()) for t in tensors)
+                rec.in_src = tuple(_src_of(t) for t in tensors)
                 if tensors:
                     rec.in_shape = tuple(tensors[0].shape)
         return pre_hook
 
     def _mk_hook(rec: _ModuleRec):
+        is_leaf = rec.name in leaf_names
+        is_reseal = rec.name in reseal_names
+
         def hook(_mod, _inp, out):
+            tensors = _iter_tensors(out)
             if rec.order < 0:
                 rec.order = counter["i"]
                 counter["i"] += 1
-                tensors = _iter_tensors(out)
                 rec.out_ids = tuple(id(t) for t in tensors)
                 if tensors:
                     rec.out_shape = tuple(tensors[0].shape)
+            if is_leaf:  # 叶子输出血缘归该叶子自身
+                # 透传叶子（Identity / inplace 激活等）输出张量与输入同一对象：
+                # 血缘不得抢占上游（否则冒名顶替真正的产出者），但**直接产出者**仍按
+                # "最近写者"记录（含透传），以复刻 block 内 inplace 链的逐叶子连边。
+                in_ids = {id(t) for t in _iter_tensors(_inp)}
+                src = frozenset({rec.name})
+                for t in tensors:
+                    if id(t) not in in_ids:
+                        prov[id(t)] = src
+                    try:
+                        live_out[id(t)] = (rec.name, weakref.ref(t))
+                    except TypeError:  # pragma: no cover - 个别张量不可弱引用
+                        pass
+            elif is_reseal:  # 残差 block 出口：把输出血缘重封为该 block 自身
+                src = frozenset({rec.name})
+                for t in tensors:
+                    prov[id(t)] = src
         return hook
 
     for rec in recs.values():
@@ -317,30 +447,38 @@ def _trace_modules(
         handles.append(rec.module.register_forward_hook(_mk_hook(rec)))
 
     traced = False
-    input_ids: Set[int] = set()
     prev_training = model.training
     try:
         dummy = torch.zeros(*in_shape, dtype=torch.float32)
-        input_ids = {id(dummy)}
         for mode in (True, False):  # 先 train()（激活 aux/ds/topo），失败再 eval()
             try:
+                prov.clear()
+                prov[id(dummy)] = frozenset({"input"})
                 model.train(mode)
+                prov_mode = _make_prov_mode(prov)
                 with torch.no_grad():
-                    model(dummy)
+                    if prov_mode is not None:
+                        with prov_mode:
+                            model(dummy)
+                    else:
+                        model(dummy)
                 traced = True
                 break
             except Exception as e:  # 换模式重试
                 logger.debug("model_flow: forward(train=%s) 失败: %s", mode, e)
                 counter["i"] = 0
+                live_out.clear()
                 for r in recs.values():  # 清空上次半成品记录
                     r.order = -1
                     r.in_ids = r.out_ids = ()
                     r.in_shape = r.out_shape = None
+                    r.in_prov = ()
+                    r.in_src = ()
     finally:
         for h in handles:
             h.remove()
         model.train(prev_training)
-    return recs, input_ids, traced
+    return recs, traced
 
 
 # ---------------------------------------------------------------------------
@@ -373,10 +511,9 @@ class _ModelGraphBuilder:
     """把 ``_ModuleRec`` 集合重建为 ``VisGraph`` 的 DAG。"""
 
     def __init__(self, g: VisGraph, recs: Dict[str, _ModuleRec],
-                 input_ids: Set[int], traced: bool):
+                 traced: bool):
         self.g = g
         self.recs = recs
-        self.input_ids = input_ids
         self.traced = traced
         self.residual_types = _residual_block_types()
 
@@ -386,11 +523,7 @@ class _ModelGraphBuilder:
             if not list(rec.module.children())
             and (rec.order >= 0 or not traced)
         }
-        # 叶子输出张量 id → 产出叶子名（用于上游反查）。
-        self.producer: Dict[int, str] = {}
-        for name, rec in self.leaves.items():
-            for tid in rec.out_ids:
-                self.producer.setdefault(tid, name)
+        self.leaf_set: Set[str] = set(self.leaves)
 
         # 分组结构。
         self.top_leaves: Dict[str, List[_ModuleRec]] = {}
@@ -418,37 +551,37 @@ class _ModelGraphBuilder:
         oo = self._order_of(self.top_leaves[key])
         return (oo[0], oo[1], self.top_order.index(key))
 
-    # -- 上游反查 ------------------------------------------------------
-    def _producers_at_top(self, in_ids: Sequence[int], exclude: str) -> List[str]:
-        """输入张量 id 列表 → 去重的上游顶层容器（或 'input'）。"""
+    # -- 上游反查（基于 pre_hook 快照的输入血缘集合）----------------------
+    def _producers_at_top(
+        self, prov_sets: Sequence["frozenset[str]"], exclude: str,
+    ) -> List[str]:
+        """输入血缘集合 → 去重的上游顶层容器（或 'input'），按多源展开。"""
         srcs: List[str] = []
         seen: Set[str] = set()
-        for tid in in_ids:
-            if tid in self.input_ids:
-                src = "input"
-            else:
-                prod = self.producer.get(tid)
-                src = _top_key(prod) if prod else None
-            if src and src != exclude and src not in seen:
+        for s in prov_sets:
+            for leaf in s:
+                src = "input" if leaf == "input" else _top_key(leaf)
+                if not src or src == exclude or src in seen:
+                    continue
                 if src == "input" or src in self.top_set:
                     seen.add(src)
                     srcs.append(src)
         return srcs
 
     def _producers_in_top(
-        self, in_ids: Sequence[int], top: str, exclude: str,
+        self, prov_sets: Sequence["frozenset[str]"], top: str, exclude: str,
     ) -> List[str]:
-        """容器内：输入张量 id → 同容器内的上游 block 键（外部来源忽略）。"""
+        """容器内：输入血缘集合 → 同容器内的上游 block 键（外部来源忽略）。"""
         srcs: List[str] = []
         seen: Set[str] = set()
-        for tid in in_ids:
-            prod = self.producer.get(tid)
-            if not prod or _top_key(prod) != top:
-                continue
-            bk = _block_key(prod, top) or prod
-            if bk != exclude and bk not in seen:
-                seen.add(bk)
-                srcs.append(bk)
+        for s in prov_sets:
+            for leaf in s:
+                if leaf == "input" or _top_key(leaf) != top:
+                    continue
+                bk = _block_key(leaf, top) or leaf
+                if bk != exclude and bk not in seen:
+                    seen.add(bk)
+                    srcs.append(bk)
         return srcs
 
     def _add_edge(self, src: str, dst: str, label: str = "",
@@ -474,11 +607,10 @@ def build_model_flow(
     g = VisGraph(title="模型流 Model Flow")
 
     recs: Dict[str, _ModuleRec] = {}
-    input_ids: Set[int] = set()
     traced = False
     if trace_shapes:
         try:
-            recs, input_ids, traced = _trace_modules(model, in_shape)
+            recs, traced = _trace_modules(model, in_shape)
         except Exception as e:  # 追踪整体失败 → 纯结构
             logger.warning("model_flow: 数据流追踪失败，退化为纯结构图: %s", e)
     if not recs:
@@ -502,7 +634,7 @@ def build_model_flow(
                 "spatial_dims": f"{topo.spatial_dims}D",
                 "n_views": str(topo.n_views)})
 
-    builder = _ModelGraphBuilder(g, recs, input_ids, traced)
+    builder = _ModelGraphBuilder(g, recs, traced)
     _emit(builder, cfg)
     return g
 
@@ -600,33 +732,30 @@ def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
 
     leaf_ids: List[str] = [_emit_leaf(b, rec, parent=block_key) for rec in members]
 
-    # 叶子间真实流连边：按执行序流式解析"我的输入由哪个兄弟叶子产出"，
-    # 正确处理 in-place / Identity 造成的张量 id 复用（避免 norm 扇出到多叶子）。
-    # 把 block 外部输入 id 标记为 external：identity/shortcut 透传不得"抢占"它，
-    # 从而 shortcut 与主路首叶都作为并联入口、互不串接。
+    # 叶子间真实流连边：每个叶子用 pre_hook 解析出的"直接产出叶子"(in_src)反查其
+    # 输入来自哪个**同 block 兄弟叶子**。in_src 经 weakref 校验，规避 id 复用误连；
+    # block 外部输入的产出者落在别的 block（不在 member 内）→ 自然不连，从而
+    # shortcut 与主路首叶都作为并联入口、互不串接。
     block_rec = b.recs.get(block_key)
     external: Set[int] = set(block_rec.in_ids) if block_rec else set()
-    cur: Dict[int, str] = {}
+    name_to_cid = {rec.name: cid for rec, cid in zip(members, leaf_ids)}
+    member_names = set(name_to_cid)
     has_succ: Set[str] = set()
     for rec, cid in zip(members, leaf_ids):
-        for tid in rec.in_ids:
-            if tid in external:
+        for tid, prod in zip(rec.in_ids, rec.in_src):
+            if tid in external:  # block 外部输入：并联入口，不连块内边
                 continue
-            src = cur.get(tid)
-            if src and src != cid:
-                b._add_edge(src, cid)
-                has_succ.add(src)
-        for tid in rec.out_ids:
-            if tid in external:           # 不抢占外部输入 id（透传算子）
-                continue
-            cur[tid] = cid
+            if prod and prod != rec.name and prod in member_names:
+                scid = name_to_cid[prod]
+                b._add_edge(scid, cid)
+                has_succ.add(scid)
 
     # 残差/融合 functional 算子（+ / cat）不产生 module，会在主路与输出叶子间断链。
     # 结构化补回：把"悬空主路叶子"接到输出叶子；shortcut 叶子以 residual 边接入。
     if residual and len(leaf_ids) >= 2:
         out_leaf = leaf_ids[-1]              # 末叶（执行序最后）= block 输出
         shortcut_ids = {cid for rec, cid in zip(members, leaf_ids)
-                        if ".shortcut" in rec.name}
+                        if any(f".{a}" in rec.name for a in _SHORTCUT_ATTRS)}
         for rec, cid in zip(members, leaf_ids):
             if cid == out_leaf:
                 continue
@@ -657,11 +786,20 @@ def _emit_leaf(b: _ModelGraphBuilder, rec: _ModuleRec, parent: str) -> str:
 
 
 def _emit_top_inbound_edges(b: _ModelGraphBuilder, key: str) -> None:
-    """顶层容器的入边：用容器模块自身输入张量 id 反查上游顶层容器。"""
+    """顶层容器的入边：反查"喂给本容器内任一叶子的外部张量"的上游容器。
+
+    既用容器模块自身输入（被直接调用的容器），也并入**所有成员叶子的输入**——
+    对 ``ModuleList`` 这类从不被调用、自身无输入记录的容器（ADM/EDM2 的 levels、
+    UNet3+ 的 branches/fusions），后者是唯一能反查出真实入边（含 encoder→decoder
+    跳连）的来源；容器内部来源由 ``_producers_at_top`` 的 exclude 自动滤除。
+    """
+    prov_sets: List["frozenset[str]"] = []
     rec = b.recs.get(key)
-    if rec is None or not rec.in_ids:
-        return
-    for src in b._producers_at_top(rec.in_ids, exclude=key):
+    if rec:
+        prov_sets.extend(rec.in_prov)
+    for r in b.top_leaves.get(key, []):
+        prov_sets.extend(r.in_prov)
+    for src in b._producers_at_top(prov_sets, exclude=key):
         b._add_edge(src, key)
 
 
@@ -675,9 +813,9 @@ def _emit_intra_edges(
     real_blocks = [bk for bk in block_order if bk is not None]
     for bk in real_blocks:
         rec = b.recs.get(bk)
-        if rec is None or not rec.in_ids:
+        if rec is None or not rec.in_prov:
             continue
-        for src in b._producers_in_top(rec.in_ids, top, exclude=bk):
+        for src in b._producers_in_top(rec.in_prov, top, exclude=bk):
             b._add_edge(src, bk)
 
     _structural_fusion_edges(b, top, real_blocks)
