@@ -67,6 +67,9 @@ header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 650; }
 .flow.active { display: block; }
 svg.edges { position: absolute; left: 0; top: 0; width: 100%; height: 100%;
   pointer-events: none; z-index: 1; overflow: visible; }
+/* 残差层置于框之上：block 内子框密排，残差线只能走子框外的左侧空白栏，
+   置顶后才可见；其余边（前向/skip/loss束）仍在框下，避免压住密集解码框。 */
+svg.edges-top { z-index: 3; }
 .col { position: relative; z-index: 2; display: flex; flex-direction: column;
   align-items: center; gap: 22px; }
 .children { display: flex; flex-direction: column; align-items: center;
@@ -341,9 +344,11 @@ function visibleAnchor(nodeId) {
 function drawEdges() {
   const flow = document.querySelector(".flow.active");
   if (!flow) return;
-  const svg = flow.querySelector("svg.edges");
+  const svg = flow.querySelector("svg.edges:not(.edges-top)");
+  const svgTop = flow.querySelector("svg.edges-top");
   const canvas = flow.querySelector(".canvas");
   svg.innerHTML = svgDefs();
+  svgTop.innerHTML = "";
   const cr = canvas.getBoundingClientRect();
   const g = DATA.flows[flow.dataset.flow] || {};
   const edges = g.edges || [];
@@ -425,14 +430,28 @@ function drawEdges() {
       d = `M ${x1} ${y1} L ${railX + r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + r} `
         + `L ${railX} ${ey - r} Q ${railX} ${ey} ${railX + r} ${ey} L ${x2} ${ey}`;
       lx = railX - 4; ly = (y1 + ey) / 2;
-    } else if (kind === "residual" || yt2 < yb1 - 2) {
-      // 残差捷径 / 回流：就近的局部右侧小弧（不进外缘车道）。
-      const off = 44 + Math.abs(cx2 - cx1) * 0.12 + (kind === "residual" ? 16 : 0);
+    } else if (kind === "residual") {
+      // 残差捷径（block 内 shortcut → act2）：走该 block 的左侧空白栏（gutter）正交下行。
+      // 边层绘制在子框之下，block 内子框密排会把斜跨的弧线整条遮住（看不到残差线）；
+      // 故从 shortcut 左缘引出 → 贴最左框之左的竖轨下行 → 在目标行水平进入其左缘，
+      // 全程位于子框之外的清空区，无论层叠次序都可见。
+      const ax1 = ra.left - cr.left;
+      const y1 = ra.top + ra.height / 2 - cr.top;
+      const x2 = rb.left - cr.left;
+      const y2 = rb.top + rb.height / 2 - cr.top;
+      const railX = Math.max(2, Math.min(ax1, x2) - 14);
+      const dn = y2 >= y1 ? 1 : -1;
+      const r = Math.min(7, Math.max(0, Math.abs(y2 - y1) / 2 - 1));
+      d = `M ${ax1} ${y1} L ${railX + r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + dn * r} `
+        + `L ${railX} ${y2 - dn * r} Q ${railX} ${y2} ${railX + r} ${y2} L ${x2} ${y2}`;
+      lx = railX - 4; ly = (y1 + y2) / 2;
+    } else if (yt2 < yb1 - 2) {
+      // 回流（上行反馈）：就近的局部右侧小弧（不进外缘车道）。
+      const off = 44 + Math.abs(cx2 - cx1) * 0.12;
       const sx = Math.max(cx1, cx2) + off;
       maxX = Math.max(maxX, sx);
-      const up = yt2 < yb1 - 2;
-      const ya = up ? (yb1 - ra.height / 2) : yb1;
-      const yb = up ? (yt2 + rb.height / 2) : yt2;
+      const ya = yb1 - ra.height / 2;
+      const yb = yt2 + rb.height / 2;
       d = `M ${cx1} ${ya} C ${sx} ${ya}, ${sx} ${yb}, ${cx2} ${yb}`;
       lx = sx + 4; ly = (ya + yb) / 2;
     } else {
@@ -447,7 +466,9 @@ function drawEdges() {
     path.setAttribute("stroke-width", style.width);
     if (style.dash) path.setAttribute("stroke-dasharray", style.dash);
     path.setAttribute("marker-end", "url(#" + style.marker + ")");
-    svg.appendChild(path);
+    // 残差线置于顶层（框上），其余边在底层（框下）。
+    const layer = kind === "residual" ? svgTop : svg;
+    layer.appendChild(path);
     if (ed.label) {
       const tx = document.createElementNS("http://www.w3.org/2000/svg", "text");
       tx.setAttribute("x", lx);
@@ -457,12 +478,13 @@ function drawEdges() {
       tx.setAttribute("font-weight", kind === "forward" ? "400" : "700");
       if (it.band === "L") tx.setAttribute("text-anchor", "end");
       tx.textContent = ed.label;
-      svg.appendChild(tx);
+      layer.appendChild(tx);
     }
   });
-  // size svg to canvas（含外缘车道）
-  svg.setAttribute("width", Math.max(canvas.scrollWidth, maxX + 12));
-  svg.setAttribute("height", canvas.scrollHeight);
+  // size both layers to canvas（含外缘车道）
+  const W = Math.max(canvas.scrollWidth, maxX + 12), H = canvas.scrollHeight;
+  svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svgTop.setAttribute("width", W); svgTop.setAttribute("height", H);
 }
 function marker(id, color) {
   return '<marker id="' + id + '" viewBox="0 0 10 10" refX="9" refY="5" ' +
@@ -487,6 +509,10 @@ function buildFlow(flowKey) {
   canvas.appendChild(svg);
   const col = el("div", "col");
   canvas.appendChild(col);
+  // 第二条边层，置于节点列之上，仅承载 block 内残差线（详见 drawEdges）。
+  const svgTop = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svgTop.setAttribute("class", "edges edges-top");
+  canvas.appendChild(svgTop);
   flow.appendChild(canvas);
 
   if (!g || !g.nodes.length) {
