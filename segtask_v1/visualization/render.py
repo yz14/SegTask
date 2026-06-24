@@ -97,7 +97,7 @@ svg.edges-top { z-index: 3; }
 /* stage container */
 .stage {
   background: var(--c-stage-bg); border: 1px dashed var(--c-stage);
-  border-radius: 12px; min-width: 280px; max-width: 1024px;
+  border-radius: 12px; min-width: 280px; width: fit-content; max-width: none;
 }
 .stage > .stage-head {
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
@@ -108,9 +108,12 @@ svg.edges-top { z-index: 3; }
 .stage > .stage-head .s-kv { color: var(--muted); font-weight: 500;
   font-size: 11px; margin-left: auto; }
 
-/* row: side-by-side grouping (并联分支 / 多分辨率输入) */
+/* row: side-by-side grouping (并联分支 / 多分辨率输入)。**不换行**：并联分支必须
+   同处一行，否则会被误读成串联（如 multi-stem 三路输入被拆成两行会让人以为
+   stem0/1 先汇入 stem2）。容器 ``.stage`` 用 ``width: fit-content`` 随之横向生长，
+   行宽超出视口时由页面水平滚动承载，而非把并联拆成多行。 */
 .row { display: flex; flex-direction: row; align-items: flex-start;
-  justify-content: center; gap: 26px; flex-wrap: wrap; }
+  justify-content: center; gap: 26px; flex-wrap: nowrap; }
 
 /* edge legend (线型说明) */
 .legend .eline { display: inline-block; width: 22px; height: 0;
