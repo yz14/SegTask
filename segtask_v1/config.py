@@ -801,6 +801,33 @@ class SSLConfig:
 
 
 # ---------------------------------------------------------------------------
+# Visualization (TODO #2)
+# ---------------------------------------------------------------------------
+@dataclass
+class VisConfig:
+    """全流程可视化分析工具开关。``enabled=False`` 时零开销、零副作用。
+
+    开启后，训练启动时自动导出一份自包含 HTML（数据流 / 模型流 / 预测流三视图），
+    用于人工核对"数据流与模型架构是否符合 yaml、是否有优化空间"。生成过程仅用
+    CPU dummy 张量、不读盘、不依赖 GPU 与真实数据。
+    """
+
+    # 总开关：关闭时 train.py 完全跳过可视化逻辑。
+    enabled: bool = False
+    # 输出目录；空串 → 落到 ``train.output_dir/visualization``。
+    output_dir: str = ""
+    # 输出文件名（单文件、三标签页）。
+    filename: str = "pipeline_vis.html"
+    # 要生成的视图子集；顺序即标签页顺序。
+    flows: List[str] = field(
+        default_factory=lambda: ["data", "model", "predict"])
+    # 是否用 CPU dummy 前向 + hook 追踪模型流真实张量形状；False 退化为纯结构图。
+    trace_shapes: bool = True
+    # 详情面板每节点最多展示的参数条数（防爆）。
+    max_detail_params: int = 200
+
+
+# ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
 @dataclass
@@ -814,6 +841,7 @@ class Config:
     train  : TrainConfig   = field(default_factory=TrainConfig)
     predict: PredictConfig = field(default_factory=PredictConfig)
     ssl    : SSLConfig     = field(default_factory=SSLConfig)
+    vis    : VisConfig     = field(default_factory=VisConfig)
 
     def sync(self) -> None:
         """同步跨子配置的对应字段。
@@ -1661,6 +1689,7 @@ _SUB_CONFIGS = {
     "train": TrainConfig,
     "predict": PredictConfig,
     "ssl": SSLConfig,
+    "vis": VisConfig,
 }
 
 

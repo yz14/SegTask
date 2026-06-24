@@ -83,6 +83,17 @@ def main():
     # Build model
     model = build_model(cfg)
 
+    # Optional: export pipeline visualization HTML (TODO #2). Guarded by
+    # cfg.vis.enabled; CPU-only, no GPU / real data needed. Zero-overhead when
+    # disabled. Placed before Trainer so the model is still on CPU / uncompiled.
+    if cfg.vis.enabled:
+        from .visualization import generate_visualization
+        try:
+            out = generate_visualization(cfg, model)
+            logger.info("Pipeline visualization written to: %s", out)
+        except Exception as e:  # 可视化失败不应中断训练
+            logger.warning("Visualization generation failed: %s", e)
+
     # Save resolved config
     save_config(cfg, Path(cfg.train.output_dir) / "resolved_config.yaml")
 
