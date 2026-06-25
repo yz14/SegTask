@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 SuffixSpec = Union[str, Sequence[str]]
 
 import numpy as np
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
 
 from ..config import Config
 from .dataset import load_nifti, load_npz_label_for_split
@@ -526,14 +526,29 @@ def _split_paths_from(npz_paths: List[str], idxs: Sequence[int]) -> SplitPaths:
         image_paths = list(sel), label_paths = list(sel), npz_paths = list(sel))
 
 
-def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
+def build_dataloaders(
+    cfg: Config,
+    rank: int = 0,
+    world_size: int = 1,
+) -> Tuple[DataLoader, DataLoader]:
     """构建 train/val DataLoader。训练仅读 npz：data.npz_dir 必须设。
     目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。
 
     ``data.npz_dir_secondary`` 非空时启用双批混合：第二批（粗标）仅用于训练，
     与第一批（金标准）经 ``ConcatDataset`` + ``MixedBatchSampler`` 在每个 train
-    batch 内按 ``data.mix_ratio`` 混合；验证集始终仅取金标准。"""
+    batch 内按 ``data.mix_ratio`` 混合；验证集始终仅取金标准。
+
+    ``world_size > 1`` 时为多卡 DDP：训练集用 ``DistributedSampler`` 不相交切分到
+    各 rank（每 epoch 需在外层 ``set_epoch`` 以重新洗牌）。验证集 loader 不在此切分
+    —— 整卷(high)验证按 ``_npz_paths`` 在验证器内按 rank 切，medium 验证在验证器内
+    按 batch 序号切，故 val_loader 保持 ``shuffle=False`` 全集不变。"""
     dc = cfg.data
+    if world_size > 1 and bool(dc.npz_dir_secondary):
+        raise ValueError(
+            "Multi-GPU DDP (train.gpus length >= 2) is not supported together "
+            "with two-source mixed training (data.npz_dir_secondary set), "
+            "because MixedBatchSampler is not rank-aware. Use a single GPU for "
+            "mixed-source runs, or disable npz_dir_secondary for DDP.")
 
     npz_dir = dc.npz_dir
     if not npz_dir:
@@ -650,6 +665,23 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             "per-batch %d gold + %d coarse (batch_size=%d), %d batches/epoch.",
             dc.mix_ratio, gold_per_batch, coarse_per_batch,
             dc.batch_size, len(sampler))
+    elif world_size > 1:
+        # DDP：训练样本经 DistributedSampler 不相交切分到各 rank（shuffle 由
+        # sampler 负责，外层每 epoch set_epoch 重洗）。drop_last 保持各 rank 等长。
+        train_sampler = DistributedSampler(
+            primary_train_ds, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True)
+        train_loader = DataLoader(
+            primary_train_ds,
+            batch_size  = dc.batch_size,
+            sampler     = train_sampler,
+            num_workers = dc.num_workers,
+            pin_memory  = dc.pin_memory,
+            drop_last   = True,
+            **loader_kwargs)
+        logger.info(
+            "DDP DistributedSampler: rank=%d/%d, ~%d samples/rank (train).",
+            rank, world_size, len(train_sampler))
     else:
         train_loader = DataLoader(
             primary_train_ds,
