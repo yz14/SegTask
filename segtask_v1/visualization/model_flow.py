@@ -32,7 +32,7 @@ import torch.nn as nn
 from ..config import Config
 from ..models.topology import ModelTopology, build_topology
 from .data_flow import _model_input_shape, _target_patch_size
-from .graph import VisGraph, shape_str
+from .graph import VisGraph, VisNode, shape_str
 
 logger = logging.getLogger(__name__)
 
@@ -787,6 +787,8 @@ def _emit(b: _ModelGraphBuilder, cfg: Config) -> None:
 
     # 4) 标注跳连（src/dst 跨级且为 down 向）+ 计算层级 rank。
     _assign_ranks_and_skip(b, backbone, heads)
+    # 5) 计算横向列位（col/colspan），供 renderer 做列对齐网格布局。
+    _assign_columns(b)
 
 
 def _called_direct_children(
@@ -1178,6 +1180,58 @@ def _assign_ranks_and_skip(
             continue
         if rankmap.get(e.dst, 0) - rankmap.get(e.src, 0) > 1:
             e.kind = "skip"
+
+
+def _assign_columns(b: _ModelGraphBuilder) -> None:
+    """对每个父容器内的兄弟节点分配横向列位 ``(col, colspan)``，使并联路径各占一列、
+    主链笔直，融合点（cat/+）居中覆盖其上游列。纯靠 forward 边血缘，不写死模块类型。
+
+    逐 rank 自上而下：
+      (a) 按已定稿的 forward 父（排除 residual/skip）定列——无父则为源、占新列；
+          有父则 ``col=min(父.col)``、``colspan`` 覆盖父列区间（单父继承，使链笔直）。
+      (b) 同 rank 内按 ``(col, 插入序)`` 从左到右扫描去重叠（右移），下游在各自 rank
+          基于已定稿父列重算自动跟随，无累积漂移。
+    """
+    g = b.g
+    by_parent: Dict[Optional[str], List[VisNode]] = {}
+    for n in g.nodes:
+        by_parent.setdefault(n.parent_id, []).append(n)
+    # dst → forward 父列表（residual/skip 不计入列血缘）。
+    fwd_parents: Dict[str, List[str]] = {}
+    for e in g.edges:
+        if e.kind == "forward":
+            fwd_parents.setdefault(e.dst, []).append(e.src)
+
+    for kids in by_parent.values():
+        idset = {n.id for n in kids}
+        order_idx = {n.id: i for i, n in enumerate(kids)}
+        by_rank: Dict[int, List[str]] = {}
+        for n in kids:
+            by_rank.setdefault(n.rank, []).append(n.id)
+        col: Dict[str, int] = {}
+        span: Dict[str, int] = {}
+        for r in sorted(by_rank):
+            row = by_rank[r]
+            for nid in row:
+                ps = [p for p in fwd_parents.get(nid, ())
+                      if p in idset and p in col and p != nid]
+                if not ps:
+                    col[nid] = 0          # 暂置，由扫描步打包成相邻列
+                    span[nid] = 1
+                else:
+                    lo = min(col[p] for p in ps)
+                    hi = max(col[p] + span[p] for p in ps)
+                    col[nid] = lo
+                    span[nid] = hi - lo
+            # 同 rank 去重叠：按 (col, 插入序) 从左到右，必要时右移。
+            cursor: Optional[int] = None
+            for nid in sorted(row, key=lambda x: (col[x], order_idx[x])):
+                if cursor is not None and col[nid] < cursor:
+                    col[nid] = cursor
+                cursor = col[nid] + span[nid]
+        for n in kids:
+            n.col = col[n.id]
+            n.colspan = span[n.id]
 
 
 # -- 小工具 ----------------------------------------------------------------

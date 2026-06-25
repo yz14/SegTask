@@ -43,6 +43,8 @@ class VisNode:
     * ``collapsed`` —— 容器默认是否折叠（仅对有子节点的容器有意义）。
     * ``rank``      —— 同一父容器内的纵向层级（0 起）；同 rank 的兄弟节点横向并排（并联分支），
       不同 rank 自上而下排列。renderer 据此把并联结构排成一行。
+    * ``col`` / ``colspan`` —— 同一父容器内的横向列位（0 起）与跨列宽：renderer 据 ``(rank, col,
+      colspan)`` 把节点摆进 CSS Grid，使各路径独占列、笔直对齐，融合点（cat/+）居中覆盖其上游列。
     """
 
     id: str
@@ -53,6 +55,8 @@ class VisNode:
     parent_id: Optional[str] = None
     collapsed: bool = True
     rank: int = 0
+    col: int = 0
+    colspan: int = 1
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -104,6 +108,8 @@ class VisGraph:
         parent_id: Optional[str] = None,
         collapsed: bool = True,
         rank: int = 0,
+        col: int = 0,
+        colspan: int = 1,
     ) -> VisNode:
         """新增节点并返回（键值统一转字符串，避免 JSON 序列化歧义）。"""
         node = VisNode(
@@ -115,6 +121,8 @@ class VisGraph:
             parent_id=parent_id,
             collapsed=collapsed,
             rank=int(rank),
+            col=int(col),
+            colspan=int(colspan),
         )
         self.nodes.append(node)
         return node
