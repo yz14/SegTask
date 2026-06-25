@@ -81,12 +81,17 @@ def test_multirf_block_dataflow():
     # (1) 框内叶子全连通：曾经分支/shortcut 断链 → 多分量。
     assert _num_components(leaf_ids, edges) == 1, "MultiRF block 叶子不应断链"
 
-    # (2) 三条并联分支都扇入同一融合叶 fuse。
+    # (2) 三条并联分支扇入同一**显式 merge 节点**(cat)，再由其汇入融合叶 fuse
+    #     ——步骤 D：split→merge 的汇流点以独立算子节点呈现，而非分支直连 fuse。
     branch_ids = [n.id for n in leaves if ".branches." in n.id]
     assert len(branch_ids) >= 2, "MultiRF 应有多条并联分支"
-    fuse_targets = {e.dst for e in edges if e.src in set(branch_ids)}
-    assert len(fuse_targets) == 1, "所有分支应汇入同一融合叶"
-    assert ".fuse" in next(iter(fuse_targets))
+    merge_targets = {e.dst for e in edges if e.src in set(branch_ids)}
+    assert len(merge_targets) == 1, "所有分支应汇入同一 merge 节点"
+    merge_id = next(iter(merge_targets))
+    merge_node = next(n for n in leaves if n.id == merge_id)
+    assert merge_node.kind == "merge" and merge_node.label == "cat"
+    fuse_targets = {e.dst for e in edges if e.src == merge_id}
+    assert any(".fuse" in t for t in fuse_targets), "merge 节点下游应为 fuse 叶"
 
     # (3) 残差捷径以 residual 边汇入主路（标注 +），而非伪造的前向跳连。
     sc_resid = [e for e in edges
@@ -124,3 +129,30 @@ def test_no_disconnected_leaf_groups(cfg_name):
         if _num_components(ids, _intra_edges(g, ids)) > 1:
             disconnected.append(pid)
     assert not disconnected, f"{cfg_name} 存在断链叶子组: {disconnected}"
+
+
+# ---------------------------------------------------------------------------
+# 步骤 D：cat / + 等融合点应呈现为显式 merge 算子节点。
+# ---------------------------------------------------------------------------
+def test_merge_nodes_at_fusion_points():
+    g = _build("seg2_5d.yaml")
+    merges = [n for n in g.nodes if n.kind == "merge"]
+    assert merges, "seg2_5d（含 MultiRF cat 融合 + 解码 skip cat + 残差 +）应有 merge 节点"
+
+    by_id = {n.id: n for n in g.nodes}
+    in_edges, out_edges = {}, {}
+    for e in g.edges:
+        out_edges.setdefault(e.src, []).append(e)
+        in_edges.setdefault(e.dst, []).append(e)
+
+    for m in merges:
+        # merge 标签为归一化算子符号；融合点须真正汇聚 ≥2 个上游、并有下游消费者。
+        assert m.label in {"cat", "+", "−", "×", "max", "min", "merge"}
+        ins = in_edges.get(m.id, [])
+        outs = out_edges.get(m.id, [])
+        assert len(ins) >= 2, f"merge {m.id} 应至少汇聚两路输入"
+        assert len(outs) >= 1, f"merge {m.id} 应有下游消费者"
+        # merge 节点与其上下游同处一个父框（局部汇流点，不跨框）。
+        for e in ins + outs:
+            assert by_id[e.src].parent_id == m.parent_id
+            assert by_id[e.dst].parent_id == m.parent_id
