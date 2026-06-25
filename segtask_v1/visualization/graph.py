@@ -22,6 +22,7 @@ NODE_KINDS = (
     "norm",     # 归一化类叶子
     "act",      # 激活类叶子
     "op",       # 其他叶子（pool / upsample / attention / add ...）
+    "merge",    # 显式融合算子节点（cat / + / × ...：split→merge 的汇流点）
     "head",     # 输出头
     "output",   # 模型输出框
     "loss",     # 损失框

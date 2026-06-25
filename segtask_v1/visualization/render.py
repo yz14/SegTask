@@ -39,6 +39,7 @@ _CSS = """
   --c-norm: #047857; --c-norm-bg: #ecfdf5;
   --c-act: #a21caf; --c-act-bg: #fdf4ff;
   --c-op: #475569; --c-op-bg: #f8fafc;
+  --c-merge: #d97706; --c-merge-bg: #fff7ed;
   --c-head: #be185d; --c-head-bg: #fdf2f8;
   --c-output: #15803d; --c-output-bg: #f0fdf4;
   --c-loss: #b91c1c; --c-loss-bg: #fef2f2;
@@ -143,6 +144,14 @@ svg.edges-top { z-index: 3; }
 .k-norm   { border-left-color: var(--c-norm);   background: var(--c-norm-bg); }
 .k-act    { border-left-color: var(--c-act);    background: var(--c-act-bg); }
 .k-op     { border-left-color: var(--c-op);     background: var(--c-op-bg); }
+/* merge：融合算子（cat / + / × …）渲染成紧凑胶囊，靠形状即可与普通叶子区分。 */
+.k-merge  { border: 1.5px solid var(--c-merge); border-left-width: 1.5px;
+  background: var(--c-merge-bg); min-width: 0; width: fit-content;
+  border-radius: 999px; padding: 5px 16px; }
+.k-merge .title { justify-content: center; gap: 6px; font-size: 13px;
+  font-weight: 800; color: var(--c-merge); }
+.k-merge .badge { display: none; }
+.k-merge .kv { text-align: center; margin-top: 2px; }
 .k-head   { border-left-color: var(--c-head);   background: var(--c-head-bg); }
 .k-output { border-left-color: var(--c-output); background: var(--c-output-bg); }
 .k-loss   { border-left-color: var(--c-loss);   background: var(--c-loss-bg); }
@@ -151,7 +160,8 @@ svg.edges-top { z-index: 3; }
 .badge.k-data{color:var(--c-data)} .badge.k-process{color:var(--c-process)}
 .badge.k-input{color:var(--c-input)} .badge.k-conv{color:var(--c-conv)}
 .badge.k-norm{color:var(--c-norm)} .badge.k-act{color:var(--c-act)}
-.badge.k-op{color:var(--c-op)} .badge.k-head{color:var(--c-head)}
+.badge.k-op{color:var(--c-op)} .badge.k-merge{color:var(--c-merge)}
+.badge.k-head{color:var(--c-head)}
 .badge.k-output{color:var(--c-output)} .badge.k-loss{color:var(--c-loss)}
 .badge.k-model{color:var(--c-model)}
 
@@ -191,7 +201,7 @@ svg.edges-top { z-index: 3; }
 # ---------------------------------------------------------------------------
 _JS = r"""
 const DATA = __DATA__;
-const KINDS = ["data","process","input","conv","norm","act","op","head",
+const KINDS = ["data","process","input","conv","norm","act","op","merge","head",
   "output","loss","model"];
 // 连边线型/配色：forward 主流（实线灰）、skip 跳连（实线蓝，走侧缘嵌套车道）、
 // residual 残差（琥珀虚线，就近局部弧）。
@@ -595,7 +605,7 @@ def _legend_html() -> str:
     items = [
         ("data", "数据"), ("process", "处理"), ("input", "输入"),
         ("stage", "阶段"), ("conv", "卷积"), ("norm", "归一化"),
-        ("act", "激活"), ("op", "算子"), ("head", "头"),
+        ("act", "激活"), ("op", "算子"), ("merge", "融合"), ("head", "头"),
         ("output", "输出"), ("loss", "损失"), ("model", "模型"),
     ]
     spans = []
