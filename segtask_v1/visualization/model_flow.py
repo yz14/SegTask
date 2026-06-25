@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -803,13 +803,119 @@ def _emit_top(b: _ModelGraphBuilder, key: str) -> None:
     for bk in block_order:
         members = block_recs[bk]
         if bk is None:
-            for rec in members:           # 直接挂顶层容器
-                _emit_leaf(b, rec, parent=key)
+            # 未成 block 的散叶直接挂顶层容器；它们之间的真实张量流(如 Downsample
+            # 的 op→norm)同样要连边，否则同框叶子会无边堆在一起。
+            leaf_ids = [_emit_leaf(b, rec, parent=key) for rec in members]
+            top_rec = b.recs.get(key)
+            external = set(top_rec.in_ids) if top_rec else set()
+            _emit_leaf_flow(b, members, leaf_ids, external)
         else:
             _emit_block(b, bk, key, members)
 
-    # 容器内连边：block / 叶子间的真实流 + 结构化补边。
+    # 容器内 block 间连边：纯真实张量流（含穿过 functional 算子的血缘）。
     _emit_intra_edges(b, key, block_recs, block_order)
+
+
+def _emit_leaf_flow(b: _ModelGraphBuilder, members: List[_ModuleRec],
+                    leaf_ids: List[str], external: Set[int]) -> None:
+    """在一组**同级叶子**间按真实张量流连边：逐**输入张量**求其"直接上游叶子"。
+
+    既服务于 block 框内的叶子(``_emit_block``)，也服务于顶层容器里未成 block 的散叶
+    (``_emit_top`` 的 ``bk is None`` 组，如 ``Downsample`` 的 ``op→norm``)。
+
+      · 该张量由某叶子直接产出(``in_src`` 非空，经 weakref 校验防 id 复用)→ 用它，
+        从而保住顺序链与透传链；
+      · 该张量由 functional 算子(torch.cat/+/split…)产生(``in_src`` 为 None)→ 退到
+        血缘 ``in_prov``，取落在**本组内**的叶子集合，从而恢复并联分支的扇入
+        (MultiRF 三支→fuse)与残差扇入(主路尾 + shortcut→输出)。
+    外部输入(``external``)是本框的并联入口，不在组内连边；其上游由顶层入边处理。
+    """
+    name_to_cid = {rec.name: cid for rec, cid in zip(members, leaf_ids)}
+    member_names = set(name_to_cid)
+
+    def _is_shortcut(name: str) -> bool:
+        return any(f".{a}" in name for a in _SHORTCUT_ATTRS)
+
+    def _block_prefix(name: str) -> str:
+        # 捷径叶子所属残差子块的路径前缀（截到 shortcut 段之前），用于把悬空 shortcut
+        # 连回**本子块**的输出叶，避免在多子块拍平成一个框时跨子块误连。
+        for a in _SHORTCUT_ATTRS:
+            idx = name.find(f".{a}")
+            if idx >= 0:
+                return name[:idx]
+        return name
+
+    if b.traced:
+        name_rec = {rec.name: rec for rec in members}
+        # 张量 id → 本 block 内**最后**产出它的叶子名（按前向序覆盖）。透传叶子(Identity、
+        # 无参 attn、inplace 激活)的输出张量与其输入同对象，故会"接管"该 id。
+        last_emit: Dict[int, str] = {}
+        for rec in sorted(members, key=lambda r: r.order):
+            for oid in rec.out_ids:
+                last_emit[oid] = rec.name
+
+        def _supersede(src: str, consumer: _ModuleRec) -> str:
+            # functional 合流(如 `主路 + shortcut`)的扇入，其血缘只记到最早产出者；但真正
+            # 喂入合流的是该张量**最后**的产出叶子(透传链尾，如 norm2→attn 的 attn)。把血缘
+            # 来源上提到该尾叶，既得到正确的 norm2→attn→act2 链，又免去冗余的 norm2→act2。
+            rec_src = name_rec.get(src)
+            if rec_src is None or not rec_src.out_ids:
+                return src
+            cand = last_emit.get(rec_src.out_ids[0])
+            cand_rec = name_rec.get(cand) if cand else None
+            if (cand_rec is not None and cand != src
+                    and cand in member_names and cand_rec.order < consumer.order):
+                return cand
+            return src
+
+        has_out: Set[str] = set()  # 已连出（有下游）的叶子，供残差兜底判定悬空 shortcut
+        for rec, cid in zip(members, leaf_ids):
+            prov = rec.in_prov if len(rec.in_prov) == len(rec.in_ids) else ()
+            for idx, (tid, prod) in enumerate(zip(rec.in_ids, rec.in_src)):
+                if tid in external:          # 外部输入：并联入口，不连块内边
+                    continue
+                if prod is not None and prod != rec.name:
+                    sources: Iterable[str] = (prod,)
+                elif idx < len(prov):        # functional 产出 → 退到血缘
+                    sources = [_supersede(s, rec) for s in prov[idx]]
+                else:
+                    sources = ()
+                for src in sources:
+                    if src not in member_names or src == rec.name:
+                        continue
+                    # 由 shortcut 子树**汇入主路**的边标注为残差(+)；shortcut 内部
+                    # 链(conv→norm)与主路前向流仍为普通前向边。
+                    residual_edge = _is_shortcut(src) and not _is_shortcut(rec.name)
+                    label = "+" if residual_edge else ""
+                    kind = "residual" if residual_edge else "forward"
+                    b._add_edge(name_to_cid[src], cid, label, kind=kind)
+                    has_out.add(src)
+        # 残差兜底：`out = 主路 + shortcut(x)` 的相加是 functional 算子，透传(Identity)
+        # 捷径叶子的输出张量与其输入(块外)同对象、血缘指向块外，prov 无法还原其汇入主路
+        # 的边，留下悬空 shortcut 叶子(无下游)。主路上的透传叶子(无参 attn 等)已由
+        # ``_supersede`` 上提到合流尾叶正确连边，故这里只需兜底**悬空的 shortcut 叶子**：
+        # 把它们补连到汇点——其后最近的悬空主路叶子(相加结果承接叶 act2/主路末层)。
+        # 以"存在悬空 shortcut 叶子"为触发条件(而非容器是否被判残差)，从而也能覆盖把多个
+        # 残差子块拍平成一个框的情形(如 selfattn stage)。仅连 shortcut 叶子，不动其余。
+        ordered = sorted(members, key=lambda r: r.order)
+        for rec in members:
+            if rec.name in has_out or not _is_shortcut(rec.name):
+                continue
+            # 汇点 = 与该 shortcut 同子块前缀、序最大的非 shortcut 叶(本子块输出叶 act2)；
+            # 退而求其次取全组最后一个非 shortcut 叶。
+            pref = _block_prefix(rec.name)
+            sink = next((r.name for r in reversed(ordered)
+                         if not _is_shortcut(r.name) and r.name.startswith(pref)),
+                        None)
+            sink = sink or next((r.name for r in reversed(ordered)
+                                 if not _is_shortcut(r.name)), None)
+            if sink is not None and sink != rec.name:
+                b._add_edge(name_to_cid[rec.name], name_to_cid[sink],
+                            "+", kind="residual")
+    else:
+        # 追踪失败的纯结构降级：按声明序把叶子连成一条线性链，至少给出可读骨架。
+        for prev, cur in zip(leaf_ids, leaf_ids[1:]):
+            b._add_edge(prev, cur)
 
 
 def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
@@ -829,46 +935,11 @@ def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
     g.add_node(block_key, _block_label(block_key, top),
                kind="stage", key_info=ki, parent_id=top, collapsed=True)
 
-    leaf_ids: List[str] = [_emit_leaf(b, rec, parent=block_key) for rec in members]
-
-    # 叶子间真实流连边：每个叶子用 pre_hook 解析出的"直接产出叶子"(in_src)反查其
-    # 输入来自哪个**同 block 兄弟叶子**。in_src 经 weakref 校验，规避 id 复用误连；
-    # block 外部输入的产出者落在别的 block（不在 member 内）→ 自然不连，从而
-    # shortcut 与主路首叶都作为并联入口、互不串接。
+    leaf_ids = [_emit_leaf(b, rec, parent=block_key) for rec in members]
+    # block 外部输入是本框的并联入口，不在块内连边；其上游由顶层入边处理。
     block_rec = b.recs.get(block_key)
     external: Set[int] = set(block_rec.in_ids) if block_rec else set()
-    name_to_cid = {rec.name: cid for rec, cid in zip(members, leaf_ids)}
-    member_names = set(name_to_cid)
-    has_succ: Set[str] = set()
-    for rec, cid in zip(members, leaf_ids):
-        for tid, prod in zip(rec.in_ids, rec.in_src):
-            if tid in external:  # block 外部输入：并联入口，不连块内边
-                continue
-            if prod and prod != rec.name and prod in member_names:
-                scid = name_to_cid[prod]
-                b._add_edge(scid, cid)
-                has_succ.add(scid)
-
-    # 残差/融合 functional 算子（+ / cat）不产生 module，会在主路与输出叶子间断链。
-    # 结构化补回：把"悬空主路叶子"接到输出叶子；shortcut 叶子以 residual 边接入。
-    if residual and len(leaf_ids) >= 2:
-        out_leaf = leaf_ids[-1]              # 末叶（执行序最后）= block 输出
-        shortcut_ids = {cid for rec, cid in zip(members, leaf_ids)
-                        if any(f".{a}" in rec.name for a in _SHORTCUT_ATTRS)}
-        for rec, cid in zip(members, leaf_ids):
-            if cid == out_leaf:
-                continue
-            if cid in shortcut_ids:
-                # 仅 shortcut 的**末叶**接入残差加法：当 shortcut 为
-                # ``Sequential(conv, norm)`` 时，conv→norm 已由块内前向边连好，
-                # 只有 norm（其输出）参与 ``act(out + shortcut(x))``；不可让中间的
-                # conv 也直连 act（否则一条捷径会画出两条入边）。
-                if cid not in has_succ:
-                    b._add_edge(cid, out_leaf, "+", kind="residual")
-            elif cid not in has_succ:        # 悬空主路末端 → 输出叶子
-                b._add_edge(cid, out_leaf)
-        if not shortcut_ids:                 # 无显式 shortcut（如 ConvNeXt 恒等残差）
-            b._add_edge(leaf_ids[0], out_leaf, "+", kind="residual")
+    _emit_leaf_flow(b, members, leaf_ids, external)
 
 
 def _emit_leaf(b: _ModelGraphBuilder, rec: _ModuleRec, parent: str) -> str:
@@ -912,8 +983,13 @@ def _emit_intra_edges(
     block_recs: Dict[Optional[str], List[_ModuleRec]],
     block_order: List[Optional[str]],
 ) -> None:
-    """容器内 block 间连边：真实张量流 + 已知融合容器的结构化补边。"""
-    # 真实流：每个 block 用其模块输入 id 反查同容器内上游 block。
+    """容器内 block 间连边：纯真实张量流。
+
+    每个 block 用其模块输入的血缘 ``in_prov`` 反查同容器内上游 block。血缘由
+    ``TorchFunctionMode`` 钩子穿过 ``torch.cat/+/split`` 等 functional 算子累积，
+    因此 MultiStem 的三路 sub-stem→proj、DecoderLevel 的 upsample→首块等
+    经 cat 融合的边都能被通用地还原，无需按容器类型写死补边。
+    """
     real_blocks = [bk for bk in block_order if bk is not None]
     for bk in real_blocks:
         rec = b.recs.get(bk)
@@ -921,44 +997,6 @@ def _emit_intra_edges(
             continue
         for src in b._producers_in_top(rec.in_prov, top, exclude=bk):
             b._add_edge(src, bk)
-
-    _structural_fusion_edges(b, top, real_blocks)
-
-
-def _structural_fusion_edges(
-    b: _ModelGraphBuilder, top: str, blocks: List[str],
-) -> None:
-    """对已知"含 functional 融合(cat/+)"的容器补结构化边。
-
-    这些融合点（split/cat）会产生无 module 产出的新张量，纯张量 id 反查会断链；
-    据容器类型补回并联分支 → 融合节点 的连边。
-    """
-    mod = b.recs[top].module if top in b.recs else None
-    if mod is None:
-        return
-
-    # MultiStemProj / 分层 stem：三路 sub-stem 并联 → proj/fuse 融合。
-    if _is_multistem(mod):
-        stems = [bk for bk in blocks if _rel(bk, top).startswith("stems.")]
-        fuses = [bk for bk in blocks if not _rel(bk, top).startswith("stems.")]
-        for s in stems:
-            for f in fuses:
-                b._add_edge(s, f, "cat")
-        return
-
-    # DecoderLevel：upsample → 首个 stage block（skip 由顶层跳连边进入本框）。
-    if _is_decoder_level(mod):
-        ups = [bk for bk in blocks if "upsample" in _rel(bk, top)]
-        body = [bk for bk in blocks
-                if "upsample" not in _rel(bk, top)
-                and "gate" not in _rel(bk, top).lower()]
-        if ups and body:
-            # body 内第一个（按已有顺序）即融合后主路入口。
-            first_body = body[0]
-            for u in ups:
-                b._add_edge(u, first_body, "cat")
-        return
-    # 其余容器：依赖张量流真实边，无需结构化补边。
 
 
 def _ensure_backbone_chain(b: _ModelGraphBuilder, backbone: List[str]) -> None:
@@ -1040,29 +1078,6 @@ def _assign_ranks_and_skip(
 
 
 # -- 小工具 ----------------------------------------------------------------
-def _rel(block_key: str, top: str) -> str:
-    return block_key[len(top) + 1:] if block_key.startswith(top + ".") else block_key
-
-
-def _is_multistem(m: nn.Module) -> bool:
-    try:
-        from ..models.stem import MultiStemProj
-        if isinstance(m, MultiStemProj):
-            return True
-    except Exception:  # pragma: no cover
-        pass
-    return type(m).__name__ in ("MultiStemProj", "HierarchicalMultiStem",
-                                "HierarchicalStems")
-
-
-def _is_decoder_level(m: nn.Module) -> bool:
-    try:
-        from ..models.unet import DecoderLevel
-        if isinstance(m, DecoderLevel):
-            return True
-    except Exception:  # pragma: no cover
-        pass
-    return type(m).__name__ == "DecoderLevel"
 
 
 __all__ = ["build_model_flow"]
