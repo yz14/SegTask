@@ -76,9 +76,12 @@ def build_single_payload(
     best_x = _best_x(hist)
     val_keys = set(hist.metric_keys("val"))
     train_keys = set(hist.metric_keys("train"))
+    sel = hist.summary.get("save_best_metric")
+    crit = hist.summary.get("save_best_criterion") or sel
     panels: List[Dict[str, Any]] = []
 
-    # 1) 损失曲线（train / val）。
+    # ============ Training ============
+    # 损失曲线（train / val），占满整行。
     loss_series: List[Dict[str, Any]] = []
     if "loss" in train_keys:
         loss_series.append(_line_series("train loss", _color(0),
@@ -89,74 +92,78 @@ def build_single_payload(
     if loss_series:
         panels.append({
             "id": "loss", "title": "Loss", "kind": "line",
+            "group": "Training", "span": "full",
             "log_toggle": True, "best_x": best_x, "series": loss_series,
         })
 
-    # 2) 选模主指标（高亮单线）。
-    sel = hist.summary.get("save_best_metric")
-    crit = hist.summary.get("save_best_criterion") or sel
-    if sel and sel in val_keys:
-        panels.append({
-            "id": "primary", "title": f"Selection metric · {sel}"
-            + (f"  (criterion={crit})" if crit and crit != sel else ""),
-            "kind": "line", "best_x": best_x,
-            "series": [_line_series(sel, _color(2), _points(hist, sel, "val"))],
-        })
-
-    # 3) 概览指标（多线）。
-    ov = [m for m in _OVERVIEW_METRICS if m in val_keys]
-    if ov:
-        panels.append({
-            "id": "overview", "title": "Validation metrics (mean)",
-            "kind": "line", "best_x": best_x,
-            "series": [_line_series(m, _color(i), _points(hist, m, "val"))
-                       for i, m in enumerate(ov)],
-        })
-
-    # 4) 学习率（对数纵轴）。
-    if any(r.lr is not None for r in hist.records):
-        panels.append({
-            "id": "lr", "title": "Learning rate", "kind": "line",
-            "log": True, "best_x": best_x,
-            "series": [_line_series("lr", _color(8), _points(hist, "lr", "top"))],
-        })
-
-    # 5) GPU 峰值显存。
-    if any(r.gpu_peak_mib is not None for r in hist.records):
-        panels.append({
-            "id": "gpu", "title": "GPU peak memory (MiB)", "kind": "line",
-            "best_x": best_x,
-            "series": [_line_series("gpu_peak_mib", _color(3),
-                                    _points(hist, "gpu_peak_mib", "top"))],
-        })
-
-    # 6) 损失分量（train）。
+    # 损失分量（train），半宽。
     comp = _loss_component_keys(hist)
     if comp:
         panels.append({
             "id": "loss_components", "title": "Loss components (train)",
-            "kind": "line", "best_x": best_x,
+            "kind": "line", "group": "Training", "span": "half",
+            "best_x": best_x,
             "series": [_line_series(k, _color(i), _points(hist, k, "train"))
                        for i, k in enumerate(comp)],
         })
 
-    # 7) 逐类指标网格（每存在前缀一个网格面板）。
+    # ============ Validation ============
+    # 均值指标总览（[0,1] 同尺度多线），选模指标加粗高亮。占满整行。
+    ov = [m for m in _OVERVIEW_METRICS if m in val_keys]
+    if sel and sel in val_keys and sel not in ov:
+        ov = [sel] + ov
+    if ov:
+        ov_series = []
+        for i, m in enumerate(ov):
+            s = _line_series(m, _color(i), _points(hist, m, "val"))
+            if m == sel:
+                s["label"] = f"{m} (selection)"
+                s["emphasis"] = True
+            ov_series.append(s)
+        title = "Validation metrics (mean)"
+        if crit and crit != sel:
+            title += f"  ·  criterion = {crit}"
+        panels.append({
+            "id": "overview", "title": title, "kind": "line",
+            "group": "Validation", "span": "full",
+            "best_x": best_x, "series": ov_series,
+        })
+
+    # 逐类指标：同尺度合并为「一图多线」（每类一条线），半宽。
     for prefix, nice in _PER_CLASS_PREFIXES:
         keys = hist.per_class_keys(prefix, "val")
         if not keys:
             continue
-        charts = []
+        series = []
         for k in keys:
             idx = k[len(prefix):]
-            charts.append({
-                "title": f"class {idx}",
-                "best_x": best_x,
-                "series": [_line_series(k, _color(int(idx) if idx.isdigit() else 0),
-                                        _points(hist, k, "val"))],
-            })
+            ci = int(idx) if idx.isdigit() else 0
+            series.append(_line_series(f"class {idx}", _color(ci),
+                                       _points(hist, k, "val")))
         panels.append({
             "id": f"per_class_{prefix.rstrip('_')}",
-            "title": f"Per-class {nice}", "kind": "grid", "charts": charts,
+            "title": f"Per-class {nice}", "kind": "line",
+            "group": "Validation", "span": "half",
+            "best_x": best_x, "series": series,
+        })
+
+    # ============ System ============
+    # 学习率（对数纵轴），半宽。
+    if any(r.lr is not None for r in hist.records):
+        panels.append({
+            "id": "lr", "title": "Learning rate", "kind": "line",
+            "group": "System", "span": "half",
+            "log": True, "best_x": best_x,
+            "series": [_line_series("lr", _color(8), _points(hist, "lr", "top"))],
+        })
+
+    # GPU 峰值显存，半宽。
+    if any(r.gpu_peak_mib is not None for r in hist.records):
+        panels.append({
+            "id": "gpu", "title": "GPU peak memory (MiB)", "kind": "line",
+            "group": "System", "span": "half", "best_x": best_x,
+            "series": [_line_series("gpu_peak_mib", _color(3),
+                                    _points(hist, "gpu_peak_mib", "top"))],
         })
 
     return {
@@ -242,6 +249,7 @@ def build_compare_payload(
                 series.append(_line_series(names[i], run_colors[i], pts))
         if series:
             panels.append({"id": f"cmp_{m}", "title": m, "kind": "line",
+                           "group": "Comparison", "span": "half",
                            "series": series})
     # 训练损失对比（train loss）。
     tr_series = []
@@ -251,7 +259,8 @@ def build_compare_payload(
             tr_series.append(_line_series(names[i], run_colors[i], pts))
     if tr_series:
         panels.insert(0, {"id": "cmp_train_loss", "title": "train loss",
-                          "kind": "line", "series": tr_series})
+                          "kind": "line", "group": "Comparison",
+                          "span": "half", "series": tr_series})
 
     # best 对照表。
     table = _compare_table(hs, names)

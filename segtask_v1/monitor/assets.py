@@ -43,6 +43,22 @@ header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 680;
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
 .wrap { padding: 16px 20px 60px; max-width: 1400px; margin: 0 auto; }
 
+/* sections + responsive panel grid */
+.section { margin: 22px 0 8px; }
+.section:first-of-type { margin-top: 4px; }
+.section h2 { font-size: 11.5px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted); margin: 0 0 8px;
+  display: flex; align-items: center; gap: 12px; }
+.section h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.panel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px; }
+.panel-grid .panel { margin-bottom: 0; }
+.span-full { grid-column: 1 / -1; }
+@media (max-width: 880px) {
+  .panel-grid { grid-template-columns: 1fr; }
+  .span-full { grid-column: auto; }
+}
+
 /* best card */
 .bestcard { background: var(--good-bg); border: 1px solid #bbf7d0;
   border-radius: 12px; padding: 14px 16px; margin-bottom: 18px; }
@@ -150,6 +166,8 @@ function niceTicks(lo, hi, n) {
 
 // dims
 const DIM = { w: 820, h: 300, ml: 56, mr: 16, mt: 12, mb: 30 };
+// 半宽面板用更窄 viewBox，使其在两列网格里放大、文字仍清晰。
+const HALFDIM = { w: 540, h: 300, ml: 52, mr: 14, mt: 12, mb: 30 };
 const SUBDIM = { w: 360, h: 220, ml: 46, mr: 12, mt: 10, mb: 26 };
 
 function makeChart(container, chart, dim) {
@@ -230,15 +248,17 @@ function makeChart(container, chart, dim) {
       s.appendChild(lab);
     }
 
-    // series polylines
-    for (const z of vis) {
+    // series polylines（强调线最后画、加粗，置于顶层）。
+    const ordered = vis.slice().sort((a, b) => (a.emphasis ? 1 : 0) - (b.emphasis ? 1 : 0));
+    for (const z of ordered) {
       let d = "";
       z.points.forEach((p, i) => {
         const X = px(p[0], xmin, xmax), Y = py(p[1], ymin, ymax, log);
         d += (i ? " L" : "M") + X + " " + Y;
       });
       s.appendChild(svg("path", { d, fill: "none", stroke: z.color,
-        "stroke-width": 1.8, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+        "stroke-width": z.emphasis ? 3 : 1.8,
+        "stroke-linejoin": "round", "stroke-linecap": "round" }));
       if (z.points.length === 1) {
         const p = z.points[0];
         s.appendChild(svg("circle", { cx: px(p[0], xmin, xmax),
@@ -304,7 +324,9 @@ function legendFor(panel, chartObj) {
   chartObj.state.series.forEach(z => {
     const it = el("div", "it" + (z.hidden ? " off" : ""));
     const sw = el("span", "sw"); sw.style.background = z.color;
-    it.appendChild(sw); it.appendChild(el("span", null, z.label));
+    const lab = el("span", null, z.label);
+    if (z.emphasis) lab.style.fontWeight = "700";
+    it.appendChild(sw); it.appendChild(lab);
     it.addEventListener("click", () => {
       z.hidden = !z.hidden; it.classList.toggle("off");
       chartObj.redraw();
@@ -331,10 +353,11 @@ function buildPanel(panel) {
     return box;
   }
 
-  // line panel
+  // line panel（半宽面板用更窄 viewBox）
   const ctrl = el("div", "ctrl");
   title.appendChild(ctrl);
-  const chartObj = makeChart(box, panel, DIM);
+  const dim = panel.span === "half" ? HALFDIM : DIM;
+  const chartObj = makeChart(box, panel, dim);
   // legend (insert before svg)
   const lg = legendFor(panel, chartObj);
   if (lg) box.insertBefore(lg, box.querySelector(".chart"));
@@ -426,7 +449,28 @@ function init() {
   if (!panels.length) {
     wrap.appendChild(el("div", "empty", "暂无指标数据（还没有完成任何 epoch）。"));
   } else {
-    panels.forEach(p => wrap.appendChild(buildPanel(p)));
+    // 按 group 连续分组：每组一个区块标题 + 两列响应式网格。
+    const groups = [];
+    let cur = null;
+    panels.forEach(p => {
+      const g = p.group || "";
+      if (!cur || cur.name !== g) { cur = { name: g, items: [] }; groups.push(cur); }
+      cur.items.push(p);
+    });
+    groups.forEach(grp => {
+      if (grp.name) {
+        const sec = el("div", "section");
+        sec.appendChild(el("h2", null, grp.name));
+        wrap.appendChild(sec);
+      }
+      const pg = el("div", "panel-grid");
+      grp.items.forEach(p => {
+        const box = buildPanel(p);
+        box.classList.add(p.span === "full" ? "span-full" : "span-half");
+        pg.appendChild(box);
+      });
+      wrap.appendChild(pg);
+    });
   }
   // scroll restore (across auto-reload)
   const y = sessionStorage.getItem("mon_scrollY");

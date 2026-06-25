@@ -621,7 +621,7 @@ HTML 交互：顶部标签页切换三视图；纵向流式布局 + 箭头表流
 monitor/
 ├── history.py     # 数据层：MetricsLogger（逐 epoch 原子追加 metrics.jsonl + metrics_summary.json）
 │                  #          MetricsHistory（只读历史模型，供渲染/对比；续训安全、NaN 过滤）
-├── charts.py      # 把历史整理成「渲染就绪」payload（指标抽取、逐类分组、best 计算）
+├── charts.py      # 把历史整理成「渲染就绪」payload（指标抽取、分区/跨列布局、逐类合并、best 计算）
 ├── assets.py      # 内嵌 CSS + 通用 SVG 绘图 JS（坐标轴/网格/悬停读数/图例开关/对数轴）
 ├── dashboard.py   # payload → 自包含 HTML：render/write_dashboard（单 run）、render/write_comparison（多 run）
 └── __main__.py    # CLI：python -m segtask_v1.monitor —— 离线重渲染 / 多 run 对比
@@ -651,6 +651,8 @@ python -m segtask_v1.monitor runs/exp_a
 python -m segtask_v1.monitor runs/exp_a runs/exp_b runs/exp_c \
     -o cmp.html --names baseline +aug +ema
 ```
+
+**布局**（按「少而精」组织，避免图过多过散）：图表分 **Training / Validation / System** 三个区块，宽屏下两列响应式网格自适应排布。**同尺度指标合并到同一张图**——例如逐类 Dice 不再每类一张小图，而是「一图多线」（每类一条线，图例可逐类开关）；逐类 IoU 同理。验证均值指标（mean_dice / mean_iou…）共用一张 [0,1] 总览图，其中**选模指标加粗高亮并标注 `(selection)`**，不再额外单列一张冗余面板。
 
 HTML 交互：每张图悬停显示竖向参考线与各序列读数；点击图例可隐藏/显示对应曲线；损失/学习率等支持对数纵轴切换；best epoch 在曲线上以标记高亮；顶部「best 模型指标卡」汇总选模指标及该 epoch 的各项验证指标。
 
