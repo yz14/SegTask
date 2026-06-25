@@ -163,6 +163,22 @@ function niceTicks(lo, hi, n) {
   for (let t = start; t <= hi + step * 1e-6; t += step) out.push(t);
   return out;
 }
+// x 轴是整数 epoch：用整数步长生成「唯一」整数刻度，避免 1,1,1,2,2,2 这类
+// 浮点等分后取整产生的重复标签；epoch 少时退化为逐个整数。
+function intTicks(lo, hi, n) {
+  if (!isFinite(lo) || !isFinite(hi)) return [];
+  const ilo = Math.ceil(lo - 1e-9), ihi = Math.floor(hi + 1e-9);
+  if (ihi <= ilo) return [Math.round((lo + hi) / 2)];
+  const span = ihi - ilo;
+  let step = Math.max(1, Math.ceil(span / Math.max(1, n)));
+  const mag = Math.pow(10, Math.floor(Math.log10(step)));
+  const norm = step / mag;
+  step = Math.max(1, Math.round((norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag));
+  const out = [];
+  for (let t = ilo; t <= ihi; t += step) out.push(t);
+  if (out[out.length - 1] !== ihi) out.push(ihi);
+  return out;
+}
 
 // dims
 const DIM = { w: 820, h: 300, ml: 56, mr: 16, mt: 12, mb: 30 };
@@ -222,8 +238,8 @@ function makeChart(container, chart, dim) {
       lab.textContent = fmt(t);
       s.appendChild(lab);
     }
-    // x ticks
-    const xticks = niceTicks(xmin, xmax, 6).filter(t => t >= xmin && t <= xmax);
+    // x ticks（整数 epoch，唯一刻度）
+    const xticks = intTicks(xmin, xmax, 6).filter(t => t >= xmin - 1e-9 && t <= xmax + 1e-9);
     for (const t of xticks) {
       const x = px(t, xmin, xmax);
       const lab = svg("text", { x: x, y: dim.h - dim.mb + 14, "text-anchor": "middle",
@@ -242,7 +258,10 @@ function makeChart(container, chart, dim) {
       const x = px(chart.best_x, xmin, xmax);
       s.appendChild(svg("line", { x1: x, y1: dim.mt, x2: x, y2: dim.h - dim.mb,
         stroke: "var(--best)", "stroke-width": 1.2, "stroke-dasharray": "4 3" }));
-      const lab = svg("text", { x: x + 3, y: dim.mt + 10, "font-size": 9.5,
+      // best 标签：靠近右边缘时改为右对齐、移到竖线左侧，避免被裁切。
+      const nearRight = x > dim.w - dim.mr - 26;
+      const lab = svg("text", { x: nearRight ? x - 4 : x + 3, y: dim.mt + 10,
+        "text-anchor": nearRight ? "end" : "start", "font-size": 9.5,
         fill: "var(--best)", "font-family": "var(--font-mono)" });
       lab.textContent = "best";
       s.appendChild(lab);
@@ -256,9 +275,11 @@ function makeChart(container, chart, dim) {
         const X = px(p[0], xmin, xmax), Y = py(p[1], ymin, ymax, log);
         d += (i ? " L" : "M") + X + " " + Y;
       });
-      s.appendChild(svg("path", { d, fill: "none", stroke: z.color,
+      const attrs = { d, fill: "none", stroke: z.color,
         "stroke-width": z.emphasis ? 3 : 1.8,
-        "stroke-linejoin": "round", "stroke-linecap": "round" }));
+        "stroke-linejoin": "round", "stroke-linecap": "round" };
+      if (z.dash) attrs["stroke-dasharray"] = z.dash;
+      s.appendChild(svg("path", attrs));
       if (z.points.length === 1) {
         const p = z.points[0];
         s.appendChild(svg("circle", { cx: px(p[0], xmin, xmax),
@@ -320,10 +341,22 @@ function logTicks(lo, hi) {
 
 function legendFor(panel, chartObj) {
   if (chartObj.state.series.length < 2) return null;
+  // 面板内存在多种线型时，图例色块用「小线段」展示颜色 + 线型（实线/虚线）。
+  const hasDash = chartObj.state.series.some(z => z.dash);
   const lg = el("div", "legend");
   chartObj.state.series.forEach(z => {
     const it = el("div", "it" + (z.hidden ? " off" : ""));
-    const sw = el("span", "sw"); sw.style.background = z.color;
+    let sw;
+    if (hasDash) {
+      sw = svg("svg", { width: 16, height: 10, viewBox: "0 0 16 10" });
+      sw.style.flex = "0 0 auto";
+      const ln = svg("line", { x1: 0, y1: 5, x2: 16, y2: 5, stroke: z.color,
+        "stroke-width": 2, "stroke-linecap": "round" });
+      if (z.dash) ln.setAttribute("stroke-dasharray", z.dash);
+      sw.appendChild(ln);
+    } else {
+      sw = el("span", "sw"); sw.style.background = z.color;
+    }
     const lab = el("span", null, z.label);
     if (z.emphasis) lab.style.fontWeight = "700";
     it.appendChild(sw); it.appendChild(lab);
