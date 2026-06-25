@@ -31,6 +31,8 @@
     - [3.6 `losses/` —— 二元 sigmoid 损失库 + 多分辨率/2.5D 包装器](#36-losses--二元-sigmoid-损失库--多分辨率25d-包装器)
     - [3.7 `trainer.py` —— 训练循环](#37-trainerpy--训练循环)
     - [3.8 `predictor.py` —— 滑动窗口推理](#38-predictorpy--滑动窗口推理)
+    - [3.9 `visualization/` —— 全流程可视化分析工具](#39-visualization--全流程可视化分析工具)
+    - [3.10 `monitor/` —— 训练过程监测仪表盘](#310-monitor--训练过程监测仪表盘)
   - [4. `configs/` —— YAML 配置 + 实验脚本](#4-configs--yaml-配置--实验脚本)
   - [5. `tools/` —— 数据集体检工具](#5-tools--数据集体检工具)
   - [6. 根目录测试脚本](#6-根目录测试脚本)
@@ -118,13 +120,20 @@ SegTask/
 │   ├── losses/                        # 损失函数（§3.6）
 │   │   ├── __init__.py
 │   │   └── losses.py                  # ~1270 行：基础 loss × wrapper × build_loss 工厂
-│   └── visualization/                 # 全流程可视化分析工具（§3.7，vis.enabled 守卫）
-│       ├── __init__.py                # generate_visualization 入口：构建三视图 → 自包含 HTML
-│       ├── graph.py                   # IR：VisNode / VisEdge / VisGraph（与渲染解耦）
-│       ├── render.py                  # 渲染器：IR → 零依赖自包含 HTML（三标签页）
-│       ├── data_flow.py               # 数据流 builder（npz → 取块 → 增强 → 裁剪 → 模型输入）
-│       ├── model_flow.py              # 模型流 builder（CPU dummy 前向 + hook 追踪真实形状）
-│       └── predict_flow.py            # 预测流 builder（预处理 → 滑窗/TTA → 模型 → 融合 → 输出）
+│   ├── visualization/                 # 全流程可视化分析工具（§3.9，vis.enabled 守卫）
+│   │   ├── __init__.py                # generate_visualization 入口：构建三视图 → 自包含 HTML
+│   │   ├── graph.py                   # IR：VisNode / VisEdge / VisGraph（与渲染解耦）
+│   │   ├── render.py                  # 渲染器：IR → 零依赖自包含 HTML（三标签页）
+│   │   ├── data_flow.py               # 数据流 builder（npz → 取块 → 增强 → 裁剪 → 模型输入）
+│   │   ├── model_flow.py              # 模型流 builder（CPU dummy 前向 + hook 追踪真实形状）
+│   │   └── predict_flow.py            # 预测流 builder（预处理 → 滑窗/TTA → 模型 → 融合 → 输出）
+│   └── monitor/                       # 训练过程监测仪表盘（§3.10，monitor.enabled 守卫）
+│       ├── __init__.py                # 导出数据层 + 渲染层 API
+│       ├── history.py                 # 数据层：MetricsLogger 落盘 / MetricsHistory 只读历史
+│       ├── charts.py                  # 历史 → 渲染就绪 payload（指标抽取 / 逐类分组 / best）
+│       ├── assets.py                  # 内嵌 CSS + 通用 SVG 绘图 JS（零依赖）
+│       ├── dashboard.py               # payload → 自包含 HTML（单 run / 多 run 对比，原子写盘）
+│       └── __main__.py                # CLI：python -m segtask_v1.monitor（离线重渲染 / 对比）
 │
 ├── tools/                             # 数据集体检脚本（§5）
 │   ├── scan_bad_nifti.py              # 扫描 SimpleITK 读不开的非正交 NIfTI
@@ -601,6 +610,49 @@ vis:
 ```
 
 HTML 交互：顶部标签页切换三视图；纵向流式布局 + 箭头表流向；stage 大框可点击折叠/展开内部算子；任意节点**双击**弹出详情抽屉（完整参数 / 形状 / 模块路径）。模型流的形状追踪若失败会优雅降级为纯结构图，不影响其余视图。
+
+---
+
+### 3.10 `monitor/` —— 训练过程监测仪表盘
+
+与 §3.9 的「静态结构图」正交：`monitor/` 关注**训练时序**——把逐 epoch 的损失、各项验证指标、逐类 Dice/IoU 等指标、学习率、显存峰值随训练演进的曲线导出为一份**自包含 HTML 仪表盘**（零外部依赖、可离线打开、手绘 SVG 曲线）。训练中按节奏实时刷新、训练后明确给出 best 模型各项指标，并支持多次实验横向对比，便于调参与 debug。
+
+```text
+monitor/
+├── history.py     # 数据层：MetricsLogger（逐 epoch 原子追加 metrics.jsonl + metrics_summary.json）
+│                  #          MetricsHistory（只读历史模型，供渲染/对比；续训安全、NaN 过滤）
+├── charts.py      # 把历史整理成「渲染就绪」payload（指标抽取、逐类分组、best 计算）
+├── assets.py      # 内嵌 CSS + 通用 SVG 绘图 JS（坐标轴/网格/悬停读数/图例开关/对数轴）
+├── dashboard.py   # payload → 自包含 HTML：render/write_dashboard（单 run）、render/write_comparison（多 run）
+└── __main__.py    # CLI：python -m segtask_v1.monitor —— 离线重渲染 / 多 run 对比
+```
+
+启用方式（默认关闭，`enabled=False` 时**零开销、零副作用、零文件**）：在 YAML 里打开开关，训练时 `Trainer` 一处守卫调用自动落盘并周期重渲染。整套逻辑异常隔离——监测任何失败仅告警、绝不中断训练。
+
+```yaml
+monitor:
+  enabled: true            # 总开关；false 时完全跳过
+  output_dir: ""           # 空 → 落到 train.output_dir；HTML 写在此，数据写在其 monitor/ 子目录
+  filename: "training_monitor.html"
+  update_every: 1          # 每多少个 epoch 重渲染一次 HTML（best/末轮总会强制刷新）
+  auto_reload_seconds: 10  # 训练中 HTML 自动重载间隔（秒）；训练结束后的终渲染为静态
+  run_name: ""             # 对比页中的显示名；空 → 取 output_dir 目录名
+```
+
+落盘产物：`<output_dir>/monitor/metrics.jsonl`（逐 epoch 一行 JSON，崩溃安全的原子写）+ `metrics_summary.json`（run 状态 / best 摘要）+ 顶层 `<output_dir>/training_monitor.html`。续训（`train.resume`）时自动按 epoch 号去重续写，不会重复或截断历史。
+
+训练之后还可用 CLI 离线（重）渲染或把多次实验叠加对比：
+
+```bash
+# 单 run 重渲染（缺省写到该 run 目录下 training_monitor.html）
+python -m segtask_v1.monitor runs/exp_a
+
+# 多 run 对比：同名指标曲线叠加 + best 对照表
+python -m segtask_v1.monitor runs/exp_a runs/exp_b runs/exp_c \
+    -o cmp.html --names baseline +aug +ema
+```
+
+HTML 交互：每张图悬停显示竖向参考线与各序列读数；点击图例可隐藏/显示对应曲线；损失/学习率等支持对数纵轴切换；best epoch 在曲线上以标记高亮；顶部「best 模型指标卡」汇总选模指标及该 epoch 的各项验证指标。
 
 ---
 

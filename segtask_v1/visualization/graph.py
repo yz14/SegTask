@@ -146,6 +146,84 @@ class VisGraph:
         }
 
 
+def assign_grid_layout(g: "VisGraph", *, assign_ranks: bool = False) -> None:
+    """为图中每个父容器内的兄弟节点计算 ``(rank, col, colspan)``，供 renderer 摆进
+    CSS Grid。纯靠图结构（forward 边血缘），与具体网络/流程无关，可被任一 builder 复用。
+
+    * ``assign_ranks=True``：先按 forward 边做**最长路径分层**写入 ``rank``（线性流程
+      因此自上而下逐级排开，不再因缺省 rank 全堆在同一格）；``residual`` 边不计入层级。
+      模型流自带更复杂的 rank/skip 计算，故以 ``False`` 调用、只补列位。
+    * 列位：逐 rank 自上而下，按已定稿的 forward 父定列——无父则占新列；有父则
+      ``col=min(父.col)``、``colspan`` 覆盖父列区间（单父继承使主链笔直，多父跨列居中）；
+      同 rank 内按 ``(col, 插入序)`` 从左到右去重叠（右移）。
+    """
+    by_parent: Dict[Optional[str], List[VisNode]] = {}
+    for n in g.nodes:
+        by_parent.setdefault(n.parent_id, []).append(n)
+
+    if assign_ranks:
+        node_rank: Dict[str, int] = {}
+        for kids in by_parent.values():
+            ids = [n.id for n in kids]
+            idset = set(ids)
+            succ: Dict[str, List[str]] = {i: [] for i in ids}
+            indeg: Dict[str, int] = {i: 0 for i in ids}
+            for e in g.edges:
+                if e.kind == "residual":
+                    continue
+                if e.src in idset and e.dst in idset:
+                    succ[e.src].append(e.dst)
+                    indeg[e.dst] += 1
+            rank = {i: 0 for i in ids}
+            queue = [i for i in ids if indeg[i] == 0]
+            while queue:
+                cur = queue.pop()
+                for nx in succ[cur]:
+                    if rank[cur] + 1 > rank[nx]:
+                        rank[nx] = rank[cur] + 1
+                    indeg[nx] -= 1
+                    if indeg[nx] == 0:
+                        queue.append(nx)
+            node_rank.update(rank)
+        for n in g.nodes:
+            n.rank = node_rank.get(n.id, 0)
+
+    fwd_parents: Dict[str, List[str]] = {}
+    for e in g.edges:
+        if e.kind == "forward":
+            fwd_parents.setdefault(e.dst, []).append(e.src)
+
+    for kids in by_parent.values():
+        idset = {n.id for n in kids}
+        order_idx = {n.id: i for i, n in enumerate(kids)}
+        by_rank: Dict[int, List[str]] = {}
+        for n in kids:
+            by_rank.setdefault(n.rank, []).append(n.id)
+        col: Dict[str, int] = {}
+        span: Dict[str, int] = {}
+        for r in sorted(by_rank):
+            row = by_rank[r]
+            for nid in row:
+                ps = [p for p in fwd_parents.get(nid, ())
+                      if p in idset and p in col and p != nid]
+                if not ps:
+                    col[nid] = 0
+                    span[nid] = 1
+                else:
+                    lo = min(col[p] for p in ps)
+                    hi = max(col[p] + span[p] for p in ps)
+                    col[nid] = lo
+                    span[nid] = hi - lo
+            cursor: Optional[int] = None
+            for nid in sorted(row, key=lambda x: (col[x], order_idx[x])):
+                if cursor is not None and col[nid] < cursor:
+                    col[nid] = cursor
+                cursor = col[nid] + span[nid]
+        for n in kids:
+            n.col = col[n.id]
+            n.colspan = span[n.id]
+
+
 def shape_str(shape) -> str:
     """张量形状 → 紧凑字符串 ``(B, C, D, H, W)``；``None`` → ``"?"``。"""
     if shape is None:
@@ -173,4 +251,4 @@ def _fmt_value(v: object) -> str:
 
 
 __all__ = ["VisNode", "VisEdge", "VisGraph", "NODE_KINDS", "EDGE_KINDS",
-           "shape_str"]
+           "shape_str", "assign_grid_layout"]

@@ -14,7 +14,9 @@ import pytest
 
 from segtask_v1.config import load_config
 from segtask_v1.models.factory import build_model
+from segtask_v1.visualization.data_flow import build_data_flow
 from segtask_v1.visualization.model_flow import build_model_flow
+from segtask_v1.visualization.predict_flow import build_predict_flow
 
 _CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 
@@ -210,3 +212,51 @@ def test_block_column_layout():
             iv = sorted((n.col, n.col + n.colspan, n.id) for n in nodes)
             for a, b in zip(iv, iv[1:]):
                 assert a[1] <= b[0], f"同 rank 列重叠: {a[2]} 与 {b[2]}"
+
+
+# ---------------------------------------------------------------------------
+# 数据流 / 预测流：线性链各节点应分到唯一 (rank, col)，不再全堆同一格。
+# （回归：列布局改造后这两条线性流未调用 assign_grid_layout，缺省 rank=0/col=0
+#  导致所有框堆叠在一起。）
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("cfg_name", ["seg2_5d.yaml", "lungves_multirf.yaml",
+                                      "seg3d.yaml"])
+def test_linear_flows_no_stacking(cfg_name):
+    cfg = load_config(str(_CONFIGS / cfg_name))
+    for builder in (build_data_flow, build_predict_flow):
+        g = builder(cfg)
+        cells = [(n.rank, n.col) for n in g.nodes]
+        assert len(cells) == len(set(cells)), \
+            f"{cfg_name} {builder.__name__}: 节点堆在同一 (rank,col) 格"
+        # 线性链：rank 逐级递增、跨越所有节点（不止 rank0）。
+        assert max(r for r, _ in cells) == len(g.nodes) - 1, \
+            f"{cfg_name} {builder.__name__}: 应自上而下逐级排开"
+
+
+# ---------------------------------------------------------------------------
+# head 容器内「block 框 + 其后散叶分类器」应串成链（conv → classifier），
+# 而非因无连边默认同 rank 并排堆叠。
+# （回归：DS Head 内 ConvNormAct block 与 loose Conv2d classifier 并列。）
+# ---------------------------------------------------------------------------
+def test_head_block_then_loose_leaf_chained():
+    g = _build("seg2_5d.yaml")
+    by_parent = {}
+    for n in g.nodes:
+        by_parent.setdefault(n.parent_id, []).append(n)
+    checked = 0
+    for pid, kids in by_parent.items():
+        if not pid or "ds_head" not in pid.lower() and "head" not in pid.lower():
+            continue
+        block_kids = [k for k in kids if k.kind == "stage"]
+        loose_kids = [k for k in kids if k.id.startswith("leaf::")]
+        if not (block_kids and loose_kids):
+            continue
+        checked += 1
+        ids = {k.id for k in kids}
+        edges = _intra_edges(g, ids)
+        assert _num_components([k.id for k in kids], edges) == 1, \
+            f"{pid}: block 与散叶分类器应连边成链"
+        # block 与散叶不应同 rank（应是先后关系，纵向错开）。
+        assert {k.rank for k in block_kids}.isdisjoint({k.rank for k in loose_kids}), \
+            f"{pid}: block 与散叶分类器不应同 rank 并排"
+    assert checked, "应存在含 block + 散叶分类器的 head 容器"
