@@ -828,6 +828,37 @@ class VisConfig:
 
 
 # ---------------------------------------------------------------------------
+# Training monitor (TODO #2)
+# ---------------------------------------------------------------------------
+@dataclass
+class MonitorConfig:
+    """训练过程监测仪表盘开关。``enabled=False`` 时零开销、零副作用。
+
+    与 ``VisConfig``（静态架构 / 数据流图）正交：本配置控制**训练时序**监测
+    —— 逐 epoch 落盘损失 / 指标 / 学习率 / 显存到 ``metrics.jsonl``，并周期性
+    重渲染一份自包含 HTML 仪表盘（曲线 + best 模型指标卡片），支持训练中实时
+    刷新与训练后复看 / 多 run 对比。落盘与渲染均封装在 ``segtask_v1.monitor``，
+    失败被隔离、不会中断训练。
+    """
+
+    # 总开关：关闭时 Trainer 完全跳过监测逻辑。
+    enabled: bool = False
+    # 输出目录；空串 → 落到 ``train.output_dir/monitor``。
+    output_dir: str = ""
+    # 仪表盘 HTML 文件名。
+    filename: str = "training_monitor.html"
+    # 每多少个 epoch 重渲染一次 HTML（指标 jsonl 每 epoch 都写）；刷新 best 与
+    # 训练收尾时强制重渲染，不受此节流影响。
+    update_every: int = 1
+    # 仪表盘内嵌 JS 自动重载间隔（秒）；<=0 关闭自动刷新（训练后静态复看）。
+    auto_reload_seconds: int = 10
+    # 本 run 名称（图例 / 标题用）；空串 → 取 output_dir 末级目录名。
+    run_name: str = ""
+    # 训练结束后额外渲染一份多 run 对比 HTML 的参照 run 目录列表；空则不生成。
+    compare_runs: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------
 @dataclass
@@ -842,6 +873,7 @@ class Config:
     predict: PredictConfig = field(default_factory=PredictConfig)
     ssl    : SSLConfig     = field(default_factory=SSLConfig)
     vis    : VisConfig     = field(default_factory=VisConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
 
     def sync(self) -> None:
         """同步跨子配置的对应字段。
@@ -954,6 +986,7 @@ class Config:
         self._validate_train()
         self._validate_predict()
         self._validate_ssl()
+        self._validate_monitor()
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)
@@ -1661,6 +1694,17 @@ class Config:
             int(s.save_every) >= 1,
             f"ssl.save_every must be >= 1; got {s.save_every}.")
 
+    def _validate_monitor(self) -> None:
+        """monitor.* 训练监测仪表盘校验（仅 monitor.enabled 时生效）。"""
+        if not self.monitor.enabled:
+            return
+        m = self.monitor
+        _require(
+            int(m.update_every) >= 1,
+            f"monitor.update_every must be >= 1; got {m.update_every}.")
+        _require(
+            isinstance(m.compare_runs, list),
+            f"monitor.compare_runs must be a list of run dirs; got {m.compare_runs!r}.")
 
     @property
     def num_fg_classes(self) -> int:
@@ -1690,6 +1734,7 @@ _SUB_CONFIGS = {
     "predict": PredictConfig,
     "ssl": SSLConfig,
     "vis": VisConfig,
+    "monitor": MonitorConfig,
 }
 
 
