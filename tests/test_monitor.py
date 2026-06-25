@@ -139,7 +139,8 @@ def test_single_payload_structure(tmp_path):
     assert {"loss", "overview", "lr", "gpu"} <= ids
     # 已去掉冗余的独立「选模指标」面板（并入概览高亮）。
     assert "primary" not in ids
-    assert any(i.startswith("per_class_dice_class") for i in ids)
+    # 逐类 [0,1] 指标合并到统一面板。
+    assert "per_class_unit" in ids
 
     # 分组 / 跨列布局元数据齐全。
     by_id = {p["id"]: p for p in payload["panels"]}
@@ -152,11 +153,12 @@ def test_single_payload_structure(tmp_path):
     ov_sel = [s for s in by_id["overview"]["series"] if s.get("emphasis")]
     assert len(ov_sel) == 1 and "(selection)" in ov_sel[0]["label"]
 
-    # 逐类指标合并为「一图多线」：每类一条线（num_classes=2 → 2 条）。
-    pc = next(p for p in payload["panels"]
-              if p["id"].startswith("per_class_dice_class"))
+    # 逐类指标合并为「一图多线」：fixture 只有 Dice（num_classes=2 → 2 条），
+    # 单指标时半宽。
+    pc = by_id["per_class_unit"]
     assert pc["kind"] == "line" and len(pc["series"]) == 2
     assert pc["span"] == "half"
+    assert pc["title"] == "Per-class Dice"
 
     # x 轴为 1-based epoch。
     loss = by_id["loss"]
@@ -166,6 +168,58 @@ def test_single_payload_structure(tmp_path):
     bc = payload["best_card"]
     assert bc["headline"]["metric"] == "mean_dice"
     assert bc["headline"]["epoch"] == 5
+
+
+def test_per_class_unit_scale_merge(tmp_path):
+    # 同为 [0,1] 尺度的 Dice + IoU 合并到一张图：每类一色、每指标一线型。
+    d = tmp_path / "merge" / "monitor"
+    lg = MetricsLogger(d, run_name="merge", save_best_metric="mean_dice",
+                       save_best_mode="max", num_classes=2, total_epochs=3)
+    for ep in range(3):
+        lg.log_epoch(ep, train=_train(ep), val={
+            "mean_dice": 0.5 + 0.04 * ep,
+            "dice_class_0": 0.9, "dice_class_1": 0.4 + 0.05 * ep,
+            "iou_class_0": 0.8, "iou_class_1": 0.3 + 0.05 * ep,
+        })
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    payload = charts.build_single_payload(hist)
+    by_id = {p["id"]: p for p in payload["panels"]}
+    pc = by_id["per_class_unit"]
+    # 两指标 → 占满整行；2 类 × 2 指标 = 4 条线。
+    assert pc["span"] == "full"
+    assert len(pc["series"]) == 4
+    assert pc["title"] == "Per-class Dice / IoU"
+    # Dice 实线（无 dash），IoU 虚线（有 dash）。
+    dice = [s for s in pc["series"] if "Dice" in s["label"]]
+    iou = [s for s in pc["series"] if "IoU" in s["label"]]
+    assert all("dash" not in s for s in dice)
+    assert all(s.get("dash") for s in iou)
+    # 同一类的 Dice / IoU 同色。
+    c0_dice = next(s for s in dice if s["label"].startswith("class 0"))
+    c0_iou = next(s for s in iou if s["label"].startswith("class 0"))
+    assert c0_dice["color"] == c0_iou["color"]
+
+
+def test_per_class_other_scale_separate(tmp_path):
+    # 非 [0,1] 尺度（MCC）不并入合并图，单独成图。
+    d = tmp_path / "mcc" / "monitor"
+    lg = MetricsLogger(d, run_name="mcc", save_best_metric="mean_dice",
+                       save_best_mode="max", num_classes=2, total_epochs=2)
+    for ep in range(2):
+        lg.log_epoch(ep, train=_train(ep), val={
+            "mean_dice": 0.5 + 0.04 * ep,
+            "dice_class_0": 0.9, "dice_class_1": 0.5,
+            "mcc_class_0": -0.2 + 0.1 * ep, "mcc_class_1": 0.1,
+        })
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    payload = charts.build_single_payload(hist)
+    ids = {p["id"] for p in payload["panels"]}
+    assert "per_class_unit" in ids          # dice
+    assert "per_class_mcc_class" in ids      # mcc 单独
+    by_id = {p["id"]: p for p in payload["panels"]}
+    assert all("dash" not in s for s in by_id["per_class_mcc_class"]["series"])
 
 
 def test_single_payload_empty_history():

@@ -40,15 +40,21 @@ _OVERVIEW_METRICS: List[str] = [
     "mean_mcc", "mean_vol_sim", "mean_surface_dice", "min_class_dice",
 ]
 
-# 逐类指标前缀 → 人类可读名。
-_PER_CLASS_PREFIXES: List[tuple] = [
+# 逐类指标前缀 → 人类可读名。[0,1] 同尺度的合并到一张图（线型区分指标）；
+# 其它尺度（MCC∈[-1,1]、VolSim）各自单图，避免尺度混淆。
+_UNIT_SCALE_PREFIXES: List[tuple] = [
     ("dice_class_", "Dice"),
     ("iou_class_", "IoU"),
     ("recall_class_", "Recall"),
     ("precision_class_", "Precision"),
+]
+_OTHER_SCALE_PREFIXES: List[tuple] = [
     ("mcc_class_", "MCC"),
     ("vol_sim_class_", "VolSim"),
 ]
+
+# 合并图里「每个指标一种线型」（SVG stroke-dasharray；None=实线）。
+_METRIC_DASH: List[Optional[str]] = [None, "5 3", "1 3", "7 3 2 3"]
 
 
 def _loss_component_keys(hist: MetricsHistory) -> List[str]:
@@ -129,8 +135,34 @@ def build_single_payload(
             "best_x": best_x, "series": ov_series,
         })
 
-    # 逐类指标：同尺度合并为「一图多线」（每类一条线），半宽。
-    for prefix, nice in _PER_CLASS_PREFIXES:
+    # 逐类指标：同为 [0,1] 尺度的多个指标进一步合并到「同一张图」——
+    # 每类一种颜色、每个指标一种线型（实线 / 虚线 …），图例区分。
+    # 非 [0,1] 尺度（MCC∈[-1,1]、VolSim）各自单图，避免尺度混淆。
+    present_unit = [(p, n) for p, n in _UNIT_SCALE_PREFIXES
+                    if hist.per_class_keys(p, "val")]
+    if present_unit:
+        series = []
+        for mi, (prefix, nice) in enumerate(present_unit):
+            dash = _METRIC_DASH[mi % len(_METRIC_DASH)]
+            for k in hist.per_class_keys(prefix, "val"):
+                idx = k[len(prefix):]
+                ci = int(idx) if idx.isdigit() else 0
+                s = _line_series(f"class {idx} · {nice}", _color(ci),
+                                 _points(hist, k, "val"))
+                if dash:
+                    s["dash"] = dash
+                series.append(s)
+        nices = [n for _, n in present_unit]
+        title = ("Per-class " + nices[0]) if len(nices) == 1 \
+            else "Per-class " + " / ".join(nices)
+        panels.append({
+            "id": "per_class_unit", "title": title, "kind": "line",
+            "group": "Validation",
+            "span": "half" if len(present_unit) == 1 else "full",
+            "best_x": best_x, "series": series,
+        })
+
+    for prefix, nice in _OTHER_SCALE_PREFIXES:
         keys = hist.per_class_keys(prefix, "val")
         if not keys:
             continue
