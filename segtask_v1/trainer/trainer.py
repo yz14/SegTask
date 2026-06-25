@@ -26,7 +26,7 @@ from colorama import Fore, Style
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from ..config import Config
 from ..data.augment import GPUAugmentor
@@ -47,6 +47,13 @@ from .checkpoint import (
     extract_model_state_dict,
     strip_common_prefixes,
     unwrap_compile,
+)
+from .dist_utils import (
+    barrier,
+    get_rank,
+    get_world_size,
+    is_dist_avail_and_initialized,
+    is_main_process,
 )
 from .memory import estimate_train_memory
 from .optim import WarmupScheduler, build_optimizer, build_scheduler
@@ -164,6 +171,38 @@ class Trainer:
                 self.model = torch.compile(self.model, mode=tc.compile_mode)
                 self._compile_enabled = True
 
+        # --- DDP (多卡) ------------------------------------------------
+        # ``self.model`` 始终保持"裸 / 已 compile"模块：optimizer / EMA / checkpoint /
+        # predictor 全部继续作用其上，参数张量与单卡完全一致（DDP 不复制参数，仅挂
+        # 反传 all-reduce 钩子）。前向走 ``self.fwd_model``（DDP 包装），梯度即在各卡
+        # 间同步。``world_size<=1`` 时 fwd_model 即裸模块，单卡路径零变化。
+        self._rank       = get_rank()
+        self._world_size = get_world_size()
+        self._is_main    = is_main_process()
+        self._is_dist    = is_dist_avail_and_initialized() and self._world_size > 1
+        if self._is_dist:
+            ddp_kwargs: Dict[str, object] = {}
+            if device.type == "cuda" and device.index is not None:
+                ddp_kwargs = {"device_ids": [device.index],
+                              "output_device": device.index}
+            self.fwd_model = nn.parallel.DistributedDataParallel(
+                self.model,
+                find_unused_parameters=bool(tc.ddp_find_unused_parameters),
+                **ddp_kwargs)
+            logger.info(
+                "DDP enabled: rank=%d/%d, device=%s, "
+                "find_unused_parameters=%s. Training grads all-reduce per "
+                "backward (math-equivalent to single-GPU under grad-accum).",
+                self._rank, self._world_size, device,
+                tc.ddp_find_unused_parameters)
+        else:
+            self.fwd_model = self.model
+
+        # DDP 训练采样器（每 epoch set_epoch 重洗）；非 DDP 为 None。
+        _sampler = getattr(self.train_loader, "sampler", None)
+        self._train_sampler = (
+            _sampler if isinstance(_sampler, DistributedSampler) else None)
+
         # --- 增强 ------------------------------------------------------
         _scales = cfg.data.multi_res_scales or [1.0]
         self.augmentor = GPUAugmentor(cfg.augment, max_scale=max(_scales))
@@ -225,7 +264,9 @@ class Trainer:
         self._monitor = None
         self._monitor_html = None
         self._monitor_cfg = getattr(self.cfg, "monitor", None)
-        if self._monitor_cfg is not None and self._monitor_cfg.enabled:
+        # 落盘 / 渲染等副作用仅在 rank0 进行，避免多进程争抢同一文件。
+        if (self._monitor_cfg is not None and self._monitor_cfg.enabled
+                and self._is_main):
             self._init_monitor(resume_active)
 
     # ------------------------------------------------------------------
@@ -283,10 +324,14 @@ class Trainer:
         for epoch in range(self.start_epoch, tc.epochs):
             epoch_t0 = time.time()
             train_metrics = self._train_epoch(epoch)
+            train_time_s = time.time() - epoch_t0
 
             val_metrics: Dict[str, float] = {}
+            val_time_s = 0.0
             if (epoch + 1) % tc.val_every == 0 or epoch == tc.epochs - 1:
+                val_t0 = time.time()
                 val_metrics = self._validate(epoch)
+                val_time_s = time.time() - val_t0
 
             # 仅 plateau 逐 epoch 驱动。
             plateau_metric = val_metrics.get(tc.save_best_metric, None)
@@ -335,6 +380,16 @@ class Trainer:
                 best_str,
                 timer.elapsed_str(),
                 aux_msg)
+            # 训练 / 验证分段计时：定位整 epoch 时间到底花在哪一阶段。
+            tot_tv = train_time_s + val_time_s
+            logger.info(
+                "  Phase time (epoch %d): train=%s | val=%s | "
+                "val=%.1f%% of (train+val)",
+                epoch + 1,
+                time.strftime("%H:%M:%S", time.gmtime(train_time_s)),
+                time.strftime("%H:%M:%S", time.gmtime(val_time_s)),
+                100.0 * val_time_s / tot_tv if tot_tv > 0 else 0.0)
+
             gpu_peak_mib = None
             if self.device.type == "cuda":
                 gpu_peak_mib = torch.cuda.max_memory_allocated(self.device) / (1 << 20)
@@ -370,6 +425,8 @@ class Trainer:
                         "Time: %s", timer.elapsed_str())
         logger.info("=" * 60)
         self._monitor_finalize(final_status)
+        # DDP：收尾屏障，确保 rank0 完成 best/checkpoint 落盘后各进程再退出。
+        barrier()
         return best_metrics
 
     # ------------------------------------------------------------------
@@ -500,6 +557,10 @@ class Trainer:
         accum       = self.grad_accum_steps
         total_steps = len(self.train_loader)
 
+        # DDP：每 epoch 重置 DistributedSampler 的洗牌种子，保证各 epoch 切分不同。
+        if self._train_sampler is not None:
+            self._train_sampler.set_epoch(epoch)
+
         self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
@@ -518,57 +579,12 @@ class Trainer:
 
             # 视图重塑（pipeline 内部决定）
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
-            
-            # ==== debug ====
-            DEBUG_DATA = False
-            import SimpleITK as sitk
-            if DEBUG_DATA:
-                debug_path = './debug_0618-1'
-                os.makedirs(debug_path, exist_ok=True)
-                B = image.shape[0]
-                label_values = self.cfg.data.label_values
-                for i in range(B):
-                    prefix = f'epoch{epoch}_step{step:04d}_smp{i}'
-
-                    # ---- image（prepare_batch 之后） ----
-                    img_np = image[i].cpu().numpy()
-                    print(f'[{prefix}] image shape: {img_np.shape}')
-                    if img_np.ndim == 4 and img_np.shape[0] == 1:
-                        img_np = img_np[0]
-                    sitk.WriteImage(sitk.GetImageFromArray(img_np),
-                                    os.path.join(debug_path, f'{prefix}_image.nii.gz'))
-
-                    # ---- label（取 prepare_batch 之后的 sup.label_main，保持一致） ----
-                    lbl_t = sup.label_main[i]
-                    lbl_np = lbl_t.cpu().numpy()
-                    print(f'[{prefix}] label raw shape: {lbl_np.shape}')
-                    if lbl_np.ndim == 4:
-                        if lbl_np.shape[0] == 1:
-                            lbl_np = lbl_np[0]
-                        else:
-                            # one-hot (num_fg, D, H, W) → integer (D, H, W)
-                            lbl_int = np.zeros(lbl_np.shape[1:], dtype=np.uint8)
-                            for ch in range(lbl_np.shape[0]):
-                                lbl_int[lbl_np[ch] > 0.5] = label_values[ch + 1]
-                            lbl_np = lbl_int
-                    sitk.WriteImage(sitk.GetImageFromArray(lbl_np.astype(np.uint8)),
-                                    os.path.join(debug_path, f'{prefix}_label.nii.gz'))
-
-                    # ---- weight map ----
-                    if sup.wmap_main is not None:
-                        w_np = sup.wmap_main[i].cpu().numpy()
-                        print(f'[{prefix}] wmap shape: {w_np.shape}')
-                        if w_np.ndim == 4 and w_np.shape[0] == 1:
-                            w_np = w_np[0]
-                        sitk.WriteImage(sitk.GetImageFromArray(w_np),
-                                        os.path.join(debug_path, f'{prefix}_wmap.nii.gz'))
-            
 
             effective_accum = self._effective_accum(step, total_steps, accum)
 
             # Forward AMP / Loss fp32（Dice/BCE 在 fp16 下汇总易溢出 → NaN）
             with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                pred = self.model(image)
+                pred = self.fwd_model(image)
             breakdown: Dict[str, float] = {}
             loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
             collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
@@ -705,6 +721,9 @@ class Trainer:
         return state
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+        # 多卡下仅 rank0 落盘，避免多进程写同一文件互相覆盖 / 损坏。
+        if not self._is_main:
+            return
         state = self._build_state_dict(ema_as_primary=is_best)
         state["epoch"] = epoch
 

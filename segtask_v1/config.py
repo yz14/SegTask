@@ -580,6 +580,21 @@ class TrainConfig:
     # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
 
+    # ---- 多卡 DDP（DistributedDataParallel）----------------------------
+    # 要使用的**物理 GPU 卡号列表**（如 [0, 2, 5, 7]）。
+    #   * [] / 单元素                 → 单卡（或 CPU）路径，行为与历史完全一致；
+    #                                   非空单元素时即用该物理卡（混用机选卡）。
+    #   * 长度 >= 2 且 CUDA 可用        → 每卡 spawn 一个进程跑 DDP，训练样本经
+    #                                   DistributedSampler 切分、整卷验证按 rank
+    #                                   切分后 all-reduce（数值与单卡严格相等）。
+    # 仅占用列出的卡，与他人共用机器互不干扰。
+    gpus: List[int] = field(default_factory=list)
+    # DDP 是否启用 find_unused_parameters（深监督 / 多头若有未参与反传的参数则需开）。
+    # 默认 True 以保正确性；确认所有参数每步都参与时可设 False 提一点速度。
+    ddp_find_unused_parameters: bool = True
+    # DDP rendezvous 端口。0 = 启动时自动挑选空闲端口（混用机避免端口冲突）。
+    ddp_master_port: int = 0
+
     # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
     @property
     def save_best_metric(self) -> str:
@@ -1595,6 +1610,15 @@ class Config:
         _require(
             0.0 <= float(self.train.surface_dice_weight) <= 1.0,
             f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}")
+        # 多卡 DDP 选卡列表：物理卡号、非负、互不重复。
+        gpus = list(self.train.gpus)
+        _require(
+            all(isinstance(g, int) and g >= 0 for g in gpus),
+            f"train.gpus must be a list of non-negative ints (physical GPU "
+            f"indices); got {self.train.gpus!r}.")
+        _require(
+            len(gpus) == len(set(gpus)),
+            f"train.gpus must not contain duplicate GPU indices; got {gpus}.")
 
     def _validate_predict(self) -> None:
         """predict.* z 交错与 AdaBN 校验。"""
