@@ -279,7 +279,7 @@ class _ModuleRec:
     """单个模块一次前向的输入/输出张量 id 与形状记录。"""
 
     __slots__ = ("name", "module", "order", "in_ids", "out_ids",
-                 "in_shape", "out_shape", "in_prov", "in_src")
+                 "in_shape", "out_shape", "in_prov", "in_src", "in_op")
 
     def __init__(self, name: str, module: nn.Module):
         self.name = name
@@ -296,6 +296,9 @@ class _ModuleRec:
         # 各输入张量的**直接产出叶子**名（weakref 校验，非直接产出则为 None），
         # 供 block 内叶子流式连边；同样在 pre_hook 解析以规避 id 复用。
         self.in_src: Tuple[Optional[str], ...] = ()
+        # 各输入张量若由**多源融合算子**（cat/+/…）产生，则记其归一化符号（"cat"/
+        # "+"/…），否则为 None；供步骤 D 在融合点插入显式 merge 节点并正确标注。
+        self.in_op: Tuple[Optional[str], ...] = ()
 
 
 def _iter_tensors(obj) -> List[torch.Tensor]:
@@ -317,9 +320,26 @@ def _iter_tensors(obj) -> List[torch.Tensor]:
 # 无法连边；用 TorchFunctionMode 拦截这些算子，把输出张量的血缘并为各输入血缘之并，
 # 从而下游 module 的输入张量能反查到真实的多个上游叶子（多输入融合 / 跳连 / 残差）。
 Provenance = Dict[int, "frozenset[str]"]
+# 融合算子标记：tensor id → 归一化符号。仅当某算子**实际合并 ≥ 2 个带血缘的输入**时
+# 记录其输出张量，供步骤 D 在融合点插入显式 merge 节点并正确标注（cat / + / × …）。
+MergeOps = Dict[int, str]
+# torch 函数名 → 展示符号。未登记的多源融合算子回退到通用 "merge"。
+_MERGE_OP_SYMBOLS: Dict[str, str] = {
+    "cat": "cat", "concat": "cat", "concatenate": "cat", "stack": "cat",
+    "hstack": "cat", "vstack": "cat", "dstack": "cat", "column_stack": "cat",
+    "add": "+", "add_": "+", "__add__": "+", "__iadd__": "+", "__radd__": "+",
+    "sub": "−", "sub_": "−", "subtract": "−", "__sub__": "−",
+    "mul": "×", "mul_": "×", "multiply": "×", "__mul__": "×",
+    "maximum": "max", "max": "max", "minimum": "min", "min": "min",
+}
 
 
-def _make_prov_mode(prov: Provenance):
+def _op_symbol(func) -> str:
+    """torch 函数对象 → merge 节点展示符号（默认 ``merge``）。"""
+    return _MERGE_OP_SYMBOLS.get(getattr(func, "__name__", ""), "merge")
+
+
+def _make_prov_mode(prov: Provenance, merge_op: MergeOps):
     """构造一个累积张量血缘的 TorchFunctionMode（torch 不支持时返回 None）。
 
     每个流经模块/算子之间的张量在产生时都会被写入血缘（functional 输出在此累积，
@@ -343,6 +363,10 @@ def _make_prov_mode(prov: Provenance):
                     if s:
                         srcs |= s
                 in_ids = {id(t) for t in ins}
+                # 是否为真正的多源融合：该算子本身接收 ≥ 2 个带血缘的输入。
+                merge_sym = (_op_symbol(func)
+                             if sum(1 for t in ins if prov.get(id(t))) >= 2
+                             else None)
                 for o in _iter_tensors(out):
                     if id(o) in in_ids:
                         # in-place / 透传：在该（存活）张量已有血缘上累加。
@@ -351,6 +375,10 @@ def _make_prov_mode(prov: Provenance):
                         # 新张量：直接覆盖，杜绝其 id 命中已释放张量的陈旧血缘
                         # （陈旧读是 id 追踪下不确定性的根源）。
                         prov[id(o)] = srcs
+                    if merge_sym is not None:
+                        merge_op[id(o)] = merge_sym
+                    else:
+                        merge_op.pop(id(o), None)  # 新张量复用旧 id 时清陈旧标记
             except Exception:  # pragma: no cover - 血缘累积尽力而为
                 pass
             return out
@@ -383,6 +411,7 @@ def _trace_modules(
         if name and list(m.children()) and _has_residual(m, residual_types)
     }
     prov: Provenance = {}
+    merge_op: MergeOps = {}
     # 叶子输出张量 id → (产出叶子名, 该张量弱引用)。weakref 用于在 pre_hook 查询时
     # 辨别"id 是否被复用"：若弱引用已失效或不指向当前输入张量，则该 id 实为陈旧项。
     live_out: Dict[int, Tuple[str, "weakref.ref"]] = {}
@@ -405,6 +434,7 @@ def _trace_modules(
                 # 此刻输入张量存活、id 唯一 → 立即快照血缘与直接产出叶子。
                 rec.in_prov = tuple(prov.get(id(t), frozenset()) for t in tensors)
                 rec.in_src = tuple(_src_of(t) for t in tensors)
+                rec.in_op = tuple(merge_op.get(id(t)) for t in tensors)
                 if tensors:
                     rec.in_shape = tuple(tensors[0].shape)
         return pre_hook
@@ -453,9 +483,10 @@ def _trace_modules(
         for mode in (True, False):  # 先 train()（激活 aux/ds/topo），失败再 eval()
             try:
                 prov.clear()
+                merge_op.clear()
                 prov[id(dummy)] = frozenset({"input"})
                 model.train(mode)
-                prov_mode = _make_prov_mode(prov)
+                prov_mode = _make_prov_mode(prov, merge_op)
                 with torch.no_grad():
                     if prov_mode is not None:
                         with prov_mode:
@@ -474,6 +505,7 @@ def _trace_modules(
                     r.in_shape = r.out_shape = None
                     r.in_prov = ()
                     r.in_src = ()
+                    r.in_op = ()
     finally:
         for h in handles:
             h.remove()
@@ -594,6 +626,9 @@ class _ModelGraphBuilder:
         self._edges: Set[Tuple[str, str]] = set()
         # 叶子模块名 → 已发射的叶子节点 id（供同 block 内叶子连边反查）。
         self._leaf_node_id: Dict[str, str] = {}
+        # (parent, tensor id, 输入序号) → 已发射的 merge 节点 id（同一融合张量被
+        # 多下游消费时复用同一节点，避免重复建框）。
+        self._merge_nodes: Dict[Tuple[str, int, int], str] = {}
 
     # -- 排序键 --------------------------------------------------------
     def _order_of(self, recs: Sequence[_ModuleRec]) -> Tuple[int, int]:
@@ -645,6 +680,29 @@ class _ModelGraphBuilder:
             return
         self._edges.add((src, dst))
         self.g.add_edge(src, dst, label, kind=kind)
+
+    def _emit_merge(self, parent: str, tid: int, idx: int, op: str,
+                    out_shape: Optional[Tuple[int, ...]] = None
+                    ) -> Tuple[str, bool]:
+        """在融合点发射（或复用）一个显式 merge 算子节点；返回 ``(节点 id, 是否新建)``。
+
+        同一 ``(parent, tid, idx)`` 复用同一节点，以免被多个下游消费时重复建框。
+        节点 ``kind="merge"``，标题为融合符号（``cat`` / ``+`` / ``×`` …）。
+        """
+        mkey = (parent, tid, idx)
+        mid = self._merge_nodes.get(mkey)
+        if mid is not None:
+            return mid, False
+        mid = f"merge::{parent}::{tid}:{idx}"
+        # 标题已是融合符号，故 key_info 只补出张量形状，避免框内重复显示算子名。
+        ki: Dict[str, object] = {}
+        if out_shape:
+            ki["out"] = shape_str(out_shape)
+        detail = {"op": op, "kind": "merge (functional fusion)"}
+        self.g.add_node(mid, op, kind="merge", key_info=ki, detail=detail,
+                        parent_id=parent)
+        self._merge_nodes[mkey] = mid
+        return mid, True
 
 
 def build_model_flow(
@@ -808,7 +866,7 @@ def _emit_top(b: _ModelGraphBuilder, key: str) -> None:
             leaf_ids = [_emit_leaf(b, rec, parent=key) for rec in members]
             top_rec = b.recs.get(key)
             external = set(top_rec.in_ids) if top_rec else set()
-            _emit_leaf_flow(b, members, leaf_ids, external)
+            _emit_leaf_flow(b, members, leaf_ids, external, parent=key)
         else:
             _emit_block(b, bk, key, members)
 
@@ -817,7 +875,8 @@ def _emit_top(b: _ModelGraphBuilder, key: str) -> None:
 
 
 def _emit_leaf_flow(b: _ModelGraphBuilder, members: List[_ModuleRec],
-                    leaf_ids: List[str], external: Set[int]) -> None:
+                    leaf_ids: List[str], external: Set[int],
+                    parent: str) -> None:
     """在一组**同级叶子**间按真实张量流连边：逐**输入张量**求其"直接上游叶子"。
 
     既服务于 block 框内的叶子(``_emit_block``)，也服务于顶层容器里未成 block 的散叶
@@ -835,6 +894,10 @@ def _emit_leaf_flow(b: _ModelGraphBuilder, members: List[_ModuleRec],
 
     def _is_shortcut(name: str) -> bool:
         return any(f".{a}" in name for a in _SHORTCUT_ATTRS)
+
+    def _infer_op(srcs: List[str]) -> str:
+        # 血缘未捕到算子符号时的回退：含捷径源 → 残差加，否则视为拼接。
+        return "+" if any(_is_shortcut(s) for s in srcs) else "cat"
 
     def _block_prefix(name: str) -> str:
         # 捷径叶子所属残差子块的路径前缀（截到 shortcut 段之前），用于把悬空 shortcut
@@ -871,25 +934,49 @@ def _emit_leaf_flow(b: _ModelGraphBuilder, members: List[_ModuleRec],
         has_out: Set[str] = set()  # 已连出（有下游）的叶子，供残差兜底判定悬空 shortcut
         for rec, cid in zip(members, leaf_ids):
             prov = rec.in_prov if len(rec.in_prov) == len(rec.in_ids) else ()
+            in_op = rec.in_op if len(rec.in_op) == len(rec.in_ids) else ()
             for idx, (tid, prod) in enumerate(zip(rec.in_ids, rec.in_src)):
                 if tid in external:          # 外部输入：并联入口，不连块内边
                     continue
+                functional = False
                 if prod is not None and prod != rec.name:
                     sources: Iterable[str] = (prod,)
                 elif idx < len(prov):        # functional 产出 → 退到血缘
                     sources = [_supersede(s, rec) for s in prov[idx]]
+                    functional = True
                 else:
                     sources = ()
+                # 去重 + 过滤到本组内、非自身的上游叶子。
+                valid: List[str] = []
                 for src in sources:
-                    if src not in member_names or src == rec.name:
-                        continue
-                    # 由 shortcut 子树**汇入主路**的边标注为残差(+)；shortcut 内部
-                    # 链(conv→norm)与主路前向流仍为普通前向边。
-                    residual_edge = _is_shortcut(src) and not _is_shortcut(rec.name)
-                    label = "+" if residual_edge else ""
-                    kind = "residual" if residual_edge else "forward"
-                    b._add_edge(name_to_cid[src], cid, label, kind=kind)
-                    has_out.add(src)
+                    if src in member_names and src != rec.name and src not in valid:
+                        valid.append(src)
+                if not valid:
+                    continue
+                if functional and len(valid) >= 2:
+                    # 多源融合点 → 插入显式 merge 节点：各上游叶→[op]→本叶。
+                    op = (in_op[idx] if idx < len(in_op) else None) or _infer_op(valid)
+                    out_sh = rec.in_shape if idx == 0 else None
+                    mid, created = b._emit_merge(parent, tid, idx, op, out_sh)
+                    if created:
+                        for src in valid:
+                            # shortcut 支汇入以残差线型凸显跳连；merge 节点本身已示算子
+                            # 符号，故入 merge 的边不再重复标 "+"。
+                            res = _is_shortcut(src) and not _is_shortcut(rec.name)
+                            b._add_edge(name_to_cid[src], mid, "",
+                                        kind="residual" if res else "forward")
+                    for src in valid:
+                        has_out.add(src)
+                    b._add_edge(mid, cid, kind="forward")
+                else:
+                    for src in valid:
+                        # 由 shortcut 子树**汇入主路**的边标注为残差(+)；shortcut 内部
+                        # 链(conv→norm)与主路前向流仍为普通前向边。
+                        residual_edge = _is_shortcut(src) and not _is_shortcut(rec.name)
+                        label = "+" if residual_edge else ""
+                        kind = "residual" if residual_edge else "forward"
+                        b._add_edge(name_to_cid[src], cid, label, kind=kind)
+                        has_out.add(src)
         # 残差兜底：`out = 主路 + shortcut(x)` 的相加是 functional 算子，透传(Identity)
         # 捷径叶子的输出张量与其输入(块外)同对象、血缘指向块外，prov 无法还原其汇入主路
         # 的边，留下悬空 shortcut 叶子(无下游)。主路上的透传叶子(无参 attn 等)已由
@@ -939,7 +1026,7 @@ def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
     # block 外部输入是本框的并联入口，不在块内连边；其上游由顶层入边处理。
     block_rec = b.recs.get(block_key)
     external: Set[int] = set(block_rec.in_ids) if block_rec else set()
-    _emit_leaf_flow(b, members, leaf_ids, external)
+    _emit_leaf_flow(b, members, leaf_ids, external, parent=block_key)
 
 
 def _emit_leaf(b: _ModelGraphBuilder, rec: _ModuleRec, parent: str) -> str:
@@ -995,8 +1082,24 @@ def _emit_intra_edges(
         rec = b.recs.get(bk)
         if rec is None or not rec.in_prov:
             continue
-        for src in b._producers_in_top(rec.in_prov, top, exclude=bk):
-            b._add_edge(src, bk)
+        in_op = rec.in_op if len(rec.in_op) == len(rec.in_prov) else ()
+        # 逐**输入张量**反查同容器上游 block：单上游直连；同一输入被多 block
+        # 经 cat/+ 融合（如 MultiStem 三路 sub-stem→proj）则经显式 merge 节点汇入。
+        for idx, pset in enumerate(rec.in_prov):
+            srcs = b._producers_in_top([pset], top, exclude=bk)
+            if not srcs:
+                continue
+            if len(srcs) >= 2:
+                op = (in_op[idx] if idx < len(in_op) else None) or "cat"
+                tid = rec.in_ids[idx] if idx < len(rec.in_ids) else -1 - idx
+                out_sh = rec.in_shape if idx == 0 else None
+                mid, created = b._emit_merge(top, tid, idx, op, out_sh)
+                if created:
+                    for src in srcs:
+                        b._add_edge(src, mid)
+                b._add_edge(mid, bk)
+            else:
+                b._add_edge(srcs[0], bk)
 
 
 def _ensure_backbone_chain(b: _ModelGraphBuilder, backbone: List[str]) -> None:
