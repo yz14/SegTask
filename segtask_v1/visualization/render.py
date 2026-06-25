@@ -87,7 +87,8 @@ svg.edges-top { z-index: 3; }
    justify-items:center 使单列后续节点在其跨列区间内居中对齐。grid-template-columns
    的列数由 layoutInto 据本容器节点 max(col+colspan) 动态注入。 */
 .col { position: relative; z-index: 2; display: grid; justify-items: center;
-  align-items: start; row-gap: 22px; column-gap: 12px; }
+  justify-content: safe center; align-items: start; row-gap: 22px;
+  column-gap: 12px; }
 .children { display: grid; justify-items: center; align-items: start;
   row-gap: 16px; column-gap: 26px; padding: 6px 14px 14px; }
 .children.collapsed { display: none; }
