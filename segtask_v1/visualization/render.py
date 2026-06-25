@@ -353,6 +353,19 @@ function drawEdges() {
     .filter(n => !n.parent_id).map(n => n.id));
   const seen = new Set();
 
+  const STEP = 22, GAP = 26;
+  // 主干（encoder/decoder）跳连走**左**外缘嵌套车道（主链恒在最左列 col0，左侧恒空，
+  // 不会被右侧分出的各 head 遮挡）；故先按顶层 enc→dec 跳连数预留左内边距，让框整体
+  // 右移腾出车道空间，避免车道坐标落到画布左外侧被裁掉。head→loss 汇聚束走右侧，无需
+  // 预留。该值仅依赖边数恒定，重复调用幂等。
+  const col = canvas.querySelector(".col");
+  let nLeftSkip = 0;
+  edges.forEach(ed => {
+    if (topIds.has(ed.src) && topIds.has(ed.dst)
+        && (ed.kind === "skip") && ed.dst !== "loss") nLeftSkip++;
+  });
+  if (col) col.style.paddingLeft = (nLeftSkip ? GAP + nLeftSkip * STEP + 14 : 0) + "px";
+
   // 内容横向边界（所有可见框的并集）：外缘车道据此排到所有框之外，杜绝压框。
   let contentL = Infinity, contentR = -Infinity;
   flow.querySelectorAll(".node, .stage").forEach(elx => {
@@ -364,8 +377,10 @@ function drawEdges() {
   if (!isFinite(contentL)) { contentL = 0; contentR = canvas.scrollWidth; }
 
   // 预解析每条边的几何 + 去重 + 归入侧边车道。
-  //  band 'R'：顶层 encoder→decoder 跳连（同心嵌套环，最长跨度最外圈）。
-  //  band 'L'：顶层 head→loss 汇聚束（ds 头上移后其 loss 边变长，单列左侧避免压框）。
+  //  band 'Lskip'：顶层 encoder→decoder 跳连（左外缘同心嵌套环，最长跨度最外圈，
+  //    主链恒在最左列、左侧恒空，故不会被右侧各 head 遮挡）。
+  //  band 'Rloss'：顶层 head→loss 汇聚束（ds 头分到右侧列，其 loss 边变长，
+  //    经右外缘竖轨下行后从 loss 右缘进框，避免穿过 seg/aux 头与解码框）。
   const items = [];
   edges.forEach(ed => {
     const a = visibleAnchor(ed.src), b = visibleAnchor(ed.dst);
@@ -379,18 +394,17 @@ function drawEdges() {
     if (seen.has(key)) return; seen.add(key);
     let band = null;
     if (topIds.has(ed.src) && topIds.has(ed.dst)) {
-      // 仅把"跨多行"的 head→loss（deep-supervision 头）引到左侧外缘束；
-      // 与 loss 相邻的 seg/aux 头照常竖向短接，避免无谓绕到最左、标签挤叠。
-      if (ed.dst === "loss") { if (yt2 - yb1 > 70) band = "L"; }
-      else if (kind === "skip") band = "R";
+      // 仅把"跨多行"的 head→loss（deep-supervision 头）引到右侧外缘束；
+      // 与 loss 相邻的 seg/aux 头照常竖向短接，避免无谓绕行、标签挤叠。
+      if (ed.dst === "loss") { if (yt2 - yb1 > 70) band = "Rloss"; }
+      else if (kind === "skip") band = "Lskip";
     }
     items.push({ ed, ra, rb, cx1, yb1, cx2, yt2, kind, band });
   });
 
   // 车道分配：同侧按纵向跨度升序 → 跨度最大者拿最高车道（最外圈），
   // 从而嵌套区间同心不交叉（如 enc0→dec3 包含 enc1→dec2）。
-  const STEP = 22, GAP = 26;
-  ["R", "L"].forEach(side => {
+  ["Lskip", "Rloss"].forEach(side => {
     const grp = items.filter(it => it.band === side);
     grp.sort((p, q) => Math.abs(p.yt2 - p.yb1) - Math.abs(q.yt2 - q.yb1));
     grp.forEach((it, i) => { it.lane = i; it.laneN = grp.length; });
@@ -402,31 +416,31 @@ function drawEdges() {
     const style = EDGE_STYLE[kind] || EDGE_STYLE.forward;
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     let d, lx, ly;
-    if (it.band === "R") {
-      // encoder→decoder 跳连：从两框右缘引出，绕到内容右外缘的同心车道再折回，
-      // 跨度最大者最外圈，平滑嵌套不交叉，全程在框右侧之外。
-      const x1 = ra.right - cr.left, x2 = rb.right - cr.left;
+    if (it.band === "Lskip") {
+      // encoder→decoder 跳连：从两框**左**缘引出，绕到内容左外缘的同心车道再折回，
+      // 跨度最大者最外圈，平滑嵌套不交叉，全程在框左侧之外（左内边距已预留空间）。
+      const x1 = ra.left - cr.left, x2 = rb.left - cr.left;
       const y1 = ra.top + ra.height / 2 - cr.top;
       const y2 = rb.top + rb.height / 2 - cr.top;
-      const sx = contentR + GAP + it.lane * STEP;
-      maxX = Math.max(maxX, sx);
+      const sx = Math.max(4, contentL - GAP - it.lane * STEP);
       d = `M ${x1} ${y1} C ${sx} ${y1}, ${sx} ${y2}, ${x2} ${y2}`;
-      lx = sx + 4; ly = (y1 + y2) / 2;
-    } else if (it.band === "L") {
-      // deep-supervision 头 → loss：正交走线（贴最左竖轨）。loss 居中、其左缘紧邻
-      // Seg Head(main) 右缘，平滑弧会回弯穿过 seg head 框；故改为：左行到最左竖轨
-      // → 竖直下行 → 在 seg/aux 头行**下方**水平进入 loss 左缘，彻底避开各框。
-      const x1 = ra.left - cr.left;
+      lx = sx - 4; ly = (y1 + y2) / 2;
+    } else if (it.band === "Rloss") {
+      // deep-supervision 头 → loss：正交走线（贴最右竖轨）。ds 头在右侧列，loss 居中
+      // 偏下，直下会穿过 seg/aux 头行；故改为：右行到最右竖轨 → 竖直下行 → 在各头行
+      // **下方**水平进入 loss 右缘，彻底避开各框。
+      const x1 = ra.right - cr.left;
       const y1 = ra.top + ra.height / 2 - cr.top;
-      const x2 = rb.left - cr.left;
+      const x2 = rb.right - cr.left;
       const lossTop = rb.top - cr.top, lossH = rb.height;
-      const railX = Math.max(8, contentL - GAP - it.lane * STEP);
+      const railX = contentR + GAP + it.lane * STEP;
+      maxX = Math.max(maxX, railX);
       const spread = Math.min(8, (lossH - 8) / Math.max(1, it.laneN));
       const ey = lossTop + lossH / 2 + (it.lane - (it.laneN - 1) / 2) * spread;
       const r = Math.min(7, Math.max(0, (ey - y1) / 2 - 1));
-      d = `M ${x1} ${y1} L ${railX + r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + r} `
-        + `L ${railX} ${ey - r} Q ${railX} ${ey} ${railX + r} ${ey} L ${x2} ${ey}`;
-      lx = railX - 4; ly = (y1 + ey) / 2;
+      d = `M ${x1} ${y1} L ${railX - r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + r} `
+        + `L ${railX} ${ey - r} Q ${railX} ${ey} ${railX - r} ${ey} L ${x2} ${ey}`;
+      lx = railX + 4; ly = (y1 + ey) / 2;
     } else if (kind === "residual") {
       // 残差捷径（block 内 shortcut → act2）：从 shortcut 底缘引出，沿子框列左侧的空白栏
       // 竖直下行，再水平进入目标左缘。竖轨落在「block 左边框」与「子框列」之间的空隙里
@@ -471,7 +485,7 @@ function drawEdges() {
       tx.setAttribute("fill", style.color);
       tx.setAttribute("font-size", "10.5");
       tx.setAttribute("font-weight", kind === "forward" ? "400" : "700");
-      if (it.band === "L") tx.setAttribute("text-anchor", "end");
+      if (it.band === "Lskip") tx.setAttribute("text-anchor", "end");
       tx.textContent = ed.label;
       layer.appendChild(tx);
     }
