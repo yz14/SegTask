@@ -156,3 +156,57 @@ def test_merge_nodes_at_fusion_points():
         for e in ins + outs:
             assert by_id[e.src].parent_id == m.parent_id
             assert by_id[e.dst].parent_id == m.parent_id
+
+
+# ---------------------------------------------------------------------------
+# 列对齐网格布局：(col, colspan) 让并联路径各占一列、串联主链笔直、融合点跨列居中。
+# ---------------------------------------------------------------------------
+def _block_by_suffix(g, suffix):
+    blocks = [n for n in g.nodes if n.id.endswith(suffix)]
+    assert blocks, f"seg2_5d 应含 {suffix}"
+    return blocks[0]
+
+
+def test_block_column_layout():
+    g = _build("seg2_5d.yaml")
+
+    # (1) stage1.block0(ResNetBlock)：shortcut 独占左列，主路在右列且笔直一列。
+    blk1 = _block_by_suffix(g, "encoder.stages.1.blocks.0")
+    leaves1 = _children(g, blk1.id)
+    sc1 = [n for n in leaves1 if ".shortcut" in n.id]
+    main1 = [n for n in leaves1 if ".shortcut" not in n.id]
+    assert sc1 and main1
+    # shortcut 整列严格在主路左侧（列区间不相交）。
+    assert max(n.col + n.colspan for n in sc1) <= min(n.col for n in main1), \
+        "shortcut 应独占主路左侧的列"
+    # 主路（非分支结构）同处一列、笔直：col 全相同、colspan==1。
+    assert len({n.col for n in main1}) == 1 and all(
+        n.colspan == 1 for n in main1), "stage1 主路应为笔直单列"
+
+    # (2) stage2.block0(MultiRFBlock)：三分支同 rank 占相邻三列；其后融合·主路
+    #     以 colspan>1 跨列居中覆盖分支列区间（即“单列后续居中对齐于分支组”）。
+    blk2 = _block_by_suffix(g, "encoder.stages.2.blocks.0")
+    leaves2 = _children(g, blk2.id)
+    branches = [n for n in leaves2 if ".branches." in n.id]
+    assert len(branches) >= 3, "MultiRF 应有≥3 条并联分支"
+    assert len({n.rank for n in branches}) == 1, "分支应同 rank"
+    assert len({n.col for n in branches}) == len(branches), "分支应各占独立列"
+    b_lo = min(n.col for n in branches)
+    b_hi = max(n.col + n.colspan for n in branches)
+    fuse = next(n for n in leaves2 if ".fuse" in n.id)
+    # fuse 跨列覆盖分支列区间（居中于三分支之下）。
+    assert fuse.col == b_lo and fuse.col + fuse.colspan == b_hi, \
+        "fuse 应跨列居中覆盖分支组"
+
+    # (3) 通用性：任一父容器内、任一 rank 上，节点列区间互不重叠（清晰分列）。
+    by_parent = {}
+    for n in g.nodes:
+        by_parent.setdefault(n.parent_id, []).append(n)
+    for kids in by_parent.values():
+        by_rank = {}
+        for n in kids:
+            by_rank.setdefault(n.rank, []).append(n)
+        for nodes in by_rank.values():
+            iv = sorted((n.col, n.col + n.colspan, n.id) for n in nodes)
+            for a, b in zip(iv, iv[1:]):
+                assert a[1] <= b[0], f"同 rank 列重叠: {a[2]} 与 {b[2]}"
