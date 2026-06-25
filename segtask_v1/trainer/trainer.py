@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import random
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, List, Tuple
@@ -217,6 +218,16 @@ class Trainer:
                     "`train.pretrain` is set but file not found: %s. "
                     "Training will start from scratch.", tc.pretrain)
 
+        # --- Training monitor (optional; fully isolated) --------------
+        # 逐 epoch 把指标落盘并周期性重渲染自包含 HTML 仪表盘。整套逻辑封装在
+        # ``segtask_v1.monitor``，由 ``cfg.monitor.enabled`` 守卫，任何失败都被
+        # 隔离（仅告警），绝不影响训练本身。
+        self._monitor = None
+        self._monitor_html = None
+        self._monitor_cfg = getattr(self.cfg, "monitor", None)
+        if self._monitor_cfg is not None and self._monitor_cfg.enabled:
+            self._init_monitor(resume_active)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -268,7 +279,9 @@ class Trainer:
         logger.info("=" * 60)
 
         best_metrics: Dict[str, float] = {}
+        final_status = "completed"
         for epoch in range(self.start_epoch, tc.epochs):
+            epoch_t0 = time.time()
             train_metrics = self._train_epoch(epoch)
 
             val_metrics: Dict[str, float] = {}
@@ -322,10 +335,18 @@ class Trainer:
                 best_str,
                 timer.elapsed_str(),
                 aux_msg)
+            gpu_peak_mib = None
             if self.device.type == "cuda":
-                peak_mib = torch.cuda.max_memory_allocated(self.device) / (1 << 20)
-                logger.info("  GPU peak (epoch %d): %.1f MiB", epoch + 1, peak_mib)
+                gpu_peak_mib = torch.cuda.max_memory_allocated(self.device) / (1 << 20)
+                logger.info("  GPU peak (epoch %d): %.1f MiB", epoch + 1, gpu_peak_mib)
                 torch.cuda.reset_peak_memory_stats(self.device)
+
+            # --- Training monitor (isolated) --------------------------
+            self._monitor_log_epoch(
+                epoch, train_metrics, val_metrics,
+                lr=self.scheduler.get_lr(), gpu_peak_mib=gpu_peak_mib,
+                wall_time_s=time.time() - epoch_t0, is_best=is_best,
+                last_epoch=(epoch == tc.epochs - 1))
 
             # --- Periodic checkpoint ----------------------------------
             if (epoch + 1) % tc.save_every == 0:
@@ -335,6 +356,7 @@ class Trainer:
             if tc.early_stopping > 0 and self.patience_counter >= tc.early_stopping:
                 logger.info("Early stopping at epoch %d (patience=%d)",
                             epoch + 1, tc.early_stopping)
+                final_status = "early_stopped"
                 break
 
         logger.info("=" * 60)
@@ -347,7 +369,95 @@ class Trainer:
             logger.info("Training complete. No validation best recorded. "
                         "Time: %s", timer.elapsed_str())
         logger.info("=" * 60)
+        self._monitor_finalize(final_status)
         return best_metrics
+
+    # ------------------------------------------------------------------
+    # Training monitor (optional, isolated) —— 见 segtask_v1.monitor
+    # ------------------------------------------------------------------
+    def _init_monitor(self, resume_active: bool) -> None:
+        """实例化 ``MetricsLogger`` 并确定 HTML 落点。失败仅告警、不影响训练。"""
+        mc = self._monitor_cfg
+        tc = self.cfg.train
+        try:
+            from ..monitor import MetricsLogger
+
+            root = Path(mc.output_dir) if mc.output_dir else self.output_dir
+            mon_dir = root / "monitor"
+            self._monitor_html = root / (mc.filename or "training_monitor.html")
+            run_name = mc.run_name or self.output_dir.name or "run"
+            self._monitor = MetricsLogger(
+                mon_dir,
+                run_name=run_name,
+                save_best_metric=tc.save_best_metric,
+                save_best_mode=tc.save_best_mode,
+                save_best_criterion=tc.save_best_criterion,
+                num_classes=self.num_fg,
+                total_epochs=tc.epochs,
+                config_meta={
+                    "loss": self.cfg.loss.name,
+                    "batch_size": self.cfg.data.batch_size,
+                    "val_metric_mode": tc.val_metric_mode,
+                },
+                resume=resume_active,
+            )
+            logger.info("Training monitor enabled → metrics: %s | dashboard: %s",
+                        mon_dir, self._monitor_html)
+        except Exception as e:  # 隔离：监测初始化失败绝不阻断训练
+            self._monitor = None
+            logger.warning("Training monitor disabled (init failed): %s", e)
+
+    def _monitor_log_epoch(
+        self,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: Dict[str, float],
+        *,
+        lr: float,
+        gpu_peak_mib,
+        wall_time_s: float,
+        is_best: bool,
+        last_epoch: bool,
+    ) -> None:
+        """落盘一个 epoch 并按 ``update_every`` 节奏重渲染 HTML（全程异常隔离）。"""
+        if self._monitor is None:
+            return
+        mc = self._monitor_cfg
+        try:
+            self._monitor.log_epoch(
+                epoch, train=train_metrics, val=val_metrics, lr=lr,
+                gpu_peak_mib=gpu_peak_mib, wall_time_s=wall_time_s,
+                is_best=is_best)
+        except Exception as e:
+            logger.warning("Training monitor: log_epoch failed at epoch %d: %s",
+                           epoch + 1, e)
+            return
+        every = max(int(mc.update_every), 1)
+        if is_best or last_epoch or ((epoch + 1) % every == 0):
+            self._monitor_render(auto_reload_seconds=int(mc.auto_reload_seconds))
+
+    def _monitor_render(self, *, auto_reload_seconds: int) -> None:
+        """从已落盘历史重渲染单 run 仪表盘 HTML（异常隔离）。"""
+        if self._monitor is None or self._monitor_html is None:
+            return
+        try:
+            from ..monitor import MetricsHistory, write_dashboard
+
+            hist = MetricsHistory.from_dir(self._monitor.dir)
+            write_dashboard(hist, self._monitor_html,
+                            auto_reload_seconds=auto_reload_seconds)
+        except Exception as e:
+            logger.warning("Training monitor: dashboard render failed: %s", e)
+
+    def _monitor_finalize(self, status: str) -> None:
+        """训练收尾：更新 run 状态并做一次静态（无自动刷新）终渲染。"""
+        if self._monitor is None:
+            return
+        try:
+            self._monitor.finalize(status)
+        except Exception as e:
+            logger.warning("Training monitor: finalize failed: %s", e)
+        self._monitor_render(auto_reload_seconds=0)
 
     # ------------------------------------------------------------------
     # EMA swap helper (exception-safe)

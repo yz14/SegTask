@@ -331,3 +331,15 @@ vis:
   flows            : ["data", "model", "predict"]   # 视图子集 + 标签页顺序
   trace_shapes     : true                  # 模型流 dummy 前向追踪真实形状
   max_detail_params: 200                   # 单节点详情最多条数
+
+
+# MONITOR — 训练过程监测仪表盘（逐 epoch 损失/指标/逐类/LR/显存曲线 → 自包含 HTML）。
+# 默认关闭、零开销；打开后训练中按 update_every 实时刷新，结束后给出 best 指标卡。
+# 续训安全、异常隔离（失败仅告警不中断训练）。详见 README §3.10。
+monitor:
+  enabled            : false               # 设 true 即落盘 + 渲染仪表盘
+  output_dir         : ""                   # 空 => train.output_dir（HTML 落此，数据落其 monitor/）
+  filename           : "training_monitor.html"
+  update_every       : 1                    # 每多少 epoch 重渲染（best/末轮总会刷新）
+  auto_reload_seconds: 10                   # 训练中 HTML 自动重载间隔（秒）
+  run_name           : ""                   # 对比页显示名；空 => output_dir 目录名
