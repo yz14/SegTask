@@ -82,10 +82,14 @@ svg.edges { position: absolute; left: 0; top: 0; width: 100%; height: 100%;
 /* 残差层置于框之上：block 内子框密排，残差线只能走子框外的左侧空白栏，
    置顶后才可见；其余边（前向/skip/loss束）仍在框下，避免压住密集解码框。 */
 svg.edges-top { z-index: 3; }
-.col { position: relative; z-index: 2; display: flex; flex-direction: column;
-  align-items: center; gap: 22px; }
-.children { display: flex; flex-direction: column; align-items: center;
-  gap: 16px; padding: 6px 14px 14px; }
+/* 列对齐网格：每个节点据 (rank, col, colspan) 摆进格子——并联路径各占一列、串联
+   主链同列笔直，融合点（cat/+）跨列居中覆盖其上游列。列宽 auto 随内容自适应，
+   justify-items:center 使单列后续节点在其跨列区间内居中对齐。grid-template-columns
+   的列数由 layoutInto 据本容器节点 max(col+colspan) 动态注入。 */
+.col { position: relative; z-index: 2; display: grid; justify-items: center;
+  align-items: start; row-gap: 22px; column-gap: 26px; }
+.children { display: grid; justify-items: center; align-items: start;
+  row-gap: 16px; column-gap: 26px; padding: 6px 14px 14px; }
 .children.collapsed { display: none; }
 
 /* leaf node card */
@@ -123,13 +127,6 @@ svg.edges-top { z-index: 3; }
   font-size: 10.5px; margin-left: auto; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
 .stage > .stage-head > span:not(.caret):not(.s-kv) { letter-spacing: -.005em; }
-
-/* row: side-by-side grouping (并联分支 / 多分辨率输入)。**不换行**：并联分支必须
-   同处一行，否则会被误读成串联（如 multi-stem 三路输入被拆成两行会让人以为
-   stem0/1 先汇入 stem2）。容器 ``.stage`` 用 ``width: fit-content`` 随之横向生长，
-   行宽超出视口时由页面水平滚动承载，而非把并联拆成多行。 */
-.row { display: flex; flex-direction: row; align-items: flex-start;
-  justify-content: center; gap: 26px; flex-wrap: nowrap; }
 
 /* edge legend (线型说明) */
 .legend .eline { display: inline-block; width: 22px; height: 0;
@@ -264,48 +261,20 @@ function buildStage(node, childrenOf) {
   return box;
 }
 
-// Lay a set of sibling nodes into `container`. If their `rank` values differ,
-// group same-rank siblings into a horizontal `.row` (并联分支 side-by-side);
-// otherwise fall back to vertical flow with consecutive `input` nodes rowed.
+// Lay a set of sibling nodes into `container` as a CSS Grid, placing each node
+// by its (rank, col, colspan): rank → grid row, col/colspan → grid column span.
+// 并联路径各占一列、串联主链同列笔直，融合点（colspan>1）跨列居中覆盖其上游列。
+// 列数据由 builder 的 _assign_columns 写入 IR（forward 血缘 + 同 rank 去重叠）。
 function layoutInto(container, nodes, childrenOf) {
   if (!nodes.length) return;
-  const ranks = new Set(nodes.map(n => n.rank || 0));
-  if (ranks.size > 1) {
-    const arr = nodes.slice().sort((a, b) => (a.rank || 0) - (b.rank || 0));
-    let i = 0;
-    while (i < arr.length) {
-      let j = i;
-      while (j < arr.length && (arr[j].rank || 0) === (arr[i].rank || 0)) j++;
-      if (j - i > 1) {
-        const row = el("div", "row");
-        // 同行内 head（如 deep-supervision 头）靠左摆，使其对应 decoder level 的
-        // 右侧边留出给 encoder→decoder 跳连进框（不被旁分支遮挡）。
-        const seg = arr.slice(i, j).sort((a, b) =>
-          (a.kind === "head" ? 0 : 1) - (b.kind === "head" ? 0 : 1));
-        for (const nd of seg) row.appendChild(render(nd, childrenOf));
-        container.appendChild(row);
-      } else {
-        container.appendChild(render(arr[i], childrenOf));
-      }
-      i = j;
-    }
-    return;
-  }
-  // single rank → preserve order; row consecutive multi-resolution inputs
-  let i = 0;
-  while (i < nodes.length) {
-    if (nodes[i].kind === "input") {
-      let j = i;
-      while (j < nodes.length && nodes[j].kind === "input") j++;
-      if (j - i > 1) {
-        const row = el("div", "row");
-        for (let k = i; k < j; k++) row.appendChild(render(nodes[k], childrenOf));
-        container.appendChild(row);
-        i = j; continue;
-      }
-    }
-    container.appendChild(render(nodes[i], childrenOf));
-    i++;
+  const maxCols = Math.max(
+    1, ...nodes.map(n => (n.col || 0) + (n.colspan || 1)));
+  container.style.gridTemplateColumns = "repeat(" + maxCols + ", auto)";
+  for (const nd of nodes) {
+    const w = render(nd, childrenOf);
+    w.style.gridRow = String((nd.rank || 0) + 1);
+    w.style.gridColumn = ((nd.col || 0) + 1) + " / span " + (nd.colspan || 1);
+    container.appendChild(w);
   }
 }
 
