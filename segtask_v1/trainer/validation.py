@@ -32,6 +32,12 @@ from ..utils import (
     surface_dice_batch_stats,
 )
 from .amp import autocast, compute_loss_fp32
+from .dist_utils import (
+    all_reduce_sum_,
+    get_world_size,
+    is_main_process,
+    shard_for_rank,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .trainer import Trainer
@@ -124,10 +130,64 @@ class MetricAccumulator:
         self.n_samples += int(pred_logits.shape[0])
 
     @torch.no_grad()
-    def compute(self, log_prefix: str = "Val") -> Dict[str, float]:
-        """闭式导出全部指标并打印一行概要。无样本时返回退化 dict。"""
+    def all_reduce(self, num_fg: int, device: torch.device) -> None:
+        """多卡：将各 rank 累加的可加混淆量 all-reduce(SUM) 汇总。
+
+        各 rank 处理不相交的样本子集，混淆量（inter / pred_sum / target_sum /
+        voxels / cov / sd_num / sd_denom）均为跨样本求和，all-reduce 后与单进程在
+        全集上累加**严格相等**（非近似），故 ``compute()`` 导出的 dice/sd/balanced
+        等与单卡一致。某 rank 未分到任何样本时累加器为空，以零参与求和。
+
+        每个可加量按其原生 (shape, dtype) 参与 all-reduce；空 rank 据此零初始化。
+        单进程（world_size<=1）时为 no-op。
+        """
+        if get_world_size() <= 1:
+            return
+
+        # 各可加量的 (shape, dtype)，与 dice_batch_stats / surface_dice_batch_stats
+        # 的返回一致：逐类量为 (num_fg,) float32，唯 voxels 为标量 () float64。
+        # 未分到样本的 rank 据此以正确形状/类型零初始化，保各 rank all-reduce 形状对齐
+        # （否则 collective 形状不一致会死锁）。保留各自原生 dtype，不强转 float32 以免
+        # voxel 大计数精度损失。
+        per_class = (int(num_fg),)
+        specs = {
+            "_inter":      (per_class, torch.float32),
+            "_pred_sum":   (per_class, torch.float32),
+            "_target_sum": (per_class, torch.float32),
+            "_voxels":     ((),        torch.float64),
+            "_cov":        (per_class, torch.float32),
+        }
+        if self.compute_sd:
+            specs["_sd_num"]   = (per_class, torch.float32)
+            specs["_sd_denom"] = (per_class, torch.float32)
+        for name, (shape, dtype) in specs.items():
+            t = getattr(self, name)
+            if t is None:
+                t = torch.zeros(shape, dtype=dtype, device=device)
+            else:
+                t = t.detach().to(device=device)
+            all_reduce_sum_(t)
+            setattr(self, name, t)
+
+        # 样本计数与（medium 模式的）loss 累加量同样可加。
+        agg = torch.tensor(
+            [float(self.n_samples), float(self.loss_meter.sum),
+             float(self.loss_meter.count)],
+            dtype=torch.float64, device=device)
+        all_reduce_sum_(agg)
+        self.n_samples = int(round(agg[0].item()))
+        self.loss_meter.sum = float(agg[1].item())
+        self.loss_meter.count = int(round(agg[2].item()))
+
+    @torch.no_grad()
+    def compute(self, log_prefix: str = "Val", *, log: bool = True) -> Dict[str, float]:
+        """闭式导出全部指标并打印一行概要。无样本时返回退化 dict。
+
+        ``log=False`` 时不打印概要行（多卡下仅 rank0 打印，避免 N 倍重复）。
+        """
         if self._inter is None:
-            logger.warning("%s: accumulator received no samples.", log_prefix)
+            if log:
+                logger.warning("%s: accumulator received no samples.", log_prefix)
             return {"val_loss": float("nan"), "mean_dice": 0.0}
 
         derived = derive_overlap_metrics(
@@ -200,18 +260,19 @@ class MetricAccumulator:
             metrics["mean_balanced"] = float(hm.item())
 
         cov = self._cov.cpu().tolist()
-        logger.info(
-            "  %s: loss=%.4f, pooled_mean_dice=%.4f, per_class=%s, "
-            "iou=%.4f, recall=%.4f, precision=%.4f, vol_sim=%.4f, "
-            "mcc=%.4f, min_class_dice=%.4f, coverage=%s/%d samples%s%s",
-            log_prefix, metrics["val_loss"], metrics["mean_dice"],
-            [f"{d:.4f}" for d in dice_per_class.tolist()],
-            metrics["mean_iou"], metrics["mean_recall"],
-            metrics["mean_precision"], metrics["mean_vol_sim"],
-            metrics["mean_mcc"], metrics["min_class_dice"],
-            [int(c) for c in cov], self.n_samples, sd_msg,
-            (f", balanced={metrics['mean_balanced']:.4f}"
-             if "mean_balanced" in metrics else ""))
+        if log:
+            logger.info(
+                "  %s: loss=%.4f, pooled_mean_dice=%.4f, per_class=%s, "
+                "iou=%.4f, recall=%.4f, precision=%.4f, vol_sim=%.4f, "
+                "mcc=%.4f, min_class_dice=%.4f, coverage=%s/%d samples%s%s",
+                log_prefix, metrics["val_loss"], metrics["mean_dice"],
+                [f"{d:.4f}" for d in dice_per_class.tolist()],
+                metrics["mean_iou"], metrics["mean_recall"],
+                metrics["mean_precision"], metrics["mean_vol_sim"],
+                metrics["mean_mcc"], metrics["min_class_dice"],
+                [int(c) for c in cov], self.n_samples, sd_msg,
+                (f", balanced={metrics['mean_balanced']:.4f}"
+                 if "mean_balanced" in metrics else ""))
         return metrics
 
 
@@ -251,7 +312,12 @@ class PatchValEvaluator(ValEvaluator):
     def evaluate(self, epoch: int) -> Dict[str, float]:
         t = self.trainer
         acc = self._new_accumulator()
-        for batch in t.val_loader:
+        world_size = get_world_size()
+        rank = getattr(t, "_rank", 0)
+        # 多卡：按 batch 序号把 val patch 不相交地切给各 rank（i%ws==rank）。
+        for i, batch in enumerate(t.val_loader):
+            if world_size > 1 and (i % world_size) != rank:
+                continue
             image = batch["image"].to(t.device, non_blocking=True)
             label = batch["label"].to(t.device, non_blocking=True).float()
 
@@ -269,7 +335,8 @@ class PatchValEvaluator(ValEvaluator):
                     "loss meter update.", loss_val, epoch + 1)
                 loss_val = None
             acc.update(pred_1x, target_1x, loss_value=loss_val)
-        return acc.compute(log_prefix=self.log_prefix)
+        acc.all_reduce(t.num_fg, t.device)
+        return acc.compute(log_prefix=self.log_prefix, log=is_main_process())
 
 
 class VolumeValEvaluator(ValEvaluator):
@@ -317,7 +384,8 @@ class VolumeValEvaluator(ValEvaluator):
         acc = self._new_accumulator()
         label_values = list(dc.label_values)
 
-        for path in npz_paths:
+        # 多卡：把去重后的整卷列表按 rank 不相交切分（每卷恰好一次，无重复计数）。
+        for path in shard_for_rank(npz_paths):
             vol = load_npz_image(
                 path, dc.intensity_min, dc.intensity_max, dc.normalize,
                 dc.global_mean, dc.global_std)
@@ -340,7 +408,8 @@ class VolumeValEvaluator(ValEvaluator):
             acc.update(
                 pred_logits.unsqueeze(0), target_t.unsqueeze(0),
                 loss_value=None)
-        return acc.compute(log_prefix=self.log_prefix)
+        acc.all_reduce(t.num_fg, t.device)
+        return acc.compute(log_prefix=self.log_prefix, log=is_main_process())
 
 
 # ---------------------------------------------------------------------------
