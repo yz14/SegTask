@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 from ..config import Config
 from ..models.topology import ModelTopology, build_topology
-from .graph import VisGraph, shape_str
+from .graph import VisGraph, assign_grid_layout, shape_str
 
 
 def _patch_forward_shape(
@@ -166,6 +166,9 @@ def build_predict_flow(
         })
     g.add_edge("label", "output")
 
+    # 按 forward 边做层级 + 列位分配，使各节点据 (rank, col, colspan) 摆进 CSS Grid
+    # 网格（线性链自上而下逐级排开，不再因缺省 rank 全堆在同一格而重叠）。
+    assign_grid_layout(g, assign_ranks=True)
     return g
 
 

@@ -32,7 +32,7 @@ import torch.nn as nn
 from ..config import Config
 from ..models.topology import ModelTopology, build_topology
 from .data_flow import _model_input_shape, _target_patch_size
-from .graph import VisGraph, VisNode, shape_str
+from .graph import VisGraph, assign_grid_layout, shape_str
 
 logger = logging.getLogger(__name__)
 
@@ -787,8 +787,9 @@ def _emit(b: _ModelGraphBuilder, cfg: Config) -> None:
 
     # 4) 标注跳连（src/dst 跨级且为 down 向）+ 计算层级 rank。
     _assign_ranks_and_skip(b, backbone, heads)
-    # 5) 计算横向列位（col/colspan），供 renderer 做列对齐网格布局。
-    _assign_columns(b)
+    # 5) 计算横向列位（col/colspan），供 renderer 做列对齐网格布局。rank 已由上一步
+    #    （含跳连/头分层等模型流专属逻辑）算好，这里只补通用列位。
+    assign_grid_layout(g, assign_ranks=False)
 
 
 def _called_direct_children(
@@ -1072,25 +1073,47 @@ def _emit_intra_edges(
     block_recs: Dict[Optional[str], List[_ModuleRec]],
     block_order: List[Optional[str]],
 ) -> None:
-    """容器内 block 间连边：纯真实张量流。
+    """容器内单元（block 框 + 未成 block 的散叶）间连边：纯真实张量流。
 
-    每个 block 用其模块输入的血缘 ``in_prov`` 反查同容器内上游 block。血缘由
+    每个单元用其模块输入的血缘 ``in_prov`` 反查同容器内上游单元。血缘由
     ``TorchFunctionMode`` 钩子穿过 ``torch.cat/+/split`` 等 functional 算子累积，
     因此 MultiStem 的三路 sub-stem→proj、DecoderLevel 的 upsample→首块等
     经 cat 融合的边都能被通用地还原，无需按容器类型写死补边。
+
+    散叶单元（如 head 容器里 ``conv`` block 之后的 ``classifier``）同样作为收/发端
+    参与，否则它与同容器的 block 框因无连边而默认同 rank，并排堆在一起。散叶**彼此
+    之间**的边由 ``_emit_leaf_flow`` 负责，这里只补 block 边界两侧的跨单元边。
     """
-    real_blocks = [bk for bk in block_order if bk is not None]
-    for bk in real_blocks:
-        rec = b.recs.get(bk)
+    # 收集本容器内所有"单元"：block 框（节点 id 即 block 键）+ 散叶（节点 id 带
+    # ``leaf::`` 前缀，反查键为叶名）。``_producers_in_top`` 返回的是反查键，需经
+    # ``key_to_node`` 译成真实节点 id 再连边。
+    units: List[Tuple[str, str, Optional[_ModuleRec]]] = []
+    loose_keys: Set[str] = set()
+    for bk in block_order:
+        if bk is None:
+            for r in block_recs[None]:
+                units.append((r.name, f"leaf::{r.name}", r))
+                loose_keys.add(r.name)
+        else:
+            units.append((bk, bk, b.recs.get(bk)))
+    key_to_node = {uk: nid for uk, nid, _ in units}
+
+    for unit_key, node_id, rec in units:
         if rec is None or not rec.in_prov:
             continue
         in_op = rec.in_op if len(rec.in_op) == len(rec.in_prov) else ()
-        # 逐**输入张量**反查同容器上游 block：单上游直连；同一输入被多 block
+        # 逐**输入张量**反查同容器上游单元：单上游直连；同一输入被多单元
         # 经 cat/+ 融合（如 MultiStem 三路 sub-stem→proj）则经显式 merge 节点汇入。
         for idx, pset in enumerate(rec.in_prov):
-            srcs = b._producers_in_top([pset], top, exclude=bk)
-            if not srcs:
+            keys = b._producers_in_top([pset], top, exclude=unit_key)
+            # 散叶↔散叶的边归 _emit_leaf_flow；这里只连至少一端为 block 框的跨单元边，
+            # 且来源须是本容器内已知单元（外部来源由顶层入边处理）。
+            keys = [k for k in keys
+                    if k in key_to_node
+                    and not (unit_key in loose_keys and k in loose_keys)]
+            if not keys:
                 continue
+            srcs = [key_to_node[k] for k in keys]
             if len(srcs) >= 2:
                 op = (in_op[idx] if idx < len(in_op) else None) or "cat"
                 tid = rec.in_ids[idx] if idx < len(rec.in_ids) else -1 - idx
@@ -1099,9 +1122,9 @@ def _emit_intra_edges(
                 if created:
                     for src in srcs:
                         b._add_edge(src, mid)
-                b._add_edge(mid, bk)
+                b._add_edge(mid, node_id)
             else:
-                b._add_edge(srcs[0], bk)
+                b._add_edge(srcs[0], node_id)
 
 
 def _ensure_backbone_chain(b: _ModelGraphBuilder, backbone: List[str]) -> None:
@@ -1180,58 +1203,6 @@ def _assign_ranks_and_skip(
             continue
         if rankmap.get(e.dst, 0) - rankmap.get(e.src, 0) > 1:
             e.kind = "skip"
-
-
-def _assign_columns(b: _ModelGraphBuilder) -> None:
-    """对每个父容器内的兄弟节点分配横向列位 ``(col, colspan)``，使并联路径各占一列、
-    主链笔直，融合点（cat/+）居中覆盖其上游列。纯靠 forward 边血缘，不写死模块类型。
-
-    逐 rank 自上而下：
-      (a) 按已定稿的 forward 父（排除 residual/skip）定列——无父则为源、占新列；
-          有父则 ``col=min(父.col)``、``colspan`` 覆盖父列区间（单父继承，使链笔直）。
-      (b) 同 rank 内按 ``(col, 插入序)`` 从左到右扫描去重叠（右移），下游在各自 rank
-          基于已定稿父列重算自动跟随，无累积漂移。
-    """
-    g = b.g
-    by_parent: Dict[Optional[str], List[VisNode]] = {}
-    for n in g.nodes:
-        by_parent.setdefault(n.parent_id, []).append(n)
-    # dst → forward 父列表（residual/skip 不计入列血缘）。
-    fwd_parents: Dict[str, List[str]] = {}
-    for e in g.edges:
-        if e.kind == "forward":
-            fwd_parents.setdefault(e.dst, []).append(e.src)
-
-    for kids in by_parent.values():
-        idset = {n.id for n in kids}
-        order_idx = {n.id: i for i, n in enumerate(kids)}
-        by_rank: Dict[int, List[str]] = {}
-        for n in kids:
-            by_rank.setdefault(n.rank, []).append(n.id)
-        col: Dict[str, int] = {}
-        span: Dict[str, int] = {}
-        for r in sorted(by_rank):
-            row = by_rank[r]
-            for nid in row:
-                ps = [p for p in fwd_parents.get(nid, ())
-                      if p in idset and p in col and p != nid]
-                if not ps:
-                    col[nid] = 0          # 暂置，由扫描步打包成相邻列
-                    span[nid] = 1
-                else:
-                    lo = min(col[p] for p in ps)
-                    hi = max(col[p] + span[p] for p in ps)
-                    col[nid] = lo
-                    span[nid] = hi - lo
-            # 同 rank 去重叠：按 (col, 插入序) 从左到右，必要时右移。
-            cursor: Optional[int] = None
-            for nid in sorted(row, key=lambda x: (col[x], order_idx[x])):
-                if cursor is not None and col[nid] < cursor:
-                    col[nid] = cursor
-                cursor = col[nid] + span[nid]
-        for n in kids:
-            n.col = col[n.id]
-            n.colspan = span[n.id]
 
 
 # -- 小工具 ----------------------------------------------------------------

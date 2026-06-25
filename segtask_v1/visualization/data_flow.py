@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 from ..config import Config
 from ..models.topology import ModelTopology, build_topology
-from .graph import VisGraph, shape_str
+from .graph import VisGraph, assign_grid_layout, shape_str
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +221,9 @@ def build_data_flow(cfg: Config, topo: Optional[ModelTopology] = None) -> VisGra
         })
     g.add_edge("reshape", "model_input", "→ 模型流")
 
+    # 按 forward 边做层级 + 列位分配，使各节点据 (rank, col, colspan) 摆进 CSS Grid
+    # 网格（线性链自上而下逐级排开，不再因缺省 rank 全堆在同一格而重叠）。
+    assign_grid_layout(g, assign_ranks=True)
     return g
 
 
