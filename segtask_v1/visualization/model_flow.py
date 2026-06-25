@@ -999,9 +999,32 @@ def _emit_leaf_flow(b: _ModelGraphBuilder, members: List[_ModuleRec],
                         None)
             sink = sink or next((r.name for r in reversed(ordered)
                                  if not _is_shortcut(r.name)), None)
-            if sink is not None and sink != rec.name:
-                b._add_edge(name_to_cid[rec.name], name_to_cid[sink],
-                            "+", kind="residual")
+            if sink is None or sink == rec.name:
+                continue
+            # 与"块内有模块捷径"（conv+norm shortcut，主循环 functional≥2 已建 + 框）
+            # 保持一致：Identity 等**无模块**捷径的残差也插入显式 '+' 融合框——主路前
+            # 向汇入、捷径以残差线汇入——而非画一条裸虚线，使各 block 残差呈现统一。
+            # 做法：把已发射的主路前向入边改接到 + 框上游，再 + 框→汇点。
+            sink_cid = name_to_cid[sink]
+            sink_rec = name_rec.get(sink)
+            tid = (sink_rec.in_ids[0] if sink_rec and sink_rec.in_ids
+                   else hash(sink_cid))
+            reuse = (parent, tid, 0) in b._merge_nodes
+            main_edges = [e for e in b.g.edges
+                          if e.dst == sink_cid and e.kind == "forward"]
+            if reuse or main_edges:
+                mid, created = b._emit_merge(
+                    parent, tid, 0, "+",
+                    sink_rec.in_shape if sink_rec else None)
+                if created:
+                    for e in main_edges:        # 主路前向：汇点 → + 框
+                        e.dst = mid
+                    b._add_edge(mid, sink_cid, kind="forward")
+                b._add_edge(name_to_cid[rec.name], mid, "", kind="residual")
+            else:
+                # 无主路前向入边（极少见）→ 退回直接残差线，避免建只有单输入的空框。
+                b._add_edge(name_to_cid[rec.name], sink_cid, "+", kind="residual")
+            has_out.add(rec.name)
     else:
         # 追踪失败的纯结构降级：按声明序把叶子连成一条线性链，至少给出可读骨架。
         for prev, cur in zip(leaf_ids, leaf_ids[1:]):
