@@ -87,7 +87,7 @@ svg.edges-top { z-index: 3; }
    justify-items:center 使单列后续节点在其跨列区间内居中对齐。grid-template-columns
    的列数由 layoutInto 据本容器节点 max(col+colspan) 动态注入。 */
 .col { position: relative; z-index: 2; display: grid; justify-items: center;
-  align-items: start; row-gap: 22px; column-gap: 26px; }
+  align-items: start; row-gap: 22px; column-gap: 16px; }
 .children { display: grid; justify-items: center; align-items: start;
   row-gap: 16px; column-gap: 26px; padding: 6px 14px 14px; }
 .children.collapsed { display: none; }
@@ -265,7 +265,7 @@ function buildStage(node, childrenOf) {
 // by its (rank, col, colspan): rank → grid row, col/colspan → grid column span.
 // 并联路径各占一列、串联主链同列笔直，融合点（colspan>1）跨列居中覆盖其上游列。
 // 列数据由 builder 的 _assign_columns 写入 IR（forward 血缘 + 同 rank 去重叠）。
-function layoutInto(container, nodes, childrenOf) {
+function layoutInto(container, nodes, childrenOf, topLevel) {
   if (!nodes.length) return;
   const maxCols = Math.max(
     1, ...nodes.map(n => (n.col || 0) + (n.colspan || 1)));
@@ -274,6 +274,14 @@ function layoutInto(container, nodes, childrenOf) {
     const w = render(nd, childrenOf);
     w.style.gridRow = String((nd.rank || 0) + 1);
     w.style.gridColumn = ((nd.col || 0) + 1) + " / span " + (nd.colspan || 1);
+    // 顶层「相连框相邻」：分支列(col≥1)左对齐——使 DS Head N / Aux Head 紧贴其左侧
+    // 的 Decoder N / Seg Head，且各分支框左缘对齐成一条竖线（取代原 justify-items
+    // 居中带来的浮动间距）。主干列(col0)保持居中：其框多已撑满该列、右缘自然成直线，
+    // 居中又能让窄框(如模型输入)的前向箭头与主链对齐不偏。跨列融合点(colspan>1，如
+    // loss)亦保持居中覆盖其上游列区间。仅作用于顶层，块内 .children 维持既有居中布局。
+    if (topLevel && (nd.colspan || 1) === 1 && (nd.col || 0) >= 1) {
+      w.style.justifySelf = "start";
+    }
     container.appendChild(w);
   }
 }
@@ -538,7 +546,7 @@ function buildFlow(flowKey) {
   });
   // top-level layout: rank-aware (并联横排) with multi-res input fallback
   const tops = g.nodes.filter(n => !n.parent_id);
-  layoutInto(col, tops, childrenOf);
+  layoutInto(col, tops, childrenOf, true);
   return flow;
 }
 

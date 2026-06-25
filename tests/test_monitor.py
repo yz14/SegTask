@@ -135,11 +135,31 @@ def test_single_payload_structure(tmp_path):
     assert payload["mode"] == "single"
     assert payload["auto_reload_seconds"] == 7
     ids = {p["id"] for p in payload["panels"]}
-    # 关键面板存在：损失 / 概览 / 学习率 / GPU / 选模指标 / 逐类 Dice。
-    assert {"loss", "overview", "lr", "gpu", "primary"} <= ids
+    # 关键面板存在：损失 / 概览 / 学习率 / GPU / 逐类 Dice。
+    assert {"loss", "overview", "lr", "gpu"} <= ids
+    # 已去掉冗余的独立「选模指标」面板（并入概览高亮）。
+    assert "primary" not in ids
     assert any(i.startswith("per_class_dice_class") for i in ids)
+
+    # 分组 / 跨列布局元数据齐全。
+    by_id = {p["id"]: p for p in payload["panels"]}
+    assert by_id["loss"]["group"] == "Training" and by_id["loss"]["span"] == "full"
+    assert by_id["overview"]["group"] == "Validation"
+    assert by_id["overview"]["span"] == "full"
+    assert by_id["lr"]["group"] == "System" and by_id["lr"]["span"] == "half"
+
+    # 选模指标并入概览并加粗高亮。
+    ov_sel = [s for s in by_id["overview"]["series"] if s.get("emphasis")]
+    assert len(ov_sel) == 1 and "(selection)" in ov_sel[0]["label"]
+
+    # 逐类指标合并为「一图多线」：每类一条线（num_classes=2 → 2 条）。
+    pc = next(p for p in payload["panels"]
+              if p["id"].startswith("per_class_dice_class"))
+    assert pc["kind"] == "line" and len(pc["series"]) == 2
+    assert pc["span"] == "half"
+
     # x 轴为 1-based epoch。
-    loss = next(p for p in payload["panels"] if p["id"] == "loss")
+    loss = by_id["loss"]
     assert loss["series"][0]["points"][0][0] == 1
     # best 标记 / best 卡片。
     assert loss["best_x"] == 5  # mean_dice 单调增 → best 在最后 epoch（0-based 4 → 1-based 5）
