@@ -29,6 +29,10 @@ class UNetPPDecoder(nn.Module):
         upsample_mode: str = "transpose",
         skip_attention: bool = False,
         spatial_dims: int = 3,
+        upsample_norm_act: bool = False,
+        norm_type: str = "instance",
+        norm_groups: int = 8,
+        activation: str = "leakyrelu",
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -53,6 +57,10 @@ class UNetPPDecoder(nn.Module):
                     encoder_channels[i],
                     mode=upsample_mode,
                     spatial_dims=spatial_dims,
+                    norm_act=upsample_norm_act,
+                    norm_type=norm_type,
+                    norm_groups=norm_groups,
+                    activation=activation,
                 )
                 # 融合：j 个同深度节点 + 1 上采样 = (j+1)*enc[i]。
                 fused_ch = (j + 1) * encoder_channels[i]

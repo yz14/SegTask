@@ -89,7 +89,8 @@ def _make_resnet_stage_builder(
                 use_se         = mc.use_se,
                 se_reduction   = mc.se_reduction,
                 attention_type = mc.attention_type,
-                spatial_dims   = spatial_dims)
+                spatial_dims   = spatial_dims,
+                branch_norm_act = mc.multirf_branch_norm_act)
         return ResNetStage(
             in_ch, out_ch,
             num_blocks     = num_blocks,
@@ -403,7 +404,11 @@ def build_model(cfg: Config):
             stage_builder=dec_builder,
             upsample_mode=mc.upsample_mode,
             skip_attention=mc.skip_attention,
-            spatial_dims=spatial_dims)
+            spatial_dims=spatial_dims,
+            upsample_norm_act=mc.upsample_norm_act,
+            norm_type=mc.norm_type,
+            norm_groups=mc.norm_groups,
+            activation=mc.activation)
     else:
         decoder = Decoder(
             encoder_channels   = enc_channels,
@@ -412,7 +417,11 @@ def build_model(cfg: Config):
             skip_mode          = mc.skip_mode,
             skip_attention     = mc.skip_attention,
             spatial_dims       = spatial_dims,
-            downsample_strides = ds_strides)
+            downsample_strides = ds_strides,
+            upsample_norm_act  = mc.upsample_norm_act,
+            norm_type          = mc.norm_type,
+            norm_groups        = mc.norm_groups,
+            activation         = mc.activation)
 
     # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
     aux_seg_supervision       = topo.aux_seg_active
