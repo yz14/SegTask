@@ -22,6 +22,7 @@
     - [2.3 预测](#23-预测)
     - [2.4 npz 预打包（可选，强烈推荐）](#24-npz-预打包可选强烈推荐)
     - [2.5 排除坏 NIfTI 样本](#25-排除坏-nifti-样本)
+    - [2.6 可视化启动器 launcher（网页一键训练/推理）](#26-可视化启动器-launcher网页一键训练推理)
   - [3. `segtask_v1/` 模块详解](#3-segtask_v1-模块详解)
     - [3.1 `train.py` / `predict.py` / `__main__.py` —— CLI 入口](#31-trainpy--predictpy--__main__py--cli-入口)
     - [3.2 `config.py` —— dataclass + YAML 配置系统](#32-configpy--dataclass--yaml-配置系统)
@@ -270,6 +271,24 @@ python -m segtask_v1.data.make_data --config configs/seg2_5d.yaml `
 python tools/scan_bad_nifti.py --config configs/seg2_5d.yaml --out tools/bad_seg2_5d
 # 然后在 YAML 里设置 data.exclude_list: "tools/bad_seg2_5d/bad_pids.txt"
 ```
+
+### 2.6 可视化启动器 launcher（网页一键训练/推理）
+
+不想手敲 YAML / CLI？用内置的 **本地网页启动器**：把 YAML 渲染成带 `?` 悬浮说明的表单，改完参数即可一键发起 `train` / `predict` 并在页面实时看日志。零新增依赖（纯 Python 标准库 `http.server`），仅监听 `127.0.0.1`。
+
+```powershell
+python -m segtask_v1.launcher                 # 默认 127.0.0.1:8771，自动开浏览器
+python -m segtask_v1.launcher --port 9000     # 换端口
+python -m segtask_v1.launcher --no-browser    # 不自动开浏览器（远程端口转发时用）
+```
+
+- **两个页面、按模式拆分**：`/2_5d`（`patch_mode=2_5d`）与 `/3d`（`z_axis`/`cubic`/`whole`）。每个页面**只展示该模式下"可调且生效"的参数**——自动剔除派生只读字段（如 `in_channels`/`spatial_dims`）、被其它字段覆盖项、以及与本模式无关的字段；带条件的参数（如 `multirf_*` 仅 `backbone=resnet`）随依赖项自动显隐。
+- **tooltip 单一真相源**：每个参数的 `?` 说明直接从 `config.py` 的行内注释自动提取，永不与代码脱节。
+- **工作流**：选 `基础配置`（自动按模式过滤 `configs/*.yaml`）→ `载入` 预填表单 → 改参 → `校验`（复用 `Config.validate()`）→ `预览 YAML` → `开始训练/推理`。运行用的 YAML 落在 `configs/_runs/<时间戳>_<task>.yaml`，对应命令即 `python -m segtask_v1.train/predict --config <该文件>`。
+- **推理页**只展示 `predict.*` 与 CLI-only 运行项（`checkpoint`/`input`/`output`/`bbox`/`weights`/`precision`…）；模型/数据几何须先 `载入` 与权重匹配的训练配置来继承。
+- **跨平台**：用 `sys.executable` 起子进程，POSIX 用进程组、Windows 用 `taskkill /T` 实现"停止"。
+
+> 仅作为既有 `train.py` / `predict.py` 的非侵入式前端，不改动任何训练/推理逻辑。
 
 ---
 
