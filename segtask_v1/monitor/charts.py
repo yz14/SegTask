@@ -53,8 +53,15 @@ _OTHER_SCALE_PREFIXES: List[tuple] = [
     ("vol_sim_class_", "VolSim"),
 ]
 
-# 合并图里「每个指标一种线型」（SVG stroke-dasharray；None=实线）。
-_METRIC_DASH: List[Optional[str]] = [None, "5 3", "1 3", "7 3 2 3"]
+# 逐类合并图（Per-class Dice/IoU/Recall/Precision）的配色：按「指标分色系、
+# 类内分深浅」给每条线一个独立颜色——既区分指标又区分类，比线型(dash)更易读。
+# 每个色系 4 档（class 0..3 由深到浅）；类数超过 4 时循环复用。
+_PER_CLASS_UNIT_FAMILIES: List[List[str]] = [
+    ["#1e3a8a", "#2563eb", "#3b82f6", "#60a5fa"],  # Dice    · 蓝
+    ["#065f46", "#059669", "#10b981", "#34d399"],  # IoU     · 绿
+    ["#9a3412", "#d97706", "#f59e0b", "#fbbf24"],  # Recall  · 橙
+    ["#5b21b6", "#7c3aed", "#8b5cf6", "#a78bfa"],  # Prec.   · 紫
+]
 
 
 def _loss_component_keys(hist: MetricsHistory) -> List[str]:
@@ -87,30 +94,27 @@ def build_single_payload(
     panels: List[Dict[str, Any]] = []
 
     # ============ Training ============
-    # 损失曲线（train / val），占满整行。
+    # 损失曲线（train / val），占满整行。总损失（train/val）加粗高亮，训练损失
+    # 分量（L_main / L_aux_* / L_res_*）以细线并入同一张图、各自一色，默认显示，
+    # 可经图例逐条开关。
     loss_series: List[Dict[str, Any]] = []
     if "loss" in train_keys:
-        loss_series.append(_line_series("train loss", _color(0),
-                                        _points(hist, "loss", "train")))
+        s = _line_series("train loss", _color(0), _points(hist, "loss", "train"))
+        s["emphasis"] = True
+        loss_series.append(s)
     if "val_loss" in val_keys:
-        loss_series.append(_line_series("val loss", _color(1),
-                                        _points(hist, "val_loss", "val")))
+        s = _line_series("val loss", _color(1), _points(hist, "val_loss", "val"))
+        s["emphasis"] = True
+        loss_series.append(s)
+    comp = _loss_component_keys(hist)
+    for j, k in enumerate(comp):
+        loss_series.append(_line_series(k, _color(2 + j),
+                                        _points(hist, k, "train")))
     if loss_series:
         panels.append({
             "id": "loss", "title": "Loss", "kind": "line",
             "group": "Training", "span": "full",
             "log_toggle": True, "best_x": best_x, "series": loss_series,
-        })
-
-    # 损失分量（train），半宽。
-    comp = _loss_component_keys(hist)
-    if comp:
-        panels.append({
-            "id": "loss_components", "title": "Loss components (train)",
-            "kind": "line", "group": "Training", "span": "half",
-            "best_x": best_x,
-            "series": [_line_series(k, _color(i), _points(hist, k, "train"))
-                       for i, k in enumerate(comp)],
         })
 
     # ============ Validation ============
@@ -135,23 +139,21 @@ def build_single_payload(
             "best_x": best_x, "series": ov_series,
         })
 
-    # 逐类指标：同为 [0,1] 尺度的多个指标进一步合并到「同一张图」——
-    # 每类一种颜色、每个指标一种线型（实线 / 虚线 …），图例区分。
+    # 逐类指标：同为 [0,1] 尺度的多个指标合并到「同一张图」——按指标分色系、
+    # 类内分深浅，每条线一个独立颜色（图例区分），默认全部显示。
     # 非 [0,1] 尺度（MCC∈[-1,1]、VolSim）各自单图，避免尺度混淆。
     present_unit = [(p, n) for p, n in _UNIT_SCALE_PREFIXES
                     if hist.per_class_keys(p, "val")]
     if present_unit:
         series = []
         for mi, (prefix, nice) in enumerate(present_unit):
-            dash = _METRIC_DASH[mi % len(_METRIC_DASH)]
+            family = _PER_CLASS_UNIT_FAMILIES[mi % len(_PER_CLASS_UNIT_FAMILIES)]
             for k in hist.per_class_keys(prefix, "val"):
                 idx = k[len(prefix):]
                 ci = int(idx) if idx.isdigit() else 0
-                s = _line_series(f"class {idx} · {nice}", _color(ci),
-                                 _points(hist, k, "val"))
-                if dash:
-                    s["dash"] = dash
-                series.append(s)
+                color = family[ci % len(family)]
+                series.append(_line_series(f"class {idx} · {nice}", color,
+                                           _points(hist, k, "val")))
         nices = [n for _, n in present_unit]
         title = ("Per-class " + nices[0]) if len(nices) == 1 \
             else "Per-class " + " / ".join(nices)
@@ -224,21 +226,72 @@ def _single_meta(hist: MetricsHistory, name: str) -> List[List[str]]:
     return meta
 
 
+# best 卡片里逐类矩阵的列（前缀 → 列名），按既有图表同序排列。
+_MATRIX_PREFIXES: List[tuple] = _UNIT_SCALE_PREFIXES + _OTHER_SCALE_PREFIXES
+
+
 def _best_card(hist: MetricsHistory) -> Optional[Dict[str, Any]]:
     best = hist.best
     if not best:
         return None
     val = best.get("val") or {}
-    ordered = [m for m in _OVERVIEW_METRICS if m in val]
-    rest = [k for k in sorted(val) if k not in ordered]
-    rows = [[k, _fmt(val[k])] for k in ordered + rest]
+    sel = best.get("metric_name")
+
+    # 1) 均值 / 聚合指标 → 高亮 stat 磁贴（按既定顺序，选模指标置顶并标记）。
+    means_keys = [m for m in _OVERVIEW_METRICS if m in val]
+    if sel in val and sel not in means_keys:
+        means_keys = [sel] + means_keys
+    means = [{"key": k, "value": _fmt(val[k]), "selected": k == sel}
+             for k in means_keys]
+
+    # 2) 逐类指标 → 矩阵（行=class，列=指标）；同时记录被矩阵吸收的 key。
+    consumed = set(means_keys)
+    columns: List[str] = []
+    col_prefix: List[str] = []
+    class_idx: List[int] = []
+    for prefix, nice in _MATRIX_PREFIXES:
+        idxs = []
+        for k in val:
+            if k.startswith(prefix):
+                suf = k[len(prefix):]
+                if suf.isdigit():
+                    idxs.append(int(suf))
+        if idxs:
+            columns.append(nice)
+            col_prefix.append(prefix)
+            class_idx = sorted(set(class_idx) | set(idxs))
+    matrix: Optional[Dict[str, Any]] = None
+    if columns and class_idx:
+        rows = []
+        for ci in class_idx:
+            cells = []
+            for prefix in col_prefix:
+                k = f"{prefix}{ci}"
+                if k in val:
+                    consumed.add(k)
+                    try:
+                        t = float(val[k])
+                    except (TypeError, ValueError):
+                        t = None
+                    cells.append({"value": _fmt(val[k]),
+                                  "t": t if t is not None and t == t else None})
+                else:
+                    cells.append({"value": "—", "t": None})
+            rows.append({"label": f"class {ci}", "cells": cells})
+        matrix = {"columns": columns, "rows": rows}
+
+    # 3) 其余标量指标（既非均值磁贴、也未进矩阵）→ 次要小列表。
+    rest = [[k, _fmt(val[k])] for k in sorted(val) if k not in consumed]
+
     return {
         "headline": {
             "metric": best.get("metric_name"),
             "value": _fmt(best.get("metric_value")),
             "epoch": (best.get("epoch") or 0) + 1,
         },
-        "metrics": rows,
+        "means": means,
+        "matrix": matrix,
+        "rest": rest,
     }
 
 
