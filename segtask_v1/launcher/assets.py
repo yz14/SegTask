@@ -43,8 +43,8 @@ button.primary{background:var(--accent);color:#04101f;border-color:var(--accent)
 button.danger{background:var(--danger);color:#fff;border-color:var(--danger)}
 button:disabled{opacity:.45;cursor:not-allowed}
 select,input[type=text],input[type=number]{background:#0d141d;color:var(--fg);
-  border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:13px;
-  width:100%}
+  border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:13px;
+  width:100%;height:34px;line-height:1.2}
 input:focus,select:focus{outline:none;border-color:var(--sec,var(--accent));
   box-shadow:0 0 0 2px color-mix(in srgb,var(--sec,var(--accent)) 22%,transparent)}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--radius);
@@ -54,7 +54,8 @@ input:focus,select:focus{outline:none;border-color:var(--sec,var(--accent));
 
 /* ---- 模块分组（每个 section 一种主题色，由 data-sec 决定 --sec） ---- */
 .group{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-  margin-bottom:12px;overflow:hidden;border-left:4px solid var(--sec,var(--accent))}
+  margin-bottom:14px;overflow:hidden;border-left:4px solid var(--sec,var(--accent));
+  box-shadow:0 1px 2px rgba(0,0,0,.25)}
 .group[data-sec=data]{--sec:#4f9cf9}
 .group[data-sec=augment]{--sec:#26c0c0}
 .group[data-sec=model]{--sec:#a972f0}
@@ -63,11 +64,12 @@ input:focus,select:focus{outline:none;border-color:var(--sec,var(--accent));
 .group[data-sec=predict]{--sec:#ef6fa6}
 .group[data-sec=vismon]{--sec:#7d92b5}
 .group[data-sec=run]{--sec:#d8b738}
-.group>.ghead{padding:9px 14px;cursor:pointer;display:flex;justify-content:space-between;
-  align-items:center;font-weight:600;user-select:none;
+.group>.ghead{padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;
+  align-items:center;font-weight:600;user-select:none;transition:filter .12s;
   background:linear-gradient(90deg,
     color-mix(in srgb,var(--sec,var(--accent)) 20%,var(--panel2)),
     var(--panel2) 60%)}
+.group>.ghead:hover{filter:brightness(1.08)}
 .group>.ghead .htitle{display:flex;align-items:center;gap:8px}
 .group>.ghead .gdot{width:9px;height:9px;border-radius:50%;
   background:var(--sec,var(--accent));box-shadow:0 0 7px var(--sec,var(--accent))}
@@ -76,26 +78,39 @@ input:focus,select:focus{outline:none;border-color:var(--sec,var(--accent));
 .group.collapsed>.ghead .arrow{transform:rotate(-90deg)}
 .group.collapsed>.gbody{display:none}
 
-/* ---- 表单：自适应多列网格；长字段占整行 ---- */
-.gbody{padding:12px 14px 14px;display:grid;gap:11px 16px;
-  grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
-.field{display:flex;flex-direction:column;gap:5px;min-width:0}
+/* ---- 表单：自适应多列网格；统一控件高度；长字段占整行 ---- */
+.gbody{padding:14px 16px 16px;display:grid;gap:13px 16px;align-items:start;
+  grid-template-columns:repeat(auto-fill,minmax(206px,1fr))}
+.field{display:flex;flex-direction:column;gap:6px;min-width:0}
 .field.wide{grid-column:1/-1}
-.field.flag{flex-direction:row;align-items:center;gap:9px}
-.field.flag .ctrl{order:-1}
-.field label{display:flex;align-items:center;gap:6px;color:#cdd9e5;font-size:12.5px;
-  word-break:break-word}
-.field .ctrl{min-width:0}
-.help{display:inline-flex;width:16px;height:16px;border-radius:50%;
-  background:#33425a;color:#cfe;font-size:11px;align-items:center;justify-content:center;
-  cursor:help;flex:none;position:relative}
+.field>label{display:flex;align-items:center;gap:6px;color:var(--muted);
+  font-size:12px;font-weight:500;word-break:break-word;min-height:15px;line-height:1.25}
+.field.changed>label{color:var(--fg)}
+.field.changed>label::after{content:"";width:5px;height:5px;border-radius:50%;flex:none;
+  background:var(--sec,var(--accent));box-shadow:0 0 5px var(--sec,var(--accent))}
+.field .ctrl{min-width:0;height:34px;display:flex;align-items:center}
+.field.wide .ctrl{height:auto;min-height:34px}
+.field .ctrl>select,.field .ctrl>input{width:100%}
+.help{display:inline-flex;width:15px;height:15px;border-radius:50%;flex:none;
+  background:transparent;border:1px solid #3a4a63;color:var(--muted);font-size:10px;
+  align-items:center;justify-content:center;cursor:help;position:relative;transition:.12s}
+.help:hover{background:#33425a;color:#cfe;border-color:transparent}
 .help:hover .tip{display:block}
 .tip{display:none;position:absolute;left:20px;top:-4px;z-index:30;width:320px;
   background:#04101f;border:1px solid var(--sec,var(--accent));border-radius:6px;
-  padding:8px 10px;color:#dfe;font-size:12px;line-height:1.45;
+  padding:8px 10px;color:#dfe;font-size:12px;line-height:1.45;font-weight:400;
   box-shadow:0 6px 20px rgba(0,0,0,.5);white-space:pre-wrap}
-.cb{width:17px;height:17px;accent-color:var(--sec,var(--accent))}
-.row-flag{display:flex;align-items:center;gap:8px}
+/* 布尔 → 开关控件（与输入框等高、顶对齐，消除错位） */
+.switch{position:relative;display:inline-flex;align-items:center;height:34px;cursor:pointer}
+.switch>input{position:absolute;opacity:0;width:0;height:0;margin:0}
+.switch .track{width:42px;height:22px;border-radius:12px;background:#2a3850;flex:none;
+  border:1px solid var(--line);transition:background .15s,border-color .15s;position:relative}
+.switch>input:checked+.track{background:var(--sec,var(--accent));
+  border-color:var(--sec,var(--accent))}
+.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;
+  border-radius:50%;background:#e6edf3;transition:transform .15s}
+.switch>input:checked+.track::after{transform:translateX(20px);background:#04101f}
+.switch>input:disabled+.track{opacity:.45;cursor:not-allowed}
 .muted{color:var(--muted)}
 .err{color:var(--danger)}
 .ok{color:#5cc97f}
@@ -220,10 +235,11 @@ function fieldActive(fld){ return (fld.depends_on||[]).every(condMet); }
 function controlFor(fld){
   const ref=fld.ref, cur=getVal(ref);
   if(fld.control==='bool'){
-    const cb=el('input',{type:'checkbox',class:'cb'});
+    const cb=el('input',{type:'checkbox'});
     cb.checked=!!cur;
+    cb.disabled=!!fld.readonly;
     cb.addEventListener('change',()=>{ setVal(ref,cb.checked); refresh(); });
-    return el('div',{class:'row-flag'},cb);
+    return el('label',{class:'switch'}, cb, el('span',{class:'track'}));
   }
   if(fld.control==='enum'){
     const sel=el('select');
@@ -268,7 +284,6 @@ function controlFor(fld){
 // 长字段（路径 / 列表 / JSON）占整行；布尔紧凑同行；短字符串/数值/枚举进多列网格
 const WIDE_RE=/(_dir|_list|path|resume|pretrain|output|input|checkpoint|weights|bbox)/i;
 function fieldClass(fld){
-  if(fld.control==='bool') return 'field flag';
   if(fld.control==='list') return 'field wide';
   const name=(fld.ref||'').split('.').pop();
   if(fld.control==='str' && WIDE_RE.test(name)) return 'field wide';
@@ -319,9 +334,9 @@ function runArgRow(ra){
   const ref='run.'+ra.name;
   let ctrl;
   if(ra.control==='bool'){
-    const cb=el('input',{type:'checkbox',class:'cb'}); cb.checked=!!RUNVALS[ra.name];
+    const cb=el('input',{type:'checkbox'}); cb.checked=!!RUNVALS[ra.name];
     cb.addEventListener('change',()=>RUNVALS[ra.name]=cb.checked);
-    ctrl=el('div',{class:'row-flag'},cb);
+    ctrl=el('label',{class:'switch'}, cb, el('span',{class:'track'}));
   }else if(ra.control==='enum'){
     const sel=el('select');
     for(const o of ra.enum){ const op=el('option',{value:o},o);
@@ -336,16 +351,23 @@ function runArgRow(ra){
   }
   const lbl=el('label',{}, ra.name,
     ra.tooltip? el('span',{class:'help'},'?', el('span',{class:'tip'},ra.tooltip)):null);
-  const cls = ra.control==='bool' ? 'field flag'
+  const cls = ra.control==='bool' ? 'field'
             : ra.control==='enum' ? 'field' : 'field wide';
   return el('div',{class:cls}, lbl, el('div',{class:'ctrl'},ctrl));
 }
 
 // re-evaluate depends_on visibility without full rebuild
+function isChanged(fld){
+  if(!fld.ref) return false;
+  const [s,f]=fld.ref.split('.');
+  const def=(PAYLOAD.all_defaults[s]||{})[f];
+  return JSON.stringify(getVal(fld.ref))!==JSON.stringify(def);
+}
 function refresh(){
   $$('#form .field').forEach(row=>{
     const fld=row.__fld; if(!fld) return;
     row.classList.toggle('hidden', !fieldActive(fld));
+    row.classList.toggle('changed', isChanged(fld));
   });
 }
 
