@@ -492,7 +492,8 @@ function renderBestCard(bc) {
     card.appendChild(grid);
   }
 
-  // 逐类指标 → 矩阵表（行=class，列=指标），按列做轻量绿色色阶 heatmap。
+  // 逐类指标 → 矩阵表（行=class，列=指标）；每格按其数值本身映射到固定
+  // [0,1] 绿色色阶上色——跨指标含义统一，深=高分（值裁剪到 [0,1]）。
   if (bc.matrix && bc.matrix.rows && bc.matrix.rows.length) {
     card.appendChild(el("div", "sub", "Per-class"));
     const t = el("table", "mtx");
@@ -500,21 +501,15 @@ function renderBestCard(bc) {
     htr.appendChild(el("th", null, "class"));
     bc.matrix.columns.forEach(c => htr.appendChild(el("th", null, c)));
     head.appendChild(htr); t.appendChild(head);
-    // 每列 min/max 用于归一化着色。
-    const n = bc.matrix.columns.length;
-    const lo = Array(n).fill(Infinity), hi = Array(n).fill(-Infinity);
-    bc.matrix.rows.forEach(r => r.cells.forEach((c, j) => {
-      if (c.t != null) { if (c.t < lo[j]) lo[j] = c.t; if (c.t > hi[j]) hi[j] = c.t; }
-    }));
     const tb = el("tbody");
     bc.matrix.rows.forEach(r => {
       const tr = el("tr");
       tr.appendChild(el("td", null, r.label));
-      r.cells.forEach((c, j) => {
+      r.cells.forEach(c => {
         const td = el("td", null, c.value);
-        if (c.t != null && isFinite(lo[j]) && hi[j] > lo[j]) {
-          const norm = (c.t - lo[j]) / (hi[j] - lo[j]);
-          td.style.background = `rgba(5,150,105,${(0.06 + 0.40 * norm).toFixed(3)})`;
+        if (c.t != null) {
+          const norm = Math.max(0, Math.min(1, c.t));
+          td.style.background = `rgba(5,150,105,${(0.04 + 0.55 * norm).toFixed(3)})`;
         }
         tr.appendChild(td);
       });
