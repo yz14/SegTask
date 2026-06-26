@@ -363,16 +363,55 @@ function drawEdges() {
   const seen = new Set();
 
   const STEP = 22, GAP = 26;
-  // 主干（encoder/decoder）跳连走**左**外缘嵌套车道（主链恒在最左列 col0，左侧恒空，
-  // 不会被右侧分出的各 head 遮挡）；故先按顶层 enc→dec 跳连数预留左内边距，让框整体
-  // 右移腾出车道空间，避免车道坐标落到画布左外侧被裁掉。head→loss 汇聚束走右侧，无需
-  // 预留。该值仅依赖边数恒定，重复调用幂等。
+  // —— 通用跳连路由（基于 rank 的两侧划分，几何无关、幂等）——
+  // 旧实现把**所有**顶层跳连塞进左侧一条同心弧带：仅当所有跳连区间「严格嵌套」时
+  // 才互不相交（如朴素 UNet）；一旦出现「交错」区间（unetpp/unet3p 的密集解码器，
+  // 同一侧无论如何排车道都必然互穿）就退化为乱麻（RC1）。
+  // 通用解：把顶层跳连按「纵向 rank 区间是否交错」做贪心两色划分到**左/右**外缘——
+  // 相互嵌套或不相交者可同侧无交叉,仅交错者分到异侧,从而把单侧不可避免的交叉
+  // 转移成两侧分担(交叉数从 O(交错对) 降到极少数残留)。左缘恒空(主链在 col0);
+  // 右缘水平段一律走**行间空隙(row-gap)**,该空隙是贯穿所有列的干净横带,故不压任何框。
+  // 划分仅依赖 rank（节点自带，无需量测 DOM），故确定、稳定、对任意 decoder_type 通用。
+  const rankOf = {};
+  (g.nodes || []).forEach(n => { rankOf[n.id] = (n.rank || 0); });
+  const skipRoute = {};   // "src>dst" -> {band:'Lskip'|'Rskip', lane, laneN}
+  (function () {
+    const sk = [];
+    edges.forEach(ed => {
+      if (topIds.has(ed.src) && topIds.has(ed.dst)
+          && ed.kind === "skip" && ed.dst !== "loss") {
+        const a = rankOf[ed.src], b = rankOf[ed.dst];
+        sk.push({ key: ed.src + ">" + ed.dst, lo: Math.min(a, b), hi: Math.max(a, b) });
+      }
+    });
+    const interleave = (p, q) => {
+      const ov = Math.max(p.lo, q.lo) < Math.min(p.hi, q.hi);
+      const nested = (p.lo <= q.lo && q.hi <= p.hi) || (q.lo <= p.lo && p.hi <= q.hi);
+      return ov && !nested;   // 仅「部分交错」需异侧；嵌套/不相交可同侧
+    };
+    // 贪心两色：跨度大者先定侧（包络边占主侧），后来者放到「与之交错更少」的一侧。
+    const order = sk.slice().sort((p, q) => (q.hi - q.lo) - (p.hi - p.lo));
+    const placed = [];
+    order.forEach(e => {
+      let c0 = 0, c1 = 0;
+      placed.forEach(f => { if (interleave(e, f)) { if (f.side === 0) c0++; else c1++; } });
+      e.side = (c0 <= c1) ? 0 : 1;
+      placed.push(e);
+    });
+    // 每侧按跨度升序排车道：小跨内圈、大跨外圈 → 嵌套同心不交叉。
+    [0, 1].forEach(side => {
+      const grp = sk.filter(e => e.side === side).sort((p, q) => (p.hi - p.lo) - (q.hi - q.lo));
+      grp.forEach((e, i) => { e.lane = i; e.laneN = grp.length; });
+    });
+    sk.forEach(e => {
+      skipRoute[e.key] = { band: e.side === 0 ? "Lskip" : "Rskip", lane: e.lane, laneN: e.laneN };
+    });
+  })();
+  // 左缘车道数 → 预留左内边距（让框整体右移腾出车道空间，避免车道被裁掉）；
+  // 右缘车道走画布右外侧,由 maxX 扩展画布,无需预留。
   const col = canvas.querySelector(".col");
-  let nLeftSkip = 0;
-  edges.forEach(ed => {
-    if (topIds.has(ed.src) && topIds.has(ed.dst)
-        && (ed.kind === "skip") && ed.dst !== "loss") nLeftSkip++;
-  });
+  let nLeftSkip = 0, nRightSkip = 0;
+  Object.keys(skipRoute).forEach(k => { (skipRoute[k].band === "Lskip" ? nLeftSkip++ : nRightSkip++); });
   if (col) col.style.paddingLeft = (nLeftSkip ? GAP + nLeftSkip * STEP + 14 : 0) + "px";
 
   // 内容横向边界（所有可见框的并集）：外缘车道据此排到所有框之外，杜绝压框。
@@ -401,23 +440,25 @@ function drawEdges() {
     const key = Math.round(cx1) + "," + Math.round(yb1) + ">" +
                 Math.round(cx2) + "," + Math.round(yt2) + ">" + kind;
     if (seen.has(key)) return; seen.add(key);
-    let band = null;
+    let band = null, lane = 0, laneN = 0;
     if (topIds.has(ed.src) && topIds.has(ed.dst)) {
       // 仅把"跨多行"的 head→loss（deep-supervision 头）引到右侧外缘束；
       // 与 loss 相邻的 seg/aux 头照常竖向短接，避免无谓绕行、标签挤叠。
       if (ed.dst === "loss") { if (yt2 - yb1 > 70) band = "Rloss"; }
-      else if (kind === "skip") band = "Lskip";
+      else if (kind === "skip") {
+        const r = skipRoute[ed.src + ">" + ed.dst];
+        if (r) { band = r.band; lane = r.lane; laneN = r.laneN; }
+      }
     }
-    items.push({ ed, ra, rb, cx1, yb1, cx2, yt2, kind, band });
+    items.push({ ed, ra, rb, cx1, yb1, cx2, yt2, kind, band, lane, laneN });
   });
 
-  // 车道分配：同侧按纵向跨度升序 → 跨度最大者拿最高车道（最外圈），
-  // 从而嵌套区间同心不交叉（如 enc0→dec3 包含 enc1→dec2）。
-  ["Lskip", "Rloss"].forEach(side => {
-    const grp = items.filter(it => it.band === side);
+  // Rloss 束车道：同侧按纵向跨度升序（旧逻辑）；跳连车道已在 skipRoute 内按侧定好。
+  {
+    const grp = items.filter(it => it.band === "Rloss");
     grp.sort((p, q) => Math.abs(p.yt2 - p.yb1) - Math.abs(q.yt2 - q.yb1));
     grp.forEach((it, i) => { it.lane = i; it.laneN = grp.length; });
-  });
+  }
   let maxX = contentR;
 
   items.forEach(it => {
@@ -434,6 +475,22 @@ function drawEdges() {
       const sx = Math.max(4, contentL - GAP - it.lane * STEP);
       d = `M ${x1} ${y1} C ${sx} ${y1}, ${sx} ${y2}, ${x2} ${y2}`;
       lx = sx - 4; ly = (y1 + y2) / 2;
+    } else if (it.band === "Rskip") {
+      // 分到右缘的跳连：从两框**右**缘引出 → 正交走到右外缘竖轨 → 折回进框右缘。
+      // 关键：水平段一律落在源/汇框的**行间空隙**（框底+11 / 框顶-11），该空隙横贯所有列、
+      // 无框，故横穿密集解码三角也不压框；与框右缘的短竖接驳走「列间空隙」（框右+0~6，
+      // 仍在该框与右邻框之间的 column-gap 内），亦不压框。竖轨在 contentR 之外，互不压框。
+      const sxR = ra.right - cr.left, dxR = rb.right - cr.left;
+      const sy = ra.top + ra.height / 2 - cr.top;
+      const dy = rb.top + rb.height / 2 - cr.top;
+      const railX = contentR + GAP + it.lane * STEP;
+      maxX = Math.max(maxX, railX + 12);
+      const down = sy < dy;
+      const yExit = down ? (ra.bottom - cr.top + 11) : (ra.top - cr.top - 11);
+      const yEnt  = down ? (rb.top - cr.top - 11) : (rb.bottom - cr.top + 11);
+      d = `M ${sxR} ${sy} L ${sxR} ${yExit} L ${railX} ${yExit} `
+        + `L ${railX} ${yEnt} L ${dxR + 6} ${yEnt} L ${dxR + 6} ${dy} L ${dxR} ${dy}`;
+      lx = railX + 4; ly = (yExit + yEnt) / 2;
     } else if (it.band === "Rloss") {
       // deep-supervision 头 → loss：正交走线（贴最右竖轨）。ds 头在右侧列，loss 居中
       // 偏下，直下会穿过 seg/aux 头行；故改为：右行到最右竖轨 → 竖直下行 → 在各头行
@@ -442,7 +499,8 @@ function drawEdges() {
       const y1 = ra.top + ra.height / 2 - cr.top;
       const x2 = rb.right - cr.left;
       const lossTop = rb.top - cr.top, lossH = rb.height;
-      const railX = contentR + GAP + it.lane * STEP;
+      // Rloss 竖轨排在右缘跳连车道之外，避免两束共用同一 x 互相重叠。
+      const railX = contentR + GAP + (nRightSkip + it.lane) * STEP;
       maxX = Math.max(maxX, railX);
       const spread = Math.min(8, (lossH - 8) / Math.max(1, it.laneN));
       const ey = lossTop + lossH / 2 + (it.lane - (it.laneN - 1) / 2) * spread;
