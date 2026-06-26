@@ -22,6 +22,7 @@ DAG**，从而正确呈现：并联分支（如 multi-stem 三路并行）、残
 
 from __future__ import annotations
 
+import inspect
 import logging
 import weakref
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -35,6 +36,14 @@ from .data_flow import _model_input_shape, _target_patch_size
 from .graph import VisGraph, assign_grid_layout, shape_str
 
 logger = logging.getLogger(__name__)
+
+# ``register_forward_pre_hook(..., with_kwargs=True)`` 仅 PyTorch >= 2.0 支持。旧版本
+# 调用会抛 TypeError，导致数据流追踪整体失败、退化为纯结构图。这里一次性特性探测：
+# 支持则按 kwargs-aware 注册（可捕获以关键字传入子模块的张量）；不支持则退回不带该
+# 参数的注册——pre-hook 签名 ``(_mod, args, kwargs=None)`` 对两种调用约定都兼容（旧版
+# 仅缺少关键字参数的血缘，属可接受降级），从而在旧 torch 上仍能正常产出数据流图。
+_PRE_HOOK_SUPPORTS_KWARGS: bool = "with_kwargs" in inspect.signature(
+    nn.Module.register_forward_pre_hook).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +480,12 @@ def _trace_modules(
         return hook
 
     for rec in recs.values():
-        handles.append(
-            rec.module.register_forward_pre_hook(_mk_pre_hook(rec),
-                                                  with_kwargs=True))
+        if _PRE_HOOK_SUPPORTS_KWARGS:
+            pre_handle = rec.module.register_forward_pre_hook(
+                _mk_pre_hook(rec), with_kwargs=True)
+        else:
+            pre_handle = rec.module.register_forward_pre_hook(_mk_pre_hook(rec))
+        handles.append(pre_handle)
         handles.append(rec.module.register_forward_hook(_mk_hook(rec)))
 
     traced = False

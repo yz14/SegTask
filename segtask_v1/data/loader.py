@@ -526,6 +526,17 @@ def _split_paths_from(npz_paths: List[str], idxs: Sequence[int]) -> SplitPaths:
         image_paths = list(sel), label_paths = list(sel), npz_paths = list(sel))
 
 
+def scaled_num_workers(num_workers: int, world_size: int, enabled: bool) -> int:
+    """DDP 下每卡 DataLoader 的 ``num_workers``。
+
+    ``world_size>1`` 且 ``enabled`` 时按卡数平摊（向下取整、至少 1），使**全机聚合**
+    worker 进程数与逐 worker LRU 缓存 RAM 与单卡基线一致；否则原样返回（每卡满额）。
+    """
+    if world_size > 1 and enabled and num_workers > 0:
+        return max(1, num_workers // world_size)
+    return num_workers
+
+
 def build_dataloaders(
     cfg: Config,
     rank: int = 0,
@@ -549,6 +560,25 @@ def build_dataloaders(
             "with two-source mixed training (data.npz_dir_secondary set), "
             "because MixedBatchSampler is not rank-aware. Use a single GPU for "
             "mixed-source runs, or disable npz_dir_secondary for DDP.")
+
+    # DDP 下按 world_size 平摊每卡 DataLoader 的 num_workers（向下取整、至少 1）。
+    # 每个 rank 是独立进程，各自 fork ``num_workers`` 个 worker 且各持一份逐 worker
+    # LRU 卷缓存；不分摊则 worker 进程数与缓存 RAM 随卡数线性翻倍（混用机上 CPU 超额
+    # 订阅 / 换页抖动 / 内核 soft-lockup 的根因）。分摊后**全机聚合**量与单卡基线一致。
+    eff_num_workers = scaled_num_workers(
+        dc.num_workers, world_size,
+        bool(cfg.train.ddp_scale_dataloader_per_rank))
+    if world_size > 1 and bool(cfg.train.ddp_scale_dataloader_per_rank):
+        if eff_num_workers != dc.num_workers:
+            logger.info(
+                "DDP dataloader scaling: num_workers %d -> %d per rank "
+                "(world_size=%d; aggregate %d workers across ranks matches "
+                "the single-GPU baseline). Per-worker LRU cache is unchanged, "
+                "so aggregate cache RAM also matches single-GPU. Set "
+                "train.ddp_scale_dataloader_per_rank=false to keep full "
+                "num_workers on every rank.",
+                dc.num_workers, eff_num_workers, world_size,
+                eff_num_workers * world_size)
 
     npz_dir = dc.npz_dir
     if not npz_dir:
@@ -624,7 +654,7 @@ def build_dataloaders(
 
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}
-    if dc.num_workers > 0:
+    if eff_num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(dc.persistent_workers)
         loader_kwargs["prefetch_factor"] = int(dc.prefetch_factor)
 
@@ -656,7 +686,7 @@ def build_dataloaders(
         train_loader = DataLoader(
             concat_ds,
             batch_sampler = sampler,
-            num_workers   = dc.num_workers,
+            num_workers   = eff_num_workers,
             pin_memory    = dc.pin_memory,
             **loader_kwargs)
         n_train_vols = len(train_idx) + len(secondary_paths)
@@ -675,7 +705,7 @@ def build_dataloaders(
             primary_train_ds,
             batch_size  = dc.batch_size,
             sampler     = train_sampler,
-            num_workers = dc.num_workers,
+            num_workers = eff_num_workers,
             pin_memory  = dc.pin_memory,
             drop_last   = True,
             **loader_kwargs)
@@ -687,7 +717,7 @@ def build_dataloaders(
             primary_train_ds,
             batch_size  = dc.batch_size,
             shuffle     = True,
-            num_workers = dc.num_workers,
+            num_workers = eff_num_workers,
             pin_memory  = dc.pin_memory,
             drop_last   = True,
             **loader_kwargs)
@@ -696,15 +726,15 @@ def build_dataloaders(
         val_ds,
         batch_size  = dc.batch_size,
         shuffle     = False,
-        num_workers = dc.num_workers,
+        num_workers = eff_num_workers,
         pin_memory  = dc.pin_memory,
         drop_last   = False,
         **loader_kwargs)
 
     logger.info(
-        "DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, "
+        "DataLoader: batch_size=%d, num_workers=%d (per rank), pin_memory=%s, "
         "persistent_workers=%s, prefetch_factor=%s",
-        dc.batch_size, dc.num_workers, dc.pin_memory,
+        dc.batch_size, eff_num_workers, dc.pin_memory,
         loader_kwargs.get("persistent_workers", "n/a"),
         loader_kwargs.get("prefetch_factor", "n/a"))
 
@@ -726,25 +756,30 @@ def build_dataloaders(
             # cap=0 为无上限 → 最坏情况缓存全部。
             eff_cap = cap if cap > 0 else n_train_vols
             eff_cap = min(eff_cap, n_train_vols)
-            workers = max(dc.num_workers, 1)
+            workers = max(eff_num_workers, 1)
             total_gb = per_vol_bytes * eff_cap * workers / (1024 ** 3)
+            agg_note = (
+                "" if world_size <= 1 else
+                " [per rank; x%d ranks => ~%.2f GiB machine-wide aggregate]"
+                % (world_size, total_gb * world_size))
             logger.info(
                 "Volume cache estimate: ~%.2f MiB per volume "
                 "(image fp32 + label int16%s, bbox-cropped); effective "
                 "cap=%d, num_workers=%d => up to ~%.2f GiB RAM (all "
                 "workers, caches only; transient decode peaks add "
-                "~%.2f MiB/worker).",
+                "~%.2f MiB/worker)%s.",
                 per_vol_bytes / (1024 ** 2),
                 " + region_weight fp32" if bytes_per_rw else "",
                 eff_cap, workers, total_gb,
-                bytes_per_img / (1024 ** 2))
-            if cap == 0 and n_train_vols * workers >= 16:
+                bytes_per_img / (1024 ** 2), agg_note)
+            agg_workers = workers * max(world_size, 1)
+            if cap == 0 and n_train_vols * agg_workers >= 16:
                 # 在 8 GiB 预算下建议一个合适的 cap。
                 budget_gb = 8.0
                 rec = max(
                     1,
                     int(budget_gb * (1024 ** 3)
-                        / max(per_vol_bytes, 1) / workers))
+                        / max(per_vol_bytes, 1) / agg_workers))
                 logger.warning(
                     "cache_max_volumes=0 (unbounded) with %d volumes and "
                     "%d workers is the likely OOM culprit on large "

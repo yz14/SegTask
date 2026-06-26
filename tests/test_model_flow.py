@@ -14,6 +14,7 @@ import pytest
 
 from segtask_v1.config import load_config
 from segtask_v1.models.factory import build_model
+from segtask_v1.visualization import model_flow as model_flow_mod
 from segtask_v1.visualization.data_flow import build_data_flow
 from segtask_v1.visualization.model_flow import build_model_flow
 from segtask_v1.visualization.predict_flow import build_predict_flow
@@ -104,6 +105,18 @@ def test_multirf_block_dataflow():
     rank = {n.id: n.rank for n in leaves}
     assert len({rank[b] for b in branch_ids}) == 1, "并联分支应同 rank"
     assert max(rank.values()) >= 4, "主路应展开为多级链，而非全堆一行"
+
+
+# ---------------------------------------------------------------------------
+# 旧 PyTorch (<2.0) 兼容：register_forward_pre_hook 无 ``with_kwargs`` 参数时，
+# 应回退到不带该参数的注册而非整体追踪失败退化为纯结构图。强制 fallback 路径后，
+# 张量数据流追踪仍须成功（以 cat 融合产出的 merge 节点存在为证）。
+# ---------------------------------------------------------------------------
+def test_pre_hook_kwargs_fallback_still_traces(monkeypatch):
+    monkeypatch.setattr(model_flow_mod, "_PRE_HOOK_SUPPORTS_KWARGS", False)
+    g = _build("seg2_5d.yaml")
+    merges = [n for n in g.nodes if n.kind == "merge"]
+    assert merges, "无 with_kwargs 的回退注册下，数据流追踪仍应成功（merge 节点应在）"
 
 
 # ---------------------------------------------------------------------------

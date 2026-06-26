@@ -104,3 +104,22 @@ def test_all_reduce_matches_single_process(world_size, n_samples, tmp_path):
             continue
         assert g_v == pytest.approx(exp_v, rel=1e-5, abs=1e-6), (
             f"metric {k!r}: ddp={g_v} vs single={exp_v}")
+
+
+# ---------------------------------------------------------------------------
+# DDP 下按 world_size 平摊每卡 DataLoader 的 num_workers。
+# ---------------------------------------------------------------------------
+def test_scaled_num_workers():
+    from segtask_v1.data.loader import scaled_num_workers
+
+    # 单卡 / 关闭 / world_size<=1：原样返回。
+    assert scaled_num_workers(16, 1, True) == 16
+    assert scaled_num_workers(16, 4, False) == 16
+    # DDP 开启：平摊，全机聚合 == 单卡基线。
+    assert scaled_num_workers(16, 4, True) == 4
+    assert scaled_num_workers(4, 4, True) == 1
+    # 向下取整、至少 1（worker 比卡少时不归零）。
+    assert scaled_num_workers(6, 4, True) == 1
+    assert scaled_num_workers(10, 4, True) == 2
+    # num_workers=0（主进程加载）不受影响。
+    assert scaled_num_workers(0, 4, True) == 0

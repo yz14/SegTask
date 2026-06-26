@@ -594,6 +594,12 @@ class TrainConfig:
     ddp_find_unused_parameters: bool = True
     # DDP rendezvous 端口。0 = 启动时自动挑选空闲端口（混用机避免端口冲突）。
     ddp_master_port: int = 0
+    # DDP 下是否按 world_size 把每卡 DataLoader 的 num_workers 平摊到 1/world_size
+    # （向下取整、至少 1）。每个 rank 是独立进程、各自 fork num_workers 个 worker 且各
+    # 持一份逐 worker LRU 卷缓存——不分摊则 worker 进程数与缓存 RAM 都随卡数线性翻倍
+    # （8 卡混用机上易触发 CPU 超额订阅 / 换页抖动 / 内核 soft-lockup）。分摊后**全机
+    # 聚合** worker 数与缓存 RAM 与单卡基线一致。默认 True；置 False 保留旧行为（每卡满额）。
+    ddp_scale_dataloader_per_rank: bool = True
 
     # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
     @property
