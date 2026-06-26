@@ -81,7 +81,7 @@ def _best_x(hist: MetricsHistory) -> Optional[float]:
 # 模型健康监测键（训练侧），由 trainer 逐 epoch 聚合后写入 train 指标。
 _HEALTH_KEYS = (
     "grad_norm", "grad_norm_max", "weight_norm",
-    "grad_clip_frac", "nonfinite_steps", "amp_scale",
+    "grad_clip_frac", "nonfinite_steps", "amp_scale", "update_ratio",
 )
 
 
@@ -97,6 +97,8 @@ def _health_panels(
     - 裁剪比例：开启 grad_clip 时范数超阈值的优化步占比。
     - 非有限步计数：NaN/Inf loss 何时出现。
     - AMP loss scale：仅 fp16 scaler 启用时存在，反复回退=溢出频繁。
+    - update/weight 比值（默认对数纵轴）：仅开启该开关时存在；健康区间约 1e-3，
+      过大=可能发散/lr 偏高，过小=学不动/lr 偏低。
     """
     panels: List[Dict[str, Any]] = []
     grp = "Model health"
@@ -147,6 +149,15 @@ def _health_panels(
             "best_x": best_x,
             "series": [_line_series("amp_scale", _color(5),
                                     _points(hist, "amp_scale", "train"))],
+        })
+
+    if "update_ratio" in train_keys:
+        panels.append({
+            "id": "update_ratio", "title": "Update/weight ratio", "kind": "line",
+            "group": grp, "span": "half", "log": True, "log_toggle": True,
+            "best_x": best_x,
+            "series": [_line_series("update_ratio", _color(2),
+                                    _points(hist, "update_ratio", "train"))],
         })
 
     return panels
@@ -201,8 +212,9 @@ def build_single_payload(
         for i, m in enumerate(ov):
             s = _line_series(m, _color(i), _points(hist, m, "val"))
             if m == sel:
-                s["label"] = f"{m} (selection)"
+                # 选模指标无需文字标注：加粗 + 虚线即可一眼识别（图例同步显示）。
                 s["emphasis"] = True
+                s["dash"] = "6 4"
             ov_series.append(s)
         title = "Validation metrics (mean)"
         if crit and crit != sel:
