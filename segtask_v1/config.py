@@ -887,6 +887,14 @@ class MonitorConfig:
     # 训练结束后额外渲染一份多 run 对比 HTML 的参照 run 目录列表；空则不生成。
     compare_runs: List[str] = field(default_factory=list)
 
+    # 模型健康监测：逐 epoch 聚合梯度范数 / 非有限步计数 / 裁剪比例 / 权重范数 /
+    # AMP scaler 标度等「训练是否正常」的轻量指标，并入 train 指标随仪表盘展示。
+    # 成本极低（开 grad_clip 时复用其已算出的范数；仅 rank0 记录），失败被隔离。
+    health_monitor: bool = True
+    # 未开启 grad_clip_norm 时，是否仍在每个优化步边界手动算一次全局梯度范数。
+    # 关闭后未裁剪场景将不记录 grad_norm（彻底零额外开销）。
+    health_grad_norm_when_no_clip: bool = True
+
 
 # ---------------------------------------------------------------------------
 # Top-level configuration

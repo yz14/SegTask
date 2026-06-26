@@ -78,6 +78,80 @@ def _best_x(hist: MetricsHistory) -> Optional[float]:
     return (ep + 1) if isinstance(ep, int) else None
 
 
+# 模型健康监测键（训练侧），由 trainer 逐 epoch 聚合后写入 train 指标。
+_HEALTH_KEYS = (
+    "grad_norm", "grad_norm_max", "weight_norm",
+    "grad_clip_frac", "nonfinite_steps", "amp_scale",
+)
+
+
+def _health_panels(
+    hist: MetricsHistory,
+    train_keys: set,
+    best_x: Optional[float],
+) -> List[Dict[str, Any]]:
+    """「Model health」组面板：present-才画，老 run 无这些键时整组不出现。
+
+    - 梯度范数（mean + max，默认对数纵轴）：发散/消失一眼可见。
+    - 权重范数（L2）：权重是否异常增长 / 坍塌。
+    - 裁剪比例：开启 grad_clip 时范数超阈值的优化步占比。
+    - 非有限步计数：NaN/Inf loss 何时出现。
+    - AMP loss scale：仅 fp16 scaler 启用时存在，反复回退=溢出频繁。
+    """
+    panels: List[Dict[str, Any]] = []
+    grp = "Model health"
+
+    gn_series: List[Dict[str, Any]] = []
+    if "grad_norm" in train_keys:
+        s = _line_series("grad_norm", _color(0), _points(hist, "grad_norm", "train"))
+        s["emphasis"] = True
+        gn_series.append(s)
+    if "grad_norm_max" in train_keys:
+        gn_series.append(_line_series(
+            "grad_norm_max", _color(1), _points(hist, "grad_norm_max", "train")))
+    if gn_series:
+        panels.append({
+            "id": "grad_norm", "title": "Gradient norm", "kind": "line",
+            "group": grp, "span": "half", "log": True, "log_toggle": True,
+            "best_x": best_x, "series": gn_series,
+        })
+
+    if "weight_norm" in train_keys:
+        panels.append({
+            "id": "weight_norm", "title": "Weight norm (L2)", "kind": "line",
+            "group": grp, "span": "half", "best_x": best_x,
+            "series": [_line_series("weight_norm", _color(4),
+                                    _points(hist, "weight_norm", "train"))],
+        })
+
+    if "grad_clip_frac" in train_keys:
+        panels.append({
+            "id": "grad_clip_frac", "title": "Grad-clip fraction", "kind": "line",
+            "group": grp, "span": "half", "best_x": best_x,
+            "series": [_line_series("grad_clip_frac", _color(3),
+                                    _points(hist, "grad_clip_frac", "train"))],
+        })
+
+    if "nonfinite_steps" in train_keys:
+        panels.append({
+            "id": "nonfinite_steps", "title": "Non-finite steps", "kind": "line",
+            "group": grp, "span": "half", "best_x": best_x,
+            "series": [_line_series("nonfinite_steps", _color(1),
+                                    _points(hist, "nonfinite_steps", "train"))],
+        })
+
+    if "amp_scale" in train_keys:
+        panels.append({
+            "id": "amp_scale", "title": "AMP loss scale", "kind": "line",
+            "group": grp, "span": "half", "log": True, "log_toggle": True,
+            "best_x": best_x,
+            "series": [_line_series("amp_scale", _color(5),
+                                    _points(hist, "amp_scale", "train"))],
+        })
+
+    return panels
+
+
 def build_single_payload(
     hist: MetricsHistory,
     *,
@@ -199,6 +273,9 @@ def build_single_payload(
             "series": [_line_series("gpu_peak_mib", _color(3),
                                     _points(hist, "gpu_peak_mib", "top"))],
         })
+
+    # ============ Model health ============
+    panels.extend(_health_panels(hist, train_keys, best_x))
 
     return {
         "mode": "single",
