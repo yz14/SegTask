@@ -268,6 +268,13 @@ class Trainer:
         if (self._monitor_cfg is not None and self._monitor_cfg.enabled
                 and self._is_main):
             self._init_monitor(resume_active)
+        # 模型健康监测：仅当监测启用、配置开启且在 rank0 时采集（成本极低，
+        # 失败被隔离）。非有限步计数 / 梯度范数 / 裁剪比例 / 权重范数 / AMP 标度。
+        self._health_monitor = bool(
+            self._monitor is not None
+            and getattr(self._monitor_cfg, "health_monitor", False))
+        self._health_grad_norm_when_no_clip = bool(
+            getattr(self._monitor_cfg, "health_grad_norm_when_no_clip", True))
 
     # ------------------------------------------------------------------
     # Public API
@@ -545,6 +552,66 @@ class Trainer:
         return remainder if (remainder > 0 and step >= partial_start) else accum
 
     # ------------------------------------------------------------------
+    # Model-health helpers (轻量；仅 rank0 监测启用时调用)
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _global_grad_norm(self) -> "float | None":
+        """当前已 unscale 的全局梯度 L2 范数（遍历一次有梯度的参数）。
+
+        仅在未开启 grad_clip（无现成范数可复用）且监测需要时手动调用；调用方
+        负责在 AMP fp16 下先 ``scaler.unscale_``，以免量纲被 loss scale 污染。
+        """
+        sq = 0.0
+        found = False
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            found = True
+            sq += float(p.grad.detach().norm(2).item()) ** 2
+        return math.sqrt(sq) if found else None
+
+    @torch.no_grad()
+    def _global_weight_norm(self) -> "float | None":
+        """全部参数的全局 L2 范数（每 epoch 仅算一次，开销可忽略）。"""
+        sq = 0.0
+        found = False
+        for p in self.model.parameters():
+            found = True
+            sq += float(p.detach().norm(2).item()) ** 2
+        return math.sqrt(sq) if found else None
+
+    def _collect_health_metrics(
+        self,
+        out: Dict[str, float],
+        *,
+        grad_norm_meter: AverageMeter,
+        grad_norm_max: float,
+        nonfinite_steps: int,
+        clipped_steps: int,
+        opt_steps: int,
+        grad_clip_norm: float,
+    ) -> None:
+        """把本 epoch 聚合的健康指标并入 ``out``（仅写入有意义的键）。
+
+        - ``grad_norm`` / ``grad_norm_max``：仅在采集到范数时写入。
+        - ``nonfinite_steps``：非有限 loss 的 micro-batch 计数。
+        - ``grad_clip_frac``：开启 grad_clip 时，范数超阈值的优化步占比。
+        - ``weight_norm``：每 epoch 末一次全参数范数。
+        - ``amp_scale``：AMP fp16 scaler 标度（仅 scaler 实际启用时）。
+        """
+        if grad_norm_meter.count > 0:
+            out["grad_norm"] = grad_norm_meter.avg
+            out["grad_norm_max"] = grad_norm_max
+        out["nonfinite_steps"] = float(nonfinite_steps)
+        if grad_clip_norm > 0 and opt_steps > 0:
+            out["grad_clip_frac"] = clipped_steps / opt_steps
+        wn = self._global_weight_norm()
+        if wn is not None:
+            out["weight_norm"] = wn
+        if self._scaler_active:
+            out["amp_scale"] = float(self.scaler.get_scale())
+
+    # ------------------------------------------------------------------
     # Training / validation loops
     # ------------------------------------------------------------------
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -556,6 +623,13 @@ class Trainer:
         tc          = self.cfg.train
         accum       = self.grad_accum_steps
         total_steps = len(self.train_loader)
+
+        # 模型健康监测累计器（仅 rank0 监测启用时填充；否则恒为空，零开销）。
+        grad_norm_meter = AverageMeter()
+        grad_norm_max = 0.0
+        nonfinite_steps = 0
+        clipped_steps = 0
+        opt_steps = 0
 
         # DDP：每 epoch 重置 DistributedSampler 的洗牌种子，保证各 epoch 切分不同。
         if self._train_sampler is not None:
@@ -596,16 +670,41 @@ class Trainer:
             # 参数更新
             is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_step_boundary:
+                # 健康监测：开 clip 时复用其已算出的范数（零成本）；未开 clip 时
+                # 仅 rank0 按开关手动算一次（AMP fp16 下先 unscale 以免量纲被污染）。
+                grad_norm_val = None
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(
+                    gn = nn.utils.clip_grad_norm_(
                         self.model.parameters(), tc.grad_clip_norm)
+                    if self._health_monitor:
+                        grad_norm_val = float(gn)
+                elif self._health_monitor and self._health_grad_norm_when_no_clip:
+                    try:
+                        if self._scaler_active:
+                            self.scaler.unscale_(self.optimizer)
+                        grad_norm_val = self._global_grad_norm()
+                    except Exception:  # 监测失败绝不打断训练
+                        logger.warning(
+                            "Health grad-norm computation failed; skipping.",
+                            exc_info=True)
+                        grad_norm_val = None
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scheduler.step()
                 if self.ema is not None:
                     self.ema.update(self.model)
+
+                if self._health_monitor:
+                    opt_steps += 1
+                    if grad_norm_val is not None and math.isfinite(grad_norm_val):
+                        grad_norm_meter.update(grad_norm_val)
+                        if grad_norm_val > grad_norm_max:
+                            grad_norm_max = grad_norm_val
+                        if (tc.grad_clip_norm > 0
+                                and grad_norm_val > tc.grad_clip_norm):
+                            clipped_steps += 1
 
                 if (not self._first_step_mem_logged
                         and self.device.type == "cuda"):
@@ -633,6 +732,7 @@ class Trainer:
                         component_meters[name] = AverageMeter()
                     component_meters[name].update(val, image.shape[0])
             else:
+                nonfinite_steps += 1
                 logger.warning(
                     "Non-finite train loss (%s) at epoch %d step %d/%d; "
                     "skipping meter update. GradScaler will skip this "
@@ -656,6 +756,17 @@ class Trainer:
         out = {"loss": loss_meter.avg, "dice": dice_meter.avg}
         for name, meter in component_meters.items():
             out[name] = meter.avg
+        if self._health_monitor:
+            try:
+                self._collect_health_metrics(
+                    out, grad_norm_meter=grad_norm_meter,
+                    grad_norm_max=grad_norm_max, nonfinite_steps=nonfinite_steps,
+                    clipped_steps=clipped_steps, opt_steps=opt_steps,
+                    grad_clip_norm=tc.grad_clip_norm)
+            except Exception:  # 监测失败绝不打断训练
+                logger.warning(
+                    "Health metric collection failed; skipping.",
+                    exc_info=True)
         return out
 
     @torch.no_grad()
