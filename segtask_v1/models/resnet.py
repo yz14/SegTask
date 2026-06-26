@@ -290,7 +290,8 @@ class MultiRFBlock(nn.Module):
         use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
-        spatial_dims  : int = 3):
+        spatial_dims  : int = 3,
+        branch_norm_act: bool = False):
         super().__init__()
         d = spatial_dims
         dils = [int(x) for x in dilations]
@@ -333,6 +334,34 @@ class MultiRFBlock(nn.Module):
                          dilation=dilation, bias=False))
         total = sum(branch_ch)
 
+        # 可选：ASPP 风格的 per-branch norm+act —— 每条膨胀卷积分支在 concat/相加
+        # 融合「之前」各自接一层 norm+act，使各感受野分支成为独立的非线性特征提取
+        # 器（否则多分支+融合在第一个激活前整体仍是线性映射）。默认关、向后兼容。
+        self.branch_norm_act = bool(branch_norm_act)
+        if self.branch_norm_act:
+            self.branch_post = nn.ModuleList()
+            for c in branch_ch:
+                # split 模式下分支通道 = out_ch//n，GroupNorm 需 c 能被 norm_groups
+                # 整除。仓库的 get_norm 会静默把 groups 折半直至整除（最坏退化为 1 组），
+                # 这里改为显式报错，让用户据此决定改通道数或换 norm（不做自适配）。
+                if norm_type == "group" and c % norm_groups != 0:
+                    raise ValueError(
+                        f"MultiRF branch_norm_act=True with norm_type='group': "
+                        f"branch channel count {c} (out_ch={out_ch}, "
+                        f"mode={mode!r}, {n} branches) is not divisible by "
+                        f"norm_groups={norm_groups}. Per-branch GroupNorm "
+                        f"requires each branch's channels to be a multiple of "
+                        f"norm_groups. Fix by one of: change out_ch so each "
+                        f"branch (out_ch//{n}) is divisible by {norm_groups}; "
+                        f"set norm_groups to a divisor of {c}; switch norm_type "
+                        f"to 'instance'/'batch'; or use multirf_mode='parallel' "
+                        f"(each branch = out_ch).")
+                self.branch_post.append(nn.Sequential(
+                    get_norm(norm_type, c, norm_groups, spatial_dims=d),
+                    get_activation(activation)))
+        else:
+            self.branch_post = None
+
         # 融合层。
         if fusion == "sum":
             self.se   = None
@@ -367,6 +396,8 @@ class MultiRFBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = self.shortcut(x)
         feats = [branch(x) for branch in self.branches]
+        if self.branch_post is not None:
+            feats = [post(f) for post, f in zip(self.branch_post, feats)]
         if self.fusion == "sum":
             out = feats[0]
             for f in feats[1:]:
@@ -402,7 +433,8 @@ class MultiRFStage(nn.Module):
         use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
-        spatial_dims  : int = 3):
+        spatial_dims  : int = 3,
+        branch_norm_act: bool = False):
         super().__init__()
         if num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
@@ -410,7 +442,8 @@ class MultiRFStage(nn.Module):
             dilations=dilations, mode=mode, fusion=fusion, axes=axes,
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,
             dropout=dropout, use_se=use_se, se_reduction=se_reduction,
-            attention_type=attention_type, spatial_dims=spatial_dims)
+            attention_type=attention_type, spatial_dims=spatial_dims,
+            branch_norm_act=branch_norm_act)
         blocks = [MultiRFBlock(in_ch, out_ch, **kwargs)]
         for _ in range(1, num_blocks):
             blocks.append(MultiRFBlock(out_ch, out_ch, **kwargs))
