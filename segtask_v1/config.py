@@ -894,6 +894,11 @@ class MonitorConfig:
     # 未开启 grad_clip_norm 时，是否仍在每个优化步边界手动算一次全局梯度范数。
     # 关闭后未裁剪场景将不记录 grad_norm（彻底零额外开销）。
     health_grad_norm_when_no_clip: bool = True
+    # 全局 update/weight 比值（‖Δw‖/‖w‖，Karpathy 经典健康信号，健康区间约 1e-3）：
+    # 每 epoch 仅在「第一个优化步边界」测一次——step 前后各算一次全参数范数。
+    # 计算可忽略，但需对参数做一次瞬时 clone（峰值额外显存≈一份参数大小，用完即释放），
+    # 故默认关闭，按需开启用于诊断 lr / 优化器是否合理。
+    health_update_ratio: bool = False
 
 
 # ---------------------------------------------------------------------------

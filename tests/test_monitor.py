@@ -149,9 +149,12 @@ def test_single_payload_structure(tmp_path):
     assert by_id["overview"]["span"] == "full"
     assert by_id["lr"]["group"] == "System" and by_id["lr"]["span"] == "half"
 
-    # 选模指标并入概览并加粗高亮。
+    # 选模指标并入概览：加粗 + 虚线区分，标签不再含 "(selection)" 文字。
     ov_sel = [s for s in by_id["overview"]["series"] if s.get("emphasis")]
-    assert len(ov_sel) == 1 and "(selection)" in ov_sel[0]["label"]
+    assert len(ov_sel) == 1
+    assert ov_sel[0].get("dash") == "6 4"
+    assert all("(selection)" not in s["label"]
+               for s in by_id["overview"]["series"])
 
     # 逐类指标合并为「一图多线」：fixture 只有 Dice（num_classes=2 → 2 条），
     # 单指标时半宽。
@@ -371,6 +374,29 @@ def test_health_amp_scale_panel_present_only_when_logged(tmp_path):
     by_id = {p["id"]: p for p in charts.build_single_payload(hist)["panels"]}
     assert "amp_scale" in by_id
     assert by_id["amp_scale"]["log"] is True
+
+
+def test_health_update_ratio_panel_present_only_when_logged(tmp_path):
+    # update_ratio 仅在被记录时出现（present-才画，默认关→老/常规 run 无此键）。
+    no_ur = _make_health_run(tmp_path, "no_ur")
+    assert "update_ratio" not in {p["id"] for p in
+                                  charts.build_single_payload(no_ur)["panels"]}
+
+    d = tmp_path / "with_ur" / "monitor"
+    lg = MetricsLogger(d, run_name="with_ur", save_best_metric="mean_dice",
+                       total_epochs=3, save_best_criterion="mean_dice")
+    for ep in range(3):
+        tr = _train_health(ep)
+        tr["update_ratio"] = 1e-3 * (ep + 1)
+        lg.log_epoch(ep, train=tr, val=_val(ep))
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    by_id = {p["id"]: p for p in charts.build_single_payload(hist)["panels"]}
+    assert "update_ratio" in by_id
+    ur = by_id["update_ratio"]
+    assert ur["group"] == "Model health"
+    assert ur["log"] is True and ur["log_toggle"] is True
+    assert [s["label"] for s in ur["series"]] == ["update_ratio"]
 
 
 def test_render_dashboard_html_self_contained(tmp_path):

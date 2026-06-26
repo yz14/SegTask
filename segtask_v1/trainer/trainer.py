@@ -275,6 +275,9 @@ class Trainer:
             and getattr(self._monitor_cfg, "health_monitor", False))
         self._health_grad_norm_when_no_clip = bool(
             getattr(self._monitor_cfg, "health_grad_norm_when_no_clip", True))
+        self._health_update_ratio = bool(
+            self._health_monitor
+            and getattr(self._monitor_cfg, "health_update_ratio", False))
 
     # ------------------------------------------------------------------
     # Public API
@@ -580,6 +583,27 @@ class Trainer:
             sq += float(p.detach().norm(2).item()) ** 2
         return math.sqrt(sq) if found else None
 
+    @torch.no_grad()
+    def _param_snapshot(self) -> "list":
+        """对全部参数做一次瞬时 clone（用于 update/weight 比值，每 epoch 仅一次）。"""
+        return [p.detach().clone() for p in self.model.parameters()]
+
+    @torch.no_grad()
+    def _update_ratio_from_snapshot(self, snapshot: "list") -> "float | None":
+        """由 ``optimizer.step`` 前的快照算全局 ‖Δw‖/‖w‖（用完释放快照）。
+
+        参数遍历顺序与 ``_param_snapshot`` 一致，逐张量累加更新量与原权重的平方和。
+        若原权重范数为 0（理论上不会发生）则返回 ``None`` 以免除零。
+        """
+        upd_sq = 0.0
+        w_sq = 0.0
+        for p, w0 in zip(self.model.parameters(), snapshot):
+            upd_sq += float((p.detach() - w0).norm(2).item()) ** 2
+            w_sq += float(w0.norm(2).item()) ** 2
+        if w_sq <= 0.0:
+            return None
+        return math.sqrt(upd_sq) / math.sqrt(w_sq)
+
     def _collect_health_metrics(
         self,
         out: Dict[str, float],
@@ -590,6 +614,7 @@ class Trainer:
         clipped_steps: int,
         opt_steps: int,
         grad_clip_norm: float,
+        update_ratio: "float | None" = None,
     ) -> None:
         """把本 epoch 聚合的健康指标并入 ``out``（仅写入有意义的键）。
 
@@ -598,6 +623,7 @@ class Trainer:
         - ``grad_clip_frac``：开启 grad_clip 时，范数超阈值的优化步占比。
         - ``weight_norm``：每 epoch 末一次全参数范数。
         - ``amp_scale``：AMP fp16 scaler 标度（仅 scaler 实际启用时）。
+        - ``update_ratio``：全局 ‖Δw‖/‖w‖（仅开启且本 epoch 成功测得时）。
         """
         if grad_norm_meter.count > 0:
             out["grad_norm"] = grad_norm_meter.avg
@@ -610,6 +636,8 @@ class Trainer:
             out["weight_norm"] = wn
         if self._scaler_active:
             out["amp_scale"] = float(self.scaler.get_scale())
+        if update_ratio is not None and math.isfinite(update_ratio):
+            out["update_ratio"] = update_ratio
 
     # ------------------------------------------------------------------
     # Training / validation loops
@@ -630,6 +658,7 @@ class Trainer:
         nonfinite_steps = 0
         clipped_steps = 0
         opt_steps = 0
+        update_ratio_val: "float | None" = None  # 每 epoch 仅首个优化步测一次
 
         # DDP：每 epoch 重置 DistributedSampler 的洗牌种子，保证各 epoch 切分不同。
         if self._train_sampler is not None:
@@ -689,12 +718,35 @@ class Trainer:
                             "Health grad-norm computation failed; skipping.",
                             exc_info=True)
                         grad_norm_val = None
+
+                # update/weight 比值：每 epoch 仅首个优化步测一次（step 前快照）。
+                pre_step_snapshot = None
+                if self._health_update_ratio and update_ratio_val is None:
+                    try:
+                        pre_step_snapshot = self._param_snapshot()
+                    except Exception:  # 监测失败绝不打断训练
+                        logger.warning(
+                            "Health param snapshot failed; skipping "
+                            "update/weight ratio this epoch.", exc_info=True)
+                        pre_step_snapshot = None
+
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scheduler.step()
                 if self.ema is not None:
                     self.ema.update(self.model)
+
+                if pre_step_snapshot is not None:
+                    try:
+                        update_ratio_val = self._update_ratio_from_snapshot(
+                            pre_step_snapshot)
+                    except Exception:  # 监测失败绝不打断训练
+                        logger.warning(
+                            "Health update/weight ratio computation failed; "
+                            "skipping.", exc_info=True)
+                    finally:
+                        pre_step_snapshot = None
 
                 if self._health_monitor:
                     opt_steps += 1
@@ -762,7 +814,8 @@ class Trainer:
                     out, grad_norm_meter=grad_norm_meter,
                     grad_norm_max=grad_norm_max, nonfinite_steps=nonfinite_steps,
                     clipped_steps=clipped_steps, opt_steps=opt_steps,
-                    grad_clip_norm=tc.grad_clip_norm)
+                    grad_clip_norm=tc.grad_clip_norm,
+                    update_ratio=update_ratio_val)
             except Exception:  # 监测失败绝不打断训练
                 logger.warning(
                     "Health metric collection failed; skipping.",
