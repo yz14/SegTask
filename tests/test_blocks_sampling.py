@@ -165,6 +165,45 @@ def test_upsample_rejects_unknown_mode():
 
 
 # ---------------------------------------------------------------------------
+# Upsample — optional post-interpolate norm+act (trilinear / nearest)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("mode", ["trilinear", "nearest"])
+def test_upsample_post_norm_act_interp_modes(mode):
+    """norm_act adds a Norm+Act after the refinement conv (interp modes only)."""
+    in_ch, out_ch = 8, 4
+    up = Upsample(in_ch, out_ch, mode=mode, norm_act=True,
+                  norm_type="instance", activation="leakyrelu")
+    # post is a real Sequential (Norm + Act), not the default Identity.
+    assert isinstance(up.post, nn.Sequential)
+    assert len(up.post) == 2
+    x = torch.randn(2, in_ch, 4, 8, 8, requires_grad=True)
+    y = up(x)
+    assert y.shape == (2, out_ch, 8, 16, 16)
+    y.sum().backward()
+    assert x.grad is not None and x.grad.shape == x.shape
+
+
+def test_upsample_post_norm_act_default_off_is_identity():
+    up = Upsample(8, 4, mode="trilinear")
+    assert isinstance(up.post, nn.Identity)
+
+
+@pytest.mark.parametrize("mode", ["transpose", "pixelshuffle", "carafe",
+                                  "dysample"])
+def test_upsample_post_norm_act_ignored_for_non_interp_modes(mode):
+    """Non-interpolate modes ignore norm_act (post stays Identity)."""
+    up = Upsample(8, 4, mode=mode, norm_act=True)
+    assert isinstance(up.post, nn.Identity)
+
+
+def test_upsample_post_norm_act_group_norm():
+    up = Upsample(8, 8, mode="trilinear", norm_act=True,
+                  norm_type="group", norm_groups=4)
+    x = torch.randn(1, 8, 4, 8, 8)
+    assert up(x).shape == (1, 8, 8, 16, 16)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end UNet3D build across (down, up) mode combinations
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("down_mode,up_mode",

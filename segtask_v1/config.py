@@ -299,6 +299,10 @@ class ModelConfig:
 
     # 上采样："transpose" | "trilinear" | "nearest" | "pixelshuffle" | "carafe" | "dysample"。
     upsample_mode: str = "transpose"
+    # 仅插值模式（'trilinear'/'nearest'）：在上采样精修 conv 之后再接 norm+act，使插值
+    # 分支成为真正的非线性特征变换（否则 interpolate→conv 两层连续线性，直到下游 stage
+    # 才有非线性）。默认关、向后兼容；其余上采样模式忽略该选项。
+    upsample_norm_act: bool = False
 
     # 各向异性下采样。True 时按 patch_size 自动推导逐级 per-axis stride：薄轴（如 z）
     # 分辨率落后才不降采样，避免深层被压成 1（nnU-Net 思路，保持各轴分辨率 2× 以内）。
@@ -337,6 +341,11 @@ class ModelConfig:
     multirf_encoder_stages: List[int] = field(default_factory=list)
     # 解码器逐 level 开关（0/1）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
     multirf_decoder_stages: List[int] = field(default_factory=list)
+    # ASPP 风格 per-branch norm+act：每条膨胀卷积分支在 concat/相加融合「之前」各自接
+    # norm+act，使各感受野分支成为独立的非线性特征提取器（默认关、向后兼容）。
+    # 注：split 模式下分支通道=out_ch//n_branches，与 norm_type='group' 组合时 norm_groups
+    # 须能整除分支通道，否则 MultiRFBlock 显式报错（不自适配，由用户改 ch 或换 norm）。
+    multirf_branch_norm_act: bool = False
 
     # ---- 内容寻址自注意力 SelfAttention（仅 backbone=='resnet' + arch=='unet'） ----
     # 在选定 stage 末尾追加一个自注意力残差块（拍平空间轴 → 多头 QKV → 残差），2.5D/3D 通用。

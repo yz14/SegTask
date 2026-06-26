@@ -154,22 +154,30 @@ class DecoderLevel(nn.Module):
 
     def __init__(
         self,
-        in_ch         : int,
-        skip_ch       : int,
-        out_ch        : int,
+        in_ch            : int,
+        skip_ch          : int,
+        out_ch           : int,
         stage_builder,
-        upsample_mode : str = "transpose",
-        skip_mode     : str = "cat",
-        skip_attention: bool = False,
-        spatial_dims  : int = 3,
-        upsample_stride = 2):
+        upsample_mode    : str = "transpose",
+        skip_mode        : str = "cat",
+        skip_attention   : bool = False,
+        spatial_dims     : int = 3,
+        upsample_stride  = 2,
+        upsample_norm_act: bool = False,
+        norm_type        : str = "instance",
+        norm_groups      : int = 8,
+        activation       : str = "leakyrelu"):
         super().__init__()
 
         self.skip_mode    = skip_mode
         self.spatial_dims = spatial_dims
         self.upsample     = Upsample(in_ch, out_ch, mode=upsample_mode,
                                      spatial_dims=spatial_dims,
-                                     stride=upsample_stride)
+                                     stride=upsample_stride,
+                                     norm_act=upsample_norm_act,
+                                     norm_type=norm_type,
+                                     norm_groups=norm_groups,
+                                     activation=activation)
 
         if skip_mode == "cat":
             fused_ch = out_ch + skip_ch
@@ -217,7 +225,11 @@ class Decoder(nn.Module):
         skip_mode         : str = "cat",
         skip_attention    : bool = False,
         spatial_dims      : int = 3,
-        downsample_strides: Optional[List] = None):
+        downsample_strides: Optional[List] = None,
+        upsample_norm_act : bool = False,
+        norm_type         : str = "instance",
+        norm_groups       : int = 8,
+        activation        : str = "leakyrelu"):
         super().__init__()
 
         self.levels       = nn.ModuleList()
@@ -247,7 +259,11 @@ class Decoder(nn.Module):
                 skip_mode      = skip_mode,
                 skip_attention = skip_attention,
                 spatial_dims   = spatial_dims,
-                upsample_stride = up_stride))
+                upsample_stride = up_stride,
+                upsample_norm_act = upsample_norm_act,
+                norm_type      = norm_type,
+                norm_groups    = norm_groups,
+                activation     = activation))
 
         # 各 decoder 层的输出通道（low-res → high-res）。
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]

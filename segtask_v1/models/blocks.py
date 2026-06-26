@@ -815,6 +815,10 @@ class Upsample(nn.Module):
         mode: str = "transpose",
         spatial_dims: int = 3,
         stride = 2,
+        norm_act: bool = False,
+        norm_type: str = "instance",
+        norm_groups: int = 8,
+        activation: str = "leakyrelu",
     ):
         super().__init__()
         d = _check_dims(spatial_dims)
@@ -831,6 +835,15 @@ class Upsample(nn.Module):
         self.spatial_dims = d
         self.stride = st
         isotropic2 = all(s == 2 for s in st)
+
+        # 可选：插值上采样精修 conv 之后再接 norm+act，使插值分支成为真正的
+        # 非线性特征变换（否则 interpolate→conv 两层连续线性，直到下游 stage 才有
+        # 非线性）。仅对插值模式 'trilinear'/'nearest' 生效；其余模式忽略该选项。
+        self.post = nn.Identity()
+        if norm_act and mode in ("trilinear", "nearest"):
+            self.post = nn.Sequential(
+                get_norm(norm_type, out_ch, norm_groups, spatial_dims=d),
+                get_activation(activation))
 
         if mode == "transpose":
             self.up = _CONV_T[d](in_ch, out_ch, kernel_size=st, stride=st)
@@ -878,7 +891,7 @@ class Upsample(nn.Module):
                 align_corners=False)
             if x.dtype != orig_dtype:
                 x = x.to(orig_dtype)
-            return self.up(x)
+            return self.post(self.up(x))
         if self.mode == "nearest":
             orig_dtype = x.dtype
             if orig_dtype in (torch.bfloat16, torch.float16):
@@ -886,7 +899,7 @@ class Upsample(nn.Module):
             x = F.interpolate(x, scale_factor=self.stride, mode="nearest")
             if x.dtype != orig_dtype:
                 x = x.to(orig_dtype)
-            return self.up(x)
+            return self.post(self.up(x))
         if self.mode == "pixelshuffle":
             return self.shuffle(self.expand(x))
         # carafe / dysample（__init__ 已限 3D）。
