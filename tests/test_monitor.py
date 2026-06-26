@@ -149,9 +149,12 @@ def test_single_payload_structure(tmp_path):
     assert by_id["overview"]["span"] == "full"
     assert by_id["lr"]["group"] == "System" and by_id["lr"]["span"] == "half"
 
-    # 选模指标并入概览并加粗高亮。
+    # 选模指标并入概览：加粗 + 虚线区分，标签不再含 "(selection)" 文字。
     ov_sel = [s for s in by_id["overview"]["series"] if s.get("emphasis")]
-    assert len(ov_sel) == 1 and "(selection)" in ov_sel[0]["label"]
+    assert len(ov_sel) == 1
+    assert ov_sel[0].get("dash") == "6 4"
+    assert all("(selection)" not in s["label"]
+               for s in by_id["overview"]["series"])
 
     # 逐类指标合并为「一图多线」：fixture 只有 Dice（num_classes=2 → 2 条），
     # 单指标时半宽。
@@ -296,6 +299,104 @@ def test_single_payload_empty_history():
     payload = charts.build_single_payload(hist)
     assert payload["panels"] == []
     assert payload["best_card"] is None
+
+
+def _train_health(epoch: int) -> dict:
+    """带模型健康指标的训练 dict（模拟 trainer 逐 epoch 聚合输出）。"""
+    return {
+        "loss": 2.0 / (epoch + 1),
+        "L_main": 1.0 / (epoch + 1),
+        "grad_norm": 5.0 / (epoch + 1),
+        "grad_norm_max": 9.0 / (epoch + 1),
+        "weight_norm": 100.0 + epoch,
+        "grad_clip_frac": 0.25,
+        "nonfinite_steps": 0.0,
+    }
+
+
+def _make_health_run(tmp_path, name="run_h", n=5):
+    d = tmp_path / name / "monitor"
+    lg = MetricsLogger(d, run_name=name, save_best_metric="mean_dice",
+                       save_best_mode="max", num_classes=2, total_epochs=n,
+                       save_best_criterion="mean_dice")
+    for ep in range(n):
+        lg.log_epoch(ep, train=_train_health(ep), val=_val(ep),
+                     lr=1e-3, gpu_peak_mib=1234.0 + ep)
+    lg.finalize("completed")
+    return MetricsHistory.from_dir(d)
+
+
+def test_health_panels_present_when_keys_exist(tmp_path):
+    hist = _make_health_run(tmp_path)
+    payload = charts.build_single_payload(hist)
+    by_id = {p["id"]: p for p in payload["panels"]}
+    # 健康面板存在且归入 "Model health" 组。
+    for pid in ("grad_norm", "weight_norm", "grad_clip_frac", "nonfinite_steps"):
+        assert pid in by_id, pid
+        assert by_id[pid]["group"] == "Model health"
+        assert by_id[pid]["span"] == "half"
+    # 梯度范数面板：mean + max 两条线，默认对数纵轴且可切换，mean 加粗。
+    gn = by_id["grad_norm"]
+    labels = [s["label"] for s in gn["series"]]
+    assert labels == ["grad_norm", "grad_norm_max"]
+    assert gn["log"] is True and gn["log_toggle"] is True
+    assert gn["series"][0].get("emphasis") is True
+    # 健康键不污染 Loss 面板（仅 loss + 分量）。
+    loss_labels = [s["label"] for s in by_id["loss"]["series"]]
+    assert "grad_norm" not in loss_labels and "weight_norm" not in loss_labels
+
+
+def test_health_panels_absent_for_legacy_run(tmp_path):
+    # 老 run（无健康键）→ 不出现 Model health 组，向后兼容。
+    hist = _make_run(tmp_path, "run_legacy")
+    payload = charts.build_single_payload(hist)
+    groups = {p.get("group") for p in payload["panels"]}
+    assert "Model health" not in groups
+    ids = {p["id"] for p in payload["panels"]}
+    assert ids.isdisjoint(set(charts._HEALTH_KEYS))
+
+
+def test_health_amp_scale_panel_present_only_when_logged(tmp_path):
+    # amp_scale 仅在被记录时出现（present-才画）。
+    no_amp = _make_health_run(tmp_path, "no_amp")
+    assert "amp_scale" not in {p["id"] for p in
+                               charts.build_single_payload(no_amp)["panels"]}
+
+    d = tmp_path / "with_amp" / "monitor"
+    lg = MetricsLogger(d, run_name="with_amp", save_best_metric="mean_dice",
+                       total_epochs=3, save_best_criterion="mean_dice")
+    for ep in range(3):
+        tr = _train_health(ep)
+        tr["amp_scale"] = 65536.0
+        lg.log_epoch(ep, train=tr, val=_val(ep))
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    by_id = {p["id"]: p for p in charts.build_single_payload(hist)["panels"]}
+    assert "amp_scale" in by_id
+    assert by_id["amp_scale"]["log"] is True
+
+
+def test_health_update_ratio_panel_present_only_when_logged(tmp_path):
+    # update_ratio 仅在被记录时出现（present-才画，默认关→老/常规 run 无此键）。
+    no_ur = _make_health_run(tmp_path, "no_ur")
+    assert "update_ratio" not in {p["id"] for p in
+                                  charts.build_single_payload(no_ur)["panels"]}
+
+    d = tmp_path / "with_ur" / "monitor"
+    lg = MetricsLogger(d, run_name="with_ur", save_best_metric="mean_dice",
+                       total_epochs=3, save_best_criterion="mean_dice")
+    for ep in range(3):
+        tr = _train_health(ep)
+        tr["update_ratio"] = 1e-3 * (ep + 1)
+        lg.log_epoch(ep, train=tr, val=_val(ep))
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    by_id = {p["id"]: p for p in charts.build_single_payload(hist)["panels"]}
+    assert "update_ratio" in by_id
+    ur = by_id["update_ratio"]
+    assert ur["group"] == "Model health"
+    assert ur["log"] is True and ur["log_toggle"] is True
+    assert [s["label"] for s in ur["series"]] == ["update_ratio"]
 
 
 def test_render_dashboard_html_self_contained(tmp_path):

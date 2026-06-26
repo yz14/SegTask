@@ -73,14 +73,12 @@ header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 680;
   grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
 .bestcard .tile { background: var(--panel); border: 1px solid #bbf7d0;
   border-radius: 9px; padding: 7px 10px; position: relative; }
-.bestcard .tile.sel { border-color: var(--good-ink);
+.bestcard .tile.sel { border-color: var(--good-ink); background: #ecfdf3;
   box-shadow: 0 0 0 1px var(--good-ink) inset; }
 .bestcard .tile .tk { color: var(--muted); font-size: 10.5px; }
+.bestcard .tile.sel .tk { color: var(--good-ink); font-weight: 700; }
 .bestcard .tile .tv { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   font-size: 16px; font-weight: 650; color: var(--ink); margin-top: 1px; }
-.bestcard .tile .tag { display: inline-block; margin-top: 4px; font-size: 9px;
-  font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
-  color: var(--good-ink); background: #dcfce7; border-radius: 4px; padding: 1px 5px; }
 /* per-class matrix (heatmap) */
 .bestcard .mtx { width: 100%; border-collapse: collapse; font-size: 12px;
   background: var(--panel); border: 1px solid #bbf7d0; border-radius: 9px;
@@ -489,7 +487,6 @@ function renderBestCard(bc) {
       const tile = el("div", "tile" + (m.selected ? " sel" : ""));
       tile.appendChild(el("div", "tk", m.key));
       tile.appendChild(el("div", "tv", m.value));
-      if (m.selected) tile.appendChild(el("span", "tag", "selection"));
       grid.appendChild(tile);
     });
     card.appendChild(grid);
