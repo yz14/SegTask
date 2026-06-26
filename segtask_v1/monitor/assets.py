@@ -63,15 +63,40 @@ header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 680;
 .bestcard { background: var(--good-bg); border: 1px solid #bbf7d0;
   border-radius: 12px; padding: 14px 16px; margin-bottom: 18px; }
 .bestcard .hl { font-size: 14px; font-weight: 700; color: var(--good-ink);
-  margin-bottom: 10px; }
+  margin-bottom: 12px; }
 .bestcard .hl b { font-family: var(--font-mono); font-size: 18px; }
-.bestcard .grid { display: grid; gap: 6px 18px;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
-.bestcard .m { display: flex; justify-content: space-between; gap: 10px;
-  border-bottom: 1px solid #dcfce7; padding: 3px 0; }
-.bestcard .m .k { color: var(--muted); }
-.bestcard .m .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
-  color: var(--ink); }
+.bestcard .sub { font-size: 10.5px; font-weight: 700; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--good-ink); opacity: .8;
+  margin: 4px 0 7px; }
+/* mean / aggregate stat tiles */
+.bestcard .means { display: grid; gap: 8px; margin-bottom: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
+.bestcard .tile { background: var(--panel); border: 1px solid #bbf7d0;
+  border-radius: 9px; padding: 7px 10px; position: relative; }
+.bestcard .tile.sel { border-color: var(--good-ink);
+  box-shadow: 0 0 0 1px var(--good-ink) inset; }
+.bestcard .tile .tk { color: var(--muted); font-size: 10.5px; }
+.bestcard .tile .tv { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 16px; font-weight: 650; color: var(--ink); margin-top: 1px; }
+.bestcard .tile .tag { display: inline-block; margin-top: 4px; font-size: 9px;
+  font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--good-ink); background: #dcfce7; border-radius: 4px; padding: 1px 5px; }
+/* per-class matrix (heatmap) */
+.bestcard .mtx { width: 100%; border-collapse: collapse; font-size: 12px;
+  background: var(--panel); border: 1px solid #bbf7d0; border-radius: 9px;
+  overflow: hidden; }
+.bestcard .mtx th, .bestcard .mtx td { padding: 6px 10px; text-align: right;
+  border-bottom: 1px solid #dcfce7; font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono); }
+.bestcard .mtx tr:last-child td { border-bottom: 0; }
+.bestcard .mtx th { background: #ecfdf5; color: var(--good-ink); font-weight: 600;
+  font-family: var(--font-sans); }
+.bestcard .mtx th:first-child, .bestcard .mtx td:first-child { text-align: left;
+  font-family: var(--font-sans); font-weight: 600; color: var(--ink); }
+.bestcard .rest { display: flex; flex-wrap: wrap; gap: 4px 18px; margin-top: 12px;
+  color: var(--muted); font-size: 11.5px; }
+.bestcard .rest .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  color: var(--ink); margin-left: 5px; }
 
 /* panels */
 .panel { background: var(--panel); border: 1px solid var(--line);
@@ -134,6 +159,25 @@ function svg(tag, attrs) {
   for (const k in (attrs || {})) e.setAttribute(k, attrs[k]);
   return e;
 }
+// 跨「自动重载」持久化的 UI 状态（图例隐藏的曲线、log y 开关），按面板 key 存
+// sessionStorage——否则训练中定时 location.reload() 会把这些选择重置回默认。
+function loadHidden(key) {
+  try { return new Set(JSON.parse(sessionStorage.getItem("mon_hid_" + key) || "[]")); }
+  catch (e) { return new Set(); }
+}
+function saveHidden(key, series) {
+  try {
+    const arr = series.filter(z => z.hidden).map(z => z.label);
+    sessionStorage.setItem("mon_hid_" + key, JSON.stringify(arr));
+  } catch (e) { /* storage 不可用时静默降级 */ }
+}
+function loadLog(key, dflt) {
+  const v = sessionStorage.getItem("mon_log_" + key);
+  return v == null ? dflt : v === "1";
+}
+function saveLog(key, on) {
+  try { sessionStorage.setItem("mon_log_" + key, on ? "1" : "0"); } catch (e) {}
+}
 function fmt(v) {
   if (v == null || !isFinite(v)) return "-";
   const a = Math.abs(v);
@@ -186,9 +230,12 @@ const DIM = { w: 820, h: 300, ml: 56, mr: 16, mt: 12, mb: 30 };
 const HALFDIM = { w: 540, h: 300, ml: 52, mr: 14, mt: 12, mb: 30 };
 const SUBDIM = { w: 360, h: 220, ml: 46, mr: 12, mt: 10, mb: 26 };
 
-function makeChart(container, chart, dim) {
-  const state = { series: chart.series.map(s => ({ ...s, hidden: !!s.hidden })),
-                  log: !!chart.log };
+function makeChart(container, chart, dim, key) {
+  const skey = key || chart.id || chart.title || "";
+  const hiddenSet = loadHidden(skey);
+  const state = { series: chart.series.map(s => ({
+                    ...s, hidden: hiddenSet.has(s.label) ? true : !!s.hidden })),
+                  log: loadLog(skey, !!chart.log) };
   const root = el("div", "chart");
   const tt = el("div", "tt");
   const s = svg("svg", { viewBox: `0 0 ${dim.w} ${dim.h}`,
@@ -330,7 +377,7 @@ function makeChart(container, chart, dim) {
     if (hoverG) while (hoverG.firstChild) hoverG.removeChild(hoverG.firstChild); });
 
   redraw();
-  return { state, redraw };
+  return { state, redraw, key: skey };
 }
 
 function logTicks(lo, hi) {
@@ -362,6 +409,7 @@ function legendFor(panel, chartObj) {
     it.appendChild(sw); it.appendChild(lab);
     it.addEventListener("click", () => {
       z.hidden = !z.hidden; it.classList.toggle("off");
+      saveHidden(chartObj.key, chartObj.state.series);
       chartObj.redraw();
     });
     lg.appendChild(it);
@@ -381,7 +429,7 @@ function buildPanel(panel) {
       const sub = el("div", "sub");
       sub.appendChild(el("div", "st", c.title));
       gw.appendChild(sub);
-      makeChart(sub, c, SUBDIM);
+      makeChart(sub, c, SUBDIM, (panel.id || "") + "/" + (c.title || ""));
     });
     return box;
   }
@@ -399,8 +447,13 @@ function buildPanel(panel) {
     const id = "log_" + panel.id;
     const lab = el("label");
     const cb = el("input"); cb.type = "checkbox"; cb.id = id;
+    cb.checked = chartObj.state.log;  // 反映跨重载恢复的状态
     lab.appendChild(cb); lab.appendChild(document.createTextNode(" log y"));
-    cb.addEventListener("change", () => { chartObj.state.log = cb.checked; chartObj.redraw(); });
+    cb.addEventListener("change", () => {
+      chartObj.state.log = cb.checked;
+      saveLog(chartObj.key, cb.checked);
+      chartObj.redraw();
+    });
     ctrl.appendChild(lab);
   }
   return box;
@@ -427,14 +480,64 @@ function renderBestCard(bc) {
   const hl = el("div", "hl");
   hl.innerHTML = `Best model · ${bc.headline.metric} = <b>${bc.headline.value}</b> @ epoch ${bc.headline.epoch}`;
   card.appendChild(hl);
-  const grid = el("div", "grid");
-  (bc.metrics || []).forEach(([k, v]) => {
-    const m = el("div", "m");
-    m.appendChild(el("span", "k", k));
-    m.appendChild(el("span", "v", v));
-    grid.appendChild(m);
-  });
-  card.appendChild(grid);
+
+  // 均值 / 聚合指标 → 高亮磁贴，选模指标加边框 + badge。
+  if (bc.means && bc.means.length) {
+    card.appendChild(el("div", "sub", "Mean / aggregate"));
+    const grid = el("div", "means");
+    bc.means.forEach(m => {
+      const tile = el("div", "tile" + (m.selected ? " sel" : ""));
+      tile.appendChild(el("div", "tk", m.key));
+      tile.appendChild(el("div", "tv", m.value));
+      if (m.selected) tile.appendChild(el("span", "tag", "selection"));
+      grid.appendChild(tile);
+    });
+    card.appendChild(grid);
+  }
+
+  // 逐类指标 → 矩阵表（行=class，列=指标），按列做轻量绿色色阶 heatmap。
+  if (bc.matrix && bc.matrix.rows && bc.matrix.rows.length) {
+    card.appendChild(el("div", "sub", "Per-class"));
+    const t = el("table", "mtx");
+    const head = el("thead"), htr = el("tr");
+    htr.appendChild(el("th", null, "class"));
+    bc.matrix.columns.forEach(c => htr.appendChild(el("th", null, c)));
+    head.appendChild(htr); t.appendChild(head);
+    // 每列 min/max 用于归一化着色。
+    const n = bc.matrix.columns.length;
+    const lo = Array(n).fill(Infinity), hi = Array(n).fill(-Infinity);
+    bc.matrix.rows.forEach(r => r.cells.forEach((c, j) => {
+      if (c.t != null) { if (c.t < lo[j]) lo[j] = c.t; if (c.t > hi[j]) hi[j] = c.t; }
+    }));
+    const tb = el("tbody");
+    bc.matrix.rows.forEach(r => {
+      const tr = el("tr");
+      tr.appendChild(el("td", null, r.label));
+      r.cells.forEach((c, j) => {
+        const td = el("td", null, c.value);
+        if (c.t != null && isFinite(lo[j]) && hi[j] > lo[j]) {
+          const norm = (c.t - lo[j]) / (hi[j] - lo[j]);
+          td.style.background = `rgba(5,150,105,${(0.06 + 0.40 * norm).toFixed(3)})`;
+        }
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb);
+    card.appendChild(t);
+  }
+
+  // 其余标量指标 → 次要小列表。
+  if (bc.rest && bc.rest.length) {
+    const r = el("div", "rest");
+    bc.rest.forEach(([k, v]) => {
+      const sp = el("span", null, k);
+      sp.appendChild(el("span", "v", v));
+      r.appendChild(sp);
+    });
+    card.appendChild(r);
+  }
+
   document.getElementById("wrap").appendChild(card);
 }
 
