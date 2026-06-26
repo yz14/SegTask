@@ -222,7 +222,7 @@ loss:
 
 
 train:
-  epochs: 1
+  epochs: 2
 
   optimizer   : "adamw"
   lr          : 1.0e-3
@@ -337,7 +337,7 @@ vis:
 # 默认关闭、零开销；打开后训练中按 update_every 实时刷新，结束后给出 best 指标卡。
 # 续训安全、异常隔离（失败仅告警不中断训练）。详见 README §3.10。
 monitor:
-  enabled            : false               # 设 true 即落盘 + 渲染仪表盘
+  enabled            : true                 # 设 true 即落盘 + 渲染仪表盘
   output_dir         : ""                   # 空 => train.output_dir（HTML 落此，数据落其 monitor/）
   filename           : "training_monitor.html"
   update_every       : 1                    # 每多少 epoch 重渲染（best/末轮总会刷新）

@@ -2,16 +2,17 @@
 # 用法: python -m segtask_v1.train --config configs/seg3d.yaml [--override key=val ...]
 
 data:
-  # NIfTI 路径。image / label 文件名必须一致
-  image_dir: "F:/BaiduNetdiskDownload/lung_nii"
-  label_dir: "F:/BaiduNetdiskDownload/lung_bone"
-  bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"            # F:/BaiduNetdiskDownload/bone_bbox
-  region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"  # 
   image_suffix: ".nii.gz"
   label_suffix: ".nii.gz"
   bbox_suffix : ".nii.gz"
   region_weight_suffix: ".nii.gz"
-  npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
+
+  # #### 样例 ####
+  image_dir: "F:/Totalsegmentator_dataset_v201/small_data/nii"
+  label_dir: "F:/Totalsegmentator_dataset_v201/small_data/mask"
+  bbox_dir : "F:/Totalsegmentator_dataset_v201/small_data/bbox"
+  region_weight_dir : "F:/Totalsegmentator_dataset_v201/small_data/region_weight"
+  npz_dir: "F:/Totalsegmentator_dataset_v201/small_data/npz"
 
   # 第二批(粗标)预生成 npz 目录。空 => 单批金标准(现有行为)。
   # 非空 => 训练时金/粗按 mix_ratio 在每个 batch 内混合(副源仅训练; val 始终仅金标准)。
@@ -23,10 +24,10 @@ data:
   mix_ratio: [1, 1]
 
   # label 整数值，[bg, fg1, fg2, ...]。空 => 首运自动检测。例: [0,1,2]
-  label_values: [0, 1, 2]
-  num_classes : 3          # 0 => 自动 = len(label_values)
+  label_values: [0, 1]
+  num_classes : 2          # 0 => 自动 = len(label_values)
 
-  patch_size: [32, 256, 256]            # [D, H, W]
+  patch_size: [16, 128, 128]            # [D, H, W]
 
   # patch_mode — 训练样本抽取方式:
   #   'z_axis' — 沿 z 轴滑块；x,y resize 到 (pH,pW)。支持 multi_res (仅 z)
@@ -40,12 +41,12 @@ data:
   aug_oversample_ratio: 1.5
 
   # 多分辨率输入 (多 FOV)。[1.0] 单分辨率；[1.0,1.5,2.0] 多分辨率 (3 通道)。whole 必须 [1.0]
-  multi_res_scales: [1.0]
+  multi_res_scales: [1.0, 1.5, 2.0]
 
   # 3D 多分辨率 lazy 单 cube 提取 (仅 z_axis/cubic + n>1)。
   #   false — 默认: 每 scale 独立 scipy.zoom; aux 高频细节在增强前已损
   #   true  — 只抽 max-FOV cube 增强 1 次，trainer per-view crop+interpolate; 锁 edge_pad; 与 keep_native_view_depth 互斥
-  keep_native_multi_res: false
+  keep_native_multi_res: true
 
   # HU 窗 + 归一化。normalize: 'minmax' → [0,1] | 'zscore' → (x-mean)/std (需 global_mean/std)
   intensity_min: -1024.0
@@ -148,7 +149,7 @@ model:
   # attention_type: "none"                # 'none' | 'se' | 'eca' | 'cbam' | 'coord'
   # skip_attention: false                 # Skip 路 AttentionGate3D (Oktay 2018)
 
-  deep_supervision: false                # 多 decoder 层预测; 权重见 loss.deep_supervision_weights
+  deep_supervision: true                # 多 decoder 层预测; 权重见 loss.deep_supervision_weights
 
   # 'conv3' | 'conv7' | 'dual' | 'patch2' | 'patch4' (patchN 降 N 倍, 输出补 trilinear)
   stem_mode: "conv3"
@@ -190,7 +191,7 @@ loss:
   class_weights: [1.0, 1.0]              # 按前景类; 长度 = num_fg_classes (空 = 均匀)
 
   # 按 label_values 逐值 (含 bg)。例: [0,1,2]+[1,2,1] => label=1 体素 loss 权重 2。空 = 禁用
-  region_weights: [1.0, 2.0, 1.0]
+  region_weights: [1.0, 2.0]
 
   dice_smooth : 1.0e-5                   # 防 0/0
   dice_squared: false                    # true → Dice^2 (稳但梯度弱)
@@ -219,7 +220,13 @@ loss:
 
 
 train:
-  epochs: 50
+  epochs: 2
+  # ---- 多卡 DDP --- -
+  gpus: [0]                         # 要用的物理卡号列表（你 8 卡 4090 混用机，按需选空闲卡）
+  ddp_find_unused_parameters: true  # 深监督/多头默认 true 保正确；确认全参每步参与可设 false 提一点速
+  ddp_master_port: 0                # 0=自动挑空闲端口（混用机避免端口冲突）；也可固定如 29501
+ 
+  val_every: 1       
 
   optimizer   : "adamw"                  # 'adam' | 'adamw' | 'sgd'
   lr          : 1.0e-3
@@ -256,7 +263,7 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir: "outputs/lung_bone_zaxis"
+  output_dir: "outputs/base3d"
   save_every: 10
   # 选模标准：单一接口。可选 loss/dice/dice+surface_dice/iou/mcc/min_dice/balanced。
   # save_best_metric / save_best_mode 由此自动派生，无需手设。
@@ -297,3 +304,26 @@ predict:
   output_dir: "predictions"
   save_probabilities: false              # 同时保存每前景类概率图
 
+
+# VIS — 全流程可视化（数据流 / 模型流 / 预测流 → 自包含 HTML）。
+# 默认关闭、零开销；打开后训练启动时导出到 train.output_dir/visualization/。
+# CPU dummy 张量推导，不读盘、不依赖 GPU/真实数据。详见 README §3.9。
+vis:
+  enabled          : true                 # 设 true 即生成 HTML
+  output_dir       : ""                    # 空 => train.output_dir/visualization/
+  filename         : "pipeline_vis.html"
+  flows            : ["data", "model", "predict"]   # 视图子集 + 标签页顺序
+  trace_shapes     : true                  # 模型流 dummy 前向追踪真实形状
+  max_detail_params: 200                   # 单节点详情最多条数
+
+
+# MONITOR — 训练过程监测仪表盘（逐 epoch 损失/指标/逐类/LR/显存曲线 → 自包含 HTML）。
+# 默认关闭、零开销；打开后训练中按 update_every 实时刷新，结束后给出 best 指标卡。
+# 续训安全、异常隔离（失败仅告警不中断训练）。详见 README §3.10。
+monitor:
+  enabled            : true                 # 设 true 即落盘 + 渲染仪表盘
+  output_dir         : ""                   # 空 => train.output_dir（HTML 落此，数据落其 monitor/）
+  filename           : "training_monitor.html"
+  update_every       : 1                    # 每多少 epoch 重渲染（best/末轮总会刷新）
+  auto_reload_seconds: 10                   # 训练中 HTML 自动重载间隔（秒）
+  run_name           : ""                   # 对比页显示名；空 => output_dir 目录名
