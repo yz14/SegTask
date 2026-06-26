@@ -171,7 +171,8 @@ def test_single_payload_structure(tmp_path):
 
 
 def test_per_class_unit_scale_merge(tmp_path):
-    # 同为 [0,1] 尺度的 Dice + IoU 合并到一张图：每类一色、每指标一线型。
+    # 同为 [0,1] 尺度的 Dice + IoU 合并到一张图：每条线一个独立颜色（无 dash），
+    # 按「指标分色系、类内分深浅」区分，默认全部显示。
     d = tmp_path / "merge" / "monitor"
     lg = MetricsLogger(d, run_name="merge", save_best_metric="mean_dice",
                        save_best_mode="max", num_classes=2, total_epochs=3)
@@ -190,15 +191,83 @@ def test_per_class_unit_scale_merge(tmp_path):
     assert pc["span"] == "full"
     assert len(pc["series"]) == 4
     assert pc["title"] == "Per-class Dice / IoU"
-    # Dice 实线（无 dash），IoU 虚线（有 dash）。
+    # 不再用线型(dash)区分，全部为独立实线颜色。
+    assert all("dash" not in s for s in pc["series"])
+    # 16 条以内每条线颜色互不相同（此处 4 条）。
+    colors = [s["color"] for s in pc["series"]]
+    assert len(set(colors)) == len(colors)
+    # 同一类的 Dice / IoU 现在用不同颜色（不同色系）。
     dice = [s for s in pc["series"] if "Dice" in s["label"]]
     iou = [s for s in pc["series"] if "IoU" in s["label"]]
-    assert all("dash" not in s for s in dice)
-    assert all(s.get("dash") for s in iou)
-    # 同一类的 Dice / IoU 同色。
     c0_dice = next(s for s in dice if s["label"].startswith("class 0"))
     c0_iou = next(s for s in iou if s["label"].startswith("class 0"))
-    assert c0_dice["color"] == c0_iou["color"]
+    assert c0_dice["color"] != c0_iou["color"]
+
+
+def test_loss_components_merged_into_loss_panel(tmp_path):
+    # 训练损失分量并入 Loss 面板（不再有独立 loss_components 面板）；
+    # 总损失 train/val 加粗高亮，分量默认显示。
+    d = tmp_path / "lossc" / "monitor"
+    lg = MetricsLogger(d, run_name="lossc", save_best_metric="mean_dice",
+                       save_best_mode="max", num_classes=2, total_epochs=3)
+    for ep in range(3):
+        lg.log_epoch(ep, train={"loss": 2.0 / (ep + 1), "L_main": 1.0 / (ep + 1),
+                                "L_res_0": 0.5 / (ep + 1)},
+                     val=_val(ep))
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    payload = charts.build_single_payload(hist)
+    ids = {p["id"] for p in payload["panels"]}
+    assert "loss_components" not in ids  # 已合并
+    by_id = {p["id"]: p for p in payload["panels"]}
+    loss = by_id["loss"]
+    labels = [s["label"] for s in loss["series"]]
+    assert "train loss" in labels and "val loss" in labels
+    assert "L_main" in labels and "L_res_0" in labels  # 分量并入
+    # 总损失（train/val）加粗高亮，分量不强调。
+    emph = {s["label"] for s in loss["series"] if s.get("emphasis")}
+    assert emph == {"train loss", "val loss"}
+    assert all(not s.get("emphasis") for s in loss["series"]
+               if s["label"] in ("L_main", "L_res_0"))
+    # 每条线颜色互不相同。
+    colors = [s["color"] for s in loss["series"]]
+    assert len(set(colors)) == len(colors)
+
+
+def test_best_card_means_and_per_class_matrix(tmp_path):
+    # best 卡片：均值磁贴 + 逐类矩阵（含数值用于 heatmap）+ 其余标量列表。
+    d = tmp_path / "card" / "monitor"
+    lg = MetricsLogger(d, run_name="card", save_best_metric="mean_dice",
+                       save_best_mode="max", num_classes=2, total_epochs=2)
+    for ep in range(2):
+        lg.log_epoch(ep, train=_train(ep), val={
+            "val_loss": 1.0 / (ep + 1),
+            "mean_dice": 0.5 + 0.1 * ep, "mean_iou": 0.4 + 0.1 * ep,
+            "dice_class_0": 0.8 + 0.05 * ep, "dice_class_1": 0.6 + 0.05 * ep,
+            "iou_class_0": 0.7, "iou_class_1": 0.5,
+            "mcc_class_0": 0.3, "mcc_class_1": 0.4,
+        })
+    lg.finalize("completed")
+    hist = MetricsHistory.from_dir(d)
+    bc = charts.build_single_payload(hist)["best_card"]
+
+    # 均值磁贴：含 mean_dice / mean_iou，选模指标标 selected。
+    mean_keys = [m["key"] for m in bc["means"]]
+    assert "mean_dice" in mean_keys and "mean_iou" in mean_keys
+    sel = [m for m in bc["means"] if m["selected"]]
+    assert len(sel) == 1 and sel[0]["key"] == "mean_dice"
+
+    # 逐类矩阵：列含 Dice / IoU / MCC，行=2 个 class，cell 带数值 t。
+    mtx = bc["matrix"]
+    assert mtx["columns"] == ["Dice", "IoU", "MCC"]
+    assert [r["label"] for r in mtx["rows"]] == ["class 0", "class 1"]
+    c0 = mtx["rows"][0]["cells"]
+    assert len(c0) == 3 and c0[0]["t"] is not None
+
+    # 逐类 key 被矩阵吸收，不再混入「其余」列表；val_loss 进入其余。
+    rest_keys = [k for k, _ in bc["rest"]]
+    assert "dice_class_0" not in rest_keys
+    assert "val_loss" in rest_keys
 
 
 def test_per_class_other_scale_separate(tmp_path):
@@ -241,6 +310,16 @@ def test_render_dashboard_html_self_contained(tmp_path):
     assert "</script>" in htmlstr  # 仅结尾真正闭合标签
     # 标题含 run 名。
     assert "run_a" in htmlstr
+
+
+def test_render_dashboard_persists_legend_state(tmp_path):
+    # 图例隐藏 / log 开关状态跨自动重载持久化：HTML 内联的 JS 必须用
+    # sessionStorage 存取（否则定时 location.reload() 会把隐藏曲线重置）。
+    hist = _make_run(tmp_path, "run_a")
+    htmlstr = render_dashboard(hist, auto_reload_seconds=5)
+    assert "loadHidden" in htmlstr and "saveHidden" in htmlstr
+    assert "mon_hid_" in htmlstr
+    assert "loadLog" in htmlstr and "saveLog" in htmlstr
 
 
 def test_render_dashboard_escapes_script_close(tmp_path):
