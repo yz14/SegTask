@@ -59,7 +59,18 @@ _TEMPLATE = """<!DOCTYPE html>
         <button id="tabYaml">YAML 预览</button>
       </span>
     </div>
-    <div id="logs"></div>
+    <div id="term" class="term">
+      <div class="termbar">
+        <span class="lights"><i class="r"></i><i class="y"></i><i class="g"></i></span>
+        <span id="termtitle" class="ttitle">terminal · 就绪</span>
+        <span class="ttools">
+          <button id="copyBtn" class="tbtn">复制</button>
+          <button id="clearBtn" class="tbtn">清空</button>
+        </span>
+      </div>
+      <div id="logs"></div>
+      <button id="toBottom" class="tobottom hidden">↓ 回到底部</button>
+    </div>
     <pre id="yamlview" class="hidden"></pre>
     <div id="msg" class="msgbar muted">就绪。</div>
   </div>
