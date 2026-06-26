@@ -5,3 +5,5 @@ __pycache__/
 debug*
 edm2
 guided-diff
+# launcher 运行时生成的临时配置
+configs/_runs/
