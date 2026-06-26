@@ -78,11 +78,13 @@ input:focus,select:focus{outline:none;border-color:var(--sec,var(--accent));
 .group.collapsed>.ghead .arrow{transform:rotate(-90deg)}
 .group.collapsed>.gbody{display:none}
 
-/* ---- 表单：自适应多列网格；统一控件高度；长字段占整行 ---- */
+/* ---- 表单：自适应多列网格；统一控件高度；三档跨度 + dense 回填消除空隙 ---- */
 .gbody{padding:14px 16px 16px;display:grid;gap:13px 16px;align-items:start;
-  grid-template-columns:repeat(auto-fill,minmax(206px,1fr))}
+  grid-auto-flow:row dense;grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
 .field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.field.w2{grid-column:span 2}
 .field.wide{grid-column:1/-1}
+@media (max-width:520px){.field.w2{grid-column:1/-1}}
 .field>label{display:flex;align-items:center;gap:6px;color:var(--muted);
   font-size:12px;font-weight:500;word-break:break-word;min-height:15px;line-height:1.25}
 .field.changed>label{color:var(--fg)}
@@ -281,12 +283,14 @@ function controlFor(fld){
   return inp;
 }
 
-// 长字段（路径 / 列表 / JSON）占整行；布尔紧凑同行；短字符串/数值/枚举进多列网格
-const WIDE_RE=/(_dir|_list|path|resume|pretrain|output|input|checkpoint|weights|bbox)/i;
+// 三档跨度：极少数超长自由路径占整行(wide)；路径/目录/列表跨2列(w2)；短标量/枚举/布尔占1列
+const ULTRA_RE=/(resume|pretrain|checkpoint|weights|input)/i;
+const W2_RE=/(_dir|_list|path|output|bbox|exclude)/i;
 function fieldClass(fld){
-  if(fld.control==='list') return 'field wide';
   const name=(fld.ref||'').split('.').pop();
-  if(fld.control==='str' && WIDE_RE.test(name)) return 'field wide';
+  if(fld.control==='str' && ULTRA_RE.test(name)) return 'field wide';
+  if(fld.control==='list') return 'field w2';
+  if(fld.control==='str' && W2_RE.test(name)) return 'field w2';
   return 'field';
 }
 function fieldRow(fld){
