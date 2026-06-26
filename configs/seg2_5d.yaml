@@ -171,9 +171,10 @@ model:
   # Plan C aux 挂在低分辨率 decoder 特征上，'conv' 兼有空间聚合作用，同样推荐。
   aux_head_mode: "conv"
 
-  decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
+  decoder_type   : "unetpp"         # 'unet' | 'unetpp' | 'unet3p'
   downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
   upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
+  upsample_norm_act: true         # 仅 trilinear/nearest 生效
   skip_mode      : "cat"          # 'cat' | 'add'
 
   drop_path_rate : 0.0
@@ -186,10 +187,9 @@ model:
   multirf_mode          : "split"        # 'split'(≈等成本) | 'parallel'(≈N×)
   multirf_fusion        : "concat_proj"  # 'concat_proj' | 'sum'(需 parallel) | 'se'
   multirf_axes          : "hw"           # 'hw'(保 z, 推荐) | 'all'
-  # 编码器逐 stage（长度=len(encoder_channels)=5；浅→深，末位=bottleneck）。
-  multirf_encoder_stages: [0, 0, 1, 1, 1]
-  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅）。默认关，作为第二轮对照。
-  multirf_decoder_stages: [1, 1, 0, 0]
+  multirf_encoder_stages: [0, 0, 1, 1, 1]  # 编码器逐 stage（长度=len(encoder_channels)=5；浅→深，末位=bottleneck）。
+  multirf_decoder_stages: [0, 0, 0, 0]  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅）。默认关，作为第二轮对照。
+  multirf_branch_norm_act: true   # 注意 split+group：分支通道须被 norm_groups 整除，否则显式报错
 
 
 # LOSS — 2.5D 走 SliceChannelLoss 包装; base_loss 在 (B*D,1,H,W) 作为 2D 二值损失
