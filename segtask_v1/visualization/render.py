@@ -113,6 +113,18 @@ svg.edges-top { z-index: 3; }
   color: var(--muted); opacity: 0; }
 .node:hover .hint { opacity: .7; }
 
+/* —— 聚焦高亮（单击模块）：仅被点模块+直接邻居+相连边醒目，其余淡出 —— */
+.node, .stage { transition: opacity .15s, box-shadow .15s; }
+.canvas.focusing .node:not(.foc-on):not(.foc-nb),
+.canvas.focusing .stage:not(.foc-on):not(.foc-nb):not(.foc-keep) {
+  opacity: .12; filter: saturate(.5); }
+.node.foc-on, .stage.foc-on {
+  opacity: 1; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent), 0 6px 20px rgba(37,99,235,.32); }
+.node.foc-nb, .stage.foc-nb {
+  opacity: 1;
+  box-shadow: 0 0 0 2.5px #f59e0b, 0 4px 14px rgba(245,158,11,.30); }
+
 /* stage container */
 .stage {
   background: var(--c-stage-bg); border: 1px dashed var(--c-stage);
@@ -208,6 +220,8 @@ const EDGE_STYLE = {
   skip:     { color: "#2563eb", width: "1.8", dash: null,  marker: "arrow-skip" },
   residual: { color: "#d97706", width: "1.8", dash: "3 3", marker: "arrow-res" },
 };
+// 聚焦高亮色：单击模块后,其直接相连边以此醒目色绘于顶层（框之上，永不被任何框遮挡）。
+const HILITE = { color: "#db2777", width: "2.6" };
 
 function el(tag, cls, txt) {
   const e = document.createElement(tag);
@@ -235,7 +249,9 @@ function buildLeaf(node) {
     });
     card.appendChild(kv);
   }
-  card.appendChild(el("div", "hint", "double-click for details"));
+  card.appendChild(el("div", "hint", "\u5355\u51FB\u9AD8\u4EAE \u00B7 \u53CC\u51FB\u8BE6\u60C5"));
+  card.addEventListener("click", (ev) => focusClick(node, ev));
+  card.addEventListener("dblclick", (ev) => focusDbl(node, ev));
   return card;
 }
 
@@ -244,7 +260,8 @@ function buildStage(node, childrenOf) {
   box.id = "n-" + node.id;
   box.dataset.nodeId = node.id;
   const head = el("div", "stage-head" + (node.collapsed ? " collapsed" : ""));
-  head.appendChild(el("span", "caret", "\u25BC"));
+  const caret = el("span", "caret", "\u25BC");
+  head.appendChild(caret);
   head.appendChild(el("span", null, node.label));
   const sk = Object.entries(node.key_info || {})
     .map(([k, v]) => k + " " + v).join("  ·  ");
@@ -253,12 +270,15 @@ function buildStage(node, childrenOf) {
   const body = el("div", "children" + (node.collapsed ? " collapsed" : ""));
   layoutInto(body, childrenOf[node.id] || [], childrenOf);
   box.appendChild(body);
-  head.addEventListener("click", (ev) => {
+  // 折叠/展开仅由标题左侧的三角图标触发；标题其余区域单击=聚焦高亮、双击=详情。
+  caret.addEventListener("click", (ev) => {
     ev.stopPropagation();
     body.classList.toggle("collapsed");
     head.classList.toggle("collapsed");
     scheduleDraw(true);
   });
+  head.addEventListener("click", (ev) => focusClick(node, ev));
+  head.addEventListener("dblclick", (ev) => focusDbl(node, ev));
   return box;
 }
 
@@ -292,13 +312,29 @@ function render(node, childrenOf) {
   const wrap = el("div", "node-wrap");
   wrap.style.position = "relative";
   const elx = isStage ? buildStage(node, childrenOf) : buildLeaf(node);
-  // double-click → detail drawer (works for both leaf & stage)
-  elx.addEventListener("dblclick", (ev) => { ev.stopPropagation(); openDrawer(node); });
   wrap.appendChild(elx);
   return wrap;
 }
 
 let CUR = null;
+// —— 聚焦高亮交互：单击模块=高亮其直接连接，双击=打开详情抽屉 ——
+// 通用、数据驱动（基于 IR 邻接）：对 configs 下任意 yaml / 任意模型参数都成立。
+// 思路：密集解码器（unetpp/unet3p）的连通图本质不可平面化，静态布局必有残留交叉；
+// 聚焦后只高亮被点模块的少数直连边并绘于框之上，故这些线既不被遮挡、也几乎不互相交叉。
+let FOCUS = null;
+let _clickTimer = null;
+function toggleFocus(id) { FOCUS = (FOCUS === id) ? null : id; drawEdges(); }
+function clearFocus() { if (FOCUS !== null) { FOCUS = null; drawEdges(); } }
+function focusClick(node, ev) {
+  ev.stopPropagation();
+  if (_clickTimer) return;            // 双击进行中：交由 dblclick 处理
+  _clickTimer = setTimeout(() => { _clickTimer = null; toggleFocus(node.id); }, 220);
+}
+function focusDbl(node, ev) {
+  ev.stopPropagation();
+  if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
+  openDrawer(node);
+}
 function openDrawer(node) {
   const d = document.getElementById("drawer");
   document.getElementById("drawer-title").textContent = node.label;
@@ -361,6 +397,40 @@ function drawEdges() {
   const topIds = new Set((g.nodes || [])
     .filter(n => !n.parent_id).map(n => n.id));
   const seen = new Set();
+
+  // —— 聚焦高亮：单击模块后,仅其本身+直接邻居+相连边醒目,其余淡出 ——
+  // focusSet = 被点节点 ∪ 其所有直接前驱/后继；据此给框打 foc-on/foc-nb 类、
+  // 给相连边换醒目色并改绘到顶层(svgTop,框之上)→ 被点模块的连接清晰且永不被遮挡。
+  const focus = FOCUS;
+  const focusSet = new Set();
+  if (focus != null) {
+    focusSet.add(focus);
+    edges.forEach(ed => {
+      if (ed.src === focus) focusSet.add(ed.dst);
+      else if (ed.dst === focus) focusSet.add(ed.src);
+    });
+  }
+  flow.querySelectorAll(".node,.stage").forEach(e =>
+    e.classList.remove("foc-on", "foc-nb", "foc-keep"));
+  if (focus != null) {
+    canvas.classList.add("focusing");
+    // 把 id 解析到可见 DOM(折叠 stage 上卷),打高亮类;并给其祖先 stage 打 foc-keep,
+    // 避免「聚焦的子框因祖先 stage 被整体淡化而连带变淡」。
+    const markFoc = (id, cls) => {
+      const e = visibleAnchor(id);
+      if (!e) return;
+      if (!e.classList.contains("foc-on")) e.classList.add(cls);
+      let p = e.parentElement;
+      while (p) {
+        if (p.classList && p.classList.contains("stage")) p.classList.add("foc-keep");
+        p = p.parentElement;
+      }
+    };
+    markFoc(focus, "foc-on");
+    focusSet.forEach(id => { if (id !== focus) markFoc(id, "foc-nb"); });
+  } else {
+    canvas.classList.remove("focusing");
+  }
 
   const STEP = 22, GAP = 26;
   // —— 通用跳连路由（基于 rank 的两侧划分，几何无关、幂等）——
@@ -553,23 +623,28 @@ function drawEdges() {
       }
       lx = (cx1 + cx2) / 2 + 6; ly = my - 2;
     }
+    // 聚焦态：被点模块的直连边醒目(洋红、加粗、绘于顶层框之上→永不被遮挡)；其余边淡出。
+    const isFoc = focus != null && (ed.src === focus || ed.dst === focus);
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
-    path.setAttribute("stroke", style.color);
-    path.setAttribute("stroke-width", style.width);
-    if (style.dash) path.setAttribute("stroke-dasharray", style.dash);
-    path.setAttribute("marker-end", "url(#" + style.marker + ")");
-    // 残差线置于顶层（框上），其余边在底层（框下）。
-    const layer = kind === "residual" ? svgTop : svg;
+    path.setAttribute("stroke", isFoc ? HILITE.color : style.color);
+    path.setAttribute("stroke-width", isFoc ? HILITE.width : style.width);
+    if (style.dash && !isFoc) path.setAttribute("stroke-dasharray", style.dash);
+    path.setAttribute("marker-end", "url(#" + (isFoc ? "arrow-foc" : style.marker) + ")");
+    if (focus != null && !isFoc) path.setAttribute("opacity", "0.07");
+    // 残差线 / 聚焦边置于顶层（框上），其余边在底层（框下）。
+    let layer = kind === "residual" ? svgTop : svg;
+    if (isFoc) layer = svgTop;
     layer.appendChild(path);
     if (ed.label) {
       const tx = document.createElementNS("http://www.w3.org/2000/svg", "text");
       tx.setAttribute("x", lx);
       tx.setAttribute("y", ly);
-      tx.setAttribute("fill", style.color);
+      tx.setAttribute("fill", isFoc ? HILITE.color : style.color);
       tx.setAttribute("font-size", "10.5");
-      tx.setAttribute("font-weight", kind === "forward" ? "400" : "700");
+      tx.setAttribute("font-weight", (isFoc || kind !== "forward") ? "700" : "400");
       if (it.band === "Lskip") tx.setAttribute("text-anchor", "end");
+      if (focus != null && !isFoc) tx.setAttribute("opacity", "0.07");
       tx.textContent = ed.label;
       layer.appendChild(tx);
     }
@@ -593,6 +668,7 @@ function svgDefs() {
     marker("arrow", EDGE_STYLE.forward.color) +
     marker("arrow-skip", EDGE_STYLE.skip.color) +
     marker("arrow-res", EDGE_STYLE.residual.color) +
+    marker("arrow-foc", HILITE.color) +
     '</defs>';
 }
 
@@ -601,6 +677,8 @@ function buildFlow(flowKey) {
   const flow = el("div", "flow");
   flow.dataset.flow = flowKey;
   const canvas = el("div", "canvas");
+  // 点击画布空白处 → 清除聚焦（节点/标题的 click 均 stopPropagation，不会误触）。
+  canvas.addEventListener("click", clearFocus);
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("class", "edges");
   canvas.appendChild(svg);
@@ -690,6 +768,7 @@ function init() {
   window.addEventListener("load", () => scheduleDraw(true));
 }
 function activate(k) {
+  FOCUS = null;
   document.querySelectorAll(".tab").forEach(t =>
     t.classList.toggle("active", t.dataset.flow === k));
   document.querySelectorAll(".flow").forEach(f =>
@@ -710,7 +789,9 @@ function renderMeta(k) {
 }
 
 window.addEventListener("resize", () => scheduleDraw(true));
-window.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closeDrawer(); clearFocus(); }
+});
 document.addEventListener("DOMContentLoaded", init);
 """
 
@@ -739,6 +820,10 @@ def _legend_html() -> str:
         spans.append(
             f'<span><i class="eline" style="border-top-color:{color};'
             f'border-top-style:{style}"></i>{html.escape(name)}</span>')
+    # 交互提示：单击模块高亮其连接，空白/Esc 还原。
+    spans.append(
+        '<span style="margin-left:auto;color:var(--accent);font-weight:600">'
+        '单击模块：高亮其连接 · 空白处/Esc 还原</span>')
     return '<div class="legend">' + "".join(spans) + "</div>"
 
 
