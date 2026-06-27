@@ -534,6 +534,90 @@ function drawEdges() {
   });
   if (!isFinite(contentL)) { contentL = 0; contentR = canvas.scrollWidth; }
 
+  // —— 聚焦专属布线 —— 聚焦时被点框的连线不再沿用整图全局车道（会绕远、互相挤叠），
+  // 而是就地重算一套**干净**布线：用同一套正交线条/配色，但保证彼此不重叠、不交叉、
+  // 不被遮挡，每条可独立追溯。思路（以被点框为 hub 的星形展开）：
+  //   * forward 且目标与 hub 横向重叠(上/下直邻) → 直竖线，最短、天然不交叠。
+  //   * 其余(如 encoder→decoder 跳连) → 朝目标所在一侧(左/右)扇出：按「上方组/下方组」
+  //     分别处理，每条独占一条外缘竖轨车道、起点沿 hub 侧边错开。排序规则保证正交折线
+  //     互相嵌套不相交：越远的目标用越外圈的车道、且起点越靠近 hub 中心(已数学验证无交叉)。
+  let focusRoutes = null, focusMaxX = -Infinity;
+  if (focus != null) {
+    focusRoutes = {};
+    const fa = visibleAnchor(focus);
+    if (fa) {
+      const frr = fa.getBoundingClientRect();
+      const F = { l: frr.left - cr.left, r: frr.right - cr.left,
+                  t: frr.top - cr.top, b: frr.bottom - cr.top };
+      F.cx = (F.l + F.r) / 2; F.cy = (F.t + F.b) / 2;
+      // 顶层可见框矩形（用于判断「直竖线是否穿过其它框」）。
+      const topBoxes = [];
+      g.nodes.filter(n => !n.parent_id).forEach(n => {
+        const el = visibleAnchor(n.id);
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0) return;
+        topBoxes.push({ el, l: r.left - cr.left, r: r.right - cr.left,
+                        t: r.top - cr.top, b: r.bottom - cr.top });
+      });
+      const vert = [], grp = { L: { up: [], dn: [] }, R: { up: [], dn: [] } };
+      edges.forEach(ed => {
+        if (ed.src !== focus && ed.dst !== focus) return;
+        const other = ed.src === focus ? ed.dst : ed.src;
+        const oa = visibleAnchor(other);
+        if (!oa || oa === fa) return;
+        const orr = oa.getBoundingClientRect();
+        const O = { l: orr.left - cr.left, r: orr.right - cr.left,
+                    t: orr.top - cr.top, b: orr.bottom - cr.top };
+        O.cx = (O.l + O.r) / 2; O.cy = (O.t + O.b) / 2;
+        const s = { key: ed.src + ">" + ed.dst + ">" + (ed.kind || "forward"), O };
+        // 直竖线仅用于「横向重叠 且 中间无其它框阻挡」的直邻框（最短、无交叠）；
+        // 否则（如同列远跨的稠密跳连）走侧缘车道，避免一条竖线穿过一排框。
+        const dn = O.cy >= F.cy;
+        const yTop = dn ? F.b : O.b, yBot = dn ? O.t : F.t;
+        const blocked = topBoxes.some(bx => bx.el !== fa && bx.el !== oa &&
+          bx.l < F.cx && F.cx < bx.r && bx.b > yTop + 1 && bx.t < yBot - 1);
+        if (Math.abs(O.cx - F.cx) < (F.r - F.l) / 2 + 4 && !blocked) vert.push(s);
+        else grp[O.cx > F.cx + 1 ? "R" : "L"][dn ? "dn" : "up"].push(s);
+      });
+      vert.forEach(s => {
+        const x = F.cx;
+        const dn = s.O.cy >= F.cy;
+        const y1 = dn ? F.b : F.t, y2 = dn ? s.O.t : s.O.b;
+        focusRoutes[s.key] = { d: `M ${x} ${y1} L ${x} ${y2}`, lx: x + 6, ly: (y1 + y2) / 2 };
+      });
+      const STEPF = 26, GAPF = 18, PAD = 6;
+      const layout = (arr, side, dir) => {
+        if (!arr.length) return;
+        // nearest-first：i=0 内圈车道 + 起点靠 hub 外端；越远 i 越大→外圈车道 + 起点靠中心。
+        // 竖轨贴住本组目标外缘（base），不绕到整图最右/最左，缩短横向引线。
+        arr.sort((p, q) => Math.abs(p.O.cy - F.cy) - Math.abs(q.O.cy - F.cy));
+        const base = side === "R"
+          ? Math.max(F.r, ...arr.map(s => s.O.r))
+          : Math.min(F.l, ...arr.map(s => s.O.l));
+        const n = arr.length;
+        arr.forEach((s, i) => {
+          const railX = side === "R" ? base + GAPF + i * STEPF
+                                     : Math.max(4, base - GAPF - i * STEPF);
+          focusMaxX = Math.max(focusMaxX, railX);
+          const m = n > 1 ? i / (n - 1) : 0;
+          const span = dir === "dn" ? (F.b - F.cy) : (F.cy - F.t);
+          const ey = dir === "dn" ? F.b - PAD - m * Math.max(0, span - PAD)
+                                  : F.t + PAD + m * Math.max(0, span - PAD);
+          const hubX = side === "R" ? F.r : F.l;
+          const tX = side === "R" ? s.O.r : s.O.l;
+          const ty = s.O.cy;
+          focusRoutes[s.key] = {
+            d: ortho([[hubX, ey], [railX, ey], [railX, ty], [tX, ty]], 8),
+            lx: railX + (side === "R" ? 6 : -6), ly: (ey + ty) / 2,
+          };
+        });
+      };
+      layout(grp.R.dn, "R", "dn"); layout(grp.R.up, "R", "up");
+      layout(grp.L.dn, "L", "dn"); layout(grp.L.up, "L", "up");
+    }
+  }
+
   // 预解析每条边的几何 + 去重 + 归入侧边车道。
   //  band 'Lskip'：顶层 encoder→decoder 跳连（左外缘同心嵌套环，最长跨度最外圈，
   //    主链恒在最左列、左侧恒空，故不会被右侧各 head 遮挡）。
@@ -651,24 +735,27 @@ function drawEdges() {
       }
       lx = (cx1 + cx2) / 2 + 6; ly = my - 2;
     }
-    // —— 聚焦态：统一线条（几何不再改写）——
-    // 两种模式共用上面算好的正交导轨 / 圆角折线几何与 forward(灰)/skip(蓝)/residual(琥珀)
-    // 配色；聚焦只改「强调」不改「形状」：
-    //   * 与被聚焦框直连的边(focusEdge) → 满不透明 + 上浮顶层(svgTop,框之上)：既不被相关
-    //     框遮挡，相关边又各走不同侧缘车道故彼此不重叠（与不相关框/线的重叠则放任）。
-    //   * 两端都落在「明亮框(foc-vis)」内的边(visEdge，如选中/相关框的内部连线) → 维持
-    //     正常透明度与原图层，使可见框的内部连线随框一并完整呈现（与未聚焦时一致）。
-    //   * 其余无关边 → 淡出(opacity .07)。
+    // —— 聚焦态 —— 共用 forward(灰)/skip(蓝)/residual(琥珀) 同一套线条配色：
+    //   * 与被聚焦框直连的边(focusEdge) → 几何换成上面 focusRoutes 算好的**专属干净布线**
+    //     (彼此不重叠/交叉、不被遮挡)，满不透明、上浮顶层(svgTop,框之上)。
+    //   * 框**内部**连线(两端均非顶层、且都在明亮框 foc-vis 内) → 维持原几何与图层，随框
+    //     一并完整呈现（与未聚焦时一致）。
+    //   * 其余边（含相关框之间、不经被点框的顶层连线）→ 聚焦时**整条隐藏**(不绘制)，
+    //     使画面只剩被点框自身的连线、清晰可追溯。
     const isFocusEdge = focus != null && (ed.src === focus || ed.dst === focus);
-    const visEdge = a.classList.contains("foc-vis") && b.classList.contains("foc-vis");
-    const dimEdge = focus != null && !isFocusEdge && !visEdge;
+    const internalEdge = !topIds.has(ed.src) && !topIds.has(ed.dst)
+      && a.classList.contains("foc-vis") && b.classList.contains("foc-vis");
+    if (focus != null && !isFocusEdge && !internalEdge) return;  // 隐藏无关线条
+    if (isFocusEdge && focusRoutes) {
+      const fr = focusRoutes[ed.src + ">" + ed.dst + ">" + kind];
+      if (fr) { d = fr.d; lx = fr.lx; ly = fr.ly; }
+    }
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
     path.setAttribute("stroke", style.color);
     path.setAttribute("stroke-width", style.width);
     if (style.dash) path.setAttribute("stroke-dasharray", style.dash);
     path.setAttribute("marker-end", "url(#" + style.marker + ")");
-    if (dimEdge) path.setAttribute("opacity", "0.07");
     // 残差线 / 聚焦直连边置于顶层（框上），其余边在底层（框下）。
     let layer = kind === "residual" ? svgTop : svg;
     if (isFocusEdge) layer = svgTop;
@@ -680,8 +767,7 @@ function drawEdges() {
       tx.setAttribute("fill", style.color);
       tx.setAttribute("font-size", "10.5");
       tx.setAttribute("font-weight", kind !== "forward" ? "700" : "400");
-      if (it.band === "Lskip") tx.setAttribute("text-anchor", "end");
-      if (dimEdge) tx.setAttribute("opacity", "0.07");
+      if (it.band === "Lskip" && !isFocusEdge) tx.setAttribute("text-anchor", "end");
       tx.textContent = ed.label;
       layer.appendChild(tx);
     }
@@ -690,7 +776,7 @@ function drawEdges() {
   // 会盖过 width 属性；若 canvas 本身不变宽，最右竖轨虽因 overflow:visible 被绘制，
   // 却落在文档可滚动区之外 → 用户「右侧溢出看不到」。故把 canvas 撑到 W,使文档
   // 横向可滚动且 100% 宽的 svg 随之变宽，任何线条都不再被裁切。
-  const W = Math.max(canvas.scrollWidth, maxX + 12), H = canvas.scrollHeight;
+  const W = Math.max(canvas.scrollWidth, maxX + 12, focusMaxX + 12), H = canvas.scrollHeight;
   canvas.style.minWidth = W + "px";
   svg.style.width = W + "px"; svg.setAttribute("width", W); svg.setAttribute("height", H);
   svgTop.style.width = W + "px"; svgTop.setAttribute("width", W); svgTop.setAttribute("height", H);
