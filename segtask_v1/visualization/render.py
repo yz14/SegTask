@@ -586,30 +586,50 @@ function drawEdges() {
         const y1 = dn ? F.b : F.t, y2 = dn ? s.O.t : s.O.b;
         focusRoutes[s.key] = { d: `M ${x} ${y1} L ${x} ${y2}`, lx: x + 6, ly: (y1 + y2) / 2 };
       });
-      const STEPF = 26, GAPF = 18, PAD = 6;
+      const STEPF = 26, GAPF = 18, PAD = 6, CG = 5;
       const layout = (arr, side, dir) => {
         if (!arr.length) return;
-        // nearest-first：i=0 内圈车道 + 起点靠 hub 外端；越远 i 越大→外圈车道 + 起点靠中心。
-        // 竖轨贴住本组目标外缘（base），不绕到整图最右/最左，缩短横向引线。
-        arr.sort((p, q) => Math.abs(p.O.cy - F.cy) - Math.abs(q.O.cy - F.cy));
-        const base = side === "R"
-          ? Math.max(F.r, ...arr.map(s => s.O.r))
-          : Math.min(F.l, ...arr.map(s => s.O.l));
+        const R = side === "R";
+        // 1) 嵌套序：nearest-first（按到 hub 的纵向距离）；同一行(纵距相等)再按列分内外——
+        //    R 侧左框(O.r 小)内圈、右框外圈；L 侧右框(O.l 大)内圈、左框外圈。如此「同行多
+        //    目标」近框竖轨落在两框之间、进框横段短，不横穿外框、不与之重叠。
+        arr.sort((p, q) => {
+          const d = Math.abs(p.O.cy - F.cy) - Math.abs(q.O.cy - F.cy);
+          if (Math.abs(d) > 0.5) return d;
+          return R ? (p.O.r - q.O.r) : (q.O.l - p.O.l);
+        });
+        // 2) 竖轨：以**本框与 hub 外缘的更外者**(max(O.r,F.r)+GAP / min(O.l,F.l)-GAP)为底——
+        //    既清出本框、也清出 hub 框（hub 较宽且目标落在其投影内时，必须绕过 hub 自身，
+        //    否则出线横段会穿过 hub 框造成遮挡）。再沿嵌套序**强制单调外扩**且相邻至少 STEPF：
+        //    竖轨顺序与嵌套序一致(内圈必在内)，这是正交折线层层嵌套、互不相交/重叠/遮挡的充要前提。
+        let prev = null;
+        arr.forEach((s, i) => {
+          let r = R ? Math.max(s.O.r, F.r) + GAPF : Math.min(s.O.l, F.l) - GAPF;
+          if (prev !== null) r = R ? Math.max(r, prev + STEPF) : Math.min(r, prev - STEPF);
+          // 同一行紧邻外侧框（间隙 < GAPF 时竖轨会扎进外框）：把竖轨夹到两框间隙中点。
+          const nx = arr[i + 1];
+          if (nx && Math.abs(nx.O.cy - s.O.cy) <= 0.5) {
+            r = R ? Math.min(r, (s.O.r + nx.O.l) / 2) : Math.max(r, (s.O.l + nx.O.r) / 2);
+          }
+          if (!R) r = Math.max(4, r);
+          s._rail = r; prev = r;
+        });
+        // 3) 起点(hub 侧出线点)沿嵌套序由内到外：最内(贴 hub)落在 hub 边**远端**(上行→顶 /
+        //    下行→底)，最外收向中心(留 CG，上/下两组永不在中心同 y 相撞)。外圈折线整体包住内圈。
         const n = arr.length;
         arr.forEach((s, i) => {
-          const railX = side === "R" ? base + GAPF + i * STEPF
-                                     : Math.max(4, base - GAPF - i * STEPF);
-          focusMaxX = Math.max(focusMaxX, railX);
           const m = n > 1 ? i / (n - 1) : 0;
-          const span = dir === "dn" ? (F.b - F.cy) : (F.cy - F.t);
-          const ey = dir === "dn" ? F.b - PAD - m * Math.max(0, span - PAD)
-                                  : F.t + PAD + m * Math.max(0, span - PAD);
-          const hubX = side === "R" ? F.r : F.l;
-          const tX = side === "R" ? s.O.r : s.O.l;
+          const far = dir === "dn" ? F.b - PAD : F.t + PAD;
+          const near = dir === "dn" ? F.cy + CG : F.cy - CG;
+          const ey = far + m * (near - far);
+          const railX = s._rail;
+          focusMaxX = Math.max(focusMaxX, railX);
+          const hubX = R ? F.r : F.l;
+          const tX = R ? s.O.r : s.O.l;
           const ty = s.O.cy;
           focusRoutes[s.key] = {
             d: ortho([[hubX, ey], [railX, ey], [railX, ty], [tX, ty]], 8),
-            lx: railX + (side === "R" ? 6 : -6), ly: (ey + ty) / 2,
+            lx: railX + (R ? 6 : -6), ly: (ey + ty) / 2,
           };
         });
       };
