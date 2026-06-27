@@ -257,7 +257,7 @@ function buildStage(node, childrenOf) {
     ev.stopPropagation();
     body.classList.toggle("collapsed");
     head.classList.toggle("collapsed");
-    requestAnimationFrame(drawEdges);
+    scheduleDraw(true);
   });
   return box;
 }
@@ -467,14 +467,22 @@ function drawEdges() {
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     let d, lx, ly;
     if (it.band === "Lskip") {
-      // encoder→decoder 跳连：从两框**左**缘引出，绕到内容左外缘的同心车道再折回，
-      // 跨度最大者最外圈，平滑嵌套不交叉，全程在框左侧之外（左内边距已预留空间）。
-      const x1 = ra.left - cr.left, x2 = rb.left - cr.left;
-      const y1 = ra.top + ra.height / 2 - cr.top;
-      const y2 = rb.top + rb.height / 2 - cr.top;
-      const sx = Math.max(4, contentL - GAP - it.lane * STEP);
-      d = `M ${x1} ${y1} C ${sx} ${y1}, ${sx} ${y2}, ${x2} ${y2}`;
-      lx = sx - 4; ly = (y1 + y2) / 2;
+      // encoder→decoder 跳连（左缘）：与右缘 Rskip 完全对称的正交路由。
+      // 旧实现用「框左缘→框左缘、走框竖向中心高度」的贝塞尔：当汇点解码框不在最左列
+      // （unetpp/unet3p 的二维点阵），其左缘落在画布中部，曲线便从最左外缘斜扫回中部，
+      // **横穿沿途所有 encoder 框**（RC1 的真正成因）。改为：从两框**左**缘引出后，
+      // 立刻拐入框上/下的**行间空隙**（贯穿所有列的干净横带）做水平段，再到左外缘竖轨，
+      // 与框左缘的短竖接驳走「列间空隙」（框左 -0~6）。全程不进任何框内部 → 零遮挡。
+      const sxL = ra.left - cr.left, dxL = rb.left - cr.left;
+      const sy = ra.top + ra.height / 2 - cr.top;
+      const dy = rb.top + rb.height / 2 - cr.top;
+      const railX = Math.max(4, contentL - GAP - it.lane * STEP);
+      const down = sy < dy;
+      const yExit = down ? (ra.bottom - cr.top + 11) : (ra.top - cr.top - 11);
+      const yEnt  = down ? (rb.top - cr.top - 11) : (rb.bottom - cr.top + 11);
+      d = `M ${sxL} ${sy} L ${sxL} ${yExit} L ${railX} ${yExit} `
+        + `L ${railX} ${yEnt} L ${dxL - 6} ${yEnt} L ${dxL - 6} ${dy} L ${dxL} ${dy}`;
+      lx = railX - 4; ly = (yExit + yEnt) / 2;
     } else if (it.band === "Rskip") {
       // 分到右缘的跳连：从两框**右**缘引出 → 正交走到右外缘竖轨 → 折回进框右缘。
       // 关键：水平段一律落在源/汇框的**行间空隙**（框底+11 / 框顶-11），该空隙横贯所有列、
@@ -495,8 +503,11 @@ function drawEdges() {
       // deep-supervision 头 → loss：正交走线（贴最右竖轨）。ds 头在右侧列，loss 居中
       // 偏下，直下会穿过 seg/aux 头行；故改为：右行到最右竖轨 → 竖直下行 → 在各头行
       // **下方**水平进入 loss 右缘，彻底避开各框。
-      const x1 = ra.right - cr.left;
-      const y1 = ra.top + ra.height / 2 - cr.top;
+      // 旧实现的首段水平线走在**头框中心高度**（y1），会横穿该行右侧的解码框
+      // （unetpp 最右列 Decoder/Upsample），与旧 Lskip 同类缺陷。改为从头框**下缘**
+      // 引出、立即落入下方**行间空隙**再水平到最右竖轨 → 全程不切任何框。
+      const xc = ra.left + ra.width / 2 - cr.left;
+      const yg = ra.bottom - cr.top + 11;
       const x2 = rb.right - cr.left;
       const lossTop = rb.top - cr.top, lossH = rb.height;
       // Rloss 竖轨排在右缘跳连车道之外，避免两束共用同一 x 互相重叠。
@@ -504,10 +515,9 @@ function drawEdges() {
       maxX = Math.max(maxX, railX);
       const spread = Math.min(8, (lossH - 8) / Math.max(1, it.laneN));
       const ey = lossTop + lossH / 2 + (it.lane - (it.laneN - 1) / 2) * spread;
-      const r = Math.min(7, Math.max(0, (ey - y1) / 2 - 1));
-      d = `M ${x1} ${y1} L ${railX - r} ${y1} Q ${railX} ${y1} ${railX} ${y1 + r} `
-        + `L ${railX} ${ey - r} Q ${railX} ${ey} ${railX - r} ${ey} L ${x2} ${ey}`;
-      lx = railX + 4; ly = (y1 + ey) / 2;
+      d = `M ${xc} ${ra.bottom - cr.top} L ${xc} ${yg} L ${railX} ${yg} `
+        + `L ${railX} ${ey} L ${x2} ${ey}`;
+      lx = railX + 4; ly = (yg + ey) / 2;
     } else if (kind === "residual") {
       // 残差捷径（block 内 shortcut → act2）：从 shortcut 底缘引出，沿子框列左侧的空白栏
       // 竖直下行，再水平进入目标左缘。竖轨落在「block 左边框」与「子框列」之间的空隙里
@@ -531,9 +541,16 @@ function drawEdges() {
       d = `M ${cx1} ${ya} C ${sx} ${ya}, ${sx} ${yb}, ${cx2} ${yb}`;
       lx = sx + 4; ly = (ya + yb) / 2;
     } else {
-      // 前向相邻：竖向贝塞尔。
+      // 前向边：同列直下走竖向贝塞尔；**跨列相邻**（unetpp 解码点阵相邻列之间）改走
+      // 行间空隙的正交折线——下探入两框间的 row-gap、在该干净横带内水平移到目标列、
+      // 再竖直进框，避免旧实现的斜向贝塞尔切过相邻解码框的边角。长跨前向（少见）
+      // 仍退回贝塞尔。
       const my = (yb1 + yt2) / 2;
-      d = `M ${cx1} ${yb1} C ${cx1} ${my}, ${cx2} ${my}, ${cx2} ${yt2}`;
+      if (Math.abs(cx2 - cx1) >= 8 && (yt2 - yb1) < 120 && yt2 > yb1) {
+        d = `M ${cx1} ${yb1} L ${cx1} ${my} L ${cx2} ${my} L ${cx2} ${yt2}`;
+      } else {
+        d = `M ${cx1} ${yb1} C ${cx1} ${my}, ${cx2} ${my}, ${cx2} ${yt2}`;
+      }
       lx = (cx1 + cx2) / 2 + 6; ly = my - 2;
     }
     path.setAttribute("d", d);
@@ -557,10 +574,14 @@ function drawEdges() {
       layer.appendChild(tx);
     }
   });
-  // size both layers to canvas（含外缘车道）
+  // size both layers to canvas（含外缘车道）。注意 svg.edges 的 CSS 是 width:100%,
+  // 会盖过 width 属性；若 canvas 本身不变宽，最右竖轨虽因 overflow:visible 被绘制，
+  // 却落在文档可滚动区之外 → 用户「右侧溢出看不到」。故把 canvas 撑到 W,使文档
+  // 横向可滚动且 100% 宽的 svg 随之变宽，任何线条都不再被裁切。
   const W = Math.max(canvas.scrollWidth, maxX + 12), H = canvas.scrollHeight;
-  svg.setAttribute("width", W); svg.setAttribute("height", H);
-  svgTop.setAttribute("width", W); svgTop.setAttribute("height", H);
+  canvas.style.minWidth = W + "px";
+  svg.style.width = W + "px"; svg.setAttribute("width", W); svg.setAttribute("height", H);
+  svgTop.style.width = W + "px"; svgTop.setAttribute("width", W); svgTop.setAttribute("height", H);
 }
 function marker(id, color) {
   return '<marker id="' + id + '" viewBox="0 0 10 10" refX="9" refY="5" ' +
@@ -609,6 +630,40 @@ function buildFlow(flowKey) {
   return flow;
 }
 
+// —— 布局稳定后再绘边（修复「陈旧几何」类缺陷）——
+// drawEdges 依据各框的实测包围盒计算外缘竖轨/行间空隙的位置。若在 DOM 布局尚未
+// 定型时（大网格首帧未回流完、Web 字体异步换字导致框宽变化等）就绘制，竖轨会贴着
+// **偏小的内容边界**落点；随后布局沉降、框右移，竖轨/横段便压到框上 → 出现「时序性」
+// 遮挡与「右侧溢出被裁」。解决：用 rAF 轮询「布局指纹」（各框 left/top/right 取整拼接），
+// 指纹变化就重绘、直到连续两帧一致为止（≤8 次，含我们自己改 padding/minWidth 引起的一次
+// 位移，故必然收敛、不会死循环）；并在 fonts.ready / window load / ResizeObserver(列容器)
+// 等「迟到的回流」事件上重新触发。指纹一致即跳过，故对任意 decoder_type 幂等、无抖动。
+let _lastDrawSig = null;
+let _settleRAF = 0;
+let _settleTries = 0;
+function layoutSig(flow) {
+  let s = "";
+  flow.querySelectorAll(".node,.stage").forEach(e => {
+    const r = e.getBoundingClientRect();
+    if (r.width) s += Math.round(r.left) + "," + Math.round(r.top)
+      + "," + Math.round(r.right) + ";";
+  });
+  return s;
+}
+function scheduleDraw(reset) {
+  if (reset) { _lastDrawSig = null; _settleTries = 0; }
+  cancelAnimationFrame(_settleRAF);
+  _settleRAF = requestAnimationFrame(() => {
+    const flow = document.querySelector(".flow.active");
+    if (!flow) return;
+    const sig = layoutSig(flow);
+    if (sig !== _lastDrawSig) {
+      _lastDrawSig = sig;
+      drawEdges();
+      if (_settleTries++ < 8) scheduleDraw(false);
+    }
+  });
+}
 function init() {
   const order = DATA.order.filter(k => DATA.flows[k]);
   const tabsEl = document.getElementById("tabs");
@@ -623,7 +678,16 @@ function init() {
     wrap.appendChild(flow);
   });
   renderMeta(order[0]);
-  requestAnimationFrame(drawEdges);
+  scheduleDraw(true);
+  // 列容器尺寸一旦因迟到的回流/字体换字而变化即重排边（指纹守卫防抖、防死循环）。
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => scheduleDraw(true));
+    document.querySelectorAll(".flow .col").forEach(c => ro.observe(c));
+  }
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => scheduleDraw(true));
+  }
+  window.addEventListener("load", () => scheduleDraw(true));
 }
 function activate(k) {
   document.querySelectorAll(".tab").forEach(t =>
@@ -631,7 +695,7 @@ function activate(k) {
   document.querySelectorAll(".flow").forEach(f =>
     f.classList.toggle("active", f.dataset.flow === k));
   renderMeta(k);
-  requestAnimationFrame(drawEdges);
+  scheduleDraw(true);
 }
 function renderMeta(k) {
   const m = (DATA.flows[k] && DATA.flows[k].meta) || {};
@@ -645,7 +709,7 @@ function renderMeta(k) {
   });
 }
 
-window.addEventListener("resize", () => requestAnimationFrame(drawEdges));
+window.addEventListener("resize", () => scheduleDraw(true));
 window.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
 document.addEventListener("DOMContentLoaded", init);
 """

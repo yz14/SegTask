@@ -1197,17 +1197,34 @@ def _assign_ranks_and_skip(
             if e.src in idset and e.dst in idset:
                 succ[e.src].append(e.dst)
                 indeg[e.dst] += 1
-        # Kahn 最长路径。
+        # Kahn 最长路径；图中存在环（如 hierarchical 融合的反馈边）时，
+        # 朴素 Kahn 会让环内节点永远到不了 indeg 0、全卡在 rank 0（横向铺开、
+        # forward 边横穿同排框）。这里在队列耗尽但仍有未处理节点时贪心断环：
+        # 选环内「已被环外前驱定到最高 rank」的入口节点强制入队（其回边自然
+        # 退化为反向边/skip），从而恢复纵向分层。结果对节点序确定、幂等。
         rank = {i: 0 for i in ids}
-        queue = [i for i in ids if indeg[i] == 0]
-        while queue:
-            cur = queue.pop()
-            for nx in succ[cur]:
-                if rank[cur] + 1 > rank[nx]:
-                    rank[nx] = rank[cur] + 1
-                indeg[nx] -= 1
-                if indeg[nx] == 0:
-                    queue.append(nx)
+        indeg2 = dict(indeg)
+        queue = [i for i in ids if indeg2[i] == 0]
+        done: set = set()
+        remaining = set(ids)
+        order = {i: k for k, i in enumerate(ids)}
+        while remaining:
+            while queue:
+                cur = queue.pop()
+                if cur in done:
+                    continue
+                done.add(cur)
+                remaining.discard(cur)
+                for nx in succ[cur]:
+                    if rank[cur] + 1 > rank[nx]:
+                        rank[nx] = rank[cur] + 1
+                    indeg2[nx] -= 1
+                    if indeg2[nx] <= 0 and nx not in done:
+                        queue.append(nx)
+            if remaining:
+                nxt = max(remaining, key=lambda i: (rank[i], -order[i]))
+                indeg2[nxt] = 0
+                queue.append(nxt)
         node_rank.update(rank)
 
     # 顶层 head 分层：
@@ -1229,14 +1246,16 @@ def _assign_ranks_and_skip(
     for n in g.nodes:
         n.rank = rankmap[n.id]
 
-    # 跨级 down 边（dst.rank - src.rank > 1）标为 skip（同一父容器内）。
+    # 跨级边（|dst.rank - src.rank| > 1）标为 skip（同一父容器内）。
+    # 含**上行反馈边**（如 hierarchical 融合 aux_fuse→stages.*，dst.rank<src.rank）：
+    # 二者都会跨越中间若干行、若直连必横穿沿途框，统一交由外缘竖轨正交路由绕开。
     parent_of = {n.id: n.parent_id for n in g.nodes}
     for e in g.edges:
         if e.kind != "forward":
             continue
         if parent_of.get(e.src) != parent_of.get(e.dst):
             continue
-        if rankmap.get(e.dst, 0) - rankmap.get(e.src, 0) > 1:
+        if abs(rankmap.get(e.dst, 0) - rankmap.get(e.src, 0)) > 1:
             e.kind = "skip"
 
 
