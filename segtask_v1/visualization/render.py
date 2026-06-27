@@ -114,9 +114,12 @@ svg.edges-top { z-index: 3; }
 .node:hover .hint { opacity: .7; }
 
 /* —— 聚焦高亮（单击模块）：仅被点模块+直接邻居+相连边醒目，其余淡出 —— */
+/* foc-vis 标记「保持明亮」的框（被聚焦框/相关框本身 + 其全部后代 + 其祖先 stage）：
+   淡化规则只作用于**不带 foc-vis** 的框,故选中框与相关框的内部子模块都完整可见,
+   不再因祖先框被整体淡化而连带变淡。 */
 .node, .stage { transition: opacity .15s, box-shadow .15s; }
-.canvas.focusing .node:not(.foc-on):not(.foc-nb),
-.canvas.focusing .stage:not(.foc-on):not(.foc-nb):not(.foc-keep) {
+.canvas.focusing .node:not(.foc-vis),
+.canvas.focusing .stage:not(.foc-vis) {
   opacity: .12; filter: saturate(.5); }
 .node.foc-on, .stage.foc-on {
   opacity: 1; border-color: var(--accent);
@@ -220,8 +223,6 @@ const EDGE_STYLE = {
   skip:     { color: "#2563eb", width: "1.8", dash: null,  marker: "arrow-skip" },
   residual: { color: "#d97706", width: "1.8", dash: "3 3", marker: "arrow-res" },
 };
-// 聚焦高亮色：单击模块后,其直接相连边以此醒目色绘于顶层（框之上，永不被任何框遮挡）。
-const HILITE = { color: "#db2777", width: "2.6" };
 
 function el(tag, cls, txt) {
   const e = document.createElement(tag);
@@ -334,8 +335,10 @@ function render(node, childrenOf) {
 let CUR = null;
 // —— 聚焦高亮交互：单击模块=高亮其直接连接，双击=打开详情抽屉 ——
 // 通用、数据驱动（基于 IR 邻接）：对 configs 下任意 yaml / 任意模型参数都成立。
-// 思路：密集解码器（unetpp/unet3p）的连通图本质不可平面化，静态布局必有残留交叉；
-// 聚焦后只高亮被点模块的少数直连边并绘于框之上，故这些线既不被遮挡、也几乎不互相交叉。
+// 思路：密集解码器（unetpp/unet3p）的连通图本质不可平面化，整图布局必有残留交叠；
+// 聚焦不另起一套线条——沿用整图同一套正交导轨/折线几何与配色，只把被点模块的少数直连边
+// 上浮到顶层(框之上、不被遮挡)并满不透明、其余无关边淡出。这些直连边本就分到不同侧缘车道，
+// 故聚焦视图里它们彼此不重叠、也不被相关框遮挡；与不相关框/线的重叠则放任（已淡出，无碍）。
 let FOCUS = null;
 let _clickTimer = null;
 function toggleFocus(id) { FOCUS = (FOCUS === id) ? null : id; drawEdges(); }
@@ -417,16 +420,6 @@ function ortho(pts, r) {
   d += " L " + last[0] + " " + last[1];
   return d;
 }
-// 框边界交点：从框中心朝 (tx,ty) 射出，返回与框边的交点（画布坐标）。聚焦直线用。
-function borderPt(r, cr, tx, ty) {
-  const cx = r.left + r.width / 2 - cr.left, cy = r.top + r.height / 2 - cr.top;
-  const dx = tx - cx, dy = ty - cy;
-  if (!dx && !dy) return [cx, cy];
-  const sx = dx ? (r.width / 2) / Math.abs(dx) : Infinity;
-  const sy = dy ? (r.height / 2) / Math.abs(dy) : Infinity;
-  const s = Math.min(sx, sy);
-  return [cx + dx * s, cy + dy * s];
-}
 function drawEdges() {
   const flow = document.querySelector(".flow.active");
   if (!flow) return;
@@ -444,7 +437,7 @@ function drawEdges() {
 
   // —— 聚焦高亮：单击模块后,仅其本身+直接邻居+相连边醒目,其余淡出 ——
   // focusSet = 被点节点 ∪ 其所有直接前驱/后继；据此给框打 foc-on/foc-nb 类、
-  // 给相连边换醒目色并改绘到顶层(svgTop,框之上)→ 被点模块的连接清晰且永不被遮挡。
+  // 把相连边(几何不变)改绘到顶层(svgTop,框之上)并满不透明 → 被点模块的连接清晰且永不被遮挡。
   const focus = FOCUS;
   const focusSet = new Set();
   if (focus != null) {
@@ -455,18 +448,21 @@ function drawEdges() {
     });
   }
   flow.querySelectorAll(".node,.stage").forEach(e =>
-    e.classList.remove("foc-on", "foc-nb", "foc-keep"));
+    e.classList.remove("foc-on", "foc-nb", "foc-vis"));
   if (focus != null) {
     canvas.classList.add("focusing");
-    // 把 id 解析到可见 DOM(折叠 stage 上卷),打高亮类;并给其祖先 stage 打 foc-keep,
-    // 避免「聚焦的子框因祖先 stage 被整体淡化而连带变淡」。
+    // 把 id 解析到可见 DOM(折叠 stage 上卷),打高亮类(foc-on/foc-nb)。foc-vis 标记
+    // 「保持明亮」的框：被聚焦框/相关框**本身 + 其全部后代 + 其祖先 stage**都打 foc-vis,
+    // 故选中框与相关框的内部子模块都完整可见(不再被祖先框的整体淡化连累),祖先框也不淡。
     const markFoc = (id, cls) => {
       const e = visibleAnchor(id);
       if (!e) return;
       if (!e.classList.contains("foc-on")) e.classList.add(cls);
+      e.classList.add("foc-vis");
+      e.querySelectorAll(".node,.stage").forEach(d => d.classList.add("foc-vis"));
       let p = e.parentElement;
       while (p) {
-        if (p.classList && p.classList.contains("stage")) p.classList.add("foc-keep");
+        if (p.classList && p.classList.contains("stage")) p.classList.add("foc-vis");
         p = p.parentElement;
       }
     };
@@ -564,7 +560,7 @@ function drawEdges() {
         if (r) { band = r.band; lane = r.lane; laneN = r.laneN; }
       }
     }
-    items.push({ ed, ra, rb, cx1, yb1, cx2, yt2, kind, band, lane, laneN });
+    items.push({ ed, a, b, ra, rb, cx1, yb1, cx2, yt2, kind, band, lane, laneN });
   });
 
   // Rloss 束车道：同侧按纵向跨度升序（旧逻辑）；跳连车道已在 skipRoute 内按侧定好。
@@ -576,15 +572,15 @@ function drawEdges() {
   let maxX = contentR;
 
   items.forEach(it => {
-    const { ed, ra, rb, cx1, yb1, cx2, yt2, kind } = it;
+    const { ed, a, b, ra, rb, cx1, yb1, cx2, yt2, kind } = it;
     const style = EDGE_STYLE[kind] || EDGE_STYLE.forward;
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     let d, lx, ly;
     if (it.band === "Lskip") {
       // encoder→decoder 跳连（左缘）：从源框左缘水平直接引出，到左外缘竖轨竖直，再直接
       // 进汇框左缘——去掉旧版「先入行间空隙再水平」的额外小拐角，更顺眼（圆角拐弯）。
-      // 未聚焦的整图允许该边与框/其它边交叠；聚焦时这些边会改走顶层「框心→框心」直线
-      // （星形发散、互不交叉/重叠、不被遮挡），故默认视图的交叠不影响看清单个模块。
+      // 整图允许该边与框/其它边交叠；聚焦时几何不变，只是与被聚焦框直连的边会上浮到顶层
+      // （框之上、不被遮挡）并满不透明，其余无关边淡出，故聚焦视图里相关线条清晰不被遮。
       const sxL = ra.left - cr.left, dxL = rb.left - cr.left;
       const sy = ra.top + ra.height / 2 - cr.top;
       const dy = rb.top + rb.height / 2 - cr.top;
@@ -593,7 +589,7 @@ function drawEdges() {
       lx = railX - 4; ly = (sy + dy) / 2;
     } else if (it.band === "Rskip") {
       // 分到右缘的跳连：从源框右缘水平直接引出 → 右外缘竖轨 → 竖直 → 直接进汇框右缘
-      // （圆角拐弯）。同 Lskip：默认视图允许交叠，聚焦时改走顶层直线保证清晰。
+      // （圆角拐弯）。同 Lskip：整图允许交叠，聚焦时几何不变、直连边上浮顶层保证清晰。
       const sxR = ra.right - cr.left, dxR = rb.right - cr.left;
       const sy = ra.top + ra.height / 2 - cr.top;
       const dy = rb.top + rb.height / 2 - cr.top;
@@ -655,37 +651,37 @@ function drawEdges() {
       }
       lx = (cx1 + cx2) / 2 + 6; ly = my - 2;
     }
-    // 聚焦态：被点模块的直连边改走「框心→框心」的顶层直线——星形发散，彼此不交叉、不重叠，
-    // 且绘于所有框之上→不被遮挡；其余边淡出。未聚焦时各边按上面的正交圆角路由（允许交叠）。
-    const isFoc = focus != null && (ed.src === focus || ed.dst === focus);
-    if (isFoc) {
-      const acx = ra.left + ra.width / 2 - cr.left, acy = ra.top + ra.height / 2 - cr.top;
-      const bcx = rb.left + rb.width / 2 - cr.left, bcy = rb.top + rb.height / 2 - cr.top;
-      const p1 = borderPt(ra, cr, bcx, bcy);
-      const p2 = borderPt(rb, cr, acx, acy);
-      d = "M " + p1[0] + " " + p1[1] + " L " + p2[0] + " " + p2[1];
-      lx = (p1[0] + p2[0]) / 2; ly = (p1[1] + p2[1]) / 2 - 4;
-    }
+    // —— 聚焦态：统一线条（几何不再改写）——
+    // 两种模式共用上面算好的正交导轨 / 圆角折线几何与 forward(灰)/skip(蓝)/residual(琥珀)
+    // 配色；聚焦只改「强调」不改「形状」：
+    //   * 与被聚焦框直连的边(focusEdge) → 满不透明 + 上浮顶层(svgTop,框之上)：既不被相关
+    //     框遮挡，相关边又各走不同侧缘车道故彼此不重叠（与不相关框/线的重叠则放任）。
+    //   * 两端都落在「明亮框(foc-vis)」内的边(visEdge，如选中/相关框的内部连线) → 维持
+    //     正常透明度与原图层，使可见框的内部连线随框一并完整呈现（与未聚焦时一致）。
+    //   * 其余无关边 → 淡出(opacity .07)。
+    const isFocusEdge = focus != null && (ed.src === focus || ed.dst === focus);
+    const visEdge = a.classList.contains("foc-vis") && b.classList.contains("foc-vis");
+    const dimEdge = focus != null && !isFocusEdge && !visEdge;
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
-    path.setAttribute("stroke", isFoc ? HILITE.color : style.color);
-    path.setAttribute("stroke-width", isFoc ? HILITE.width : style.width);
-    if (style.dash && !isFoc) path.setAttribute("stroke-dasharray", style.dash);
-    path.setAttribute("marker-end", "url(#" + (isFoc ? "arrow-foc" : style.marker) + ")");
-    if (focus != null && !isFoc) path.setAttribute("opacity", "0.07");
-    // 残差线 / 聚焦边置于顶层（框上），其余边在底层（框下）。
+    path.setAttribute("stroke", style.color);
+    path.setAttribute("stroke-width", style.width);
+    if (style.dash) path.setAttribute("stroke-dasharray", style.dash);
+    path.setAttribute("marker-end", "url(#" + style.marker + ")");
+    if (dimEdge) path.setAttribute("opacity", "0.07");
+    // 残差线 / 聚焦直连边置于顶层（框上），其余边在底层（框下）。
     let layer = kind === "residual" ? svgTop : svg;
-    if (isFoc) layer = svgTop;
+    if (isFocusEdge) layer = svgTop;
     layer.appendChild(path);
     if (ed.label) {
       const tx = document.createElementNS("http://www.w3.org/2000/svg", "text");
       tx.setAttribute("x", lx);
       tx.setAttribute("y", ly);
-      tx.setAttribute("fill", isFoc ? HILITE.color : style.color);
+      tx.setAttribute("fill", style.color);
       tx.setAttribute("font-size", "10.5");
-      tx.setAttribute("font-weight", (isFoc || kind !== "forward") ? "700" : "400");
+      tx.setAttribute("font-weight", kind !== "forward" ? "700" : "400");
       if (it.band === "Lskip") tx.setAttribute("text-anchor", "end");
-      if (focus != null && !isFoc) tx.setAttribute("opacity", "0.07");
+      if (dimEdge) tx.setAttribute("opacity", "0.07");
       tx.textContent = ed.label;
       layer.appendChild(tx);
     }
@@ -709,7 +705,6 @@ function svgDefs() {
     marker("arrow", EDGE_STYLE.forward.color) +
     marker("arrow-skip", EDGE_STYLE.skip.color) +
     marker("arrow-res", EDGE_STYLE.residual.color) +
-    marker("arrow-foc", HILITE.color) +
     '</defs>';
 }
 
