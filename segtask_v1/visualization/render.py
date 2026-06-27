@@ -249,9 +249,18 @@ function buildLeaf(node) {
     });
     card.appendChild(kv);
   }
-  card.appendChild(el("div", "hint", "\u5355\u51FB\u9AD8\u4EAE \u00B7 \u53CC\u51FB\u8BE6\u60C5"));
-  card.addEventListener("click", (ev) => focusClick(node, ev));
-  card.addEventListener("dblclick", (ev) => focusDbl(node, ev));
+  const topLevel = !node.parent_id;
+  card.appendChild(el("div", "hint",
+    topLevel ? "\u5355\u51FB\u9AD8\u4EAE \u00B7 \u53CC\u51FB\u8BE6\u60C5"
+             : "\u53CC\u51FB\u8BE6\u60C5"));
+  if (topLevel) {
+    card.addEventListener("click", (ev) => focusClick(node, ev));
+    card.addEventListener("dblclick", (ev) => focusDbl(node, ev));
+  } else {
+    // 框内子模块不参与聚焦：单击不做任何事（避免干扰展开查看内部结构），仅双击看详情。
+    card.addEventListener("click", (ev) => ev.stopPropagation());
+    card.addEventListener("dblclick", (ev) => { ev.stopPropagation(); openDrawer(node); });
+  }
   return card;
 }
 
@@ -277,8 +286,14 @@ function buildStage(node, childrenOf) {
     head.classList.toggle("collapsed");
     scheduleDraw(true);
   });
-  head.addEventListener("click", (ev) => focusClick(node, ev));
-  head.addEventListener("dblclick", (ev) => focusDbl(node, ev));
+  if (!node.parent_id) {
+    head.addEventListener("click", (ev) => focusClick(node, ev));
+    head.addEventListener("dblclick", (ev) => focusDbl(node, ev));
+  } else {
+    // 嵌套子 stage 不参与聚焦：单击不做任何事，仅双击看详情。
+    head.addEventListener("click", (ev) => ev.stopPropagation());
+    head.addEventListener("dblclick", (ev) => { ev.stopPropagation(); openDrawer(node); });
+  }
   return box;
 }
 
@@ -383,6 +398,35 @@ function visibleAnchor(nodeId) {
   return e;
 }
 
+// 正交折线 + 圆角：给定折点序列，输出带圆角拐弯的 path（让默认整图的连线更顺眼）。
+function ortho(pts, r) {
+  r = (r == null) ? 7 : r;
+  if (pts.length < 2) return "";
+  let d = "M " + pts[0][0] + " " + pts[0][1];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1], p1 = pts[i], p2 = pts[i + 1];
+    const d1 = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) || 1;
+    const d2 = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) || 1;
+    const rr = Math.min(r, d1 / 2, d2 / 2);
+    const u1x = (p1[0] - p0[0]) / d1, u1y = (p1[1] - p0[1]) / d1;
+    const u2x = (p2[0] - p1[0]) / d2, u2y = (p2[1] - p1[1]) / d2;
+    d += " L " + (p1[0] - u1x * rr) + " " + (p1[1] - u1y * rr)
+       + " Q " + p1[0] + " " + p1[1] + " " + (p1[0] + u2x * rr) + " " + (p1[1] + u2y * rr);
+  }
+  const last = pts[pts.length - 1];
+  d += " L " + last[0] + " " + last[1];
+  return d;
+}
+// 框边界交点：从框中心朝 (tx,ty) 射出，返回与框边的交点（画布坐标）。聚焦直线用。
+function borderPt(r, cr, tx, ty) {
+  const cx = r.left + r.width / 2 - cr.left, cy = r.top + r.height / 2 - cr.top;
+  const dx = tx - cx, dy = ty - cy;
+  if (!dx && !dy) return [cx, cy];
+  const sx = dx ? (r.width / 2) / Math.abs(dx) : Infinity;
+  const sy = dy ? (r.height / 2) / Math.abs(dy) : Infinity;
+  const s = Math.min(sx, sy);
+  return [cx + dx * s, cy + dy * s];
+}
 function drawEdges() {
   const flow = document.querySelector(".flow.active");
   if (!flow) return;
@@ -537,38 +581,26 @@ function drawEdges() {
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     let d, lx, ly;
     if (it.band === "Lskip") {
-      // encoder→decoder 跳连（左缘）：与右缘 Rskip 完全对称的正交路由。
-      // 旧实现用「框左缘→框左缘、走框竖向中心高度」的贝塞尔：当汇点解码框不在最左列
-      // （unetpp/unet3p 的二维点阵），其左缘落在画布中部，曲线便从最左外缘斜扫回中部，
-      // **横穿沿途所有 encoder 框**（RC1 的真正成因）。改为：从两框**左**缘引出后，
-      // 立刻拐入框上/下的**行间空隙**（贯穿所有列的干净横带）做水平段，再到左外缘竖轨，
-      // 与框左缘的短竖接驳走「列间空隙」（框左 -0~6）。全程不进任何框内部 → 零遮挡。
+      // encoder→decoder 跳连（左缘）：从源框左缘水平直接引出，到左外缘竖轨竖直，再直接
+      // 进汇框左缘——去掉旧版「先入行间空隙再水平」的额外小拐角，更顺眼（圆角拐弯）。
+      // 未聚焦的整图允许该边与框/其它边交叠；聚焦时这些边会改走顶层「框心→框心」直线
+      // （星形发散、互不交叉/重叠、不被遮挡），故默认视图的交叠不影响看清单个模块。
       const sxL = ra.left - cr.left, dxL = rb.left - cr.left;
       const sy = ra.top + ra.height / 2 - cr.top;
       const dy = rb.top + rb.height / 2 - cr.top;
       const railX = Math.max(4, contentL - GAP - it.lane * STEP);
-      const down = sy < dy;
-      const yExit = down ? (ra.bottom - cr.top + 11) : (ra.top - cr.top - 11);
-      const yEnt  = down ? (rb.top - cr.top - 11) : (rb.bottom - cr.top + 11);
-      d = `M ${sxL} ${sy} L ${sxL} ${yExit} L ${railX} ${yExit} `
-        + `L ${railX} ${yEnt} L ${dxL - 6} ${yEnt} L ${dxL - 6} ${dy} L ${dxL} ${dy}`;
-      lx = railX - 4; ly = (yExit + yEnt) / 2;
+      d = ortho([[sxL, sy], [railX, sy], [railX, dy], [dxL, dy]], 8);
+      lx = railX - 4; ly = (sy + dy) / 2;
     } else if (it.band === "Rskip") {
-      // 分到右缘的跳连：从两框**右**缘引出 → 正交走到右外缘竖轨 → 折回进框右缘。
-      // 关键：水平段一律落在源/汇框的**行间空隙**（框底+11 / 框顶-11），该空隙横贯所有列、
-      // 无框，故横穿密集解码三角也不压框；与框右缘的短竖接驳走「列间空隙」（框右+0~6，
-      // 仍在该框与右邻框之间的 column-gap 内），亦不压框。竖轨在 contentR 之外，互不压框。
+      // 分到右缘的跳连：从源框右缘水平直接引出 → 右外缘竖轨 → 竖直 → 直接进汇框右缘
+      // （圆角拐弯）。同 Lskip：默认视图允许交叠，聚焦时改走顶层直线保证清晰。
       const sxR = ra.right - cr.left, dxR = rb.right - cr.left;
       const sy = ra.top + ra.height / 2 - cr.top;
       const dy = rb.top + rb.height / 2 - cr.top;
       const railX = contentR + GAP + it.lane * STEP;
       maxX = Math.max(maxX, railX + 12);
-      const down = sy < dy;
-      const yExit = down ? (ra.bottom - cr.top + 11) : (ra.top - cr.top - 11);
-      const yEnt  = down ? (rb.top - cr.top - 11) : (rb.bottom - cr.top + 11);
-      d = `M ${sxR} ${sy} L ${sxR} ${yExit} L ${railX} ${yExit} `
-        + `L ${railX} ${yEnt} L ${dxR + 6} ${yEnt} L ${dxR + 6} ${dy} L ${dxR} ${dy}`;
-      lx = railX + 4; ly = (yExit + yEnt) / 2;
+      d = ortho([[sxR, sy], [railX, sy], [railX, dy], [dxR, dy]], 8);
+      lx = railX + 4; ly = (sy + dy) / 2;
     } else if (it.band === "Rloss") {
       // deep-supervision 头 → loss：正交走线（贴最右竖轨）。ds 头在右侧列，loss 居中
       // 偏下，直下会穿过 seg/aux 头行；故改为：右行到最右竖轨 → 竖直下行 → 在各头行
@@ -617,14 +649,23 @@ function drawEdges() {
       // 仍退回贝塞尔。
       const my = (yb1 + yt2) / 2;
       if (Math.abs(cx2 - cx1) >= 8 && (yt2 - yb1) < 120 && yt2 > yb1) {
-        d = `M ${cx1} ${yb1} L ${cx1} ${my} L ${cx2} ${my} L ${cx2} ${yt2}`;
+        d = ortho([[cx1, yb1], [cx1, my], [cx2, my], [cx2, yt2]], 7);
       } else {
         d = `M ${cx1} ${yb1} C ${cx1} ${my}, ${cx2} ${my}, ${cx2} ${yt2}`;
       }
       lx = (cx1 + cx2) / 2 + 6; ly = my - 2;
     }
-    // 聚焦态：被点模块的直连边醒目(洋红、加粗、绘于顶层框之上→永不被遮挡)；其余边淡出。
+    // 聚焦态：被点模块的直连边改走「框心→框心」的顶层直线——星形发散，彼此不交叉、不重叠，
+    // 且绘于所有框之上→不被遮挡；其余边淡出。未聚焦时各边按上面的正交圆角路由（允许交叠）。
     const isFoc = focus != null && (ed.src === focus || ed.dst === focus);
+    if (isFoc) {
+      const acx = ra.left + ra.width / 2 - cr.left, acy = ra.top + ra.height / 2 - cr.top;
+      const bcx = rb.left + rb.width / 2 - cr.left, bcy = rb.top + rb.height / 2 - cr.top;
+      const p1 = borderPt(ra, cr, bcx, bcy);
+      const p2 = borderPt(rb, cr, acx, acy);
+      d = "M " + p1[0] + " " + p1[1] + " L " + p2[0] + " " + p2[1];
+      lx = (p1[0] + p2[0]) / 2; ly = (p1[1] + p2[1]) / 2 - 4;
+    }
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
     path.setAttribute("stroke", isFoc ? HILITE.color : style.color);
