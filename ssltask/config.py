@@ -1,0 +1,385 @@
+"""ssltask 配置系统。
+
+设计：**复用 ``segtask_v1.config.Config``** 作为 data/model/train/... 的载体（即与下游
+分割/分类共用同一份骨干配置真相源，满足 ``SSL.md`` §0.1“所有方案严格同一骨干”），
+仅新增 SSL 专有的 :class:`SSLConfig`。``load_config`` 返回 ``(cfg, ssl)`` 二元组：
+
+* ``cfg``  —— ``segtask_v1.config.Config``，喂给 ``build_model`` / 数据管线 / 优化器；
+* ``ssl``  —— 本模块 :class:`SSLConfig`，承载方法选择与各方法超参。
+
+这样既不重复 ``Config.sync/validate`` 的复杂派生/校验逻辑，也让 ssltask 与下游天然
+共享骨干几何。YAML 中 ``ssl:`` 段被本模块单独解析，其余段交给 segtask 构造。
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Union
+
+import yaml
+
+from segtask_v1.config import (
+    Config as SegConfig,
+    ConfigError,
+    _dataclass_from_dict,
+    _require,
+)
+
+logger = logging.getLogger(__name__)
+
+#: 重建/回归损失。
+RECON_LOSSES = ("l1", "smooth_l1", "mse")
+#: 已实现的 SSL 方法注册键（须与 ``ssltask.methods`` 注册表保持同步；随 P2+ 扩展）。
+METHODS = ("genesis", "prior", "simmim", "dino", "spark")
+
+
+# ---------------------------------------------------------------------------
+# SSL-specific config
+# ---------------------------------------------------------------------------
+@dataclass
+class SSLConfig:
+    """自监督预训练专有配置。
+
+    骨干 / 优化器 / 调度器 / AMP / EMA / 输出目录 / epochs / lr / 数据预处理全部读
+    ``segtask_v1.config.Config``（``cfg.model`` / ``cfg.train`` / ``cfg.data``）；此处只放
+    SSL 目标本身相关的项。
+    """
+
+    # 预训练方法（见 ``ssltask.methods`` 注册表）：
+    #   "genesis" — Models Genesis 式破坏→重建原图（SSL.md 方案③）。
+    #   "prior"   — 回归经典 Frangi vesselness（免标注管状先验）。
+    #   "simmim"  — mask token 稠密掩码图像建模（SSL.md 方案②）。
+    #   "dino"    — 多裁剪 + EMA 教师自蒸馏（SSL.md 方案④）。
+    #   "spark"   — 掩码-稠密等价 + 层次解码器像素重建（SSL.md 方案①）。
+    method: str = "genesis"
+
+    # 重建/回归损失："l1" | "smooth_l1" | "mse"。
+    recon_loss: str = "l1"
+
+    # --- Genesis 破坏（image-only，GPU 逐样本即时施加）---
+    nonlinear_prob: float = 0.9
+    local_shuffle_prob: float = 0.5
+    local_shuffle_blocks: int = 100
+    local_shuffle_max_block: List[int] = field(default_factory=lambda: [4, 8, 8])
+    paint_prob: float = 0.9
+    inner_paint_prob: float = 0.5
+    paint_count: int = 5
+    paint_block_range: List[float] = field(default_factory=lambda: [0.1, 0.25])
+
+    # --- method='prior'：Frangi vesselness 回归目标（label-free）---
+    prior_scales: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
+    prior_alpha: float = 0.5
+    prior_beta: float = 0.5
+    prior_black_vessels: bool = False
+    prior_corrupt_input: bool = False
+
+    # --- method='simmim'：mask token 稠密掩码图像建模（SSL.md 方案②）---
+    # 掩码比例（SimMIM 经验 0.5–0.6）。
+    mim_mask_ratio: float = 0.6
+    # 掩码单元边长（体素），patch-wise 掩码粒度（SSL.md 取 16，可更大）。
+    mim_mask_unit: int = 16
+    # 轻量预测头隐藏通道；<=0 自动取 max(encoder_channels[-1]//2, 32)。
+    mim_head_dim: int = 0
+
+    # --- method='spark'：掩码-稠密等价 MIM + 轻量层次解码器（SSL.md 方案①）---
+    # 掩码比例（SparK 经验 0.6，低于 MAE 的 0.75）。
+    spark_mask_ratio: float = 0.6
+    # 掩码单元边长（体素），应与骨干总下采样步长对齐（SSL.md 取 16）。
+    spark_mask_unit: int = 16
+    # 轻量解码器宽度除数：解码各级通道 = max(encoder_channels[level]//div, min_dim)。
+    # div 越大解码器越窄（SSL.md：参数约 encoder 的 1/5–1/10，用完即弃）。
+    spark_decoder_dim_div: int = 4
+    # 解码器各级最小通道数。
+    spark_decoder_min_dim: int = 16
+    # 是否对重建目标做 per-unit 归一化（减单元均值除单元标准差，MAE 经验）。
+    spark_norm_pix: bool = True
+
+    # --- method='dino'：多裁剪 + EMA 教师自蒸馏（SSL.md 方案④）---
+    # 投影头：原型数 out_dim、MLP 隐藏/瓶颈维、层数、是否 BN（小 batch 慎用）。
+    dino_out_dim: int = 4096
+    dino_hidden_dim: int = 2048
+    dino_bottleneck_dim: int = 256
+    dino_head_layers: int = 3
+    dino_head_use_bn: bool = False
+    # 多裁剪：global/local 数量、输出尺寸（空=由 patch_size 推导）、裁剪尺度区间。
+    dino_global_crops: int = 2
+    dino_local_crops: int = 6
+    dino_global_size: List[int] = field(default_factory=list)
+    dino_local_size: List[int] = field(default_factory=list)
+    dino_global_scale: List[float] = field(default_factory=lambda: [0.5, 1.0])
+    dino_local_scale: List[float] = field(default_factory=lambda: [0.15, 0.5])
+    # 视图增广：随机翻转概率 + 强度缩放/平移幅度。
+    dino_flip_prob: float = 0.5
+    dino_intensity_scale: float = 0.1
+    dino_intensity_shift: float = 0.1
+    # 温度：学生固定、教师从 warmup 起点升到 final（前 warmup_frac 比例步内）。
+    dino_student_temp: float = 0.1
+    dino_teacher_temp: float = 0.07
+    dino_teacher_temp_warmup: float = 0.04
+    dino_warmup_teacher_temp_frac: float = 0.3
+    # centering 动量 + 教师 EMA 动量（cosine base→final）。
+    dino_center_momentum: float = 0.9
+    dino_momentum_base: float = 0.996
+    dino_momentum_final: float = 1.0
+
+    # --- 在线分割线性探针（SSL.md §0.5；驱动 best 选择，避免按 SSL loss 选模）---
+    # 启用后每 probe_every 个 epoch 在 probe_data_dir 的标注 npz 上冻结 encoder 跑线性探针。
+    probe_enabled: bool = False
+    probe_data_dir: str = ""            # 标注 npz 目录（含 image+label），enabled 时必填
+    probe_every: int = 10               # 探针评估的 epoch 间隔
+    probe_iters: int = 100              # 每次评估训练线性头的步数
+    probe_lr: float = 1.0e-2            # 线性头学习率
+    probe_val_ratio: float = 0.3        # 探针 train/val 划分比例
+    probe_samples_per_volume: int = 4   # 探针每卷抽样数
+    probe_seed: int = 0                 # 线性头重置 + 划分种子（保证跨 epoch 可比）
+    probe_select_best: bool = True      # True: 以 probe_dice 选 best；False: 退回 train loss
+
+    # 周期性保存 SSL ckpt 的 epoch 间隔（best-by-train-recon 始终单独保存）。
+    save_every: int = 10
+
+
+def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
+    """校验 SSL 配置与骨干配置的一致性；非法时抛 ``ConfigError``。"""
+    _require(
+        ssl.method in METHODS,
+        f"Invalid ssl.method: {ssl.method!r}. Valid: {METHODS}.")
+    if ssl.method == "prior":
+        _require(
+            len(ssl.prior_scales) >= 1 and all(float(v) > 0 for v in ssl.prior_scales),
+            f"ssl.prior_scales must be a non-empty list of positive sigmas; "
+            f"got {ssl.prior_scales}.")
+        _require(
+            float(ssl.prior_alpha) > 0 and float(ssl.prior_beta) > 0,
+            f"ssl.prior_alpha/prior_beta must be > 0; "
+            f"got {ssl.prior_alpha}, {ssl.prior_beta}.")
+    if ssl.method == "simmim":
+        _require(
+            0.0 < float(ssl.mim_mask_ratio) < 1.0,
+            f"ssl.mim_mask_ratio must be in (0,1); got {ssl.mim_mask_ratio}.")
+        _require(
+            int(ssl.mim_mask_unit) >= 1,
+            f"ssl.mim_mask_unit must be >= 1; got {ssl.mim_mask_unit}.")
+        _require(
+            int(ssl.mim_head_dim) >= 0,
+            f"ssl.mim_head_dim must be >= 0 (0=auto); got {ssl.mim_head_dim}.")
+    if ssl.method == "spark":
+        _require(
+            0.0 < float(ssl.spark_mask_ratio) < 1.0,
+            f"ssl.spark_mask_ratio must be in (0,1); got {ssl.spark_mask_ratio}.")
+        _require(
+            int(ssl.spark_mask_unit) >= 1,
+            f"ssl.spark_mask_unit must be >= 1; got {ssl.spark_mask_unit}.")
+        _require(
+            int(ssl.spark_decoder_dim_div) >= 1,
+            f"ssl.spark_decoder_dim_div must be >= 1; got "
+            f"{ssl.spark_decoder_dim_div}.")
+        _require(
+            int(ssl.spark_decoder_min_dim) >= 1,
+            f"ssl.spark_decoder_min_dim must be >= 1; got "
+            f"{ssl.spark_decoder_min_dim}.")
+    if ssl.method == "dino":
+        _require(
+            int(ssl.dino_out_dim) >= 1,
+            f"ssl.dino_out_dim must be >= 1; got {ssl.dino_out_dim}.")
+        _require(
+            int(ssl.dino_hidden_dim) >= 1 and int(ssl.dino_bottleneck_dim) >= 1,
+            f"ssl.dino_hidden_dim/bottleneck_dim must be >= 1; got "
+            f"{ssl.dino_hidden_dim}, {ssl.dino_bottleneck_dim}.")
+        _require(
+            int(ssl.dino_head_layers) >= 1,
+            f"ssl.dino_head_layers must be >= 1; got {ssl.dino_head_layers}.")
+        _require(
+            int(ssl.dino_global_crops) >= 2,
+            f"ssl.dino_global_crops must be >= 2 (DINO needs >=2 global views); "
+            f"got {ssl.dino_global_crops}.")
+        _require(
+            int(ssl.dino_local_crops) >= 0,
+            f"ssl.dino_local_crops must be >= 0; got {ssl.dino_local_crops}.")
+        _require(
+            float(ssl.dino_student_temp) > 0 and float(ssl.dino_teacher_temp) > 0
+            and float(ssl.dino_teacher_temp_warmup) > 0,
+            f"ssl.dino_student_temp/teacher_temp/teacher_temp_warmup must be > 0; "
+            f"got {ssl.dino_student_temp}, {ssl.dino_teacher_temp}, "
+            f"{ssl.dino_teacher_temp_warmup}.")
+        _require(
+            0.0 < float(ssl.dino_warmup_teacher_temp_frac) <= 1.0,
+            f"ssl.dino_warmup_teacher_temp_frac must be in (0,1]; got "
+            f"{ssl.dino_warmup_teacher_temp_frac}.")
+        _require(
+            0.0 <= float(ssl.dino_center_momentum) < 1.0,
+            f"ssl.dino_center_momentum must be in [0,1); got "
+            f"{ssl.dino_center_momentum}.")
+        _require(
+            0.0 <= float(ssl.dino_momentum_base) <= float(ssl.dino_momentum_final) <= 1.0,
+            f"ssl.dino_momentum_base/final must satisfy 0<=base<=final<=1; got "
+            f"{ssl.dino_momentum_base}, {ssl.dino_momentum_final}.")
+        for nm, rng in (("dino_global_scale", ssl.dino_global_scale),
+                        ("dino_local_scale", ssl.dino_local_scale)):
+            _require(
+                len(rng) == 2 and 0.0 < float(rng[0]) <= float(rng[1]) <= 1.0,
+                f"ssl.{nm} must be [lo,hi] with 0<lo<=hi<=1; got {rng}.")
+        for nm, sz in (("dino_global_size", ssl.dino_global_size),
+                       ("dino_local_size", ssl.dino_local_size)):
+            if sz:
+                _require(
+                    len(sz) == int(cfg.model.spatial_dims)
+                    and all(int(s) >= 1 for s in sz),
+                    f"ssl.{nm} (if set) must have length == model.spatial_dims "
+                    f"({cfg.model.spatial_dims}) and all >= 1; got {sz}.")
+        _require(
+            0.0 <= float(ssl.dino_flip_prob) <= 1.0,
+            f"ssl.dino_flip_prob must be in [0,1]; got {ssl.dino_flip_prob}.")
+        _require(
+            float(ssl.dino_intensity_scale) >= 0 and float(ssl.dino_intensity_shift) >= 0,
+            f"ssl.dino_intensity_scale/shift must be >= 0; got "
+            f"{ssl.dino_intensity_scale}, {ssl.dino_intensity_shift}.")
+        if bool(cfg.train.use_ema):
+            logger.warning(
+                "ssl.method='dino' with train.use_ema=True: the DINO teacher "
+                "is already an EMA of the student; the trainer-level EMA is "
+                "redundant. Recommend train.use_ema=false for DINO.")
+    _require(
+        ssl.recon_loss in RECON_LOSSES,
+        f"Invalid ssl.recon_loss: {ssl.recon_loss!r}. Valid: {RECON_LOSSES}.")
+    # SSL 重建路径走单视图（与分割同构 UNet，只换重建头）。
+    _require(
+        str(cfg.model.arch).lower() == "unet",
+        f"ssl requires model.arch=='unet'; got {cfg.model.arch!r}.")
+    _require(
+        len(cfg.data.multi_res_scales) == 1,
+        f"ssl requires a single view (len(data.multi_res_scales)==1); "
+        f"got {cfg.data.multi_res_scales}.")
+    for name in ("nonlinear_prob", "local_shuffle_prob",
+                 "paint_prob", "inner_paint_prob"):
+        v = float(getattr(ssl, name))
+        _require(0.0 <= v <= 1.0, f"ssl.{name} must be in [0,1]; got {v}.")
+    _require(
+        int(ssl.local_shuffle_blocks) >= 0,
+        f"ssl.local_shuffle_blocks must be >= 0; got {ssl.local_shuffle_blocks}.")
+    _require(
+        int(ssl.paint_count) >= 0,
+        f"ssl.paint_count must be >= 0; got {ssl.paint_count}.")
+    _require(
+        all(int(b) >= 1 for b in ssl.local_shuffle_max_block),
+        f"ssl.local_shuffle_max_block must all be >= 1; "
+        f"got {ssl.local_shuffle_max_block}.")
+    pr = ssl.paint_block_range
+    _require(
+        len(pr) == 2 and 0.0 < float(pr[0]) <= float(pr[1]) < 1.0,
+        f"ssl.paint_block_range must be [lo,hi] with 0<lo<=hi<1; got {pr}.")
+    if ssl.probe_enabled:
+        _require(
+            bool(ssl.probe_data_dir),
+            "ssl.probe_enabled=True requires ssl.probe_data_dir "
+            "(a directory of labelled image+label npz).")
+        _require(
+            int(cfg.model.spatial_dims) == 3,
+            f"ssl.probe_enabled is only supported for 3D backbones "
+            f"(model.spatial_dims==3); got {cfg.model.spatial_dims}.")
+        _require(
+            int(ssl.probe_every) >= 1,
+            f"ssl.probe_every must be >= 1; got {ssl.probe_every}.")
+        _require(
+            int(ssl.probe_iters) >= 1,
+            f"ssl.probe_iters must be >= 1; got {ssl.probe_iters}.")
+        _require(
+            0.0 < float(ssl.probe_val_ratio) < 1.0,
+            f"ssl.probe_val_ratio must be in (0,1); got {ssl.probe_val_ratio}.")
+        _require(
+            int(ssl.probe_samples_per_volume) >= 1,
+            f"ssl.probe_samples_per_volume must be >= 1; "
+            f"got {ssl.probe_samples_per_volume}.")
+    _require(
+        int(ssl.save_every) >= 1,
+        f"ssl.save_every must be >= 1; got {ssl.save_every}.")
+
+
+# ---------------------------------------------------------------------------
+# YAML I/O + overrides
+# ---------------------------------------------------------------------------
+def _ssl_from_dict(d: Dict[str, Any]) -> SSLConfig:
+    """从 ``ssl:`` YAML 段构造 :class:`SSLConfig`（未知键仅告警并忽略）。"""
+    return _dataclass_from_dict(SSLConfig, dict(d or {}))
+
+
+def _seg_from_dict(raw: Dict[str, Any]) -> SegConfig:
+    """从 YAML（已剔除 ``ssl`` 段）构造并校验 segtask ``Config``。"""
+    cfg = _dataclass_from_dict(SegConfig, raw)
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
+def load_config(path: Union[str, Path]) -> Tuple[SegConfig, SSLConfig]:
+    """加载 ssltask YAML，返回 ``(cfg, ssl)``。"""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    ssl_raw = dict(raw.pop("ssl", {}) or {})
+    cfg = _seg_from_dict(raw)
+    ssl = _ssl_from_dict(ssl_raw)
+    validate_ssl(ssl, cfg)
+    return cfg, ssl
+
+
+def save_config(cfg: SegConfig, ssl: SSLConfig, path: Union[str, Path]) -> None:
+    """把 ``(cfg, ssl)`` 落盘为单个 YAML（``ssl`` 段覆盖 seg 端可能残留的同名段）。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = asdict(cfg)
+    blob["ssl"] = asdict(ssl)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(blob, f, default_flow_style=False, sort_keys=False,
+                  allow_unicode=True)
+
+
+def _coerce(old: Any, val: str) -> Any:
+    """按既有字段类型把字符串 override 值转回原类型（与 segtask 行为一致）。"""
+    if isinstance(old, bool):
+        return val.lower() in ("true", "1", "yes")
+    if isinstance(old, int):
+        return int(val)
+    if isinstance(old, float):
+        return float(val)
+    if isinstance(old, list):
+        import json
+        return json.loads(val)
+    return val
+
+
+def _set_dotted(obj: Any, dotted: str, val: str) -> None:
+    parts = dotted.split(".")
+    for p in parts[:-1]:
+        obj = getattr(obj, p)
+    attr = parts[-1]
+    old = getattr(obj, attr)
+    new = _coerce(old, val)
+    setattr(obj, attr, new)
+    logger.info("Override: %s = %s -> %s", dotted, old, new)
+
+
+def apply_overrides(cfg: SegConfig, ssl: SSLConfig, overrides: List[str]) -> None:
+    """应用点记法 override；``ssl.*`` 路由到 ``ssl``，其余路由到 ``cfg``。
+
+    示例：``--override train.epochs=50 ssl.method=prior ssl.recon_loss=mse``。
+    调用方应在其后自行 ``cfg.sync(); cfg.validate(); validate_ssl(ssl, cfg)``。
+    """
+    for ov in overrides:
+        if "=" not in ov:
+            continue
+        key, val = ov.split("=", 1)
+        if key.startswith("ssl."):
+            _set_dotted(ssl, key[len("ssl."):], val)
+        else:
+            _set_dotted(cfg, key, val)
+
+
+__all__ = [
+    "SSLConfig", "SegConfig", "ConfigError",
+    "validate_ssl", "load_config", "save_config", "apply_overrides",
+    "RECON_LOSSES", "METHODS",
+]

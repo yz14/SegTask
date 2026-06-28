@@ -213,7 +213,7 @@ class ModelConfig:
     # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）。
     arch: str = "unet"
 
-    # Backbone："resnet" 或 "convnext"。
+    # Backbone："resnet" | "convnext" | "mednext"。
     backbone: str = "resnet"
 
     # 注：spatial_dims（2/3）与 in_channels 是由 patch_mode/multi_res_scales 等
@@ -319,10 +319,31 @@ class ModelConfig:
     # skip："cat" 或 "add"。
     skip_mode: str = "cat"
 
+    # 梯度检查点（gradient checkpointing）：以约 +20~33% 算力换取激活显存大幅下降，可放大
+    # 3D patch/batch（利于气道/血管等需大上下文的细结构）或更深更宽的 backbone。覆盖 encoder
+    # 各 stage 与 decoder（unet/unetpp/unet3p）各节点；stem/上下采样/头不包裹（开销小）。
+    # 反向重算前向 → 数值/收敛与关闭时一致（use_reentrant=False + preserve_rng_state 保
+    # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
+    # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。
+    grad_checkpointing: bool = False
+
     # ConvNeXt: drop path / LayerScale / LN-first downsample。
     drop_path_rate: float = 0.0
     convnext_layer_scale_init: float = 1e-6  # <=0 禁用
     convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
+
+    # ---- MedNeXt（Roy et al., MICCAI 2023；仅 backbone=='mednext'） ----
+    # 残差倒瓶颈块：dwconv(k³, groups=C) → 通道级 GroupNorm → 1×1 扩张(×R) → GELU →
+    # 1×1 压缩 → +残差。块内 norm/act 固定为通道级 GroupNorm + GELU（类似 convnext 固定
+    # LN+GELU）；上面的 norm_type/activation/dropout 对 mednext 块内无效（仅作用于
+    # stem / 上下采样 / decoder skip 投影 / 头）。
+    # 档位 A：重采样复用通用 Downsample/Upsample（downsample_mode/upsample_mode 仍生效，
+    # 且与 anisotropic_pooling 兼容，区别于 ConvNeXt LN-first 下采样）；MedNeXt 原生重采样
+    # 残差块 + UpKern 为后续档位 B。
+    # 扩张比 R（MedNeXt 用 2/3/4/8；ConvNeXt 固定 4）。
+    mednext_expand_ratio: int = 4
+    # 深度卷积核大小（MedNeXt 用 3 或 5；ConvNeXt 固定 7）。
+    mednext_kernel_size: int = 3
 
     # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone=='resnet'） ----
     # 把选定 stage 的标准 ResNet 块替换为「多膨胀率并行分支 → 融合」的残差块，
@@ -776,60 +797,6 @@ class PredictConfig:
     adabn_num_volumes: int = 8
 
 
-@dataclass
-class SSLConfig:
-    """自监督预训练（SSL）。**独立 task**：由 `python -m segtask_v1.pretrain` 入口
-    驱动，与分割训练互不污染。SSL 用与分割同构的 UNet（enc+dec），仅把分割头换成
-    重建头（out_channels=in_channels）；产出的 ckpt 经分割侧已有的 `train.pretrain`
-    非严格加载衔接（enc+dec 命中、seg head 随机）。
-
-    优化器/调度器/AMP/EMA/输出目录/epochs/lr 全部复用 `train.*`，此处只放 SSL 专有项。
-    `enabled` 仅作 pretrain 入口的显式确认与 validate 门控；分割训练读不到本段（默认关）。
-    """
-
-    enabled: bool = False
-
-    # 预训练方法：
-    #   "genesis" — Models Genesis 式破坏→重建原图（学图像/结构先验）。
-    #   "prior"   — 回归经典 Frangi vesselness（免标注管状先验，直击 precision）。
-    method: str = "genesis"
-
-    # 重建/回归损失："l1" | "smooth_l1" | "mse"。
-    recon_loss: str = "l1"
-
-    # --- Genesis 破坏（image-only，GPU 逐样本即时施加）---
-    # 非线性强度变换（随机 Bézier 单调/非单调曲线；学 HU/对比剂不变性）。
-    nonlinear_prob: float = 0.9
-    # 局部像素打乱（随机小窗内重排；学局部纹理/结构）。
-    local_shuffle_prob  : float = 0.5
-    local_shuffle_blocks: int = 100
-    # 打乱窗口最大边长（每轴）；2D 仅用末两项。
-    local_shuffle_max_block: List[int] = field(
-        default_factory=lambda: [4, 8, 8])
-    # 内/外补全（painting）。paint_prob 命中后，inner_paint_prob 决定内补 vs 外补。
-    paint_prob      : float = 0.9
-    inner_paint_prob: float = 0.5
-    # 补全时随机盒子的迭代次数（仅内补）。
-    paint_count: int = 5
-    # 补全盒子边长占该轴比例区间。
-    paint_block_range: List[float] = field(
-        default_factory=lambda: [0.1, 0.25])
-
-    # --- method='prior'：Frangi vesselness 回归目标（label-free）---
-    # 多尺度 sigma（覆盖你血管口径跨度；细管用小 sigma、粗管用大 sigma）。
-    prior_scales: List[float] = field(default_factory=lambda: [1.0, 2.0, 3.0])
-    # Frangi 形状/blob 抑制系数（Frangi'98 默认 0.5）。
-    prior_alpha: float = 0.5
-    prior_beta : float = 0.5
-    # 血管相对背景的明暗：CT 增强血管偏亮 → False（亮管）。
-    prior_black_vessels: bool = False
-    # 是否对输入也施加 Genesis 破坏（目标仍是干净图的 vesselness）；默认纯净输入。
-    prior_corrupt_input: bool = False
-
-    # 周期性保存 SSL ckpt 的 epoch 间隔（best-by-train-recon 始终单独保存）。
-    save_every: int = 10
-
-
 # ---------------------------------------------------------------------------
 # Visualization (TODO #2)
 # ---------------------------------------------------------------------------
@@ -914,7 +881,6 @@ class Config:
     loss   : LossConfig    = field(default_factory=LossConfig)
     train  : TrainConfig   = field(default_factory=TrainConfig)
     predict: PredictConfig = field(default_factory=PredictConfig)
-    ssl    : SSLConfig     = field(default_factory=SSLConfig)
     vis    : VisConfig     = field(default_factory=VisConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
 
@@ -1028,7 +994,6 @@ class Config:
         self._validate_2_5d()
         self._validate_train()
         self._validate_predict()
-        self._validate_ssl()
         self._validate_monitor()
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
@@ -1042,7 +1007,7 @@ class Config:
             f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
         if arch == "unet":
             _require(
-                self.model.backbone in ("resnet", "convnext"),
+                self.model.backbone in ("resnet", "convnext", "mednext"),
                 f"Invalid backbone: {self.model.backbone}")
             _require(
                 self.model.norm_type in ("batch", "instance", "group"),
@@ -1147,6 +1112,15 @@ class Config:
             _require(
                 self.model.resenc_preset in ("none", "S", "M", "L", "XL"),
                 f"Invalid resenc_preset: {self.model.resenc_preset}")
+            # MedNeXt 块超参（仅 backbone=='mednext' 生效；默认值对其他 backbone 无害）。
+            _require(
+                self.model.mednext_kernel_size in (3, 5, 7),
+                f"Invalid mednext_kernel_size: {self.model.mednext_kernel_size}; "
+                "valid: 3 | 5 | 7.")
+            _require(
+                self.model.mednext_expand_ratio >= 1,
+                f"mednext_expand_ratio must be >= 1; got "
+                f"{self.model.mednext_expand_ratio}.")
         # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage
@@ -1694,58 +1668,6 @@ class Config:
                     "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
                     self.model.norm_type)
 
-    def _validate_ssl(self) -> None:
-        """ssl.* 自监督预训练校验（仅 ssl.enabled 时生效；分割训练默认关，跳过）。"""
-        if not self.ssl.enabled:
-            return
-        s = self.ssl
-        _require(
-            s.method in ("genesis", "prior"),
-            f"Invalid ssl.method: {s.method!r}. Valid: 'genesis' | 'prior'.")
-        if s.method == "prior":
-            _require(
-                len(s.prior_scales) >= 1 and all(float(v) > 0 for v in s.prior_scales),
-                f"ssl.prior_scales must be a non-empty list of positive sigmas; "
-                f"got {s.prior_scales}.")
-            _require(
-                float(s.prior_alpha) > 0 and float(s.prior_beta) > 0,
-                f"ssl.prior_alpha/prior_beta must be > 0; "
-                f"got {s.prior_alpha}, {s.prior_beta}.")
-        _require(
-            s.recon_loss in ("l1", "smooth_l1", "mse"),
-            f"Invalid ssl.recon_loss: {s.recon_loss!r}. "
-            "Valid: 'l1' | 'smooth_l1' | 'mse'.")
-        # SSL 重建路径走单视图（与分割同构 UNet，只换重建头）；多 FOV/扩散架构暂不支持。
-        _require(
-            str(self.model.arch).lower() == "unet",
-            f"ssl.enabled=True requires model.arch=='unet'; got {self.model.arch!r}.")
-        _require(
-            len(self.data.multi_res_scales) == 1,
-            f"ssl.enabled=True requires a single view "
-            f"(len(data.multi_res_scales)==1); got {self.data.multi_res_scales}.")
-        for name in ("nonlinear_prob", "local_shuffle_prob",
-                     "paint_prob", "inner_paint_prob"):
-            v = float(getattr(s, name))
-            _require(0.0 <= v <= 1.0,
-                     f"ssl.{name} must be in [0,1]; got {v}.")
-        _require(
-            int(s.local_shuffle_blocks) >= 0,
-            f"ssl.local_shuffle_blocks must be >= 0; got {s.local_shuffle_blocks}.")
-        _require(
-            int(s.paint_count) >= 0,
-            f"ssl.paint_count must be >= 0; got {s.paint_count}.")
-        _require(
-            all(int(b) >= 1 for b in s.local_shuffle_max_block),
-            f"ssl.local_shuffle_max_block must all be >= 1; "
-            f"got {s.local_shuffle_max_block}.")
-        pr = s.paint_block_range
-        _require(
-            len(pr) == 2 and 0.0 < float(pr[0]) <= float(pr[1]) < 1.0,
-            f"ssl.paint_block_range must be [lo,hi] with 0<lo<=hi<1; got {pr}.")
-        _require(
-            int(s.save_every) >= 1,
-            f"ssl.save_every must be >= 1; got {s.save_every}.")
-
     def _validate_monitor(self) -> None:
         """monitor.* 训练监测仪表盘校验（仅 monitor.enabled 时生效）。"""
         if not self.monitor.enabled:
@@ -1784,7 +1706,6 @@ _SUB_CONFIGS = {
     "loss": LossConfig,
     "train": TrainConfig,
     "predict": PredictConfig,
-    "ssl": SSLConfig,
     "vis": VisConfig,
     "monitor": MonitorConfig,
 }

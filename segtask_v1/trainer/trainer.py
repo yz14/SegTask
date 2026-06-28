@@ -300,6 +300,11 @@ class Trainer:
             mem["param_mib"], mem["grad_mib"],
             mem["optim_name"], mem["optim_mult"], mem["optim_mib"],
             ema_part, mem["persistent_mib"])
+        if self.cfg.model.grad_checkpointing:
+            logger.info(
+                "Gradient checkpointing: ON — encoder/decoder activations "
+                "recomputed in backward (~+20-33%% compute, much lower "
+                "activation memory; numerics unchanged vs OFF).")
         if self.device.type == "cuda":
             cur_alloc  = torch.cuda.memory_allocated(self.device) / (1 << 20)
             cur_reserv = torch.cuda.memory_reserved(self.device) / (1 << 20)

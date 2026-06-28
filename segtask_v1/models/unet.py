@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 from .blocks import (
     _CONV, INTERP_SMOOTH,
-    AttentionGate3D, ConvNormAct, Downsample, Upsample, get_norm)
+    AttentionGate3D, ConvNormAct, Downsample, Upsample, checkpoint_if, get_norm)
 from .stem import HierarchicalStems, build_context_stem, build_stem
 
 logger = logging.getLogger(__name__)
@@ -36,10 +36,13 @@ class Encoder(nn.Module):
         stem_fusion_mode     : str = "shared_stem",
         in_ch_per_view_list  : Optional[List[int]] = None,
         downsample_builder   : Optional[Callable[[int, int], nn.Module]] = None,
-        downsample_strides   : Optional[List] = None):
+        downsample_strides   : Optional[List] = None,
+        grad_checkpointing   : bool = False):
         super().__init__()
 
         self.spatial_dims = spatial_dims
+        # 梯度检查点：逐 stage 包裹前向，反向重算以省激活显存（仅训练且需梯度时生效）。
+        self.grad_checkpointing = bool(grad_checkpointing)
         if num_stem_fusion_views < 1:        # 输入不可为空
             raise ValueError(
                 f"num_stem_fusion_views must be >= 1, got {num_stem_fusion_views}")
@@ -144,7 +147,7 @@ class Encoder(nn.Module):
                             f"input spatial dims are divisible by the "
                             f"aux stem stride.")
                     x = self.aux_fuse[str(i)](torch.cat([x, aux], dim=1))
-            x = stage(x)
+            x = checkpoint_if(self.grad_checkpointing, stage, x)
             features.append(x)
         return features
 
@@ -229,11 +232,14 @@ class Decoder(nn.Module):
         upsample_norm_act : bool = False,
         norm_type         : str = "instance",
         norm_groups       : int = 8,
-        activation        : str = "leakyrelu"):
+        activation        : str = "leakyrelu",
+        grad_checkpointing: bool = False):
         super().__init__()
 
-        self.levels       = nn.ModuleList()
-        self.spatial_dims = spatial_dims
+        self.levels            = nn.ModuleList()
+        self.spatial_dims      = spatial_dims
+        # 梯度检查点：逐 decoder level 包裹前向（含上采样+skip 融合+stage block）。
+        self.grad_checkpointing = bool(grad_checkpointing)
         n = len(encoder_channels)
 
         # 镜像 encoder 的逐级下采样 stride：decoder level i 还原 encoder
@@ -274,7 +280,8 @@ class Decoder(nn.Module):
         outputs = []
         for i, level in enumerate(self.levels):
             skip_idx = len(encoder_features) - 2 - i
-            x        = level(x, encoder_features[skip_idx])
+            x        = checkpoint_if(
+                self.grad_checkpointing, level, x, encoder_features[skip_idx])
             outputs.append(x)
         return outputs
 

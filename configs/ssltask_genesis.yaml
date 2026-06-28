@@ -1,0 +1,125 @@
+# 自监督预训练（ssltask, Models Genesis 式破坏→重建）示例配置。
+# 运行：  python -m ssltask.pretrain --config configs/ssltask_genesis.yaml
+# 产出：  outputs/ssltask_genesis/ssl_best.pt
+# 衔接：  下游分割/分类训练加 --override train.pretrain=outputs/ssltask_genesis/ssl_best.pt
+#         下游 _load_pretrain 非严格加载：encoder.*/decoder.* 命中，任务头随机。
+#
+# 重要：要让权重 1:1 迁移，下游 config 的 `model:` 段（backbone/encoder_channels/
+#       blocks/stem/norm/down-up/skip 等几何项）应与本文件一致。
+#
+# 数据：只读 image-only npz（data.npz_dir 指向预制好的 image npz；可为大规模无标注池）。
+# SSL 走单视图重建：data.multi_res_scales 必须为 [1.0]（见 ssltask.config.validate_ssl）。
+
+data:
+  npz_dir: "F:/LUNA25/ssl_npz"         # 预制好的 image-only npz（SSL 价值来源：大规模无标注）
+  npz_suffix: ".npz"
+
+  label_values: [0, 1]                 # 仅用于 segtask Config 校验；SSL 不读 label
+  num_classes : 2
+
+  patch_size: [96, 112, 112]
+  patch_mode: "cubic"
+
+  multi_res_scales    : [1.0]          # SSL 单视图（必须长度 1）
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  batch_size     : 2
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  samples_per_volume: 8
+
+
+augment:
+  enabled: false
+
+
+model:
+  backbone: "resnet"
+  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type: "basic"
+
+  norm_type  : "instance"
+  norm_groups: 8
+  activation : "leakyrelu"
+  dropout    : 0.0
+
+  attention_type: "none"
+  skip_attention: true
+
+  # 以下头在 SSL 阶段被丢弃（仅预训练 encoder+decoder）；列出以便与下游对齐。
+  deep_supervision   : false
+  aux_seg_supervision: false
+  aux_topo_head      : false
+
+  stem_mode      : "conv3"
+  decoder_type   : "unet"
+  downsample_mode: "conv"
+  upsample_mode  : "trilinear"
+  skip_mode      : "cat"
+
+
+# 优化器/调度器/AMP/EMA/output_dir/epochs/lr 由 SSL 复用 segtask train.*。
+train:
+  epochs: 200
+
+  optimizer   : "adamw"
+  lr          : 1.0e-3
+  weight_decay: 1.0e-4
+
+  scheduler    : "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4
+  grad_clip_norm  : 12.0
+
+  use_amp  : false
+  amp_dtype: "auto"
+
+  compile_mode: "none"
+
+  use_ema  : true
+  ema_decay: 0.999
+
+  output_dir: "outputs/ssltask_genesis"
+
+  log_every: 10
+
+  seed: 42
+  deterministic: false
+
+
+ssl:
+  method : "genesis"
+  recon_loss: "l1"
+
+  nonlinear_prob     : 0.9            # 非线性强度变换（学 HU/对比剂不变性）
+  local_shuffle_prob : 0.5
+  local_shuffle_blocks   : 100
+  local_shuffle_max_block: [4, 8, 8]
+  paint_prob      : 0.9              # 内/外补全
+  inner_paint_prob: 0.5
+  paint_count     : 5
+  paint_block_range: [0.1, 0.25]
+
+  # 在线分割线性探针（§0.5）：每 probe_every 个 epoch 在小标注集上冻结 encoder 跑线性头，
+  # 用 Dice 选 best（避免按 SSL loss 选模）。需预制含 image+label 的标注 npz 目录。
+  # probe_enabled           : true
+  # probe_data_dir          : "F:/LUNA25/probe_npz"
+  # probe_every             : 10
+  # probe_iters             : 200
+  # probe_lr                : 1.0e-2
+  # probe_val_ratio         : 0.3
+  # probe_samples_per_volume: 4
+  # probe_select_best       : true
+
+  save_every: 10

@@ -10,7 +10,7 @@ import torch.nn as nn
 
 import torch.nn.functional as F
 
-from .blocks import INTERP_SMOOTH, AttentionGate3D, Upsample
+from .blocks import INTERP_SMOOTH, AttentionGate3D, Upsample, checkpoint_if
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class UNetPPDecoder(nn.Module):
         norm_type: str = "instance",
         norm_groups: int = 8,
         activation: str = "leakyrelu",
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -42,6 +43,8 @@ class UNetPPDecoder(nn.Module):
         self._size_mismatch_warned = False
         self.skip_attention = skip_attention
         self.spatial_dims = spatial_dims
+        # 梯度检查点：逐节点包裹融合 block 前向，反向重算以省激活显存。
+        self.grad_checkpointing = bool(grad_checkpointing)
 
         # 以 'i_j' 为 key 保证 ModuleDict 注册顺序确定。
         self.upsamples = nn.ModuleDict()
@@ -103,6 +106,7 @@ class UNetPPDecoder(nn.Module):
                 if self.skip_attention:
                     up = self.gates[key](up, x[i][0])
                 fused = torch.cat(x[i][:j] + [up], dim=1)
-                x[i][j] = self.blocks[key](fused)
+                x[i][j] = checkpoint_if(
+                    self.grad_checkpointing, self.blocks[key], fused)
 
         return [x[n - 2 - k][1 + k] for k in range(n - 1)]

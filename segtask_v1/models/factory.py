@@ -12,6 +12,7 @@ import torch.nn as nn
 from ..config import Config, resolve_selfattn_stage
 from .blocks import Downsample, SelfAttentionBlock, Upsample
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
+from .mednext import MedNeXtStage
 from .resnet import MultiRFStage, ResNetStage
 from .topology import ModelTopology, build_topology
 from .unet import Encoder, Decoder, UNet3D
@@ -178,6 +179,41 @@ def _make_convnext_downsample_builder(
     return build
 
 
+def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
+    """MedNeXt stage 构建器：块内固定通道级 GroupNorm + GELU；用户设其他 norm/act/dropout 时警告。
+
+    重采样复用通用 Downsample/Upsample（``downsample_mode`` / ``upsample_mode`` 决定），
+    与 ConvNeXt 的 LN-first 阶间下采样不同——故 ``anisotropic_pooling`` 仍可用。
+    """
+    mc = cfg.model
+    spatial_dims = mc.spatial_dims
+    non_default = []
+    if mc.norm_type != "group":
+        non_default.append(f"norm_type={mc.norm_type}")
+    if mc.activation != "gelu":
+        non_default.append(f"activation={mc.activation}")
+    if mc.dropout and mc.dropout > 0:
+        non_default.append(f"dropout={mc.dropout}")
+    if non_default:
+        logger.warning(
+            "Backbone=mednext: block-internal norm/activation are fixed to "
+            "channel-wise GroupNorm+GELU and the following settings are "
+            "IGNORED inside MedNeXt blocks: %s. (They still apply to the "
+            "stem/decoder skip projections built in Encoder/Decoder.)",
+            ", ".join(non_default))
+
+    def factory(in_ch: int, out_ch: int, num_blocks: int) -> MedNeXtStage:
+        return MedNeXtStage(
+            in_ch, out_ch,
+            num_blocks     = num_blocks,
+            expand_ratio   = mc.mednext_expand_ratio,
+            kernel_size    = mc.mednext_kernel_size,
+            attention_type = mc.attention_type,
+            spatial_dims   = spatial_dims)
+
+    return _StatefulStageBuilder(factory, counts)
+
+
 # 各向异性自动调度的最小特征边长（nnU-Net 默认 4）：降采样后某轴不小于此值才继续降。
 _MIN_FEATURE_SIZE = 4
 
@@ -342,6 +378,10 @@ def build_model(cfg: Config):
         # LN-first 下采样；置 False 回退通用 Downsample（消融实验）。
         if bool(mc.convnext_downsample_lnfirst):
             downsample_builder = _make_convnext_downsample_builder(cfg)
+    elif mc.backbone == "mednext":
+        # 档位 A：MedNeXt 残差倒瓶颈块 + 通用 Downsample/Upsample（无自定义 downsample_builder）。
+        enc_builder = _make_mednext_stage_builder(cfg, enc_counts)
+        dec_builder = _make_mednext_stage_builder(cfg, dec_counts)
     else:
         raise ValueError(f"Unknown backbone: {mc.backbone}")
 
@@ -386,7 +426,8 @@ def build_model(cfg: Config):
         stem_fusion_mode      = mc.stem_fusion_mode,
         in_ch_per_view_list   = in_ch_per_view_list,
         downsample_builder    = downsample_builder,
-        downsample_strides    = ds_strides)
+        downsample_strides    = ds_strides,
+        grad_checkpointing    = mc.grad_checkpointing)
 
     # decoder: unet | unetpp | unet3p
     if   mc.decoder_type == "unet3p":
@@ -397,7 +438,8 @@ def build_model(cfg: Config):
             norm_groups=mc.norm_groups,
             activation=mc.activation,
             skip_attention=mc.skip_attention,
-            spatial_dims=spatial_dims)
+            spatial_dims=spatial_dims,
+            grad_checkpointing=mc.grad_checkpointing)
     elif mc.decoder_type == "unetpp":
         decoder = UNetPPDecoder(
             encoder_channels=enc_channels,
@@ -408,7 +450,8 @@ def build_model(cfg: Config):
             upsample_norm_act=mc.upsample_norm_act,
             norm_type=mc.norm_type,
             norm_groups=mc.norm_groups,
-            activation=mc.activation)
+            activation=mc.activation,
+            grad_checkpointing=mc.grad_checkpointing)
     else:
         decoder = Decoder(
             encoder_channels   = enc_channels,
@@ -421,7 +464,8 @@ def build_model(cfg: Config):
             upsample_norm_act  = mc.upsample_norm_act,
             norm_type          = mc.norm_type,
             norm_groups        = mc.norm_groups,
-            activation         = mc.activation)
+            activation         = mc.activation,
+            grad_checkpointing = mc.grad_checkpointing)
 
     # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
     aux_seg_supervision       = topo.aux_seg_active
@@ -449,7 +493,7 @@ def build_model(cfg: Config):
         "enc_blocks=%s, dec_blocks=%s, out_classes=%d (fg=%d, res=%d), "
         "stem=%s(stride=%d, n_views=%d, fusion=%s), "
         "down=%s, up=%s, skip=%s, attn=%s, skip_attn=%s, "
-        "ds=%s, aux_seg=%s(n_aux_heads=%d, mode=%s)",
+        "ds=%s, aux_seg=%s(n_aux_heads=%d, mode=%s), grad_ckpt=%s",
         mc.backbone, mc.block_type, mc.decoder_type, mc.resenc_preset,
         pc["encoder"] / 1e6, pc["decoder"] / 1e6, pc["total"] / 1e6,
         enc_channels,
@@ -461,37 +505,6 @@ def build_model(cfg: Config):
         mc.downsample_mode, mc.upsample_mode, mc.skip_mode,
         mc.attention_type, mc.skip_attention,
         mc.deep_supervision, aux_seg_supervision, len(model.aux_heads),
-        mc.aux_head_mode)
+        mc.aux_head_mode, mc.grad_checkpointing)
 
     return model
-
-
-def build_ssl_model(cfg: Config):
-    """自监督预训练（SSL）重建模型：与分割同构 UNet（复用 ``build_model`` 构建的
-    ``encoder`` / ``decoder`` 子模块）+ 独立命名的重建头 ``recon_head``
-    （out_channels = 模型输入通道数）。
-
-    复用 ``build_model`` 保证编/解码器与下游分割逐参数同名同形 → SSL ckpt 可经
-    分割侧已有的 ``train.pretrain`` 非严格加载干净衔接（enc+dec 命中、seg head 随机）。
-    分割头/深监督/aux 头在此被丢弃（仅取 encoder/decoder），不参与 SSL。
-    """
-    from .ssl import SSLReconModel
-
-    arch = str(cfg.model.arch).lower()
-    if arch != "unet":
-        raise ValueError(
-            f"build_ssl_model requires model.arch=='unet'; got {arch!r}.")
-
-    seg_model = build_model(cfg)  # 复用同一构建路径，确保 enc/dec 同名同形
-    ssl_model = SSLReconModel(
-        encoder      = seg_model.encoder,
-        decoder      = seg_model.decoder,
-        out_channels = int(cfg.model.in_channels),
-        spatial_dims = int(cfg.model.spatial_dims))
-    pc = ssl_model.param_count()
-    logger.info(
-        "Built SSLReconModel [genesis]: enc=%.2fM, dec=%.2fM, "
-        "recon_head=%.2fM, total=%.2fM, out_channels=%d (=in_channels).",
-        pc["encoder"] / 1e6, pc["decoder"] / 1e6,
-        pc["recon_head"] / 1e6, pc["total"] / 1e6, ssl_model.out_channels)
-    return ssl_model

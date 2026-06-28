@@ -53,7 +53,7 @@ ENUMS: Dict[str, List[str]] = {
     "data.cache_mode":             ["none", "memory"],
     "data.z_boundary_mode":        ["stretch", "edge_pad"],
     "augment.wmap_interp_mode":    ["nearest", "bilinear"],
-    "model.backbone":              ["resnet", "convnext"],
+    "model.backbone":              ["resnet", "convnext", "mednext"],
     "model.block_type":            ["basic", "preact", "bottleneck", "r2plus1d"],
     "model.resenc_preset":         ["none", "S", "M", "L", "XL"],
     "model.norm_type":             ["batch", "instance", "group"],
@@ -267,10 +267,15 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.upsample_norm_act", depends_on=unet + [_in("model.upsample_mode", ["trilinear", "nearest"])]),
         Field("model.downsample_strides", depends_on=unet),
         Field("model.skip_mode", depends_on=unet),
+        # 梯度检查点（所有 backbone 通用）。
+        Field("model.grad_checkpointing", depends_on=unet),
         # ConvNeXt 专属。
         Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         Field("model.convnext_layer_scale_init", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         Field("model.convnext_downsample_lnfirst", depends_on=unet + [_in("model.backbone", ["convnext"])]),
+        # MedNeXt 专属（仅 backbone=='mednext'）。
+        Field("model.mednext_expand_ratio", depends_on=unet + [_in("model.backbone", ["mednext"])]),
+        Field("model.mednext_kernel_size", depends_on=unet + [_in("model.backbone", ["mednext"])]),
         # 拓扑辅助头（2D/3D 通用，仅 unet）。
         Field("model.aux_topo_head", depends_on=unet),
         Field("model.aux_topo_target", depends_on=unet + [_truthy("model.aux_topo_head")]),

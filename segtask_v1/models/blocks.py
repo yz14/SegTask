@@ -8,6 +8,7 @@ from typing import Sequence, Tuple, Type
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from einops import rearrange
 
 
@@ -31,6 +32,24 @@ def _check_dims(spatial_dims: int) -> int:
         raise ValueError(
             f"spatial_dims must be 2 or 3, got {spatial_dims!r}")
     return spatial_dims
+
+
+def checkpoint_if(enabled: bool, fn, *args):
+    """可选梯度检查点：用算力换激活显存。
+
+    ``enabled`` 且当前处于需要梯度的前向（训练且 ``torch.is_grad_enabled()``）时，用
+    ``torch.utils.checkpoint`` 包裹 ``fn(*args)``——前向不保存其内部激活，反向时重算一次。
+    其余情况（eval / ``torch.no_grad()`` 验证 / 关闭）直接 ``fn(*args)``，**零开销且数值与
+    未开启严格一致**。
+
+    - ``use_reentrant=False``：PyTorch 推荐的非重入实现，正确处理「输入不需梯度但子模块参数
+      需梯度」（如首个 encoder stage）与多输入（如 ``DecoderLevel(x, skip)``）情形。
+    - ``preserve_rng_state=True``：重算时复现 DropPath/dropout 的随机掩码，使梯度无偏。
+    """
+    if enabled and torch.is_grad_enabled():
+        return _torch_checkpoint(
+            fn, *args, use_reentrant=False, preserve_rng_state=True)
+    return fn(*args)
 
 
 def _as_stride_tuple(stride, spatial_dims: int) -> Tuple[int, ...]:
