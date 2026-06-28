@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import INTERP_SMOOTH, AttentionGate3D, ConvNormAct
+from .blocks import INTERP_SMOOTH, AttentionGate3D, ConvNormAct, checkpoint_if
 
 
 class UNet3PDecoder(nn.Module):
@@ -28,6 +28,7 @@ class UNet3PDecoder(nn.Module):
         activation: str = "leakyrelu",
         skip_attention: bool = False,
         spatial_dims: int = 3,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -38,6 +39,8 @@ class UNet3PDecoder(nn.Module):
         self.fused_ch = fused_channels if fused_channels > 0 else cat_channels * n
         self.skip_attention = skip_attention
         self.spatial_dims = spatial_dims
+        # 梯度检查点：逐节点包裹融合卷积前向，反向重算以省激活显存。
+        self.grad_checkpointing = bool(grad_checkpointing)
 
         def _cna(in_ch: int, out_ch: int) -> ConvNormAct:
             return ConvNormAct(
@@ -109,6 +112,7 @@ class UNet3PDecoder(nn.Module):
                 branches.append(self.branches[i][j](src))
 
             fused = torch.cat(branches, dim=1)
-            decoder_nodes[i] = self.fusions[i](fused)
+            decoder_nodes[i] = checkpoint_if(
+                self.grad_checkpointing, self.fusions[i], fused)
 
         return list(reversed(decoder_nodes))

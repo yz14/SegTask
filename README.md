@@ -55,7 +55,7 @@
 | 配置 | `@dataclass` 嵌套 + PyYAML，CLI dot-notation override | `@d:\codes\work-projects\SegTask\segtask_v1\config.py` |
 | 医学图像 IO | SimpleITK（首选，带退避重试）+ numpy `npz mmap` | `@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:32-419` |
 | 数据增强 | 纯 GPU（`grid_sample` 共享 warp、弹性形变、强度抖动） | `@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py` |
-| 模型 | UNet / UNet++ / UNet3+ × ResNet(basic/preact/bottleneck/R(2+1)D) / ConvNeXt | `@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py` |
+| 模型 | UNet / UNet++ / UNet3+ × ResNet(basic/preact/bottleneck/R(2+1)D) / ConvNeXt / **MedNeXt** | `@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py` |
 | 多 FOV 融合 | shared\_stem / multi\_stem\_proj (Plan A) / hierarchical (Plan C) | `@d:\codes\work-projects\SegTask\segtask_v1\models\stem.py` |
 | 注意力 | SE / ECA / CBAM / CoordAttention + AttentionGate (skip) | `@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:146-435` |
 | 上下采样 | conv / max / avg / **BlurPool** / PixelUnShuffle ↔ transpose / linear / nearest / PixelShuffle / **CARAFE** / **DySample** | `@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:611-948` |
@@ -113,6 +113,7 @@ SegTask/
 │   │   ├── stem.py                    # 5 种 stem + 3 种多视图融合策略
 │   │   ├── resnet.py                  # 4 种 ResNet 残差块 + ResNetStage
 │   │   ├── convnext.py                # ConvNeXt 块 + 论文 norm-first downsample
+│   │   ├── mednext.py                 # MedNeXt 残差倒瓶颈块（GroupNorm，档位 A，复用通用重采样）
 │   │   ├── unet.py                    # 通用 UNet3D（spatial_dims=2 兼容 2.5D）
 │   │   ├── unetpp.py                  # UNet++ 嵌套稠密 decoder
 │   │   ├── unet3p.py                  # UNet3+ 全尺度跳连 decoder
@@ -324,7 +325,7 @@ config.py
 │                         # z_boundary_mode（stretch | edge_pad）、keep_native_view_depth、
 │                         # keep_native_multi_res、stratified_split、dataloader 参数…
 ├── AugConfig             # GPU 增强各类概率与范围（flip / affine / elastic / dropout / brightness …）
-├── ModelConfig           # backbone (resnet | convnext) / spatial_dims / block_type
+├── ModelConfig           # backbone (resnet | convnext | mednext) / spatial_dims / block_type
 │                         # (basic | preact | bottleneck | r2plus1d) / resenc_preset (none|S|M|L|XL)
 │                         # / encoder_channels / blocks_per_stage / norm / activation / dropout
 │                         # / attention_type / skip_attention / deep_supervision
@@ -431,6 +432,7 @@ segtask_v1/models/
 ├── stem.py       # 5 种 stem + 3 种多 FOV 上下文融合策略
 ├── resnet.py     # 4 种残差块 + ResNetStage
 ├── convnext.py   # ConvNeXt 块 + 论文 norm-first downsample
+├── mednext.py    # MedNeXt 残差倒瓶颈块（档位 A，复用通用重采样）
 ├── unet.py       # UNet3D 主网络（兼容 2D）
 ├── unetpp.py     # UNet++ 嵌套稠密 decoder（接口和 unet.Decoder 一致）
 ├── unet3p.py     # UNet3+ 全尺度跳连 decoder
@@ -469,6 +471,11 @@ segtask_v1/models/
 - `LayerNorm3d` channel-first LN（与官方 channels-last 数学等价）。
 - `ConvNeXtBlock`（7×7×7 DW + 4× 扩展 PW + LayerScale `1e-6`）+ `ConvNeXtAdaptBlock`（通道适配版）。
 - `ConvNeXtStage`（N blocks）+ `ConvNeXtDownsample`（论文版 LN → stride-2 Conv，由 `model.convnext_downsample_lnfirst` 切换）。
+
+**`mednext.py`** —— MedNeXt（Roy et al., MICCAI 2023）**档位 A**：
+- `MedNeXtBlock` 残差倒瓶颈：DW Conv `k³`（groups=C）→ **通道级 GroupNorm**（`num_groups=C`，小 batch 稳定，替代 ConvNeXt 的 LN）→ 1×1 扩张（×R）→ GELU → 1×1 压缩 → +残差。可配 `mednext_kernel_size`（3/5/7）与 `mednext_expand_ratio`（R），区别于 ConvNeXt 的固定 7×7×7/×4/LayerScale。
+- `MedNeXtAdaptBlock`（首块通道适配）+ `MedNeXtStage`（接口同 `ConvNeXtStage`/`ResNetStage`）。
+- **档位 A 复用框架通用 `Downsample`/`Upsample`**（`downsample_mode`/`upsample_mode` 仍生效，且与 `anisotropic_pooling` 兼容，区别于 ConvNeXt LN-first 下采样）；MedNeXt 原生重采样残差块 + UpKern 大核权重迁移为后续**档位 B**。配置 `model.backbone='mednext'`。
 
 **`unet.py`** —— UNet3D 主网络：
 

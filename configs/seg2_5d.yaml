@@ -171,7 +171,7 @@ model:
   # Plan C aux 挂在低分辨率 decoder 特征上，'conv' 兼有空间聚合作用，同样推荐。
   aux_head_mode: "conv"
 
-  decoder_type   : "unetpp"         # 'unet' | 'unetpp' | 'unet3p'
+  decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
   downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
   upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
   upsample_norm_act: true         # 仅 trilinear/nearest 生效

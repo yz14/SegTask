@@ -213,7 +213,7 @@ class ModelConfig:
     # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）。
     arch: str = "unet"
 
-    # Backbone："resnet" 或 "convnext"。
+    # Backbone："resnet" | "convnext" | "mednext"。
     backbone: str = "resnet"
 
     # 注：spatial_dims（2/3）与 in_channels 是由 patch_mode/multi_res_scales 等
@@ -319,10 +319,31 @@ class ModelConfig:
     # skip："cat" 或 "add"。
     skip_mode: str = "cat"
 
+    # 梯度检查点（gradient checkpointing）：以约 +20~33% 算力换取激活显存大幅下降，可放大
+    # 3D patch/batch（利于气道/血管等需大上下文的细结构）或更深更宽的 backbone。覆盖 encoder
+    # 各 stage 与 decoder（unet/unetpp/unet3p）各节点；stem/上下采样/头不包裹（开销小）。
+    # 反向重算前向 → 数值/收敛与关闭时一致（use_reentrant=False + preserve_rng_state 保
+    # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
+    # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。
+    grad_checkpointing: bool = False
+
     # ConvNeXt: drop path / LayerScale / LN-first downsample。
     drop_path_rate: float = 0.0
     convnext_layer_scale_init: float = 1e-6  # <=0 禁用
     convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
+
+    # ---- MedNeXt（Roy et al., MICCAI 2023；仅 backbone=='mednext'） ----
+    # 残差倒瓶颈块：dwconv(k³, groups=C) → 通道级 GroupNorm → 1×1 扩张(×R) → GELU →
+    # 1×1 压缩 → +残差。块内 norm/act 固定为通道级 GroupNorm + GELU（类似 convnext 固定
+    # LN+GELU）；上面的 norm_type/activation/dropout 对 mednext 块内无效（仅作用于
+    # stem / 上下采样 / decoder skip 投影 / 头）。
+    # 档位 A：重采样复用通用 Downsample/Upsample（downsample_mode/upsample_mode 仍生效，
+    # 且与 anisotropic_pooling 兼容，区别于 ConvNeXt LN-first 下采样）；MedNeXt 原生重采样
+    # 残差块 + UpKern 为后续档位 B。
+    # 扩张比 R（MedNeXt 用 2/3/4/8；ConvNeXt 固定 4）。
+    mednext_expand_ratio: int = 4
+    # 深度卷积核大小（MedNeXt 用 3 或 5；ConvNeXt 固定 7）。
+    mednext_kernel_size: int = 3
 
     # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone=='resnet'） ----
     # 把选定 stage 的标准 ResNet 块替换为「多膨胀率并行分支 → 融合」的残差块，
@@ -1042,7 +1063,7 @@ class Config:
             f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
         if arch == "unet":
             _require(
-                self.model.backbone in ("resnet", "convnext"),
+                self.model.backbone in ("resnet", "convnext", "mednext"),
                 f"Invalid backbone: {self.model.backbone}")
             _require(
                 self.model.norm_type in ("batch", "instance", "group"),
@@ -1147,6 +1168,15 @@ class Config:
             _require(
                 self.model.resenc_preset in ("none", "S", "M", "L", "XL"),
                 f"Invalid resenc_preset: {self.model.resenc_preset}")
+            # MedNeXt 块超参（仅 backbone=='mednext' 生效；默认值对其他 backbone 无害）。
+            _require(
+                self.model.mednext_kernel_size in (3, 5, 7),
+                f"Invalid mednext_kernel_size: {self.model.mednext_kernel_size}; "
+                "valid: 3 | 5 | 7.")
+            _require(
+                self.model.mednext_expand_ratio >= 1,
+                f"mednext_expand_ratio must be >= 1; got "
+                f"{self.model.mednext_expand_ratio}.")
         # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage
