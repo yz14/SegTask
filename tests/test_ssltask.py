@@ -1,0 +1,772 @@
+"""Tests for the standalone ssltask self-supervised pretraining package.
+
+Covers:
+- SSLConfig defaults + validate_ssl (method/recon_loss/single-view/probs guards).
+- build_ssl_recon_model: encoder/decoder reuse + recon_head, shape-preserving
+  forward (3D and 2.5D), out_channels == in_channels.
+- GenesisCorruptor + frangi_vesselness (ported behaviour).
+- **SSL -> downstream weight handoff**: encoder.*/decoder.* match exactly under
+  strict=False load into a segtask build_model; recon_head.* is the only extra;
+  seg_head.* is the only (head) missing.
+- ImageOnlyPatchDataset: reads a temp image-only npz and yields shaped patches.
+- SSLTrainer: one-epoch CPU smoke run (genesis & prior) -> loadable ssl_best.pt
+  whose model_state_dict carries encoder.* keys.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+from segtask_v1.config import Config as SegConfig
+from segtask_v1.models.factory import build_model
+from segtask_v1.trainer.checkpoint import strip_common_prefixes
+
+from ssltask.config import SSLConfig, validate_ssl
+from ssltask.data.corruptions import GenesisCorruptor
+from ssltask.data.masking import (
+    apply_mask_token,
+    compute_grid_shape,
+    make_unit_mask,
+    masked_recon_loss,
+    sample_unit_mask,
+    upsample_mask_to,
+)
+from ssltask.data.multicrop import MultiCropGenerator
+from ssltask.data.ssl_dataset import ImageOnlyPatchDataset, LabeledPatchDataset
+from ssltask.data.vesselness import frangi_vesselness
+from ssltask.eval.probe import SegProbe
+from ssltask.methods import build_method
+from ssltask.models.dino_modules import DINOHead, DINONet, build_dino_net
+from ssltask.models.ssl_models import (
+    SSLMIMModel,
+    SSLReconModel,
+    build_ssl_mim_model,
+    build_ssl_recon_model,
+)
+from ssltask.trainer import SSLTrainer
+
+try:
+    from segtask_v1.config import ConfigError
+except Exception:  # pragma: no cover
+    ConfigError = Exception
+
+
+# ---------------------------------------------------------------------------
+# config helpers
+# ---------------------------------------------------------------------------
+def _cfg(patch_mode="cubic"):
+    cfg = SegConfig()
+    cfg.data.patch_mode = patch_mode
+    cfg.data.patch_size = [16, 32, 32]
+    cfg.data.multi_res_scales = [1.0]
+    cfg.data.label_values = [0, 1]
+    cfg.data.num_classes = 2
+    cfg.model.backbone = "resnet"
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.model.stem_mode = "conv3"
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# config validation
+# ---------------------------------------------------------------------------
+def test_ssl_validate_ok():
+    cfg = _cfg()
+    validate_ssl(SSLConfig(), cfg)
+
+
+def test_ssl_validate_prior_ok():
+    cfg = _cfg()
+    validate_ssl(SSLConfig(method="prior"), cfg)
+
+
+def test_ssl_validate_simmim_ok():
+    cfg = _cfg()
+    validate_ssl(SSLConfig(method="simmim"), cfg)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("mim_mask_ratio", 0.0),
+    ("mim_mask_ratio", 1.0),
+    ("mim_mask_unit", 0),
+    ("mim_head_dim", -1),
+])
+def test_ssl_validate_simmim_rejects_bad(field, value):
+    cfg = _cfg()
+    ssl = SSLConfig(method="simmim")
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+def test_ssl_validate_probe_requires_dir():
+    cfg = _cfg()
+    ssl = SSLConfig()
+    ssl.probe_enabled = True            # but no probe_data_dir
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+def test_ssl_validate_probe_rejects_2_5d():
+    cfg = _cfg("2_5d")
+    ssl = SSLConfig()
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = "some/dir"
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("probe_every", 0),
+    ("probe_iters", 0),
+    ("probe_val_ratio", 0.0),
+    ("probe_val_ratio", 1.0),
+    ("probe_samples_per_volume", 0),
+])
+def test_ssl_validate_probe_rejects_bad(field, value):
+    cfg = _cfg()
+    ssl = SSLConfig()
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = "some/dir"
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("method", "bogus"),
+    ("recon_loss", "huber"),
+    ("nonlinear_prob", 1.5),
+    ("paint_count", -1),
+])
+def test_ssl_validate_rejects_bad(field, value):
+    cfg = _cfg()
+    ssl = SSLConfig()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+def test_ssl_validate_rejects_bad_paint_range():
+    cfg = _cfg()
+    ssl = SSLConfig()
+    ssl.paint_block_range = [0.5, 0.2]   # lo > hi
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+def test_ssl_validate_requires_single_view():
+    cfg = _cfg()
+    cfg.data.multi_res_scales = [1.0, 1.5]
+    cfg.sync()
+    with pytest.raises(ConfigError):
+        validate_ssl(SSLConfig(), cfg)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("prior_scales", []),
+    ("prior_scales", [0.0, 1.0]),
+    ("prior_alpha", 0.0),
+])
+def test_ssl_validate_prior_rejects_bad(field, value):
+    cfg = _cfg()
+    ssl = SSLConfig(method="prior")
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Frangi vesselness target (label-free)
+# ---------------------------------------------------------------------------
+def test_frangi_vesselness_3d_highlights_tube():
+    vol = torch.zeros(1, 1, 24, 32, 32)
+    vol[0, 0, :, 16, 16] = 1.0
+    vol[0, 0, :, 16, 17] = 1.0
+    vol[0, 0, :, 17, 16] = 1.0
+    out = frangi_vesselness(vol, scales=[1.0, 2.0], spatial_dims=3)
+    assert out.shape == vol.shape
+    assert 0.0 <= float(out.min()) and float(out.max()) <= 1.0 + 1e-5
+    tube = out[0, 0, :, 15:19, 15:19].mean().item()
+    bg = out[0, 0, :, 0:4, 0:4].mean().item()
+    assert tube > bg + 0.05
+
+
+# ---------------------------------------------------------------------------
+# model build + forward
+# ---------------------------------------------------------------------------
+def test_build_ssl_model_3d_forward():
+    cfg = _cfg("cubic")
+    model = build_ssl_recon_model(cfg).eval()
+    assert isinstance(model, SSLReconModel)
+    assert model.out_channels == cfg.model.in_channels
+    x = torch.randn(2, cfg.model.in_channels, 16, 32, 32)
+    with torch.no_grad():
+        y = model(x)
+    assert y.shape == x.shape
+
+
+def test_build_ssl_model_2_5d_forward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    model = build_ssl_recon_model(cfg).eval()
+    x = torch.randn(2, cfg.model.in_channels, 32, 32)
+    with torch.no_grad():
+        y = model(x)
+    assert y.shape == x.shape
+
+
+def test_build_ssl_model_requires_unet():
+    cfg = _cfg("2_5d")
+    cfg.model.arch = "adm"
+    with pytest.raises(ValueError):
+        build_ssl_recon_model(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Genesis corruption
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("spatial_dims,shape", [(3, (8, 16, 16)), (2, (16, 16))])
+def test_genesis_corruptor_shape_and_corrupts(spatial_dims, shape):
+    corruptor = GenesisCorruptor(SSLConfig(), spatial_dims)
+    x = torch.rand(2, 1, *shape)
+    y = corruptor(x)
+    assert y.shape == x.shape
+    assert y.dtype == x.dtype
+    assert torch.isfinite(y).all()
+    assert not torch.allclose(y, x)          # something changed
+    assert torch.equal(x, x)                 # input not mutated in place
+
+
+def test_genesis_corruptor_noop_when_all_probs_zero():
+    ssl = SSLConfig()
+    ssl.nonlinear_prob = 0.0
+    ssl.local_shuffle_prob = 0.0
+    ssl.paint_prob = 0.0
+    corruptor = GenesisCorruptor(ssl, 3)
+    x = torch.rand(2, 1, 8, 16, 16)
+    y = corruptor(x)
+    assert torch.allclose(y, x)
+
+
+# ---------------------------------------------------------------------------
+# MIM masking utilities (SimMIM / SparK / iBOT / JEPA shared)
+# ---------------------------------------------------------------------------
+def test_compute_grid_shape_ceil():
+    assert compute_grid_shape((96, 112, 112), 16) == (6, 7, 7)
+    assert compute_grid_shape((30, 30), 16) == (2, 2)        # ceil
+    assert compute_grid_shape((16, 16, 16), [16, 8, 4]) == (1, 2, 4)
+
+
+@pytest.mark.parametrize("spatial,unit", [((8, 8, 8), 4), ((32, 32), 8)])
+def test_sample_unit_mask_ratio_and_binary(spatial, unit):
+    grid = compute_grid_shape(spatial, unit)
+    n_units = int(np.prod(grid))
+    mask = sample_unit_mask(4, grid, 0.6, torch.device("cpu"))
+    assert mask.shape == (4, 1, *grid)
+    assert set(torch.unique(mask).tolist()).issubset({0.0, 1.0})
+    expected = min(max(int(round(0.6 * n_units)), 1), max(n_units - 1, 1))
+    # per-sample masked-unit count is exact
+    assert torch.allclose(mask.flatten(1).sum(1),
+                          torch.full((4,), float(expected)))
+
+
+def test_sample_unit_mask_never_all_or_none():
+    grid = (2, 2, 2)  # 8 units
+    mask = sample_unit_mask(16, grid, 0.99, torch.device("cpu"))
+    s = mask.flatten(1).sum(1)
+    assert (s >= 1).all() and (s <= 7).all()
+
+
+def test_upsample_mask_to_preserves_binary_and_size():
+    grid_mask = sample_unit_mask(2, (3, 4, 4), 0.5, torch.device("cpu"))
+    up = upsample_mask_to(grid_mask, (12, 16, 16))
+    assert up.shape == (2, 1, 12, 16, 16)
+    assert set(torch.unique(up).tolist()).issubset({0.0, 1.0})
+
+
+def test_apply_mask_token_replaces_only_masked():
+    x = torch.zeros(1, 2, 4, 4, 4)
+    mask = torch.zeros(1, 1, 4, 4, 4)
+    mask[..., :2, :, :] = 1.0
+    token = torch.tensor([5.0, 7.0]).view(1, 2, 1, 1, 1)
+    out = apply_mask_token(x, mask, token)
+    assert torch.allclose(out[0, 0, :2], torch.full((2, 4, 4), 5.0))
+    assert torch.allclose(out[0, 1, :2], torch.full((2, 4, 4), 7.0))
+    assert torch.allclose(out[..., 2:, :, :], torch.zeros(1, 2, 2, 4, 4))
+
+
+def test_masked_recon_loss_only_on_masked():
+    pred = torch.zeros(1, 1, 4, 4, 4)
+    target = torch.ones(1, 1, 4, 4, 4)
+    mask = torch.zeros(1, 1, 4, 4, 4)
+    mask[..., :2, :, :] = 1.0           # half masked
+    # only masked positions count; |0-1| = 1 over masked -> mean 1.0
+    loss = masked_recon_loss(pred, target, mask, "l1")
+    assert pytest.approx(float(loss), abs=1e-6) == 1.0
+    # if visible region differs, loss must NOT change (masked-only)
+    pred2 = pred.clone()
+    pred2[..., 2:, :, :] = 99.0
+    loss2 = masked_recon_loss(pred2, target, mask, "l1")
+    assert pytest.approx(float(loss2), abs=1e-6) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# SimMIM model build + forward
+# ---------------------------------------------------------------------------
+def test_build_ssl_mim_model_3d_forward():
+    cfg = _cfg("cubic")
+    model = build_ssl_mim_model(cfg).eval()
+    assert isinstance(model, SSLMIMModel)
+    assert model.out_channels == cfg.model.in_channels
+    assert model.mask_token.shape == (1, cfg.model.in_channels, 1, 1, 1)
+    x = torch.randn(2, cfg.model.in_channels, 16, 32, 32)
+    with torch.no_grad():
+        y = model(x)
+    assert y.shape == x.shape
+
+
+def test_build_ssl_mim_model_2_5d_forward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    model = build_ssl_mim_model(cfg).eval()
+    assert model.mask_token.shape == (1, cfg.model.in_channels, 1, 1)
+    x = torch.randn(2, cfg.model.in_channels, 32, 32)
+    with torch.no_grad():
+        y = model(x)
+    assert y.shape == x.shape
+
+
+def test_build_ssl_mim_model_requires_unet():
+    cfg = _cfg("2_5d")
+    cfg.model.arch = "adm"
+    with pytest.raises(ValueError):
+        build_ssl_mim_model(cfg)
+
+
+def test_simmim_handoff_encoder_only():
+    """SimMIM 仅迁移 encoder：encoder.* 全命中；decoder.*/seg_head.* missing；
+    head.*/mask_token 作为 unexpected 丢弃。"""
+    cfg = _cfg("cubic")
+    mim_sd = strip_common_prefixes(build_ssl_mim_model(cfg).state_dict())
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(mim_sd, strict=False)
+    missing = list(result.missing_keys)
+    unexpected = list(result.unexpected_keys)
+
+    enc_missing = [k for k in missing if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert all(k.startswith("head.") or k == "mask_token" for k in unexpected), \
+        unexpected
+    assert any(k.startswith("decoder.") for k in missing)
+    assert any(k.startswith("seg_head.") for k in missing)
+
+
+# ---------------------------------------------------------------------------
+# SSL -> downstream handoff (the core integration property)
+# ---------------------------------------------------------------------------
+def test_ssl_to_downstream_weight_handoff():
+    cfg = _cfg("cubic")
+    ssl_model = build_ssl_recon_model(cfg)
+    ssl_sd = strip_common_prefixes(ssl_model.state_dict())
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(ssl_sd, strict=False)
+    missing = list(result.missing_keys)
+    unexpected = list(result.unexpected_keys)
+
+    enc_dec_missing = [k for k in missing
+                       if k.startswith("encoder.") or k.startswith("decoder.")]
+    assert enc_dec_missing == [], f"enc/dec keys not transferred: {enc_dec_missing}"
+    assert all(k.startswith("recon_head.") for k in unexpected), unexpected
+    assert any(k.startswith("recon_head.") for k in unexpected)
+    assert any(k.startswith("seg_head.") for k in missing)
+
+
+# ---------------------------------------------------------------------------
+# image-only dataset
+# ---------------------------------------------------------------------------
+def test_image_only_dataset_yields_patches(tmp_path):
+    # write two image-only npz volumes (int16 HU)
+    paths = []
+    for i in range(2):
+        p = tmp_path / f"vol_{i}.npz"
+        img = (np.random.rand(20, 40, 40) * 400 - 200).astype(np.int16)
+        np.savez(p, image=img)
+        paths.append(str(p))
+
+    ds = ImageOnlyPatchDataset(
+        paths, patch_size=[16, 32, 32],
+        intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
+        samples_per_volume=3)
+    assert len(ds) == 2 * 3
+    sample = ds[0]
+    assert set(sample.keys()) == {"image"}
+    assert sample["image"].shape == (1, 16, 32, 32)
+    assert sample["image"].dtype == torch.float32
+    assert torch.isfinite(sample["image"]).all()
+
+
+def _write_labeled_npz(out_dir, n=2, shape=(20, 40, 40)):
+    """写 n 个含 image+label 的 npz；label 为随机 {0,1}（含一些前景）。"""
+    paths = []
+    for i in range(n):
+        p = out_dir / f"lab_{i}.npz"
+        img = (np.random.rand(*shape) * 400 - 200).astype(np.int16)
+        lbl = (np.random.rand(*shape) > 0.7).astype(np.int16)
+        lbl[..., :5, :5] = 1                        # guarantee some foreground
+        np.savez(p, image=img, label=lbl)
+        paths.append(str(p))
+    return paths
+
+
+def test_labeled_dataset_yields_image_and_label(tmp_path):
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
+    from ssltask.data.ssl_dataset import discover_image_npz
+    ds = LabeledPatchDataset(
+        discover_image_npz(str(tmp_path)),
+        patch_size=[16, 32, 32],
+        intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
+        samples_per_volume=2)
+    sample = ds[0]
+    assert set(sample.keys()) == {"image", "label"}
+    assert sample["image"].shape == (1, 16, 32, 32)
+    assert sample["label"].shape == (1, 16, 32, 32)
+    assert torch.isfinite(sample["image"]).all()
+
+
+# ---------------------------------------------------------------------------
+# online seg probe (§0.5)
+# ---------------------------------------------------------------------------
+def test_seg_probe_evaluate_returns_dice(tmp_path):
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
+    cfg = _cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 2
+    ssl.probe_samples_per_volume = 2
+    validate_ssl(ssl, cfg)
+
+    probe = SegProbe(cfg, ssl, torch.device("cpu"))
+    # feed a freshly-built SSL recon model's weights (encoder.* loadable strict)
+    sd = build_ssl_recon_model(cfg).state_dict()
+    out = probe.evaluate(sd)
+    assert "probe_dice" in out
+    assert 0.0 <= out["probe_dice"] <= 1.0
+
+
+def test_seg_probe_rejects_state_dict_without_encoder(tmp_path):
+    _write_labeled_npz(tmp_path, 1, (20, 40, 40))
+    cfg = _cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 1
+    ssl.probe_samples_per_volume = 1
+    validate_ssl(ssl, cfg)
+    probe = SegProbe(cfg, ssl, torch.device("cpu"))
+    with pytest.raises(KeyError):
+        probe.evaluate({"seg_head.conv.weight": torch.zeros(1)})
+
+
+# ---------------------------------------------------------------------------
+# SSLTrainer smoke
+# ---------------------------------------------------------------------------
+class _ImgDataset(Dataset):
+    def __init__(self, n, ch, shape):
+        self.x = [torch.rand(ch, *shape) for _ in range(n)]
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return {"image": self.x[i]}
+
+
+@pytest.mark.parametrize("method", ["genesis", "prior", "simmim"])
+def test_ssl_trainer_one_epoch_smoke(tmp_path, method):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = True
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = SSLConfig(method=method)
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert "model_state_dict" in blob
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+def test_ssl_trainer_with_online_probe(tmp_path):
+    """探针启用：fit 返回 best_probe，ssl_best.pt 由探针 Dice 选出且含 encoder.*。"""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    _write_labeled_npz(probe_dir, 2, (20, 40, 40))
+    out_dir = tmp_path / "out"
+
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = True
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(out_dir)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(probe_dir)
+    ssl.probe_every = 1
+    ssl.probe_iters = 2
+    ssl.probe_samples_per_volume = 2
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_probe" in out
+
+    ckpt = out_dir / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert "best_probe" in blob
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# DINO④ — multi-crop + EMA-teacher self-distillation
+# ---------------------------------------------------------------------------
+def _dino_ssl(**kw):
+    """Small DINO SSLConfig for fast CPU tests (tiny head / few local crops)."""
+    ssl = SSLConfig(method="dino")
+    ssl.dino_out_dim = 128
+    ssl.dino_hidden_dim = 64
+    ssl.dino_bottleneck_dim = 32
+    ssl.dino_local_crops = 2
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+def test_ssl_validate_dino_ok():
+    validate_ssl(_dino_ssl(), _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dino_out_dim", 0),
+    ("dino_hidden_dim", 0),
+    ("dino_head_layers", 0),
+    ("dino_global_crops", 1),          # DINO needs >= 2 globals
+    ("dino_local_crops", -1),
+    ("dino_student_temp", 0.0),
+    ("dino_center_momentum", 1.0),     # must be < 1
+    ("dino_warmup_teacher_temp_frac", 0.0),
+    ("dino_flip_prob", 1.5),
+])
+def test_ssl_validate_dino_rejects_bad(field, value):
+    ssl = _dino_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_ssl_validate_dino_rejects_bad_momentum():
+    ssl = _dino_ssl(dino_momentum_base=0.99, dino_momentum_final=0.9)  # base > final
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_ssl_validate_dino_rejects_bad_scale():
+    ssl = _dino_ssl(dino_local_scale=[0.5, 0.2])  # lo > hi
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_ssl_validate_dino_rejects_bad_crop_size_length():
+    ssl = _dino_ssl(dino_global_size=[16, 16])    # len 2 != spatial_dims 3
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("spatial_dims,shape,gsz,lsz", [
+    (3, (16, 32, 32), [16, 32, 32], [8, 16, 16]),
+    (2, (32, 32), [32, 32], [16, 16]),
+])
+def test_multicrop_generator_shapes(spatial_dims, shape, gsz, lsz):
+    gen = MultiCropGenerator(
+        spatial_dims, global_size=gsz, local_size=lsz, n_global=2, n_local=3)
+    x = torch.rand(2, 1, *shape)
+    out = gen(x)
+    assert len(out["global"]) == 2 and len(out["local"]) == 3
+    for g in out["global"]:
+        assert g.shape == (2, 1, *gsz)
+    for l in out["local"]:
+        assert l.shape == (2, 1, *lsz)
+    flat = torch.cat([t.flatten() for t in out["global"] + out["local"]])
+    assert torch.isfinite(flat).all()
+    assert x.shape == (2, 1, *shape)              # input not mutated in place
+
+
+def test_multicrop_generator_rejects_wrong_dims():
+    gen = MultiCropGenerator(3, global_size=[16, 16, 16], local_size=[8, 8, 8])
+    with pytest.raises(ValueError):
+        gen(torch.rand(2, 1, 16, 16))             # 4D into a 3D generator
+
+
+def test_dino_head_forward_and_frozen_g():
+    head = DINOHead(in_dim=32, out_dim=64, hidden_dim=48, bottleneck_dim=16)
+    x = torch.randn(4, 32)
+    y = head(x)
+    assert y.shape == (4, 64)
+    assert head.last_layer.weight_g.requires_grad is False
+    assert torch.allclose(head.last_layer.weight_g,
+                          torch.ones_like(head.last_layer.weight_g))
+
+
+def test_build_dino_net_3d_forward():
+    cfg = _cfg("cubic")
+    net = build_dino_net(cfg, out_dim=128, hidden_dim=64, bottleneck_dim=32).eval()
+    assert isinstance(net, DINONet)
+    x = torch.randn(2, cfg.model.in_channels, 16, 32, 32)
+    with torch.no_grad():
+        y = net(x)
+    assert y.shape == (2, 128)
+
+
+def test_build_dino_net_2_5d_forward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    net = build_dino_net(cfg, out_dim=64, hidden_dim=32, bottleneck_dim=16).eval()
+    x = torch.randn(2, cfg.model.in_channels, 32, 32)
+    with torch.no_grad():
+        y = net(x)
+    assert y.shape == (2, 64)
+
+
+def test_build_dino_net_requires_unet():
+    cfg = _cfg("2_5d")
+    cfg.model.arch = "adm"
+    with pytest.raises(ValueError):
+        build_dino_net(cfg, out_dim=8)
+
+
+def test_dino_method_loss_runs_and_backward():
+    cfg = _cfg("cubic")
+    ssl = _dino_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert "dino_loss" in logs and "teacher_temp" in logs
+    loss.backward()
+    # student receives grads; frozen teacher never does.
+    assert any(p.grad is not None for p in m.module.student.parameters())
+    assert all(p.grad is None for p in m.module.teacher.parameters())
+
+
+def test_dino_schedules_monotonic():
+    cfg = _cfg()
+    ssl = _dino_ssl()
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(100)
+    m._step = 0
+    t0, mom0 = m._teacher_temp(), m._momentum()
+    m._step = m.total_steps
+    tN, momN = m._teacher_temp(), m._momentum()
+    assert t0 == pytest.approx(ssl.dino_teacher_temp_warmup)
+    assert tN == pytest.approx(ssl.dino_teacher_temp)
+    assert mom0 == pytest.approx(ssl.dino_momentum_base)
+    assert momN == pytest.approx(ssl.dino_momentum_final)
+    assert tN >= t0 and momN >= mom0
+
+
+def test_dino_ema_teacher_update():
+    cfg = _cfg()
+    ssl = _dino_ssl()
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    with torch.no_grad():
+        for p in m.module.student.parameters():
+            p.fill_(1.0)
+        for p in m.module.teacher.parameters():
+            p.zero_()
+    m.on_after_step(5)
+    mom = m._momentum()                       # teacher <- mom*0 + (1-mom)*1
+    for p in m.module.teacher.parameters():
+        assert torch.allclose(p, torch.full_like(p, 1.0 - mom), atol=1e-6)
+
+
+def test_dino_handoff_encoder_only():
+    """DINO 仅迁移（教师）encoder：encoder.* 全命中；无 unexpected；decoder/seg_head missing。"""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _dino_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert list(result.unexpected_keys) == [], list(result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+def test_dino_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False                 # DINO 教师即 EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _dino_ssl()
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert "model_state_dict" in blob
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])

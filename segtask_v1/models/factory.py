@@ -508,34 +508,3 @@ def build_model(cfg: Config):
         mc.aux_head_mode, mc.grad_checkpointing)
 
     return model
-
-
-def build_ssl_model(cfg: Config):
-    """自监督预训练（SSL）重建模型：与分割同构 UNet（复用 ``build_model`` 构建的
-    ``encoder`` / ``decoder`` 子模块）+ 独立命名的重建头 ``recon_head``
-    （out_channels = 模型输入通道数）。
-
-    复用 ``build_model`` 保证编/解码器与下游分割逐参数同名同形 → SSL ckpt 可经
-    分割侧已有的 ``train.pretrain`` 非严格加载干净衔接（enc+dec 命中、seg head 随机）。
-    分割头/深监督/aux 头在此被丢弃（仅取 encoder/decoder），不参与 SSL。
-    """
-    from .ssl import SSLReconModel
-
-    arch = str(cfg.model.arch).lower()
-    if arch != "unet":
-        raise ValueError(
-            f"build_ssl_model requires model.arch=='unet'; got {arch!r}.")
-
-    seg_model = build_model(cfg)  # 复用同一构建路径，确保 enc/dec 同名同形
-    ssl_model = SSLReconModel(
-        encoder      = seg_model.encoder,
-        decoder      = seg_model.decoder,
-        out_channels = int(cfg.model.in_channels),
-        spatial_dims = int(cfg.model.spatial_dims))
-    pc = ssl_model.param_count()
-    logger.info(
-        "Built SSLReconModel [genesis]: enc=%.2fM, dec=%.2fM, "
-        "recon_head=%.2fM, total=%.2fM, out_channels=%d (=in_channels).",
-        pc["encoder"] / 1e6, pc["decoder"] / 1e6,
-        pc["recon_head"] / 1e6, pc["total"] / 1e6, ssl_model.out_channels)
-    return ssl_model

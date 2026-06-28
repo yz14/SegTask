@@ -1,7 +1,7 @@
 """Models Genesis 式自监督破坏变换（image-only，GPU 逐样本）。
 
 输入是干净 image patch ``x: (B, C, *spatial)``（spatial 为 2 或 3 维），输出是
-**破坏后**的同形张量；训练目标是用破坏版重建干净版（见 ``SSLTrainer``）。
+**破坏后**的同形张量；训练目标是用破坏版重建干净版（见 ``GenesisMethod``）。
 
 四类破坏（Zhou et al., Models Genesis, MICCAI'19）：
 - 非线性强度变换（随机 Bézier 曲线）——学 HU/对比剂等强度域不变性；
@@ -9,8 +9,7 @@
 - 内补全（inner-painting）——学局部细节补全（对"补断血管"对味）；
 - 外补全（outer-painting）——学全局上下文。
 
-破坏不依赖标签，与分割增强解耦；强度变换思路与 ``augment.py`` 同源但此处是
-专用的可逆曲线映射。
+破坏不依赖标签；强度变换是专用的可逆曲线映射。
 """
 
 from __future__ import annotations
