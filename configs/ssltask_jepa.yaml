@@ -1,0 +1,121 @@
+# 自监督预训练（ssltask, JEPA-3D⑦ 隐空间掩码预测）示例配置。
+# 运行：  python -m ssltask.pretrain --config configs/ssltask_jepa.yaml
+# 产出：  outputs/ssltask_jepa/ssl_best.pt
+# 衔接：  下游分割/分类训练加 --override train.pretrain=outputs/ssltask_jepa/ssl_best.pt
+#         下游 _load_pretrain 非严格加载：encoder.* 命中（导出的是 EMA 目标编码器）；
+#         decoder.*/seg_head.* 随机；predictor.*/mask_token 作为 unexpected 丢弃。
+#
+# 重要：要让 encoder 权重 1:1 迁移，下游 config 的 `model:` 段（backbone/encoder_channels/
+#       blocks/stem/norm/down 等几何项）应与本文件一致。
+#
+# 数据：只读 image-only npz；SSL 走单视图（multi_res_scales=[1.0]）。
+# 掩码单元 jepa_mask_unit 建议与骨干总下采样步长对齐（此处 5 级 conv3 stem → /16，取 16）。
+# JEPA 不做像素重建、不做对比；目标编码器为上下文编码器的 EMA（train.use_ema 置 false）。
+
+data:
+  npz_dir: "F:/LUNA25/ssl_npz"
+  npz_suffix: ".npz"
+
+  label_values: [0, 1]                 # 仅用于 segtask Config 校验；SSL 不读 label
+  num_classes : 2
+
+  patch_size: [96, 112, 112]
+  patch_mode: "cubic"
+
+  multi_res_scales    : [1.0]          # SSL 单视图（必须长度 1）
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  batch_size     : 2
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  samples_per_volume: 8
+
+
+augment:
+  enabled: false
+
+
+model:
+  backbone: "resnet"
+  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type: "basic"
+
+  norm_type  : "instance"
+  norm_groups: 8
+  activation : "leakyrelu"
+  dropout    : 0.0
+
+  attention_type: "none"
+  skip_attention: true
+
+  # 以下头在 SSL 阶段被丢弃；列出以便与下游对齐。
+  deep_supervision   : false
+  aux_seg_supervision: false
+  aux_topo_head      : false
+
+  stem_mode      : "conv3"
+  decoder_type   : "unet"
+  downsample_mode: "conv"
+  upsample_mode  : "trilinear"
+  skip_mode      : "cat"
+
+
+# 优化器/调度器/AMP/EMA/output_dir/epochs/lr 由 SSL 复用 segtask train.*。
+train:
+  epochs: 200
+
+  optimizer   : "adamw"
+  lr          : 1.0e-3
+  weight_decay: 1.0e-4
+
+  scheduler    : "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4
+  grad_clip_norm  : 12.0
+
+  use_amp  : false
+  amp_dtype: "auto"
+
+  compile_mode: "none"
+
+  use_ema  : false                     # JEPA 目标编码器即上下文编码器的 EMA，trainer EMA 冗余
+  ema_decay: 0.999
+
+  output_dir: "outputs/ssltask_jepa"
+
+  log_every: 10
+
+  seed: 42
+  deterministic: false
+
+
+ssl:
+  method : "jepa"
+
+  # 目标块掩码（被遮单元作为隐空间预测目标）。
+  jepa_mask_ratio: 0.6                 # 目标块覆盖比
+  jepa_mask_unit : 16                  # 与总下采样步长对齐
+  # 在哪一级 encoder 特征上预测（-1=瓶颈）。
+  jepa_feature_level: -1
+  # 轻量预测器：卷积块数 + 隐藏通道（0=取特征通道数）。
+  jepa_predictor_depth : 2
+  jepa_predictor_hidden: 0
+  # 目标编码器 EMA 动量（cosine base→final）。
+  jepa_momentum_base : 0.996
+  jepa_momentum_final: 1.0
+  # 可选 VICReg 抗坍缩正则（方差/协方差项；0=关闭）。
+  jepa_var_weight: 0.0
+  jepa_cov_weight: 0.0
+
+  save_every: 10
