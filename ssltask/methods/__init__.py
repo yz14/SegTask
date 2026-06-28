@@ -13,6 +13,7 @@ import torch
 from .base import SSLMethod
 from .dino import DINOMethod
 from .genesis import GenesisMethod
+from .jepa import JEPAMethod
 from .prior import PriorMethod
 from .simmim import SimMIMMethod
 from .spark import SparKMethod
@@ -23,6 +24,7 @@ _REGISTRY: Dict[str, Type[SSLMethod]] = {
     SimMIMMethod.name: SimMIMMethod,
     DINOMethod.name: DINOMethod,
     SparKMethod.name: SparKMethod,
+    JEPAMethod.name: JEPAMethod,
 }
 
 

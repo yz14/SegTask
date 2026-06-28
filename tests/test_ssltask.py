@@ -43,6 +43,7 @@ from ssltask.data.vesselness import frangi_vesselness
 from ssltask.eval.probe import SegProbe
 from ssltask.methods import build_method
 from ssltask.models.dino_modules import DINOHead, DINONet, build_dino_net
+from ssltask.models.jepa_modules import JEPAPredictor, build_jepa_predictor
 from ssltask.models.ssl_models import (
     SSLMIMModel,
     SSLReconModel,
@@ -998,4 +999,217 @@ def test_spark_trainer_smoke(tmp_path):
     assert ckpt.exists()
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert "model_state_dict" in blob
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# JEPA-3D⑦ — latent-space masked prediction (context/EMA-target + predictor)
+# ---------------------------------------------------------------------------
+def _jepa_ssl(**kw):
+    """Small JEPA SSLConfig for fast CPU tests."""
+    ssl = SSLConfig(method="jepa")
+    ssl.jepa_mask_unit = 8
+    ssl.jepa_mask_ratio = 0.5
+    ssl.jepa_predictor_depth = 2
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation -----------------------------------------------------
+def test_ssl_validate_jepa_ok():
+    validate_ssl(_jepa_ssl(), _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("jepa_mask_ratio", 0.0),
+    ("jepa_mask_ratio", 1.0),
+    ("jepa_mask_unit", 0),
+    ("jepa_predictor_depth", 0),
+    ("jepa_predictor_hidden", -1),
+    ("jepa_var_weight", -1.0),
+    ("jepa_cov_weight", -1.0),
+    ("jepa_feature_level", 99),                # out of encoder_channels range
+])
+def test_ssl_validate_jepa_rejects_bad(field, value):
+    ssl = _jepa_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_ssl_validate_jepa_rejects_bad_momentum():
+    ssl = _jepa_ssl(jepa_momentum_base=0.99, jepa_momentum_final=0.9)  # base>final
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- predictor module ------------------------------------------------------
+@pytest.mark.parametrize("shape", [(2, 8, 4, 4, 4), (2, 8, 8, 8)])
+def test_jepa_predictor_preserves_shape(shape):
+    pred = JEPAPredictor(channels=shape[1], hidden=16, depth=2,
+                         spatial_dims=len(shape) - 2)
+    x = torch.randn(*shape)
+    y = pred(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
+def test_build_jepa_predictor_hidden_defaults_to_channels():
+    cfg = _cfg("cubic")
+    ch = int(cfg.model.encoder_channels[-1])
+    pred = build_jepa_predictor(cfg, channels=ch, hidden=0, depth=2)
+    # hidden==0 -> uses `ch`; final 1x1 conv maps hidden->ch.
+    assert pred.out.in_channels == ch and pred.out.out_channels == ch
+
+
+# ---- loss / gradients ------------------------------------------------------
+def test_jepa_method_loss_runs_and_backward():
+    cfg = _cfg("cubic")
+    ssl = _jepa_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert "jepa_loss" in logs and "ema_momentum" in logs
+    loss.backward()
+    # context encoder + predictor + mask_token learn; EMA target never does.
+    assert any(p.grad is not None for p in m.module.context_encoder.parameters())
+    assert any(p.grad is not None for p in m.module.predictor.parameters())
+    assert m.module.mask_token.grad is not None
+    assert all(p.grad is None for p in m.module.target_encoder.parameters())
+
+
+def test_jepa_vicreg_terms_only_when_enabled():
+    cfg = _cfg("cubic")
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+
+    off = build_method(cfg, _jepa_ssl(), torch.device("cpu"))
+    off.configure_schedule(10); off.train(); off._step = 1
+    _, logs_off = off.compute_loss(batch)
+    assert "vicreg_var" not in logs_off and "vicreg_cov" not in logs_off
+
+    on = build_method(
+        cfg, _jepa_ssl(jepa_var_weight=1.0, jepa_cov_weight=1.0),
+        torch.device("cpu"))
+    on.configure_schedule(10); on.train(); on._step = 1
+    _, logs_on = on.compute_loss(batch)
+    assert logs_on["vicreg_var"] >= 0.0 and logs_on["vicreg_cov"] >= 0.0
+
+
+def test_jepa_target_is_stop_grad_and_initialized_to_context():
+    """Target encoder starts == context encoder and stays grad-free (EMA only)."""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _jepa_ssl(), torch.device("cpu"))
+    for pc, pt in zip(m.module.context_encoder.parameters(),
+                      m.module.target_encoder.parameters()):
+        assert torch.allclose(pc, pt)
+        assert pt.requires_grad is False
+
+
+# ---- EMA target update -----------------------------------------------------
+def test_jepa_ema_target_update():
+    cfg = _cfg()
+    m = build_method(cfg, _jepa_ssl(), torch.device("cpu"))
+    m.configure_schedule(10)
+    with torch.no_grad():
+        for p in m.module.context_encoder.parameters():
+            p.fill_(1.0)
+        for p in m.module.target_encoder.parameters():
+            p.zero_()
+    m.on_after_step(5)
+    mom = m._momentum()                       # target <- mom*0 + (1-mom)*1
+    for p in m.module.target_encoder.parameters():
+        assert torch.allclose(p, torch.full_like(p, 1.0 - mom), atol=1e-6)
+
+
+def test_jepa_momentum_monotonic():
+    cfg = _cfg()
+    ssl = _jepa_ssl()
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(100)
+    m._step = 0
+    mom0 = m._momentum()
+    m._step = m.total_steps
+    momN = m._momentum()
+    assert mom0 == pytest.approx(ssl.jepa_momentum_base)
+    assert momN == pytest.approx(ssl.jepa_momentum_final)
+    assert momN >= mom0
+
+
+# ---- SSL -> downstream handoff (EMA target encoder -> encoder.* only) -------
+def test_jepa_handoff_encoder_only():
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _jepa_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert list(result.unexpected_keys) == [], list(result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+def test_jepa_handoff_exports_target_not_context():
+    """Export must reflect the EMA target encoder, not the context encoder."""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _jepa_ssl(), torch.device("cpu"))
+    with torch.no_grad():
+        for p in m.module.context_encoder.parameters():
+            p.fill_(1.0)
+        for p in m.module.target_encoder.parameters():
+            p.fill_(0.25)
+    sd = m.export_backbone_state_dict()
+    sample = next(v for v in sd.values() if v.numel() > 0)
+    assert torch.allclose(sample, torch.full_like(sample, 0.25))
+
+
+# ---- 2D / 2.5D shape support ----------------------------------------------
+def test_jepa_method_2_5d_forward_backward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    ssl = _jepa_ssl(jepa_mask_unit=8)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10); m.train(); m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 32, 32)}
+    loss, _ = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    loss.backward()
+    assert any(p.grad is not None for p in m.module.context_encoder.parameters())
+
+
+# ---- one-epoch CPU trainer smoke -------------------------------------------
+def test_jepa_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False                 # JEPA target is already EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _jepa_ssl(jepa_var_weight=1.0, jepa_cov_weight=1.0)
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
