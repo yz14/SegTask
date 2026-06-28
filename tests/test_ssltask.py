@@ -42,6 +42,7 @@ from ssltask.data.ssl_dataset import ImageOnlyPatchDataset, LabeledPatchDataset
 from ssltask.data.vesselness import frangi_vesselness
 from ssltask.eval.probe import SegProbe
 from ssltask.methods import build_method
+from ssltask.methods.dino_gram import DINOGramMethod
 from ssltask.models.dino_modules import DINOHead, DINONet, build_dino_net
 from ssltask.models.ssl_models import (
     SSLMIMModel,
@@ -998,4 +999,185 @@ def test_spark_trainer_smoke(tmp_path):
     assert ckpt.exists()
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert "model_state_dict" in blob
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# DINO+Gram⑤ — DINO self-distillation + Gram anchoring on dense features
+# ---------------------------------------------------------------------------
+def _dino_gram_ssl(**kw):
+    """Small DINO+Gram SSLConfig for fast CPU tests."""
+    ssl = SSLConfig(method="dino_gram")
+    ssl.dino_out_dim = 128
+    ssl.dino_hidden_dim = 64
+    ssl.dino_bottleneck_dim = 32
+    ssl.dino_local_crops = 2
+    ssl.dino_gram_start_frac = 0.3
+    ssl.dino_gram_refresh_steps = 1
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation (reuses all dino_* checks + gram-specific) ----------
+def test_ssl_validate_dino_gram_ok():
+    validate_ssl(_dino_gram_ssl(), _cfg())
+
+
+def test_ssl_validate_dino_gram_inherits_dino_checks():
+    ssl = _dino_gram_ssl(dino_global_crops=1)      # DINO rule: needs >= 2 globals
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dino_gram_weight", -1.0),
+    ("dino_gram_start_frac", 1.5),
+    ("dino_gram_start_frac", -0.1),
+    ("dino_gram_refresh_steps", 0),
+    ("dino_gram_feature_level", 99),               # out of encoder_channels range
+])
+def test_ssl_validate_dino_gram_rejects_bad(field, value):
+    ssl = _dino_gram_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- gram weight gating ----------------------------------------------------
+def test_dino_gram_off_before_start_frac():
+    """progress < start_frac => gram disabled: weight==0 and gram_loss==0."""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.5)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 0                                     # progress 0 < 0.5
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert logs["gram_weight"] == 0.0
+    assert logs["gram_loss"] == 0.0
+    assert torch.isfinite(loss) and loss.requires_grad
+
+
+def test_dino_gram_on_after_start_frac_and_backward():
+    """progress >= start_frac => gram active; once student diverges from the
+    gram-teacher snapshot the term is > 0; grads reach only the student."""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.3, dino_gram_weight=2.0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    # perturb the (frozen) gram-teacher so student != snapshot => non-zero Gram.
+    with torch.no_grad():
+        for p in m.module.gram_teacher.parameters():
+            p.add_(0.5)
+    m._step = 5                                     # progress 0.5 >= 0.3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert logs["gram_weight"] == pytest.approx(2.0)
+    assert logs["gram_loss"] > 0.0
+    loss.backward()
+    assert any(p.grad is not None for p in m.module.student.parameters())
+    assert all(p.grad is None for p in m.module.teacher.parameters())
+    assert all(p.grad is None for p in m.module.gram_teacher.parameters())
+
+
+def test_dino_gram_loss_zero_when_snapshot_matches_student():
+    """gram-teacher initialized == teacher == student => identical dense feats =>
+    Gram term is exactly 0 even when the schedule has it enabled."""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 5
+    _, logs = m.compute_loss(
+        {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)})
+    assert logs["gram_weight"] > 0.0
+    assert logs["gram_loss"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ---- gram matrix property --------------------------------------------------
+def test_dino_gram_matrix_is_normalized_gram():
+    """Gram matrix diagonal == 1 (unit L2 rows) and entries in [-1, 1]."""
+    feat = torch.randn(2, 8, 4, 4, 4)
+    g = DINOGramMethod._gram_matrix(feat)
+    assert g.shape == (2, 64, 64)
+    diag = torch.diagonal(g, dim1=-2, dim2=-1)
+    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-5)
+    assert float(g.max()) <= 1.0 + 1e-4 and float(g.min()) >= -1.0 - 1e-4
+
+
+# ---- periodic gram-teacher refresh ----------------------------------------
+def test_dino_gram_teacher_refresh_on_interval():
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_refresh_steps=2)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    # student != teacher so the EMA update actually moves the teacher.
+    with torch.no_grad():
+        for p in m.module.student.parameters():
+            p.fill_(1.0)
+        for p in m.module.teacher.parameters():
+            p.zero_()
+        for p in m.module.gram_teacher.parameters():
+            p.zero_()
+
+    m.on_after_step(1)                              # 1 % 2 != 0 -> no refresh
+    moved = any(not torch.allclose(g, t) for g, t in zip(
+        m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
+    assert moved, "teacher EMA moved but gram-teacher refreshed off-interval"
+
+    m.on_after_step(2)                              # 2 % 2 == 0 -> refresh
+    assert all(torch.allclose(g, t) for g, t in zip(
+        m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
+
+
+# ---- SSL -> downstream handoff (encoder.* only, same as DINO) --------------
+def test_dino_gram_handoff_encoder_only():
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _dino_gram_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert list(result.unexpected_keys) == [], list(result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+# ---- one-epoch CPU trainer smoke (covers gram-on via start_frac=0) ---------
+def test_dino_gram_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False                       # DINO teacher is already EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0)  # gram active from step 0
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
