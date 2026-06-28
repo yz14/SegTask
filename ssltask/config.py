@@ -196,7 +196,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.spark_decoder_min_dim) >= 1,
             f"ssl.spark_decoder_min_dim must be >= 1; got "
             f"{ssl.spark_decoder_min_dim}.")
-    if ssl.method == "dino":
+    if ssl.method in ("dino", "dino_gram"):
         _require(
             int(ssl.dino_out_dim) >= 1,
             f"ssl.dino_out_dim must be >= 1; got {ssl.dino_out_dim}.")
@@ -254,7 +254,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             f"{ssl.dino_intensity_scale}, {ssl.dino_intensity_shift}.")
         if bool(cfg.train.use_ema):
             logger.warning(
-                "ssl.method='dino' with train.use_ema=True: the DINO teacher "
+                "ssl.method=%r with train.use_ema=True: the DINO teacher "
                 "is already an EMA of the student; the trainer-level EMA is "
                 "redundant. Recommend train.use_ema=false for DINO.")
     if ssl.method == "jepa":

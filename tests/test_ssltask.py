@@ -42,6 +42,7 @@ from ssltask.data.ssl_dataset import ImageOnlyPatchDataset, LabeledPatchDataset
 from ssltask.data.vesselness import frangi_vesselness
 from ssltask.eval.probe import SegProbe
 from ssltask.methods import build_method
+from ssltask.methods.dino_gram import DINOGramMethod
 from ssltask.models.dino_modules import DINOHead, DINONet, build_dino_net
 from ssltask.models.jepa_modules import JEPAPredictor, build_jepa_predictor
 from ssltask.models.ssl_models import (
