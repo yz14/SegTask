@@ -1596,3 +1596,163 @@ def test_ibot_trainer_smoke(tmp_path):
     assert ckpt.exists()
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# SparK + DINO⑧ — pixel reconstruction (SparK①) + global distillation (DINO④)
+# ---------------------------------------------------------------------------
+def _sparkdino_ssl(**kw):
+    """Small SparK+DINO SSLConfig for fast CPU tests."""
+    ssl = SSLConfig(method="sparkdino")
+    ssl.dino_out_dim = 128
+    ssl.dino_hidden_dim = 64
+    ssl.dino_bottleneck_dim = 32
+    ssl.dino_local_crops = 2
+    ssl.spark_mask_unit = 8
+    ssl.recon_loss = "mse"
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation (reuses both dino_* and spark_* checks) -------------
+def test_ssl_validate_sparkdino_ok():
+    validate_ssl(_sparkdino_ssl(), _cfg())
+
+
+def test_ssl_validate_sparkdino_inherits_dino_checks():
+    ssl = _sparkdino_ssl(dino_global_crops=1)       # DINO rule: needs >= 2 globals
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_ssl_validate_sparkdino_inherits_spark_checks():
+    ssl = _sparkdino_ssl(spark_mask_ratio=1.0)      # SparK rule: in (0,1)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("value", [-1.0, -0.01])
+def test_ssl_validate_sparkdino_rejects_bad_weight(value):
+    ssl = _sparkdino_ssl(sparkdino_dino_weight=value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- shared encoder receives gradients from BOTH branches ------------------
+def test_sparkdino_loss_runs_and_backward():
+    cfg = _cfg("cubic")
+    ssl = _sparkdino_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert logs["spark_loss"] > 0.0 and "dino_loss" in logs
+    loss.backward()
+    # one shared encoder trained by both branches; SparK decoder + DINO head learn.
+    assert any(p.grad is not None for p in m.module.student.encoder.parameters())
+    assert any(p.grad is not None for p in m.module.spark_decoder.parameters())
+    assert any(p.grad is not None for p in m.module.student.head.parameters())
+    assert all(p.grad is None for p in m.module.teacher.parameters())
+
+
+def test_sparkdino_shares_single_encoder():
+    """SparK branch and DINO student branch use the very same encoder instance."""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _sparkdino_ssl(), torch.device("cpu"))
+    # decoder operates on student.encoder features (no second encoder built).
+    assert hasattr(m.module, "spark_decoder")
+    assert m.module.spark_decoder is not None
+    # teacher has its own (EMA) encoder, distinct from the student/SparK encoder.
+    assert m.module.teacher.encoder is not m.module.student.encoder
+
+
+def test_sparkdino_weight_zero_is_pure_spark():
+    """dino_weight=0 => total loss == SparK reconstruction loss alone."""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _sparkdino_ssl(sparkdino_dino_weight=0.0),
+                     torch.device("cpu"))
+    m.configure_schedule(10); m.train(); m._step = 3
+    loss, logs = m.compute_loss(
+        {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)})
+    assert logs["dino_loss"] > 0.0                  # still computed/logged
+    assert float(loss.detach()) == pytest.approx(logs["spark_loss"], abs=1e-5)
+
+
+def test_sparkdino_weight_scales_dino_term():
+    """Total == spark_loss + mu * dino_loss for the logged components."""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _sparkdino_ssl(sparkdino_dino_weight=2.0),
+                     torch.device("cpu"))
+    m.configure_schedule(10); m.train(); m._step = 3
+    loss, logs = m.compute_loss(
+        {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)})
+    assert logs["dino_weight"] == pytest.approx(2.0)
+    expect = logs["spark_loss"] + 2.0 * logs["dino_loss"]
+    assert float(loss.detach()) == pytest.approx(expect, abs=1e-5)
+
+
+# ---- SSL -> downstream handoff (encoder.* only) ----------------------------
+def test_sparkdino_handoff_encoder_only():
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _sparkdino_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert list(result.unexpected_keys) == [], list(result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+# ---- 2.5D shape support ----------------------------------------------------
+def test_sparkdino_method_2_5d_forward_backward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    ssl = _sparkdino_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10); m.train(); m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert logs["spark_loss"] > 0.0
+    loss.backward()
+    assert any(p.grad is not None for p in m.module.student.encoder.parameters())
+    assert any(p.grad is not None for p in m.module.spark_decoder.parameters())
+
+
+# ---- one-epoch CPU trainer smoke -------------------------------------------
+def test_sparkdino_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False                       # DINO teacher is already EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _sparkdino_ssl()
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
