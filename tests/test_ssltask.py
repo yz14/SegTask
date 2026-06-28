@@ -29,8 +29,11 @@ from ssltask.data.corruptions import GenesisCorruptor
 from ssltask.data.masking import (
     apply_mask_token,
     compute_grid_shape,
+    densify,
+    downsample_mask_to,
     make_unit_mask,
     masked_recon_loss,
+    per_unit_normalize,
     sample_unit_mask,
     upsample_mask_to,
 )
@@ -45,6 +48,12 @@ from ssltask.models.ssl_models import (
     SSLReconModel,
     build_ssl_mim_model,
     build_ssl_recon_model,
+)
+from ssltask.models.spark_modules import (
+    SSLSparkModel,
+    SparkLightDecoder,
+    build_ssl_spark_model,
+    spark_encode,
 )
 from ssltask.trainer import SSLTrainer
 
@@ -755,6 +764,226 @@ def test_dino_trainer_smoke(tmp_path):
     cfg.validate()
 
     ssl = _dino_ssl()
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert "model_state_dict" in blob
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# SparK① — mask-dense-equivalence MIM + lightweight hierarchical decoder
+# ---------------------------------------------------------------------------
+def _spark_ssl(**kw):
+    """Small SparK SSLConfig for fast CPU tests (narrow decoder, small unit)."""
+    ssl = SSLConfig(method="spark")
+    ssl.spark_mask_unit = 8
+    ssl.spark_decoder_dim_div = 4
+    ssl.spark_decoder_min_dim = 8
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation ----------------------------------------------------
+def test_ssl_validate_spark_ok():
+    validate_ssl(_spark_ssl(), _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("spark_mask_ratio", 0.0),
+    ("spark_mask_ratio", 1.0),
+    ("spark_mask_unit", 0),
+    ("spark_decoder_dim_div", 0),
+    ("spark_decoder_min_dim", 0),
+])
+def test_ssl_validate_spark_rejects_bad(field, value):
+    ssl = _spark_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- shared MIM masking utilities SparK relies on --------------------------
+def test_downsample_mask_to_preserves_binary_and_size():
+    full = make_unit_mask(2, (16, 32, 32), 8, 0.6, torch.device("cpu"))
+    down = downsample_mask_to(full, (4, 8, 8))
+    assert down.shape == (2, 1, 4, 8, 8)
+    assert set(torch.unique(down).tolist()).issubset({0.0, 1.0})
+    # identity when target already matches
+    assert downsample_mask_to(full, (16, 32, 32)) is full
+
+
+def test_per_unit_normalize_shift_and_scale_invariant():
+    # unit evenly divides spatial -> per-unit mean/std subtraction is
+    # invariant to a global additive offset and a global multiplicative scale.
+    x = torch.randn(2, 1, 8, 8, 8)
+    base = per_unit_normalize(x, 4)
+    assert base.shape == x.shape and torch.isfinite(base).all()
+    shifted = per_unit_normalize(x + 5.0, 4)
+    scaled = per_unit_normalize(3.0 * x, 4)
+    assert torch.allclose(base, shifted, atol=1e-4)
+    assert torch.allclose(base, scaled, atol=1e-4)
+
+
+def test_densify_keeps_visible_fills_masked_with_embed():
+    feat = torch.ones(1, 2, 4, 4, 4)
+    visible = torch.zeros(1, 1, 4, 4, 4)
+    visible[..., :2, :, :] = 1.0                       # first half visible
+    embed = torch.tensor([5.0, 7.0]).view(1, 2, 1, 1, 1)
+    out = densify(feat, visible, embed)
+    assert torch.allclose(out[..., :2, :, :], torch.ones(1, 2, 2, 4, 4))
+    assert torch.allclose(out[0, 0, 2:], torch.full((2, 4, 4), 5.0))
+    assert torch.allclose(out[0, 1, 2:], torch.full((2, 4, 4), 7.0))
+
+
+# ---- model build + shape-preserving forward --------------------------------
+def test_build_ssl_spark_model_3d_forward():
+    cfg = _cfg("cubic")
+    model = build_ssl_spark_model(cfg, dim_div=4, min_dim=8).eval()
+    assert isinstance(model, SSLSparkModel)
+    assert isinstance(model.spark_decoder, SparkLightDecoder)
+    assert model.out_channels == cfg.model.in_channels
+    x = torch.randn(2, cfg.model.in_channels, 16, 32, 32)
+    mask = make_unit_mask(2, (16, 32, 32), 8, 0.6, x.device)
+    with torch.no_grad():
+        y = model(x, mask)
+    assert y.shape == x.shape
+
+
+def test_build_ssl_spark_model_2_5d_forward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    model = build_ssl_spark_model(cfg, dim_div=4, min_dim=8).eval()
+    x = torch.randn(2, cfg.model.in_channels, 32, 32)
+    mask = make_unit_mask(2, (32, 32), 8, 0.6, x.device)
+    with torch.no_grad():
+        y = model(x, mask)
+    assert y.shape == x.shape
+
+
+def test_build_ssl_spark_model_requires_unet():
+    cfg = _cfg("2_5d")
+    cfg.model.arch = "adm"
+    with pytest.raises(ValueError):
+        build_ssl_spark_model(cfg)
+
+
+def test_spark_decoder_is_lighter_than_encoder():
+    cfg = _cfg("cubic")
+    model = build_ssl_spark_model(cfg, dim_div=4, min_dim=8)
+    pc = model.param_count()
+    assert pc["spark_decoder"] < pc["encoder"]
+    assert pc["total"] == pc["encoder"] + pc["spark_decoder"]
+
+
+# ---- mask-dense equivalence (the core SparK property) ----------------------
+def test_spark_encode_full_density_equals_dense_forward():
+    """mask=0 (fully visible) => gated encode is bit-identical to plain dense
+    encoder.forward — this is what lets pretrain(sparse)/downstream(dense) share
+    one set of encoder weights with zero conversion."""
+    cfg = _cfg("cubic")
+    encoder = build_ssl_spark_model(cfg, dim_div=4, min_dim=8).encoder.eval()
+    x = torch.randn(2, cfg.model.in_channels, 16, 32, 32)
+    with torch.no_grad():
+        dense = encoder(x)
+        feats, vis = spark_encode(encoder, x, torch.zeros(2, 1, 16, 32, 32))
+    assert len(feats) == len(dense)
+    for f, d in zip(feats, dense):
+        assert f.shape == d.shape
+        assert torch.allclose(f, d, atol=1e-6)
+    # full-density visibility masks are all-ones at every scale
+    for v in vis:
+        assert torch.equal(v, torch.ones_like(v))
+
+
+def test_spark_encode_gates_masked_positions_to_zero():
+    """At every scale, masked positions (visible==0) must be exactly zero so the
+    receptive field never leaks into the occluded region."""
+    cfg = _cfg("cubic")
+    encoder = build_ssl_spark_model(cfg, dim_div=4, min_dim=8).encoder.eval()
+    x = torch.randn(2, cfg.model.in_channels, 16, 32, 32)
+    mask = make_unit_mask(2, (16, 32, 32), 8, 0.6, x.device)
+    with torch.no_grad():
+        feats, vis = spark_encode(encoder, x, mask)
+    for f, v in zip(feats, vis):
+        assert f.shape[2:] == v.shape[2:]
+        masked = (v == 0)
+        assert float((f * masked).abs().max()) == 0.0
+
+
+def test_spark_encode_rejects_hierarchical_stem():
+    cfg = _cfg("cubic")
+    encoder = build_ssl_spark_model(cfg, dim_div=4, min_dim=8).encoder
+    encoder.aux_fuse = torch.nn.ModuleDict(            # simulate hierarchical stem
+        {"dummy": torch.nn.Identity()})
+    x = torch.randn(1, cfg.model.in_channels, 16, 32, 32)
+    with pytest.raises(NotImplementedError):
+        spark_encode(encoder, x, torch.zeros(1, 1, 16, 32, 32))
+
+
+# ---- method: loss runs + grads flow to the shared encoder ------------------
+@pytest.mark.parametrize("norm_pix", [True, False])
+def test_spark_method_loss_runs_and_backward(norm_pix):
+    cfg = _cfg("cubic")
+    ssl = _spark_ssl(spark_norm_pix=norm_pix)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.train()
+    batch = {"image": torch.randn(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert "recon_loss" in logs and "mask_ratio" in logs
+    assert pytest.approx(logs["mask_ratio"], abs=1e-9) == ssl.spark_mask_ratio
+    loss.backward()
+    # the shared encoder (the downstream transfer target) must receive grads.
+    assert any(p.grad is not None for p in m.module.encoder.parameters())
+
+
+# ---- SSL -> downstream handoff (encoder.* only) ----------------------------
+def test_spark_handoff_encoder_only():
+    """SparK transfers only the encoder: encoder.* all hit; spark_decoder.* are
+    the only unexpected keys (decoder used-then-discarded); decoder.*/seg_head.*
+    remain missing on the downstream seg model."""
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _spark_ssl(), torch.device("cpu"))
+    sd = strip_common_prefixes(m.export_backbone_state_dict())
+    assert any(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert all(k.startswith("spark_decoder.") for k in result.unexpected_keys), \
+        list(result.unexpected_keys)
+    assert any(k.startswith("spark_decoder.") for k in result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+# ---- one-epoch CPU trainer smoke -------------------------------------------
+def test_spark_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = True
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _spark_ssl()
     validate_ssl(ssl, cfg)
 
     device = torch.device("cpu")
