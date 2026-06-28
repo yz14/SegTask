@@ -14,6 +14,7 @@ from .base import SSLMethod
 from .dino import DINOMethod
 from .dino_gram import DINOGramMethod
 from .genesis import GenesisMethod
+from .ibot import IBOTMethod
 from .jepa import JEPAMethod
 from .prior import PriorMethod
 from .simmim import SimMIMMethod
@@ -27,6 +28,7 @@ _REGISTRY: Dict[str, Type[SSLMethod]] = {
     DINOGramMethod.name: DINOGramMethod,
     SparKMethod.name: SparKMethod,
     JEPAMethod.name: JEPAMethod,
+    IBOTMethod.name: IBOTMethod,
 }
 
 
