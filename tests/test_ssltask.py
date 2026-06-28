@@ -44,6 +44,7 @@ from ssltask.eval.probe import SegProbe
 from ssltask.methods import build_method
 from ssltask.methods.dino_gram import DINOGramMethod
 from ssltask.models.dino_modules import DINOHead, DINONet, build_dino_net
+from ssltask.models.ibot_modules import build_ibot_head, dense_head_forward
 from ssltask.models.jepa_modules import JEPAPredictor, build_jepa_predictor
 from ssltask.models.ssl_models import (
     SSLMIMModel,
@@ -1200,6 +1201,387 @@ def test_jepa_trainer_smoke(tmp_path):
     cfg.validate()
 
     ssl = _jepa_ssl(jepa_var_weight=1.0, jepa_cov_weight=1.0)
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# DINO+Gram⑤ — DINO self-distillation + Gram anchoring on dense features
+# ---------------------------------------------------------------------------
+def _dino_gram_ssl(**kw):
+    """Small DINO+Gram SSLConfig for fast CPU tests."""
+    ssl = SSLConfig(method="dino_gram")
+    ssl.dino_out_dim = 128
+    ssl.dino_hidden_dim = 64
+    ssl.dino_bottleneck_dim = 32
+    ssl.dino_local_crops = 2
+    ssl.dino_gram_start_frac = 0.3
+    ssl.dino_gram_refresh_steps = 1
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation (reuses all dino_* checks + gram-specific) ----------
+def test_ssl_validate_dino_gram_ok():
+    validate_ssl(_dino_gram_ssl(), _cfg())
+
+
+def test_ssl_validate_dino_gram_inherits_dino_checks():
+    ssl = _dino_gram_ssl(dino_global_crops=1)      # DINO rule: needs >= 2 globals
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dino_gram_weight", -1.0),
+    ("dino_gram_start_frac", 1.5),
+    ("dino_gram_start_frac", -0.1),
+    ("dino_gram_refresh_steps", 0),
+    ("dino_gram_feature_level", 99),               # out of encoder_channels range
+])
+def test_ssl_validate_dino_gram_rejects_bad(field, value):
+    ssl = _dino_gram_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- gram weight gating ----------------------------------------------------
+def test_dino_gram_off_before_start_frac():
+    """progress < start_frac => gram disabled: weight==0 and gram_loss==0."""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.5)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 0                                     # progress 0 < 0.5
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert logs["gram_weight"] == 0.0
+    assert logs["gram_loss"] == 0.0
+    assert torch.isfinite(loss) and loss.requires_grad
+
+
+def test_dino_gram_on_after_start_frac_and_backward():
+    """progress >= start_frac => gram active; once student diverges from the
+    gram-teacher snapshot the term is > 0; grads reach only the student."""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.3, dino_gram_weight=2.0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    # perturb the (frozen) gram-teacher so student != snapshot => non-zero Gram.
+    with torch.no_grad():
+        for p in m.module.gram_teacher.parameters():
+            p.add_(0.5)
+    m._step = 5                                     # progress 0.5 >= 0.3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert logs["gram_weight"] == pytest.approx(2.0)
+    assert logs["gram_loss"] > 0.0
+    loss.backward()
+    assert any(p.grad is not None for p in m.module.student.parameters())
+    assert all(p.grad is None for p in m.module.teacher.parameters())
+    assert all(p.grad is None for p in m.module.gram_teacher.parameters())
+
+
+def test_dino_gram_loss_zero_when_snapshot_matches_student():
+    """gram-teacher initialized == teacher == student => identical dense feats =>
+    Gram term is exactly 0 even when the schedule has it enabled."""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 5
+    _, logs = m.compute_loss(
+        {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)})
+    assert logs["gram_weight"] > 0.0
+    assert logs["gram_loss"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ---- gram matrix property --------------------------------------------------
+def test_dino_gram_matrix_is_normalized_gram():
+    """Gram matrix diagonal == 1 (unit L2 rows) and entries in [-1, 1]."""
+    feat = torch.randn(2, 8, 4, 4, 4)
+    g = DINOGramMethod._gram_matrix(feat)
+    assert g.shape == (2, 64, 64)
+    diag = torch.diagonal(g, dim1=-2, dim2=-1)
+    assert torch.allclose(diag, torch.ones_like(diag), atol=1e-5)
+    assert float(g.max()) <= 1.0 + 1e-4 and float(g.min()) >= -1.0 - 1e-4
+
+
+# ---- periodic gram-teacher refresh ----------------------------------------
+def test_dino_gram_teacher_refresh_on_interval():
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_refresh_steps=2)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    # student != teacher so the EMA update actually moves the teacher.
+    with torch.no_grad():
+        for p in m.module.student.parameters():
+            p.fill_(1.0)
+        for p in m.module.teacher.parameters():
+            p.zero_()
+        for p in m.module.gram_teacher.parameters():
+            p.zero_()
+
+    m.on_after_step(1)                              # 1 % 2 != 0 -> no refresh
+    moved = any(not torch.allclose(g, t) for g, t in zip(
+        m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
+    assert moved, "teacher EMA moved but gram-teacher refreshed off-interval"
+
+    m.on_after_step(2)                              # 2 % 2 == 0 -> refresh
+    assert all(torch.allclose(g, t) for g, t in zip(
+        m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
+
+
+# ---- SSL -> downstream handoff (encoder.* only, same as DINO) --------------
+def test_dino_gram_handoff_encoder_only():
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _dino_gram_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert list(result.unexpected_keys) == [], list(result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+# ---- one-epoch CPU trainer smoke (covers gram-on via start_frac=0) ---------
+def test_dino_gram_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False                       # DINO teacher is already EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0)  # gram active from step 0
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# iBOT/DINOv2⑥ — DINO global self-distillation + iBOT masked dense prediction
+# ---------------------------------------------------------------------------
+def _ibot_ssl(**kw):
+    """Small iBOT SSLConfig for fast CPU tests (tiny heads / few local crops)."""
+    ssl = SSLConfig(method="ibot")
+    ssl.dino_out_dim = 128
+    ssl.dino_hidden_dim = 64
+    ssl.dino_bottleneck_dim = 32
+    ssl.dino_local_crops = 2
+    ssl.ibot_mask_unit = 8
+    ssl.ibot_mask_ratio = 0.5
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation (reuses all dino_* checks + ibot-specific) ----------
+def test_ssl_validate_ibot_ok():
+    validate_ssl(_ibot_ssl(), _cfg())
+
+
+def test_ssl_validate_ibot_inherits_dino_checks():
+    ssl = _ibot_ssl(dino_global_crops=1)            # DINO rule: needs >= 2 globals
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("ibot_weight", -1.0),
+    ("ibot_mask_ratio", 0.0),
+    ("ibot_mask_ratio", 1.0),
+    ("ibot_mask_unit", 0),
+    ("ibot_out_dim", -1),
+    ("ibot_feature_level", 99),                     # out of encoder_channels range
+])
+def test_ssl_validate_ibot_rejects_bad(field, value):
+    ssl = _ibot_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- dense projection head -------------------------------------------------
+@pytest.mark.parametrize("shape", [(2, 16, 4, 4, 4), (2, 16, 8, 8)])
+def test_dense_head_forward_shape(shape):
+    head = build_ibot_head(in_dim=shape[1], out_dim=48, hidden_dim=32,
+                           bottleneck_dim=16, n_layers=2)
+    feat = torch.randn(*shape)
+    out = dense_head_forward(head, feat)
+    n = 1
+    for s in shape[2:]:
+        n *= s
+    assert out.shape == (shape[0], n, 48)
+    assert torch.isfinite(out).all()
+
+
+# ---- loss / gradients ------------------------------------------------------
+def test_ibot_method_loss_runs_and_backward():
+    cfg = _cfg("cubic")
+    ssl = _ibot_ssl(ibot_out_dim=48)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert "dino_loss" in logs and "ibot_loss" in logs
+    assert logs["ibot_loss"] > 0.0                  # random init => non-zero CE
+    loss.backward()
+    # student encoder + iBOT student head + mask_token learn; teacher never does.
+    assert any(p.grad is not None for p in m.module.student.encoder.parameters())
+    assert any(p.grad is not None
+               for p in m.module.ibot_student_head.parameters())
+    assert m.module.mask_token.grad is not None
+    assert all(p.grad is None for p in m.module.teacher.parameters())
+    assert all(p.grad is None
+               for p in m.module.ibot_teacher_head.parameters())
+
+
+def test_ibot_weight_scales_extra_term():
+    """ibot_weight=0 => total loss == bare DINO loss (iBOT term contributes 0)."""
+    cfg = _cfg("cubic")
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    torch.manual_seed(0)
+    m0 = build_method(cfg, _ibot_ssl(ibot_weight=0.0), torch.device("cpu"))
+    m0.configure_schedule(10); m0.train(); m0._step = 3
+    loss0, logs0 = m0.compute_loss(batch)
+    # iBOT term still computed/logged, but contributes nothing to the total.
+    assert logs0["ibot_loss"] > 0.0
+    assert float(loss0.detach()) == pytest.approx(logs0["dino_loss"], abs=1e-5)
+
+
+# ---- independent vs shared dense head --------------------------------------
+def test_ibot_independent_head_has_own_params_and_center():
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _ibot_ssl(ibot_out_dim=48, ibot_share_head=False),
+                     torch.device("cpu"))
+    assert m.module.own_heads is True
+    assert m.module.ibot_student_head is not m.module.student.head
+    assert m.module.ibot_center.shape[-1] == 48
+
+
+def test_ibot_shared_head_reuses_global_head():
+    cfg = _cfg("cubic")
+    ssl = _ibot_ssl(ibot_share_head=True)           # default level -1 == bottleneck
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    assert m.module.own_heads is False
+    assert m.module.ibot_student_head is m.module.student.head
+    assert m.module.ibot_teacher_head is m.module.teacher.head
+    assert m.module.ibot_center.shape[-1] == ssl.dino_out_dim
+
+
+def test_ibot_shared_head_requires_bottleneck_level():
+    cfg = _cfg("cubic")
+    ssl = _ibot_ssl(ibot_share_head=True, ibot_feature_level=0)   # 8 != 32 channels
+    validate_ssl(ssl, cfg)
+    with pytest.raises(ValueError):
+        build_method(cfg, ssl, torch.device("cpu"))
+
+
+# ---- EMA of the independent iBOT teacher head ------------------------------
+def test_ibot_teacher_head_ema_update():
+    cfg = _cfg()
+    m = build_method(cfg, _ibot_ssl(ibot_out_dim=48), torch.device("cpu"))
+    m.configure_schedule(10)
+    with torch.no_grad():
+        for p in m.module.ibot_student_head.parameters():
+            p.fill_(1.0)
+        for p in m.module.ibot_teacher_head.parameters():
+            p.zero_()
+    m.on_after_step(5)
+    mom = m._momentum()                             # teacher <- mom*0 + (1-mom)*1
+    for p in m.module.ibot_teacher_head.parameters():
+        assert torch.allclose(p, torch.full_like(p, 1.0 - mom), atol=1e-6)
+
+
+# ---- SSL -> downstream handoff (encoder.* only, same as DINO) --------------
+def test_ibot_handoff_encoder_only():
+    cfg = _cfg("cubic")
+    m = build_method(cfg, _ibot_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+    assert list(result.unexpected_keys) == [], list(result.unexpected_keys)
+    assert any(k.startswith("decoder.") for k in result.missing_keys)
+    assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+# ---- 2.5D shape support ----------------------------------------------------
+def test_ibot_method_2_5d_forward_backward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    ssl = _ibot_ssl(ibot_out_dim=48)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10); m.train(); m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert logs["ibot_loss"] > 0.0
+    loss.backward()
+    assert any(p.grad is not None for p in m.module.student.encoder.parameters())
+
+
+# ---- one-epoch CPU trainer smoke -------------------------------------------
+def test_ibot_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False                       # DINO teacher is already EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _ibot_ssl(ibot_out_dim=48)
     validate_ssl(ssl, cfg)
 
     device = torch.device("cpu")
