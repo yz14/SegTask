@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #: 重建/回归损失。
 RECON_LOSSES = ("l1", "smooth_l1", "mse")
 #: 已实现的 SSL 方法注册键（须与 ``ssltask.methods`` 注册表保持同步；随 P2+ 扩展）。
-METHODS = ("genesis", "prior", "simmim", "dino", "spark")
+METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,7 @@ class SSLConfig:
     #   "simmim"  — mask token 稠密掩码图像建模（SSL.md 方案②）。
     #   "dino"    — 多裁剪 + EMA 教师自蒸馏（SSL.md 方案④）。
     #   "spark"   — 掩码-稠密等价 + 层次解码器像素重建（SSL.md 方案①）。
+    #   "dino_gram" — DINO + Gram anchoring（SSL.md 方案⑤；④ 基础上加密集特征 Gram 约束）。
     method: str = "genesis"
 
     # 重建/回归损失："l1" | "smooth_l1" | "mse"。
@@ -124,6 +125,17 @@ class SSLConfig:
     dino_momentum_base: float = 0.996
     dino_momentum_final: float = 1.0
 
+    # --- method='dino_gram'：DINO + Gram anchoring（SSL.md 方案⑤）---
+    # 复用上面全部 dino_* 项；以下仅 Gram 分支专用。
+    # Gram 损失权重 λ（L = L_DINO + λ·L_gram）。
+    dino_gram_weight: float = 1.0
+    # 训练进度 < 此比例时 λ=0（只跑纯 DINO，待密集特征成形后再锚定）。
+    dino_gram_start_frac: float = 0.3
+    # Gram 教师刷新间隔（优化步）：每多少步从当前 EMA 教师整份拷贝一次快照。
+    dino_gram_refresh_steps: int = 1
+    # 计算 Gram 的 encoder 特征级（feats 索引，-1=瓶颈）。
+    dino_gram_feature_level: int = -1
+
     # --- 在线分割线性探针（SSL.md §0.5；驱动 best 选择，避免按 SSL loss 选模）---
     # 启用后每 probe_every 个 epoch 在 probe_data_dir 的标注 npz 上冻结 encoder 跑线性探针。
     probe_enabled: bool = False
@@ -179,7 +191,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.spark_decoder_min_dim) >= 1,
             f"ssl.spark_decoder_min_dim must be >= 1; got "
             f"{ssl.spark_decoder_min_dim}.")
-    if ssl.method == "dino":
+    if ssl.method in ("dino", "dino_gram"):
         _require(
             int(ssl.dino_out_dim) >= 1,
             f"ssl.dino_out_dim must be >= 1; got {ssl.dino_out_dim}.")
@@ -237,9 +249,26 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             f"{ssl.dino_intensity_scale}, {ssl.dino_intensity_shift}.")
         if bool(cfg.train.use_ema):
             logger.warning(
-                "ssl.method='dino' with train.use_ema=True: the DINO teacher "
+                "ssl.method=%r with train.use_ema=True: the DINO teacher "
                 "is already an EMA of the student; the trainer-level EMA is "
-                "redundant. Recommend train.use_ema=false for DINO.")
+                "redundant. Recommend train.use_ema=false.", ssl.method)
+    if ssl.method == "dino_gram":
+        _require(
+            float(ssl.dino_gram_weight) >= 0.0,
+            f"ssl.dino_gram_weight must be >= 0; got {ssl.dino_gram_weight}.")
+        _require(
+            0.0 <= float(ssl.dino_gram_start_frac) <= 1.0,
+            f"ssl.dino_gram_start_frac must be in [0,1]; got "
+            f"{ssl.dino_gram_start_frac}.")
+        _require(
+            int(ssl.dino_gram_refresh_steps) >= 1,
+            f"ssl.dino_gram_refresh_steps must be >= 1; got "
+            f"{ssl.dino_gram_refresh_steps}.")
+        n_levels = len(cfg.model.encoder_channels)
+        _require(
+            -n_levels <= int(ssl.dino_gram_feature_level) < n_levels,
+            f"ssl.dino_gram_feature_level must index encoder_channels "
+            f"(len {n_levels}); got {ssl.dino_gram_feature_level}.")
     _require(
         ssl.recon_loss in RECON_LOSSES,
         f"Invalid ssl.recon_loss: {ssl.recon_loss!r}. Valid: {RECON_LOSSES}.")
