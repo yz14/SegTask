@@ -399,9 +399,9 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             "ssl.probe_enabled=True requires ssl.probe_data_dir "
             "(a directory of labelled image+label npz).")
         _require(
-            int(cfg.model.spatial_dims) == 3,
-            f"ssl.probe_enabled is only supported for 3D backbones "
-            f"(model.spatial_dims==3); got {cfg.model.spatial_dims}.")
+            int(cfg.model.spatial_dims) in (2, 3),
+            f"ssl.probe_enabled supports 3D (spatial_dims==3) and 2.5D "
+            f"(spatial_dims==2) backbones; got {cfg.model.spatial_dims}.")
         _require(
             int(ssl.probe_every) >= 1,
             f"ssl.probe_every must be >= 1; got {ssl.probe_every}.")

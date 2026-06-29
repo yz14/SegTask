@@ -125,13 +125,14 @@ def test_ssl_validate_probe_requires_dir():
         validate_ssl(ssl, cfg)
 
 
-def test_ssl_validate_probe_rejects_2_5d():
+def test_ssl_validate_probe_accepts_2_5d():
+    """2.5D 在线探针已支持（深度折通道，线性头逐 类×切片 输出）。"""
     cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
     ssl = SSLConfig()
     ssl.probe_enabled = True
     ssl.probe_data_dir = "some/dir"
-    with pytest.raises(ConfigError):
-        validate_ssl(ssl, cfg)
+    validate_ssl(ssl, cfg)        # 不再抛出
 
 
 @pytest.mark.parametrize("field,value", [
@@ -426,6 +427,56 @@ def test_image_only_dataset_yields_patches(tmp_path):
     assert torch.isfinite(sample["image"]).all()
 
 
+def test_image_only_dataset_2_5d_folds_depth_to_channels(tmp_path):
+    """2.5D（spatial_dims=2）：深度 D 折进通道，样本形状为 (D, H, W)。"""
+    p = tmp_path / "vol_0.npz"
+    img = (np.random.rand(20, 40, 40) * 400 - 200).astype(np.int16)
+    np.savez(p, image=img)
+
+    ds = ImageOnlyPatchDataset(
+        [str(p)], patch_size=[16, 32, 32],
+        intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
+        samples_per_volume=2, spatial_dims=2)
+    sample = ds[0]
+    assert sample["image"].shape == (16, 32, 32)        # (C=D, H, W)
+    assert sample["image"].dtype == torch.float32
+    assert torch.isfinite(sample["image"]).all()
+
+
+def test_build_ssl_dataloader_2_5d_batch_shape(tmp_path):
+    """2.5D dataloader 产出 (B, D, H, W)，C=in_channels=patch_size[0]（单 FOV）。"""
+    from ssltask.data.ssl_dataset import build_ssl_dataloader
+    for i in range(2):
+        img = (np.random.rand(20, 40, 40) * 400 - 200).astype(np.int16)
+        np.savez(tmp_path / f"vol_{i}.npz", image=img)
+
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    assert cfg.model.in_channels == cfg.data.patch_size[0]   # single FOV
+    cfg.data.npz_dir = str(tmp_path)
+    cfg.data.batch_size = 2
+    cfg.data.num_workers = 0
+
+    loader = build_ssl_dataloader(cfg)
+    batch = next(iter(loader))
+    assert batch["image"].shape == (2, 16, 32, 32)           # (B, C=D, H, W)
+    assert torch.isfinite(batch["image"]).all()
+
+
+def test_build_ssl_dataloader_2_5d_rejects_multi_fov(tmp_path):
+    """2.5D 多 FOV（in_channels != patch_size[0]）应被拒：image-only SSL 仅支持单 FOV。"""
+    from ssltask.data.ssl_dataset import build_ssl_dataloader
+    img = (np.random.rand(20, 40, 40) * 400 - 200).astype(np.int16)
+    np.savez(tmp_path / "vol_0.npz", image=img)
+
+    cfg = _cfg("2_5d")
+    cfg.data.npz_dir = str(tmp_path)
+    # 制造 in_channels != patch_size[0] 的多 FOV 错配（绕过 sync 直接触发守卫）。
+    cfg.data.patch_size = [8, 32, 32]                        # D=8，但 in_channels 仍=16
+    with pytest.raises(ValueError, match="single-FOV"):
+        build_ssl_dataloader(cfg)
+
+
 def _write_labeled_npz(out_dir, n=2, shape=(20, 40, 40)):
     """写 n 个含 image+label 的 npz；label 为随机 {0,1}（含一些前景）。"""
     paths = []
@@ -454,6 +505,21 @@ def test_labeled_dataset_yields_image_and_label(tmp_path):
     assert torch.isfinite(sample["image"]).all()
 
 
+def test_labeled_dataset_2_5d_folds_depth_to_channels(tmp_path):
+    """2.5D 探针数据集：image/label 均把深度 D 折进通道，形状 (D, H, W)。"""
+    _write_labeled_npz(tmp_path, 1, (20, 40, 40))
+    from ssltask.data.ssl_dataset import discover_image_npz
+    ds = LabeledPatchDataset(
+        discover_image_npz(str(tmp_path)),
+        patch_size=[16, 32, 32],
+        intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
+        samples_per_volume=2, spatial_dims=2)
+    sample = ds[0]
+    assert sample["image"].shape == (16, 32, 32)        # (C=D, H, W)
+    assert sample["label"].shape == (16, 32, 32)
+    assert torch.isfinite(sample["image"]).all()
+
+
 # ---------------------------------------------------------------------------
 # online seg probe (§0.5)
 # ---------------------------------------------------------------------------
@@ -469,6 +535,26 @@ def test_seg_probe_evaluate_returns_dice(tmp_path):
 
     probe = SegProbe(cfg, ssl, torch.device("cpu"))
     # feed a freshly-built SSL recon model's weights (encoder.* loadable strict)
+    sd = build_ssl_recon_model(cfg).state_dict()
+    out = probe.evaluate(sd)
+    assert "probe_dice" in out
+    assert 0.0 <= out["probe_dice"] <= 1.0
+
+
+def test_seg_probe_evaluate_returns_dice_2_5d(tmp_path):
+    """2.5D 在线探针：折叠 D 进通道，线性头输出 num_fg*D 通道，返回合法 Dice。"""
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 2
+    ssl.probe_samples_per_volume = 2
+    validate_ssl(ssl, cfg)
+
+    probe = SegProbe(cfg, ssl, torch.device("cpu"))
+    assert probe.head_out == cfg.num_fg_classes * cfg.data.patch_size[0]
     sd = build_ssl_recon_model(cfg).state_dict()
     out = probe.evaluate(sd)
     assert "probe_dice" in out
@@ -531,6 +617,43 @@ def test_ssl_trainer_one_epoch_smoke(tmp_path, method):
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert "model_state_dict" in blob
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+@pytest.mark.parametrize("method", ["genesis", "simmim", "spark", "dino"])
+def test_ssl_trainer_2_5d_smoke_and_handoff(tmp_path, method):
+    """2.5D（spatial_dims=2，深度折通道）端到端：单 epoch 训练 + 下游 encoder.* 交接。"""
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = method != "dino"        # DINO 教师本身即 EMA
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _dino_ssl() if method == "dino" else SSLConfig(method=method)
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (32, 32))     # (C=D, H, W)
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    sd = torch.load(ckpt, map_location="cpu", weights_only=False)["model_state_dict"]
+    assert any(k.startswith("encoder.") for k in sd)
+
+    # 下游交接：strict=False 载入 2.5D seg 模型，encoder.* 必须全命中。
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(strip_common_prefixes(sd), strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
 
 
 def test_ssl_trainer_with_online_probe(tmp_path):

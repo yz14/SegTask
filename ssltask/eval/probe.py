@@ -12,7 +12,9 @@
 * **可比性**：每次评估都从固定随机种子重置线性头、训练固定步数，跨 epoch 可比。
 * **零侵入下游**：encoder 经 ``build_model(cfg).encoder`` 构造（与 SSL 同构），探针仅读
   SSL 导出 state_dict 的 ``encoder.*`` 子集（``strict=True`` 校验同名同形）。
-* **范围**：当前仅支持 3D（``spatial_dims==3``，与 SSL image-only 通路一致）；2.5D 探针后续再加。
+* **范围**：3D（``spatial_dims==3``）与 2.5D（``spatial_dims==2``，深度 D 折进通道）均支持。
+  2.5D 下线性头输出 ``num_fg*D`` 通道（逐 类×切片 预测，布局 ``b (c d) h w``），与 segtask
+  ``SliceChannelLoss`` 折叠口径一致。
 """
 
 from __future__ import annotations
@@ -49,6 +51,8 @@ def build_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
     train_paths = paths[n_val:] or list(paths)          # 单卷时 train==val
     dc = cfg.data
 
+    spatial_dims = int(cfg.model.spatial_dims)
+
     def _mk(p, spv):
         return LabeledPatchDataset(
             npz_paths          = p,
@@ -56,7 +60,8 @@ def build_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
             intensity_min      = dc.intensity_min,
             intensity_max      = dc.intensity_max,
             normalize          = dc.normalize,
-            samples_per_volume = spv)
+            samples_per_volume = spv,
+            spatial_dims       = spatial_dims)
 
     train_ds = _mk(train_paths, int(ssl.probe_samples_per_volume))
     val_ds = _mk(val_paths, max(int(ssl.probe_samples_per_volume) // 2, 1))
@@ -72,14 +77,18 @@ def build_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
 
 
 class _MultiScaleLinearHead(nn.Module):
-    """逐 encoder 特征级一个 1×1 卷积 → 前景 logits，上采样到输入分辨率后求和。"""
+    """逐 encoder 特征级一个 1×1 卷积 → 前景 logits，上采样到输入分辨率后求和。
 
-    def __init__(self, enc_channels: List[int], num_fg: int, spatial_dims: int):
+    ``out_channels`` ：3D = num_fg；2.5D 折叠 = num_fg*D（逐 类×切片）。
+    """
+
+    def __init__(self, enc_channels: List[int], out_channels: int,
+                 spatial_dims: int):
         super().__init__()
         self.spatial_dims = int(spatial_dims)
         self.mode = INTERP_SMOOTH[self.spatial_dims]
         self.heads = nn.ModuleList(
-            [_CONV[self.spatial_dims](int(c), int(num_fg), kernel_size=1)
+            [_CONV[self.spatial_dims](int(c), int(out_channels), kernel_size=1)
              for c in enc_channels])
 
     def forward(self, feats: List[torch.Tensor], target_spatial) -> torch.Tensor:
@@ -102,12 +111,15 @@ class SegProbe:
         self.ssl = ssl
         self.device = device
         self.spatial_dims = int(cfg.model.spatial_dims)
-        if self.spatial_dims != 3:
+        if self.spatial_dims not in (2, 3):
             raise ValueError(
-                f"SegProbe currently supports 3D only (model.spatial_dims==3); "
-                f"got {self.spatial_dims}. Disable ssl.probe_enabled for 2.5D.")
+                f"SegProbe supports model.spatial_dims in (2, 3); "
+                f"got {self.spatial_dims}.")
         self.num_fg = int(cfg.num_fg_classes)
         self.enc_channels = list(cfg.model.encoder_channels)
+        # 2.5D：深度 D 折进通道，线性头逐 类×切片 输出 num_fg*D 通道；3D=num_fg。
+        self.slab_depth = int(cfg.data.patch_size[0]) if self.spatial_dims == 2 else 1
+        self.head_out = self.num_fg * self.slab_depth
         # 前景类取值（去 bg）；长度应等于 num_fg。
         lv = list(cfg.data.label_values)
         self.fg_values = [float(v) for v in lv[1:]] if len(lv) > 1 else [1.0]
@@ -123,7 +135,19 @@ class SegProbe:
 
     # ------------------------------------------------------------------
     def _binary_target(self, label: torch.Tensor) -> torch.Tensor:
-        """raw label (B,1,*spatial) → 前景二值 (B,num_fg,*spatial)。"""
+        """raw label → 前景二值，与线性头输出同形。
+
+        * 3D：``(B,1,D,H,W) → (B,num_fg,D,H,W)``。
+        * 2.5D：``(B,D,H,W) → (B,num_fg*D,H,W)``，布局 ``b (c d) h w``（类-major、切片-minor），
+          与 ``SliceChannelLoss._split_pred`` / ``binarize_full`` 一致。
+        """
+        if self.spatial_dims == 2:
+            # label 为 (B, D, H, W)（C=D 折叠）。
+            B, D, H, W = label.shape
+            # (B, num_fg, D, H, W)，再 reshape 为 (B, num_fg*D, H, W)（c-major d-minor）。
+            chans = [(label == v).float() for v in self.fg_values]
+            stacked = torch.stack(chans, dim=1)                 # (B, num_fg, D, H, W)
+            return stacked.reshape(B, self.num_fg * D, H, W)
         chans = [(label[:, 0] == v).float() for v in self.fg_values]
         return torch.stack(chans, dim=1)
 
@@ -165,7 +189,7 @@ class SegProbe:
         try:
             torch.manual_seed(self.seed)
             head = _MultiScaleLinearHead(
-                self.enc_channels, self.num_fg, self.spatial_dims).to(self.device)
+                self.enc_channels, self.head_out, self.spatial_dims).to(self.device)
             opt = torch.optim.Adam(head.parameters(), lr=self.lr)
 
             # --- train linear head (encoder frozen) ---
