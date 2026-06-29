@@ -630,6 +630,9 @@ class TrainConfig:
     # （8 卡混用机上易触发 CPU 超额订阅 / 换页抖动 / 内核 soft-lockup）。分摊后**全机
     # 聚合** worker 数与缓存 RAM 与单卡基线一致。默认 True；置 False 保留旧行为（每卡满额）。
     ddp_scale_dataloader_per_rank: bool = True
+    # NCCL collective 超时（分钟）。卡住的集合通信超过此时长会被 watchdog abort，
+    # 避免某 rank 因 peer 已死而无限等待、永久挂起占显存。默认 30 分钟。
+    ddp_timeout_minutes: int = 30
 
     # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
     @property
