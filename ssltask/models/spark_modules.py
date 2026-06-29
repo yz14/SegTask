@@ -235,6 +235,28 @@ class SSLSparkModel(nn.Module):
         return {"encoder": enc, "spark_decoder": dec, "total": enc + dec}
 
 
+def build_spark_decoder(cfg, encoder: nn.Module, dim_div: int = 4,
+                        min_dim: int = 16) -> SparkLightDecoder:
+    """在给定 ``encoder`` 上构造轻量层次解码器（供 SparK① 与 ⑧ SparK+DINO 共用）。
+
+    解码器参数由 ``cfg.model`` 与 encoder 的 ``downsample_strides`` 推导；不持有 encoder。
+    """
+    spatial_dims = int(cfg.model.spatial_dims)
+    encoder_channels = [int(c) for c in cfg.model.encoder_channels]
+    out_ch = int(cfg.model.in_channels)
+    return SparkLightDecoder(
+        encoder_channels  = encoder_channels,
+        out_channels      = out_ch,
+        spatial_dims      = spatial_dims,
+        dim_div           = int(dim_div),
+        min_dim           = int(min_dim),
+        upsample_mode     = cfg.model.upsample_mode,
+        downsample_strides= getattr(encoder, "downsample_strides", None),
+        norm_type         = cfg.model.norm_type,
+        norm_groups       = cfg.model.norm_groups,
+        activation        = cfg.model.activation)
+
+
 def build_ssl_spark_model(cfg, dim_div: int = 4, min_dim: int = 16
                           ) -> SSLSparkModel:
     """构造 SparK 模型：复用 ``build_model`` 的 encoder（保证下游同名同形）。
@@ -250,19 +272,8 @@ def build_ssl_spark_model(cfg, dim_div: int = 4, min_dim: int = 16
     seg_model = build_model(cfg)                 # 同一构建路径，确保 encoder 同名同形
     encoder = seg_model.encoder
     spatial_dims = int(cfg.model.spatial_dims)
-    encoder_channels = [int(c) for c in cfg.model.encoder_channels]
     out_ch = int(cfg.model.in_channels)
-    decoder = SparkLightDecoder(
-        encoder_channels  = encoder_channels,
-        out_channels      = out_ch,
-        spatial_dims      = spatial_dims,
-        dim_div           = int(dim_div),
-        min_dim           = int(min_dim),
-        upsample_mode     = cfg.model.upsample_mode,
-        downsample_strides= getattr(encoder, "downsample_strides", None),
-        norm_type         = cfg.model.norm_type,
-        norm_groups       = cfg.model.norm_groups,
-        activation        = cfg.model.activation)
+    decoder = build_spark_decoder(cfg, encoder, dim_div=dim_div, min_dim=min_dim)
     model = SSLSparkModel(
         encoder=encoder, decoder=decoder, in_channels=out_ch,
         spatial_dims=spatial_dims)
@@ -278,5 +289,5 @@ def build_ssl_spark_model(cfg, dim_div: int = 4, min_dim: int = 16
 
 __all__ = [
     "spark_encode", "SparkUpLevel", "SparkLightDecoder",
-    "SSLSparkModel", "build_ssl_spark_model",
+    "SSLSparkModel", "build_spark_decoder", "build_ssl_spark_model",
 ]
