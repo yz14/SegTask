@@ -1,0 +1,148 @@
+# 自监督预训练（ssltask, SparK+DINO⑧：SparK① 像素重建 + DINO④ 全局蒸馏的朴素多任务组合）。
+# 运行：  python -m ssltask.pretrain --config configs/ssltask_sparkdino.yaml
+# 产出：  outputs/ssltask_sparkdino/ssl_best.pt
+# 衔接：  下游分割/分类训练加 --override train.pretrain=outputs/ssltask_sparkdino/ssl_best.pt
+#         下游 _load_pretrain 非严格加载：encoder.* 命中；decoder.*/seg_head.* 随机
+#         （SparK 解码器 + DINO 头用完即弃；导出的是 **教师** encoder）。
+#
+# 两分支共享同一 encoder：SparK 分支（稀疏掩码输入→encoder→层次解码器→像素重建，同①）
+# 与 DINO 分支（多视图完整输入→encoder→全局池化→投影头→对 EMA 教师蒸馏，同④）。
+# L = L_SparK(像素重建) + μ·L_DINO(全局蒸馏)，μ=sparkdino_dino_weight。目标：分割+分类双强。
+#
+# 重要：要让 encoder 权重 1:1 迁移，下游 config 的 `model:` 段应与本文件一致。
+
+data:
+  npz_dir: "F:/LUNA25/ssl_npz"
+  npz_suffix: ".npz"
+
+  label_values: [0, 1]                 # 仅用于 segtask Config 校验；SSL 不读 label
+  num_classes : 2
+
+  patch_size: [96, 112, 112]
+  patch_mode: "cubic"
+
+  multi_res_scales    : [1.0]          # SSL 单视图（必须长度 1）
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  batch_size     : 2
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  samples_per_volume: 8
+
+
+augment:
+  enabled: false                       # DINO 视图增广在方法内（多裁剪 + 翻转 + 强度抖动）
+
+
+model:
+  backbone: "resnet"
+  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type: "basic"
+
+  norm_type  : "instance"
+  norm_groups: 8
+  activation : "leakyrelu"
+  dropout    : 0.0
+
+  attention_type: "none"
+  skip_attention: true
+
+  # 以下头在 SSL 阶段被丢弃（仅预训练 encoder）；列出以便与下游对齐。
+  deep_supervision   : false
+  aux_seg_supervision: false
+  aux_topo_head      : false
+
+  stem_mode      : "conv3"
+  decoder_type   : "unet"
+  downsample_mode: "conv"
+  upsample_mode  : "trilinear"
+  skip_mode      : "cat"
+
+
+# 优化器/调度器/AMP/output_dir/epochs/lr 由 SSL 复用 segtask train.*。
+train:
+  epochs: 300
+
+  optimizer   : "adamw"
+  lr          : 5.0e-4
+  weight_decay: 4.0e-2                  # DINO 用较大 weight decay
+
+  scheduler    : "cosine"
+  warmup_epochs: 10
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4
+  grad_clip_norm  : 3.0                 # DINO 推荐裁剪到 ~3
+
+  use_amp  : false
+  amp_dtype: "auto"
+
+  compile_mode: "none"
+
+  use_ema  : false                      # DINO 教师即 EMA；关闭训练器级 EMA
+  ema_decay: 0.999
+
+  output_dir: "outputs/ssltask_sparkdino"
+
+  log_every: 10
+
+  seed: 42
+  deterministic: false
+
+
+ssl:
+  method: "sparkdino"
+
+  recon_loss: "mse"                     # SparK 分支：仅被遮位点 L2（同①）
+
+  # --- SparK 分支超参（复用 spark_*）---
+  spark_mask_ratio    : 0.6
+  spark_mask_unit     : 16
+  spark_decoder_dim_div: 4
+  spark_decoder_min_dim: 16
+  spark_norm_pix      : true
+
+  # --- DINO 分支超参（复用 dino_*）---
+  dino_out_dim       : 4096
+  dino_hidden_dim    : 2048
+  dino_bottleneck_dim: 256
+  dino_head_layers   : 3
+  dino_head_use_bn   : false
+
+  dino_global_crops: 2
+  dino_local_crops : 6
+  dino_global_scale: [0.5, 1.0]
+  dino_local_scale : [0.15, 0.5]
+
+  dino_flip_prob      : 0.5
+  dino_intensity_scale: 0.1
+  dino_intensity_shift: 0.1
+
+  dino_student_temp            : 0.1
+  dino_teacher_temp            : 0.07
+  dino_teacher_temp_warmup     : 0.04
+  dino_warmup_teacher_temp_frac: 0.3
+  dino_center_momentum         : 0.9
+  dino_momentum_base           : 0.996
+  dino_momentum_final          : 1.0
+
+  # --- 多任务组合权重（方案⑧专用）---
+  sparkdino_dino_weight: 1.0            # μ：L = L_SparK + μ·L_DINO
+
+  # 在线分割线性探针（§0.5）：强烈建议开启以按 Dice 选 best。
+  # probe_enabled           : true
+  # probe_data_dir          : "F:/LUNA25/probe_npz"
+  # probe_every             : 10
+  # probe_iters             : 200
+  # probe_select_best       : true
+
+  save_every: 10

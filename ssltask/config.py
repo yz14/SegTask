@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #: 重建/回归损失。
 RECON_LOSSES = ("l1", "smooth_l1", "mse")
 #: 已实现的 SSL 方法注册键（须与 ``ssltask.methods`` 注册表保持同步；随 P2+ 扩展）。
-METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot")
+METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot", "sparkdino")
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +56,7 @@ class SSLConfig:
     #   "dino_gram" — DINO + Gram anchoring（SSL.md 方案⑤；④ 基础上加密集特征 Gram 约束）。
     #   "jepa"    — 隐空间掩码预测（上下文/EMA 目标编码器 + 预测器，SSL.md 方案⑦）。
     #   "ibot"    — DINO 全局蒸馏 + iBOT 掩码密集特征预测（SSL.md 方案⑥；④ 基础上加密集头）。
+    #   "sparkdino" — SparK 像素重建 + DINO 全局蒸馏的朴素多任务组合（SSL.md 方案⑧；①+④ 共享 encoder）。
     method: str = "genesis"
 
     # 重建/回归损失："l1" | "smooth_l1" | "mse"。
@@ -168,6 +169,11 @@ class SSLConfig:
     # True=与全局 DINO 头共享原型；False=独立 iBOT 头（DINOv2 默认）。
     ibot_share_head: bool = False
 
+    # --- method='sparkdino'：SparK 像素重建 + DINO 全局蒸馏（SSL.md 方案⑧）---
+    # 双分支共享同一 encoder；SparK 侧复用全部 spark_* 超参、DINO 侧复用全部 dino_*。
+    # L = L_SparK(像素重建) + μ·L_DINO(全局蒸馏)；μ 为 DINO 损失权重。
+    sparkdino_dino_weight: float = 1.0
+
     # --- 在线分割线性探针（SSL.md §0.5；驱动 best 选择，避免按 SSL loss 选模）---
     # 启用后每 probe_every 个 epoch 在 probe_data_dir 的标注 npz 上冻结 encoder 跑线性探针。
     probe_enabled: bool = False
@@ -208,7 +214,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
         _require(
             int(ssl.mim_head_dim) >= 0,
             f"ssl.mim_head_dim must be >= 0 (0=auto); got {ssl.mim_head_dim}.")
-    if ssl.method == "spark":
+    if ssl.method in ("spark", "sparkdino"):
         _require(
             0.0 < float(ssl.spark_mask_ratio) < 1.0,
             f"ssl.spark_mask_ratio must be in (0,1); got {ssl.spark_mask_ratio}.")
@@ -223,7 +229,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.spark_decoder_min_dim) >= 1,
             f"ssl.spark_decoder_min_dim must be >= 1; got "
             f"{ssl.spark_decoder_min_dim}.")
-    if ssl.method in ("dino", "dino_gram", "ibot"):
+    if ssl.method in ("dino", "dino_gram", "ibot", "sparkdino"):
         _require(
             int(ssl.dino_out_dim) >= 1,
             f"ssl.dino_out_dim must be >= 1; got {ssl.dino_out_dim}.")
@@ -353,6 +359,11 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             -n_levels <= int(ssl.ibot_feature_level) < n_levels,
             f"ssl.ibot_feature_level must index encoder_channels (len "
             f"{n_levels}); got {ssl.ibot_feature_level}.")
+    if ssl.method == "sparkdino":
+        _require(
+            float(ssl.sparkdino_dino_weight) >= 0.0,
+            f"ssl.sparkdino_dino_weight must be >= 0; got "
+            f"{ssl.sparkdino_dino_weight}.")
     _require(
         ssl.recon_loss in RECON_LOSSES,
         f"Invalid ssl.recon_loss: {ssl.recon_loss!r}. Valid: {RECON_LOSSES}.")
