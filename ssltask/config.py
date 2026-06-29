@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #: 重建/回归损失。
 RECON_LOSSES = ("l1", "smooth_l1", "mse")
 #: 已实现的 SSL 方法注册键（须与 ``ssltask.methods`` 注册表保持同步；随 P2+ 扩展）。
-METHODS = ("genesis", "prior", "simmim", "dino", "spark")
+METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,9 @@ class SSLConfig:
     #   "simmim"  — mask token 稠密掩码图像建模（SSL.md 方案②）。
     #   "dino"    — 多裁剪 + EMA 教师自蒸馏（SSL.md 方案④）。
     #   "spark"   — 掩码-稠密等价 + 层次解码器像素重建（SSL.md 方案①）。
+    #   "dino_gram" — DINO + Gram anchoring（SSL.md 方案⑤；④ 基础上加密集特征 Gram 约束）。
+    #   "jepa"    — 隐空间掩码预测（上下文/EMA 目标编码器 + 预测器，SSL.md 方案⑦）。
+    #   "ibot"    — DINO 全局蒸馏 + iBOT 掩码密集特征预测（SSL.md 方案⑥；④ 基础上加密集头）。
     method: str = "genesis"
 
     # 重建/回归损失："l1" | "smooth_l1" | "mse"。
@@ -124,6 +127,47 @@ class SSLConfig:
     dino_momentum_base: float = 0.996
     dino_momentum_final: float = 1.0
 
+    # --- method='jepa'：隐空间掩码预测（SSL.md 方案⑦）---
+    # 目标块掩码：单元尺寸（体素）与覆盖比例（被遮单元占比，作为预测目标）。
+    jepa_mask_unit: int = 16
+    jepa_mask_ratio: float = 0.6
+    # 在哪一级 encoder 特征上预测（feats 索引，-1=瓶颈）。
+    jepa_feature_level: int = -1
+    # 轻量预测器：卷积块数 + 隐藏通道（0=取特征通道数）。
+    jepa_predictor_depth: int = 2
+    jepa_predictor_hidden: int = 0
+    # 目标编码器 EMA 动量（cosine base→final）。
+    jepa_momentum_base: float = 0.996
+    jepa_momentum_final: float = 1.0
+    # 可选 VICReg 抗坍缩正则权重（方差项 / 协方差项；0=关闭）。
+    jepa_var_weight: float = 0.0
+    jepa_cov_weight: float = 0.0
+
+    # --- method='dino_gram'：DINO + Gram anchoring（SSL.md 方案⑤）---
+    # 复用上面全部 dino_* 项；以下仅 Gram 分支专用。
+    # Gram 损失权重 λ（L = L_DINO + λ·L_gram）。
+    dino_gram_weight: float = 1.0
+    # 训练进度 < 此比例时 λ=0（只跑纯 DINO，待密集特征成形后再锚定）。
+    dino_gram_start_frac: float = 0.3
+    # Gram 教师刷新间隔（优化步）：每多少步从当前 EMA 教师整份拷贝一次快照。
+    dino_gram_refresh_steps: int = 1
+    # 计算 Gram 的 encoder 特征级（feats 索引，-1=瓶颈）。
+    dino_gram_feature_level: int = -1
+
+    # --- method='ibot'：DINO 全局蒸馏 + iBOT 掩码密集特征预测（SSL.md 方案⑥）---
+    # 复用上面全部 dino_* 项（多裁剪/温度/center/EMA 动量/投影头维度）；以下仅 iBOT 分支专用。
+    # iBOT 掩码密集特征损失权重（L = L_DINO + λ·L_iBOT）。
+    ibot_weight: float = 1.0
+    # 学生输入掩码比例（iBOT 经验 0.3–0.5）与掩码单元边长（体素）。
+    ibot_mask_ratio: float = 0.4
+    ibot_mask_unit: int = 16
+    # 计算密集特征的 encoder 特征级（feats 索引，-1=瓶颈）。
+    ibot_feature_level: int = -1
+    # iBOT 密集头原型数（0=复用 dino_out_dim）。
+    ibot_out_dim: int = 0
+    # True=与全局 DINO 头共享原型；False=独立 iBOT 头（DINOv2 默认）。
+    ibot_share_head: bool = False
+
     # --- 在线分割线性探针（SSL.md §0.5；驱动 best 选择，避免按 SSL loss 选模）---
     # 启用后每 probe_every 个 epoch 在 probe_data_dir 的标注 npz 上冻结 encoder 跑线性探针。
     probe_enabled: bool = False
@@ -179,7 +223,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.spark_decoder_min_dim) >= 1,
             f"ssl.spark_decoder_min_dim must be >= 1; got "
             f"{ssl.spark_decoder_min_dim}.")
-    if ssl.method == "dino":
+    if ssl.method in ("dino", "dino_gram", "ibot"):
         _require(
             int(ssl.dino_out_dim) >= 1,
             f"ssl.dino_out_dim must be >= 1; got {ssl.dino_out_dim}.")
@@ -237,9 +281,78 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             f"{ssl.dino_intensity_scale}, {ssl.dino_intensity_shift}.")
         if bool(cfg.train.use_ema):
             logger.warning(
-                "ssl.method='dino' with train.use_ema=True: the DINO teacher "
+                "ssl.method=%r with train.use_ema=True: the DINO teacher "
                 "is already an EMA of the student; the trainer-level EMA is "
-                "redundant. Recommend train.use_ema=false for DINO.")
+                "redundant. Recommend train.use_ema=false.", ssl.method)
+    if ssl.method == "jepa":
+        _require(
+            0.0 < float(ssl.jepa_mask_ratio) < 1.0,
+            f"ssl.jepa_mask_ratio must be in (0,1); got {ssl.jepa_mask_ratio}.")
+        _require(
+            int(ssl.jepa_mask_unit) >= 1,
+            f"ssl.jepa_mask_unit must be >= 1; got {ssl.jepa_mask_unit}.")
+        _require(
+            int(ssl.jepa_predictor_depth) >= 1,
+            f"ssl.jepa_predictor_depth must be >= 1; got "
+            f"{ssl.jepa_predictor_depth}.")
+        _require(
+            int(ssl.jepa_predictor_hidden) >= 0,
+            f"ssl.jepa_predictor_hidden must be >= 0 (0=feature channels); got "
+            f"{ssl.jepa_predictor_hidden}.")
+        _require(
+            0.0 < float(ssl.jepa_momentum_base) <= float(ssl.jepa_momentum_final) <= 1.0,
+            f"ssl.jepa_momentum_base/final must satisfy 0<base<=final<=1; got "
+            f"{ssl.jepa_momentum_base}, {ssl.jepa_momentum_final}.")
+        _require(
+            float(ssl.jepa_var_weight) >= 0.0 and float(ssl.jepa_cov_weight) >= 0.0,
+            f"ssl.jepa_var_weight/cov_weight must be >= 0; got "
+            f"{ssl.jepa_var_weight}, {ssl.jepa_cov_weight}.")
+        n_levels = len(cfg.model.encoder_channels)
+        _require(
+            -n_levels <= int(ssl.jepa_feature_level) < n_levels,
+            f"ssl.jepa_feature_level must index encoder_channels (len "
+            f"{n_levels}); got {ssl.jepa_feature_level}.")
+        if bool(cfg.train.use_ema):
+            logger.warning(
+                "ssl.method='jepa' with train.use_ema=True: the JEPA target "
+                "encoder is already an EMA of the context encoder; the "
+                "trainer-level EMA is redundant. Recommend train.use_ema=false.")
+    if ssl.method == "dino_gram":
+        _require(
+            float(ssl.dino_gram_weight) >= 0.0,
+            f"ssl.dino_gram_weight must be >= 0; got {ssl.dino_gram_weight}.")
+        _require(
+            0.0 <= float(ssl.dino_gram_start_frac) <= 1.0,
+            f"ssl.dino_gram_start_frac must be in [0,1]; got "
+            f"{ssl.dino_gram_start_frac}.")
+        _require(
+            int(ssl.dino_gram_refresh_steps) >= 1,
+            f"ssl.dino_gram_refresh_steps must be >= 1; got "
+            f"{ssl.dino_gram_refresh_steps}.")
+        n_levels = len(cfg.model.encoder_channels)
+        _require(
+            -n_levels <= int(ssl.dino_gram_feature_level) < n_levels,
+            f"ssl.dino_gram_feature_level must index encoder_channels "
+            f"(len {n_levels}); got {ssl.dino_gram_feature_level}.")
+    if ssl.method == "ibot":
+        _require(
+            float(ssl.ibot_weight) >= 0.0,
+            f"ssl.ibot_weight must be >= 0; got {ssl.ibot_weight}.")
+        _require(
+            0.0 < float(ssl.ibot_mask_ratio) < 1.0,
+            f"ssl.ibot_mask_ratio must be in (0,1); got {ssl.ibot_mask_ratio}.")
+        _require(
+            int(ssl.ibot_mask_unit) >= 1,
+            f"ssl.ibot_mask_unit must be >= 1; got {ssl.ibot_mask_unit}.")
+        _require(
+            int(ssl.ibot_out_dim) >= 0,
+            f"ssl.ibot_out_dim must be >= 0 (0=use dino_out_dim); got "
+            f"{ssl.ibot_out_dim}.")
+        n_levels = len(cfg.model.encoder_channels)
+        _require(
+            -n_levels <= int(ssl.ibot_feature_level) < n_levels,
+            f"ssl.ibot_feature_level must index encoder_channels (len "
+            f"{n_levels}); got {ssl.ibot_feature_level}.")
     _require(
         ssl.recon_loss in RECON_LOSSES,
         f"Invalid ssl.recon_loss: {ssl.recon_loss!r}. Valid: {RECON_LOSSES}.")

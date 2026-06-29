@@ -12,7 +12,10 @@ import torch
 
 from .base import SSLMethod
 from .dino import DINOMethod
+from .dino_gram import DINOGramMethod
 from .genesis import GenesisMethod
+from .ibot import IBOTMethod
+from .jepa import JEPAMethod
 from .prior import PriorMethod
 from .simmim import SimMIMMethod
 from .spark import SparKMethod
@@ -22,7 +25,10 @@ _REGISTRY: Dict[str, Type[SSLMethod]] = {
     PriorMethod.name: PriorMethod,
     SimMIMMethod.name: SimMIMMethod,
     DINOMethod.name: DINOMethod,
+    DINOGramMethod.name: DINOGramMethod,
     SparKMethod.name: SparKMethod,
+    JEPAMethod.name: JEPAMethod,
+    IBOTMethod.name: IBOTMethod,
 }
 
 
