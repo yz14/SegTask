@@ -27,8 +27,9 @@ class GenesisMethod(SSLMethod):
     def build_modules(self) -> nn.Module:
         return build_ssl_recon_model(self.cfg)
 
-    def compute_loss(self, batch: Dict[str, torch.Tensor]
-                     ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(
+        self, batch: Dict[str, torch.Tensor]
+        ) -> Tuple[torch.Tensor, Dict[str, float]]:
         clean = batch["image"]
         model_input = self.corruptor(clean)          # @no_grad 内部已 clone
         pred = self.module(model_input)

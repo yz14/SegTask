@@ -32,8 +32,7 @@ def setup_logging(output_dir: str, level: str = "INFO") -> None:
 def main():
     parser = argparse.ArgumentParser(description="Self-Supervised Pretraining (ssltask)")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
-    parser.add_argument("--override", nargs="*", default=[],
-                        help="Config overrides (key=value); ssl.* routes to SSLConfig")
+    parser.add_argument("--override", nargs="*", default=[], help="Config overrides (key=value); ssl.* routes to SSLConfig")
     parser.add_argument("--log-level", type=str, default="INFO")
     args = parser.parse_args()
 
