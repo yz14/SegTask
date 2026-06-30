@@ -1,6 +1,8 @@
 data:
   image_suffix: ".nii.gz"
+  label_suffix: "-seg.nii.gz"
   bbox_suffix : "_pred.nii.gz"
+  region_weight_suffix: "-seg.nii.gz"
 
   image_dir: "F:/lung_paired/imgs"
   bbox_dir : "F:/lung_paired/lung_resnet_bnorm_pred"
@@ -27,7 +29,7 @@ data:
   stratified_split: true
 
   batch_size     : 4
-  num_workers    : 16
+  num_workers    : 8
   prefetch_factor: 8
   pin_memory     : true
 
@@ -99,17 +101,12 @@ model:
 
   aux_head_mode: "conv"
 
-  # 中心线/距离场辅助头（拓扑感知多任务监督，与多 FOV aux 相互独立）。
-  # 2.5D 用 centerline（软骨架，逐切片 2D，保连通），训练期前向、eval 零开销。
-  aux_topo_head      : true
-  aux_topo_target    : "centerline"
-  aux_topo_head_mode : "conv"
-
   drop_path_rate : 0.0
 
   decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
   downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
   upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
+  upsample_norm_act: true
   skip_mode      : "cat"          # 'cat' | 'add'
 
   drop_path_rate : 0.0
@@ -118,14 +115,13 @@ model:
   # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合、
   # axes=hw 只在 H/W 膨胀（肺 CT z 各向异性）。先验证有效再往更多 stage / 解码器铺开。
   multirf_enabled       : true
-  multirf_dilations     : [1, 2, 3]      # 必须含 1（守门支路）
-  multirf_mode          : "split"        # 'split'(≈等成本) | 'parallel'(≈N×)
-  multirf_fusion        : "concat_proj"  # 'concat_proj' | 'sum'(需 parallel) | 'se'
-  multirf_axes          : "hw"           # 'hw'(保 z, 推荐) | 'all'
-  # 编码器逐 stage（长度=len(encoder_channels)=5；浅→深，末位=bottleneck）。
-  multirf_encoder_stages: [0, 0, 1, 1, 1]
-  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅）。默认关，作为第二轮对照。
-  multirf_decoder_stages: [0, 0, 0, 0]
+  multirf_dilations     : [1, 2, 3]        # 必须含 1（守门支路）
+  multirf_mode          : "split"          # 'split'(≈等成本) | 'parallel'(≈N×)
+  multirf_fusion        : "concat_proj"    # 'concat_proj' | 'sum'(需 parallel) | 'se'
+  multirf_axes          : "hw"             # 'hw'(保 z, 推荐) | 'all'
+  multirf_encoder_stages: [0, 1, 1, 1, 1]  # 编码器逐 stage；浅→深，末位=bottleneck
+  multirf_decoder_stages: [1, 1, 1, 0]     # 解码器逐 level；深→浅
+  multirf_branch_norm_act: true
 
 
 loss:
@@ -154,17 +150,19 @@ loss:
 
   aux_supervision_weights: [0.5, 0.5]
 
-  # 中心线辅助头损失：total += aux_topo_weight * soft-dice(skeleton)。
-  aux_topo_weight: 0.3
-  aux_topo_iter  : 3             # 软骨架迭代步（2D）
-  aux_topo_loss  : "auto"        # centerline → soft-dice
-
 
 train:
-  epochs: 400
+  epochs: 1000
+  
+  # ---- 多卡 DDP ----
+  gpus: [1,3,4,5,7]                         # 要用的物理卡号列表（你 8 卡 4090 混用机，按需选空闲卡）
+  ddp_find_unused_parameters: true  # 深监督/多头默认 true 保正确；确认全参每步参与可设 false 提一点速
+  ddp_master_port: 0                # 0=自动挑空闲端口（混用机避免端口冲突）；也可固定如 29501
+ 
+  val_every: 1  
 
   optimizer   : "adamw"
-  lr          : 1.0e-3
+  lr          : 1.0e-4
   weight_decay: 1.0e-4
 
   scheduler    : "cosine"
@@ -172,7 +170,7 @@ train:
   warmup_lr    : 1.0e-6
   cosine_min_lr: 1.0e-6
 
-  grad_accum_steps: 1
+  grad_accum_steps: 2
   grad_clip_norm  : 12.0
 
   use_amp  : true
@@ -183,13 +181,13 @@ train:
   use_ema  : true
   ema_decay: 0.999
 
-  output_dir      : "outputs/ves_multirf"    ############################################################
+  output_dir      : "outputs/ves_multirf2d_mmore"    ############################################################
   save_every      : 10
   save_best_criterion: ""
   surface_dice_tolerance: 1
   surface_dice_weight: 0.5
   save_best_preset: "vessel"
-  val_metric_mode: "medium"
+  val_metric_mode: "high"
 
   early_stopping: 0
 
@@ -217,3 +215,21 @@ predict:
   threshold : 0.5
   output_dir: ""
   save_probabilities: false
+
+
+vis:
+  enabled          : false                 # 设 true 即生成 HTML
+  output_dir       : ""                    # 空 => train.output_dir/visualization/
+  filename         : "pipeline_vis.html"
+  flows            : ["data", "model", "predict"]   # 视图子集 + 标签页顺序
+  trace_shapes     : true                  # 模型流 dummy 前向追踪真实形状
+  max_detail_params: 200                   # 单节点详情最多条数
+
+
+monitor:
+  enabled            : false                 # 设 true 即落盘 + 渲染仪表盘
+  output_dir         : ""                   # 空 => train.output_dir（HTML 落此，数据落其 monitor/）
+  filename           : "training_monitor.html"
+  update_every       : 1                    # 每多少 epoch 重渲染（best/末轮总会刷新）
+  auto_reload_seconds: 10                   # 训练中 HTML 自动重载间隔（秒）
+  run_name           : ""                   # 对比页显示名；空 => output_dir 目录名
