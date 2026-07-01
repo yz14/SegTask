@@ -158,7 +158,8 @@ class LabeledPatchDataset(Dataset):
         samples_per_volume: int = 1,
         global_mean       : float = 0.0,
         global_std        : float = 1.0,
-        spatial_dims      : int = 3):
+        spatial_dims      : int = 3,
+        cls_label_key     : str = ""):
         self.paths = list(npz_paths)
         if not self.paths:
             raise ValueError("LabeledPatchDataset got empty npz_paths.")
@@ -179,6 +180,7 @@ class LabeledPatchDataset(Dataset):
         self.global_mean = float(global_mean)
         self.global_std = float(global_std)
         self.spv = max(int(samples_per_volume), 1)
+        self.cls_label_key = str(cls_label_key)
         logger.info(
             "LabeledPatchDataset (probe): %d volumes x %d samples = %d, patch=%s, "
             "spatial_dims=%d (%s)",
@@ -199,15 +201,22 @@ class LabeledPatchDataset(Dataset):
                 self.normalize, self.global_mean, self.global_std,
                 inplace=False)
             lbl = np.asarray(f["label"])
+            cls_label = None
+            if self.cls_label_key:
+                if self.cls_label_key not in f.files:
+                    raise KeyError(
+                        f"probe npz {path!r} has no {self.cls_label_key!r} "
+                        f"key (keys={list(f.files)}).")
+                cls_label = np.asarray(f[self.cls_label_key])
         if img.shape != lbl.shape:
             raise ValueError(
                 f"image/label shape mismatch in {path!r}: "
                 f"{img.shape} vs {lbl.shape}.")
-        return img, lbl
+        return img, lbl, cls_label
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path = self.paths[idx % len(self.paths)]
-        img, lbl = self._load(path)                       # (D,H,W) fp32 / raw
+        img, lbl, cls_label = self._load(path)            # (D,H,W) fp32 / raw
         if img.ndim != 3:
             raise ValueError(
                 f"probe expects 3D volume (D,H,W); got {img.shape} in {path!r}.")
@@ -220,7 +229,10 @@ class LabeledPatchDataset(Dataset):
             img_t = img_t.unsqueeze(0)                             # (1,pD,pH,pW)
             lbl_t = lbl_t.unsqueeze(0)
         # 2.5D：(pD,pH,pW) = (C=D, H, W)，深度折进通道。
-        return {"image": img_t, "label": lbl_t}
+        out = {"image": img_t, "label": lbl_t}
+        if cls_label is not None:
+            out["cls_label"] = torch.from_numpy(np.asarray(cls_label))
+        return out
 
 
 def build_ssl_dataloader(cfg) -> DataLoader:

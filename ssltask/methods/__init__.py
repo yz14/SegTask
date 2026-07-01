@@ -11,7 +11,9 @@ from typing import Dict, Type
 import torch
 
 from .base import SSLMethod
+from .byol import BYOLMethod
 from .dino import DINOMethod
+from .moco import MoCoMethod
 from .dino_gram import DINOGramMethod
 from .genesis import GenesisMethod
 from .ibot import IBOTMethod
@@ -28,6 +30,8 @@ _REGISTRY: Dict[str, Type[SSLMethod]] = {
     DINOMethod.name: DINOMethod,
     DINOGramMethod.name: DINOGramMethod,
     SparKMethod.name: SparKMethod,
+    BYOLMethod.name: BYOLMethod,
+    MoCoMethod.name: MoCoMethod,
     JEPAMethod.name: JEPAMethod,
     IBOTMethod.name: IBOTMethod,
     SparkDINOMethod.name: SparkDINOMethod,

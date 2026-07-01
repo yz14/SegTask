@@ -15,6 +15,9 @@ Covers:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -40,6 +43,9 @@ from ssltask.data.masking import (
 from ssltask.data.multicrop import MultiCropGenerator
 from ssltask.data.ssl_dataset import ImageOnlyPatchDataset, LabeledPatchDataset
 from ssltask.data.vesselness import frangi_vesselness
+from ssltask.eval.cls_probe import ClsProbe, macro_cls_metrics
+from ssltask.eval.metrics import hd95
+from ssltask.eval.pipeline import build_nested_shot_splits, run_eval_pipeline
 from ssltask.eval.probe import SegProbe
 from ssltask.methods import build_method
 from ssltask.methods.dino_gram import DINOGramMethod
@@ -80,6 +86,23 @@ def _cfg(patch_mode="cubic"):
     cfg.model.encoder_channels = [8, 16, 32]
     cfg.model.blocks_per_level = 1
     cfg.model.stem_mode = "conv3"
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
+def _cls_cfg(patch_mode="cubic"):
+    cfg = _cfg(patch_mode)
+    cfg.data.label_values = [0, 1, 2]
+    cfg.data.num_classes = 3
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
+def _eval_cfg(patch_mode="cubic"):
+    cfg = _cls_cfg(patch_mode)
+    cfg.data.batch_size = 1
     cfg.sync()
     cfg.validate()
     return cfg
@@ -502,7 +525,7 @@ def test_build_ssl_dataloader_2_5d_rejects_multi_fov(tmp_path):
         build_ssl_dataloader(cfg)
 
 
-def _write_labeled_npz(out_dir, n=2, shape=(20, 40, 40)):
+def _write_labeled_npz(out_dir, n=2, shape=(20, 40, 40), cls_labels=None):
     """写 n 个含 image+label 的 npz；label 为随机 {0,1}（含一些前景）。"""
     paths = []
     for i in range(n):
@@ -510,7 +533,10 @@ def _write_labeled_npz(out_dir, n=2, shape=(20, 40, 40)):
         img = (np.random.rand(*shape) * 400 - 200).astype(np.int16)
         lbl = (np.random.rand(*shape) > 0.7).astype(np.int16)
         lbl[..., :5, :5] = 1                        # guarantee some foreground
-        np.savez(p, image=img, label=lbl)
+        payload = {"image": img, "label": lbl}
+        if cls_labels is not None:
+            payload["cls_label"] = np.asarray(cls_labels[i])
+        np.savez(p, **payload)
         paths.append(str(p))
     return paths
 
@@ -562,8 +588,9 @@ def test_seg_probe_evaluate_returns_dice(tmp_path):
     # feed a freshly-built SSL recon model's weights (encoder.* loadable strict)
     sd = build_ssl_recon_model(cfg).state_dict()
     out = probe.evaluate(sd)
-    assert "probe_dice" in out
+    assert set(out) == {"probe_dice", "probe_hd95"}
     assert 0.0 <= out["probe_dice"] <= 1.0
+    assert out["probe_hd95"] >= 0.0
 
 
 def test_seg_probe_evaluate_returns_dice_2_5d(tmp_path):
@@ -582,8 +609,40 @@ def test_seg_probe_evaluate_returns_dice_2_5d(tmp_path):
     assert probe.head_out == cfg.num_fg_classes * cfg.data.patch_size[0]
     sd = build_ssl_recon_model(cfg).state_dict()
     out = probe.evaluate(sd)
-    assert "probe_dice" in out
+    assert set(out) == {"probe_dice", "probe_hd95"}
     assert 0.0 <= out["probe_dice"] <= 1.0
+    assert out["probe_hd95"] >= 0.0
+
+
+def test_seg_probe_frozen_and_finetune_gradients(tmp_path):
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
+    cfg = _cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 1
+    ssl.probe_samples_per_volume = 1
+    validate_ssl(ssl, cfg)
+    batch = next(iter(SegProbe(cfg, ssl, torch.device("cpu")).train_loader))
+
+    frozen_probe = SegProbe(cfg, ssl, torch.device("cpu"), finetune=False)
+    frozen_probe._load_encoder(build_ssl_recon_model(cfg).state_dict())
+    frozen_head = frozen_probe._build_head()
+    frozen_opt = torch.optim.Adam(frozen_head.parameters(), lr=1e-3)
+    frozen_probe._train_step(batch, frozen_head, frozen_opt, torch.nn.BCEWithLogitsLoss())
+    assert all(p.grad is None for p in frozen_probe.encoder.parameters())
+    assert any(p.grad is not None for p in frozen_head.parameters())
+
+    finetune_probe = SegProbe(cfg, ssl, torch.device("cpu"), finetune=True)
+    finetune_probe._load_encoder(build_ssl_recon_model(cfg).state_dict())
+    finetune_head = finetune_probe._build_head()
+    finetune_opt = torch.optim.Adam(
+        [{"params": finetune_probe.encoder.parameters(), "lr": 1e-4},
+         {"params": finetune_head.parameters(), "lr": 1e-3}]
+    )
+    finetune_probe._train_step(batch, finetune_head, finetune_opt, torch.nn.BCEWithLogitsLoss())
+    assert any(p.grad is not None for p in finetune_probe.encoder.parameters())
+    assert any(p.grad is not None for p in finetune_head.parameters())
 
 
 def test_seg_probe_rejects_state_dict_without_encoder(tmp_path):
@@ -601,6 +660,200 @@ def test_seg_probe_rejects_state_dict_without_encoder(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# offline metrics / sampling
+# ---------------------------------------------------------------------------
+def test_hd95_basic_cases():
+    a = np.zeros((16, 16), dtype=np.uint8)
+    a[4:8, 4:8] = 1
+    assert hd95(a, a) == pytest.approx(0.0)
+
+    b = np.zeros((16, 16), dtype=np.uint8)
+    b[5:9, 4:8] = 1  # one-voxel shift along the first axis
+    assert hd95(a, b) == pytest.approx(1.0, rel=0.25)
+
+    empty = np.zeros((16, 16), dtype=np.uint8)
+    assert hd95(a, empty) != hd95(a, empty)  # nan by convention
+    assert hd95(empty, empty) == pytest.approx(0.0)
+
+
+def test_nested_shot_splits_are_nested_and_reproducible():
+    train_pool = [f"v{i}" for i in range(6)]
+    a = build_nested_shot_splits(train_pool, [1, 2, 5, 99], seed=7)
+    b = build_nested_shot_splits(train_pool, [1, 2, 5, 99], seed=7)
+    assert a == b
+    assert a[1] == a[2][:1]
+    assert a[2] == a[5][:2]
+    assert a[5] == a[99][:5]
+    assert len(a[99]) == len(train_pool)
+
+
+# ---------------------------------------------------------------------------
+# online cls probe (§0.4)
+# ---------------------------------------------------------------------------
+def test_cls_probe_evaluate_returns_metrics_3d(tmp_path):
+    _write_labeled_npz(tmp_path, 3, (20, 40, 40))
+    cfg = _cls_cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 2
+    ssl.probe_samples_per_volume = 2
+    validate_ssl(ssl, cfg)
+
+    probe = ClsProbe(cfg, ssl, torch.device("cpu"))
+    sd = build_ssl_recon_model(cfg).state_dict()
+    out = probe.evaluate(sd)
+    assert set(out) == {"cls_auc", "cls_f1"}
+    assert 0.0 <= out["cls_auc"] <= 1.0
+    assert 0.0 <= out["cls_f1"] <= 1.0
+
+
+def test_cls_probe_evaluate_returns_metrics_2_5d(tmp_path):
+    _write_labeled_npz(tmp_path, 3, (20, 40, 40))
+    cfg = _cls_cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 2
+    ssl.probe_samples_per_volume = 2
+    validate_ssl(ssl, cfg)
+
+    probe = ClsProbe(cfg, ssl, torch.device("cpu"))
+    sd = build_ssl_recon_model(cfg).state_dict()
+    out = probe.evaluate(sd)
+    assert set(out) == {"cls_auc", "cls_f1"}
+    assert 0.0 <= out["cls_auc"] <= 1.0
+    assert 0.0 <= out["cls_f1"] <= 1.0
+
+
+def test_cls_probe_frozen_and_finetune_gradients(tmp_path):
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
+    cfg = _cls_cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 1
+    ssl.probe_samples_per_volume = 1
+    validate_ssl(ssl, cfg)
+    batch = next(iter(ClsProbe(cfg, ssl, torch.device("cpu")).train_loader))
+
+    frozen_probe = ClsProbe(cfg, ssl, torch.device("cpu"), finetune=False)
+    frozen_probe._load_encoder(build_ssl_recon_model(cfg).state_dict())
+    frozen_head = frozen_probe._build_head()
+    frozen_opt = torch.optim.Adam(frozen_head.parameters(), lr=1e-3)
+    frozen_probe._train_step(batch, frozen_head, frozen_opt, torch.nn.BCEWithLogitsLoss())
+    assert all(p.grad is None for p in frozen_probe.encoder.parameters())
+    assert any(p.grad is not None for p in frozen_head.parameters())
+
+    finetune_probe = ClsProbe(cfg, ssl, torch.device("cpu"), finetune=True)
+    finetune_probe._load_encoder(build_ssl_recon_model(cfg).state_dict())
+    finetune_head = finetune_probe._build_head()
+    finetune_opt = torch.optim.Adam(
+        [{"params": finetune_probe.encoder.parameters(), "lr": 1e-4},
+         {"params": finetune_head.parameters(), "lr": 1e-3}]
+    )
+    finetune_probe._train_step(batch, finetune_head, finetune_opt, torch.nn.BCEWithLogitsLoss())
+    assert any(p.grad is not None for p in finetune_probe.encoder.parameters())
+    assert any(p.grad is not None for p in finetune_head.parameters())
+
+
+def test_cls_probe_encoder_only_load_and_missing_encoder_key(tmp_path):
+    _write_labeled_npz(tmp_path, 1, (20, 40, 40))
+    cfg = _cls_cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 1
+    ssl.probe_samples_per_volume = 1
+    validate_ssl(ssl, cfg)
+    probe = ClsProbe(cfg, ssl, torch.device("cpu"))
+
+    sd = strip_common_prefixes(build_ssl_recon_model(cfg).state_dict())
+    sd["decoder.fake"] = torch.zeros(1)
+    probe._load_encoder(sd)
+
+    with pytest.raises(KeyError):
+        probe._load_encoder({"decoder.fake": torch.zeros(1)})
+
+
+def test_cls_probe_metrics_helpers():
+    y_true = np.array([[1, 0], [0, 1], [1, 0], [0, 1]], dtype=np.float32)
+    perfect = np.array([[0.99, 0.01], [0.02, 0.98], [0.95, 0.05], [0.05, 0.95]], dtype=np.float32)
+    reverse = 1.0 - perfect
+    ties = np.full_like(perfect, 0.5)
+    out = macro_cls_metrics(y_true, perfect)
+    assert out["cls_auc"] == pytest.approx(1.0)
+    assert out["cls_f1"] == pytest.approx(1.0)
+    out = macro_cls_metrics(y_true, reverse)
+    assert out["cls_auc"] == pytest.approx(0.0)
+    out = macro_cls_metrics(y_true, ties)
+    assert out["cls_auc"] == pytest.approx(0.5)
+
+
+def test_offline_eval_pipeline_smoke(tmp_path):
+    cls_labels = [
+        np.array([1, 0], dtype=np.int16),
+        np.array([0, 1], dtype=np.int16),
+        np.array([1, 1], dtype=np.int16),
+        np.array([0, 0], dtype=np.int16),
+    ]
+    _write_labeled_npz(tmp_path, 4, (12, 20, 20), cls_labels=cls_labels)
+    cfg = _eval_cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.eval_data_dir = str(tmp_path)
+    ssl.eval_shots = [1, 2]
+    ssl.eval_readouts = ["linear", "finetune"]
+    ssl.eval_tasks = ["seg", "cls"]
+    ssl.eval_out_dir = str(tmp_path / "eval_out")
+    ssl.eval_holdout_ratio = 0.25
+    ssl.eval_seed = 3
+    ssl.probe_iters = 1
+    ssl.probe_samples_per_volume = 1
+    ssl.cls_probe_iters = 1
+    ssl.cls_probe_hidden_dim = 16
+    ssl.cls_label_key = "cls_label"
+    validate_ssl(ssl, cfg)
+
+    ckpt = tmp_path / "pretrained.pt"
+    torch.save({"model_state_dict": build_ssl_recon_model(cfg).state_dict()}, ckpt)
+
+    res = run_eval_pipeline(
+        cfg,
+        ssl,
+        entries=[("pretrained", ckpt), ("B2", None)],
+        shots=[1, 2],
+        readouts=["linear", "finetune"],
+        tasks=["seg", "cls"],
+        out_dir=tmp_path / "eval_out",
+    )
+    assert Path(res["json_path"]).exists()
+    assert Path(res["csv_path"]).exists()
+    assert set(res["nested"]) == {"pretrained", "B2"}
+    assert len(res["rows"]) == 16
+    for row in res["rows"]:
+        assert row["entry"] in {"pretrained", "B2"}
+        assert row["task"] in {"seg", "cls"}
+        assert row["readout"] in {"linear", "finetune"}
+        assert row["shots"] in {1, 2}
+        if row["task"] == "seg":
+            assert row["dice"] is not None and 0.0 <= row["dice"] <= 1.0
+            assert row["hd95"] is not None and row["hd95"] >= 0.0
+        else:
+            assert row["auc"] is not None and 0.0 <= row["auc"] <= 1.0
+            assert row["f1"] is not None and 0.0 <= row["f1"] <= 1.0
+    seg_metrics = res["nested"]["pretrained"]["seg"]["linear"][1]
+    assert set(seg_metrics) == {"probe_dice", "probe_hd95"}
+    cls_metrics = res["nested"]["pretrained"]["cls"]["linear"][1]
+    assert set(cls_metrics) == {"cls_auc", "cls_f1"}
+
+    with open(res["json_path"], "r", encoding="utf-8") as f:
+        blob = json.load(f)
+    assert "nested" in blob and "rows" in blob
+    with open(res["csv_path"], "r", encoding="utf-8") as f:
+        header = f.readline().strip().split(",")
+    assert header == ["entry", "task", "readout", "shots", "dice", "hd95", "auc", "f1"]
+
+
+# ---------------------------------------------------------------------------
 # SSLTrainer smoke
 # ---------------------------------------------------------------------------
 class _ImgDataset(Dataset):
@@ -614,12 +867,12 @@ class _ImgDataset(Dataset):
         return {"image": self.x[i]}
 
 
-@pytest.mark.parametrize("method", ["genesis", "prior", "simmim"])
+@pytest.mark.parametrize("method", ["genesis", "prior", "simmim", "byol", "moco"])
 def test_ssl_trainer_one_epoch_smoke(tmp_path, method):
     cfg = _cfg("cubic")
     cfg.train.epochs = 1
     cfg.train.warmup_epochs = 0
-    cfg.train.use_ema = True
+    cfg.train.use_ema = method not in ("dino", "byol", "moco")
     cfg.train.use_amp = False
     cfg.train.grad_accum_steps = 1
     cfg.train.output_dir = str(tmp_path)
@@ -644,14 +897,14 @@ def test_ssl_trainer_one_epoch_smoke(tmp_path, method):
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
 
 
-@pytest.mark.parametrize("method", ["genesis", "simmim", "spark", "dino"])
+@pytest.mark.parametrize("method", ["genesis", "simmim", "spark", "dino", "byol", "moco"])
 def test_ssl_trainer_2_5d_smoke_and_handoff(tmp_path, method):
     """2.5D（spatial_dims=2，深度折通道）端到端：单 epoch 训练 + 下游 encoder.* 交接。"""
     cfg = _cfg("2_5d")
     assert cfg.model.spatial_dims == 2
     cfg.train.epochs = 1
     cfg.train.warmup_epochs = 0
-    cfg.train.use_ema = method != "dino"        # DINO 教师本身即 EMA
+    cfg.train.use_ema = method not in ("dino", "byol", "moco")
     cfg.train.use_amp = False
     cfg.train.grad_accum_steps = 1
     cfg.train.output_dir = str(tmp_path)
@@ -930,6 +1183,157 @@ def test_dino_trainer_smoke(tmp_path):
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert "model_state_dict" in blob
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# B1 — BYOL-3D / MoCo-3D
+# ---------------------------------------------------------------------------
+def _byol_ssl(**kw):
+    ssl = SSLConfig(method="byol")
+    ssl.byol_proj_dim = 32
+    ssl.byol_pred_hidden_dim = 48
+    ssl.dino_hidden_dim = 64
+    ssl.dino_global_scale = [0.5, 1.0]
+    ssl.dino_local_scale = [0.15, 0.5]
+    ssl.dino_flip_prob = 0.5
+    ssl.dino_intensity_scale = 0.1
+    ssl.dino_intensity_shift = 0.1
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+def _moco_ssl(**kw):
+    ssl = SSLConfig(method="moco")
+    ssl.moco_proj_dim = 32
+    ssl.moco_queue_size = 8
+    ssl.moco_temperature = 0.2
+    ssl.dino_hidden_dim = 64
+    ssl.dino_global_scale = [0.5, 1.0]
+    ssl.dino_local_scale = [0.15, 0.5]
+    ssl.dino_flip_prob = 0.5
+    ssl.dino_intensity_scale = 0.1
+    ssl.dino_intensity_shift = 0.1
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+def test_ssl_validate_byol_ok():
+    validate_ssl(_byol_ssl(), _cfg())
+
+
+def test_ssl_validate_moco_ok():
+    validate_ssl(_moco_ssl(), _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("byol_proj_dim", 0),
+    ("byol_pred_hidden_dim", 0),
+    ("byol_momentum_base", 0.0),
+])
+def test_ssl_validate_byol_rejects_bad(field, value):
+    ssl = _byol_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("moco_proj_dim", 0),
+    ("moco_queue_size", 1),
+    ("moco_temperature", 0.0),
+])
+def test_ssl_validate_moco_rejects_bad(field, value):
+    ssl = _moco_ssl()
+    setattr(ssl, field, value)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+@pytest.mark.parametrize("method,ssl_factory", [
+    ("byol", _byol_ssl),
+    ("moco", _moco_ssl),
+])
+def test_byol_moco_loss_backward_and_handoff(method, ssl_factory):
+    cfg = _cfg("cubic")
+    ssl = ssl_factory()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m._step = 3
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss) and loss.requires_grad
+    assert any(k.endswith("_loss") for k in logs)
+    loss.backward()
+    if method == "byol":
+        assert any(p.grad is not None for p in m.module.online.encoder.parameters())
+        assert any(p.grad is not None for p in m.module.predictor.parameters())
+        assert all(p.grad is None for p in m.module.target.parameters())
+    else:
+        assert any(p.grad is not None for p in m.module.query.encoder.parameters())
+        assert all(p.grad is None for p in m.module.key.parameters())
+
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in result.missing_keys if k.startswith("encoder.")]
+    assert enc_missing == [], f"encoder keys not transferred: {enc_missing}"
+
+
+def test_byol_moco_method_2_5d_forward_backward():
+    cfg = _cfg("2_5d")
+    assert cfg.model.spatial_dims == 2
+    for ssl in (_byol_ssl(), _moco_ssl()):
+        validate_ssl(ssl, cfg)
+        m = build_method(cfg, ssl, torch.device("cpu"))
+        m.configure_schedule(10)
+        m.train()
+        m._step = 3
+        batch = {"image": torch.rand(2, cfg.model.in_channels, 32, 32)}
+        loss, logs = m.compute_loss(batch)
+        assert torch.isfinite(loss) and loss.requires_grad
+        assert any(k.endswith("_loss") for k in logs)
+        loss.backward()
+        assert any(p.grad is not None for p in m.module.parameters())
+
+
+def test_moco_queue_updates_and_wraps():
+    cfg = _cfg("cubic")
+    ssl = _moco_ssl(moco_queue_size=6)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    assert int(m.module.queue_ptr.item()) == 0
+
+    _, _ = m.compute_loss(batch)
+    assert int(m.module.queue_ptr.item()) == 4
+    q = m.module.queue
+    assert q.shape == (ssl.moco_proj_dim, ssl.moco_queue_size)
+    norms = torch.linalg.norm(q, dim=0)
+    assert torch.isfinite(norms).all()
+    assert torch.all(norms > 0)
+    _, _ = m.compute_loss(batch)
+    assert int(m.module.queue_ptr.item()) == 2
+
+
+def test_byol_moco_handoff_can_load_probe_encoder(tmp_path):
+    _write_labeled_npz(tmp_path, 1, (20, 40, 40))
+    cfg = _cls_cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 1
+    ssl.probe_samples_per_volume = 1
+    validate_ssl(ssl, cfg)
+    byol_sd = build_method(cfg, _byol_ssl(), torch.device("cpu")).export_backbone_state_dict()
+    moco_sd = build_method(cfg, _moco_ssl(), torch.device("cpu")).export_backbone_state_dict()
+    probe = ClsProbe(cfg, ssl, torch.device("cpu"))
+    probe._load_encoder(byol_sd)
+    probe._load_encoder(moco_sd)
 
 
 # ---------------------------------------------------------------------------
