@@ -32,7 +32,7 @@ import torch.nn as nn
 
 from ..config import Config
 from ..models.topology import ModelTopology, build_topology
-from .data_flow import _model_input_shape, _target_patch_size
+from .data_flow import _model_input_shape
 from .graph import VisGraph, assign_grid_layout, shape_str
 
 logger = logging.getLogger(__name__)
@@ -725,9 +725,8 @@ def build_model_flow(
 ) -> VisGraph:
     """构造模型流 ``VisGraph``。``trace_shapes=False`` 时跳过 dummy 前向、纯结构图。"""
     topo = topo or build_topology(cfg)
-    target = _target_patch_size(cfg)
-    in_shape = _model_input_shape(cfg, topo, target)
-    in_shape = (1,) + tuple(in_shape[1:])  # 追踪 batch 固定为 1（省算力）
+    in_shape = _model_input_shape(cfg, topo)
+    trace_shape = (1,) + tuple(in_shape[1:])  # 追踪 batch 固定为 1（省算力）
 
     g = VisGraph(title="模型流 Model Flow")
 
@@ -735,7 +734,7 @@ def build_model_flow(
     traced = False
     if trace_shapes:
         try:
-            recs, traced = _trace_modules(model, in_shape)
+            recs, traced = _trace_modules(model, trace_shape)
         except Exception as e:  # 追踪整体失败 → 纯结构
             logger.warning("model_flow: 数据流追踪失败，退化为纯结构图: %s", e)
     if not recs:

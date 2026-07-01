@@ -74,15 +74,15 @@ def _target_patch_size(cfg: Config) -> Tuple[int, int, int]:
 
 
 def _model_input_shape(
-    cfg: Config, topo: ModelTopology, target: Tuple[int, int, int],
+    cfg: Config, topo: ModelTopology,
 ) -> Tuple[int, ...]:
-    """pipeline 重塑后送入模型的张量形状（含 batch 维）。"""
+    """模型实际输入张量形状（含 batch 维）。"""
     B = int(cfg.data.batch_size)
-    tD, tH, tW = target
+    pD, pH, pW = (int(x) for x in cfg.data.patch_size)
     if topo.spatial_dims == 2:
         # 2.5D 折叠：深度并入通道；空间仅 (H, W)。
-        return (B, topo.in_channels, tH, tW)
-    return (B, topo.in_channels, tD, tH, tW)
+        return (B, topo.in_channels, pH, pW)
+    return (B, topo.in_channels, pD, pH, pW)
 
 
 def _reshape_note(topo: ModelTopology) -> str:
@@ -115,7 +115,7 @@ def build_data_flow(cfg: Config, topo: Optional[ModelTopology] = None) -> VisGra
 
     extract, cube, cube_note = _extract_cube_shape(cfg, topo)
     target = _target_patch_size(cfg)
-    model_in = _model_input_shape(cfg, topo, target)
+    model_in = _model_input_shape(cfg, topo)
 
     g = VisGraph(title="数据流 Data Flow")
     g.meta = {

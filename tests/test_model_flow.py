@@ -8,12 +8,17 @@ block，其叶子级连边曾因「只认直接产出叶子(in_src)、不认 fun
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
+import torch
 
 from segtask_v1.config import load_config
+from segtask_v1.losses.losses import build_loss
 from segtask_v1.models.factory import build_model
+from segtask_v1.models.topology import build_topology
+from segtask_v1.trainer.pipelines.factory import build_pipeline
 from segtask_v1.visualization import model_flow as model_flow_mod
 from segtask_v1.visualization.data_flow import build_data_flow
 from segtask_v1.visualization.model_flow import build_model_flow
@@ -26,6 +31,15 @@ def _build(cfg_name: str):
     cfg = load_config(str(_CONFIGS / cfg_name))
     model = build_model(cfg)
     return build_model_flow(cfg, model, trace_shapes=True)
+
+
+def _model_input_shape(cfg):
+    topo = build_topology(cfg)
+    model = build_model(cfg)
+    g = build_model_flow(cfg, model, trace_shapes=False)
+    node = next(n for n in g.nodes if n.id == "input")
+    shape = ast.literal_eval(node.key_info["shape"])
+    return topo, shape
 
 
 def _children(g, parent_id):
@@ -244,6 +258,44 @@ def test_linear_flows_no_stacking(cfg_name):
         # 线性链：rank 逐级递增、跨越所有节点（不止 rank0）。
         assert max(r for r, _ in cells) == len(g.nodes) - 1, \
             f"{cfg_name} {builder.__name__}: 应自上而下逐级排开"
+
+
+@pytest.mark.parametrize(
+    "cfg_name, expected_spatial",
+    [
+        ("seg3d.yaml", (16, 128, 128)),
+        ("seg2_5d.yaml", (256, 256)),
+        ("seg2_5d_planA.yaml", (16, 256, 256)),
+    ],
+)
+def test_model_input_spatial_matches_patch_size(cfg_name, expected_spatial):
+    cfg = load_config(str(_CONFIGS / cfg_name))
+    topo, shape = _model_input_shape(cfg)
+    assert shape[0] == cfg.data.batch_size
+    assert shape[1] == topo.in_channels
+    assert shape[2:] == expected_spatial
+
+
+def test_model_input_shape_matches_real_pipeline_feed_seg3d():
+    cfg = load_config(str(_CONFIGS / "seg3d.yaml"))
+    topo, shape = _model_input_shape(cfg)
+    pipe = build_pipeline(cfg, build_loss(cfg.loss))
+    cube = torch.zeros(
+        cfg.data.batch_size, 1, *pipe.target_patch_size, dtype=torch.float32)
+    lab = torch.zeros_like(cube)
+    img, _ = pipe.prepare_val_batch(cube, lab)
+    assert shape == tuple(img.shape)
+    assert shape[1] == topo.in_channels
+
+
+def test_model_input_spatial_cubic_keep_native_multi_res_matches_patch_size():
+    cfg = load_config(str(_CONFIGS / "seg3d.yaml"))
+    cfg.data.patch_mode = "cubic"
+    cfg.sync()
+    cfg.validate()
+    topo, shape = _model_input_shape(cfg)
+    assert topo.spatial_dims == 3
+    assert shape[2:] == tuple(cfg.data.patch_size)
 
 
 # ---------------------------------------------------------------------------
