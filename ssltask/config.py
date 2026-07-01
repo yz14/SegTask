@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #: 重建/回归损失。
 RECON_LOSSES = ("l1", "smooth_l1", "mse")
 #: 已实现的 SSL 方法注册键（须与 ``ssltask.methods`` 注册表保持同步；随 P2+ 扩展）。
-METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot", "sparkdino")
+METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot", "sparkdino", "byol", "moco")
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +128,19 @@ class SSLConfig:
     dino_momentum_base: float = 0.996
     dino_momentum_final: float = 1.0
 
+    # --- method='byol'：BYOL-3D（online/query + EMA target；无负样本）---
+    byol_proj_dim: int = 128
+    byol_pred_hidden_dim: int = 128
+    byol_momentum_base: float = 0.996
+    byol_momentum_final: float = 1.0
+
+    # --- method='moco'：MoCo-3D（query/key + EMA queue）---
+    moco_proj_dim: int = 128
+    moco_queue_size: int = 32
+    moco_temperature: float = 0.2
+    moco_momentum_base: float = 0.996
+    moco_momentum_final: float = 1.0
+
     # --- method='jepa'：隐空间掩码预测（SSL.md 方案⑦）---
     # 目标块掩码：单元尺寸（体素）与覆盖比例（被遮单元占比，作为预测目标）。
     jepa_mask_unit: int = 16
@@ -181,10 +194,30 @@ class SSLConfig:
     probe_every: int = 10               # 探针评估的 epoch 间隔
     probe_iters: int = 100              # 每次评估训练线性头的步数
     probe_lr: float = 1.0e-2            # 线性头学习率
+    probe_finetune: bool = False        # True: encoder 也参与训练（encoder-finetune 读数）
+    probe_finetune_lr: float = 1.0e-3   # encoder-finetune 时 encoder 学习率
     probe_val_ratio: float = 0.3        # 探针 train/val 划分比例
     probe_samples_per_volume: int = 4   # 探针每卷抽样数
     probe_seed: int = 0                 # 线性头重置 + 划分种子（保证跨 epoch 可比）
     probe_select_best: bool = True      # True: 以 probe_dice 选 best；False: 退回 train loss
+
+    # --- 在线分类探针（SSL.md §0.4；encoder + GAP + MLP 头；frozen/finetune）---
+    cls_probe_iters: int = 100
+    cls_probe_lr: float = 1.0e-2
+    cls_probe_hidden_dim: int = 128
+    cls_probe_finetune: bool = False
+    cls_probe_finetune_lr: float = 1.0e-3
+    cls_label_key: str = ""
+
+    # --- P6 离线评测 / few-shot 曲线（§0.4）---
+    eval_data_dir: str = ""             # 留出评测用标注 npz 目录；空=复用 probe_data_dir
+    eval_shots: List[int] = field(default_factory=lambda: [10, 30, 50, 100])
+    eval_readouts: List[str] = field(default_factory=lambda: ["linear", "finetune"])
+    eval_tasks: List[str] = field(default_factory=lambda: ["seg", "cls"])
+    eval_out_dir: str = ""              # 输出目录；空=自动落到 train.output_dir/eval
+    eval_holdout_ratio: float = 0.2
+    eval_seed: int = 0
+    eval_entries: List[str] = field(default_factory=list)
 
     # 周期性保存 SSL ckpt 的 epoch 间隔（best-by-train-recon 始终单独保存）。
     save_every: int = 10
@@ -359,6 +392,61 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             -n_levels <= int(ssl.ibot_feature_level) < n_levels,
             f"ssl.ibot_feature_level must index encoder_channels (len "
             f"{n_levels}); got {ssl.ibot_feature_level}.")
+    if ssl.method == "byol":
+        _require(
+            int(ssl.dino_hidden_dim) >= 1,
+            f"ssl.dino_hidden_dim must be >= 1; got {ssl.dino_hidden_dim}.")
+        _require(
+            int(ssl.byol_proj_dim) >= 1,
+            f"ssl.byol_proj_dim must be >= 1; got {ssl.byol_proj_dim}.")
+        _require(
+            int(ssl.byol_pred_hidden_dim) >= 1,
+            f"ssl.byol_pred_hidden_dim must be >= 1; got {ssl.byol_pred_hidden_dim}.")
+        for nm, rng in (("dino_global_scale", ssl.dino_global_scale),
+                        ("dino_local_scale", ssl.dino_local_scale)):
+            _require(
+                len(rng) == 2 and 0.0 < float(rng[0]) <= float(rng[1]) <= 1.0,
+                f"ssl.{nm} must be [lo,hi] with 0<lo<=hi<=1; got {rng}.")
+        _require(
+            0.0 <= float(ssl.dino_flip_prob) <= 1.0,
+            f"ssl.dino_flip_prob must be in [0,1]; got {ssl.dino_flip_prob}.")
+        _require(
+            float(ssl.dino_intensity_scale) >= 0 and float(ssl.dino_intensity_shift) >= 0,
+            f"ssl.dino_intensity_scale/shift must be >= 0; got "
+            f"{ssl.dino_intensity_scale}, {ssl.dino_intensity_shift}.")
+        _require(
+            0.0 < float(ssl.byol_momentum_base) <= float(ssl.byol_momentum_final) <= 1.0,
+            f"ssl.byol_momentum_base/final must satisfy 0<base<=final<=1; got "
+            f"{ssl.byol_momentum_base}, {ssl.byol_momentum_final}.")
+    if ssl.method == "moco":
+        _require(
+            int(ssl.dino_hidden_dim) >= 1,
+            f"ssl.dino_hidden_dim must be >= 1; got {ssl.dino_hidden_dim}.")
+        _require(
+            int(ssl.moco_proj_dim) >= 1,
+            f"ssl.moco_proj_dim must be >= 1; got {ssl.moco_proj_dim}.")
+        _require(
+            int(ssl.moco_queue_size) >= 2,
+            f"ssl.moco_queue_size must be >= 2; got {ssl.moco_queue_size}.")
+        _require(
+            float(ssl.moco_temperature) > 0,
+            f"ssl.moco_temperature must be > 0; got {ssl.moco_temperature}.")
+        for nm, rng in (("dino_global_scale", ssl.dino_global_scale),
+                        ("dino_local_scale", ssl.dino_local_scale)):
+            _require(
+                len(rng) == 2 and 0.0 < float(rng[0]) <= float(rng[1]) <= 1.0,
+                f"ssl.{nm} must be [lo,hi] with 0<lo<=hi<=1; got {rng}.")
+        _require(
+            0.0 <= float(ssl.dino_flip_prob) <= 1.0,
+            f"ssl.dino_flip_prob must be in [0,1]; got {ssl.dino_flip_prob}.")
+        _require(
+            float(ssl.dino_intensity_scale) >= 0 and float(ssl.dino_intensity_shift) >= 0,
+            f"ssl.dino_intensity_scale/shift must be >= 0; got "
+            f"{ssl.dino_intensity_scale}, {ssl.dino_intensity_shift}.")
+        _require(
+            0.0 < float(ssl.moco_momentum_base) <= float(ssl.moco_momentum_final) <= 1.0,
+            f"ssl.moco_momentum_base/final must satisfy 0<base<=final<=1; got "
+            f"{ssl.moco_momentum_base}, {ssl.moco_momentum_final}.")
     if ssl.method == "sparkdino":
         _require(
             float(ssl.sparkdino_dino_weight) >= 0.0,
@@ -415,6 +503,30 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.probe_samples_per_volume) >= 1,
             f"ssl.probe_samples_per_volume must be >= 1; "
             f"got {ssl.probe_samples_per_volume}.")
+    _require(
+        int(ssl.cls_probe_iters) >= 1,
+        f"ssl.cls_probe_iters must be >= 1; got {ssl.cls_probe_iters}.")
+    _require(
+        float(ssl.cls_probe_lr) > 0 and float(ssl.cls_probe_finetune_lr) > 0,
+        f"ssl.cls_probe_lr/cls_probe_finetune_lr must be > 0; got "
+        f"{ssl.cls_probe_lr}, {ssl.cls_probe_finetune_lr}.")
+    _require(
+        int(ssl.cls_probe_hidden_dim) >= 1,
+        f"ssl.cls_probe_hidden_dim must be >= 1; got "
+        f"{ssl.cls_probe_hidden_dim}.")
+    _require(
+        0.0 < float(ssl.eval_holdout_ratio) < 1.0,
+        f"ssl.eval_holdout_ratio must be in (0,1); got {ssl.eval_holdout_ratio}.")
+    _require(
+        all(int(s) >= 1 for s in ssl.eval_shots),
+        f"ssl.eval_shots must contain positive integers; got {ssl.eval_shots}.")
+    _require(
+        all(str(r) in ("linear", "finetune") for r in ssl.eval_readouts),
+        f"ssl.eval_readouts must be subset of ['linear', 'finetune']; got "
+        f"{ssl.eval_readouts}.")
+    _require(
+        all(str(t) in ("seg", "cls") for t in ssl.eval_tasks),
+        f"ssl.eval_tasks must be subset of ['seg', 'cls']; got {ssl.eval_tasks}.")
     _require(
         int(ssl.save_every) >= 1,
         f"ssl.save_every must be >= 1; got {ssl.save_every}.")

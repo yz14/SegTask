@@ -1,0 +1,120 @@
+# 自监督预训练（ssltask, MoCo-3D：query + 动量 key + FIFO 队列 InfoNCE）示例配置。
+# 运行：  python -m ssltask.pretrain --config configs/ssltask_moco.yaml
+# 产出：  outputs/ssltask_moco/ssl_best.pt
+# 衔接：  下游分割/分类训练加 --override train.pretrain=outputs/ssltask_moco/ssl_best.pt
+#         下游 _load_pretrain 非严格加载：encoder.* 命中；decoder.*/seg_head.* 随机
+#         （MoCo 仅预训练 encoder；导出的是 query encoder。）。
+#
+# 重要：要让 encoder 权重 1:1 迁移，下游 config 的 `model:` 段（backbone/encoder_channels/
+#       blocks/stem/norm/down 等几何项）应与本文件一致。
+#
+# 数据：只读 image-only npz；SSL 走单视图（multi_res_scales=[1.0]）。视图在 GPU/CPU 上
+#       从单 patch 即时生成（global≈整 patch，n_global=2, n_local=0），无需改数据管线。
+
+data:
+  npz_dir: "F:/LUNA25/ssl_npz"
+  npz_suffix: ".npz"
+
+  label_values: [0, 1]                 # 仅用于 segtask Config 校验；SSL 不读 label
+  num_classes : 2
+
+  patch_size: [96, 112, 112]
+  patch_mode: "cubic"
+
+  multi_res_scales    : [1.0]          # SSL 单视图（必须长度 1）
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  batch_size     : 2
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  samples_per_volume: 8
+
+
+augment:
+  enabled: false                       # MoCo 视图增广在方法内（多裁剪 + 翻转 + 强度抖动）
+
+
+model:
+  backbone: "resnet"
+  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type: "basic"
+
+  norm_type  : "instance"
+  norm_groups: 8
+  activation : "leakyrelu"
+  dropout    : 0.0
+
+  attention_type: "none"
+  skip_attention: true
+
+  # 以下头在 SSL 阶段被丢弃（MoCo 仅预训练 encoder）；列出以便与下游对齐。
+  deep_supervision   : false
+  aux_seg_supervision: false
+  aux_topo_head      : false
+
+  stem_mode      : "conv3"
+  decoder_type   : "unet"
+  downsample_mode: "conv"
+  upsample_mode  : "trilinear"
+  skip_mode      : "cat"
+
+
+# 优化器/调度器/AMP/output_dir/epochs/lr 由 SSL 复用 segtask train.*。
+train:
+  epochs: 300
+
+  optimizer   : "adamw"
+  lr          : 5.0e-4
+  weight_decay: 4.0e-2                  # 与 DINO 同级别的轻量正则
+
+  scheduler    : "cosine"
+  warmup_epochs: 10
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4
+  grad_clip_norm  : 3.0
+
+  use_amp  : false
+  amp_dtype: "auto"
+
+  compile_mode: "none"
+
+  use_ema  : false                      # MoCo 自带 EMA key；关闭训练器级 EMA
+  ema_decay: 0.999
+
+  output_dir: "outputs/ssltask_moco"
+
+  log_every: 10
+
+  seed: 42
+  deterministic: false
+
+
+ssl:
+  method: "moco"
+
+  # MoCo 共享视图增广 / hidden 维（DINOHead 复用）
+  dino_hidden_dim    : 2048             # query/key projector 的 hidden dim
+  dino_global_scale   : [0.5, 1.0]      # 两个 global crops 的随机裁剪尺度
+  dino_local_scale    : [0.15, 0.5]     # 兼容字段：MoCo 不用 local crops，但沿用同一裁剪配置
+  dino_flip_prob      : 0.5             # 视图翻转概率
+  dino_intensity_scale: 0.1             # 视图强度缩放扰动
+  dino_intensity_shift: 0.1             # 视图强度平移扰动
+
+  # MoCo 专属 tunable
+  moco_proj_dim       : 128             # query/key projector 输出维度
+  moco_queue_size     : 32              # 队列长度
+  moco_temperature    : 0.2             # InfoNCE 温度
+  moco_momentum_base  : 0.996           # EMA 动量起点
+  moco_momentum_final : 1.0             # EMA 动量终点
+
+  save_every: 10
