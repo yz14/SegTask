@@ -195,6 +195,31 @@ def test_ssl_validate_prior_rejects_bad(field, value):
         validate_ssl(ssl, cfg)
 
 
+def test_legacy_sslconfig_pickle_shim_roundtrip(tmp_path, monkeypatch):
+    import segtask_v1.config as legacy_cfg
+
+    legacy_class = getattr(legacy_cfg, "SSLConfig")
+    assert isinstance(legacy_class, type)
+    with pytest.raises(AttributeError):
+        getattr(legacy_cfg, "NopeNotReal")
+
+    legacy_ref_class = type("SSLConfig", (), {})
+    legacy_ref_class.__module__ = "segtask_v1.config"
+    monkeypatch.setattr(legacy_cfg, "SSLConfig", legacy_ref_class, raising=False)
+    ckpt = tmp_path / "legacy_sslconfig.pkl"
+    torch.save({"config": legacy_ref_class()}, ckpt, pickle_protocol=2)
+    monkeypatch.delattr(legacy_cfg, "SSLConfig", raising=False)
+
+    loaded = torch.load(ckpt, weights_only=False)
+    assert type(loaded["config"]) is legacy_class
+
+    monkeypatch.setattr(legacy_cfg, "_LEGACY_MODULE_ATTRS", {}, raising=False)
+    with pytest.raises(AttributeError):
+        getattr(legacy_cfg, "SSLConfig")
+    with pytest.raises(AttributeError):
+        torch.load(ckpt, weights_only=False)
+
+
 # ---------------------------------------------------------------------------
 # Frangi vesselness target (label-free)
 # ---------------------------------------------------------------------------

@@ -1799,3 +1799,43 @@ def save_config(cfg: Config, path: Union[str, Path]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(asdict(cfg), f, default_flow_style=False,
                   sort_keys=False, allow_unicode=True)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat: legacy checkpoint unpickling
+# ---------------------------------------------------------------------------
+@dataclass
+class _LegacySSLConfig:
+    """占位类，仅用于反序列化历史 checkpoint。
+
+    早期版本（提交 e0a7f26 一带）``SSLConfig`` 定义在本模块且是 ``Config.ssl``
+    字段；trainer 会把整个 ``Config`` 对象 pickle 进 checkpoint（见
+    ``trainer._build_state_dict`` 的 ``"config": self.cfg``）。之后 ``SSLConfig``
+    被移到 :mod:`ssltask.config`，该符号在本模块消失，导致老 checkpoint 走
+    ``torch.load(..., weights_only=False)`` 时 ``find_class`` 抛
+    ``AttributeError: Can't get attribute 'SSLConfig'``。
+
+    pickle 还原对象走 ``cls.__new__(cls)`` + 恢复 ``__dict__``，不调用 ``__init__``，
+    因此这里只需存在一个同名类即可让老 checkpoint 正常反序列化；历史字段全为基础
+    类型，会被原样挂到实例上。本占位不参与任何训练/推理逻辑——推理用的是命令行
+    ``--config`` 的 YAML，checkpoint 内嵌的 ``config`` 对象并不被消费。
+    """
+
+
+_LEGACY_MODULE_ATTRS = {"SSLConfig": _LegacySSLConfig}
+
+
+def __getattr__(name: str):
+    """PEP 562 模块级钩子：把已迁走的历史符号解析为兼容占位。
+
+    仅覆盖 :data:`_LEGACY_MODULE_ATTRS` 中登记的名字（当前只有 ``SSLConfig``），
+    其余未知属性照常抛 ``AttributeError``，不会掩盖真正的拼写/导入错误。
+    """
+    target = _LEGACY_MODULE_ATTRS.get(name)
+    if target is not None:
+        logger.warning(
+            "segtask_v1.config.%s 已迁至 ssltask.config；返回向后兼容占位以反序列化"
+            "历史 checkpoint。请重新保存 checkpoint 以移除该历史引用。", name)
+        return target
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}")
