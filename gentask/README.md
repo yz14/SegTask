@@ -5,53 +5,102 @@ gentask 是从 segtask_v1 剥离出的超分生成工程：`train.py` / `predict
 ## 详细说明
 
 ### 总览与模块树
+
 ```text
 gentask/
-├── gentask/__init__.py  # 包入口 / 对外导出
-├── gentask/__main__.py  # 模块 CLI 入口
-├── gentask/logging_utils.py  # 日志初始化工具
-├── gentask/predict.py  # 预测入口
-├── gentask/train.py  # 训练入口
-├── gentask/utils.py  # 通用工具
-├── gentask/docs/generative_models_survey.md  # 生成模型综述备忘
-├── gentask/config/__init__.py  # 包入口 / 对外导出
-├── gentask/config/dataclasses.py  # Config / Task / Model dataclass 定义
-├── gentask/config/io.py  # YAML 读写与保存 resolved config
-├── gentask/config/validation.py  # 生成任务配置校验
-├── gentask/data/__init__.py  # 包入口 / 对外导出
-├── gentask/data/degradation.py  # 在线超分退化算子
-├── gentask/data/loader.py  # 路径匹配与 dataloader 工厂
-├── gentask/data/make_data.py  # 离线预打包 npz
-├── gentask/data/specs.py  # patch / view 规格推导
-├── gentask/data/dataset/__init__.py  # 包入口 / 对外导出
-├── gentask/data/dataset/cache.py  # 缓存与 LRU 管理
-├── gentask/data/dataset/core.py  # npz dataset 主逻辑
-├── gentask/data/dataset/io.py  # npz / NIfTI 读取工具
-├── gentask/losses/__init__.py  # 包入口 / 对外导出
-├── gentask/losses/recon.py  # 重建损失与加权封装
-├── gentask/models/__init__.py  # 包入口 / 对外导出
-├── gentask/models/adm_unet.py  # ADM backbone
-├── gentask/models/blocks.py  # 共享积木与注意力模块
-├── gentask/models/convnext.py  # ConvNeXt stage / block
-├── gentask/models/diffusion.py  # 扩散 sampler / scheduler
-├── gentask/models/edm2_unet.py  # EDM2 backbone
-├── gentask/models/factory.py  # generation model 装配工厂
-├── gentask/models/generation.py  # 回归 / 扩散统一接口
-├── gentask/models/resnet.py  # ResNet block / stage
-├── gentask/models/stem.py  # stem 与多视图融合
-├── gentask/models/topology.py  # 派生输入/输出几何真相源
-├── gentask/models/unet.py  # UNet encoder/decoder 主体
-├── gentask/models/unet3p.py  # UNet3+ decoder
-├── gentask/models/unetpp.py  # UNet++ decoder
-├── gentask/predictor/__init__.py  # 包入口 / 对外导出
-├── gentask/predictor/gen_predictor.py  # generation 推理器
-├── gentask/trainer/__init__.py  # 包入口 / 对外导出
-├── gentask/trainer/amp.py  # AMP / GradScaler 工具
-├── gentask/trainer/checkpoint.py  # checkpoint 读写与兼容
-├── gentask/trainer/gen_trainer.py  # generation 训练循环
-├── gentask/trainer/memory.py  # 显存统计工具
-└── gentask/trainer/optim.py  # 优化器 / 调度器 / warmup
+├── __init__.py  # 包入口 / 对外导出
+├── __main__.py  # 模块 CLI 入口
+├── train.py  # 训练 CLI 入口
+├── predict.py  # 推理 CLI 入口
+├── logging_utils.py  # 日志初始化工具
+├── utils.py  # 通用工具
+├── docs/  # 生成模型综述与设计备忘
+├── config/  # 配置系统（见下）
+├── data/  # 数据子系统（见下）
+├── losses/  # 损失库（见下）
+├── models/  # 网络与生成接口（见下）
+├── predictor/  # 推理器（见下）
+└── trainer/  # 训练循环（见下）
 ```
+
+### 配置系统
+
+```text
+gentask/config/
+├── __init__.py  # 配置包入口
+├── dataclasses.py  # Config / Task / Model dataclass 定义
+├── io.py  # YAML 读写与 resolved config 保存
+└── validation.py  # 生成任务配置校验
+```
+
+### 数据子系统
+
+```text
+gentask/data/
+├── __init__.py  # 数据子系统入口
+├── degradation.py  # 在线超分退化算子
+├── loader.py  # 路径匹配与 dataloader 工厂
+├── make_data.py  # 离线预打包 npz
+├── specs.py  # patch / view 规格推导
+└── dataset/  # npz 数据集子包（见下）
+```
+
+```text
+gentask/data/dataset/
+├── __init__.py  # dataset 子包入口
+├── cache.py  # 缓存与 LRU 管理
+├── core.py  # npz dataset 主逻辑
+└── io.py  # npz / NIfTI 读取工具
+```
+
+### 损失库
+
+```text
+gentask/losses/
+├── __init__.py  # 损失包入口
+└── recon.py  # 重建损失与加权封装
+```
+
+### 模型与生成接口
+
+```text
+gentask/models/
+├── __init__.py  # 模型包入口
+├── adm_unet.py  # ADM backbone
+├── blocks.py  # 共享积木与注意力模块
+├── convnext.py  # ConvNeXt stage / block
+├── diffusion.py  # 扩散 sampler / scheduler
+├── edm2_unet.py  # EDM2 backbone
+├── factory.py  # generation model 装配工厂
+├── generation.py  # 回归 / 扩散统一接口
+├── resnet.py  # ResNet block / stage
+├── stem.py  # stem 与多视图融合
+├── topology.py  # 派生输入/输出几何真相源
+├── unet.py  # UNet encoder/decoder 主体
+├── unet3p.py  # UNet3+ decoder
+└── unetpp.py  # UNet++ decoder
+```
+
+### 推理器
+
+```text
+gentask/predictor/
+├── __init__.py  # 预测器包入口
+└── gen_predictor.py  # generation 推理器
+```
+
+### 训练循环
+
+```text
+gentask/trainer/
+├── __init__.py  # 训练包入口
+├── amp.py  # AMP / GradScaler 工具
+├── checkpoint.py  # checkpoint 读写与兼容
+├── gen_trainer.py  # generation 训练循环
+├── memory.py  # 显存统计工具
+└── optim.py  # 优化器 / 调度器 / warmup
+```
+
 ### 关键设计
 
 #### 两类生成范式

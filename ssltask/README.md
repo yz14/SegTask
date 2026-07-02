@@ -5,46 +5,83 @@ ssltask 是与 `segtask_v1` 共骨干的无标注自监督预训练工程：`pre
 ## 详细说明
 
 ### 总览与模块树
+
 ```text
 ssltask/
-├── ssltask/__init__.py  # 包入口 / 注册表
-├── ssltask/__main__.py  # python -m ssltask 入口
-├── ssltask/config.py  # SegConfig 复用 + SSLConfig
-├── ssltask/evaluate.py  # 离线 few-shot 评测 CLI
-├── ssltask/pretrain.py  # 自监督预训练 CLI
-├── ssltask/data/__init__.py  # 包入口 / 注册表
-├── ssltask/data/corruptions.py  # Genesis 式破坏变换
-├── ssltask/data/masking.py  # mask / 掩码建模共享工具
-├── ssltask/data/multicrop.py  # 多裁剪视图生成器
-├── ssltask/data/ssl_dataset.py  # image-only / labeled npz 数据集
-├── ssltask/data/vesselness.py  # Frangi vesselness 目标
-├── ssltask/eval/__init__.py  # 包入口 / 注册表
-├── ssltask/eval/cls_probe.py  # 在线分类探针
-├── ssltask/eval/metrics.py  # AUC / F1 / HD95 指标
-├── ssltask/eval/pipeline.py  # 离线评测与对比 pipeline
-├── ssltask/eval/probe.py  # 在线分割探针
-├── ssltask/methods/__init__.py  # 包入口 / 注册表
-├── ssltask/methods/base.py  # SSLMethod 抽象接口
-├── ssltask/methods/byol.py  # BYOL-3D
-├── ssltask/methods/dino.py  # DINO-3D
-├── ssltask/methods/dino_gram.py  # DINO + Gram anchoring
-├── ssltask/methods/genesis.py  # Models Genesis 式重建
-├── ssltask/methods/ibot.py  # iBOT / DINOv2 混合
-├── ssltask/methods/jepa.py  # JEPA 隐空间预测
-├── ssltask/methods/moco.py  # MoCo-3D
-├── ssltask/methods/prior.py  # Frangi vesselness 回归
-├── ssltask/methods/simmim.py  # SimMIM-3D
-├── ssltask/methods/spark.py  # SparK-3D
-├── ssltask/methods/sparkdino.py  # SparK + DINO 联合目标
-├── ssltask/models/__init__.py  # 包入口 / 注册表
-├── ssltask/models/dino_modules.py  # DINOHead / DINONet
-├── ssltask/models/ibot_modules.py  # iBOT 密集头工具
-├── ssltask/models/jepa_modules.py  # JEPA encoder / predictor builder
-├── ssltask/models/spark_modules.py  # SparK 稀疏编码与轻量解码器
-├── ssltask/models/ssl_models.py  # 重建 / MIM 模型与 head builder
-├── ssltask/trainer/__init__.py  # 包入口 / 注册表
-└── ssltask/trainer/ssl_trainer.py  # 方法无关的 SSL 训练循环
+├── __init__.py  # 包入口 / 注册表
+├── __main__.py  # python -m ssltask 入口
+├── config.py  # SegConfig 复用 + SSLConfig
+├── evaluate.py  # 离线 few-shot 评测 CLI
+├── pretrain.py  # 自监督预训练 CLI
+├── data/  # 数据子系统（见下）
+├── eval/  # 评测子系统（见下）
+├── methods/  # SSL 方法注册表（见下）
+├── models/  # SSL 专有模型模块（见下）
+└── trainer/  # SSL 训练循环（见下）
 ```
+
+### 数据子系统
+
+```text
+ssltask/data/
+├── __init__.py  # 数据子系统入口
+├── corruptions.py  # Genesis 式破坏变换
+├── masking.py  # mask / 掩码建模共享工具
+├── multicrop.py  # 多裁剪视图生成器
+├── ssl_dataset.py  # image-only / labeled npz 数据集
+└── vesselness.py  # Frangi vesselness 目标
+```
+
+### 评测子系统
+
+```text
+ssltask/eval/
+├── __init__.py  # 评测子包入口
+├── cls_probe.py  # 在线分类探针
+├── metrics.py  # AUC / F1 / HD95 指标
+├── pipeline.py  # 离线评测与对比 pipeline
+└── probe.py  # 在线分割探针
+```
+
+### 方法注册与实现
+
+```text
+ssltask/methods/
+├── __init__.py  # 方法注册表 / build_method
+├── base.py  # SSLMethod 抽象接口
+├── byol.py  # BYOL-3D
+├── dino.py  # DINO-3D
+├── dino_gram.py  # DINO + Gram anchoring
+├── genesis.py  # Models Genesis 式重建
+├── ibot.py  # iBOT / DINOv2 混合
+├── jepa.py  # JEPA 隐空间预测
+├── moco.py  # MoCo-3D
+├── prior.py  # Frangi vesselness 回归
+├── simmim.py  # SimMIM-3D
+├── spark.py  # SparK-3D
+└── sparkdino.py  # SparK + DINO 联合目标
+```
+
+### SSL 专有模型模块
+
+```text
+ssltask/models/
+├── __init__.py  # SSL 模型包入口
+├── dino_modules.py  # DINOHead / DINONet
+├── ibot_modules.py  # iBOT 密集头工具
+├── jepa_modules.py  # JEPA encoder / predictor builder
+├── spark_modules.py  # SparK 稀疏编码与轻量解码器
+└── ssl_models.py  # 重建 / MIM 模型与 head builder
+```
+
+### 训练循环
+
+```text
+ssltask/trainer/
+├── __init__.py  # 训练包入口
+└── ssl_trainer.py  # 方法无关的 SSL 训练循环
+```
+
 ### 方法家族速览
 
 - `genesis.py`：Models Genesis 式多变换破坏 → 重建。
