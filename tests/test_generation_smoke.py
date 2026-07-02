@@ -273,6 +273,33 @@ def _conditioning_cfg(mode: str):
     return cfg
 
 
+def _diffusion_conditioning_cfg():
+    cfg = Config()
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.num_classes = 2
+    cfg.data.label_values = [0, 1]
+    cfg.data.patch_size = [4, 16, 16]
+    cfg.data.multi_res_scales = [1.0]
+    cfg.data.cond_dirs = ["/tmp/cond"]
+    cfg.data.cond_suffixes = ".nii.gz"
+    cfg.data.cond_normalize = "minmax"
+    cfg.data.cond_intensity_min = 0.0
+    cfg.data.cond_intensity_max = 1.0
+    cfg.model.arch = "adm"
+    cfg.model.encoder_channels = [16, 32, 48]
+    cfg.model.encoder_blocks_per_stage = [1, 1, 1]
+    cfg.task.type = "generation"
+    cfg.task.algorithm = "diffusion"
+    cfg.task.degradation = "superres"
+    cfg.task.out_channels = 1
+    cfg.task.parameterization = "edm"
+    cfg.task.sample_steps = 2
+    cfg.task.sampler = "edm_heun"
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
 def test_multi_view_aux_recon_forward_and_restore():
     from gentask.models.factory import build_model
 
@@ -423,6 +450,40 @@ def test_conditioning_multi_view_is_rejected():
         assert "not yet supported" in str(exc)
     else:
         raise AssertionError("multi-view conditioning should be rejected")
+
+
+def test_diffusion_conditioning_forward_restore_and_backward():
+    from gentask.losses.recon import DiffusionLoss
+    from gentask.models.factory import build_model
+
+    cfg = _diffusion_conditioning_cfg()
+    model = build_model(cfg)
+    assert cfg.model.in_channels == 8
+    hr = torch.rand(2, 4, 16, 16)
+    cond = torch.rand(2, 4, 16, 16)
+    out = model(hr, cond=cond)
+    assert tuple(out["pred"].shape) == tuple(hr.shape)
+    assert tuple(out["target"].shape) == tuple(hr.shape)
+    loss = DiffusionLoss()(out)
+    loss.backward()
+    assert any(p.grad is not None for p in model.parameters())
+    with torch.no_grad():
+        rec = model.restore(model.degrade(hr), cond=cond)
+    assert tuple(rec.shape) == tuple(hr.shape)
+
+
+def test_diffusion_no_cond_restore_unchanged():
+    from gentask.models.factory import build_model
+
+    cfg = _cfg("diffusion", arch="adm", param="edm")
+    model = build_model(cfg)
+    hr = torch.rand(2, 4, 16, 16)
+    lr = model.degrade(hr)
+    torch.manual_seed(123)
+    rec0 = model.restore(lr)
+    torch.manual_seed(123)
+    rec1 = model.restore(lr, cond=None)
+    assert torch.allclose(rec0, rec1)
 
 
 def test_zaxis_sr_regression_3d_end_to_end():
@@ -720,6 +781,8 @@ def main() -> int:
         test_conditioning_3d_forward_and_trainer_step,
         test_conditioning_2_5d_forward_and_trainer_step,
         test_conditioning_multi_view_is_rejected,
+        test_diffusion_conditioning_forward_restore_and_backward,
+        test_diffusion_no_cond_restore_unchanged,
         test_zaxis_sr_regression_3d_end_to_end,
         test_deep_supervision_regression,
         test_deep_supervision_trainer_runs,
