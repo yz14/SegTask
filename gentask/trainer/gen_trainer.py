@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -92,15 +92,72 @@ class GenerationTrainer:
         """取干净高分图（忽略分割标签）。"""
         return batch["image"].to(self.device, non_blocking=True).float()
 
-    def _step_loss(self, out: Dict[str, torch.Tensor], breakdown) -> torch.Tensor:
+    def _cond_batch(self, batch) -> Optional[torch.Tensor]:
+        cond = batch.get("cond")
+        if cond is None:
+            return None
+        return cond.to(self.device, non_blocking=True).float()
+
+    def _align_weight_map(
+        self,
+        weight_map: Optional[torch.Tensor],
+        ref: torch.Tensor) -> Optional[torch.Tensor]:
+        if weight_map is None:
+            return None
+        w = weight_map.to(self.device, non_blocking=True).float()
+        if ref.ndim == 4 and w.ndim == 5:
+            w = w[:, 0] if w.shape[1] == 1 else w.flatten(1, 2)
+        elif ref.ndim == 5 and w.ndim == 4:
+            w = w.unsqueeze(1)
+
+        if w.shape[-self.spatial_dims:] != ref.shape[-self.spatial_dims:]:
+            try:
+                w = F.interpolate(
+                    w, size=tuple(ref.shape[-self.spatial_dims:]), mode="area")
+            except Exception as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    f"weight_map shape {tuple(weight_map.shape)} cannot be "
+                    f"aligned to reference shape {tuple(ref.shape)}.") from exc
+
+        try:
+            torch.broadcast_shapes(w.shape, ref.shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"weight_map shape {tuple(weight_map.shape)} cannot be "
+                f"broadcast to reference shape {tuple(ref.shape)} after "
+                "alignment.") from exc
+        return w
+
+    def _step_loss(
+        self,
+        out: Dict[str, torch.Tensor],
+        breakdown,
+        weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.is_diffusion:
             return self.loss_fn(out, breakdown=breakdown)
         preds = out.get("ds_preds")
+        total = None
         if preds is not None and len(preds) > 1:
-            return self._ds_recon_loss(preds, out["target"], breakdown)
-        return self.loss_fn(out["pred"], out["target"], breakdown=breakdown)
+            total = self._ds_recon_loss(preds, out["target"], breakdown, weight_map)
+        else:
+            weight = self._align_weight_map(weight_map, out["target"])
+            total = self.loss_fn(out["pred"], out["target"], weight=weight,
+                                 breakdown=breakdown)
+        aux_preds = out.get("aux_preds")
+        aux_targets = out.get("aux_targets")
+        if aux_preds and aux_targets:
+            aux_term = self._aux_recon_loss(aux_preds, aux_targets)
+            total = total + aux_term
+            if breakdown is not None:
+                breakdown["L_aux"] = float(aux_term.detach().item())
+        return total
 
-    def _ds_recon_loss(self, preds, hr: torch.Tensor, breakdown) -> torch.Tensor:
+    def _ds_recon_loss(
+        self,
+        preds,
+        hr: torch.Tensor,
+        breakdown,
+        weight_map: Optional[torch.Tensor] = None) -> torch.Tensor:
         """深监督重建损失：逐尺度与下采样后的 HR 算 recon，按归一化权重聚合。"""
         raw = list(self.cfg.loss.deep_supervision_weights[:len(preds)])
         if not raw:
@@ -114,8 +171,20 @@ class GenerationTrainer:
             else:
                 tgt = F.interpolate(
                     hr, size=tuple(p.shape[-self.spatial_dims:]), mode="area")
+            wmap = self._align_weight_map(weight_map, tgt)
             bd = breakdown if k == 0 else None
-            total = total + w * self.loss_fn(p, tgt, breakdown=bd)
+            total = total + w * self.loss_fn(p, tgt, weight=wmap, breakdown=bd)
+        return total
+
+    def _aux_recon_loss(self, preds, targets) -> torch.Tensor:
+        raw = list(self.cfg.loss.aux_recon_weights[:len(preds)])
+        if not raw:
+            raw = [0.5 ** k for k in range(len(preds))]
+        denom = float(sum(raw)) or 1.0
+        weights = [w / denom for w in raw]
+        total = preds[0].new_zeros(())
+        for w, pred, target in zip(weights, preds, targets):
+            total = total + w * self.loss_fn(pred, target, breakdown=None)
         return total
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -126,11 +195,13 @@ class GenerationTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(self.train_loader):
             hr = self._hr_batch(batch)
+            cond = self._cond_batch(batch)
+            weight_map = batch.get("weight_map")
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.use_amp, dtype=self.amp_dtype):
-                out = self.model(hr)
+                out = self.model(hr, cond=cond)
             bd: Dict[str, float] = {}
-            loss = self._step_loss(out, bd)
+            loss = self._step_loss(out, bd, weight_map=weight_map)
             loss_scaled = loss / accum if accum > 1 else loss
             self.scaler.scale(loss_scaled).backward()
 
@@ -162,9 +233,10 @@ class GenerationTrainer:
         try:
             for batch in self.val_loader:
                 hr = self._hr_batch(batch)
+                cond = self._cond_batch(batch)
                 bare = unwrap_compile(self.model)
                 lr = bare.degrade(hr)
-                rec = bare.restore(lr).clamp(0.0, 1.0)
+                rec = bare.restore(lr, cond=cond).clamp(0.0, 1.0)
                 psnr_m.update(float(psnr(rec, hr)), hr.shape[0])
                 ssim_m.update(
                     float(ssim(rec, hr, self.spatial_dims)), hr.shape[0])

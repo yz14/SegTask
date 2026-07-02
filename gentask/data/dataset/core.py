@@ -1,413 +1,28 @@
-"""3D 分割 dataset。
-
-三种 patch 模式：SegDataset3D（z_axis 滑块）、SegDataset3DCubic（cubic 3轴滑块）、
-SegDataset3DWhole（整体 resize）。输出逐前景类二值通道：
-label_values=[0,1,2] → 2 个前景通道。
-"""
+"""Dataset classes and patch extractors for gentask.data.dataset."""
 
 from __future__ import annotations
 
 import logging
-import os
-import time
-from collections import OrderedDict
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import SimpleITK as sitk
 import torch
-from scipy.ndimage import zoom
 from torch.utils.data import Dataset
+
+from .cache import VolumeCache
+from .io import (
+    BBox, compute_bbox_from_volume, compute_region_weight_map,
+    load_nifti, load_nifti_cropped, load_nifti_with_spacing,
+    load_npz_fg_coords, load_npz_fg_slices, load_npz_image,
+    load_npz_cond, load_npz_label, load_npz_label_for_split,
+    load_npz_region_weight,
+    load_region_weight_volume, npz_has_rw, preprocess_image,
+    preprocess_label, resize_3d, _open_npz,
+)
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Volume I/O
-# ---------------------------------------------------------------------------
-# NIfTI 读取重试：网盘/虚拟路径偊尔报 nifti_image_load failed，重试可恢复。
-# 环境变量：SEGTASK_NIFTI_READ_RETRIES（默认 4）、SEGTASK_NIFTI_READ_BACKOFF_S（默认 0.5）。
-_NIFTI_READ_RETRIES = max(1, int(os.environ.get("SEGTASK_NIFTI_READ_RETRIES", "4")))
-_NIFTI_READ_BACKOFF_S = max(0.0, float(os.environ.get("SEGTASK_NIFTI_READ_BACKOFF_S", "0.5")))
-
-
-# RuntimeError 消息中含有以下子串表示 OOM，不重试，直接折为 MemoryError。
-_ALLOC_ERROR_MARKERS = (
-    "bad allocation",
-    "failed to allocate memory",
-    "std::bad_alloc",
-    "cannot allocate memory",
-)
-
-
-def _is_alloc_error(exc: BaseException) -> bool:
-    if isinstance(exc, MemoryError):
-        return True
-    msg = str(exc).lower()
-    return any(m in msg for m in _ALLOC_ERROR_MARKERS)
-
-
-def _sitk_read_with_retry(read_callable, path: str) -> "sitk.Image":
-    """有限重试调用 sitk 读取闭包；仅重试 I/O 瞬态故障，OOM 直接报 MemoryError。"""
-    last_exc: Optional[BaseException] = None
-    for attempt in range(1, _NIFTI_READ_RETRIES + 1):
-        try:
-            return read_callable()
-        except RuntimeError as exc:  # SimpleITK 包装底层错误
-            if _is_alloc_error(exc):
-                # Host OOM — 直接折为 MemoryError，不重试。
-                raise MemoryError(
-                    f"NIfTI read aborted (host OOM) for {path}: {exc}") from exc
-            last_exc = exc
-            if attempt >= _NIFTI_READ_RETRIES:
-                break
-            wait = _NIFTI_READ_BACKOFF_S * (2 ** (attempt - 1))
-            logger.warning(
-                "NIfTI read failed (attempt %d/%d) for %s: %s — retrying in %.2fs",
-                attempt, _NIFTI_READ_RETRIES, path, exc, wait)
-            if wait > 0:
-                time.sleep(wait)
-    raise RuntimeError(
-        f"NIfTI read permanently failed after {_NIFTI_READ_RETRIES} attempts "
-        f"for {path}: {last_exc}") from last_exc
-
-
-def load_nifti(path: str, dtype: np.dtype = np.float32) -> np.ndarray:
-    """NIfTI → (D,H,W) ndarray（SimpleITK）。浮点请求时 sitk 原生代 scl_slope/inter，节省中间 fp64 临时 buffer。"""
-    np_dtype = np.dtype(dtype)
-    if np.issubdtype(np_dtype, np.floating):
-        # 直接解码到请求精度；sitk 同时应用 scl_slope/inter。
-        sitk_pixel = (sitk.sitkFloat32 if np_dtype == np.float32
-                      else sitk.sitkFloat64)
-        read_args = (str(path), sitk_pixel)
-    else:
-        # 读原生 dtype，不提升，后续手动封装转型。
-        read_args = (str(path),)
-
-    img = _sitk_read_with_retry(lambda: sitk.ReadImage(*read_args), path)
-    arr = sitk.GetArrayFromImage(img)  # (Z, Y, X) = (D, H, W)
-    if arr.dtype != np_dtype:
-        arr = arr.astype(np_dtype, copy=False)
-    return arr
-
-
-def load_nifti_with_spacing(
-    path: str, dtype: np.dtype = np.float32,
-) -> "Tuple[np.ndarray, float]":
-    """NIfTI → (volume, z_spacing_mm)。仅推理 z-interleave 需要。缺 meta 时 z_spacing 退 1.0。"""
-    np_dtype = np.dtype(dtype)
-    if np.issubdtype(np_dtype, np.floating):
-        sitk_pixel = (sitk.sitkFloat32 if np_dtype == np.float32
-                      else sitk.sitkFloat64)
-        read_args = (str(path), sitk_pixel)
-    else:
-        read_args = (str(path),)
-    img = _sitk_read_with_retry(lambda: sitk.ReadImage(*read_args), path)
-    arr = sitk.GetArrayFromImage(img)
-    if arr.dtype != np_dtype:
-        arr = arr.astype(np_dtype, copy=False)
-    spacing = img.GetSpacing()  # (sx, sy, sz)
-    z_spacing = float(spacing[2]) if len(spacing) >= 3 else 1.0
-    if not np.isfinite(z_spacing) or z_spacing <= 0.0:
-        z_spacing = 1.0
-    return arr, z_spacing
-
-
-def load_nifti_cropped(
-    path: str,
-    bbox: "Optional[BBox]" = None,
-    dtype: np.dtype = np.float32,
-) -> np.ndarray:
-    """流式 bbox-裁剪读取 NIfTI：利用 sitk SetExtractIndex/Size 仅返 ROI，
-    平均峰值与裁后体积同量级（可能比全卷读小 ~14×）。返 (D',H',W') C-contig owned ndarray。。"""
-    np_dtype = np.dtype(dtype)
-    floating = np.issubdtype(np_dtype, np.floating)
-    sitk_pixel = (
-        sitk.sitkFloat32 if (floating and np_dtype == np.float32)
-        else sitk.sitkFloat64 if floating
-        else None)
-
-    def _read() -> "sitk.Image":
-        # 闭包内重建 reader，避免重试复用部分失败的 IORegion 状态。
-        reader = sitk.ImageFileReader()
-        reader.SetFileName(str(path))
-        # 头信息只读（~352 字节）以获 GetSize() 防御性夹匯 bbox。
-        reader.ReadImageInformation()
-        if bbox is not None:
-            # sitk 为 (X,Y,Z) 顺序，与 numpy/本 BBox 相反，需倒转。
-            full_w, full_h, full_d = reader.GetSize()
-            (d0, d1), (h0, h1), (w0, w1) = bbox
-            # bbox 夹匯：在 Execute() 出 cryptic ITK 越界错之前处理。
-            d0c = max(0, min(d0, full_d))
-            d1c = max(d0c, min(d1, full_d))
-            h0c = max(0, min(h0, full_h))
-            h1c = max(h0c, min(h1, full_h))
-            w0c = max(0, min(w0, full_w))
-            w1c = max(w0c, min(w1, full_w))
-            if d1c > d0c and h1c > h0c and w1c > w0c:
-                reader.SetExtractIndex([w0c, h0c, d0c])
-                reader.SetExtractSize([w1c - w0c, h1c - h0c, d1c - d0c])
-            # 空 bbox 退为全卷读；保留明确分支供下游错误信息体现。
-        if sitk_pixel is not None:
-            # 强制 fp32/fp64 输出；sitk 在转型中应用 scl_slope/inter。
-            reader.SetOutputPixelType(sitk_pixel)
-        return reader.Execute()
-
-    img = _sitk_read_with_retry(_read, path)
-    # GetArrayViewFromImage 与 sitk buffer 共内存；del img 前必须 copy 到 owned。
-    view = sitk.GetArrayViewFromImage(img)  # (Z, Y, X) = (D', H', W')
-    arr = np.array(view, copy=True, order="C")
-    if arr.dtype != np_dtype:
-        arr = arr.astype(np_dtype, copy=False)
-    del view
-    del img
-    return arr
-
-
-# ---------------------------------------------------------------------------
-# NPZ pre-computed package I/O
-# ---------------------------------------------------------------------------
-# make_data 输出的 <pid>.npz（ZIP_STORED，无 gzip），含：
-#   image int16 (D',H',W') HU bbox-裁剪
-#   label int16 (D',H',W') 原始标签 bbox-裁剪
-#   rw    float32 (D',H',W') +1 偏移后的区域权重（可选）
-#   fg_slices int32 (M,)
-#   fg_coords int32 (N,3) seed=42、cap=50000
-#   meta  object 0-d dict
-# numpy 对 .npz 忽略 mmap_mode，逐 worker 为 owned ndarray；OS page cache 跨 worker 共享。
-
-
-def _open_npz(path: str) -> "np.lib.npyio.NpzFile":
-    """打开 npz（仅解析 zip 目录）。allow_pickle=True 供 meta dict 反序列。"""
-    return np.load(path, allow_pickle=True)
-
-
-def load_npz_image(
-    path: str,
-    intensity_min: float,
-    intensity_max: float,
-    normalize: str,
-    global_mean: float = 0.0,
-    global_std: float = 1.0) -> np.ndarray:
-    """读 npz image（int16 HU）后运行 preprocess_image → owned fp32。"""
-    with _open_npz(path) as f:
-        img_int16 = f["image"]
-        return preprocess_image(
-            img_int16, intensity_min, intensity_max,
-            normalize, global_mean, global_std,
-            inplace=False)
-
-
-def load_npz_label(path: str) -> np.ndarray:
-    """返 npz 中 owned int16 label ndarray。"""
-    with _open_npz(path) as f:
-        return f["label"]
-
-
-def load_npz_region_weight(path: str) -> Optional[np.ndarray]:
-    """返 owned fp32 区域权重（+1 偏移已由 make_data 加过）；无 rw 返 None。"""
-    with _open_npz(path) as f:
-        if "rw" not in f.files:
-            return None
-        rw = f["rw"]
-    if rw.dtype != np.float32:
-        rw = rw.astype(np.float32, copy=False)
-    return rw
-
-
-def npz_has_rw(path: str) -> bool:
-    """仅查 npz 是否含 rw 键（不解码数据）。"""
-    with _open_npz(path) as f:
-        return "rw" in f.files
-
-
-def load_npz_fg_slices(path: str) -> np.ndarray:
-    """返 npz 内预计算的逐 z 前景切片索引（裁剪后坐标系）。"""
-    with _open_npz(path) as f:
-        return np.asarray(f["fg_slices"], dtype=np.int32)
-
-
-def load_npz_fg_coords(path: str) -> np.ndarray:
-    """返 npz 内预计算的 (N,3) 前景 voxel 坐标（裁剪后坐标系）。"""
-    with _open_npz(path) as f:
-        return np.asarray(f["fg_coords"], dtype=np.int32)
-
-
-def load_npz_label_for_split(path: str) -> np.ndarray:
-    """owned int16 label copy，供 loader.py 预扫描使用。强制 copy 以免父进程持有 mmap 句柄。"""
-    with _open_npz(path) as f:
-        return np.array(f["label"])
-
-
-# ---------------------------------------------------------------------------
-# Preprocessing
-# ---------------------------------------------------------------------------
-def preprocess_image(
-    volume: np.ndarray,
-    intensity_min: float,
-    intensity_max: float,
-    normalize: str,
-    global_mean: float = 0.0,
-    global_std: float = 1.0,
-    inplace: bool = False) -> np.ndarray:
-    """强度窗 + 归一化 → fp32。单次分配 + in-place clip/normalize，避免中间临时 buffer。
-
-    inplace=True 且输入本是 fp32 时复用 buffer（调用方拥有该数组才可启用）。。"""
-    vol = np.asarray(volume, dtype=np.float32)
-    if vol is volume and not inplace:
-        # 输入本为 fp32 且未明示同意 in-place：拷贝避免污染上游。
-        vol = volume.copy()
-    np.clip(vol, intensity_min, intensity_max, out=vol)
-
-    if normalize == "minmax":
-        denom = float(intensity_max - intensity_min)
-        if denom > 0:
-            vol -= float(intensity_min)
-            vol /= denom
-        else:
-            vol.fill(0.0)
-    elif normalize == "zscore":
-        if global_std > 0:
-            vol -= float(global_mean)
-            vol /= float(global_std)
-        else:
-            vol.fill(0.0)
-    else:
-        raise ValueError(f"Unknown normalize: {normalize}")
-    return vol
-
-
-def compute_region_weight_map(
-    volume: np.ndarray, label_values: List[int],
-    region_weights: List[float]) -> np.ndarray:
-    """由整数 label 与逐值权重生成 (1,D,H,W) fp32 区域权重图；未命中标签赋 1.0。"""
-    vol  = np.round(volume).astype(np.int16)  # int16已经足够
-    wmap = np.ones_like(vol, dtype=np.float32)
-    for lv, w in zip(label_values, region_weights):
-        wmap[vol == lv] = w
-    return wmap[np.newaxis]  # (1, D, H, W)
-
-
-def load_region_weight_volume(
-    path: str, bbox: "Optional[BBox]" = None) -> np.ndarray:
-    """读样本区域权重 NIfTI 并 +1 偏移（背景变 1.0，标注 w 变 w+1）。
-    传 bbox 时 “裁后 +1”，避免全卷 fp32 临时 buffer。。"""
-    rw = load_nifti_cropped(path, bbox=bbox, dtype=np.float32)
-    rw += 1.0
-    return rw
-
-
-def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
-    """整数 label → 逐前景类二值掊叠 (num_fg,D,H,W) fp32；label_values 首位为背景。"""
-    vol = np.round(volume).astype(np.int32)
-    fg_values = label_values[1:]
-    # 向量化比较：(C,1,1,1) == (D,H,W) → (C,D,H,W)。
-    lv = np.array(fg_values, dtype=np.int32).reshape(-1, *([1] * vol.ndim))
-    return (vol[np.newaxis] == lv).astype(np.float32, copy=False)
-
-
-# ---------------------------------------------------------------------------
-# Resize helpers
-# ---------------------------------------------------------------------------
-def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_label: bool = False) -> np.ndarray:
-    """(D,H,W) 或 (C,D,H,W) resize：图像 order=1 线性，label order=0 近邻。"""
-    if arr.ndim == 3:
-        D, H, W = arr.shape
-        if D == target_d and H == target_h and W == target_w:
-            return arr
-        factors = [target_d / D, target_h / H, target_w / W]
-    elif arr.ndim == 4:
-        _, D, H, W = arr.shape
-        if D == target_d and H == target_h and W == target_w:
-            return arr
-        factors = [1.0, target_d / D, target_h / H, target_w / W]
-    else:
-        raise ValueError(f"Expected 3D or 4D array, got {arr.ndim}D")
-    order = 0 if is_label else 1
-    # zoom 已返输入 dtype；copy=False 避免冷拷贝。
-    return zoom(arr, factors, order=order).astype(arr.dtype, copy=False)
-
-
-# ---------------------------------------------------------------------------
-# Bounding-box helpers (optional ROI cropping of image / label volumes)
-# ---------------------------------------------------------------------------
-# bbox 约定：((d0,d1),(h0,h1),(w0,w1))，半开区间。
-BBox = Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]
-
-
-def compute_bbox_from_volume(vol: np.ndarray) -> Optional[BBox]:
-    """计算 (D,H,W) ROI 掩膜非零区域的轴齐包围盒；掩膜全空返 None。使用 np.any 逐轴崩装，比 argwhere 快且低内存。"""
-    if vol.ndim != 3:
-        raise ValueError(f"BBox volume must be 3D (D,H,W), got {vol.ndim}D")
-    mask = np.round(vol).astype(np.int16) != 0
-    if not mask.any():
-        return None
-    d_any = np.any(mask, axis=(1, 2))
-    h_any = np.any(mask, axis=(0, 2))
-    w_any = np.any(mask, axis=(0, 1))
-
-    def _span(flat: np.ndarray) -> Tuple[int, int]:
-        idx = np.where(flat)[0]
-        return int(idx[0]), int(idx[-1]) + 1  # half-open
-
-    return (_span(d_any), _span(h_any), _span(w_any))
-
-
-# ---------------------------------------------------------------------------
-# Volume cache
-# ---------------------------------------------------------------------------
-class VolumeCache:
-    """内存卷 LRU 缓存。max_volumes=0 不限容量；enabled=False 禁用。"""
-
-    def __init__(self, enabled: bool = False, max_volumes: int = 0):
-        self._enabled = enabled
-        self._max = max(int(max_volumes), 0)
-        self._store: "OrderedDict[str, np.ndarray]" = OrderedDict()
-
-    def get(self, path: str) -> Optional[np.ndarray]:
-        if not self._enabled:
-            return None
-        data = self._store.get(path)
-        if data is not None:
-            # Mark as most-recently-used.
-            self._store.move_to_end(path)
-        return data
-
-    def put(self, path: str, data: np.ndarray) -> None:
-        if not self._enabled:
-            return
-        if path in self._store:
-            self._store.move_to_end(path)
-            self._store[path] = data
-            return
-        self._store[path] = data
-        if self._max > 0:
-            while len(self._store) > self._max:
-                # popitem(last=False) pops the LEAST-recently-used entry.
-                self._store.popitem(last=False)
-
-    @property
-    def size(self) -> int:
-        return len(self._store)
-
-    # Pickling：传到 DataLoader worker 时丢弃缓存内容（Windows spawn 下防管道超限，
-    # 并且 worker 间不共享内存，传输是纯开销）。
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        state["_store"] = OrderedDict()
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        if not isinstance(self._store, OrderedDict):
-            self._store = OrderedDict()
-
-
-# ---------------------------------------------------------------------------
-# Common npz-backed Dataset base
-# ---------------------------------------------------------------------------
-class SegDatasetNpzBase(Dataset):
+class VolumeNpzDatasetBase(Dataset):
     """共用 npz I/O + 缓存基类。子类负责索引构建、采样与 __getitem__。
 
     抽出三类（z 轴 / cubic / whole）重复的 image/label/region-weight 读取、LRU 缓存、
@@ -432,7 +47,12 @@ class SegDatasetNpzBase(Dataset):
         is_train            : bool,
         cache_enabled       : bool,
         cache_max_volumes   : int,
-        region_weights      : Optional[List[float]]):
+        region_weights      : Optional[List[float]],
+        cond_normalize      : str,
+        cond_intensity_min  : float,
+        cond_intensity_max  : float,
+        cond_global_mean    : float,
+        cond_global_std     : float):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert npz_paths is not None and len(npz_paths) == len(image_paths), (
@@ -453,10 +73,16 @@ class SegDatasetNpzBase(Dataset):
         self.samples_per_volume = samples_per_volume
         self.is_train           = is_train
         self.region_weights     = region_weights
+        self.cond_normalize     = cond_normalize
+        self.cond_intensity_min = cond_intensity_min
+        self.cond_intensity_max = cond_intensity_max
+        self.cond_global_mean   = cond_global_mean
+        self.cond_global_std    = cond_global_std
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
+        self._cond_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
         # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw。
         self._npz_paths       : List[str]       = list(npz_paths)
@@ -525,14 +151,36 @@ class SegDatasetNpzBase(Dataset):
             self._rw_cache.put(path, rw)
         return rw
 
+    def _load_cond(self, vol_idx: int) -> Optional[np.ndarray]:
+        """加载条件体（npz）；无 cond 返 None。"""
+        path   = self._npz_paths[vol_idx]
+        cached = self._cond_cache.get(path)
+        if cached is not None:
+            return cached
+        cond = load_npz_cond(path)
+        if cond is None:
+            return None
+        if cond.ndim == 3:
+            cond = cond[np.newaxis]
+        if cond.ndim != 4:
+            raise ValueError(
+                f"Expected cond volume to have shape (C,D,H,W) or (D,H,W); got {cond.shape}")
+        normed = np.empty_like(cond, dtype=np.float32)
+        for i, ch in enumerate(cond):
+            normed[i] = preprocess_image(
+                ch, self.cond_intensity_min, self.cond_intensity_max,
+                self.cond_normalize, self.cond_global_mean, self.cond_global_std)
+        self._cond_cache.put(path, normed)
+        return normed
+
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
 
 
 # ---------------------------------------------------------------------------
-# 3D Segmentation Dataset (z-axis sliding window)
+# 3D Volume Dataset (z-axis sliding window)
 # ---------------------------------------------------------------------------
-class SegDataset3D(SegDatasetNpzBase):
+class Volume3D(VolumeNpzDatasetBase):
     """3D z 轴滑窗 dataset。z 轴滑动抖中心 z，折取 round(eD*s) 切片，
     仅 z 过采样；H/W 全分辨率 resize 到 patch_size。与 predictor.sliding.sliding_window_z 一致。
 
@@ -542,26 +190,30 @@ class SegDataset3D(SegDatasetNpzBase):
 
     def __init__(
         self,
-        image_paths                : List[str],
-        label_paths                : List[str],
-        label_values               : List[int],
-        patch_size                 : Tuple[int, int, int] = (64, 128, 128),
-        aug_oversample_ratio       : float = 1.0,
-        multi_res_scales           : Optional[List[float]] = None,
-        intensity_min              : float = -1024.0,
-        intensity_max              : float = 3071.0,
-        normalize                  : str = "minmax",
-        global_mean                : float = 0.0,
-        global_std                 : float = 1.0,
+        image_paths         : List[str],
+        label_paths         : List[str],
+        label_values        : List[int],
+        patch_size          : Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio: float = 1.0,
+        multi_res_scales    : Optional[List[float]] = None,
+        intensity_min       : float = -1024.0,
+        intensity_max       : float = 3071.0,
+        normalize           : str = "minmax",
+        global_mean         : float = 0.0,
+        global_std          : float = 1.0,
         foreground_oversample_ratio: float = 0.5,
-        samples_per_volume         : int = 8,
-        is_train                   : bool = True,
-        cache_enabled              : bool = True,
-        cache_max_volumes          : int = 0,
-        region_weights             : Optional[List[float]] = None,
-        z_boundary_mode            : str = "stretch",
-        npz_paths                  : Optional[List[str]] = None):
-
+        samples_per_volume  : int = 8,
+        is_train            : bool = True,
+        cache_enabled       : bool = True,
+        cache_max_volumes   : int = 0,
+        region_weights      : Optional[List[float]] = None,
+        cond_normalize      : str = "minmax",
+        cond_intensity_min  : float = -1024.0,
+        cond_intensity_max  : float = 1024.0,
+        cond_global_mean    : float = 0.0,
+        cond_global_std     : float = 1.0,
+        z_boundary_mode     : str = "stretch",
+        npz_paths           : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -578,7 +230,12 @@ class SegDataset3D(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            cond_normalize       = cond_normalize,
+            cond_intensity_min   = cond_intensity_min,
+            cond_intensity_max   = cond_intensity_max,
+            cond_global_mean     = cond_global_mean,
+            cond_global_std      = cond_global_std)
         if z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
@@ -644,13 +301,15 @@ class SegDataset3D(SegDatasetNpzBase):
         # 样本区域权重文件 > 静态 region_weights 映射。
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
-        return self._getitem_max_fov(img, lbl, rw_vol, z, eD, eH, eW)
+        cond_vol = self._load_cond(vol_idx)
+        return self._getitem_max_fov(img, lbl, rw_vol, cond_vol, z, eD, eH, eW)
 
     def _getitem_max_fov(
         self,
         img    : np.ndarray,
         lbl    : np.ndarray,
         rw_vol : Optional[np.ndarray],
+        cond_vol: Optional[np.ndarray],
         z      : int,
         eD     : int,
         eH     : int,
@@ -662,10 +321,16 @@ class SegDataset3D(SegDatasetNpzBase):
         img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, eD_max)
         rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
                 if rw_vol is not None else None)
+        cond_s = (_channelwise_3d(
+            cond_vol,
+            lambda ch: extract_z_patch_padded(ch, z, eD_max))
+            if cond_vol is not None else None)
 
         # 面内 resize 到 (eH,eW)；D 轴保持 eD_max（不重采样）。
         img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
         lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
+        if cond_s is not None:
+            cond_s = resize_3d(cond_s, eD_max, eH, eW, is_label=False)
         result = {
             # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
@@ -680,6 +345,9 @@ class SegDataset3D(SegDatasetNpzBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        if cond_s is not None:
+            result["cond"] = torch.from_numpy(
+                np.ascontiguousarray(cond_s.astype(np.float32, copy=False)))
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
@@ -736,6 +404,19 @@ def extract_z_patch_padded(
     return patch.copy()
 
 
+def _channelwise_3d(
+    vol: Optional[np.ndarray], fn) -> Optional[np.ndarray]:
+    """对 (C,D,H,W) 逐通道应用 3D 体操作；3D 输入会先补通道维。"""
+    if vol is None:
+        return None
+    if vol.ndim == 3:
+        vol = vol[np.newaxis]
+    if vol.ndim != 4:
+        raise ValueError(f"Expected 3D or 4D volume, got {vol.ndim}D")
+    out = [fn(ch) for ch in vol]
+    return np.stack(out, axis=0)
+
+
 # ---------------------------------------------------------------------------
 # 3D Cubic Patch Dataset
 # ---------------------------------------------------------------------------
@@ -773,9 +454,9 @@ def _extract_cubic_patch(
     return patch
 
 
-class SegDataset3DCubic(SegDatasetNpzBase):
+class Volume3DCubic(VolumeNpzDatasetBase):
     """3D cubic patch dataset：以 (d,h,w) 为中心抽 3D cube。支持增强过采样与
-    多分辨率（同中心多 scale resize 后拼通道）。输出与 SegDataset3D 一致：(C_res, eD, eH, eW)，
+    多分辨率（同中心多 scale resize 后拼通道）。输出与 Volume3D 一致：(C_res, eD, eH, eW)，
     label 以原始整数传到损失处二值化。"""
 
     def __init__(
@@ -797,6 +478,11 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         cache_enabled              : bool = True,
         cache_max_volumes          : int = 0,
         region_weights             : Optional[List[float]] = None,
+        cond_normalize             : str = "minmax",
+        cond_intensity_min         : float = -1024.0,
+        cond_intensity_max         : float = 1024.0,
+        cond_global_mean           : float = 0.0,
+        cond_global_std            : float = 1.0,
         npz_paths                  : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
@@ -814,7 +500,12 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            cond_normalize       = cond_normalize,
+            cond_intensity_min   = cond_intensity_min,
+            cond_intensity_max   = cond_intensity_max,
+            cond_global_mean     = cond_global_mean,
+            cond_global_std      = cond_global_std)
         
         self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
@@ -861,7 +552,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
-        return self._getitem_max_fov(center, img, lbl, rw_vol, eD, eH, eW)
+        cond_vol = self._load_cond(vol_idx)
+        return self._getitem_max_fov(center, img, lbl, rw_vol, cond_vol, eD, eH, eW)
 
     def _getitem_max_fov(
         self,
@@ -869,6 +561,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         img   : np.ndarray,
         lbl   : np.ndarray,
         rw_vol: Optional[np.ndarray],
+        cond_vol: Optional[np.ndarray],
         eD    : int,
         eH    : int,
         eW    : int) -> Dict[str, torch.Tensor]:
@@ -882,6 +575,9 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         lbl_s = _extract_cubic_patch(lbl, center, size_max)
         rw_s  = (_extract_cubic_patch(rw_vol, center, size_max)
                 if rw_vol is not None else None)
+        cond_s = (_channelwise_3d(
+            cond_vol, lambda ch: _extract_cubic_patch(ch, center, size_max))
+            if cond_vol is not None else None)
 
         result = {
             # 领头 "1" = 压叠 C_res 轴；trainer 逐视图裁+resize。
@@ -896,6 +592,10 @@ class SegDataset3DCubic(SegDatasetNpzBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        if cond_s is not None:
+            cond_s = resize_3d(cond_s, eD_max, eH_max, eW_max, is_label=False)
+            result["cond"] = torch.from_numpy(
+                np.ascontiguousarray(cond_s.astype(np.float32, copy=False)))
         return result
 
     def _safe_center_range(
@@ -944,7 +644,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 # ---------------------------------------------------------------------------
 # 3D Whole-Volume Dataset (no sliding window, no sub-cropping)
 # ---------------------------------------------------------------------------
-class SegDataset3DWhole(SegDatasetNpzBase):
+class Volume3DWhole(VolumeNpzDatasetBase):
     """整体卷 dataset：全卷 resize 到 extract_size = round(patch_size*oversample)，
     不切块/不采中心。trainer 增强后中心裁为 patch_size。。
 
@@ -969,6 +669,11 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         cache_enabled       : bool = True,
         cache_max_volumes   : int = 0,
         region_weights      : Optional[List[float]] = None,
+        cond_normalize      : str = "minmax",
+        cond_intensity_min  : float = -1024.0,
+        cond_intensity_max  : float = 1024.0,
+        cond_global_mean    : float = 0.0,
+        cond_global_std     : float = 1.0,
         npz_paths           : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
@@ -986,7 +691,12 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            cond_normalize       = cond_normalize,
+            cond_intensity_min   = cond_intensity_min,
+            cond_intensity_max   = cond_intensity_max,
+            cond_global_mean     = cond_global_mean,
+            cond_global_std      = cond_global_std)
         # 3 轴同步过采样：与 cubic 一致，给增强（旋转/弹性）留中心裁余量。
         self.extract_size = tuple(
             int(round(p * self.oversample)) for p in self.patch_size)
@@ -1004,6 +714,9 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         # 全卷单次 3D zoom。
         img_r = resize_3d(img, eD, eH, eW, is_label=False)
         lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
+        cond_r = self._load_cond(vol_idx)
+        if cond_r is not None:
+            cond_r = resize_3d(cond_r, eD, eH, eW, is_label=False)
 
         result = {
             "image": torch.from_numpy(img_r[np.newaxis]).float(),
@@ -1020,4 +733,7 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             rw_vol = compute_region_weight_map(
                 lbl_r, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(rw_vol).float()
+        if cond_r is not None:
+            result["cond"] = torch.from_numpy(
+                np.ascontiguousarray(cond_r.astype(np.float32, copy=False)))
         return result

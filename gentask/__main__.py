@@ -1,4 +1,4 @@
-"""Allow running as: python -m segtask_v1.train"""
+"""Allow running as: python -m gentask.train"""
 from .train import main
 
 if __name__ == "__main__":

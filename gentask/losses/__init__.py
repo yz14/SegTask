@@ -1,1 +1,1 @@
-"""Loss functions for segmentation."""
+"""Losses for generation and shared image-to-image support."""

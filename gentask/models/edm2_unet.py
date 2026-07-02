@@ -1,4 +1,4 @@
-"""EDM2 U-Net 分割 backbone (Karras 2024)。忠实 MP 块：MPConv、mp_silu/mp_sum/mp_cat、pixel-norm、Block (可选 resample/MHSA，去扩散 FiLM)。仅 2.5D；DS/aux 为附加扩展（_MPSegHead 1×1 代替论文 3×3）。Multi-FOV stem：shared_stem | multi_stem_proj（拒 hierarchical）。forward 合同与 UNet3D 一致。"""
+"""EDM2 U-Net 共享 backbone (Karras 2024)。忠实 MP 块：MPConv、mp_silu/mp_sum/mp_cat、pixel-norm、Block (可选 resample/MHSA，去扩散 FiLM)。仅 2.5D；DS/aux 为附加扩展（_MPSegHead 1×1 代替论文 3×3）。Multi-FOV stem：shared_stem | multi_stem_proj（拒 hierarchical）。forward 合同与 UNet3D 一致。"""
 
 from __future__ import annotations
 
@@ -611,7 +611,7 @@ class EDM2SegModel(nn.Module):
 # ============================================================================
 
 
-def build_edm2_seg_model(cfg) -> EDM2SegModel:
+def build_edm2_backbone(cfg) -> EDM2SegModel:
     """从 Config 构造 EDM2SegModel。读取 EDM2 专有：edm2_attention_levels（默认 [L-1]）、edm2_channels_per_head(64)、edm2_res_balance/attn_balance(0.3)、edm2_concat_balance(0.5)、edm2_clip_act(256.0)。复用 model.dropout 为 Block dropout。"""
     mc = cfg.model
     enc_channels = list(mc.encoder_channels)

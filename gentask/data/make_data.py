@@ -1,4 +1,4 @@
-"""逐样本 npz 预烘包（image+label+可选 rw+fg 索引）。将 bbox 裁剪后的体积输出为 <out_dir>/<pid>.npz，训练时 mmap 多 worker 共享 OS page cache。默认 np.savez 不压缩（供共享）；--compress 使用 savez_compressed。CLI：`python -m segtask_v1.data.make_data --config <yaml> --out <dir> [--workers N]`。已存在不覆盖（除非 --overwrite）；失败写 <out_dir>/_failures.txt（与 data.exclude_list 兼容）。"""
+"""逐样本 npz 预烘包（image+label+可选 rw+fg 索引）。将 bbox 裁剪后的体积输出为 <out_dir>/<pid>.npz，训练时 mmap 多 worker 共享 OS page cache。默认 np.savez 不压缩（供共享）；--compress 使用 savez_compressed。CLI：`python -m gentask.data.make_data --config <yaml> --out <dir> [--workers N]`。已存在不覆盖（除非 --overwrite）；失败写 <out_dir>/_failures.txt（与 data.exclude_list 兼容）。"""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from .loader import (
     _filter_by_exclude,
     _load_exclude_pids,
     discover_samples,
+    match_condition_paths,
     match_bbox_paths,
     match_region_weight_paths,
     detect_label_values,
@@ -38,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_VERSION = "make_data/1.0"
 
-# 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
+# 同 Volume3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
 
 
@@ -57,7 +58,7 @@ def _compute_fg_indices(
     bg_val: int,
     fg_subsample: int,
     seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 SegDataset3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
+    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 Volume3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
     if label.size == 0:
         return (np.zeros((0,), dtype=np.int32),
                 np.zeros((0, 3), dtype=np.int32))
@@ -89,6 +90,7 @@ def prepare_one(
     label_path: str,
     bbox_path: Optional[str],
     rw_path: Optional[str],
+    cond_paths: Optional[List[str]],
     out_path: str,
     label_values: List[int],
     fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
@@ -139,6 +141,19 @@ def prepare_one(
                 "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
                 pid, rw_min, rw_max, is_integer_valued)
 
+    # 4b. 条件体：与 image 1:1 对齐、同 bbox 裁剪；按 channel stack。
+    cond: Optional[np.ndarray] = None
+    if cond_paths:
+        cond_vols: List[np.ndarray] = []
+        for cpath in cond_paths:
+            cvol = load_nifti_cropped(cpath, bbox=bbox, dtype=np.float32)
+            if cvol.shape != image.shape:
+                raise ValueError(
+                    f"cond shape {cvol.shape} != image shape {image.shape} "
+                    f"for pid={pid} (cond={cpath})")
+            cond_vols.append(cvol)
+        cond = np.stack(cond_vols, axis=0).astype(np.float32, copy=False)
+
     # 5. 裁剪坐标系下的前景索引。
     bg_val = int(label_values[0])
     fg_slices, fg_coords = _compute_fg_indices(label, bg_val, fg_subsample)
@@ -150,9 +165,11 @@ def prepare_one(
         "src_label"   : str(label_path),
         "src_bbox"    : str(bbox_path) if bbox_path else "",
         "src_rw"      : str(rw_path) if rw_path else "",
+        "src_cond"    : list(map(str, cond_paths)) if cond_paths else [],
         "bbox"        : (list(map(list, bbox)) if bbox is not None else None),
         "label_values": list(map(int, label_values)),
         "has_rw"      : rw is not None,
+        "has_cond"    : cond is not None,
         "rw_shift"    : 1.0,
         "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
         "image_dtype" : str(image.dtype),
@@ -171,6 +188,8 @@ def prepare_one(
         "meta"     : meta_arr}
     if rw is not None:
         payload["rw"] = rw
+    if cond is not None:
+        payload["cond"] = cond
     with open(tmp_path, "wb") as fh:
         save_fn(fh, **payload)
     # Windows：rename 前目标不能存在。
@@ -211,6 +230,13 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
             image_paths, dc.region_weight_dir, dc.image_suffix,
             dc.region_weight_suffix)
 
+    cond_paths_all: Optional[List[List[str]]] = None
+    if dc.cond_dirs:
+        cond_paths_all = []
+        for cond_dir in dc.cond_dirs:
+            cond_paths_all.append(match_condition_paths(
+                image_paths, cond_dir, dc.image_suffix, dc.cond_suffixes))
+
     samples: List[Dict[str, Optional[str]]] = []
     for i, (img, lbl) in enumerate(zip(image_paths, label_paths)):
         samples.append({
@@ -218,7 +244,8 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
             "image": img,
             "label": lbl,
             "bbox" : bbox_paths_all[i] if bbox_paths_all else None,
-            "rw"   : rw_paths_all[i] if rw_paths_all else None})
+            "rw"   : rw_paths_all[i] if rw_paths_all else None,
+            "cond" : [paths[i] for paths in cond_paths_all] if cond_paths_all else None})
     return samples
 
 
@@ -278,6 +305,7 @@ def prepare_dataset(
             label_path   = sample["label"],
             bbox_path    = sample["bbox"],
             rw_path      = sample["rw"],
+            cond_paths   = sample["cond"],
             out_path     = out_path,
             label_values = label_values,
             fg_subsample = fg_subsample,
@@ -352,6 +380,7 @@ def prepare_dataset(
             "label_dir": cfg.data.label_dir,
             "bbox_dir": cfg.data.bbox_dir,
             "region_weight_dir": cfg.data.region_weight_dir,
+            "cond_dirs": list(cfg.data.cond_dirs),
         },
         "label_values": label_values,
         "n_total": counters["total"],
@@ -427,7 +456,7 @@ def main() -> int:
     parser.add_argument("--fg-subsample", type=int,
                         default=_DEFAULT_FG_SUBSAMPLE,
                         help="Max stored 3D fg coords per sample "
-                             "(matches SegDataset3DCubic._build_index).")
+                             "(matches Volume3DCubic._build_index).")
     parser.add_argument("--compress", action="store_true",
                         help="Use np.savez_compressed (smaller disk, "
                              "but no shared OS page cache and slower load).")
