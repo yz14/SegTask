@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from ..data.degradation import build_degradation
 from .diffusion import build_diffusion
 from .factory import build_backbone
+from .topology import build_topology
 
 
 class RegressionModel(nn.Module):
@@ -35,47 +36,88 @@ class RegressionModel(nn.Module):
     与下采样后的 HR 算重建损失并加权聚合；推理（``restore``）只取全分辨率头。
     """
 
-    def __init__(self, net: nn.Module, degradation, residual: bool = False,
-                 spatial_dims: int = 2):
+    def __init__(
+        self,
+        net: nn.Module,
+        degradation,
+        residual: bool = False,
+        spatial_dims: int = 2,
+        view_depths: Optional[Sequence[int]] = None,
+        aux_views_active: bool = False):
         super().__init__()
         self.net = net
         self.degradation = degradation
         self.residual = bool(residual)
         self.spatial_dims = int(spatial_dims)
+        self.view_depths = tuple(int(v) for v in view_depths) if view_depths else ()
+        self.aux_views_active = bool(aux_views_active)
+
+    def _is_multi_view_2_5d(self) -> bool:
+        return self.spatial_dims == 2 and len(self.view_depths) > 1
+
+    def _view_splits(self, x: torch.Tensor) -> List[torch.Tensor]:
+        if not self._is_multi_view_2_5d():
+            return [x]
+        try:
+            return list(torch.split(x, list(self.view_depths), dim=1))
+        except RuntimeError as exc:  # pragma: no cover - defensive
+            raise ValueError(
+                f"packed 2.5D tensor with shape {tuple(x.shape)} does not "
+                f"match view_depths={self.view_depths}.") from exc
+
+    def _main_view(self, x: torch.Tensor) -> torch.Tensor:
+        return self._view_splits(x)[0]
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
         return self.degradation.degrade(hr)
 
-    def _add_residual(self, out: torch.Tensor, lr: torch.Tensor) -> torch.Tensor:
+    def _add_residual(self, out: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
         """残差基线：全分辨率头加 ``lr``；下采样头加 ``lr`` 缩放到该头尺寸。"""
-        base = lr
-        if out.shape[-self.spatial_dims:] != lr.shape[-self.spatial_dims:]:
+        if out.shape[-self.spatial_dims:] != base.shape[-self.spatial_dims:]:
             base = F.interpolate(
-                lr, size=tuple(out.shape[-self.spatial_dims:]), mode="area")
+                base, size=tuple(out.shape[-self.spatial_dims:]), mode="area")
         if out.shape[1] != base.shape[1]:
             raise ValueError(
-                "residual=True requires net out channels == lr channels "
+                "residual=True requires net out channels == base channels "
                 f"({out.shape[1]} != {base.shape[1]}); set task.residual=False "
                 "or match out_channels to input depth.")
         return out + base
 
-    def _heads(self, lr: torch.Tensor) -> list:
-        """返回多尺度输出头列表（深监督关时为单元素）；head[0] 为全分辨率。"""
+    def _heads(self, lr: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """返回主路径多尺度头与可选 aux 头；head[0] 为全分辨率。"""
         out = self.net(lr)
+        aux = []
         if isinstance(out, dict):
+            aux = list(out.get("aux", []))
             out = out["main"]
         heads = list(out) if isinstance(out, (list, tuple)) else [out]
+        base = self._main_view(lr)
         if self.residual:
-            heads = [self._add_residual(h, lr) for h in heads]
-        return heads
+            heads = [self._add_residual(h, base) for h in heads]
+        # aux 头直接重建各自 view，不叠 residual；residual 只作用于主 view 0。
+        return heads, aux
 
     def restore(self, lr: torch.Tensor) -> torch.Tensor:
-        return self._heads(lr)[0]
+        return self._heads(lr)[0][0]
+
+    def _target_views(self, hr: torch.Tensor) -> List[torch.Tensor]:
+        if not self._is_multi_view_2_5d():
+            return [hr]
+        return self._view_splits(hr)
 
     def forward(self, hr: torch.Tensor) -> Dict[str, torch.Tensor]:
         lr = self.degrade(hr)
-        heads = self._heads(lr)
-        return {"pred": heads[0], "ds_preds": heads, "target": hr}
+        heads, aux = self._heads(lr)
+        target_views = self._target_views(hr)
+        out = {"pred": heads[0], "ds_preds": heads, "target": target_views[0]}
+        if self._is_multi_view_2_5d() and self.aux_views_active and aux:
+            if len(aux) != len(target_views) - 1:
+                raise ValueError(
+                    f"aux head count {len(aux)} does not match auxiliary "
+                    f"view count {len(target_views) - 1}.")
+            out["aux_preds"] = aux
+            out["aux_targets"] = target_views[1:]
+        return out
 
 
 class DiffusionModel(nn.Module):
@@ -113,13 +155,25 @@ def build_generation_model(cfg) -> nn.Module:
             f"task.degradation must be 'superres'; got {task.degradation!r}")
 
     spatial_dims = 2 if cfg.data.patch_mode == "2_5d" else 3
+    topology = build_topology(cfg)
     degradation = build_degradation(task, spatial_dims=spatial_dims)
     algo = str(task.algorithm).lower()
 
     if algo == "regression":
+        if topology.patch_mode == "2_5d" and topology.n_views > 1 and not topology.lift_2_5d_to_3d:
+            if topology.keep_native_view_depth and topology.per_view_depths:
+                view_depths = list(topology.per_view_depths)
+            else:
+                view_depths = [topology.slab_depth] * topology.n_views
+        else:
+            view_depths = None
         net = build_backbone(cfg)  # 复用图到图 backbone（输出通道按 out_channels）
         return RegressionModel(net, degradation, residual=bool(task.residual),
-                               spatial_dims=spatial_dims)
+                               spatial_dims=spatial_dims,
+                               view_depths=view_depths,
+                               aux_views_active=(topology.aux_seg_active
+                                                 and topology.patch_mode == "2_5d"
+                                                 and not topology.lift_2_5d_to_3d))
 
     if algo == "diffusion":
         arch = str(cfg.model.arch).lower()
