@@ -215,3 +215,134 @@ forwards.py 有完整 3D 7-flip / 2.5D 3-flip TTA 且支持变体批量化，无
 
 D3. prob_to_label 全类共享单一阈值
 blending.py:111：max_prob < threshold → bg，所有前景类共用 threshold。one-vs-rest sigmoid 框架下（B7），不同类的最优操作点常差异很大（小结构类偏低阈值）。低成本改进：支持逐类阈值（配置为标量或列表），并可在 val 集上自动扫描。另外没有连通域后处理选项（nnU-Net 的 largest-CC 消融是常规免费增益），可作为可选后处理加入 predictor。
+
+
+核对：
+
+## A. 正确性问题核对
+
+### A1. LR 调度 horizon 与梯度累积不匹配 —— ✅ 成立（确认为真 bug）
+- `trainer/trainer.py:120-123`：`steps_per_epoch = len(train_loader)`，warmup/total 均按 micro-batch 数计。
+- `trainer/trainer.py:705-741`：`self.scheduler.step()` 只在 `is_step_boundary`（优化步边界）调用。
+- `WarmupScheduler.step()`（`trainer/optim.py:113-121`）按调用次数推进 → grad_accum=N 时整个训练只推进 horizon 的 1/N；warmup 实际持续 N× 个 epoch。
+- 你的修复方案正确：`steps_per_epoch = ceil(len(train_loader) / accum)`。注意 `_train_epoch` 中 `is_step_boundary` 在 epoch 尾部（`(step+1)==total_steps`）也会触发一次优化步，所以每 epoch 的真实优化步数恰好是 `ceil(len/accum)`，与该修复严格一致。
+
+### A2. EMA × torch.compile key 不匹配 —— ✅ 成立（比你判断的更严重一点）
+- 顺序确认：`trainer.py:154` 用裸模型建 EMA → `trainer.py:171` `self.model = torch.compile(...)` → `trainer.py:742-743` `ema.update(self.model)`。
+- `OptimizedModule.state_dict()` 的 key 带 `_orig_mod.` 前缀，`utils.py:55-59` `_build_pairs` 直接 `self.shadow[k]` → 首个优化步 KeyError。
+- 补充：不只 update/apply_shadow/restore —— **best checkpoint 保存路径也会炸**：`trainer.py:882` `self.ema.apply_shadow(self.model)` 传入的是 compiled 模块（尽管同函数内 `unwrap_compile` 已用于 state_dict 提取）。
+- 你"现有 Windows 环境 compile 回退 eager 故未触发"的推测与代码一致：`trainer.py:159-172` 无 Triton 时 `_compile_enabled=False`，`self.model` 保持裸模块。Linux + Triton 环境首步必炸。建议方案（key 归一化或 EMA 持有 unwrap 后引用 + compile+EMA 冒烟测试）合理，后者更干净。
+
+### A3. ModelEMA 文档自相矛盾 —— ✅ 成立
+- `utils.py:40` 注释"仅单卡，不兼容 DDP/FSDP"；但 Trainer 在 DDP 下无条件启用 EMA（`trainer.py:154` 无 DDP 判断）。
+- 数学上你的分析正确：DDP 不包装 `self.model` 本体（`trainer.py:174-199` 注释明确参数张量与单卡一致，DDP 只挂 all-reduce 钩子），梯度同步后各 rank 参数一致，EMA 等价。确为"改注释而非改代码"级别的问题。FSDP 部分注释仍然成立（参数分片下确实不兼容）。
+
+### A4. bf16/fp32 下非有限 loss 不被跳过 —— ✅ 成立（高优先级判断正确）
+- `trainer.py:150-151`：scaler 仅 fp16 启用。`trainer.py:793-797` 的告警文案 "GradScaler will skip this optimizer step" 在 bf16/fp32 下是**错误陈述**：`GradScaler(enabled=False).step()` 直接透传 `optimizer.step()`，无 inf/NaN 检查。
+- 后果链成立：NaN loss → NaN 梯度 → AdamW 一步后权重 NaN → 下一次 `ema.update` 污染 shadow，不可恢复。且 `resolve_auto_amp_dtype` 在 Ampere+ 默认解析为 bf16，即生产默认配置正处于无保护路径。你的修复建议（accum 组内出现非有限 loss 时 zero_grad 跳过该优化步，含 scheduler/EMA，并修文案）与 fp16 语义对齐，正确。
+
+### A5. medium 验证 patch 每 epoch 随机重采 —— ✅ 成立
+- `dataset.py:685-693` `_sample_z`：`is_train=False` 时走 `rng.integers(0, D_vol)` 均匀随机；cubic 的 `_sample_center`（923-941）同理。
+- `dataset.py:469-483` per-worker RNG 种子来自 `info.seed`，而 DataLoader 每次 `__iter__` 从全局 torch RNG 抽新 base_seed，且 `loader.py:725-728` 的 val_loader 未传固定 `generator` → 每个 epoch 验证集 patch 确实不同。
+- 后果链（save_best/early-stopping/plateau 被采样噪声驱动）成立：`trainer.py:352-378` 全部以该指标为准。建议方向（val 确定性采样或推荐 `val_metric_mode=high`）合理；`validation.py` 的 VolumeValEvaluator 实现确实完整可用。
+
+### A6. one_cycle horizon 同族 bug —— ✅ 成立
+- `optim.py:75` `total_steps = tc.epochs * steps_per_epoch`（micro-step 数）。修 A1 时传入的 `steps_per_epoch` 改为优化步数即一并修好；`optim.py:78-79` `pct_start` 下限 `2.0/max(total_steps,4)` 依赖 total_steps，你"修复时同步验证"的提醒是对的（total_steps 变小后下限变松，不会出错但 warmup 段占比会变）。
+
+### A7. DDP 全 rank 同 seed —— ✅ 成立
+- `train.py:183`：`_train_worker` 内所有 rank 用 `cfg.train.seed`。GPUAugmentor 全部用 `torch.rand(..., device)`（`augment.py` 各处）→ 各 rank CUDA RNG 流相同，每 step 增强参数序列完全一致；DataLoader worker numpy RNG 派生自 torch 种子，同理。
+- 定性正确：非致命（数据不同）但增强多样性打折。`seed_everything(seed + local_rank)` 是标准做法（nnU-Net/timm 均如此）。resume 时 `trainer.py:934-947` 各 rank 恢复同一份 RNG 状态的补充观察也属实。
+
+---
+
+## B. 算法/架构层面核对
+
+### B1. 缺失 spacing 归一化 —— ✅ 成立（同意"最大系统性短板"的定级）
+- `make_data.py` 全文无 spacing/resample 处理；spacing 仅在 `dataset.py:95-114` `load_nifti_with_spacing` 被推理 z-interleave 读取一次。npz meta 有落点，你提出的"烘焙阶段插入 target-spacing 重采样 + Predictor 镜像回采"是侵入最小的正确位置。这也是 nnU-Net 数据指纹里权重最高的一环，同意优先级排在 B 组首位。
+
+### B2. z_axis 面内整片 resize —— ✅ 成立
+- `dataset.py:666-668` 每个 `__getitem__` 对 `(eD_max,H,W)` 做 scipy `zoom`（`resize_3d`，label order=0）；面内无随机 crop（z 是唯一随机自由度）。三条后果（细节上限锁死、面内平移多样性=0、CPU 热点重复计算）均与代码一致。"resize 前移到 make_data 烘焙或改面内原生分辨率+随机 crop"两个方案都成立，后者收益更大但要重估显存。
+
+### B3. 空间增强物理正确性 —— ✅ 成立
+- `augment.py:92-129` 仿射在 `affine_grid` 归一化坐标系做三轴欧拉旋转，无 aspect 校正；patch (64,128,128) 各向异性下旋转即混入剪切/非均匀缩放。`random_rotate_range` 三轴共用（`augment.py:109-110`）。elastic 的补充判断也对：`voxel_to_grid`（190-195）位移幅度逐轴换算正确，但粗网格 `cD/cH/cW = round(dim/sigma)`（184-186）的平滑尺度是体素意义的，各向异性下不均。建议（aspect 校正对角阵 + 三轴角度分开配置）是标准做法（batchgenerators 即如此）。
+
+### B4. 前景采样不感知类别 —— ✅ 成立
+- `make_data.py:56-75` `_compute_fg_indices`：`fg_mask = label != bg` 把所有前景类合并；`fg_coords` cap=50000 的均匀下采样进一步按体积比例分配 → 大器官统治采样。nnU-Net "先随机选类、再从该类 voxel 采中心"的对照准确。改动点（make_data 按类存 + 两个 `_sample_*`）评估正确，属低成本高收益。
+
+### B5. Dice 默认配置 —— ✅ 成立
+- `config.py:467-469`：`batch_dice=False`、`ignore_empty=False` 均为默认。分析正确（空 GT patch 的 per-sample Dice ≈1 抬高基线、稀释梯度）。代码已支持 batch_dice，确属纯配置/文档建议。
+
+### B6. Plan A aux 头同源 —— ✅ 成立
+- `unet.py:450-455`：非 hierarchical 时所有 aux 头 `feat_idx = n_dec - 1`，与主头（`unet.py:476` 读 `dec_features[-1]`）完全同源。hierarchical（Plan C）挂 `n_dec-1-k`（444-449）确实不同深度。"用 run_aux_sweep 消融验证 Plan A aux 是否有增益，无则简化"是合理的处置。
+
+### B7. sigmoid vs softmax —— ✅ 成立（属设计权衡而非 bug）
+- `losses.py:1-6` 明确全框架锁定逐类 sigmoid、背景隐含；推理端 `blending.py:108-111` 的 max/argmax 解决冲突。对互斥器官 softmax+CE+Dice 归纳偏置更强的判断符合社区共识（nnU-Net 默认 softmax，region-based 才用 sigmoid）。这是框架级改动，成本高，建议先在一个互斥多类任务上 AB 验证再决定。
+
+### B8. 缺平移自由度 —— ✅ 成立
+- `_build_rotation_matrices`（`augment.py:156-160`）平移列恒 `zeros`。cubic 模式随机 crop 提供平移、z_axis 模式面内完全没有的分析正确。仿射矩阵补随机平移确实是一行级改动。
+
+### B9. 强度增强后无 clamp —— ✅ 成立（同意影响小）
+- `augment.py:63-68` brightness/contrast/noise 后无重裁剪。gamma 内部有 `clamp(0,1)`（317）但之后 `*rng+mn` 反归一，与 brightness 叠加可产生越界值。低优先级判断合适。
+
+### B10. blur/lowres 逐样本循环 —— ✅ 基本成立，一处细节修正
+- `augment.py:353`、`augment.py:387` 逐选中样本 Python 循环属实，热路径隐性串行成立。
+- **修正**：`torch.empty(1).uniform_()` 创建的是 **CPU 张量**，其 `float()` 不构成 CUDA→CPU 同步点（没有 GPU 参与）。真正的同步点是各函数里的 `mask.any()` / `mask.sum().item()` / `.nonzero().tolist()`（整个 augment 管线普遍存在）。结论（可向量化、优先级低于 B2）不变。
+
+### B11. stem_stride 注释-实现漂移 —— ✅ 成立
+- `unet.py:377` 注释称"stem_stride>1 时 forward 末尾上采回输入分辨率"，`unet.py:477-481` 实际尺寸不符直接 raise，全 forward 无上采样逻辑。`stem.py:82`：patchN stem 的 stride=N，配置上可达 stem_stride>1 → 注释确会误导。与 A3 同性质（文档漂移），改注释即可（或真正实现上采样，但需先确认是否有 patchN 使用场景）。
+
+### B12. 优化器无参数分组 —— ✅ 成立
+- `optim.py:24-26` 单参数组，norm affine 与 bias 均被 decay。零风险改进 + 为 ssltask layer-wise LR decay 预留入口的理由都成立。
+
+### B13. EMA decay 无 warmup —— ✅ 成立
+- `utils.py:42` 固定 decay=0.999。timm 式 `min(decay, (1+step)/(10+step))` ramp-up 建议标准。补充：`_load_pretrain`（`trainer.py:989-995`）已把 EMA shadow 对齐加载权重，所以 pretrain 场景问题不大，主要影响 from-scratch 且 `val_every` 较小的配置。
+
+---
+
+## C. 训练流程/工程核对
+
+### C1. DDP medium 验证浪费 CPU —— ✅ 成立
+- `validation.py:318-320`：每 rank 完整迭代 val_loader、`i % world_size != rank` 跳过，batch 已被 worker 完整生产（含 B2 的 resize）。val 走 DistributedSampler(drop_last=False)+去重 或 Dataset 层分片的建议正确；注意去重逻辑（DistributedSampler 会 padding 补齐）需要小心处理以免指标偏差。
+
+### C2. 周期 checkpoint 无保留策略 —— ✅ 成立
+- `trainer.py:422-423` + `_save_checkpoint`（904 行）：`checkpoint_epoch_{N}.pth` 从不清理。keep-last-k 建议标准。
+
+### C3. compile 模型滑窗 shape 抖动 —— ✅ 方向成立，定性为"需验证"恰当
+- `VolumeValEvaluator` 确实复用 `trainer.model`（可能 compiled）做滑窗；不同卷尺寸/尾窗会触发 recompile 属 torch.compile 已知行为。属 Linux+Triton+`val_metric_mode=high` 组合下值得冒烟验证的项，与 A2 可共用同一条 compile 冒烟测试。
+
+---
+
+## D. 推理端核对
+
+### D1. 概率累加器 GPU fp32 OOM 风险 —— ✅ 成立
+- `sliding.py:87-91`（z 轴）与 `sliding.py:283-287`（cubic）：`acc_pred (num_fg,D,H,W) fp32` + `acc_weight` 常驻 GPU；cubic 的 `acc_weight` 还是全尺寸 `(1,D,H,W)`。512³×800×4 类的量级估算正确。fp16 累加（blend 权重归一后精度足够）或 `accumulate_on_cpu` 逃生门都是 nnU-Net 已验证的方案。
+
+### D2. TTA 已实现且质量好 —— ✅ 成立
+- `forwards.py`：3D 7-flip / 2.5D 3-flip、`tta_batch_size` 变体批量化、2.5D 不翻 D 轴的理由（注释 52-53 行）都正确。无需补。
+
+### D3. 全类共享单一阈值 —— ✅ 成立
+- `blending.py:111`：`max_prob < threshold → bg`，单标量阈值。one-vs-rest 下逐类阈值 + val 集自动扫描是低成本改进；largest-CC 后处理选项确实缺失，均同意。
+
+---
+
+## 算法层面建议
+
+**1. 先吃数据/训练侧的"免费增益"，再动架构。**
+2024 年 nnU-Net 团队的系统性对照（*nnU-Net Revisited*, arXiv:2404.09556）结论很硬：绝大多数 2020-2024 的"新架构"（含多数 transformer/Mamba 变体）在同等训练预算下**打不过配置正确的纯 CNN U-Net**；宣称的提升多来自不公平的 baseline。对本仓库，B1（spacing 归一化）、B4（类感知采样）、B5（batch_dice）、A 组 bug 的期望收益大概率高于任何架构升级，建议先落地并建立可信消融基线。
+
+**2. 编码器现代化：残差缩放 > 换范式。**
+- **nnU-Net ResEnc (M/L/XL)**：残差 encoder + 按显存预算缩放深度/宽度，是上文对照中的最强配置。你的 `stage_builder` 注入机制天然支持，只需加残差 block preset 与更深的 stage 配比，成本低、证据强，**首推**。
+- **MedNeXt（MICCAI 2023）**：3D ConvNeXt 风格 + 大核（3→5→7 kernel 上采样迁移训练），在多个 CT 任务上稳定超 nnU-Net baseline，是"大感受野"路线里证据最好的；与你的 multirf 思路同向，可作为 multirf block 的升级替换。
+- **STU-Net（2023）**：结构与 nnU-Net 兼容、在 TotalSegmentator 上有预训练权重，可与 ssltask 的预训练路线互补（直接拿监督预训练权重微调）。
+
+**3. 注意力升级：优先"工程正确"而非换算法。**
+- 现有 `_SoftmaxQKVAttention`（`blocks.py:361`）是手写 O(N²) 实现，建议改走 `F.scaled_dot_product_attention`（自动用 FlashAttention/内存高效 kernel），同精度下显著省显存提速——这比换注意力公式收益更确定。
+- 线性注意力（Shen 2021）之上，若追求全局上下文，**Mamba/SSM 系**（U-Mamba、SegMamba，2024）是当前热点且复杂度 O(N)，但复现口碑分化、且被 nnU-Net Revisited 点名质疑，建议只作小规模消融，不作主线。
+- 3D 分割中注意力的实证甜点位是：**仅在 bottleneck 和最低两级分辨率放注意力**（N 小、O(N²) 可承受，softmax 注意力即可），高分辨率级保持纯卷积。你现有的 per-level 注入机制可直接表达该配置。
+- CBAM/SE/ECA/CoordAttention 这类通道注意力（blocks.py 已备齐）在 3D 分割的期望增益 <0.5 Dice，不建议再投入。
+
+**4. skip/解码器路线：UNet++ 之后不必追 UNet3+。**
+UNet3+ 全尺度 skip 的独立复现证据弱。更值得试的是：a) skip 上的 Attention Gate（已实现，`skip_attention`）与 deep supervision（已实现）保持；b) 解码器上采样从 transpose 换 DySample/CARAFE（已实现，做一次系统消融定夺）；c) 若做 B1 spacing 归一化，记得按各向异性 spacing 配 `downsample_strides`（代码已支持各向异性 stride，这是 nnU-Net plan 的核心自由度，目前可能未被配置利用）。
+
+**5. 损失/后处理侧。**
+clDice 已实现（管状结构任务记得用）；可补 boundary-based loss（HD loss / boundary DoU）作为可选项；D3 的逐类阈值 + largest-CC 是推理端最便宜的两个增益点。
