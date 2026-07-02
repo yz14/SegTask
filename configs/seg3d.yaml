@@ -143,8 +143,6 @@ model:
 
   activation: "leakyrelu"                # 'relu' | 'leakyrelu' | 'gelu' | 'swish'
   dropout   : 0.0
-
-  use_se      : false                    # legacy; 优先用 attention_type
   se_reduction: 16
   # attention_type: "none"                # 'none' | 'se' | 'eca' | 'cbam' | 'coord'
   # skip_attention: false                 # Skip 路 AttentionGate3D (Oktay 2018)
@@ -193,7 +191,7 @@ loss:
 
   compound_weights: [1.0, 1.0]           # [loss1_w, loss2_w] 仅 compound 使用
 
-  class_weights: [1.0, 1.0]              # 按前景类; 长度 = num_fg_classes (空 = 均匀)
+  class_weights: [1.0, 1.0]              # 按前景类; 长度 = 前景类数 (空 = 均匀)
 
   # 按 label_values 逐值 (含 bg)。例: [0,1,2]+[1,2,1] => label=1 体素 loss 权重 2。空 = 禁用
   region_weights: [1.0, 2.0]
@@ -271,7 +269,7 @@ train:
   output_dir: "outputs/base3d"
   save_every: 10
   # 选模标准：单一接口。可选 loss/dice/dice+surface_dice/iou/mcc/min_dice/balanced。
-  # save_best_metric / save_best_mode 由此自动派生，YAML 中不单独设置。
+  # save_best_criterion 由此自动派生，YAML 中不单独设置。
   save_best_criterion: "dice"
 
   # 选模严格度：'medium' (默认, 在随机 patch 上算指标, 快) | 'high' (对每个 val

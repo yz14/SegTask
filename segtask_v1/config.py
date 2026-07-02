@@ -248,8 +248,6 @@ class ModelConfig:
 
     dropout: float = 0.0
 
-    # 旧 SE 开关（仅 attention_type=='none' 生效）。
-    use_se      : bool = False
     se_reduction: int = 16
 
     # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
@@ -1741,6 +1739,13 @@ _DEPRECATED_DERIVED_KEYS: Dict[type, Dict[str, str]] = {
 }
 
 
+# 旧 YAML 中已移除、但需要更具体迁移提示的字段。旧名现已硬拒绝。
+#   model.use_se → 改用 model.attention_type: "se"。
+_REMOVED_KEYS: Dict[type, Dict[str, str]] = {
+    ModelConfig: {"use_se": 'attention_type: "se"'},
+}
+
+
 def _dataclass_from_dict(cls, d: Dict[str, Any]):
     """Recursively construct a dataclass from a dict.
 
@@ -1753,8 +1758,13 @@ def _dataclass_from_dict(cls, d: Dict[str, Any]):
     field_names = {f.name for f in fields(cls)}
     aliases = _FIELD_ALIASES.get(cls, {})
     derived = _DEPRECATED_DERIVED_KEYS.get(cls, {})
+    removed = _REMOVED_KEYS.get(cls, {})
     kwargs = {}
     for k, v in d.items():
+        if k in removed:
+            raise ConfigError(
+                f"Config key '{k}' is removed from {cls.__name__}; use "
+                f"{removed[k]} instead.")
         if k in derived:
             raise ConfigError(
                 f"Config key '{k}' is removed from {cls.__name__}; it is now "

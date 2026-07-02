@@ -71,8 +71,6 @@ def _make_resnet_stage_builder(
     mc = cfg.model
     spatial_dims = mc.spatial_dims
     attention_type = mc.attention_type
-    if attention_type == "none" and mc.use_se:
-        attention_type = "se"
     mask = list(multirf_mask) if multirf_mask else []
     sa_types = list(selfattn_types) if selfattn_types else []
 
@@ -136,8 +134,6 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
         non_default.append(f"norm_type={mc.norm_type!r}")
     if mc.activation != "leakyrelu":
         non_default.append(f"activation={mc.activation!r}")
-    if mc.use_se:
-        non_default.append("use_se=True")
     if mc.dropout and mc.dropout > 0.0:
         non_default.append(f"dropout={mc.dropout}")
     if non_default:
