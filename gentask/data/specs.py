@@ -68,8 +68,8 @@ class DatasetCommonCfg:
             global_std        = float(dc.global_std),
             cache_enabled     = (str(dc.cache_mode) == "memory"),
             cache_max_volumes = int(dc.cache_max_volumes),
-            region_weights    = (list(cfg.loss.region_weights)
-                                 if cfg.loss.region_weights else None))
+            region_weights    = (list(dc.region_weights)
+                                 if dc.region_weights else None))
 
     def to_kwargs(self) -> dict:
         """直接展开为 ``SegDataset3D*.__init__`` 的 kwargs。"""

@@ -17,6 +17,45 @@ def unwrap_compile(m: nn.Module) -> nn.Module:
     return getattr(m, "_orig_mod", m)
 
 
+def _strip_compile_prefix(sd):
+    """剥去 torch.compile 添加的 ``_orig_mod.`` 前缀。"""
+    prefix = "_orig_mod."
+    if isinstance(sd, dict) and any(k.startswith(prefix) for k in sd):
+        return {(k[len(prefix):] if k.startswith(prefix) else k): v
+                for k, v in sd.items()}
+    return sd
+
+
+def _unwrap_ema_state(ema_sd):
+    """将 ``{shadow, decay}`` 拆为普通 state_dict；已是拆过的旧格式原返。"""
+    if isinstance(ema_sd, dict) and "shadow" in ema_sd and isinstance(
+            ema_sd["shadow"], dict):
+        return ema_sd["shadow"]
+    return ema_sd
+
+
+def _select_state_dict(ckpt, variant: str):
+    """从 ckpt 选权重。``variant``: ``'auto'`` (优 EMA) / ``'ema'`` / ``'online'``。
+
+    返 ``(state_dict, label)``，``label`` 用于日志。
+    """
+    has_online = "model_online_state_dict" in ckpt
+    has_ema = "ema_state_dict" in ckpt
+    primary = ckpt["model_state_dict"]
+
+    if variant == "online":
+        return (ckpt["model_online_state_dict"] if has_online else primary,
+                "online")
+    if variant == "ema":
+        if has_ema:
+            return _unwrap_ema_state(ckpt["ema_state_dict"]), "ema"
+        return (ckpt["model_online_state_dict"] if has_online else primary,
+                "online")
+    if has_ema:
+        return _unwrap_ema_state(ckpt["ema_state_dict"]), "ema"
+    return primary, "online"
+
+
 def extract_model_state_dict(ckpt, prefer_ema: bool):
     """定位 ckpt 里的 model state_dict，兼容 3 种布局：
 
@@ -77,6 +116,9 @@ def strip_common_prefixes(sd):
 
 __all__ = [
     "unwrap_compile",
+    "_strip_compile_prefix",
+    "_unwrap_ema_state",
+    "_select_state_dict",
     "extract_model_state_dict",
     "strip_common_prefixes",
 ]

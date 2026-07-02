@@ -852,55 +852,49 @@ predict.py
 
 ---
 
-## 10. 生成任务（超分）— TODO #2：用经典生成算法改写 gentask
+## 10. 超分生成任务 — gentask
 
-`gentask/` 在分割框架之上扩展了**图像复原（当前仅超分 super-resolution）**，提供两类经典深度生成范式，二者共用同一退化算子、损失库与 2.5D / 3D 几何，仅通过配置切换：
+`gentask/` 是一个基于共享 2.5D/3D UNet backbone 的**图像超分辨率（super-resolution）** 包，提供两类经典深度生成范式，二者共用同一退化算子、损失库与 2.5D / 3D 几何，仅通过配置切换：
 
 | 范式 | `task.algorithm` | 思路 | 复用 backbone |
 |---|---|---|---|
-| **回归复原** | `regression` | 单次前向把低分图映射回高分图（DnCNN / SRCNN / U-Net regression），可选残差学习 `HR−LR` | 任意分割 backbone（`unet` / `adm` / `edm2`）作图到图网络 |
+| **回归复原** | `regression` | 单次前向把低分图映射回高分图（DnCNN / SRCNN / U-Net regression），可选残差学习 `HR−LR` | 任意 backbone（`unet` / `adm` / `edm2`）作图到图网络 |
 | **条件扩散** | `diffusion` | 以低分图为条件迭代去噪采样（类 SR3 / Palette），支持 EDM（Karras 2022）与 DDPM（Ho 2020） | `adm` / `edm2`（**重新启用** timestep/σ 条件） |
 
 ### 10.1 关键设计
 
 - **退化算子** `data/degradation.py::SuperResDegradation`：HR→下采样→上采样回 HR 网格得低分输入，支持 `sr_kernel ∈ {area, trilinear, nearest}`、可选高斯噪声。仅作用空间轴；2.5D 下 D 折叠为通道、逐通道退化。
   - **各向同性**：标量 `sr_scale` 各空间轴同倍（面内 2.5D 默认）。
-  - **各向异性**：`sr_scale_per_axis`（顺序按空间轴，3D 为 `(D,H,W)`、2.5D 为 `(H,W)`）逐轴单独配置。CT **厚层→薄层**用 `[2,1,1]` —— 仅 z 轴是低分辨率，故只对 z 下/上采样（z-SISR），x,y 保原分辨率（`area` 核沿 z 即层厚范围内体素的区域均值，近似部分容积效应）。见 `configs/gensr_3d_zaxis_regression.yaml`。
-  - **退化采样方式** `sr_sampling`：`blur`（SISR，默认）降采样再上采样造成同尺寸模糊；`decimate`（**VFI 插帧**）沿退化轴抽稀保留帧（`[::s]`）再线性插值填回原尺寸，对应 TODO 1a「取稀疏厚层切片、模型补足中间薄层」的帧插值设定（线性插值作天真 baseline，模型学残差）。见 `configs/gensr_3d_zaxis_vfi.yaml`。
+  - **各向异性**：`sr_scale_per_axis`（顺序按空间轴，3D 为 `(D,H,W)`、2.5D 为 `(H,W)`）逐轴单独配置。CT **厚层→薄层**用 `[2,1,1]` —— 仅 z 轴是低分辨率，故只对 z 下/上采样（z-SISR），x,y 保原分辨率。见 `configs/gensr_3d_zaxis_regression.yaml`。
+  - **退化采样方式** `sr_sampling`：`blur`（SISR，默认）降采样再上采样造成同尺寸模糊；`decimate`（**VFI 插帧**）沿退化轴抽稀保留帧再线性插值填回原尺寸。见 `configs/gensr_3d_zaxis_vfi.yaml`。
 - **损失** `losses/recon.py`：`ReconstructionLoss`（Charbonnier / L1 / MSE + 可选 (1−SSIM) + 梯度 L1）用于回归；`DiffusionLoss`（逐样本加权 MSE）用于扩散；`psnr` / `ssim` 作验证指标。
-- **深监督（回归）** `model.deep_supervision=true`：复用分割 backbone 的多尺度解码头，`RegressionModel.forward` 经 `ds_preds` 返回 `[full, /2, ...]` 各头，`GenerationTrainer` 对每个尺度与 `area` 下采样后的 HR 算重建损失、按 `loss.deep_supervision_weights`（归一化）加权聚合（`residual=true` 时各头加 `lr` 缩放到该尺寸的基线）；推理只取全分辨率头。仅 `algorithm=regression` 支持（扩散用 ADM/EDM2 网络、无多尺度头，校验会拒绝）。开启方式：`--override model.deep_supervision=true`。
-- **条件 backbone**：ADM/EDM2 原作分割时**移除了** timestep 条件；扩散路径将其按论文忠实复原——
-  - ADM：`AdaGN` scale-shift，`h = norm(h)·(1+scale) + shift`，由正弦时间嵌入经 MLP 得到（`models/adm_unet.py::ADMDiffusionUNet`）；
-  - EDM2：幅度保持 FiLM，`y = y·(emb_linear(emb)+1)`，由 MP-Fourier 噪声嵌入得到（`models/edm2_unet.py::EDM2DiffusionUNet`）。
-  - **分割路径零改动**：`emb_channels==0` 时条件分支整体跳过，旧分割配置行为不变（见 `tests/test_adm_edm2_seg_smoke.py` 与 `tests/test_generation_smoke.py::test_seg_backbone_unchanged`）。
-- **扩散框架** `models/diffusion.py`：
-  - `EDMDiffusion`：去噪预条件 `D=c_skip·x + c_out·F(c_in·x⊕cond, c_noise)`，对数正态 σ 采样训练，Heun 二阶采样（`sampler='edm_heun'`）/ 确定性 Euler（`'ddim'`）；
-  - `DDPMDiffusion`：ε-预测，linear / cosine β schedule，祖先采样（`'ddpm'`）或 DDIM（`'ddim'`，`ddim_eta` 可调）。
-- **统一模型接口** `models/generation.py`：`forward(hr)` 在线退化并返回训练三元组；`restore(lr)` 出图；`degrade(hr)` 供验证在线造对。`models/factory.build_model` 在 `cfg.is_generation` 时分派至此。
+- **深监督（回归）** `model.deep_supervision=true`：复用 backbone 的多尺度解码头，`GenerationTrainer` 对每个尺度与下采样后的 HR 算重建损失、按 `loss.deep_supervision_weights` 加权聚合。仅 `algorithm=regression` 支持。
+- **条件 backbone**：ADM/EDM2 的 timestep/σ 条件在扩散路径按论文忠实复原；非扩散路径（`emb_channels==0`）条件分支整体跳过，行为不变。
+- **扩散框架** `models/diffusion.py`：`EDMDiffusion`（去噪预条件 + Heun 二阶采样）与 `DDPMDiffusion`（ε-预测 + 祖先/DDIM 采样）。
+- **统一模型接口** `models/generation.py`：`forward(hr)` 在线退化并返回训练三元组；`restore(lr)` 出图；`degrade(hr)` 供验证。`models/factory.build_model` 在 `cfg.is_generation` 时分派至此。
 
 ### 10.2 训练 / 推理
 
-生成任务由 `trainer/gen_trainer.py::GenerationTrainer` 承载（分割 `Trainer` 与 Dice 深度耦合，故另起精简训练器，复用优化器 / 调度器 / warmup / AMP / EMA），验证报告 PSNR / SSIM 及低分基线 PSNR。`train.py` / `predict.py` 按 `cfg.is_generation` 自动分派。
+生成任务由 `trainer/gen_trainer.py::GenerationTrainer` 承载，验证报告 PSNR / SSIM 及低分基线 PSNR。
 
 ```bash
 # 训练（回归）
 python -m gentask.train --config configs/gensr_2_5d_regression.yaml
 # 训练（条件扩散，ADM backbone）
-python -m gentask.train --config configs/gensr_2_5d_diffusion_adm.yaml \
-    --override task.parameterization=ddpm_eps task.sampler=ddpm
+python -m gentask.train --config configs/gensr_2_5d_diffusion_adm.yaml
 # 训练（3D 厚层→薄层，z 轴各向异性 SISR）
 python -m gentask.train --config configs/gensr_3d_zaxis_regression.yaml
 # 训练（3D 厚层→薄层，z 轴帧插值 VFI）
 python -m gentask.train --config configs/gensr_3d_zaxis_vfi.yaml
 # 推理：逐卷复原写出 <output_dir>/<pid>_sr.nii.gz
 python -m gentask.predict --config configs/gensr_2_5d_regression.yaml \
-    --checkpoint outputs/gensr_regression/best_model.pth --input F:/med_data/lr_imgs
+    --checkpoint outputs/gensr_regression/best_model.pth --input /path/to/lr_imgs
 ```
 
-注意：生成任务**忽略分割标签**（训练目标是干净图自身），但 dataloader 仍需 `label_dir`；当前仅支持 `task.out_channels==1`（CT 灰度）与单视图（`multi_res_scales=[1.0]`）。
+注意：生成任务忽略分割标签（训练目标是干净图自身），但 dataloader 仍需 `label_dir`；当前仅支持 `task.out_channels==1`（CT 灰度）与单视图（`multi_res_scales=[1.0]`）。
 
 ### 10.3 配置与测试
 
-- 示例配置：`configs/gensr_2_5d_regression.yaml`（面内超分）、`configs/gensr_3d_zaxis_regression.yaml`（厚层→薄层 z 轴 SISR）、`configs/gensr_3d_zaxis_vfi.yaml`（厚层→薄层 z 轴 VFI 插帧）、`configs/gensr_2_5d_diffusion_adm.yaml`（含逐字段注释）。
-- 冒烟测试（无数据、CPU、小张量，验证「跑通 / 形状对 / 可反传 / 能出图」）：`python tests/test_generation_smoke.py`。
+- 示例配置：`configs/gensr_2_5d_regression.yaml`、`configs/gensr_3d_zaxis_regression.yaml`、`configs/gensr_3d_zaxis_vfi.yaml`、`configs/gensr_2_5d_diffusion_adm.yaml`。
+- 冒烟测试：`python tests/test_generation_smoke.py`。
 - 真实训练效果（收敛、PSNR/SSIM 提升）需在本机带数据与 GPU 跑。

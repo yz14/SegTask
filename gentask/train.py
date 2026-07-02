@@ -1,4 +1,7 @@
-"""3D 分割训练 CLI 入口。示例：`python -m segtask_v1.train --config configs/seg3d.yaml [--override train.epochs=50 ...]`。"""
+"""gentask 训练 CLI 入口。
+
+示例：`python -m gentask.train --config configs/gensr_2_5d_regression.yaml`
+"""
 
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ from .config import load_config, save_config
 from .data.loader import build_dataloaders
 from .logging_utils import setup_logging as _setup_logging
 from .models.factory import build_model
-from .trainer import Trainer
+from .trainer import GenerationTrainer
 from .utils import seed_everything
 
 
@@ -50,7 +53,7 @@ def apply_overrides(cfg, overrides: list) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="3D Segmentation Training")
+    parser = argparse.ArgumentParser(description="gentask super-resolution training")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     parser.add_argument("--override", nargs="*", default=[], help="Config overrides (key=value)")
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -62,6 +65,8 @@ def main():
         apply_overrides(cfg, args.override)
         cfg.sync()
         cfg.validate()
+    if not cfg.is_generation:
+        raise ValueError("gentask.train expects task.type='generation'.")
 
     # Setup
     setup_logging(cfg.train.output_dir, args.log_level)
@@ -86,12 +91,7 @@ def main():
     # Save resolved config
     save_config(cfg, Path(cfg.train.output_dir) / "resolved_config.yaml")
 
-    # Train（生成任务走专用训练器，分割走原 Trainer）
-    if cfg.is_generation:
-        from .trainer.gen_trainer import GenerationTrainer
-        trainer = GenerationTrainer(model, cfg, train_loader, val_loader, device)
-    else:
-        trainer = Trainer(model, cfg, train_loader, val_loader, device)
+    trainer = GenerationTrainer(model, cfg, train_loader, val_loader, device)
     best_metrics = trainer.fit()
 
     logger.info("Best metrics: %s", best_metrics)

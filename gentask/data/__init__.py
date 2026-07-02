@@ -1,1 +1,1 @@
-"""Data loading, preprocessing, and augmentation."""
+"""Data loading, preprocessing, and shared dataset helpers."""

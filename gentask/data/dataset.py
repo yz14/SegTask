@@ -1,8 +1,7 @@
-"""3D 分割 dataset。
+"""Shared dataset helpers for 3D/2.5D volume I/O and patching.
 
-三种 patch 模式：SegDataset3D（z_axis 滑块）、SegDataset3DCubic（cubic 3轴滑块）、
-SegDataset3DWhole（整体 resize）。输出逐前景类二值通道：
-label_values=[0,1,2] → 2 个前景通道。
+Provides NIfTI loading, intensity preprocessing, and patch-based dataset
+classes used by both segmentation and super-resolution pipelines.
 """
 
 from __future__ import annotations

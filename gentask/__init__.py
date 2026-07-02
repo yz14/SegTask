@@ -1,1 +1,1 @@
-"""segtask_v1 — Generic 3D segmentation training pipeline."""
+"""gentask — super-resolution training and inference package."""

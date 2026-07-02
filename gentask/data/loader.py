@@ -444,7 +444,7 @@ def discover_npz_samples(
     if not paths:
         raise ValueError(
             f"No npz packages found under {d} (suffix={npz_suffix!r}). "
-            f"Did you run `python -m segtask_v1.data.make_data` first?")
+            f"Did you run `python -m gentask.data.make_data` first?")
     logger.info("Discovered %d npz package(s) under %s.", len(paths), d)
     return [str(p) for p in paths]
 
@@ -458,7 +458,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     if not npz_dir:
         raise ValueError(
             "data.npz_dir is required for training (npz-only data path). "
-            "(or should be created); see segtask_v1.data.make_data.")
+            "(or should be created); see gentask.data.make_data.")
     npz_suffix = dc.npz_suffix
 
     # 缺失/空时自建 npz 缓存（一次性；部分目录被视为权威，重生请 make_data --overwrite）。
@@ -470,7 +470,7 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             raise FileNotFoundError(
                 f"data.npz_dir={npz_dir!r} is empty/missing and "
                 f"data.npz_auto_build is False. Run "
-                f"`python -m segtask_v1.data.make_data --config "
+                f"`python -m gentask.data.make_data --config "
                 f"<yaml> --out {npz_dir}` first, or set "
                 f"data.npz_auto_build: true to build inline.")
         logger.info(

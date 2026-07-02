@@ -1,4 +1,4 @@
-"""逐样本 npz 预烘包（image+label+可选 rw+fg 索引）。将 bbox 裁剪后的体积输出为 <out_dir>/<pid>.npz，训练时 mmap 多 worker 共享 OS page cache。默认 np.savez 不压缩（供共享）；--compress 使用 savez_compressed。CLI：`python -m segtask_v1.data.make_data --config <yaml> --out <dir> [--workers N]`。已存在不覆盖（除非 --overwrite）；失败写 <out_dir>/_failures.txt（与 data.exclude_list 兼容）。"""
+"""逐样本 npz 预烘包（image+label+可选 rw+fg 索引）。将 bbox 裁剪后的体积输出为 <out_dir>/<pid>.npz，训练时 mmap 多 worker 共享 OS page cache。默认 np.savez 不压缩（供共享）；--compress 使用 savez_compressed。CLI：`python -m gentask.data.make_data --config <yaml> --out <dir> [--workers N]`。已存在不覆盖（除非 --overwrite）；失败写 <out_dir>/_failures.txt（与 data.exclude_list 兼容）。"""
 
 from __future__ import annotations
 

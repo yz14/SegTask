@@ -158,10 +158,5 @@ def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegrad
         sampling=str(cfg_task.sr_sampling).lower())
 
 
-def make_pair(
-    degradation: SuperResDegradation, hr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """便捷封装：返回 ``(lr_input, hr_target)``。"""
-    return degradation.degrade(hr), hr
 
-
-__all__ = ["SuperResDegradation", "build_degradation", "make_pair"]
+__all__ = ["SuperResDegradation", "build_degradation"]

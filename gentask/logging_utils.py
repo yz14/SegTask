@@ -5,7 +5,7 @@
 - 颜色仅作用于控制台 handler；文件 handler 始终输出纯文本，避免 ``train.log``
   里混入 ANSI 转义符导致编辑器乱码。
 - 模块类别由 logger 名（``logging.getLogger(__name__)`` 产生，形如
-  ``segtask_v1.trainer.trainer``）的子包前缀推断，无需各模块改动。
+  ``gentask.trainer.gen_trainer``）的子包前缀推断，无需各模块改动。
 - 颜色启用条件遵循业界惯例：输出为 TTY 且未设置 ``NO_COLOR`` 环境变量；
   非 TTY（重定向/管道）自动退化为纯文本。Windows 下经 ``colorama`` 处理 ANSI。
 - ``train.py`` / ``predict.py`` / ``make_data.py`` 统一调用本模块的
@@ -53,14 +53,14 @@ _LEVEL_COLORS = {
     logging.CRITICAL: Back.RED + Fore.WHITE + Style.BRIGHT,
 }
 
-_TOP_PACKAGE = "segtask_v1"
+_TOP_PACKAGE = "gentask"
 
 
 def _module_category(logger_name: str) -> str:
     """从 logger 名推断模块类别（首段子包名）。
 
-    示例：``segtask_v1.trainer.pipelines.slab25d`` -> ``trainer``；
-    ``segtask_v1.config`` -> ``config``；``segtask_v1`` -> ``segtask_v1``。
+    示例：``gentask.trainer.gen_trainer`` -> ``trainer``；
+    ``gentask.config`` -> ``config``；``gentask`` -> ``gentask``。
     """
     parts = logger_name.split(".")
     if parts and parts[0] == _TOP_PACKAGE:
