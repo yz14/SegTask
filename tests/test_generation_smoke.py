@@ -225,6 +225,104 @@ def test_regression_model_end_to_end():
     assert tuple(rec.shape) == (2, 4, 16, 16)
 
 
+def _multi_view_aux_cfg():
+    cfg = Config()
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.num_classes = 2
+    cfg.data.label_values = [0, 1]
+    cfg.data.patch_size = [4, 16, 16]
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.data.z_boundary_mode = "edge_pad"
+    cfg.model.arch = "unet"
+    cfg.model.encoder_channels = [16, 32, 48]
+    cfg.model.encoder_blocks_per_stage = [1, 1, 1]
+    cfg.model.aux_seg_supervision = True
+    cfg.task.type = "generation"
+    cfg.task.algorithm = "regression"
+    cfg.task.degradation = "superres"
+    cfg.task.out_channels = 1
+    cfg.task.sr_scale = 2
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
+def test_multi_view_aux_recon_forward_and_restore():
+    from gentask.models.factory import build_model
+
+    cfg = _multi_view_aux_cfg()
+    model = build_model(cfg)
+    model.train()
+    hr = torch.cat([
+        torch.zeros(1, 4, 16, 16),
+        torch.ones(1, 4, 16, 16),
+    ], dim=1)
+    out = model(hr)
+    assert set(out) >= {"pred", "ds_preds", "target", "aux_preds", "aux_targets"}
+    assert tuple(out["pred"].shape) == (1, 4, 16, 16)
+    assert tuple(out["target"].shape) == (1, 4, 16, 16)
+    assert len(out["aux_preds"]) == 1 and len(out["aux_targets"]) == 1
+    assert tuple(out["aux_preds"][0].shape) == (1, 4, 16, 16)
+    assert tuple(out["aux_targets"][0].shape) == (1, 4, 16, 16)
+    assert torch.allclose(out["target"], hr[:, :4])
+    assert torch.allclose(out["aux_targets"][0], hr[:, 4:])
+
+    lr = model.degrade(hr)
+    restored = model.restore(lr)
+    assert tuple(restored.shape) == tuple(out["pred"].shape)
+    assert torch.allclose(restored, out["pred"])
+
+
+def test_multi_view_aux_recon_trainer_step_and_backward():
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    cfg = _multi_view_aux_cfg()
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_amp = False
+    cfg.train.output_dir = "/tmp/gen_test_aux_recon"
+    model = build_model(cfg)
+    loader = [{
+        "image": torch.cat([
+            torch.zeros(1, 4, 16, 16),
+            torch.ones(1, 4, 16, 16),
+        ], dim=1),
+        "label": torch.zeros(1, 1, 4, 16, 16),
+    }]
+    tr = GenerationTrainer(model, cfg, loader, loader, torch.device("cpu"))
+    model.train()
+    out = model(loader[0]["image"])
+    breakdown = {}
+    loss = tr._step_loss(out, breakdown)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert "L_aux" in breakdown and breakdown["L_aux"] > 0
+    assert any(p.grad is not None for p in model.parameters())
+
+
+def test_single_view_regression_unchanged_with_no_aux_path():
+    from gentask.losses.recon import build_recon_loss
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.data.multi_res_scales = [1.0]
+    cfg.model.aux_seg_supervision = False
+    cfg.sync()
+    cfg.validate()
+    model = build_model(cfg)
+    hr = torch.rand(2, 4, 16, 16)
+    out = model(hr)
+    assert set(out) == {"pred", "ds_preds", "target"}
+    loss_ref = build_recon_loss(cfg)(out["pred"], out["target"])
+    tr = GenerationTrainer(model, cfg, _loader(cfg.data.patch_size[0], n=1, B=2),
+                           _loader(cfg.data.patch_size[0], n=1, B=2),
+                           torch.device("cpu"))
+    loss_new = tr._step_loss(out, {})
+    assert torch.allclose(loss_ref, loss_new)
+
+
 def test_zaxis_sr_regression_3d_end_to_end():
     """3D 厚→薄 z 轴超分回归：退化仅作用 z，模型输出与 HR 同形、可反传。"""
     from gentask.losses.recon import build_recon_loss
@@ -513,6 +611,9 @@ def main() -> int:
         test_seg_backbone_unchanged,
         test_diffusion_backbone_forward_backward,
         test_regression_model_end_to_end,
+        test_multi_view_aux_recon_forward_and_restore,
+        test_multi_view_aux_recon_trainer_step_and_backward,
+        test_single_view_regression_unchanged_with_no_aux_path,
         test_zaxis_sr_regression_3d_end_to_end,
         test_deep_supervision_regression,
         test_deep_supervision_trainer_runs,

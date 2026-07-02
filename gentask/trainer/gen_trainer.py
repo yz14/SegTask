@@ -130,11 +130,21 @@ class GenerationTrainer:
         if self.is_diffusion:
             return self.loss_fn(out, breakdown=breakdown)
         preds = out.get("ds_preds")
+        total = None
         if preds is not None and len(preds) > 1:
-            return self._ds_recon_loss(preds, out["target"], breakdown, weight_map)
-        weight = self._align_weight_map(weight_map, out["target"])
-        return self.loss_fn(out["pred"], out["target"], weight=weight,
-                            breakdown=breakdown)
+            total = self._ds_recon_loss(preds, out["target"], breakdown, weight_map)
+        else:
+            weight = self._align_weight_map(weight_map, out["target"])
+            total = self.loss_fn(out["pred"], out["target"], weight=weight,
+                                 breakdown=breakdown)
+        aux_preds = out.get("aux_preds")
+        aux_targets = out.get("aux_targets")
+        if aux_preds and aux_targets:
+            aux_term = self._aux_recon_loss(aux_preds, aux_targets)
+            total = total + aux_term
+            if breakdown is not None:
+                breakdown["L_aux"] = float(aux_term.detach().item())
+        return total
 
     def _ds_recon_loss(
         self,
@@ -158,6 +168,17 @@ class GenerationTrainer:
             wmap = self._align_weight_map(weight_map, tgt)
             bd = breakdown if k == 0 else None
             total = total + w * self.loss_fn(p, tgt, weight=wmap, breakdown=bd)
+        return total
+
+    def _aux_recon_loss(self, preds, targets) -> torch.Tensor:
+        raw = list(self.cfg.loss.aux_recon_weights[:len(preds)])
+        if not raw:
+            raw = [0.5 ** k for k in range(len(preds))]
+        denom = float(sum(raw)) or 1.0
+        weights = [w / denom for w in raw]
+        total = preds[0].new_zeros(())
+        for w, pred, target in zip(weights, preds, targets):
+            total = total + w * self.loss_fn(pred, target, breakdown=None)
         return total
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:

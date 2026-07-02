@@ -313,6 +313,9 @@ class Config:
         _require(
             all(w >= 0 for w in self.loss.deep_supervision_weights),
             f"Invalid deep_supervision_weights: {self.loss.deep_supervision_weights}")
+        _require(
+            all(w >= 0 for w in self.loss.aux_recon_weights),
+            f"Invalid aux_recon_weights: {self.loss.aux_recon_weights}")
 
     def _validate_data(self) -> None:
         """data.* patch/multi-res/keep_native 校验。"""
@@ -476,4 +479,3 @@ class Config:
         """
         from ..models.topology import build_topology
         return list(build_topology(self).per_view_depths)
-

@@ -184,8 +184,9 @@ class ModelConfig:
     # 深度监督：多 decoder 级输出预测。
     deep_supervision: bool = False
 
-    # 多 FOV 辅助分割监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，辅助 view k 输出 (B, num_fg*D, H, W)。
-    # 损失权重见 loss.aux_supervision_weights（空则默认 0.5^k）。单视图/3D 不生效。
+    # 多 FOV 辅助重建监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，
+    # 辅助 view k 输出对应 view_k 的 HR slice；损失权重见 loss.aux_recon_weights（空则默认 0.5^k）。
+    # 单视图/3D 不生效。
     aux_seg_supervision: bool = False
 
     # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
@@ -290,6 +291,7 @@ class LossConfig:
 
     deep_supervision_weights: List[float] = field(
         default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
+    aux_recon_weights: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
