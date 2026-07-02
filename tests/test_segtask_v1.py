@@ -54,7 +54,8 @@ class TestConfig:
         cfg = load_config("configs/seg3d.yaml")
         assert cfg.train.grad_accum_steps == 1
         assert cfg.train.compile_mode == "none"
-        assert cfg.model.use_se == False
+        assert cfg.model.attention_type == "none"
+        assert cfg.model.se_reduction == 16
         assert cfg.train.cosine_restart_period == 50
 
 
@@ -121,13 +122,31 @@ class TestModel:
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
         cfg.model.encoder_channels = [16, 32, 64]
-        cfg.model.use_se = True
+        cfg.model.attention_type = "se"
         cfg.model.se_reduction = 4
         cfg.sync()
         model = build_model(cfg)
         x = torch.randn(1, 1, 32, 64, 64)
         y = model(x)
         assert y.shape == (1, 1, 32, 64, 64)
+
+    def test_use_se_is_rejected(self, tmp_path):
+        from segtask_v1.config import ConfigError, load_config
+        path = tmp_path / "use_se.yaml"
+        path.write_text(
+            "data:\n"
+            "  patch_mode: z_axis\n"
+            "  patch_size: [64, 128, 128]\n"
+            "  multi_res_scales: [1.0]\n"
+            "  label_values: [0, 1]\n"
+            "model:\n"
+            "  use_se: true\n"
+            "train:\n"
+            "  save_best_criterion: dice\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match='attention_type: "se"'):
+            load_config(str(path))
 
     def test_deep_supervision(self):
         from segtask_v1.config import Config
