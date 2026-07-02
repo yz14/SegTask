@@ -11,7 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .stem import HierarchicalStems  # only for the explicit reject branch
+from .stem import HierarchicalStems, build_stem  # only for the explicit reject branch
+from .topology import build_topology
 
 logger = logging.getLogger(__name__)
 
@@ -295,9 +296,15 @@ class _EDM2Encoder(nn.Module):
         encoder_blocks_per_stage: List[int],
         attention_levels: List[int],
         block_kwargs: Dict[str, Any],
+        cond_stem: Optional[nn.Module] = None,
+        cond_fuse: Optional[nn.Module] = None,
+        cond_in_channels: int = 0,
     ):
         super().__init__()
         self.stem = stem
+        self.cond_stem = cond_stem
+        self.cond_fuse = cond_fuse
+        self.cond_in_channels = int(cond_in_channels)
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
         self.n_levels = n_levels
@@ -338,7 +345,18 @@ class _EDM2Encoder(nn.Module):
             self.level_blocks.append(nn.ModuleList(blocks))
 
     def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None) -> Dict[str, Any]:
+        cond = None
+        if self.cond_in_channels > 0:
+            if x.shape[1] <= self.cond_in_channels:
+                raise ValueError(
+                    f"Expected recon+cond channels > cond_in_channels="
+                    f"{self.cond_in_channels}; got {x.shape[1]}.")
+            x, cond = torch.split(
+                x, [x.shape[1] - self.cond_in_channels, self.cond_in_channels], dim=1)
         x = self.stem(x)
+        if cond is not None:
+            cond = self.cond_stem(cond)
+            x = self.cond_fuse(torch.cat([x, cond], dim=1))
         enc_skips: List[torch.Tensor] = [x]
         enc_features: List[torch.Tensor] = []
         for level in range(self.n_levels):
@@ -498,6 +516,9 @@ class EDM2SegModel(nn.Module):
         aux_seg_supervision: bool,
         aux_head_mode: str,  # 'linear' only for EDM2 (MP-style)
         aux_head_out_channels: Optional[List[int]] = None,
+        cond_stem: Optional[nn.Module] = None,
+        cond_fuse: Optional[nn.Module] = None,
+        cond_in_channels: int = 0,
     ):
         super().__init__()
         self.spatial_dims = 2
@@ -521,6 +542,9 @@ class EDM2SegModel(nn.Module):
             encoder_blocks_per_stage=encoder_blocks_per_stage,
             attention_levels=attention_levels,
             block_kwargs=block_kwargs,
+            cond_stem=cond_stem,
+            cond_fuse=cond_fuse,
+            cond_in_channels=cond_in_channels,
         )
         self.decoder = _EDM2Decoder(
             encoder_channels=encoder_channels,
@@ -617,6 +641,7 @@ def build_edm2_backbone(cfg) -> EDM2SegModel:
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
+    topo = build_topology(cfg)
 
     assert cfg.data.patch_mode == "2_5d", (
         "arch='edm2' is currently only wired for patch_mode='2_5d'.")
@@ -661,6 +686,7 @@ def build_edm2_backbone(cfg) -> EDM2SegModel:
     else:
         in_channels = D * n_views
     base_ch_per_view = D
+    cond_in_channels = int(topo.cond_in_channels)
 
     stem = _build_edm2_stem(
         fusion=mc.stem_fusion_mode,
@@ -670,6 +696,11 @@ def build_edm2_backbone(cfg) -> EDM2SegModel:
         in_ch_per_view_list=in_ch_per_view_list,
     )
     stem_stride = stem.stem_stride
+    cond_stem = None
+    cond_fuse = None
+    if cond_in_channels > 0:
+        cond_stem = _MPConv(cond_in_channels, enc_channels[0], kernel=[3, 3])
+        cond_fuse = _MPConv(enc_channels[0] * 2, enc_channels[0], kernel=[1, 1])
 
     aux_seg = bool(mc.aux_seg_supervision) and n_views > 1
 
@@ -693,6 +724,9 @@ def build_edm2_backbone(cfg) -> EDM2SegModel:
         aux_seg_supervision=aux_seg,
         aux_head_mode=str(mc.aux_head_mode),
         aux_head_out_channels=aux_head_out_channels,
+        cond_stem=cond_stem,
+        cond_fuse=cond_fuse,
+        cond_in_channels=cond_in_channels,
     )
 
     pc = model.param_count()
