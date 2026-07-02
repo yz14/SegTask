@@ -92,6 +92,12 @@ class GenerationTrainer:
         """取干净高分图（忽略分割标签）。"""
         return batch["image"].to(self.device, non_blocking=True).float()
 
+    def _cond_batch(self, batch) -> Optional[torch.Tensor]:
+        cond = batch.get("cond")
+        if cond is None:
+            return None
+        return cond.to(self.device, non_blocking=True).float()
+
     def _align_weight_map(
         self,
         weight_map: Optional[torch.Tensor],
@@ -189,10 +195,11 @@ class GenerationTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(self.train_loader):
             hr = self._hr_batch(batch)
+            cond = self._cond_batch(batch)
             weight_map = batch.get("weight_map")
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.use_amp, dtype=self.amp_dtype):
-                out = self.model(hr)
+                out = self.model(hr, cond=cond)
             bd: Dict[str, float] = {}
             loss = self._step_loss(out, bd, weight_map=weight_map)
             loss_scaled = loss / accum if accum > 1 else loss
@@ -226,9 +233,10 @@ class GenerationTrainer:
         try:
             for batch in self.val_loader:
                 hr = self._hr_batch(batch)
+                cond = self._cond_batch(batch)
                 bare = unwrap_compile(self.model)
                 lr = bare.degrade(hr)
-                rec = bare.restore(lr).clamp(0.0, 1.0)
+                rec = bare.restore(lr, cond=cond).clamp(0.0, 1.0)
                 psnr_m.update(float(psnr(rec, hr)), hr.shape[0])
                 ssim_m.update(
                     float(ssim(rec, hr, self.spatial_dims)), hr.shape[0])

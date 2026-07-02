@@ -55,6 +55,26 @@ class RegressionModel(nn.Module):
     def _is_multi_view_2_5d(self) -> bool:
         return self.spatial_dims == 2 and len(self.view_depths) > 1
 
+    def _pack_2_5d(self, x: torch.Tensor) -> torch.Tensor:
+        """单视图 2.5D 把 (B,C,D,H,W) 折为 (B,C*D,H,W)；4D 输入保持不变。"""
+        if self.spatial_dims != 2:
+            return x
+        if x.ndim == 5:
+            return x.flatten(1, 2)
+        return x
+
+    def _concat_cond(
+        self, lr: torch.Tensor, cond: Optional[torch.Tensor]) -> torch.Tensor:
+        if cond is None:
+            return lr
+        lr_p = self._pack_2_5d(lr)
+        cond_p = self._pack_2_5d(cond)
+        if lr_p.shape[0] != cond_p.shape[0] or lr_p.shape[2:] != cond_p.shape[2:]:
+            raise ValueError(
+                f"cond shape {tuple(cond.shape)} cannot be aligned with "
+                f"lr shape {tuple(lr.shape)}.")
+        return torch.cat([lr_p, cond_p], dim=1)
+
     def _view_splits(self, x: torch.Tensor) -> List[torch.Tensor]:
         if not self._is_multi_view_2_5d():
             return [x]
@@ -69,6 +89,8 @@ class RegressionModel(nn.Module):
         return self._view_splits(x)[0]
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
+        if self.spatial_dims == 2 and hr.ndim == 5:
+            hr = hr.flatten(1, 2)
         return self.degradation.degrade(hr)
 
     def _add_residual(self, out: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
@@ -97,16 +119,21 @@ class RegressionModel(nn.Module):
         # aux 头直接重建各自 view，不叠 residual；residual 只作用于主 view 0。
         return heads, aux
 
-    def restore(self, lr: torch.Tensor) -> torch.Tensor:
+    def restore(self, lr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        lr = self._pack_2_5d(lr)
+        lr = self._concat_cond(lr, cond)
         return self._heads(lr)[0][0]
 
     def _target_views(self, hr: torch.Tensor) -> List[torch.Tensor]:
         if not self._is_multi_view_2_5d():
-            return [hr]
+            return [self._pack_2_5d(hr)]
         return self._view_splits(hr)
 
-    def forward(self, hr: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, hr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        hr = self._pack_2_5d(hr)
+        cond = self._pack_2_5d(cond) if cond is not None else None
         lr = self.degrade(hr)
+        lr = self._concat_cond(lr, cond)
         heads, aux = self._heads(lr)
         target_views = self._target_views(hr)
         out = {"pred": heads[0], "ds_preds": heads, "target": target_views[0]}
@@ -123,19 +150,28 @@ class RegressionModel(nn.Module):
 class DiffusionModel(nn.Module):
     """条件扩散复原（DDPM / EDM），以低分图为条件迭代去噪。"""
 
-    def __init__(self, diffusion: nn.Module, degradation):
+    def __init__(self, diffusion: nn.Module, degradation, spatial_dims: int):
         super().__init__()
         self.diffusion = diffusion
         self.degradation = degradation
+        self.spatial_dims = int(spatial_dims)
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
+        if self.spatial_dims == 2 and hr.ndim == 5:
+            hr = hr.flatten(1, 2)
         return self.degradation.degrade(hr)
 
     @torch.no_grad()
-    def restore(self, lr: torch.Tensor) -> torch.Tensor:
+    def restore(self, lr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if cond is not None:
+            raise NotImplementedError(
+                "diffusion + conditioning is not yet supported.")
         return self.diffusion.sample(cond=lr)
 
-    def forward(self, hr: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, hr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        if cond is not None:
+            raise NotImplementedError(
+                "diffusion + conditioning is not yet supported.")
         lr = self.degrade(hr)
         return self.diffusion.train_outputs(hr, cond=lr)
 
@@ -176,6 +212,9 @@ def build_generation_model(cfg) -> nn.Module:
                                                  and not topology.lift_2_5d_to_3d))
 
     if algo == "diffusion":
+        if topology.cond_in_channels > 0:
+            raise NotImplementedError(
+                "task.algorithm='diffusion' with data.cond_dirs is not yet supported.")
         arch = str(cfg.model.arch).lower()
         D = _slab_depth(cfg)
         target_ch = int(task.out_channels) * D       # 高分（噪声）图折叠通道
@@ -193,7 +232,7 @@ def build_generation_model(cfg) -> nn.Module:
                 f"{{'adm','edm2'}} (paper-faithful σ/timestep conditioning); "
                 f"got arch={arch!r}.")
         diffusion = build_diffusion(cfg, net)
-        return DiffusionModel(diffusion, degradation)
+        return DiffusionModel(diffusion, degradation, spatial_dims=spatial_dims)
 
     raise ValueError(
         f"task.algorithm must be 'regression' | 'diffusion'; got {algo!r}")

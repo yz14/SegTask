@@ -280,6 +280,16 @@ def match_region_weight_paths(
         kind="RegionWeight")
 
 
+def match_condition_paths(
+    image_paths: List[str],
+    cond_dir: str,
+    image_suffix: SuffixSpec,
+    cond_suffix: SuffixSpec) -> List[str]:
+    """与 image_paths 1:1 解析条件体 NIfTI 路径；缺失报错。"""
+    return _match_per_sample_paths(
+        image_paths, cond_dir, image_suffix, cond_suffix, kind="Condition")
+
+
 def _default_label_loader(path: str) -> np.ndarray:
     """默认 int16 NIfTI label reader；npz 模式使用 load_npz_label_for_split。"""
     return load_nifti(path, dtype=np.int16)

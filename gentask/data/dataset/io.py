@@ -171,6 +171,7 @@ def load_nifti_cropped(
 #   image int16 (D',H',W') HU bbox-裁剪
 #   label int16 (D',H',W') 原始标签 bbox-裁剪
 #   rw    float32 (D',H',W') +1 偏移后的区域权重（可选）
+#   cond  float32/int16 (C,D',H',W') 条件体（可选）
 #   fg_slices int32 (M,)
 #   fg_coords int32 (N,3) seed=42、cap=50000
 #   meta  object 0-d dict
@@ -213,6 +214,15 @@ def load_npz_region_weight(path: str) -> Optional[np.ndarray]:
     if rw.dtype != np.float32:
         rw = rw.astype(np.float32, copy=False)
     return rw
+
+
+def load_npz_cond(path: str) -> Optional[np.ndarray]:
+    """返 owned 条件体 ndarray；无 cond 返 None。"""
+    with _open_npz(path) as f:
+        if "cond" not in f.files:
+            return None
+        cond = f["cond"]
+    return np.array(cond, copy=True)
 
 
 def npz_has_rw(path: str) -> bool:

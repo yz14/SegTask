@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -247,6 +248,31 @@ def _multi_view_aux_cfg():
     return cfg
 
 
+def _conditioning_cfg(mode: str):
+    cfg = Config()
+    cfg.data.patch_mode = mode
+    cfg.data.num_classes = 2
+    cfg.data.label_values = [0, 1]
+    cfg.data.patch_size = [4, 16, 16] if mode == "2_5d" else [8, 16, 16]
+    cfg.data.multi_res_scales = [1.0]
+    cfg.data.cond_dirs = ["/tmp/cond"]
+    cfg.data.cond_suffixes = ".nii.gz"
+    cfg.data.cond_normalize = "minmax"
+    cfg.data.cond_intensity_min = 0.0
+    cfg.data.cond_intensity_max = 1.0
+    cfg.model.arch = "unet"
+    cfg.model.encoder_channels = [16, 32, 48]
+    cfg.model.encoder_blocks_per_stage = [1, 1, 1]
+    cfg.task.type = "generation"
+    cfg.task.algorithm = "regression"
+    cfg.task.degradation = "superres"
+    cfg.task.out_channels = 1
+    cfg.task.sr_scale = 2
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
 def test_multi_view_aux_recon_forward_and_restore():
     from gentask.models.factory import build_model
 
@@ -321,6 +347,82 @@ def test_single_view_regression_unchanged_with_no_aux_path():
                            torch.device("cpu"))
     loss_new = tr._step_loss(out, {})
     assert torch.allclose(loss_ref, loss_new)
+
+
+def test_conditioning_disabled_is_noop():
+    from gentask.models.factory import build_model
+
+    for mode, hr in (
+        ("z_axis", torch.rand(2, 1, 8, 16, 16)),
+        ("2_5d", torch.rand(2, 4, 16, 16)),
+    ):
+        cfg = _cfg("regression", mode=mode)
+        model = build_model(cfg).eval()
+        with torch.no_grad():
+            out0 = model(hr)
+            out1 = model(hr, cond=None)
+            lr = model.degrade(hr)
+            rec0 = model.restore(lr)
+            rec1 = model.restore(lr, cond=None)
+        assert torch.allclose(out0["pred"], out1["pred"])
+        assert torch.allclose(rec0, rec1)
+
+
+def test_conditioning_3d_forward_and_trainer_step():
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    cfg = _conditioning_cfg("z_axis")
+    model = build_model(cfg)
+    assert cfg.model.in_channels == 2
+    hr = torch.rand(2, 1, 8, 16, 16)
+    cond = torch.rand(2, 1, 8, 16, 16)
+    batch = {"image": hr, "cond": cond, "label": torch.zeros(2, 1, 8, 16, 16)}
+    out = model(hr, cond=cond)
+    assert tuple(out["pred"].shape) == tuple(hr.shape)
+    with tempfile.TemporaryDirectory() as td:
+        cfg.train.output_dir = td
+        tr = GenerationTrainer(model, cfg, [batch], [batch], torch.device("cpu"))
+        loss = tr._train_epoch(0)["loss"]
+    assert np.isfinite(loss)
+    with torch.no_grad():
+        rec = model.restore(model.degrade(hr), cond=cond)
+    assert tuple(rec.shape) == tuple(hr.shape)
+
+
+def test_conditioning_2_5d_forward_and_trainer_step():
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    cfg = _conditioning_cfg("2_5d")
+    model = build_model(cfg)
+    assert cfg.model.in_channels == 8
+    hr = torch.rand(2, 1, 4, 16, 16)
+    cond = torch.rand(2, 1, 4, 16, 16)
+    batch = {"image": hr, "cond": cond, "label": torch.zeros(2, 1, 4, 16, 16)}
+    out = model(hr, cond=cond)
+    assert tuple(out["pred"].shape) == (2, 4, 16, 16)
+    with tempfile.TemporaryDirectory() as td:
+        cfg.train.output_dir = td
+        tr = GenerationTrainer(model, cfg, [batch], [batch], torch.device("cpu"))
+        loss = tr._train_epoch(0)["loss"]
+    assert np.isfinite(loss)
+    with torch.no_grad():
+        rec = model.restore(model.degrade(hr), cond=cond)
+    assert tuple(rec.shape) == (2, 4, 16, 16)
+
+
+def test_conditioning_multi_view_is_rejected():
+    cfg = _conditioning_cfg("2_5d")
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.data.z_boundary_mode = "edge_pad"
+    try:
+        cfg.sync()
+        cfg.validate()
+    except Exception as exc:
+        assert "not yet supported" in str(exc)
+    else:
+        raise AssertionError("multi-view conditioning should be rejected")
 
 
 def test_zaxis_sr_regression_3d_end_to_end():
@@ -614,6 +716,10 @@ def main() -> int:
         test_multi_view_aux_recon_forward_and_restore,
         test_multi_view_aux_recon_trainer_step_and_backward,
         test_single_view_regression_unchanged_with_no_aux_path,
+        test_conditioning_disabled_is_noop,
+        test_conditioning_3d_forward_and_trainer_step,
+        test_conditioning_2_5d_forward_and_trainer_step,
+        test_conditioning_multi_view_is_rejected,
         test_zaxis_sr_regression_3d_end_to_end,
         test_deep_supervision_regression,
         test_deep_supervision_trainer_runs,
