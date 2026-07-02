@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_VERSION = "make_data/1.0"
 
-# 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
+# 同 Volume3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
 
 
@@ -57,7 +57,7 @@ def _compute_fg_indices(
     bg_val: int,
     fg_subsample: int,
     seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 SegDataset3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
+    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 Volume3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
     if label.size == 0:
         return (np.zeros((0,), dtype=np.int32),
                 np.zeros((0, 3), dtype=np.int32))
@@ -427,7 +427,7 @@ def main() -> int:
     parser.add_argument("--fg-subsample", type=int,
                         default=_DEFAULT_FG_SUBSAMPLE,
                         help="Max stored 3D fg coords per sample "
-                             "(matches SegDataset3DCubic._build_index).")
+                             "(matches Volume3DCubic._build_index).")
     parser.add_argument("--compress", action="store_true",
                         help="Use np.savez_compressed (smaller disk, "
                              "but no shared OS page cache and slower load).")

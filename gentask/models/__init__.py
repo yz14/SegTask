@@ -1,1 +1,1 @@
-"""Shared 2.5D/3D model architectures for gentask."""
+"""Shared 2.5D/3D image-to-image models for gentask."""

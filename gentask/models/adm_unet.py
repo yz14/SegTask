@@ -1,4 +1,4 @@
-"""ADM U-Net 分割 backbone (Dhariwal & Nichol 2021)。与论文 enc/mid/dec 块一致 (GN32+SiLU, ResBlock 无 emb, 多头 QKVAttention, stride-2 Downsample, nearest+conv Upsample, 逐块 skip)。仅 2.5D；DS/aux/lucidrains LinearAttention 为附加扩展。forward 返回与 UNet3D 一致。"""
+"""ADM U-Net 共享 backbone (Dhariwal & Nichol 2021)。与论文 enc/mid/dec 块一致 (GN32+SiLU, ResBlock 无 emb, 多头 QKVAttention, stride-2 Downsample, nearest+conv Upsample, 逐块 skip)。仅 2.5D；DS/aux/lucidrains LinearAttention 为附加扩展。forward 返回与 UNet3D 一致。"""
 
 from __future__ import annotations
 
@@ -291,7 +291,7 @@ class _AttentionBlock(nn.Module):
 
 
 # ============================================================================
-# ADM segmentation U-Net wrapper.
+# ADM shared U-Net backbone wrapper.
 # ============================================================================
 
 
@@ -711,7 +711,7 @@ class ADMSegModel(nn.Module):
 # ============================================================================
 
 
-def build_adm_seg_model(cfg) -> ADMSegModel:
+def build_adm_backbone(cfg) -> ADMSegModel:
     """从 Config 构造 ADMSegModel。读标准 data/model 字段 + ADM 专有：
     adm_attention_levels (默认 [L-2, L-1])、adm_num_heads(4)、adm_num_head_channels(-1)。
     model.dropout 复用为 ADM ResBlock dropout。。"""
