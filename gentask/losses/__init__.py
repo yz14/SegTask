@@ -1,1 +1,1 @@
-"""Losses for generation and shared model support."""
+"""Losses for generation and shared image-to-image support."""

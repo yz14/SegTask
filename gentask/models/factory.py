@@ -1,4 +1,4 @@
-"""根据 config 构建 UNet3D / ADM / EDM2 模型。"""
+"""根据 config 构建 gentask 的共享 2.5D/3D 图像到图像模型。"""
 
 from __future__ import annotations
 
@@ -212,91 +212,91 @@ def build_model(cfg: Config):
     return build_backbone(cfg)
 
 
-def build_backbone(cfg: Config):
-    """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
-    （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
-    arch = str(cfg.model.arch).lower()
-    if arch == "adm":
-        from .adm_unet import build_adm_seg_model
-        return build_adm_seg_model(cfg)
-    if arch == "edm2":
-        from .edm2_unet import build_edm2_seg_model
-        return build_edm2_seg_model(cfg)
-    if arch != "unet":
-        raise ValueError(
-            f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
-
-    mc           = cfg.model
-    enc_channels = list(mc.encoder_channels)
-    num_fg       = cfg.num_fg_classes
-    n_levels     = len(enc_channels)
-
-    topo                  = build_topology(cfg)
-    spatial_dims          = topo.spatial_dims
-    out_classes           = topo.out_classes
-    num_stem_fusion_views = topo.num_stem_fusion_views  # 2.5D才需要融合，3D是通道拼接
-    in_ch_per_view_list   = topo.in_ch_per_view_list    # 2.5D才有每个视图的in_ch=depth
-    aux_head_out_channels = topo.aux_head_out_channels  # 2.5D才有aux监督选项，3D是必须
-
-    enc_counts = _resolve_blocks_per_stage(  # 确认enc各stage通道
-        mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
-
-    if   mc.decoder_type == "unet":
+def _resolve_decoder_counts(mc, n_levels: int) -> list[int]:
+    """按 decoder 类型解析各 stage 的 block 数。"""
+    if mc.decoder_type == "unet":
         expected_dec_calls = n_levels - 1
     elif mc.decoder_type == "unetpp":
         expected_dec_calls = n_levels * (n_levels - 1) // 2
-    else:  # unet3p: no stage_builder calls
+    else:
         expected_dec_calls = 0
 
-    if   mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
-        dec_counts = _resolve_blocks_per_stage(  # 确认dec各stage通道
+    if mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
+        return _resolve_blocks_per_stage(
             mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
-    elif mc.decoder_blocks_per_stage:  # UNet++：首项广播到所有嵌套节点
-        dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
-    else:
-        dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)
+    if mc.decoder_blocks_per_stage:
+        return [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
+    return [mc.blocks_per_level] * max(expected_dec_calls, 1)
 
-    # enc/dec 分别构建以使计数独立。
+
+def _resolve_backbone_stage_builders(cfg: Config, enc_counts, dec_counts):
+    """按 backbone 解析 encoder/decoder stage builder。"""
+    mc = cfg.model
     downsample_builder = None
-    if   mc.backbone == "resnet":
+    if mc.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(cfg, enc_counts)
         dec_builder = _make_resnet_stage_builder(cfg, dec_counts)
     elif mc.backbone == "convnext":
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)
-        # LN-first 下采样；置 False 回退通用 Downsample（消融实验）。
         if bool(mc.convnext_downsample_lnfirst):
             downsample_builder = _make_convnext_downsample_builder(cfg)
     else:
         raise ValueError(f"Unknown backbone: {mc.backbone}")
+    return enc_builder, dec_builder, downsample_builder
 
-    # 各向异性下采样 stride 调度（None = 各向同性，沿用历史行为）。
-    ds_strides = compute_downsample_strides(cfg, spatial_dims, n_levels)
-    if ds_strides is not None and any(
+
+def _validate_anisotropic_downsampling(cfg: Config, downsample_builder, ds_strides):
+    """检查各向异性 stride 与 decoder / downsample 实现的兼容性。"""
+    mc = cfg.model
+    if ds_strides is None or not any(
             any(int(s) != 2 for s in stage) for stage in ds_strides):
-        # 仅对真正非各向同性的调度做兼容性校验；全 2 的调度等价于默认。
-        if downsample_builder is not None:
-            raise ValueError(
-                "Anisotropic downsampling is not supported with ConvNeXt "
-                "LN-first downsample. Set model.convnext_downsample_lnfirst="
-                "false to use the generic Downsample, or disable "
-                "anisotropic_pooling/downsample_strides.")
-        if mc.decoder_type != "unet":
-            raise ValueError(
-                f"Anisotropic downsampling currently supports only "
-                f"decoder_type='unet'; got {mc.decoder_type!r}. "
-                f"(unetpp/unet3p decoders use isotropic ×2 up/down.)")
-        if mc.downsample_mode not in _ANISO_DOWN_MODES:
-            raise ValueError(
-                f"Anisotropic downsampling requires downsample_mode in "
-                f"{_ANISO_DOWN_MODES}; got {mc.downsample_mode!r}.")
-        if mc.upsample_mode not in _ANISO_UP_MODES:
-            raise ValueError(
-                f"Anisotropic downsampling requires upsample_mode in "
-                f"{_ANISO_UP_MODES}; got {mc.upsample_mode!r}.")
-        logger.info("Anisotropic downsample strides (per level): %s", ds_strides)
+        return
+    if downsample_builder is not None:
+        raise ValueError(
+            "Anisotropic downsampling is not supported with ConvNeXt "
+            "LN-first downsample. Set model.convnext_downsample_lnfirst="
+            "false to use the generic Downsample, or disable "
+            "anisotropic_pooling/downsample_strides.")
+    if mc.decoder_type != "unet":
+        raise ValueError(
+            f"Anisotropic downsampling currently supports only "
+            f"decoder_type='unet'; got {mc.decoder_type!r}. "
+            f"(unetpp/unet3p decoders use isotropic ×2 up/down.)")
+    if mc.downsample_mode not in _ANISO_DOWN_MODES:
+        raise ValueError(
+            f"Anisotropic downsampling requires downsample_mode in "
+            f"{_ANISO_DOWN_MODES}; got {mc.downsample_mode!r}.")
+    if mc.upsample_mode not in _ANISO_UP_MODES:
+        raise ValueError(
+            f"Anisotropic downsampling requires upsample_mode in "
+            f"{_ANISO_UP_MODES}; got {mc.upsample_mode!r}.")
+    logger.info("Anisotropic downsample strides (per level): %s", ds_strides)
 
-    # Build encoder
+
+def _build_unet_backbone(cfg: Config):
+    """构建共享 UNet-style backbone。"""
+    mc = cfg.model
+    enc_channels = list(mc.encoder_channels)
+    num_fg = cfg.num_fg_classes
+    n_levels = len(enc_channels)
+
+    topo = build_topology(cfg)
+    spatial_dims = topo.spatial_dims
+    out_classes = topo.out_classes
+    num_stem_fusion_views = topo.num_stem_fusion_views
+    in_ch_per_view_list = topo.in_ch_per_view_list
+    aux_head_out_channels = topo.aux_head_out_channels
+
+    enc_counts = _resolve_blocks_per_stage(
+        mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
+    dec_counts = _resolve_decoder_counts(mc, n_levels)
+    enc_builder, dec_builder, downsample_builder = _resolve_backbone_stage_builders(
+        cfg, enc_counts, dec_counts)
+
+    ds_strides = compute_downsample_strides(cfg, spatial_dims, n_levels)
+    _validate_anisotropic_downsampling(cfg, downsample_builder, ds_strides)
+
     encoder = Encoder(
         in_channels           = mc.in_channels,
         stage_channels        = enc_channels,
@@ -313,8 +313,7 @@ def build_backbone(cfg: Config):
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides)
 
-    # decoder: unet | unetpp | unet3p
-    if   mc.decoder_type == "unet3p":
+    if mc.decoder_type == "unet3p":
         decoder = UNet3PDecoder(
             encoder_channels=enc_channels,
             cat_channels=mc.unet3p_cat_channels,
@@ -340,8 +339,7 @@ def build_backbone(cfg: Config):
             spatial_dims       = spatial_dims,
             downsample_strides = ds_strides)
 
-    # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
-    aux_seg_supervision       = topo.aux_seg_active
+    aux_seg_supervision = topo.aux_seg_active
     aux_head_out_channels_arg = (
         aux_head_out_channels if (aux_seg_supervision and aux_head_out_channels) else None)
     model = UNet3D(
@@ -379,3 +377,18 @@ def build_backbone(cfg: Config):
         mc.aux_head_mode)
 
     return model
+
+
+def build_backbone(cfg: Config):
+    """按 `model.arch` 构造共享 backbone：UNet、ADM、EDM2。"""
+    arch = str(cfg.model.arch).lower()
+    if arch == "adm":
+        from .adm_unet import build_adm_backbone
+        return build_adm_backbone(cfg)
+    if arch == "edm2":
+        from .edm2_unet import build_edm2_backbone
+        return build_edm2_backbone(cfg)
+    if arch != "unet":
+        raise ValueError(
+            f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
+    return _build_unet_backbone(cfg)

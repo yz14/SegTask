@@ -1,4 +1,4 @@
-"""Dataset selection strategy（data 侧 ``ViewPipeline`` 类比）。
+"""Dataset selection strategy for the shared gentask data layer.
 
 R4：把 ``loader.py::build_dataloaders`` 中"按 ``patch_mode`` 选 dataset 类
 + 准备各模式专属 kwargs"的 6 处重复构造收敛到 3 个 ``DatasetSpec`` 子类与
@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple
 from torch.utils.data import Dataset
 
 from ..config import Config
-from .dataset import SegDataset3D, SegDataset3DCubic, SegDataset3DWhole
+from .dataset import Volume3D, Volume3DCubic, Volume3DWhole
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +37,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class DatasetCommonCfg:
-    """与 patch_mode 无关的 dataset 公共构造参数。
+    """与 patch_mode 无关的 dataset 公共构造参数（shared image-to-image data path）。
 
-    所有 3 个 dataset 子类（``SegDataset3D`` / ``SegDataset3DCubic`` /
-    ``SegDataset3DWhole``）共享这 11 个字段。原 ``loader.py:522-532`` 的
+    所有 3 个 dataset 子类（``Volume3D`` / ``Volume3DCubic`` /
+    ``Volume3DWhole``）共享这 11 个字段。原 ``loader.py:522-532`` 的
     ``common_kwargs`` dict 已被这个 dataclass 替代。
     """
 
@@ -72,7 +72,7 @@ class DatasetCommonCfg:
                                  if dc.region_weights else None))
 
     def to_kwargs(self) -> dict:
-        """直接展开为 ``SegDataset3D*.__init__`` 的 kwargs。"""
+        """直接展开为 ``Volume3D*.__init__`` 的 kwargs。"""
         return dict(
             label_values      = self.label_values,
             patch_size        = self.patch_size,
@@ -105,7 +105,7 @@ class SplitPaths:
 # Strategy base + concrete specs
 # ---------------------------------------------------------------------------
 class DatasetSpec(ABC):
-    """Data 侧策略对象：把 ``cfg`` + (paths, is_train) 翻译成具体 ``Dataset``。"""
+    """Data 侧策略对象：把 ``cfg`` + (paths, is_train) 翻译成具体 ``Dataset``，用于 gentask 的共享 data path。"""
 
     name: str = "abstract"
 
@@ -156,7 +156,7 @@ class WholeSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         # whole 在 Config.validate 中已强制 multi_res_scales=[1.0]、忽略 fg 过采样。
-        return SegDataset3DWhole(
+        return Volume3DWhole(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio = self._aug_oversample(is_train),
@@ -165,7 +165,7 @@ class WholeSpec(DatasetSpec):
 
 
 class ZCubeSpec(DatasetSpec):
-    """z 轴 single max-FOV cube 模式（``patch_mode in {z_axis, 2_5d}``）。
+    """z 轴 single max-FOV cube 模式（共享 data path）。（``patch_mode in {z_axis, 2_5d}``）。
 
     两种 patch_mode 在 dataset 侧抽取逻辑完全一致 —— 都发 max-FOV z-cube；
     多分辨率拆视图全部交给 trainer/predictor 完成。仅日志区分。
@@ -189,7 +189,7 @@ class ZCubeSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         dc = self.cfg.data
-        return SegDataset3D(
+        return Volume3D(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio        = self._aug_oversample(is_train),
@@ -201,7 +201,7 @@ class ZCubeSpec(DatasetSpec):
 
 
 class CubicSpec(DatasetSpec):
-    """3 轴 cubic max-FOV 模式（``patch_mode='cubic'``）。"""
+    """3 轴 cubic max-FOV 模式（共享 data path）。（``patch_mode='cubic'``）。"""
 
     name = "cubic"
 
@@ -218,7 +218,7 @@ class CubicSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         dc = self.cfg.data
-        return SegDataset3DCubic(
+        return Volume3DCubic(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio        = self._aug_oversample(is_train),
@@ -232,7 +232,7 @@ class CubicSpec(DatasetSpec):
 # Factory — 整个 data 子包中唯一允许 patch_mode if/elif 的地方
 # ---------------------------------------------------------------------------
 def build_data_spec(cfg: Config) -> DatasetSpec:
-    """``cfg.data.patch_mode`` → ``DatasetSpec``。新增 patch_mode 仅需在此追加一行。"""
+    """``cfg.data.patch_mode`` → ``DatasetSpec``。新增 patch_mode 仅需在此追加一行（shared data path）。"""
     pm = str(cfg.data.patch_mode).lower()
     if pm in ("2_5d", "z_axis"):
         return ZCubeSpec(cfg)

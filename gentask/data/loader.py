@@ -1,4 +1,4 @@
-"""DataLoader 工厂 + 训/验划分。扫描数据目录、划分 train/val、创建 DataLoader。"""
+"""DataLoader 工厂 + 训/验划分。扫描数据目录、划分 train/val、创建 DataLoader，供 gentask 的共享 data 层使用。"""
 
 from __future__ import annotations
 
