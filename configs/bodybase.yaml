@@ -94,7 +94,7 @@ model:
 
   stem_mode    : "dual"
 
-  context_fusion: "multi_stem_proj"
+  stem_fusion_mode: "multi_stem_proj"
 
   aux_seg_supervision: true
 

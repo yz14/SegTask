@@ -70,6 +70,9 @@ def _make_resnet_stage_builder(
     """
     mc = cfg.model
     spatial_dims = mc.spatial_dims
+    attention_type = mc.attention_type
+    if attention_type == "none" and mc.use_se:
+        attention_type = "se"
     mask = list(multirf_mask) if multirf_mask else []
     sa_types = list(selfattn_types) if selfattn_types else []
 
@@ -87,9 +90,8 @@ def _make_resnet_stage_builder(
                 norm_groups    = mc.norm_groups,
                 activation     = mc.activation,
                 dropout        = mc.dropout,
-                use_se         = mc.use_se,
                 se_reduction   = mc.se_reduction,
-                attention_type = mc.attention_type,
+                attention_type = attention_type,
                 spatial_dims   = spatial_dims,
                 branch_norm_act = mc.multirf_branch_norm_act)
         return ResNetStage(
@@ -99,9 +101,8 @@ def _make_resnet_stage_builder(
             norm_groups    = mc.norm_groups,
             activation     = mc.activation,
             dropout        = mc.dropout,
-            use_se         = mc.use_se,
             se_reduction   = mc.se_reduction,
-            attention_type = mc.attention_type,
+            attention_type = attention_type,
             block_type     = mc.block_type,
             spatial_dims   = spatial_dims)
 

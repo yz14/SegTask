@@ -360,24 +360,11 @@ class UNet3D(nn.Module):
         norm_groups          : int = 8,
         activation           : str = "leakyrelu",
         aux_head_out_channels: Optional[List[int]] = None,
-        num_fg_classes       : Optional[int] = None,
         aux_topo_head        : bool = False,
         aux_topo_head_mode   : str = "conv"):
         super().__init__()
-        # 向后兼容：旧形参名 num_fg_classes 实为"主头输出通道数"（2.5D 折叠下
-        # = num_fg * D，并非类数），改名 out_channels；旧名仍接受但提示迁移。
-        if out_channels is None and num_fg_classes is None:
-            raise TypeError("UNet3D requires out_channels.")
-        if out_channels is not None and num_fg_classes is not None:
-            raise TypeError(
-                "UNet3D got both out_channels and deprecated num_fg_classes; "
-                "pass only out_channels.")
         if out_channels is None:
-            logger.warning(
-                "UNet3D(num_fg_classes=...) is deprecated; use "
-                "out_channels=... (it is the main-head output channel "
-                "count, not the class count).")
-            out_channels = num_fg_classes
+            raise TypeError("UNet3D requires out_channels.")
 
         self.encoder          = encoder
         self.decoder          = decoder

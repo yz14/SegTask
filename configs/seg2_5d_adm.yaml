@@ -158,7 +158,7 @@ train:
 
   output_dir: "outputs/lung_adm"
   save_every: 10
-  # 选模标准：唯一接口；save_best_metric/mode 由此自动派生。
+  # 选模标准：唯一接口；save_best_metric/mode 仅为派生只读量。
   save_best_criterion: "dice"
 
   early_stopping: 15

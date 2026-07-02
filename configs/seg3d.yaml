@@ -271,7 +271,7 @@ train:
   output_dir: "outputs/base3d"
   save_every: 10
   # 选模标准：单一接口。可选 loss/dice/dice+surface_dice/iou/mcc/min_dice/balanced。
-  # save_best_metric / save_best_mode 由此自动派生，无需手设。
+  # save_best_metric / save_best_mode 由此自动派生，YAML 中不单独设置。
   save_best_criterion: "dice"
 
   # 选模严格度：'medium' (默认, 在随机 patch 上算指标, 快) | 'high' (对每个 val
