@@ -1,14 +1,7 @@
-"""生成（超分）推理。
+"""Generation inference for super-resolution.
 
-分割 ``Predictor`` 的滑窗 / 概率融合 / argmax 全程假设 sigmoid 分割输出，不适用于
-图像复原；本模块提供独立的 ``GenerationPredictor``，复用既有 NIfTI 读取 / 归一化 /
-写出，按训练时的折叠方式对体数据做复原：
-
-* 2.5D：沿 z 轴按 ``patch_size[0]`` 折叠为通道的 slab 逐窗复原，重叠处平均；
-* 3D：整卷一次复原。
-
-输入体数据视为「目标网格上的低分图」（与训练 ``degrade`` 的输出口径一致——先降采样
-再上采样回 HR 尺寸）。当前仅支持 ``task.out_channels==1``（CT 灰度）。
+The predictor reuses the shared NIfTI I/O and model topology layer, but it
+operates on restored image volumes instead of segmentation logits.
 """
 
 from __future__ import annotations
@@ -22,8 +15,11 @@ import torch
 
 from ..config import Config
 from ..data.dataset import load_nifti, preprocess_image
-from ..trainer.checkpoint import unwrap_compile
-from .io import _select_state_dict, _strip_compile_prefix
+from ..trainer.checkpoint import (
+    _select_state_dict,
+    _strip_compile_prefix,
+    unwrap_compile,
+)
 
 logger = logging.getLogger(__name__)
 

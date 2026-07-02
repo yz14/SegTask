@@ -45,9 +45,12 @@ class DataConfig:
     bbox_dir   : str = ""
     bbox_suffix: Union[str, List[str]] = ".nii.gz"
 
-    # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > loss.region_weights。
+    # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > data.region_weights。
     region_weight_dir   : str = ""
     region_weight_suffix: Union[str, List[str]] = ".nii.gz"
+
+    # 静态区域权重（值 +1）；空表示不启用。优先级低于 region_weight_dir。
+    region_weights: List[float] = field(default_factory=list)
 
     # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
     npz_dir   : str = ""
@@ -118,59 +121,6 @@ class DataConfig:
     # 3D 多 FOV 懒加载单 cube（z_axis/cubic）。True：dataset 发单 cube，trainer 逐视图裁剪/重采样。
     # 约束：scales[0]==1.0；与 keep_native_view_depth 互斥；z_axis 强制 edge_pad。
     keep_native_multi_res: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Augmentation configuration
-# ---------------------------------------------------------------------------
-@dataclass
-class AugConfig:
-    """GPU 数据增强。所有空间变换逐样本独立。"""
-
-    enabled: bool = True
-
-    # --- 空间变换（image + label 同步） ---
-    random_flip_prob: float = 0.2
-    random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
-
-    # Affine：小角旋转 + 缩放，合成单次 grid_sample。
-    random_affine_prob : float = 0.3
-    random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
-    random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
-
-    # 弹性形变（B-spline 随机位移场）。
-    elastic_deform_prob : float = 0.2
-    elastic_deform_sigma: float = 5.0   # 位移平滑度
-    elastic_deform_alpha: float = 7.0   # 位移幅度（voxel）
-
-    # Grid dropout：随机遮挡矩形子区域。
-    grid_dropout_prob : float = 0.0
-    grid_dropout_ratio: float = 0.3
-    grid_dropout_holes: int = 4
-
-    # --- 强度变换（仅 image） ---
-    random_brightness_prob : float = 0.3
-    random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
-
-    random_contrast_prob : float = 0.3
-    random_contrast_range: List[float] = field(default_factory=lambda: [0.8, 1.2])
-
-    random_gamma_prob : float = 0.2
-    random_gamma_range: List[float] = field(default_factory=lambda: [0.8, 1.2])
-
-    gaussian_noise_prob: float = 0.15
-    gaussian_noise_std : float = 0.05
-
-    gaussian_blur_prob : float = 0.1
-    gaussian_blur_sigma: List[float] = field(default_factory=lambda: [0.5, 1.5])
-
-    # 模拟低分辨率（下采样后上采样）。
-    simulate_lowres_prob: float = 0.1
-    simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
-
-    # weight_map 插值模式："nearest" 保持离散权重（默认，含连续手标 wmap）；
-    # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
-    wmap_interp_mode: str = "nearest"
 
 
 # ---------------------------------------------------------------------------
@@ -334,61 +284,10 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class LossConfig:
-    """损失函数设置。输出为逐类独立 sigmoid，每个前景类产生 (B, 1, D, H, W) 二值输出。"""
+    """Generation-side loss settings."""
 
-    # 损失名：常用 "dice_bce" 或 "dice_focal"；其他选项见 validate() 白名单。
-    name: str = "dice_bce"
-
-    # 复合损失权重 [loss1_w, loss2_w]。
-    compound_weights: List[float] = field(default_factory=lambda: [1.0, 1.0])
-
-    # 逐类损失权重（空=均匀）；长度 = num_fg_classes。
-    class_weights: List[float] = field(default_factory=list)
-
-    # 逐区域空间权重：按 label 取值一个权重（含 bg）。例：[1.0, 2.0, 2.0, 1.0, 1.0] → label 1/2 位置损失×2。空=禁用。
-    region_weights: List[float] = field(default_factory=list)
-
-    # Dice 参数。
-    dice_smooth: float = 1e-5
-    dice_squared: bool = False
-
-    # Focal 参数。
-    focal_alpha: float = 0.25
-    focal_gamma: float = 2.0
-
-    # Tversky 参数（alpha=FP权重, beta=FN权重）。
-    tversky_alpha: float = 0.3
-    tversky_beta: float = 0.7
-
-    # True：全 batch+空间上汇总 TP/分母后一次除（nnU-Net Dice 默认）。作用于 Dice/Tversky/FocalTversky/GDL。
-    batch_dice: bool = False
-    # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
-    ignore_empty: bool = False
-
-    # GDL 体积加权："square"（论文）| "simple"（w=1/Σt）| "uniform"（禁用）。
-    gdl_weight_type: str = "square"
-    gdl_w_max: float = 1.0e5  # 限住 1/volume。
-
-    # Focal Tversky：(1-TI)^gamma，gamma≥1。
-    focal_tversky_gamma: float = 4.0 / 3.0
-
-    # Lovász-Hinge：True=逐 (B, C) 排序取均；False=批级排序（小 patch 更平滑）。
-    lovasz_per_sample: bool = True
-
-    # Soft clDice 骨架化迭代：2D 用 3，3D 取 3–10。
-    cldice_iter: int = 3
-    cldice_smooth: float = 1.0
-
-    # 深度监督逐级权重。
     deep_supervision_weights: List[float] = field(
         default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
-
-    # 2.5D 损失聚合（仅 patch_mode=="2_5d"）："per_slice" 逐 slice 独立（空 slice Dice≈1 零梯度）；
-    # "per_volume" 按整体在 (D,H,W) 上聚合（2.5D 推荐）。仅影响 Dice 系。
-    slice_loss_reduction: str = "per_slice"
-
-    # 2.5D 多 FOV 辅助头权重（仅 model.aux_seg_supervision=True）：长度 = n_views-1。空 = trainer 自填 0.5^k。
-    aux_supervision_weights: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -399,20 +298,15 @@ class TrainConfig:
     """训练循环设置。"""
 
     epochs: int = 200
-
-    # 优化器："adam" | "adamw" | "sgd"。
     optimizer   : str = "adamw"
     lr          : float = 1e-3
     weight_decay: float = 1e-4
-    momentum    : float = 0.99   # 仅 SGD
-    nesterov    : bool = True    # 仅 SGD
-
-    # 调度器："cosine" | "cosine_warm_restarts" | "poly" | "step" | "plateau" | "one_cycle"。
+    momentum    : float = 0.99
+    nesterov    : bool = True
     scheduler    : str = "cosine"
     warmup_epochs: int = 5
     warmup_lr    : float = 1e-6
     cosine_min_lr: float = 1e-6
-    # cosine_warm_restarts 重启周期 T_0 与倍率 T_mult。
     cosine_restart_period: int = 50
     cosine_restart_mult  : int = 2
     poly_power           : float = 0.9
@@ -420,187 +314,25 @@ class TrainConfig:
     step_gamma           : float = 0.1
     plateau_patience     : int = 10
     plateau_factor       : float = 0.5
-
-    # 梯度累积（有效 batch = batch_size * accum_steps）。
     grad_accum_steps: int = 1
-
-    # 梯度裁剪。
     grad_clip_norm: float = 12.0
-
-    # AMP。amp_dtype 示例："float16"（需 GradScaler）、"bfloat16"（Ampere+，无需 scaler）。还有 "auto"（探测 BF16 否则回退 fp16）。
     use_amp  : bool = True
     amp_dtype: str = "float16"
-
-    # torch.compile："none" | "default" | "reduce-overhead" | "max-autotune"。
     compile_mode: str = "none"
-
-    # EMA。
     use_ema  : bool = True
     ema_decay: float = 0.999
-
-    # Checkpoint 保存。
     output_dir      : str = "outputs"
     save_every      : int = 10
-    # 选模标准（互斥）：
-    #   * "loss"              → val_loss ↓
-    #   * "dice"              → mean_dice ↑
-    #   * "dice+surface_dice" → mean_combined = (1−w)·dice + w·sd ↑
-    #   * "iou"               → mean_iou ↑                （Jaccard，对边界更严格）
-    #   * "mcc"               → mean_mcc ↑                （类不平衡稳健，∈[−1,1]）
-    #   * "min_dice"          → min_class_dice ↑          （短板：最差类 dice）
-    #   * "balanced"          → mean_balanced ↑           （dice/sd/iou/mcc01 调和均值）
-    # 单一真相源：选模标准只暴露 save_best_criterion 一个接口。底层的
-    # (save_best_metric, save_best_mode) 由它派生（见类末尾的只读 property），
-    # 故不再作为可写字段/YAML 接口暴露，避免"设了却被静默重写"的困惑。
-    save_best_criterion: str = "dice"
-    # Surface Dice 容差（像素，Chebyshev 邻域；0=严格表面 Dice）。
-    surface_dice_tolerance: int = 1
-    # 组合标准下 combined = (1-w)*dice + w*surface_dice。
-    surface_dice_weight: float = 0.5
-    # 任务化推荐预设：非空时由 sync() 覆盖上面三项 (criterion / tolerance / weight)。
-    # 仅作"任务名 → 经验上推荐组合"的一键映射，便于复用与切任务。空串 = 不启用，
-    # 完全沿用用户显式设置的三个字段。可选值见 ``_SAVE_BEST_PRESETS``：
-    #   lung / vessel / airway / bone_multi / lymph_node / lesion_small /
-    #   oar_multi / heart_chamber / bone_lung_combined
-    save_best_preset: str = ""
-
-    # 选模严格度（与 save_best_criterion 正交：criterion 决定"看哪个指标"，
-    # 本项决定"指标在什么预测上算"）：
-    #   * "medium" — 现状：在 val_loader 的随机 patch/切片上前向并算指标，快但
-    #                非整卷，z 向上下文被切断，指标偏乐观/抖动。
-    #   * "high"   — 严格：对每个 val 整卷做与部署一致的滑窗推理后再算指标，
-    #                最可靠但更慢（每次验证多一遍整卷推理）。npz 无物理 z-spacing，
-    #                故 high 不启用 predict.z_interleave，其余几何与推理一致。
-    # 默认 "medium" 保持既有行为不变。
-    val_metric_mode: str = "medium"
-
-    # 提前停止（0=禁用）。
     early_stopping: int = 0
-
-    # 日志。
     log_every: int = 10
     val_every: int = 1
     vis_every: int = 10
-
     seed         : int = 42
     deterministic: bool = False
-
-    # Resume：从 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
     resume: str = ""
-
-    # Pretrain：仅加载 model 权重作初始化。若同时设置了 resume 且存在则 pretrain 被忽略。
     pretrain: str = ""
-
-    # strict 加载；默认 False 允许 head 形状不一致。
     pretrain_strict: bool = False
-
-    # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
-
-    # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
-    @property
-    def save_best_metric(self) -> str:
-        """被追踪的验证指标名（如 "mean_dice"）。由 save_best_criterion 派生。"""
-        return _CRITERION_TO_METRIC.get(_norm_crit(self.save_best_criterion),
-                                        _DEFAULT_CRIT_METRIC)[0]
-
-    @property
-    def save_best_mode(self) -> str:
-        """选模方向 "max"/"min"。由 save_best_criterion 派生。"""
-        return _CRITERION_TO_METRIC.get(_norm_crit(self.save_best_criterion),
-                                        _DEFAULT_CRIT_METRIC)[1]
-
-
-# ---------------------------------------------------------------------------
-# 任务化推荐预设：``train.save_best_preset`` → (criterion, sd_tol, sd_w)。
-# 设计来源详见 docs/选模标准建议（与 ``derive_overlap_metrics`` 引入的多维度
-# pooled 指标配套）。每个 preset 仅覆盖三个底层字段，下游 trainer / validate
-# 不感知 preset 本身的存在 —— 单一真相源仍是 (criterion, sd_tol, sd_w)。
-#
-# 用法（yaml）::
-#     train:
-#       save_best_preset: vessel    # 留空 / 删除 = 不启用，沿用显式三个字段
-# ---------------------------------------------------------------------------
-_SAVE_BEST_PRESETS: Dict[str, Dict[str, Any]] = {
-    # 大实质器官：dice 易饱和，需用表面 dice 把边界质量拉进选模。
-    "lung": {
-        "save_best_criterion": "dice+surface_dice",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-    # 薄管状（血管）：dice 对断裂极不敏感；用 balanced 综合 dice/sd/iou/mcc，
-    # tol=2 给重建几何留 1-2 体素余地。建议配合 dice_cldice 损失。
-    "vessel": {
-        "save_best_criterion": "balanced",
-        "surface_dice_tolerance": 2,
-        "surface_dice_weight": 0.5,
-    },
-    # 气道（拓扑敏感）：与血管同思路；建议配合 dice_cldice 损失。
-    "airway": {
-        "save_best_criterion": "balanced",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-    # 多块骨头：min_dice 守护最差类，防止漏一块被 mean_dice 掩盖。
-    "bone_multi": {
-        "save_best_criterion": "min_dice",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-    # 小淋巴结：极端类不平衡 + 小目标，MCC 最稳健（不可用 surface dice 作主指标）。
-    "lymph_node": {
-        "save_best_criterion": "mcc",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-    # 小病灶：同 lymph_node。
-    "lesion_small": {
-        "save_best_criterion": "mcc",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-    # 多器官 OAR（大小差异巨大）：min_dice 直接守底线；监控 balanced。
-    "oar_multi": {
-        "save_best_criterion": "min_dice",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-    # 心脏腔室 / 软组织块：表面质量与体积一致性都重要，sd 权重略低。
-    "heart_chamber": {
-        "save_best_criterion": "dice+surface_dice",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.4,
-    },
-    # 用户当前 lung+bone 多任务（带强 region weight）：balanced 是稳妥折中。
-    "bone_lung_combined": {
-        "save_best_criterion": "balanced",
-        "surface_dice_tolerance": 1,
-        "surface_dice_weight": 0.5,
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# 选模标准 → (被追踪指标名, 选模方向) 的唯一映射表。
-# ``TrainConfig.save_best_metric / save_best_mode`` 是从此表派生的只读 property；
-# ``Config.validate()`` 也以本表的键作为合法 criterion 白名单。单一真相源。
-# ---------------------------------------------------------------------------
-_CRITERION_TO_METRIC: Dict[str, Tuple[str, str]] = {
-    "loss":              ("val_loss",        "min"),
-    "dice":              ("mean_dice",       "max"),
-    "dice+surface_dice": ("mean_combined",   "max"),
-    "iou":               ("mean_iou",        "max"),
-    "mcc":               ("mean_mcc",        "max"),
-    "min_dice":          ("min_class_dice",  "max"),
-    "balanced":          ("mean_balanced",   "max"),
-}
-# 未知 criterion 的兜底（validate() 会另行报错），保证 property 不抛异常。
-_DEFAULT_CRIT_METRIC: Tuple[str, str] = ("mean_dice", "max")
-
-
-def _norm_crit(crit: Any) -> str:
-    """归一化 criterion 字符串（小写 + 去空白），供映射查表使用。"""
-    return str(crit).lower().strip()
 
 
 # ---------------------------------------------------------------------------
@@ -608,59 +340,9 @@ def _norm_crit(crit: Any) -> str:
 # ---------------------------------------------------------------------------
 @dataclass
 class PredictConfig:
-    """推理设置（z 轴滑动窗口）。"""
+    """Generation inference output settings."""
 
-    # z 轴重叠比（0.0 = 不重叠，0.5 = 50%）。
-    z_overlap: float = 0.5
-
-    # 重叠区融合："gaussian" 或 "average"。
-    blend_mode: str = "gaussian"
-
-    # 推理 batch 大小。
-    batch_size: int = 2
-
-    # TTA flip。
-    tta_flip: bool = False
-
-    # TTA flip 变体的批量化前向块大小（单卷推理提速；仅 tta_flip=True 时生效）。
-    #   将多个 flip 变体沿 batch 轴 torch.cat 成一次前向，逐像素等价于串行，仅减少
-    #   前向次数。3D 7 种 flip → ceil(7/tta_batch_size)+1 次前向；2.5D 3 种 → 同理。
-    # None  — 退化为 predict.batch_size。
-    # 显存提醒：单次前向样本数 ≈ batch_size * tta_batch_size，显存随之线性上升；
-    #   显存吃紧时调小（如 2）。AdaBN per_volume 估计阶段会自动退回串行以保 BN 统计一致。
-    tta_batch_size: Optional[int] = None
-
-    # sigmoid 二值化阈值。
-    threshold: float = 0.5
-
-    # 预测输出目录。
     output_dir: str = "predictions"
-
-    # 是否保存概率图（在二值 mask 之外）。
-    save_probabilities: bool = False
-
-    # z 轴交错多流推理（仅 2.5D）：按 z 拆 k 个子体 (slices i,i+k,...)，独立推理后缝回原 z。
-    # 动机：加宽 z 感受野。警告：子流表现为 k * z_spacing。
-    z_interleave_enabled: bool = False
-
-    # k 按物理 z 间距（mm）选择。thresholds 升序，factors 长度 = len(thresholds)+1（含 fallback）。
-    # 默认：z<=1.0 → k=3；1.0<z<=1.5 → k=2；z>1.5 → k=1。
-    z_interleave_thresholds: List[float] = field(
-        default_factory=lambda: [1.0, 1.5])
-    z_interleave_factors: List[int] = field(
-        default_factory=lambda: [3, 2, 1])
-
-    # 测试时自适应 BatchNorm (AdaBN)：推理阶段用目标域前向重估 BN running stats，
-    # 无需标签、不重训，针对跨数据集域漂移导致的假阳。仅当 model.norm_type=='batch'
-    # 时有效（instance/group norm 为 no-op）。
-    adabn_enabled: bool = False
-
-    # 'global'    — 用 adabn_num_volumes 卷目标域整卷预热一次 BN 统计，全程复用。
-    # 'per_volume'— 每卷推理前用该卷自身重估 BN，再冻结预测（transductive BN）。
-    adabn_mode: str = "global"
-
-    # global 模式预热用的目标域整卷数；per_volume 模式忽略。
-    adabn_num_volumes: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +428,6 @@ class Config:
     """顶层配置，聚合所有子配置。"""
 
     data   : DataConfig    = field(default_factory=DataConfig)
-    augment: AugConfig     = field(default_factory=AugConfig)
     model  : ModelConfig   = field(default_factory=ModelConfig)
     loss   : LossConfig    = field(default_factory=LossConfig)
     train  : TrainConfig   = field(default_factory=TrainConfig)
@@ -757,10 +438,10 @@ class Config:
         """同步跨子配置的对应字段。
 
         所有"模型几何派生量"（``in_channels`` / ``spatial_dims``）由
-        ``segtask_v1.models.topology.build_topology(self)`` 一次性算出，写入
+        ``gentask.models.topology.build_topology(self)`` 一次性算出，写入
         ``ModelConfig`` 的私有 backing 字段（对外是只读 property）。本方法仅保留
         "非派生"职责（``num_classes`` 推断、``z_boundary_mode`` 自动升级、resenc
-        preset、save_best 预设）。
+        preset）。
         """
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
@@ -793,35 +474,6 @@ class Config:
         self.model._spatial_dims = topo.spatial_dims
 
         self._apply_resenc_preset()
-        # 任务化预设（若启用）覆盖 (criterion, sd_tol, sd_w)；save_best_metric/mode
-        # 是 criterion 的派生只读 property，无需在此写回。
-        self._apply_save_best_preset()
-
-    def _apply_save_best_preset(self) -> None:
-        """``train.save_best_preset`` 非空时覆盖 (criterion, tolerance, weight)。
-
-        预设由 ``_SAVE_BEST_PRESETS`` 定义；空串表示不启用、保留用户显式设置。
-        非法预设名不在此处报错（避免 sync() 中产生 hard fail），由
-        ``validate()`` 给出可读错误。本方法仅做"已知则覆盖"。
-        """
-        name = str(self.train.save_best_preset or "").strip().lower()
-        if not name:
-            return
-        spec = _SAVE_BEST_PRESETS.get(name)
-        if spec is None:
-            return  # validate() 报错
-        tc = self.train
-        prev = (tc.save_best_criterion, tc.surface_dice_tolerance,
-                tc.surface_dice_weight)
-        tc.save_best_criterion    = str(spec["save_best_criterion"])
-        tc.surface_dice_tolerance = int(spec["surface_dice_tolerance"])
-        tc.surface_dice_weight    = float(spec["surface_dice_weight"])
-        new = (tc.save_best_criterion, tc.surface_dice_tolerance,
-               tc.surface_dice_weight)
-        if prev != new:
-            logger.info(
-                "save_best_preset=%r overrode (criterion, sd_tol, sd_w): "
-                "%s → %s.", name, prev, new)
 
     def _apply_resenc_preset(self) -> None:
         """将 model.resenc_preset 展开为逐级 block 数；用户显式传入优先。"""
@@ -857,7 +509,6 @@ class Config:
     def validate(self) -> None:
         """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。"""
         self._validate_model()
-        self._validate_augment()
         self._validate_loss()
         self._validate_data()
         self._validate_2_5d()
@@ -1069,40 +720,11 @@ class Config:
                     all(int(v) in (1, 2) for v in s),
                     f"downsample_strides values must be 1 or 2; got {list(s)}")
 
-    def _validate_augment(self) -> None:
-        """augment.* 校验。"""
-        _require(
-            self.augment.wmap_interp_mode in ("nearest", "bilinear"),
-            f"Invalid augment.wmap_interp_mode: {self.augment.wmap_interp_mode!r} "
-            "(expected 'nearest' or 'bilinear').")
-
     def _validate_loss(self) -> None:
-        """loss.* 名称与参数校验。"""
+        """loss.* 校验。"""
         _require(
-            self.loss.name in (
-            # 单损失
-            "dice", "bce", "focal", "tversky",
-            "gdl", "focal_tversky", "lovasz", "cldice",
-            # 复合损失
-            "dice_bce", "dice_focal", "dice_tversky",
-            "focal_plus_tversky", "dice_cldice", "dice_focal_tversky",
-            "dice_lovasz", "bce_lovasz",
-            "gdl_bce", "gdl_focal",
-        ),
-            f"Invalid loss: {self.loss.name}")
-        _require(
-            self.loss.gdl_weight_type in ("square", "simple", "uniform"),
-            f"Invalid gdl_weight_type: {self.loss.gdl_weight_type}")
-        _require(
-            self.loss.focal_tversky_gamma > 0,
-            f"focal_tversky_gamma must be > 0, got {self.loss.focal_tversky_gamma}")
-        _require(
-            self.loss.cldice_iter >= 1,
-            f"cldice_iter must be >= 1, got {self.loss.cldice_iter}")
-        _require(
-            self.loss.slice_loss_reduction in ("per_slice", "per_volume"),
-            f"Invalid slice_loss_reduction: {self.loss.slice_loss_reduction!r}; "
-            "expected 'per_slice' or 'per_volume'.")
+            all(w >= 0 for w in self.loss.deep_supervision_weights),
+            f"Invalid deep_supervision_weights: {self.loss.deep_supervision_weights}")
 
     def _validate_data(self) -> None:
         """data.* patch/multi-res/keep_native 校验。"""
@@ -1117,12 +739,9 @@ class Config:
             f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
             "expected 'stretch' or 'edge_pad'.")
         if self.data.patch_mode == "whole":
-            # whole 模式下多分辨率无物理意义。
             _require(
-                len(self.data.multi_res_scales) == 1 \
-                and self.data.multi_res_scales[0] == 1.0,
+                len(self.data.multi_res_scales) == 1 and self.data.multi_res_scales[0] == 1.0,
                 f"whole-volume mode requires multi_res_scales=[1.0]; got {self.data.multi_res_scales}.")
-        # keep_native_view_depth：仅 2.5D + 多视图有意义。
         if self.data.keep_native_view_depth:
             _require(
                 self.data.patch_mode == "2_5d",
@@ -1131,13 +750,11 @@ class Config:
                 len(self.data.multi_res_scales) > 1,
                 "data.keep_native_view_depth=True requires len(multi_res_scales) > 1; "
                 f"got {self.data.multi_res_scales}.")
-
-        # keep_native_multi_res：keep_native_view_depth 的 3D 对应，dataset 发单 cube 后由 trainer 逐视图几何处理。
         if self.data.keep_native_multi_res:
             _require(
                 self.data.patch_mode in ("z_axis", "cubic"),
                 "data.keep_native_multi_res=True requires patch_mode in "
-                f"('z_axis','cubic'); got {self.data.patch_mode!r}. Use "
+                "('z_axis','cubic'); got " + repr(self.data.patch_mode) + ". Use "
                 "data.keep_native_view_depth for the 2.5D analogue.")
             _require(
                 len(self.data.multi_res_scales) > 1,
@@ -1155,7 +772,6 @@ class Config:
                     self.data.z_boundary_mode == "edge_pad",
                     "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
                     f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
-
         _require(
             self.data.aug_oversample_ratio >= 1.0,
             "aug_oversample_ratio must be >= 1.0")
@@ -1169,7 +785,6 @@ class Config:
     def _validate_2_5d(self) -> None:
         """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。"""
         if self.data.patch_mode == "2_5d":
-            # 2.5D 不变式重检（防手改后陈旧配置）。
             _require(
                 len(self.data.multi_res_scales) >= 1,
                 "2.5D mode requires at least one entry in multi_res_scales.")
@@ -1180,7 +795,6 @@ class Config:
             n_views = len(self.data.multi_res_scales)
             lift = bool(self.model.lift_2_5d_to_3d)
             if lift:
-                # lift：D 保留为空间轴（真 3D UNet），与折叠-D 布局互斥。
                 _require(
                     self.model.spatial_dims == 3,
                     "lift_2_5d_to_3d=True requires model.spatial_dims=3 (auto-set by sync()).")
@@ -1191,7 +805,6 @@ class Config:
                 _require(
                     not self.data.keep_native_view_depth,
                     "lift_2_5d_to_3d and keep_native_view_depth are mutually exclusive.")
-                # 几何约束：D 需 % 2**(n_levels-1) == 0，且 >= 2**(n_levels-1)。
                 n_levels = len(self.model.encoder_channels)
                 D = int(self.data.patch_size[0])
                 req = 1 << (n_levels - 1)
@@ -1207,59 +820,19 @@ class Config:
                     "For Plan A 3D lift, set model.lift_2_5d_to_3d=True.")
             if (not lift) and self.data.keep_native_view_depth and n_views > 1:
                 depths = self.per_view_depths
-                expected_in = int(sum(depths))
                 _require(
-                    self.model.in_channels == expected_in,
-                    f"2.5D + keep_native_view_depth=True requires in_channels == sum(D_k) = "
-                    f"sum({depths}) = {expected_in}; got {self.model.in_channels}.")
+                    len(depths) == n_views,
+                    f"per_view_depths length must equal n_views ({n_views}); got {len(depths)}.")
                 _require(
-                    self.data.z_boundary_mode == "edge_pad",
-                    f"keep_native_view_depth=True requires z_boundary_mode='edge_pad'; "
-                    f"got {self.data.z_boundary_mode!r}.")
-                # 辅视图提供额外输入却无监督信号不合理。
+                    depths[0] == self.data.patch_size[0],
+                    f"per_view_depths[0] must equal patch_size[0]={self.data.patch_size[0]}; got {depths[0]}.")
                 _require(
-                    self.model.aux_seg_supervision,
-                    "keep_native_view_depth=True requires model.aux_seg_supervision=True "
-                    "(each native-depth view k drives an aux head).")
-            elif not lift:
-                expected_in = int(self.data.patch_size[0]) * n_views
-                _require(
-                    self.model.in_channels == expected_in,
-                    f"2.5D requires in_channels == patch_size[0] * n_views = "
-                    f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
-                    f"got {self.model.in_channels}.")
-            # Plan C：aux view k 注入 encoder 第 k 级。
-            if self.model.stem_fusion_mode == "hierarchical" and n_views > 1:
-                n_stages = len(self.model.encoder_channels)
-                _require(
-                    n_views <= n_stages,
-                    f"stem_fusion_mode='hierarchical' requires n_views <= n_stages; "
-                    f"got n_views={n_views}, n_stages={n_stages}.")
-                stem_stride_map = {
-                    "conv3": 1, "conv7": 1, "dual": 1,
-                    "patch2": 2, "patch4": 4,
-                }
-                s0 = stem_stride_map[self.model.stem_mode]
-                deepest = s0 * (2 ** (n_views - 1))
-                pH, pW = int(self.data.patch_size[1]), int(self.data.patch_size[2])
-                _require(
-                    pH % deepest == 0 and pW % deepest == 0,
-                    f"hierarchical fusion with n_views={n_views}, stem_mode={self.model.stem_mode!r} "
-                    f"requires patch H/W divisible by {deepest}; got ({pH}, {pW}).")
-            # aux 监督：仅在 n_views > 1 时有意义。
+                    self.model.in_ch_per_view_list is not None,
+                    "keep_native_view_depth=True requires in_ch_per_view_list to be set by sync().")
             if self.model.aux_seg_supervision:
                 _require(
                     n_views > 1,
                     "aux_seg_supervision=True requires n_views > 1; got 1.")
-                aw = list(self.loss.aux_supervision_weights)
-                if aw:
-                    _require(
-                        len(aw) == n_views - 1,
-                        f"aux_supervision_weights length must = n_views-1 ({n_views-1}); got {aw}.")
-                    _require(
-                        all(w >= 0 for w in aw),
-                        f"aux_supervision_weights must be non-negative; got {aw}.")
-                # Plan C 需 n_views < n_levels，使每 aux 头走不同 decoder 特征。
                 if self.model.stem_fusion_mode == "hierarchical":
                     n_levels = len(self.model.encoder_channels)
                     _require(
@@ -1268,7 +841,7 @@ class Config:
                         f"got n_views={n_views}, n_levels={n_levels}.")
 
     def _validate_train(self) -> None:
-        """train.* 优化器/调度器/选模标准校验。"""
+        """train.* 优化器/调度器校验。"""
         _require(
             self.train.optimizer in ("adam", "adamw", "sgd"),
             f"Invalid optimizer: {self.train.optimizer}")
@@ -1277,86 +850,12 @@ class Config:
             "cosine", "cosine_warm_restarts", "poly", "step", "plateau", "one_cycle",
         ),
             f"Invalid scheduler: {self.train.scheduler}")
-        # save_best_mode/metric 现为 criterion 的派生只读量（恒合法），无需单独校验。
-        _require(
-            _norm_crit(self.train.save_best_criterion) in _CRITERION_TO_METRIC,
-            f"Invalid save_best_criterion: {self.train.save_best_criterion!r}; "
-            f"expected one of: {' | '.join(repr(c) for c in _CRITERION_TO_METRIC)}.")
-        _require(
-            str(self.train.val_metric_mode).lower().strip() in ("medium", "high"),
-            f"Invalid val_metric_mode: {self.train.val_metric_mode!r}; "
-            "expected 'medium' (patch-level) or 'high' (full-volume).")
-        # high 模式在整卷 blended 概率上算指标，无可逆 logits 故不产出 val_loss；
-        # 因此 'loss' criterion 与 high 互斥（否则永远选不出 best）。改用重叠类指标。
-        if (str(self.train.val_metric_mode).lower().strip() == "high"
-                and _norm_crit(self.train.save_best_criterion) == "loss"):
-            raise ConfigError(
-                "train.save_best_criterion='loss' is incompatible with "
-                "train.val_metric_mode='high' (full-volume inference produces "
-                "blended probabilities, not invertible logits, so no val_loss "
-                "is computed). Use an overlap-based criterion "
-                "(dice / iou / mcc / min_dice / dice+surface_dice / balanced) "
-                "or switch val_metric_mode to 'medium'.")
-        # save_best_preset 空串 = 不启用；非空必须是已知预设名。
-        preset = str(self.train.save_best_preset or "").strip().lower()
-        if preset:
-            _require(
-                preset in _SAVE_BEST_PRESETS,
-                f"Invalid save_best_preset: {self.train.save_best_preset!r}; "
-                f"expected '' (disabled) or one of: "
-                f"{' | '.join(repr(k) for k in _SAVE_BEST_PRESETS)}.")
-        _require(
-            int(self.train.surface_dice_tolerance) >= 0,
-            f"surface_dice_tolerance must be >= 0; got {self.train.surface_dice_tolerance}")
-        _require(
-            0.0 <= float(self.train.surface_dice_weight) <= 1.0,
-            f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}")
 
     def _validate_predict(self) -> None:
-        """predict.* z 交错与 AdaBN 校验。"""
-        # z 轴交错推理检查（仅启用时）。
-        if self.predict.z_interleave_enabled:
-            _require(
-                self.data.patch_mode == "2_5d",
-                f"predict.z_interleave_enabled=True requires patch_mode='2_5d'; "
-                f"got {self.data.patch_mode!r}.")
-            thr = self.predict.z_interleave_thresholds
-            fac = self.predict.z_interleave_factors
-            _require(
-                len(fac) == len(thr) + 1,
-                f"z_interleave_factors length must = len(thresholds)+1; "
-                f"got thresholds={thr}, factors={fac}.")
-            _require(
-                all(t > 0 for t in thr),
-                f"z_interleave_thresholds must all > 0; got {thr}.")
-            _require(
-                thr == sorted(thr),
-                f"z_interleave_thresholds must be ascending; got {thr}.")
-            _require(
-                all(int(f) >= 1 for f in fac),
-                f"z_interleave_factors must all >= 1; got {fac}.")
-            # stretch 会拉伸短子流、冲淡交错收益，仅警告。
-            if self.data.z_boundary_mode != "edge_pad":
-                logger.warning(
-                    "z_interleave_enabled=True with z_boundary_mode=%r: "
-                    "short sub-streams will be stretched along z. Prefer 'edge_pad'.",
-                    self.data.z_boundary_mode)
-        # 测试时自适应 BatchNorm 检查（仅启用时）。
-        if self.predict.adabn_enabled:
-            _require(
-                self.predict.adabn_mode in ("global", "per_volume"),
-                f"predict.adabn_mode must be 'global' or 'per_volume'; "
-                f"got {self.predict.adabn_mode!r}.")
-            _require(
-                int(self.predict.adabn_num_volumes) >= 1,
-                f"predict.adabn_num_volumes must be >= 1; "
-                f"got {self.predict.adabn_num_volumes}.")
-            # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
-            if self.model.norm_type != "batch":
-                logger.warning(
-                    "predict.adabn_enabled=True but model.norm_type=%r != "
-                    "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
-                    self.model.norm_type)
+        """predict.* 校验。"""
+        _require(
+            bool(self.predict.output_dir),
+            "predict.output_dir must be non-empty.")
 
 
     @property
@@ -1373,8 +872,8 @@ class Config:
     def num_fg_classes(self) -> int:
         """Number of foreground classes (excluding background).
 
-        生成任务下没有"前景类"概念，复用该接口返回 ``out_channels``，使依赖它
-        推导输出通道数的下游（模型头 / 2.5D SliceChannel 重塑）保持统一口径。
+        Generation reuses this shared API to mean ``task.out_channels`` so the
+        topology layer and model heads can stay uniform across modes.
         """
         if self.is_generation:
             return int(self.task.out_channels)
@@ -1396,7 +895,6 @@ class Config:
 # ---------------------------------------------------------------------------
 _SUB_CONFIGS = {
     "data": DataConfig,
-    "augment": AugConfig,
     "model": ModelConfig,
     "loss": LossConfig,
     "train": TrainConfig,
@@ -1417,14 +915,11 @@ _FIELD_ALIASES: Dict[type, Dict[str, str]] = {
 
 # 旧 YAML 中曾可手设、现已改为派生只读量的字段：读到时静默忽略（仅一次 info 提示），
 # 而非按 "Unknown config key" 处理。TODO #4：派生量不再暴露可写接口。
-#   train.save_best_metric / save_best_mode → 由 train.save_best_criterion 派生。
+# 旧 YAML 中曾可手设、现已改为派生只读量的字段：读到时静默忽略（仅一次 info 提示），
+# 而非按 "Unknown config key" 处理。TODO #4：派生量不再暴露可写接口。
 #   model.in_channels / spatial_dims        → 由 patch_mode/multi_res_scales 等派生
 #                                             （sync() 经 build_topology 算出）。
 _DEPRECATED_DERIVED_KEYS: Dict[type, Dict[str, str]] = {
-    TrainConfig: {
-        "save_best_metric": "save_best_criterion",
-        "save_best_mode":   "save_best_criterion",
-    },
     ModelConfig: {
         "in_channels":  "data.patch_mode / data.multi_res_scales",
         "spatial_dims": "data.patch_mode",

@@ -60,10 +60,8 @@ def build_scheduler(
         return torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=milestones, gamma=tc.step_gamma)
     elif tc.scheduler == "plateau":
-        # mode 跟随 save_best_mode。
-        plateau_mode = tc.save_best_mode if tc.save_best_mode in ("max", "min") else "max"
         return torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode=plateau_mode, patience=tc.plateau_patience,
+            optimizer, mode="max", patience=tc.plateau_patience,
             factor=tc.plateau_factor)
     elif tc.scheduler == "cosine_warm_restarts":
         T_0 = tc.cosine_restart_period * steps_per_epoch
