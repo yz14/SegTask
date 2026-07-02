@@ -91,11 +91,11 @@ SegTask/
 │   ├── __main__.py                    # 让 `python -m segtask_v1` 直接跑训练
 │   ├── train.py                       # 训练 CLI（YAML + --override）
 │   ├── predict.py                     # 推理 CLI（单文件/目录、可选 bbox 裁剪）
-│   ├── config.py                      # ~1450 行的全部 @dataclass 配置系统（§3.2）
+│   ├── config.py                      # ~1840 行的全部 @dataclass 配置系统（§3.2）
 │   ├── utils.py                       # AverageMeter / ModelEMA / Timer / Dice
 │   ├── trainer/                       # 训练循环（R1–R3 模块化包）
-│   │   ├── trainer.py                 # ~700 行 Trainer 类（控制流）
-│   │   ├── pipelines/                 # ViewPipeline 策略 + 5 个具体实现
+│   │   ├── trainer.py                 # ~1000 行 Trainer 类（控制流）
+│   │   ├── pipelines/                 # ViewPipeline 策略 + 7 个具体实现
 │   │   ├── views.py / optim.py / amp.py / memory.py / breakdown.py / checkpoint.py
 │   ├── predictor/                     # 滑动窗口推理（R6 模块化包）
 │   │   ├── predictor.py               # ~450 行 Predictor 类（shim + 入口）
@@ -108,7 +108,7 @@ SegTask/
 │   │   ├── __init__.py
 │   │   ├── dataset.py                 # 3 个 Dataset + 所有 IO / patch / bbox / npz 工具
 │   │   ├── specs.py                   # DatasetSpec 策略对象（R4 引入）：模式选 dataset 类
-│   │   ├── loader.py                  # 发现-匹配-切分-build_dataloaders（已瘦身到 ~530 行）
+│   │   ├── loader.py                  # 发现-匹配-切分-build_dataloaders（~790 行）
 │   │   ├── augment.py                 # GPUAugmentor（共享 warp，多 FOV 安全）
 │   │   └── make_data.py               # 一次性把 NIfTI 打包成 bbox-cropped npz
 │   ├── models/                        # 网络结构（§3.5）
@@ -125,7 +125,7 @@ SegTask/
 │   │   └── factory.py                 # 从 Config 装配 Encoder/Decoder/UNet3D（读 topology）
 │   ├── losses/                        # 损失函数（§3.6）
 │   │   ├── __init__.py
-│   │   └── losses.py                  # ~1270 行：基础 loss × wrapper × build_loss 工厂
+│   │   └── losses.py                  # ~1040 行：基础 loss × wrapper × build_loss 工厂
 │   ├── visualization/                 # 全流程可视化分析工具（§3.9，vis.enabled 守卫）
 │   │   ├── __init__.py                # generate_visualization 入口：构建三视图 → 自包含 HTML
 │   │   ├── graph.py                   # IR：VisNode / VisEdge / VisGraph（与渲染解耦）
@@ -321,7 +321,7 @@ segtask_v1/
 
 ### 3.2 `config.py` —— dataclass + YAML 配置系统
 
-~1450 行，6 个 `@dataclass` + 顶层装配 + `sync()` / `validate()` / `load_config()` / `save_config()`：
+~1840 行，6 个 `@dataclass` + 顶层装配 + `sync()` / `validate()` / `load_config()` / `save_config()`：
 
 ```text
 config.py
@@ -383,7 +383,7 @@ segtask_v1/data/
 └── make_data.py      # 离线把 NIfTI 烘焙成 bbox-cropped npz（多进程）
 ```
 
-**`dataset.py`**（~2230 行）按职责分块：
+**`dataset.py`**（~1020 行）按职责分块：
 
 - *NIfTI IO（带退避重试）*
   - `_sitk_read_with_retry(read_callable, path)`：bounded 指数退避重试 `SimpleITK ReadImage`；对内存型错误（`bad allocation`）立即转抛 `MemoryError` 不重试。环境变量 `SEGTASK_NIFTI_READ_RETRIES` / `SEGTASK_NIFTI_READ_BACKOFF_S` 可调。
@@ -512,7 +512,7 @@ segtask_v1/models/
 ### 3.6 `losses/` —— 二元 sigmoid 损失库 + 多分辨率/2.5D 包装器
 
 ```text
-segtask_v1/losses/losses.py    # 全部损失都在这里，~1270 行
+segtask_v1/losses/losses.py    # 全部损失都在这里，~1040 行
 ```
 
 公共契约：`pred / target` 都是 `(B, num_fg, *spatial)` 的 per-class 独立 sigmoid（背景不预测）；可选 `weight_map: (B, 1, *spatial)` 广播到所有类。
@@ -579,11 +579,11 @@ segtask_v1/trainer/
 segtask_v1/predictor/
 ├── __init__.py        # 完整 re-export（外部 API 100% 兼容）
 ├── predictor.py       # ~450 行：Predictor 类外壳 + __init__（topology 化）+ predict_volume 入口 + thin shims
-├── sliding.py         # ~280 行：whole / z / z_interleave / cubic 四种主循环
-├── inputs.py          # ~240 行：6 个 window/batch builders + 共享 padding helper
-├── forwards.py        # ~270 行：3 种 forward（3D / 2.5D folded / 2.5D lift）+ 2 种 TTA + diag
-├── blending.py        # ~100 行：compute_1d_positions / build_*_weight / prob_to_label（纯 numpy）
-└── io.py              # ~145 行：run_inference + checkpoint helpers + precision resolution
+├── sliding.py         # ~370 行：whole / z / z_interleave / cubic 四种主循环
+├── inputs.py          # ~300 行：6 个 window/batch builders + 共享 padding helper
+├── forwards.py        # ~350 行：3 种 forward（3D / 2.5D folded / 2.5D lift）+ 2 种 TTA + diag
+├── blending.py        # ~130 行：compute_1d_positions / build_*_weight / prob_to_label（纯 numpy）
+└── io.py              # ~220 行：run_inference + checkpoint helpers + precision resolution
 
 Predictor                # 滑窗推理器（外壳；__init__ 读 ModelTopology 消除 ~80 行 R5 单一真相源违反）
 ├── predict_volume       # 顶层入口：load → bbox → preprocess → dispatch → blend → label_map
