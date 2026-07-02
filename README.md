@@ -869,6 +869,10 @@ predict.py
   - **退化采样方式** `sr_sampling`：`blur`（SISR，默认）降采样再上采样造成同尺寸模糊；`decimate`（**VFI 插帧**）沿退化轴抽稀保留帧再线性插值填回原尺寸。见 `configs/gensr_3d_zaxis_vfi.yaml`。
 - **损失** `losses/recon.py`：`ReconstructionLoss`（Charbonnier / L1 / MSE + 可选 (1−SSIM) + 梯度 L1）用于回归；`DiffusionLoss`（逐样本加权 MSE）用于扩散；`psnr` / `ssim` 作验证指标。
 - **深监督（回归）** `model.deep_supervision=true`：复用 backbone 的多尺度解码头，`GenerationTrainer` 对每个尺度与下采样后的 HR 算重建损失、按 `loss.deep_supervision_weights` 加权聚合。仅 `algorithm=regression` 支持。
+- **生成专属适配特性**：
+  - **重要性图加权**：`data.region_weight_dir` / `data.region_weight_suffix` 指向预计算的 per-voxel importance map（label-independent，读入后做 `+1` offset），`make_data` 会随样本一起打包成 `npz` 中的 `weight`/`weight_map`，训练时进入 `ReconstructionLoss`；若同时配置 `data.region_weights`（按标签的旧路径），该重要性图优先生效。
+  - **多视图辅助重建**：`model.aux_seg_supervision=true` 保留旧 YAML 键名，但当前语义为“辅助重建监督”。仅在 `patch_mode="2_5d"` 且 `len(data.multi_res_scales)>1` 时启用；`multi_res_scales` 必须全部 `>= 1.0`（例如 `[1.0, 2.0]`，辅助视图是更大物理 FOV）。`loss.aux_recon_weights` 可按辅助视图显式赋权，空列表则自动回退到 `0.5^k`。主头重建 view 0，aux 头按 view 1..n-1 对应各自 HR 视图。
+  - **辅助输入条件**：`data.cond_dirs` / `data.cond_suffixes` / `data.cond_normalize` / `data.cond_intensity_*` / `data.cond_global_*` 指定与图像严格配准的外部条件体（mask / 其他模态 / 预分割等）；条件体不做退化，直接作为独立融合流拼接到模型输入。当前支持单视图回归、单视图 2.5D、扩散，以及多视图 Plan A；`2.5D-lift + cond` 仍保留为未支持并带有明确报错。
 - **条件 backbone**：ADM/EDM2 的 timestep/σ 条件在扩散路径按论文忠实复原；非扩散路径（`emb_channels==0`）条件分支整体跳过，行为不变。
 - **扩散框架** `models/diffusion.py`：`EDMDiffusion`（去噪预条件 + Heun 二阶采样）与 `DDPMDiffusion`（ε-预测 + 祖先/DDIM 采样）。
 - **统一模型接口** `models/generation.py`：`forward(hr)` 在线退化并返回训练三元组；`restore(lr)` 出图；`degrade(hr)` 供验证。`models/factory.build_model` 在 `cfg.is_generation` 时分派至此。
@@ -891,10 +895,10 @@ python -m gentask.predict --config configs/gensr_2_5d_regression.yaml \
     --checkpoint outputs/gensr_regression/best_model.pth --input /path/to/lr_imgs
 ```
 
-注意：生成任务忽略分割标签（训练目标是干净图自身），但 dataloader 仍需 `label_dir`；当前仅支持 `task.out_channels==1`（CT 灰度）与单视图（`multi_res_scales=[1.0]`）。
+注意：生成任务忽略分割标签（训练目标是干净图自身），但 dataloader 仍需 `label_dir`；`task.out_channels==1`（CT 灰度）仍是当前约束，其他几何/条件特性按各自配置项启用。
 
 ### 10.3 配置与测试
 
-- 示例配置：`configs/gensr_2_5d_regression.yaml`、`configs/gensr_3d_zaxis_regression.yaml`、`configs/gensr_3d_zaxis_vfi.yaml`、`configs/gensr_2_5d_diffusion_adm.yaml`。
+- 示例配置：`configs/gensr_2_5d_regression.yaml`、`configs/gensr_3d_zaxis_regression.yaml`、`configs/gensr_3d_zaxis_vfi.yaml`、`configs/gensr_2_5d_diffusion_adm.yaml`、`configs/gensr_3d_zaxis_region_weight.yaml`、`configs/gensr_2_5d_multiview_aux.yaml`、`configs/gensr_3d_zaxis_cond.yaml`。
 - 冒烟测试：`python tests/test_generation_smoke.py`。
 - 真实训练效果（收敛、PSNR/SSIM 提升）需在本机带数据与 GPU 跑。
