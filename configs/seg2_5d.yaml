@@ -249,7 +249,7 @@ train:
   save_every      : 10
 
   # ===== 选模标准（挑 best_model.pth 的依据）=====
-  # save_best_criterion：主开关，覆盖下方 save_best_metric/save_best_mode。可选：
+  # save_best_criterion：主开关；save_best_metric/save_best_mode 只是由它派生的只读量。
   #   'loss'              — val_loss ↓。最通用但对边界/碎点不敏感。
   #   'dice'              — mean_dice ↑（各前景类等权均值）。大器官易饱和。
   #   'iou'               — mean_iou ↑（Jaccard，比 dice 对边界更严格）。

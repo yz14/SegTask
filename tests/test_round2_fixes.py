@@ -69,13 +69,13 @@ def _build_tiny_unet(num_fg: int, deep_supervision: bool = False) -> UNet3D:
     ch = [8, 16, 32]
     stage_builder = partial(
         ResNetStage, num_blocks=1, norm_type="instance",
-        norm_groups=8, activation="leakyrelu", dropout=0.0, use_se=False)
+        norm_groups=8, activation="leakyrelu", dropout=0.0, attention_type="none")
     enc = Encoder(
         in_channels=1, stage_channels=ch, stage_builder=stage_builder,
         norm_type="instance", norm_groups=8, activation="leakyrelu")
     dec = Decoder(encoder_channels=ch, stage_builder=stage_builder,
                   upsample_mode="transpose", skip_mode="cat")
-    return UNet3D(enc, dec, num_fg_classes=num_fg,
+    return UNet3D(enc, dec, out_channels=num_fg,
                   deep_supervision=deep_supervision)
 
 
@@ -143,13 +143,13 @@ def test_bug2_ds_output_order():
     ch = [8, 16, 32, 64]
     stage_builder = partial(
         ResNetStage, num_blocks=1, norm_type="instance",
-        norm_groups=8, activation="leakyrelu", dropout=0.0, use_se=False)
+        norm_groups=8, activation="leakyrelu", dropout=0.0, attention_type="none")
     enc = Encoder(
         in_channels=1, stage_channels=ch, stage_builder=stage_builder,
         norm_type="instance", norm_groups=8, activation="leakyrelu")
     dec = Decoder(encoder_channels=ch, stage_builder=stage_builder,
                   upsample_mode="transpose", skip_mode="cat")
-    model = UNet3D(enc, dec, num_fg_classes=2, deep_supervision=True).train()
+    model = UNet3D(enc, dec, out_channels=2, deep_supervision=True).train()
 
     x = torch.randn(1, 1, 16, 32, 32)
     outs = model(x)

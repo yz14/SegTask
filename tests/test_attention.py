@@ -3,7 +3,7 @@
 Covers:
 - ECA3D, CBAM3D, CoordAttention3D, AttentionGate3D: shape + grad flow
 - make_attention factory: dispatch + unknown-name rejection
-- Legacy ``use_se`` still activates SE when ``attention_type='none'``
+- SE is selected explicitly with ``attention_type='se'``
 - Stage-level injection in ResNetStage and ConvNeXtStage
 - Skip-attention-gated UNet end-to-end forward
 - Config validation rejects unknown ``attention_type``
@@ -139,16 +139,15 @@ def test_convnext_stage_with_attention(attn):
     y.sum().backward()
 
 
-def test_legacy_use_se_still_works():
-    """use_se=True with attention_type='none' must still enable SE."""
+def test_attention_type_se_enables_se():
     from segtask_v1.models.resnet import ResNetBlock
-    blk = ResNetBlock(8, 8, use_se=True, attention_type="none")
+    blk = ResNetBlock(8, 8, attention_type="se")
     assert isinstance(blk.attn, SqueezeExcite3D)
 
 
-def test_explicit_attention_type_wins_over_use_se():
+def test_explicit_attention_type_chooses_requested_attention():
     from segtask_v1.models.resnet import ResNetBlock
-    blk = ResNetBlock(8, 8, use_se=True, attention_type="eca")
+    blk = ResNetBlock(8, 8, attention_type="eca")
     assert isinstance(blk.attn, ECA3D)
 
 
