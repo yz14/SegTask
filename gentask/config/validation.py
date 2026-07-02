@@ -374,10 +374,6 @@ class Config:
             "All multi_res_scales must be >= 1.0")
         if self.data.cond_dirs:
             _require(
-                len(self.data.multi_res_scales) == 1,
-                "data.cond_dirs is only supported for single-view configs "
-                "(len(data.multi_res_scales)==1); multi-view is not yet supported.")
-            _require(
                 self.data.cond_normalize in ("minmax", "zscore"),
                 f"Invalid data.cond_normalize: {self.data.cond_normalize!r}")
 

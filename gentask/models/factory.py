@@ -287,6 +287,7 @@ def _build_unet_backbone(cfg: Config):
     num_stem_fusion_views = topo.num_stem_fusion_views
     in_ch_per_view_list = topo.in_ch_per_view_list
     aux_head_out_channels = topo.aux_head_out_channels
+    cond_in_channels = topo.cond_in_channels
 
     enc_counts = _resolve_blocks_per_stage(
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
@@ -310,6 +311,7 @@ def _build_unet_backbone(cfg: Config):
         num_stem_fusion_views = num_stem_fusion_views,
         stem_fusion_mode      = mc.stem_fusion_mode,
         in_ch_per_view_list   = in_ch_per_view_list,
+        cond_in_channels      = cond_in_channels,
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides)
 

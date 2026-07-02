@@ -273,6 +273,34 @@ def _conditioning_cfg(mode: str):
     return cfg
 
 
+def _multi_view_conditioning_cfg(stem_fusion_mode: str):
+    cfg = Config()
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.num_classes = 2
+    cfg.data.label_values = [0, 1]
+    cfg.data.patch_size = [4, 16, 16]
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.data.z_boundary_mode = "edge_pad"
+    cfg.data.cond_dirs = ["/tmp/cond"]
+    cfg.data.cond_suffixes = ".nii.gz"
+    cfg.data.cond_normalize = "minmax"
+    cfg.data.cond_intensity_min = 0.0
+    cfg.data.cond_intensity_max = 1.0
+    cfg.model.arch = "unet"
+    cfg.model.stem_fusion_mode = stem_fusion_mode
+    cfg.model.encoder_channels = [16, 32, 48]
+    cfg.model.encoder_blocks_per_stage = [1, 1, 1]
+    cfg.model.aux_seg_supervision = True
+    cfg.task.type = "generation"
+    cfg.task.algorithm = "regression"
+    cfg.task.degradation = "superres"
+    cfg.task.out_channels = 1
+    cfg.task.sr_scale = 2
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
 def _diffusion_conditioning_cfg():
     cfg = Config()
     cfg.data.patch_mode = "2_5d"
@@ -439,17 +467,44 @@ def test_conditioning_2_5d_forward_and_trainer_step():
     assert tuple(rec.shape) == (2, 4, 16, 16)
 
 
-def test_conditioning_multi_view_is_rejected():
-    cfg = _conditioning_cfg("2_5d")
-    cfg.data.multi_res_scales = [1.0, 2.0]
-    cfg.data.z_boundary_mode = "edge_pad"
-    try:
-        cfg.sync()
-        cfg.validate()
-    except Exception as exc:
-        assert "not yet supported" in str(exc)
-    else:
-        raise AssertionError("multi-view conditioning should be rejected")
+def test_multi_view_conditioning_forward_backward_and_restore():
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    hr = torch.cat([
+        torch.zeros(1, 4, 16, 16),
+        torch.ones(1, 4, 16, 16),
+    ], dim=1)
+    cond = torch.full((1, 4, 16, 16), 2.0)
+    for stem_mode in ("multi_stem_proj", "hierarchical"):
+        cfg = _multi_view_conditioning_cfg(stem_mode)
+        model = build_model(cfg)
+        assert cfg.model.in_channels == 12
+        model.train()
+        out = model(hr, cond=cond)
+        assert set(out) >= {"pred", "ds_preds", "target", "aux_preds", "aux_targets"}
+        assert tuple(out["pred"].shape) == (1, 4, 16, 16)
+        assert tuple(out["target"].shape) == (1, 4, 16, 16)
+        assert len(out["aux_preds"]) == 1
+        assert len(out["aux_targets"]) == 1
+        assert tuple(out["aux_preds"][0].shape) == (1, 4, 16, 16)
+        assert tuple(out["aux_targets"][0].shape) == (1, 4, 16, 16)
+        assert torch.allclose(out["target"], hr[:, :4])
+        assert torch.allclose(out["aux_targets"][0], hr[:, 4:])
+
+        batch = {"image": hr, "label": torch.zeros(1, 1, 4, 16, 16), "cond": cond}
+        tr = GenerationTrainer(model, cfg, [batch], [batch], torch.device("cpu"))
+        breakdown = {}
+        loss = tr._step_loss(out, breakdown)
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert breakdown.get("L_aux", 0.0) > 0
+        assert any(p.grad is not None for p in model.parameters())
+
+        model.eval()
+        with torch.no_grad():
+            rec = model.restore(model.degrade(hr), cond=cond)
+        assert tuple(rec.shape) == tuple(out["pred"].shape)
 
 
 def test_diffusion_conditioning_forward_restore_and_backward():
@@ -780,7 +835,7 @@ def main() -> int:
         test_conditioning_disabled_is_noop,
         test_conditioning_3d_forward_and_trainer_step,
         test_conditioning_2_5d_forward_and_trainer_step,
-        test_conditioning_multi_view_is_rejected,
+        test_multi_view_conditioning_forward_backward_and_restore,
         test_diffusion_conditioning_forward_restore_and_backward,
         test_diffusion_no_cond_restore_unchanged,
         test_zaxis_sr_regression_3d_end_to_end,
