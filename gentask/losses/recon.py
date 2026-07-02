@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -26,15 +26,30 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # 逐像素回归损失
 # ---------------------------------------------------------------------------
+def _charbonnier_error(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-3) -> torch.Tensor:
+    return torch.sqrt((pred - target) ** 2 + eps * eps)
+
+
 def charbonnier(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
     """Charbonnier（平滑 L1）：sqrt((x-y)^2 + eps^2) 的均值。"""
-    return torch.sqrt((pred - target) ** 2 + eps * eps).mean()
+    return _charbonnier_error(pred, target, eps).mean()
+
+
+def _l1_error(pred: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
+    return (pred - target).abs()
+
+
+def _mse_error(pred: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
+    return (pred - target) ** 2
 
 
 _PIXEL_LOSSES = {
-    "l1": lambda p, t, eps: F.l1_loss(p, t),
-    "mse": lambda p, t, eps: F.mse_loss(p, t),
-    "charbonnier": lambda p, t, eps: charbonnier(p, t, eps),
+    "l1": _l1_error,
+    "mse": _mse_error,
+    "charbonnier": _charbonnier_error,
 }
 
 
@@ -52,6 +67,47 @@ def gradient_l1(pred: torch.Tensor, target: torch.Tensor, spatial_dims: int) -> 
     first_spatial = pred.ndim - spatial_dims
     for d in range(first_spatial, pred.ndim):
         total = total + F.l1_loss(_finite_diff(pred, d), _finite_diff(target, d))
+    return total / spatial_dims
+
+
+def _broadcast_weight(weight: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.broadcast_tensors(weight, ref)[0]
+    except RuntimeError as exc:  # pragma: no cover - defensive
+        raise ValueError(
+            f"weight must be broadcastable to {tuple(ref.shape)}, got "
+            f"{tuple(weight.shape)}") from exc
+
+
+def _weighted_mean(
+    err: torch.Tensor,
+    weight: Optional[torch.Tensor]) -> torch.Tensor:
+    if weight is None:
+        return err.mean()
+    w = _broadcast_weight(weight, err)
+    denom = w.sum()
+    if float(denom.item()) <= 0.0:
+        raise ValueError("weight must have positive sum.")
+    return (w * err).sum() / denom
+
+
+def _weighted_gradient_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    spatial_dims: int,
+    weight: Optional[torch.Tensor]) -> torch.Tensor:
+    if weight is None:
+        return gradient_l1(pred, target, spatial_dims)
+    total = pred.new_zeros(())
+    first_spatial = pred.ndim - spatial_dims
+    w = _broadcast_weight(weight, pred)
+    for d in range(first_spatial, pred.ndim):
+        p_diff = _finite_diff(pred, d)
+        t_diff = _finite_diff(target, d)
+        w_diff = 0.5 * (
+            w.narrow(d, 1, w.size(d) - 1) +
+            w.narrow(d, 0, w.size(d) - 1))
+        total = total + _weighted_mean((p_diff - t_diff).abs(), w_diff)
     return total / spatial_dims
 
 
@@ -144,14 +200,20 @@ class ReconstructionLoss(nn.Module):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        breakdown: Dict[str, float] = None) -> torch.Tensor:
+        breakdown: Dict[str, float] = None,
+        weight: Optional[torch.Tensor] = None) -> torch.Tensor:
         pred = pred.float()
         target = target.float()
-        pix = _PIXEL_LOSSES[self.pixel_loss](pred, target, self.charbonnier_eps)
+        weight = weight.float() if weight is not None else None
+        pix = _weighted_mean(
+            _PIXEL_LOSSES[self.pixel_loss](pred, target, self.charbonnier_eps),
+            weight)
         total = pix
         if breakdown is not None:
             breakdown["L_pixel"] = float(pix.detach().item())
         if self.ssim_weight > 0.0:
+            # SSIM is windowed over neighborhoods; there is no well-defined
+            # per-voxel weighting analogue, so keep it unweighted.
             s = ssim(pred, target, self.spatial_dims,
                      window_size=self.ssim_window, data_range=self.data_range)
             ssim_term = self.ssim_weight * (1.0 - s)
@@ -159,7 +221,7 @@ class ReconstructionLoss(nn.Module):
             if breakdown is not None:
                 breakdown["L_ssim"] = float(ssim_term.detach().item())
         if self.grad_weight > 0.0:
-            g = gradient_l1(pred, target, self.spatial_dims)
+            g = _weighted_gradient_l1(pred, target, self.spatial_dims, weight)
             grad_term = self.grad_weight * g
             total = total + grad_term
             if breakdown is not None:
