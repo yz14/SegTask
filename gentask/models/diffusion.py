@@ -95,13 +95,16 @@ class EDMDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(
-        self, cond: torch.Tensor, generator: Optional[torch.Generator] = None
-    ) -> torch.Tensor:
+        self,
+        cond: torch.Tensor,
+        target_channels: Optional[int] = None,
+        generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """从噪声出发、以 ``cond`` 为条件迭代去噪，返回复原 HR。"""
         sigmas = self._sigma_schedule(cond.device, cond.dtype)
+        ch = int(cond.shape[1] if target_channels is None else target_channels)
         x = torch.randn(
-            cond.shape, device=cond.device, dtype=cond.dtype,
-            generator=generator) * sigmas[0]
+            cond.shape[0], ch, *cond.shape[2:], device=cond.device,
+            dtype=cond.dtype, generator=generator) * sigmas[0]
         deterministic_euler = self.sampler == "ddim"
         for i in range(self.sample_steps):
             s = sigmas[i]
@@ -178,15 +181,20 @@ class DDPMDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(
-        self, cond: torch.Tensor, generator: Optional[torch.Generator] = None
-    ) -> torch.Tensor:
+        self,
+        cond: torch.Tensor,
+        target_channels: Optional[int] = None,
+        generator: Optional[torch.Generator] = None) -> torch.Tensor:
         """以 ``cond`` 为条件，从 x_T~N(0,I) 反向去噪。支持祖先 / DDIM。"""
         device, dtype = cond.device, cond.dtype
+        ch = int(cond.shape[1] if target_channels is None else target_channels)
         # 子序列时间步（均匀间隔）。
         steps = torch.linspace(
             self.num_train_timesteps - 1, 0, self.sample_steps,
             device=device).round().long()
-        x = torch.randn(cond.shape, device=device, dtype=dtype, generator=generator)
+        x = torch.randn(
+            cond.shape[0], ch, *cond.shape[2:], device=device, dtype=dtype,
+            generator=generator)
         ddim = self.sampler == "ddim"
         for i, t in enumerate(steps):
             acp_t = self.alphas_cumprod[t]
