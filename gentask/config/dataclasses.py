@@ -45,11 +45,13 @@ class DataConfig:
     bbox_dir   : str = ""
     bbox_suffix: Union[str, List[str]] = ".nii.gz"
 
-    # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > data.region_weights。
+    # 可选逐样本体素重要性图目录（值 + 1）。预计算、与标签无关；生成任务可直接
+    # 作为 batch["weight_map"] 使用。优先级：此目录 > data.region_weights。
     region_weight_dir   : str = ""
     region_weight_suffix: Union[str, List[str]] = ".nii.gz"
 
-    # 静态区域权重（值 +1）；空表示不启用。优先级低于 region_weight_dir。
+    # 静态按标签区域权重（值 + 1）；仅适用于基于标签的旧路径，生成任务不使用。
+    # 空表示不启用。优先级低于 region_weight_dir。
     region_weights: List[float] = field(default_factory=list)
 
     # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。

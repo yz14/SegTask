@@ -376,6 +376,95 @@ def _loader(D, n=2, B=2):
              "label": torch.zeros(B, 1, D, 16, 16)} for _ in range(n)]
 
 
+def _trainer(cfg):
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    if cfg.data.patch_mode == "2_5d":
+        image = torch.zeros(1, cfg.data.patch_size[0], 16, 16)
+        label = torch.zeros(1, 1, cfg.data.patch_size[0], 16, 16)
+    else:
+        image = torch.zeros(1, 1, cfg.data.patch_size[0], 16, 16)
+        label = torch.zeros(1, 1, cfg.data.patch_size[0], 16, 16)
+    loader = [{"image": image, "label": label}]
+    model = build_model(cfg)
+    return GenerationTrainer(model, cfg, loader, loader, torch.device("cpu"))
+
+
+def _high_error_patch_2d():
+    pred = torch.zeros(1, 4, 8, 8)
+    target = torch.zeros_like(pred)
+    target[:, :, :2, :2] = 1.0
+    return pred, target
+
+
+def _high_error_volume_3d():
+    pred = torch.zeros(1, 1, 8, 8, 8)
+    target = torch.zeros_like(pred)
+    target[:, :, :2, :2, :2] = 1.0
+    return pred, target
+
+
+def test_weighted_recon_loss_uniform_matches_unweighted():
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.task.recon_loss = "l1"
+    tr = _trainer(cfg)
+    pred, target = _high_error_patch_2d()
+    out = {"pred": pred, "target": target}
+    w_uniform = torch.ones(1, 1, 4, 8, 8)
+    loss_u = tr._step_loss(out, {}, weight_map=None).item()
+    loss_w = tr._step_loss(out, {}, weight_map=w_uniform).item()
+    assert np.isclose(loss_u, loss_w, rtol=0, atol=1e-6), (loss_u, loss_w)
+
+
+def test_weighted_recon_loss_nonuniform_increases_with_error_region():
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.task.recon_loss = "l1"
+    tr = _trainer(cfg)
+    pred, target = _high_error_patch_2d()
+    out = {"pred": pred, "target": target}
+    w_uniform = torch.ones(1, 1, 4, 8, 8)
+    w_focus = torch.ones(1, 1, 4, 8, 8)
+    w_focus[:, :, :2, :2, :2] = 8.0
+    loss_u = tr._step_loss(out, {}, weight_map=w_uniform).item()
+    loss_f = tr._step_loss(out, {}, weight_map=w_focus).item()
+    assert loss_f > loss_u, (loss_u, loss_f)
+
+
+def test_weighted_ds_recon_loss_uniform_matches_unweighted():
+    cfg = _cfg("regression", arch="unet", mode="z_axis")
+    cfg.task.recon_loss = "l1"
+    cfg.model.deep_supervision = True
+    cfg.sync()
+    cfg.validate()
+    tr = _trainer(cfg)
+    pred, target = _high_error_volume_3d()
+    low = torch.zeros(1, 1, 4, 4, 4)
+    out = {"pred": pred, "ds_preds": [pred, low], "target": target}
+    w_uniform = torch.ones_like(pred)
+    loss_u = tr._step_loss(out, {}, weight_map=None).item()
+    loss_w = tr._step_loss(out, {}, weight_map=w_uniform).item()
+    assert np.isclose(loss_u, loss_w, rtol=0, atol=1e-6), (loss_u, loss_w)
+
+
+def test_weighted_ds_recon_loss_nonuniform_increases_with_error_region():
+    cfg = _cfg("regression", arch="unet", mode="z_axis")
+    cfg.task.recon_loss = "l1"
+    cfg.model.deep_supervision = True
+    cfg.sync()
+    cfg.validate()
+    tr = _trainer(cfg)
+    pred, target = _high_error_volume_3d()
+    low = torch.zeros(1, 1, 4, 4, 4)
+    out = {"pred": pred, "ds_preds": [pred, low], "target": target}
+    w_uniform = torch.ones_like(pred)
+    w_focus = torch.ones_like(pred)
+    w_focus[:, :, :2, :2, :2] = 8.0
+    loss_u = tr._step_loss(out, {}, weight_map=w_uniform).item()
+    loss_f = tr._step_loss(out, {}, weight_map=w_focus).item()
+    assert loss_f > loss_u, (loss_u, loss_f)
+
+
 def test_generation_trainer_runs():
     from gentask.models.factory import build_model
     from gentask.trainer.gen_trainer import GenerationTrainer
@@ -431,6 +520,10 @@ def main() -> int:
         test_diffusion_requires_adm_or_edm2,
         test_generation_trainer_runs,
         test_generation_predictor_restore_volume,
+        test_weighted_recon_loss_uniform_matches_unweighted,
+        test_weighted_recon_loss_nonuniform_increases_with_error_region,
+        test_weighted_ds_recon_loss_uniform_matches_unweighted,
+        test_weighted_ds_recon_loss_nonuniform_increases_with_error_region,
     ]
     for t in tests:
         try:
