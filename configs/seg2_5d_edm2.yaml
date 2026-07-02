@@ -7,7 +7,7 @@
 #   aux_seg_supervision (仅 Plan A) / deep_supervision 正交
 #
 # arch=='edm2' 时忽略: backbone/block_type/norm_type/activation/attention_type
-#   /use_se/decoder_type/unet3p_cat_channels/resenc_preset/skip_attention
+#   /decoder_type/unet3p_cat_channels/resenc_preset/skip_attention
 #   /skip_mode/upsample_mode/downsample_mode/drop_path_rate (论文固定)
 # 生效字段: data.*, encoder_channels/encoder_blocks_per_stage/decoder_blocks_per_stage,
 #   stem_fusion_mode, deep_supervision/aux_seg_supervision/aux_head_mode,
@@ -150,7 +150,7 @@ train:
 
   output_dir: "outputs/lung_bone_edm2"
   save_every: 10
-  # 选模标准：唯一接口；save_best_metric/mode 由此自动派生。
+  # 选模标准：唯一接口；save_best_criterion 仅为派生只读量。
   save_best_criterion: "dice"
 
   early_stopping: 15

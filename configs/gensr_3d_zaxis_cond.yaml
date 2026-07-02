@@ -1,0 +1,102 @@
+# 3D 厚层→薄层超分（生成任务）— z 轴各向异性回归复原 + 辅助输入条件体
+#
+# 该配置演示 data.cond_dirs / cond_suffixes / cond_normalize：
+#   - cond 体与 image 体需预先配准、同空间尺寸 / spacing / bbox
+#   - make_data 会按与 image 相同的 bbox 裁剪并打包到 npz 的 cond 键
+#   - dataloader 会返回 batch["cond"]，并在模型输入端与图像拼接
+# 这里用单个 mask 条件体作为示例（可替换为其他模态 / 预分割 / 先验图）。
+
+data:
+  image_suffix: ".nii.gz"
+  label_suffix: ".nii.gz"
+  cond_suffixes: ".nii.gz"
+
+  # 训练 / 推理目录（按本机修改）
+  image_dir: "F:/med_data/imgs"
+  label_dir: "F:/med_data/lbls"   # 生成任务忽略标签，但 loader 仍需该字段
+  cond_dirs: ["F:/med_data/cond_masks"]  # 示例：与图像严格对齐的条件体目录
+
+  label_values: [0, 1]
+  num_classes : 2
+
+  patch_size: [32, 256, 256]      # [D, H, W]
+  patch_mode: "z_axis"            # 沿 z 轴滑块，保留 x,y 全分辨率上下文
+
+  # 条件输入支持单视图；此处使用 3D 单视图回归。
+  multi_res_scales: [1.0]
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  # 条件体的归一化方式：
+  #   minmax → 使用 cond_intensity_min/max
+  #   zscore → 使用 cond_global_mean/std
+  cond_normalize    : "minmax"
+  cond_intensity_min: 0.0
+  cond_intensity_max: 1.0
+  # cond_global_mean: 0.0
+  # cond_global_std : 1.0
+
+  val_ratio : 0.2
+  split_seed: 42
+
+  batch_size : 2
+  num_workers: 4
+  pin_memory : true
+
+  samples_per_volume: 8
+  cache_mode: "memory"
+  cache_max_volumes: 1
+
+model:
+  arch: "unet"
+  backbone: "resnet"
+  encoder_channels: [32, 64, 128, 256]
+  encoder_blocks_per_stage: [2, 2, 2, 2]
+  decoder_type: "unet"
+
+
+# ---- 生成任务设置 ----
+task:
+  type: "generation"
+  algorithm: "regression"
+  degradation: "superres"
+  out_channels: 1
+
+  # 各向异性超分退化：仅 z 轴（D）2x，H,W 保持原分辨率。
+  # 顺序按空间轴 (D, H, W)；覆盖标量 sr_scale。
+  sr_scale_per_axis: [2, 1, 1]
+  sr_kernel: "area"              # area≈层厚范围内体素平均（部分容积效应）
+  sr_noise_std: 0.0
+
+  # 回归算法
+  residual: false
+  recon_loss: "charbonnier"
+  charbonnier_eps: 1.0e-3
+  ssim_weight: 0.1              # 0 关闭；>0 加 (1−SSIM) 辅助
+  grad_weight: 0.0
+
+train:
+  epochs: 100
+  optimizer   : "adamw"
+  lr          : 2.0e-4
+  weight_decay: 1.0e-4
+  scheduler: "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+  grad_clip_norm: 1.0
+  use_amp  : true
+  amp_dtype: "auto"
+  compile_mode: "none"
+  use_ema  : true
+  ema_decay: 0.999
+  output_dir: "outputs/gensr_zaxis_cond"
+  log_every: 20
+  seed: 42
+
+
+predict:
+  output_dir: "predictions_sr_zaxis_cond"

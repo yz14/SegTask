@@ -137,8 +137,6 @@ model:
   norm_groups: 8
   activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
   dropout    : 0.0
-
-  use_se        : false    # SE attn
   attention_type: "none"
   skip_attention: false
 
@@ -197,7 +195,7 @@ loss:
   name: "dice_focal"               # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
   compound_weights: [1.0, 1.0]
 
-  class_weights : [1.0, 1.0]       # 长度 = num_fg_classes (不含 bg)
+  class_weights : [1.0, 1.0]       # 长度 = 前景类数 (不含 bg)
   region_weights: [1.0, 4.0, 2.0]  # 按 label_values 全长 (含 bg)
 
   dice_smooth : 1.0e-5
@@ -249,7 +247,7 @@ train:
   save_every      : 10
 
   # ===== 选模标准（挑 best_model.pth 的依据）=====
-  # save_best_criterion：主开关，覆盖下方 save_best_metric/save_best_mode。可选：
+  # save_best_criterion：唯一可写接口；其余为派生只读量。
   #   'loss'              — val_loss ↓。最通用但对边界/碎点不敏感。
   #   'dice'              — mean_dice ↑（各前景类等权均值）。大器官易饱和。
   #   'iou'               — mean_iou ↑（Jaccard，比 dice 对边界更严格）。

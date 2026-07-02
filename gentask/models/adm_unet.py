@@ -12,7 +12,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .stem import build_context_stem
+from .blocks import ConvNormAct
+from .stem import build_context_stem, build_stem
+from .topology import build_topology
 from .unet import SegmentationHead, build_head
 
 logger = logging.getLogger(__name__)
@@ -328,9 +330,15 @@ class _ADMEncoder(nn.Module):
         linear_attention_num_heads: int = 4,
         linear_attention_head_dim: int = 32,
         emb_channels: int = 0,
+        cond_stem: Optional[nn.Module] = None,
+        cond_fuse: Optional[nn.Module] = None,
+        cond_in_channels: int = 0,
     ):
         super().__init__()
         self.stem = stem
+        self.cond_stem = cond_stem
+        self.cond_fuse = cond_fuse
+        self.cond_in_channels = int(cond_in_channels)
         self.emb_channels = int(emb_channels)
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
@@ -378,7 +386,13 @@ class _ADMEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor, emb: Optional[torch.Tensor] = None) -> Dict[str, Any]:
         """返 {enc_features, enc_skips}。"""
+        cond = None
+        if self.cond_in_channels > 0:
+            x, cond = torch.split(x, [x.shape[1] - self.cond_in_channels, self.cond_in_channels], dim=1)
         x = self.stem(x)
+        if cond is not None:
+            cond = self.cond_stem(cond)
+            x = self.cond_fuse(torch.cat([x, cond], dim=1))
         enc_skips: List[torch.Tensor] = [x]
         enc_features: List[torch.Tensor] = []
         for level, blocks in enumerate(self.levels):
@@ -564,6 +578,9 @@ class ADMSegModel(nn.Module):
         linear_attention_num_heads: int = 4,
         linear_attention_head_dim: int = 32,
         aux_head_out_channels: Optional[List[int]] = None,
+        cond_stem: Optional[nn.Module] = None,
+        cond_fuse: Optional[nn.Module] = None,
+        cond_in_channels: int = 0,
     ):
         super().__init__()
         self.spatial_dims = 2
@@ -575,6 +592,9 @@ class ADMSegModel(nn.Module):
 
         self.encoder = _ADMEncoder(
             stem=stem,
+            cond_stem=cond_stem,
+            cond_fuse=cond_fuse,
+            cond_in_channels=cond_in_channels,
             encoder_channels=encoder_channels,
             encoder_blocks_per_stage=encoder_blocks_per_stage,
             attention_levels=attention_levels,
@@ -719,6 +739,7 @@ def build_adm_backbone(cfg) -> ADMSegModel:
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
+    topo = build_topology(cfg)
 
     # 仅 2.5D（其他模式需额外布线）。
     assert cfg.data.patch_mode == "2_5d", (
@@ -779,6 +800,7 @@ def build_adm_backbone(cfg) -> ADMSegModel:
     else:
         in_channels = D * n_views
     base_ch_per_view = D  # 统一深度（无列表时的默认值）
+    cond_in_channels = int(topo.cond_in_channels)
 
     stem, stem_stride = build_context_stem(
         mode=mc.stem_mode,
@@ -793,11 +815,35 @@ def build_adm_backbone(cfg) -> ADMSegModel:
         spatial_dims=2,
         stage_channels=enc_channels,
         in_ch_per_view_list=in_ch_per_view_list)
+    cond_stem = None
+    cond_fuse = None
+    if cond_in_channels > 0:
+        cond_stem, cond_stride = build_stem(
+            mode=mc.stem_mode,
+            in_ch=cond_in_channels,
+            out_ch=enc_channels[0],
+            norm_type="group",
+            norm_groups=32 if enc_channels[0] % 32 == 0 else 8,
+            activation="swish",
+            spatial_dims=2)
+        if cond_stride != stem_stride:
+            raise RuntimeError(
+                f"cond stem stride {cond_stride} != main stem stride {stem_stride}.")
+        cond_fuse = ConvNormAct(
+            enc_channels[0] * 2, enc_channels[0],
+            kernel_size=1, stride=1, padding=0,
+            norm_type="group",
+            norm_groups=32 if enc_channels[0] % 32 == 0 else 8,
+            activation="swish",
+            spatial_dims=2)
 
     aux_seg = bool(mc.aux_seg_supervision) and n_views > 1
 
     model = ADMSegModel(
         stem=stem,
+        cond_stem=cond_stem,
+        cond_fuse=cond_fuse,
+        cond_in_channels=cond_in_channels,
         stem_stride=stem_stride,
         num_stem_fusion_views=n_views,
         stem_fusion_mode=mc.stem_fusion_mode,

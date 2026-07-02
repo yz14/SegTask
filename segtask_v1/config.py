@@ -248,8 +248,6 @@ class ModelConfig:
 
     dropout: float = 0.0
 
-    # 旧 SE 开关（仅 attention_type=='none' 生效）。
-    use_se      : bool = False
     se_reduction: int = 16
 
     # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
@@ -1714,7 +1712,7 @@ _SUB_CONFIGS = {
 }
 
 
-# 旧 YAML 字段名 → 新字段名的向后兼容别名。读到旧名时自动改写并提示一次。
+# 旧 YAML 字段名 → 新字段名。此处仅用于报错信息里的迁移提示；旧名现已硬拒绝。
 # 命名清晰化（TODO #4）：
 #   data.aux_keep_native_d  → data.keep_native_view_depth（'aux' 误导：含主视图）
 #   model.context_fusion    → model.stem_fusion_mode（与 num_stem_fusion_views 配对）
@@ -1724,8 +1722,8 @@ _FIELD_ALIASES: Dict[type, Dict[str, str]] = {
 }
 
 
-# 旧 YAML 中曾可手设、现已改为派生只读量的字段：读到时静默忽略（仅一次 info 提示），
-# 而非按 "Unknown config key" 处理。TODO #4：派生量不再暴露可写接口。
+# 旧 YAML 中曾可手设、现已改为派生只读量的字段。此处仅用于报错信息里的迁移提示；
+# 旧名现已硬拒绝。TODO #4：派生量不再暴露可写接口。
 #   train.save_best_metric / save_best_mode → 由 train.save_best_criterion 派生。
 #   model.in_channels / spatial_dims        → 由 patch_mode/multi_res_scales 等派生
 #                                             （sync() 经 build_topology 算出）。
@@ -1741,38 +1739,49 @@ _DEPRECATED_DERIVED_KEYS: Dict[type, Dict[str, str]] = {
 }
 
 
+# 旧 YAML 中已移除、但需要更具体迁移提示的字段。旧名现已硬拒绝。
+#   model.use_se → 改用 model.attention_type: "se"。
+_REMOVED_KEYS: Dict[type, Dict[str, str]] = {
+    ModelConfig: {"use_se": 'attention_type: "se"'},
+}
+
+
 def _dataclass_from_dict(cls, d: Dict[str, Any]):
     """Recursively construct a dataclass from a dict.
 
-    支持向后兼容别名（``_FIELD_ALIASES``）：旧 YAML 字段名会被自动改写成新名，
-    并打印一次弃用提示；若新旧名同时出现则报错。``_DEPRECATED_DERIVED_KEYS``
-    列出的"曾可写、现派生只读"字段则直接忽略。
+    旧别名（``_FIELD_ALIASES``）、曾经可写但现已派生的字段
+    （``_DEPRECATED_DERIVED_KEYS``）以及未知字段现在都直接抛
+    ``ConfigError``，并给出迁移提示。
     """
     if not isinstance(d, dict):
         return d
     field_names = {f.name for f in fields(cls)}
     aliases = _FIELD_ALIASES.get(cls, {})
     derived = _DEPRECATED_DERIVED_KEYS.get(cls, {})
+    removed = _REMOVED_KEYS.get(cls, {})
     kwargs = {}
     for k, v in d.items():
+        if k in removed:
+            raise ConfigError(
+                f"Config key '{k}' is removed from {cls.__name__}; use "
+                f"{removed[k]} instead.")
         if k in derived:
-            logger.info(
-                "Config key '%s' is now auto-derived from '%s' and no longer "
-                "settable; ignoring the value in YAML.", k, derived[k])
-            continue
+            raise ConfigError(
+                f"Config key '{k}' is removed from {cls.__name__}; it is now "
+                f"auto-derived from '{derived[k]}' and must not be set in YAML.")
         if k in aliases:
             new_key = aliases[k]
             if new_key in d:
-                raise ValueError(
+                raise ConfigError(
                     f"{cls.__name__}: both deprecated '{k}' and its "
-                    f"replacement '{new_key}' are set; remove the deprecated one.")
-            logger.warning(
-                "Config key '%s' is deprecated; use '%s' instead "
-                "(auto-remapped for backward compatibility).", k, new_key)
-            k = new_key
+                    f"replacement '{new_key}' are set; remove '{k}' and keep "
+                    f"'{new_key}'.")
+            raise ConfigError(
+                f"Config key '{k}' is removed from {cls.__name__}; use "
+                f"'{new_key}' instead.")
         if k not in field_names:
-            logger.warning("Unknown config key: %s", k)
-            continue
+            raise ConfigError(
+                f"Unknown config key '{k}' in {cls.__name__}.")
         if k in _SUB_CONFIGS and isinstance(v, dict):
             v = _dataclass_from_dict(_SUB_CONFIGS[k], v)
         kwargs[k] = v

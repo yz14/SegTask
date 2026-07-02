@@ -35,11 +35,18 @@ class Encoder(nn.Module):
         num_stem_fusion_views: int = 1,
         stem_fusion_mode     : str = "shared_stem",
         in_ch_per_view_list  : Optional[List[int]] = None,
+        cond_in_channels     : int = 0,
         downsample_builder   : Optional[Callable[[int, int], nn.Module]] = None,
         downsample_strides   : Optional[List] = None):
         super().__init__()
 
         self.spatial_dims = spatial_dims
+        self.cond_in_channels = int(cond_in_channels)
+        if self.cond_in_channels < 0 or self.cond_in_channels > in_channels:
+            raise ValueError(
+                f"cond_in_channels must be in [0, in_channels]; got "
+                f"{self.cond_in_channels} for in_channels={in_channels}.")
+        self.recon_in_channels = in_channels - self.cond_in_channels
         if num_stem_fusion_views < 1:        # 输入不可为空
             raise ValueError(
                 f"num_stem_fusion_views must be >= 1, got {num_stem_fusion_views}")
@@ -49,17 +56,17 @@ class Encoder(nn.Module):
                     f"in_ch_per_view_list length "
                     f"({len(in_ch_per_view_list)}) must equal "
                     f"num_stem_fusion_views ({num_stem_fusion_views})")
-            if sum(in_ch_per_view_list) != in_channels:  # 输入总通道数
+            if sum(in_ch_per_view_list) != self.recon_in_channels:  # 输入总通道数
                 raise ValueError(
                     f"sum(in_ch_per_view_list)={sum(in_ch_per_view_list)} "
-                    f"must equal in_channels ({in_channels})")
+                    f"must equal recon_in_channels ({self.recon_in_channels})")
             base_ch_per_view = int(in_ch_per_view_list[0])
         else:
-            if in_channels % num_stem_fusion_views != 0:
+            if self.recon_in_channels % num_stem_fusion_views != 0:
                 raise ValueError(
-                    f"in_channels ({in_channels}) must be divisible by "
+                    f"recon_in_channels ({self.recon_in_channels}) must be divisible by "
                     f"num_stem_fusion_views ({num_stem_fusion_views})")
-            base_ch_per_view = in_channels // num_stem_fusion_views
+            base_ch_per_view = self.recon_in_channels // num_stem_fusion_views
         self.num_stem_fusion_views = num_stem_fusion_views
         # UNet3D 构建 aux head 时需读此字段对齐 stem 拓扑。
         self.stem_fusion_mode = stem_fusion_mode
@@ -75,6 +82,23 @@ class Encoder(nn.Module):
             activation=activation, spatial_dims=spatial_dims,
             stage_channels=stage_channels,
             in_ch_per_view_list=in_ch_per_view_list)
+        self.cond_stem = None
+        self.cond_fuse = None
+        if self.cond_in_channels > 0:
+            self.cond_stem, cond_stride = build_stem(
+                mode=stem_mode,
+                in_ch=self.cond_in_channels,
+                out_ch=stage_channels[0],
+                norm_type=norm_type, norm_groups=norm_groups,
+                activation=activation, spatial_dims=spatial_dims)
+            if cond_stride != self.stem_stride:
+                raise RuntimeError(
+                    f"cond stem stride {cond_stride} != main stem stride {self.stem_stride}.")
+            self.cond_fuse = ConvNormAct(
+                stage_channels[0] * 2, stage_channels[0],
+                kernel_size=1, stride=1, padding=0,
+                norm_type=norm_type, norm_groups=norm_groups,
+                activation=activation, spatial_dims=spatial_dims)
 
         # Encoder stages and downsampling
         self.stages      = nn.ModuleList()
@@ -121,6 +145,10 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """返回 [level_0, ..., level_N]；hierarchical stem 在下采样后 cat 注入 aux 特征。"""
+        cond = None
+        if self.cond_in_channels > 0:
+            x, cond = torch.split(
+                x, [self.recon_in_channels, self.cond_in_channels], dim=1)
         if isinstance(self.stem, HierarchicalStems):
             chunks    = self.stem.split_views(x)
             x         = self.stem.forward_main(chunks[0])
@@ -128,6 +156,9 @@ class Encoder(nn.Module):
         else:
             x         = self.stem(x)
             aux_feats = {}
+        if cond is not None:
+            cond = self.cond_stem(cond)
+            x = self.cond_fuse(torch.cat([x, cond], dim=1))
 
         features: List[torch.Tensor] = []
         for i, stage in enumerate(self.stages):
@@ -458,10 +489,9 @@ class UNet3D(nn.Module):
             for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
                 ao = head(dec_features[feat_idx])
                 if ao.shape[2:] != target_size:
-                    raise RuntimeError(
-                        f"Aux seg head (feat_idx={feat_idx}) output size mismatch: "
-                        f"got {tuple(ao.shape[2:])}, expected {tuple(target_size)}. "
-                        f"Check stem_stride / encoder downsampling vs input spatial dims.")
+                    ao = F.interpolate(
+                        ao, size=target_size,
+                        mode="bilinear", align_corners=False)
                 aux_outs.append(ao)
 
         if self.deep_supervision and self.training:

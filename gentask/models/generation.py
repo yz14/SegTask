@@ -105,7 +105,9 @@ class RegressionModel(nn.Module):
                 "or match out_channels to input depth.")
         return out + base
 
-    def _heads(self, lr: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def _heads(
+        self, lr: torch.Tensor, base_lr: Optional[torch.Tensor] = None
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """返回主路径多尺度头与可选 aux 头；head[0] 为全分辨率。"""
         out = self.net(lr)
         aux = []
@@ -113,7 +115,7 @@ class RegressionModel(nn.Module):
             aux = list(out.get("aux", []))
             out = out["main"]
         heads = list(out) if isinstance(out, (list, tuple)) else [out]
-        base = self._main_view(lr)
+        base = self._main_view(base_lr if base_lr is not None else lr)
         if self.residual:
             heads = [self._add_residual(h, base) for h in heads]
         # aux 头直接重建各自 view，不叠 residual；residual 只作用于主 view 0。
@@ -121,8 +123,9 @@ class RegressionModel(nn.Module):
 
     def restore(self, lr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         lr = self._pack_2_5d(lr)
+        base_lr = lr
         lr = self._concat_cond(lr, cond)
-        return self._heads(lr)[0][0]
+        return self._heads(lr, base_lr=base_lr)[0][0]
 
     def _target_views(self, hr: torch.Tensor) -> List[torch.Tensor]:
         if not self._is_multi_view_2_5d():
@@ -133,8 +136,9 @@ class RegressionModel(nn.Module):
         hr = self._pack_2_5d(hr)
         cond = self._pack_2_5d(cond) if cond is not None else None
         lr = self.degrade(hr)
+        base_lr = lr
         lr = self._concat_cond(lr, cond)
-        heads, aux = self._heads(lr)
+        heads, aux = self._heads(lr, base_lr=base_lr)
         target_views = self._target_views(hr)
         out = {"pred": heads[0], "ds_preds": heads, "target": target_views[0]}
         if self._is_multi_view_2_5d() and self.aux_views_active and aux:

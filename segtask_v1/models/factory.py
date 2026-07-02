@@ -70,6 +70,7 @@ def _make_resnet_stage_builder(
     """
     mc = cfg.model
     spatial_dims = mc.spatial_dims
+    attention_type = mc.attention_type
     mask = list(multirf_mask) if multirf_mask else []
     sa_types = list(selfattn_types) if selfattn_types else []
 
@@ -87,9 +88,8 @@ def _make_resnet_stage_builder(
                 norm_groups    = mc.norm_groups,
                 activation     = mc.activation,
                 dropout        = mc.dropout,
-                use_se         = mc.use_se,
                 se_reduction   = mc.se_reduction,
-                attention_type = mc.attention_type,
+                attention_type = attention_type,
                 spatial_dims   = spatial_dims,
                 branch_norm_act = mc.multirf_branch_norm_act)
         return ResNetStage(
@@ -99,9 +99,8 @@ def _make_resnet_stage_builder(
             norm_groups    = mc.norm_groups,
             activation     = mc.activation,
             dropout        = mc.dropout,
-            use_se         = mc.use_se,
             se_reduction   = mc.se_reduction,
-            attention_type = mc.attention_type,
+            attention_type = attention_type,
             block_type     = mc.block_type,
             spatial_dims   = spatial_dims)
 
@@ -135,8 +134,6 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
         non_default.append(f"norm_type={mc.norm_type!r}")
     if mc.activation != "leakyrelu":
         non_default.append(f"activation={mc.activation!r}")
-    if mc.use_se:
-        non_default.append("use_se=True")
     if mc.dropout and mc.dropout > 0.0:
         non_default.append(f"dropout={mc.dropout}")
     if non_default:

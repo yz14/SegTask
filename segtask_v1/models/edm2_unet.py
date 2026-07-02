@@ -673,7 +673,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         attn_balance=float(mc.edm2_attn_balance),
         concat_balance=float(mc.edm2_concat_balance),
         clip_act=float(mc.edm2_clip_act),
-        num_fg_classes=out_classes,
+        out_channels=out_classes,
         deep_supervision=bool(mc.deep_supervision),
         aux_seg_supervision=aux_seg,
         aux_head_mode=str(mc.aux_head_mode),

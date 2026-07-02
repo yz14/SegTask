@@ -86,8 +86,6 @@ model:
   norm_groups: 8
   activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
   dropout    : 0.0
-
-  use_se        : false    # SE attn
   attention_type: "none"
   skip_attention: false
 
@@ -129,7 +127,7 @@ loss:
   name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
   compound_weights: [1.0, 1.0]
 
-  class_weights : [1.0]       # 长度 = num_fg_classes (不含 bg)
+  class_weights : [1.0]       # 长度 = 前景类数 (不含 bg)
   region_weights: [1.0, 5.0]  # 按 label_values 全长 (含 bg)
 
   dice_smooth : 1.0e-5

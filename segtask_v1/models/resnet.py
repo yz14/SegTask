@@ -13,7 +13,7 @@ from .blocks import (
 
 
 class ResNetBlock(nn.Module):
-    """后置激活 ResNet 块（可选 attention）。use_se=True 且 attention_type=='none' 时提升为 'se'。"""
+    """后置激活 ResNet 块（可选 attention）。attention_type='se' 时启用 SE。"""
 
     def __init__(
         self,
@@ -23,7 +23,6 @@ class ResNetBlock(nn.Module):
         norm_groups   : int = 8,
         activation    : str = "leakyrelu",
         dropout       : float = 0.0,
-        use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
         spatial_dims  : int = 3):
@@ -39,8 +38,6 @@ class ResNetBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        if attention_type == "none" and use_se:
-            attention_type = "se"  # 旧 use_se 向后兼容
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
         self.shortcut = (
@@ -68,7 +65,6 @@ class PreActResNetBlock(nn.Module):
         norm_groups   : int = 8,
         activation    : str = "leakyrelu",
         dropout       : float = 0.0,
-        use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
         spatial_dims  : int = 3):
@@ -84,8 +80,6 @@ class PreActResNetBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        if attention_type == "none" and use_se:
-            attention_type = "se"
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
         # shortcut 作用于原 x；通道不匹配时用 1×1 投影（标准 pre-act）。
@@ -114,7 +108,6 @@ class BottleneckBlock(nn.Module):
         norm_groups   : int = 8,
         activation    : str = "leakyrelu",
         dropout       : float = 0.0,
-        use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
         spatial_dims  : int = 3):
@@ -136,8 +129,6 @@ class BottleneckBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        if attention_type == "none" and use_se:
-            attention_type = "se"
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
         self.shortcut = (
@@ -166,7 +157,6 @@ class R2Plus1DBlock(nn.Module):
         norm_groups    : int = 8,
         activation     : str = "leakyrelu",
         dropout        : float = 0.0,
-        use_se         : bool = False,
         se_reduction   : int = 16,
         attention_type : str = "none",
         spatial_dims   : int = 3,
@@ -211,8 +201,6 @@ class R2Plus1DBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        if attention_type == "none" and use_se:
-            attention_type = "se"
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
 
         self.shortcut = (
@@ -287,7 +275,6 @@ class MultiRFBlock(nn.Module):
         norm_groups   : int = 8,
         activation    : str = "leakyrelu",
         dropout       : float = 0.0,
-        use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
         spatial_dims  : int = 3,
@@ -382,8 +369,6 @@ class MultiRFBlock(nn.Module):
         self.conv2 = _CONV[d](out_ch, out_ch, 3, padding=1, bias=False)
         self.norm2 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
 
-        if attention_type == "none" and use_se:
-            attention_type = "se"
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d,
                                    reduction=se_reduction)
         self.act2 = get_activation(activation)
@@ -430,7 +415,6 @@ class MultiRFStage(nn.Module):
         norm_groups   : int = 8,
         activation    : str = "leakyrelu",
         dropout       : float = 0.0,
-        use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
         spatial_dims  : int = 3,
@@ -441,7 +425,7 @@ class MultiRFStage(nn.Module):
         kwargs = dict(
             dilations=dilations, mode=mode, fusion=fusion, axes=axes,
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,
-            dropout=dropout, use_se=use_se, se_reduction=se_reduction,
+            dropout=dropout, se_reduction=se_reduction,
             attention_type=attention_type, spatial_dims=spatial_dims,
             branch_norm_act=branch_norm_act)
         blocks = [MultiRFBlock(in_ch, out_ch, **kwargs)]
@@ -465,7 +449,6 @@ class ResNetStage(nn.Module):
         norm_groups   : int = 8,
         activation    : str = "leakyrelu",
         dropout       : float = 0.0,
-        use_se        : bool = False,
         se_reduction  : int = 16,
         attention_type: str = "none",
         block_type    : str = "basic",
@@ -476,7 +459,7 @@ class ResNetStage(nn.Module):
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
         kwargs = dict(
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,
-            dropout=dropout, use_se=use_se, se_reduction=se_reduction,
+            dropout=dropout, se_reduction=se_reduction,
             attention_type=attention_type, spatial_dims=spatial_dims)
         blocks = [_make_block(block_type, in_ch, out_ch, **kwargs)]
         for _ in range(1, num_blocks):
