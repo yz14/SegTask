@@ -40,7 +40,7 @@ class DatasetCommonCfg:
     """与 patch_mode 无关的 dataset 公共构造参数（shared image-to-image data path）。
 
     所有 3 个 dataset 子类（``Volume3D`` / ``Volume3DCubic`` /
-    ``Volume3DWhole``）共享这 11 个字段。原 ``loader.py:522-532`` 的
+    ``Volume3DWhole``）共享这 16 个字段。原 ``loader.py:522-532`` 的
     ``common_kwargs`` dict 已被这个 dataclass 替代。
     """
 
@@ -54,6 +54,11 @@ class DatasetCommonCfg:
     cache_enabled: bool
     cache_max_volumes: int
     region_weights: Optional[List[float]]
+    cond_normalize: str
+    cond_intensity_min: float
+    cond_intensity_max: float
+    cond_global_mean: float
+    cond_global_std: float
 
     @classmethod
     def from_cfg(cls, cfg: Config) -> "DatasetCommonCfg":
@@ -69,7 +74,12 @@ class DatasetCommonCfg:
             cache_enabled     = (str(dc.cache_mode) == "memory"),
             cache_max_volumes = int(dc.cache_max_volumes),
             region_weights    = (list(dc.region_weights)
-                                 if dc.region_weights else None))
+                                 if dc.region_weights else None),
+            cond_normalize    = str(dc.cond_normalize),
+            cond_intensity_min = float(dc.cond_intensity_min),
+            cond_intensity_max = float(dc.cond_intensity_max),
+            cond_global_mean  = float(dc.cond_global_mean),
+            cond_global_std   = float(dc.cond_global_std))
 
     def to_kwargs(self) -> dict:
         """直接展开为 ``Volume3D*.__init__`` 的 kwargs。"""
@@ -83,7 +93,12 @@ class DatasetCommonCfg:
             global_std        = self.global_std,
             cache_enabled     = self.cache_enabled,
             cache_max_volumes = self.cache_max_volumes,
-            region_weights    = self.region_weights)
+            region_weights    = self.region_weights,
+            cond_normalize    = self.cond_normalize,
+            cond_intensity_min = self.cond_intensity_min,
+            cond_intensity_max = self.cond_intensity_max,
+            cond_global_mean  = self.cond_global_mean,
+            cond_global_std   = self.cond_global_std)
 
 
 @dataclass(frozen=True)

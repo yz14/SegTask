@@ -47,6 +47,7 @@ class ModelTopology:
 
     # ---- 模型 I/O 通道布局 ----
     in_channels          : int = 1      # 模型输入通道数（写回 cfg.model.in_channels）
+    cond_in_channels     : int = 0      # 条件输入通道数（生成 conditioning）
     out_classes          : int = 1      # 主头输出通道（= num_fg × {1, D, n_views}）
     spatial_dims         : int = 3      # 2 | 3
     num_stem_fusion_views: int = 1      # encoder stem 融合视图数（仅 2.5D=n_views）
@@ -86,6 +87,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
     n_views = max(len(dc.multi_res_scales), 1)  # 多分辨率
     D       = int(dc.patch_size[0])
     num_fg  = cfg.num_fg_classes
+    cond_in_channels = len(dc.cond_dirs) * (D if pm == "2_5d" else 1)
 
     is_2_5d        = pm == "2_5d"
     lift           = bool(mc.lift_2_5d_to_3d) and is_2_5d
@@ -107,19 +109,19 @@ def build_topology(cfg: "Config") -> ModelTopology:
         if native_d:  # 多分辨率输入，保持原尺寸
             depths    = [int(round(D * float(s))) for s in dc.multi_res_scales]
             depths[0] = D  # s_0 == 1.0
-            in_channels = int(sum(depths))
+            in_channels = int(sum(depths)) + cond_in_channels
         else:
-            in_channels = D * n_views
+            in_channels = D * n_views + cond_in_channels
     elif is_2_5d and lift:
         spatial_dims   = 3
         num_res_groups = 1
         out_classes    = num_fg
-        in_channels    = n_views  # C_res = n_views
+        in_channels    = n_views + cond_in_channels  # C_res = n_views
     else:  # 3D（whole / z_axis / cubic）
         spatial_dims   = 3
         num_res_groups = n_views                  # 3D的多分辨率都在通道cat
         out_classes    = num_fg * num_res_groups  # 每个通道都加监督
-        in_channels    = n_views                  # 通道/视图（whole 时 n_views=1）
+        in_channels    = n_views + cond_in_channels                  # 通道/视图（whole 时 n_views=1）
 
     # ---- 2.5D 专属 ------------------------------------------------------
     slab_depth      = D if is_2_5d else 0
@@ -154,6 +156,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
         in_channels            = in_channels,
         out_classes            = out_classes,
         spatial_dims           = spatial_dims,
+        cond_in_channels       = cond_in_channels,
         num_stem_fusion_views  = num_stem_fusion_views,
         in_ch_per_view_list    = in_ch_per_view_list,
         aux_seg_active         = aux_seg_active,

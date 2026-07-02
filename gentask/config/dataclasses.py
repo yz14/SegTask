@@ -54,6 +54,15 @@ class DataConfig:
     # 空表示不启用。优先级低于 region_weight_dir。
     region_weights: List[float] = field(default_factory=list)
 
+    # 可选逐样本条件卷目录；每个目录提供一个空间对齐的条件体（例如 mask / 预分割）。
+    cond_dirs: List[str] = field(default_factory=list)
+    cond_suffixes: Union[str, List[str]] = ".nii.gz"
+    cond_intensity_min: float = -1024.0
+    cond_intensity_max: float = 1024.0
+    cond_normalize  : str = "minmax"
+    cond_global_mean: float = 0.0
+    cond_global_std : float = 1.0
+
     # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
     npz_dir   : str = ""
     npz_suffix: str = ".npz"
@@ -187,6 +196,7 @@ class ModelConfig:
     # 多 FOV 辅助重建监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，
     # 辅助 view k 输出对应 view_k 的 HR slice；损失权重见 loss.aux_recon_weights（空则默认 0.5^k）。
     # 单视图/3D 不生效。
+    # 生成任务多 FOV / 多视野辅助重建监督（仅 2.5D multi-view）。
     aux_seg_supervision: bool = False
 
     # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。

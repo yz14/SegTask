@@ -27,11 +27,15 @@ def _write_nifti(path: Path, array: np.ndarray) -> None:
     sitk.WriteImage(img, str(path))
 
 
-def _make_synthetic_nifti_pair_dirs(root: Path, n_volumes: int = 4) -> tuple[Path, Path]:
+def _make_synthetic_nifti_pair_dirs(
+    root: Path, n_volumes: int = 4, with_cond: bool = False) -> tuple[Path, Path, Path | None]:
     image_dir = root / "images"
     label_dir = root / "labels"
+    cond_dir = root / "conds"
     image_dir.mkdir(parents=True, exist_ok=True)
     label_dir.mkdir(parents=True, exist_ok=True)
+    if with_cond:
+        cond_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(1234)
     for idx in range(n_volumes):
@@ -40,15 +44,24 @@ def _make_synthetic_nifti_pair_dirs(root: Path, n_volumes: int = 4) -> tuple[Pat
         label[2:5, 4:8, 5:9] = 1
         if idx % 2 == 1:
             label[1:3, 9:13, 2:6] = 1
+        cond = np.zeros((8, 16, 16), dtype=np.uint8)
+        cond[:, 4:12, 4:12] = (idx + 1) % 2
 
         stem = f"case_{idx:02d}"
         _write_nifti(image_dir / f"{stem}.nii.gz", image)
         _write_nifti(label_dir / f"{stem}.nii.gz", label)
+        if with_cond:
+            _write_nifti(cond_dir / f"{stem}.nii.gz", cond)
 
-    return image_dir, label_dir
+    return image_dir, label_dir, cond_dir if with_cond else None
 
 
-def _base_cfg(patch_mode: str, image_dir: Path, label_dir: Path, npz_dir: Path) -> Config:
+def _base_cfg(
+    patch_mode: str,
+    image_dir: Path,
+    label_dir: Path,
+    npz_dir: Path,
+    cond_dir: Path | None = None) -> Config:
     cfg = Config()
     cfg.data.image_dir = str(image_dir)
     cfg.data.label_dir = str(label_dir)
@@ -67,6 +80,12 @@ def _base_cfg(patch_mode: str, image_dir: Path, label_dir: Path, npz_dir: Path) 
     cfg.data.cache_mode = "none"
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2
+    if cond_dir is not None:
+        cfg.data.cond_dirs = [str(cond_dir)]
+        cfg.data.cond_suffixes = ".nii.gz"
+        cfg.data.cond_normalize = "minmax"
+        cfg.data.cond_intensity_min = 0.0
+        cfg.data.cond_intensity_max = 1.0
 
     cfg.model.encoder_channels = [16, 32, 48]
     cfg.task.type = "generation"
@@ -79,12 +98,13 @@ def _base_cfg(patch_mode: str, image_dir: Path, label_dir: Path, npz_dir: Path) 
     return cfg
 
 
-def _exercise_pipeline(patch_mode: str) -> dict:
+def _exercise_pipeline(patch_mode: str, with_cond: bool = False) -> dict:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        image_dir, label_dir = _make_synthetic_nifti_pair_dirs(root)
+        image_dir, label_dir, cond_dir = _make_synthetic_nifti_pair_dirs(
+            root, with_cond=with_cond)
         npz_dir = root / f"{patch_mode}_npz"
-        cfg = _base_cfg(patch_mode, image_dir, label_dir, npz_dir)
+        cfg = _base_cfg(patch_mode, image_dir, label_dir, npz_dir, cond_dir=cond_dir)
 
         counters = prepare_dataset(
             cfg=cfg,
@@ -95,6 +115,12 @@ def _exercise_pipeline(patch_mode: str) -> dict:
         assert counters["written"] == 4, counters
         assert counters["failed"] == 0, counters
         assert len(list(npz_dir.glob("*.npz"))) == 4
+        with np.load(next(npz_dir.glob("*.npz"))) as pkg:
+            if with_cond:
+                assert "cond" in pkg.files
+                assert pkg["cond"].shape == (1, 8, 16, 16)
+            else:
+                assert "cond" not in pkg.files
 
         train_loader, val_loader = build_dataloaders(cfg)
         assert len(train_loader) > 0, "train loader must be non-empty"
@@ -108,9 +134,14 @@ def _exercise_pipeline(patch_mode: str) -> dict:
         assert batch["image"].shape[0] == 2
         assert batch["image"].shape[1] == 1
         assert tuple(batch["image"].shape[2:]) == tuple(cfg.data.patch_size)
+        if with_cond:
+            assert "cond" in batch
+            assert batch["cond"].dtype.is_floating_point
+            assert batch["cond"].shape == batch["image"].shape
         return {
             "counters": counters,
             "batch_shape": tuple(batch["image"].shape),
+            "cond_shape": tuple(batch["cond"].shape) if with_cond else None,
             "model_spatial_dims": cfg.model.spatial_dims,
             "model_in_channels": cfg.model.in_channels,
         }
@@ -130,10 +161,28 @@ def test_data_pipeline_2_5d_npz_roundtrip():
     assert res["batch_shape"] == (2, 1, 4, 8, 8)
 
 
+def test_data_pipeline_z_axis_npz_roundtrip_with_cond():
+    res = _exercise_pipeline("z_axis", with_cond=True)
+    assert res["model_spatial_dims"] == 3
+    assert res["model_in_channels"] == 2
+    assert res["batch_shape"] == (2, 1, 4, 8, 8)
+    assert res["cond_shape"] == (2, 1, 4, 8, 8)
+
+
+def test_data_pipeline_2_5d_npz_roundtrip_with_cond():
+    res = _exercise_pipeline("2_5d", with_cond=True)
+    assert res["model_spatial_dims"] == 2
+    assert res["model_in_channels"] == 8
+    assert res["batch_shape"] == (2, 1, 4, 8, 8)
+    assert res["cond_shape"] == (2, 1, 4, 8, 8)
+
+
 def main() -> int:
     tests = [
         test_data_pipeline_z_axis_npz_roundtrip,
         test_data_pipeline_2_5d_npz_roundtrip,
+        test_data_pipeline_z_axis_npz_roundtrip_with_cond,
+        test_data_pipeline_2_5d_npz_roundtrip_with_cond,
     ]
     failures = 0
     for t in tests:

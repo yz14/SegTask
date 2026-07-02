@@ -181,6 +181,11 @@ class Config:
                 _require(
                     str(t.sampler).lower() == "edm_heun",
                     "parameterization='edm' requires sampler='edm_heun'.")
+        if self.data.cond_dirs:
+            _require(
+                str(t.algorithm).lower() == "regression",
+                "data.cond_dirs is not yet supported for diffusion; "
+                "use generation regression with conditioning only.")
 
     def _validate_model(self) -> None:
         """model.* 架构选项与逐级拓扑长度校验。"""
@@ -372,6 +377,14 @@ class Config:
         _require(
             all(s >= 1.0 for s in self.data.multi_res_scales),
             "All multi_res_scales must be >= 1.0")
+        if self.data.cond_dirs:
+            _require(
+                len(self.data.multi_res_scales) == 1,
+                "data.cond_dirs is only supported for single-view configs "
+                "(len(data.multi_res_scales)==1); multi-view is not yet supported.")
+            _require(
+                self.data.cond_normalize in ("minmax", "zscore"),
+                f"Invalid data.cond_normalize: {self.data.cond_normalize!r}")
 
     def _validate_2_5d(self) -> None:
         """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。"""
@@ -404,6 +417,11 @@ class Config:
                         f"lift_2_5d_to_3d=True with {n_levels} encoder stages requires "
                         f"patch_size[0] (D={D}) divisible by 2**(n_levels-1)={req}. "
                         f"Increase D to a multiple of {req}, or reduce len(encoder_channels).")
+                if self.data.cond_dirs:
+                    _require(
+                        False,
+                        "data.cond_dirs is not yet supported with "
+                        "lift_2_5d_to_3d=True.")
             else:
                 _require(
                     self.model.spatial_dims == 2,

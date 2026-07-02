@@ -14,7 +14,8 @@ from .io import (
     BBox, compute_bbox_from_volume, compute_region_weight_map,
     load_nifti, load_nifti_cropped, load_nifti_with_spacing,
     load_npz_fg_coords, load_npz_fg_slices, load_npz_image,
-    load_npz_label, load_npz_label_for_split, load_npz_region_weight,
+    load_npz_cond, load_npz_label, load_npz_label_for_split,
+    load_npz_region_weight,
     load_region_weight_volume, npz_has_rw, preprocess_image,
     preprocess_label, resize_3d, _open_npz,
 )
@@ -46,7 +47,12 @@ class VolumeNpzDatasetBase(Dataset):
         is_train            : bool,
         cache_enabled       : bool,
         cache_max_volumes   : int,
-        region_weights      : Optional[List[float]]):
+        region_weights      : Optional[List[float]],
+        cond_normalize      : str,
+        cond_intensity_min  : float,
+        cond_intensity_max  : float,
+        cond_global_mean    : float,
+        cond_global_std     : float):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert npz_paths is not None and len(npz_paths) == len(image_paths), (
@@ -67,10 +73,16 @@ class VolumeNpzDatasetBase(Dataset):
         self.samples_per_volume = samples_per_volume
         self.is_train           = is_train
         self.region_weights     = region_weights
+        self.cond_normalize     = cond_normalize
+        self.cond_intensity_min = cond_intensity_min
+        self.cond_intensity_max = cond_intensity_max
+        self.cond_global_mean   = cond_global_mean
+        self.cond_global_std    = cond_global_std
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
+        self._cond_cache = VolumeCache(cache_enabled, cache_max_volumes)
 
         # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw。
         self._npz_paths       : List[str]       = list(npz_paths)
@@ -139,6 +151,28 @@ class VolumeNpzDatasetBase(Dataset):
             self._rw_cache.put(path, rw)
         return rw
 
+    def _load_cond(self, vol_idx: int) -> Optional[np.ndarray]:
+        """加载条件体（npz）；无 cond 返 None。"""
+        path   = self._npz_paths[vol_idx]
+        cached = self._cond_cache.get(path)
+        if cached is not None:
+            return cached
+        cond = load_npz_cond(path)
+        if cond is None:
+            return None
+        if cond.ndim == 3:
+            cond = cond[np.newaxis]
+        if cond.ndim != 4:
+            raise ValueError(
+                f"Expected cond volume to have shape (C,D,H,W) or (D,H,W); got {cond.shape}")
+        normed = np.empty_like(cond, dtype=np.float32)
+        for i, ch in enumerate(cond):
+            normed[i] = preprocess_image(
+                ch, self.cond_intensity_min, self.cond_intensity_max,
+                self.cond_normalize, self.cond_global_mean, self.cond_global_std)
+        self._cond_cache.put(path, normed)
+        return normed
+
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
 
@@ -156,26 +190,30 @@ class Volume3D(VolumeNpzDatasetBase):
 
     def __init__(
         self,
-        image_paths                : List[str],
-        label_paths                : List[str],
-        label_values               : List[int],
-        patch_size                 : Tuple[int, int, int] = (64, 128, 128),
-        aug_oversample_ratio       : float = 1.0,
-        multi_res_scales           : Optional[List[float]] = None,
-        intensity_min              : float = -1024.0,
-        intensity_max              : float = 3071.0,
-        normalize                  : str = "minmax",
-        global_mean                : float = 0.0,
-        global_std                 : float = 1.0,
+        image_paths         : List[str],
+        label_paths         : List[str],
+        label_values        : List[int],
+        patch_size          : Tuple[int, int, int] = (64, 128, 128),
+        aug_oversample_ratio: float = 1.0,
+        multi_res_scales    : Optional[List[float]] = None,
+        intensity_min       : float = -1024.0,
+        intensity_max       : float = 3071.0,
+        normalize           : str = "minmax",
+        global_mean         : float = 0.0,
+        global_std          : float = 1.0,
         foreground_oversample_ratio: float = 0.5,
-        samples_per_volume         : int = 8,
-        is_train                   : bool = True,
-        cache_enabled              : bool = True,
-        cache_max_volumes          : int = 0,
-        region_weights             : Optional[List[float]] = None,
-        z_boundary_mode            : str = "stretch",
-        npz_paths                  : Optional[List[str]] = None):
-
+        samples_per_volume  : int = 8,
+        is_train            : bool = True,
+        cache_enabled       : bool = True,
+        cache_max_volumes   : int = 0,
+        region_weights      : Optional[List[float]] = None,
+        cond_normalize      : str = "minmax",
+        cond_intensity_min  : float = -1024.0,
+        cond_intensity_max  : float = 1024.0,
+        cond_global_mean    : float = 0.0,
+        cond_global_std     : float = 1.0,
+        z_boundary_mode     : str = "stretch",
+        npz_paths           : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -192,7 +230,12 @@ class Volume3D(VolumeNpzDatasetBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            cond_normalize       = cond_normalize,
+            cond_intensity_min   = cond_intensity_min,
+            cond_intensity_max   = cond_intensity_max,
+            cond_global_mean     = cond_global_mean,
+            cond_global_std      = cond_global_std)
         if z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
@@ -258,13 +301,15 @@ class Volume3D(VolumeNpzDatasetBase):
         # 样本区域权重文件 > 静态 region_weights 映射。
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
-        return self._getitem_max_fov(img, lbl, rw_vol, z, eD, eH, eW)
+        cond_vol = self._load_cond(vol_idx)
+        return self._getitem_max_fov(img, lbl, rw_vol, cond_vol, z, eD, eH, eW)
 
     def _getitem_max_fov(
         self,
         img    : np.ndarray,
         lbl    : np.ndarray,
         rw_vol : Optional[np.ndarray],
+        cond_vol: Optional[np.ndarray],
         z      : int,
         eD     : int,
         eH     : int,
@@ -276,10 +321,16 @@ class Volume3D(VolumeNpzDatasetBase):
         img_s, lbl_s = self._extract_z_patch_padded(img, lbl, z, eD_max)
         rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
                 if rw_vol is not None else None)
+        cond_s = (_channelwise_3d(
+            cond_vol,
+            lambda ch: extract_z_patch_padded(ch, z, eD_max))
+            if cond_vol is not None else None)
 
         # 面内 resize 到 (eH,eW)；D 轴保持 eD_max（不重采样）。
         img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
         lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
+        if cond_s is not None:
+            cond_s = resize_3d(cond_s, eD_max, eH, eW, is_label=False)
         result = {
             # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
@@ -294,6 +345,9 @@ class Volume3D(VolumeNpzDatasetBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        if cond_s is not None:
+            result["cond"] = torch.from_numpy(
+                np.ascontiguousarray(cond_s.astype(np.float32, copy=False)))
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
@@ -348,6 +402,19 @@ def extract_z_patch_padded(
         pad_width = [(pad_before, pad_after)] + [(0, 0)] * (vol.ndim - 1)
         patch = np.pad(patch, pad_width, mode="edge")
     return patch.copy()
+
+
+def _channelwise_3d(
+    vol: Optional[np.ndarray], fn) -> Optional[np.ndarray]:
+    """对 (C,D,H,W) 逐通道应用 3D 体操作；3D 输入会先补通道维。"""
+    if vol is None:
+        return None
+    if vol.ndim == 3:
+        vol = vol[np.newaxis]
+    if vol.ndim != 4:
+        raise ValueError(f"Expected 3D or 4D volume, got {vol.ndim}D")
+    out = [fn(ch) for ch in vol]
+    return np.stack(out, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +478,11 @@ class Volume3DCubic(VolumeNpzDatasetBase):
         cache_enabled              : bool = True,
         cache_max_volumes          : int = 0,
         region_weights             : Optional[List[float]] = None,
+        cond_normalize             : str = "minmax",
+        cond_intensity_min         : float = -1024.0,
+        cond_intensity_max         : float = 1024.0,
+        cond_global_mean           : float = 0.0,
+        cond_global_std            : float = 1.0,
         npz_paths                  : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
@@ -428,7 +500,12 @@ class Volume3DCubic(VolumeNpzDatasetBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            cond_normalize       = cond_normalize,
+            cond_intensity_min   = cond_intensity_min,
+            cond_intensity_max   = cond_intensity_max,
+            cond_global_mean     = cond_global_mean,
+            cond_global_std      = cond_global_std)
         
         self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
@@ -475,7 +552,8 @@ class Volume3DCubic(VolumeNpzDatasetBase):
 
         rw_vol = (self._load_region_weight(vol_idx)
                   if self._has_region_weight_file(vol_idx) else None)
-        return self._getitem_max_fov(center, img, lbl, rw_vol, eD, eH, eW)
+        cond_vol = self._load_cond(vol_idx)
+        return self._getitem_max_fov(center, img, lbl, rw_vol, cond_vol, eD, eH, eW)
 
     def _getitem_max_fov(
         self,
@@ -483,6 +561,7 @@ class Volume3DCubic(VolumeNpzDatasetBase):
         img   : np.ndarray,
         lbl   : np.ndarray,
         rw_vol: Optional[np.ndarray],
+        cond_vol: Optional[np.ndarray],
         eD    : int,
         eH    : int,
         eW    : int) -> Dict[str, torch.Tensor]:
@@ -496,6 +575,9 @@ class Volume3DCubic(VolumeNpzDatasetBase):
         lbl_s = _extract_cubic_patch(lbl, center, size_max)
         rw_s  = (_extract_cubic_patch(rw_vol, center, size_max)
                 if rw_vol is not None else None)
+        cond_s = (_channelwise_3d(
+            cond_vol, lambda ch: _extract_cubic_patch(ch, center, size_max))
+            if cond_vol is not None else None)
 
         result = {
             # 领头 "1" = 压叠 C_res 轴；trainer 逐视图裁+resize。
@@ -510,6 +592,10 @@ class Volume3DCubic(VolumeNpzDatasetBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        if cond_s is not None:
+            cond_s = resize_3d(cond_s, eD_max, eH_max, eW_max, is_label=False)
+            result["cond"] = torch.from_numpy(
+                np.ascontiguousarray(cond_s.astype(np.float32, copy=False)))
         return result
 
     def _safe_center_range(
@@ -583,6 +669,11 @@ class Volume3DWhole(VolumeNpzDatasetBase):
         cache_enabled       : bool = True,
         cache_max_volumes   : int = 0,
         region_weights      : Optional[List[float]] = None,
+        cond_normalize      : str = "minmax",
+        cond_intensity_min  : float = -1024.0,
+        cond_intensity_max  : float = 1024.0,
+        cond_global_mean    : float = 0.0,
+        cond_global_std     : float = 1.0,
         npz_paths           : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
@@ -600,7 +691,12 @@ class Volume3DWhole(VolumeNpzDatasetBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            cond_normalize       = cond_normalize,
+            cond_intensity_min   = cond_intensity_min,
+            cond_intensity_max   = cond_intensity_max,
+            cond_global_mean     = cond_global_mean,
+            cond_global_std      = cond_global_std)
         # 3 轴同步过采样：与 cubic 一致，给增强（旋转/弹性）留中心裁余量。
         self.extract_size = tuple(
             int(round(p * self.oversample)) for p in self.patch_size)
@@ -618,6 +714,9 @@ class Volume3DWhole(VolumeNpzDatasetBase):
         # 全卷单次 3D zoom。
         img_r = resize_3d(img, eD, eH, eW, is_label=False)
         lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
+        cond_r = self._load_cond(vol_idx)
+        if cond_r is not None:
+            cond_r = resize_3d(cond_r, eD, eH, eW, is_label=False)
 
         result = {
             "image": torch.from_numpy(img_r[np.newaxis]).float(),
@@ -634,4 +733,7 @@ class Volume3DWhole(VolumeNpzDatasetBase):
             rw_vol = compute_region_weight_map(
                 lbl_r, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(rw_vol).float()
+        if cond_r is not None:
+            result["cond"] = torch.from_numpy(
+                np.ascontiguousarray(cond_r.astype(np.float32, copy=False)))
         return result
