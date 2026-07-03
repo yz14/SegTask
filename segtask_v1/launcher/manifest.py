@@ -205,6 +205,8 @@ def _augment_fields() -> List[Field]:
         "enabled",
         "random_flip_prob", "random_flip_axes",
         "random_affine_prob", "random_rotate_range", "random_scale_range",
+        "random_rotate_range_per_axis", "random_affine_aspect_correct",
+        "random_translate_range",
         "elastic_deform_prob", "elastic_deform_sigma", "elastic_deform_alpha",
         "grid_dropout_prob", "grid_dropout_ratio", "grid_dropout_holes",
         "random_brightness_prob", "random_brightness_range",
@@ -213,6 +215,7 @@ def _augment_fields() -> List[Field]:
         "gaussian_noise_prob", "gaussian_noise_std",
         "gaussian_blur_prob", "gaussian_blur_sigma",
         "simulate_lowres_prob", "simulate_lowres_zoom",
+        "intensity_clamp",
         "wmap_interp_mode",
     ]
     dep = [_truthy("augment.enabled")]
@@ -394,6 +397,7 @@ def _train_fields() -> List[Field]:
         Field("train.compile_mode"),
         Field("train.use_ema"),
         Field("train.ema_decay", depends_on=[_truthy("train.use_ema")]),
+        Field("train.ema_warmup", depends_on=[_truthy("train.use_ema")]),
         Field("train.output_dir"),
         Field("train.save_every"),
         Field("train.save_keep_last"),

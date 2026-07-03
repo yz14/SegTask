@@ -156,7 +156,8 @@ class Trainer:
         self.scaler = GradScaler("cuda", enabled=self._scaler_active)
 
         # --- EMA -------------------------------------------------------
-        self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
+        self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup)
+                    if tc.use_ema else None)
 
         # --- torch.compile (最后) -------------------------------------
         self._compile_enabled = False
