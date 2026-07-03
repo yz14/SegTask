@@ -396,6 +396,7 @@ def _train_fields() -> List[Field]:
         Field("train.ema_decay", depends_on=[_truthy("train.use_ema")]),
         Field("train.output_dir"),
         Field("train.save_every"),
+        Field("train.save_keep_last"),
         Field("train.save_best_criterion"),
         Field("train.surface_dice_tolerance", depends_on=[_in("train.save_best_criterion", ["dice+surface_dice", "balanced"])]),
         Field("train.surface_dice_weight", depends_on=[_in("train.save_best_criterion", ["dice+surface_dice"])]),

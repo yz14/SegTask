@@ -312,12 +312,10 @@ class PatchValEvaluator(ValEvaluator):
     def evaluate(self, epoch: int) -> Dict[str, float]:
         t = self.trainer
         acc = self._new_accumulator()
-        world_size = get_world_size()
-        rank = getattr(t, "_rank", 0)
-        # 多卡：按 batch 序号把 val patch 不相交地切给各 rank（i%ws==rank）。
-        for i, batch in enumerate(t.val_loader):
-            if world_size > 1 and (i % world_size) != rank:
-                continue
+        # 多卡切分在 DataLoader 采样器层完成（loader.ValBatchShardSampler 按
+        # batch 块把 val 不相交切给各 rank，worker 只生产本 rank 的 batch），
+        # 此处直接全量迭代本 rank 的 loader。
+        for batch in t.val_loader:
             image = batch["image"].to(t.device, non_blocking=True)
             label = batch["label"].to(t.device, non_blocking=True).float()
 
