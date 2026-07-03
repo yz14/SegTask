@@ -63,7 +63,8 @@ class GPUAugmentor:
             c.grid_dropout_holes, weight_map=weight_map)
 
         # Intensity (image only)。开 intensity_clamp 时记录增强前逐样本逐通道
-        # min/max，全部强度增强后夹回原范围，避免叠加越界。
+        # min/max，全部强度增强后夹回原范围；这是比 nnU-Net 更激进的取舍，
+        # 可关掉 intensity_clamp。这样会把所有强度增强都压回增强前范围。
         if c.intensity_clamp:
             reduce_dims = tuple(range(2, image.ndim))
             clamp_lo = image.amin(dim=reduce_dims, keepdim=True)
@@ -112,7 +113,10 @@ def _random_affine(
 
     rotate_range_per_axis：3 对 [lo,hi]（度），轴序 (x,y,z)=(W,H,D)；None 时三轴共用 rotate_range。
     aspect_correct：True 时在物理各向同性坐标里旋转（R←A⁻¹RA，A=diag(W,H,D)），
-    消除各向异性 patch 上 affine_grid 归一化坐标旋转隐含的剪切/非均匀缩放。
+    消除各向异性 patch 上 affine_grid 归一化坐标旋转隐含的剪切/非均匀缩放；
+    这里只修正 voxel-count 维度比例，不含真实物理 spacing。若 data.spacing_normalization=False，
+    厚切片 z 与面内 spacing 不一致时，out-of-plane 旋转仍会受物理各向异性影响；要做物理正确旋转，
+    需要先启用 data.spacing_normalization 统一到 isotropic target_spacing。
     translate_range：[lo,hi]（归一化坐标，[-1,1] 跨整轴），逐轴独立采样；None/[0,0]=无平移。
     """
     B, _, D, H, W = image.shape
@@ -175,9 +179,9 @@ def _build_rotation_matrices(
     """从欧拉角（N×3 rad）与 scales（N×1）构建 (N,3,4) 仿射矩阵。
 
     translations：(N,3) 归一化平移；None=无平移。
-    aspect：(3,) 各轴物理尺度比例（轴序 (x,y,z)=(W,H,D)）；非 None 时对旋转
-    做共轭校正 R←A⁻¹RA，使旋转在物理各向同性坐标里进行（各同性 scale
-    与对角阵可交换，不受影响）。
+    aspect：(3,) 各轴尺度比例（轴序 (x,y,z)=(W,H,D)）；非 None 时对旋转
+    做共轭校正 R←A⁻¹RA，使旋转在 voxel-count 各向同性坐标里进行（各同性 scale
+    与对角阵可交换，不受影响）。这不代替真实 spacing 校正。
     """
     N = angles.shape[0]
     device = angles.device
