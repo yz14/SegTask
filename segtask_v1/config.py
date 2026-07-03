@@ -662,6 +662,10 @@ class TrainConfig:
     # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
 
+    # 仅对 backbone=='mednext' 有效：将预训练 checkpoint 的深度卷积权重按当前
+    # mednext_kernel_size 做 UpKern 插值迁移（k=3→k=5 等）。
+    pretrain_upkern: bool = False
+
     # ---- 多卡 DDP（DistributedDataParallel）----------------------------
     # 要使用的**物理 GPU 卡号列表**（如 [0, 2, 5, 7]）。
     #   * [] / 单元素                 → 单卡（或 CPU）路径，行为与历史完全一致；
@@ -1721,6 +1725,11 @@ class Config:
         _require(
             0.0 <= float(self.train.surface_dice_weight) <= 1.0,
             f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}")
+        if self.train.pretrain_upkern and self.model.backbone != "mednext":
+            logger.warning(
+                "train.pretrain_upkern=True only affects backbone='mednext'; "
+                "current backbone=%r, so UpKern remap will be ignored.",
+                self.model.backbone)
         # 多卡 DDP 选卡列表：物理卡号、非负、互不重复。
         gpus = list(self.train.gpus)
         _require(
