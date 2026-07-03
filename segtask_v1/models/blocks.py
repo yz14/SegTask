@@ -397,16 +397,75 @@ def _resolve_attn_heads(channels: int, num_heads: int, head_dim: int) -> int:
     return num_heads
 
 
+def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.unbind(dim=-1)
+    return torch.stack((-x2, x1), dim=-1)
+
+
+def _apply_rope_nd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    spatial_shape: Sequence[int],
+    position_offsets: Sequence[int] = (),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """按空间坐标对 q/k 施加 nD RoPE；多余通道保留不转。"""
+    if not spatial_shape:
+        return q, k
+    num_axes = len(spatial_shape)
+    head_dim = q.shape[-1]
+    rot_dim = (head_dim // (2 * num_axes)) * 2
+    if rot_dim < 2:
+        return q, k
+    if position_offsets:
+        if len(position_offsets) != num_axes:
+            raise ValueError(
+                f"RoPE position_offsets length ({len(position_offsets)}) "
+                f"must match spatial axes ({num_axes}).")
+        offsets = [int(v) for v in position_offsets]
+    else:
+        offsets = [0] * num_axes
+
+    coords = [torch.arange(s, device=q.device) + off
+              for s, off in zip(spatial_shape, offsets)]
+    mesh = torch.meshgrid(*coords, indexing="ij")
+    flat_coords = [m.reshape(-1) for m in mesh]
+    tokens = flat_coords[0].numel()
+    rot_pairs = rot_dim // 2
+    q_out = q.clone()
+    k_out = k.clone()
+    for axis, pos in enumerate(flat_coords):
+        start = axis * rot_dim
+        end = start + rot_dim
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(
+                0, rot_dim, 2, device=q.device, dtype=torch.float32) / rot_dim))
+        angles = pos.to(dtype=torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
+        cos = angles.cos().to(dtype=q.dtype).view(1, 1, tokens, rot_pairs, 1)
+        sin = angles.sin().to(dtype=q.dtype).view(1, 1, tokens, rot_pairs, 1)
+
+        q_blk = q_out[..., start:end].reshape(*q_out.shape[:-1], rot_pairs, 2)
+        k_blk = k_out[..., start:end].reshape(*k_out.shape[:-1], rot_pairs, 2)
+        q_out[..., start:end] = (
+            q_blk * cos + _rope_rotate_half(q_blk) * sin).flatten(-2)
+        k_out[..., start:end] = (
+            k_blk * cos + _rope_rotate_half(k_blk) * sin).flatten(-2)
+    return q_out, k_out
+
+
 class _SoftmaxQKVAttention(nn.Module):
     """标准多头 softmax 自注意力，输入 qkv=(B, 3*C, N)，输出 (B, C, N)。
 
-    采用 SDPA，计算仍是 O(N²)，但可走更省显存的 fused backend。"""
+    采用 SDPA，计算仍是 O(N²)，但可走更省显存的 fused backend；可选 RoPE。"""
 
-    def __init__(self, num_heads: int):
+    def __init__(self, num_heads: int, use_rope: bool = False,
+                 spatial_dims: int = 3):
         super().__init__()
         self.num_heads = num_heads
+        self.use_rope = bool(use_rope)
+        self.spatial_dims = _check_dims(spatial_dims)
 
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    def forward(self, qkv: torch.Tensor,
+                spatial_shape: Sequence[int] = ()) -> torch.Tensor:
         bs, width, length = qkv.shape
         ch = width // (3 * self.num_heads)
         qkv_h = rearrange(qkv, "b (h c3) n -> b h c3 n", h=self.num_heads)
@@ -414,6 +473,10 @@ class _SoftmaxQKVAttention(nn.Module):
         q = q.permute(0, 1, 3, 2)
         k = k.permute(0, 1, 3, 2)
         v = v.permute(0, 1, 3, 2)
+        if self.use_rope:
+            if not spatial_shape:
+                raise ValueError("RoPE requires spatial_shape in forward().")
+            q, k = _apply_rope_nd(q, k, spatial_shape)
         a = F.scaled_dot_product_attention(q, k, v)
         a = a.permute(0, 1, 3, 2)
         return rearrange(a, "b h c n -> b (h c) n")
@@ -430,7 +493,8 @@ class _LinearQKVAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    def forward(self, qkv: torch.Tensor,
+                spatial_shape: Sequence[int] = ()) -> torch.Tensor:
         h = self.num_heads
         ch = qkv.shape[1] // (3 * h)
         qkv_h = rearrange(qkv, "b (h c) l -> b h c l", h=h)
@@ -448,6 +512,7 @@ class SelfAttentionBlock(nn.Module):
 
     结构：x → GroupNorm(PreNorm) → flatten → Conv1d-QKV → {softmax|linear} attn
     → Conv1d-proj(可 zero-init) → unflatten → + x（残差）。
+    可选 RoPE（仅 softmax）与 GEGLU FFN（zero-init 输出投影）。
     """
 
     def __init__(
@@ -458,6 +523,9 @@ class SelfAttentionBlock(nn.Module):
         head_dim    : int = -1,
         norm_groups : int = 32,
         zero_init   : bool = True,
+        use_rope    : bool = False,
+        use_ffn     : bool = False,
+        ffn_ratio   : float = 4.0,
         spatial_dims: int = 3):
         super().__init__()
         _check_dims(spatial_dims)
@@ -465,7 +533,13 @@ class SelfAttentionBlock(nn.Module):
             raise ValueError(
                 f"Unknown self-attention type: {attn_type!r}; "
                 f"expected one of {SELFATTN_TYPES}.")
+        if use_rope and attn_type == "linear":
+            raise ValueError(
+                "SelfAttentionBlock(use_rope=True) is only supported with "
+                "'softmax' attention; linear attention factorization does not "
+                "support position-coupled q/k rotation.")
         self.spatial_dims = spatial_dims
+        self.use_rope = bool(use_rope)
         self.num_heads = _resolve_attn_heads(channels, num_heads, head_dim)
         g = norm_groups
         while channels % g != 0 and g > 1:
@@ -473,21 +547,43 @@ class SelfAttentionBlock(nn.Module):
         self.norm = nn.GroupNorm(g, channels)
         self.qkv = nn.Conv1d(channels, channels * 3, 1)
         self.attn = (
-            _SoftmaxQKVAttention(self.num_heads) if attn_type == "softmax"
+            _SoftmaxQKVAttention(self.num_heads, use_rope=use_rope,
+                                 spatial_dims=spatial_dims)
+            if attn_type == "softmax"
             else _LinearQKVAttention(self.num_heads))
         self.proj = nn.Conv1d(channels, channels, 1)
         if zero_init:
             nn.init.zeros_(self.proj.weight)
             nn.init.zeros_(self.proj.bias)
+        self.use_ffn = bool(use_ffn)
+        if self.use_ffn:
+            hidden = max(int(channels * float(ffn_ratio)), 1)
+            self.ffn_norm = nn.GroupNorm(g, channels)
+            self.ffn_in = nn.Conv1d(channels, hidden * 2, 1)
+            self.ffn_out = nn.Conv1d(hidden, channels, 1)
+            nn.init.zeros_(self.ffn_out.weight)
+            nn.init.zeros_(self.ffn_out.bias)
+        else:
+            self.ffn_norm = None
+            self.ffn_in = None
+            self.ffn_out = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial = x.shape[2:]
         h = rearrange(self.norm(x), "b c ... -> b c (...)")
         h = self.qkv(h)
-        h = self.attn(h)
+        h = self.attn(h, spatial_shape=spatial)
         h = self.proj(h)
         h = h.unflatten(-1, spatial)
-        return x + h
+        x = x + h
+        if self.use_ffn:
+            f = rearrange(self.ffn_norm(x), "b c ... -> b c (...)")
+            f = self.ffn_in(f)
+            a, b = f.chunk(2, dim=1)
+            f = a * F.gelu(b)
+            f = self.ffn_out(f)
+            x = x + f.unflatten(-1, spatial)
+        return x
 
 
 class AttentionGate3D(nn.Module):
