@@ -34,6 +34,7 @@ from ..config import Config
 from ..data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from ..models.unet import UNet3D
+from ..models.mednext import upkern_remap_state_dict
 from ..utils import (
     AverageMeter, ModelEMA, Timer, compute_dice_per_class, seed_everything,
 )
@@ -1052,6 +1053,24 @@ class Trainer:
         sd = strip_common_prefixes(sd)
 
         bare = unwrap_compile(self.model)
+        if self.cfg.train.pretrain_upkern:
+            target_sd = bare.state_dict()
+            n_upkern = 0
+            for key, src_tensor in sd.items():
+                tgt_tensor = target_sd.get(key)
+                if (tgt_tensor is None or not torch.is_tensor(src_tensor)
+                        or not torch.is_tensor(tgt_tensor)):
+                    continue
+                if (src_tensor.shape != tgt_tensor.shape
+                        and src_tensor.ndim in (4, 5)
+                        and tgt_tensor.ndim == src_tensor.ndim
+                        and src_tensor.shape[:2] == tgt_tensor.shape[:2]
+                        and src_tensor.shape[2:] != tgt_tensor.shape[2:]):
+                    n_upkern += 1
+            sd = upkern_remap_state_dict(sd, bare)
+            logger.info(
+                "Pretrain: applied UpKern remap to %d depthwise tensor(s).",
+                n_upkern)
         result = bare.load_state_dict(sd, strict=strict)
         missing = list(getattr(result, "missing_keys", []) or [])
         unexpected = list(getattr(result, "unexpected_keys", []) or [])

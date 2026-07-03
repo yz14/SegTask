@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .blocks import DropPath, GlobalResponseNorm, _CONV, make_attention
 
@@ -26,6 +27,49 @@ def _channelwise_groupnorm(num_channels: int) -> nn.GroupNorm:
     """通道级 GroupNorm（num_groups == num_channels）：MedNeXt 原作选型，
     等价逐通道按空间统计，小 batch 比 LayerNorm/BatchNorm 更稳。"""
     return nn.GroupNorm(num_groups=num_channels, num_channels=num_channels)
+
+
+def upkern_remap_state_dict(src_sd: dict, target_model: nn.Module) -> dict:
+    """把小核 MedNeXt checkpoint 的深度卷积权重插值到目标大核。
+
+    仅处理与目标参数同名、同 rank、同通道形状的 depthwise-conv-like 权重：
+    ``(C, 1, k, k[, k])``。当仅空间核尺寸不一致时，按空间维做
+    ``bilinear``/``trilinear`` 插值并保留其余张量不变；不在目标模型中的键
+    直接丢弃，无法对齐的张量也保持目标模型初始化值。
+
+    Parameters
+    ----------
+    src_sd:
+        源 checkpoint 的 state_dict。
+    target_model:
+        目标 MedNeXt 模型，用于提供目标形状。
+    """
+    target_sd = target_model.state_dict()
+    remapped = {}
+    for key, src_tensor in src_sd.items():
+        tgt_tensor = target_sd.get(key)
+        if tgt_tensor is None or not torch.is_tensor(src_tensor):
+            continue
+        if not torch.is_tensor(tgt_tensor):
+            continue
+        if src_tensor.shape == tgt_tensor.shape:
+            remapped[key] = src_tensor
+            continue
+        if (src_tensor.ndim not in (4, 5)
+                or tgt_tensor.ndim != src_tensor.ndim
+                or src_tensor.shape[:2] != tgt_tensor.shape[:2]):
+            continue
+        if src_tensor.shape[2:] == tgt_tensor.shape[2:]:
+            remapped[key] = src_tensor
+            continue
+        mode = "bilinear" if src_tensor.ndim == 4 else "trilinear"
+        spatial = tuple(int(s) for s in tgt_tensor.shape[2:])
+        work = src_tensor.detach().to(dtype=torch.float32)
+        work = work.reshape(work.shape[0] * work.shape[1], 1, *work.shape[2:])
+        work = F.interpolate(work, size=spatial, mode=mode, align_corners=True)
+        work = work.reshape(*tgt_tensor.shape).to(dtype=src_tensor.dtype)
+        remapped[key] = work
+    return remapped
 
 
 class MedNeXtBlock(nn.Module):
@@ -137,3 +181,11 @@ class MedNeXtStage(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.blocks(x)
+
+
+__all__ = [
+    "MedNeXtBlock",
+    "MedNeXtAdaptBlock",
+    "MedNeXtStage",
+    "upkern_remap_state_dict",
+]
