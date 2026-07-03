@@ -552,6 +552,9 @@ class TrainConfig:
     # Checkpoint 保存。
     output_dir      : str = "outputs"
     save_every      : int = 10
+    # 周期 checkpoint 保留策略：仅保留最近 k 个 checkpoint_epoch_*.pth，更早的
+    # 自动删除（best_model.pth 不受影响）。<=0 = 不清理（保留全部）。
+    save_keep_last  : int = 3
     # 选模标准（互斥）：
     #   * "loss"              → val_loss ↓
     #   * "dice"              → mean_dice ↑

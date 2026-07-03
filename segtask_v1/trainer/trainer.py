@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -928,6 +929,27 @@ class Trainer:
             path = self.output_dir / f"checkpoint_epoch_{epoch + 1}.pth"
             torch.save(state, path)
             logger.debug("Checkpoint saved: %s", path)
+            self._prune_old_checkpoints()
+
+    def _prune_old_checkpoints(self) -> None:
+        """周期 checkpoint 的 keep-last-k 保留：仅留最近 ``save_keep_last`` 个
+        ``checkpoint_epoch_*.pth``，更早的删除；``best_model.pth`` 不受影响。
+        ``save_keep_last <= 0`` 时不清理。仅 rank0 调用（由 ``_save_checkpoint`` 保证）。"""
+        keep = int(self.cfg.train.save_keep_last)
+        if keep <= 0:
+            return
+        ckpts = []
+        for p in self.output_dir.glob("checkpoint_epoch_*.pth"):
+            m = re.fullmatch(r"checkpoint_epoch_(\d+)\.pth", p.name)
+            if m:
+                ckpts.append((int(m.group(1)), p))
+        ckpts.sort(key=lambda t: t[0])
+        for _, p in ckpts[:-keep]:
+            try:
+                p.unlink()
+                logger.debug("Pruned old checkpoint: %s", p)
+            except OSError as e:  # 清理失败不影响训练
+                logger.warning("Failed to prune old checkpoint %s: %s", p, e)
 
     def _load_checkpoint(self, path: str) -> None:
         logger.info("Loading checkpoint: %s", path)
