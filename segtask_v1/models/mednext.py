@@ -16,16 +16,245 @@ Block（C 通道输入，参照论文 §2.1，3 层 mirror Transformer）:
 
 from __future__ import annotations
 
+from itertools import product
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from .blocks import DropPath, GlobalResponseNorm, _CONV, make_attention
+from .blocks import DropPath, GlobalResponseNorm, _BN, _CONV, make_attention
 
 
 def _channelwise_groupnorm(num_channels: int) -> nn.GroupNorm:
     """通道级 GroupNorm（num_groups == num_channels）：MedNeXt 原作选型，
     等价逐通道按空间统计，小 batch 比 LayerNorm/BatchNorm 更稳。"""
     return nn.GroupNorm(num_groups=num_channels, num_channels=num_channels)
+
+
+def _default_dilated_reparam_branches(kernel_size: int) -> list[tuple[int, int]]:
+    """按 K 生成默认 UniRepLKNet 风格分支（仅小集合，便于调参与验证）。"""
+    base = {
+        3: [(3, 1)],
+        5: [(3, 1), (3, 2)],
+        7: [(3, 1), (5, 2), (3, 3)],
+    }
+    specs = base.get(int(kernel_size), [(3, 1), (3, 2), (3, 3)])
+    out = []
+    for k, d in specs:
+        eff = (k - 1) * d + 1
+        if eff <= kernel_size:
+            out.append((k, d))
+    return out
+
+
+def _validate_dilated_reparam_branches(
+    kernel_size: int,
+    branch_kernel_sizes: list[int] | None,
+    branch_dilations: list[int] | None,
+) -> list[tuple[int, int]]:
+    """规整/校验显式分支配置；空列表则回退默认分支集。"""
+    k = int(kernel_size)
+    if branch_kernel_sizes is None and branch_dilations is None:
+        return _default_dilated_reparam_branches(k)
+    if not branch_kernel_sizes and not branch_dilations:
+        return _default_dilated_reparam_branches(k)
+    if not branch_kernel_sizes or not branch_dilations:
+        raise ValueError(
+            "dilated_reparam branch override requires both "
+            "branch_kernel_sizes and branch_dilations.")
+    if len(branch_kernel_sizes) != len(branch_dilations):
+        raise ValueError(
+            "dilated_reparam branch override lists must have the same length.")
+    specs: list[tuple[int, int]] = []
+    for bk, bd in zip(branch_kernel_sizes, branch_dilations):
+        bk = int(bk)
+        bd = int(bd)
+        eff = (bk - 1) * bd + 1
+        if bk % 2 != 1:
+            raise ValueError(
+                f"dilated_reparam branch kernel must be odd, got {bk}.")
+        if bd < 1:
+            raise ValueError(
+                f"dilated_reparam branch dilation must be >= 1, got {bd}.")
+        if eff % 2 != 1:
+            raise ValueError(
+                f"dilated_reparam effective kernel must be odd, got "
+                f"kernel={bk}, dilation={bd}, effective={eff}.")
+        if eff > k:
+            raise ValueError(
+                f"dilated_reparam effective kernel {eff} exceeds target "
+                f"kernel_size={k}.")
+        specs.append((bk, bd))
+    return specs
+
+
+def _fold_conv_bn(
+    conv: nn.Module,
+    bn: nn.modules.batchnorm._BatchNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """把 Conv + BN 折叠成等价的卷积权重和偏置。"""
+    weight = conv.weight
+    bias = conv.bias
+    if bias is None:
+        bias = torch.zeros(weight.shape[0], device=weight.device,
+                           dtype=weight.dtype)
+    gamma = bn.weight
+    beta = bn.bias
+    mean = bn.running_mean
+    var = bn.running_var
+    eps = bn.eps
+    std = torch.sqrt(var + eps)
+    scale = gamma / std
+    view_shape = (weight.shape[0],) + (1,) * (weight.ndim - 1)
+    weight = weight * scale.reshape(view_shape)
+    bias = beta + (bias - mean) * scale
+    return weight, bias
+
+
+def _expand_dilated_kernel(
+    weight: torch.Tensor,
+    target_kernel_size: int,
+    dilation: int,
+) -> torch.Tensor:
+    """把 dilated depthwise kernel 展开到目标大核尺寸。"""
+    spatial_dims = weight.ndim - 2
+    k = int(weight.shape[-1])
+    eff = (k - 1) * int(dilation) + 1
+    if eff > target_kernel_size:
+        raise ValueError(
+            f"effective kernel {eff} exceeds target kernel_size="
+            f"{target_kernel_size}.")
+    expanded = weight.new_zeros(
+        (weight.shape[0], weight.shape[1]) + (eff,) * spatial_dims)
+    for idx in product(range(k), repeat=spatial_dims):
+        target_idx = tuple(i * dilation for i in idx)
+        expanded[(slice(None), slice(None)) + target_idx] = weight[
+            (slice(None), slice(None)) + idx]
+    pad = (target_kernel_size - eff) // 2
+    if pad > 0:
+        pad_spec = []
+        for _ in range(spatial_dims):
+            pad_spec.extend((pad, pad))
+        expanded = F.pad(expanded, tuple(reversed(pad_spec)))
+    return expanded
+
+
+class DilatedReparamBlock(nn.Module):
+    """UniRepLKNet/RepLK 风格的可重参数化深度卷积块。
+
+    训练态：大核 depthwise conv + BN 与若干 dilated depthwise 分支 + 各自 BN
+    并行求和。
+    推理态：把所有分支的 Conv+BN 折叠并展开到同一大核后，重参数化为单个
+    depthwise Conv，零额外推理开销。
+
+    这里内部使用 BatchNorm 仅为精确 fold 需要；它只存在于训练/折叠前的模块
+    结构中，和 MedNeXt 主干里沿用的通道级 GroupNorm 互不冲突。
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        *,
+        branch_kernel_sizes: list[int] | None = None,
+        branch_dilations: list[int] | None = None,
+        spatial_dims: int = 3):
+        super().__init__()
+        d = spatial_dims
+        if kernel_size % 2 != 1:
+            raise ValueError(f"kernel_size must be odd, got {kernel_size}.")
+        self.channels = int(channels)
+        self.kernel_size = int(kernel_size)
+        self.spatial_dims = d
+        self.branch_specs = _validate_dilated_reparam_branches(
+            self.kernel_size, branch_kernel_sizes, branch_dilations)
+        Conv = _CONV[d]
+        BN = _BN[d]
+
+        self.lk = Conv(
+            channels, channels, kernel_size=kernel_size, padding=kernel_size // 2,
+            groups=channels, bias=False)
+        self.lk_bn = BN(channels)
+        self.branches = nn.ModuleList()
+        for bk, bd in self.branch_specs:
+            eff = (bk - 1) * bd + 1
+            self.branches.append(nn.Sequential(
+                Conv(
+                    channels, channels, kernel_size=bk, padding=eff // 2,
+                    dilation=bd, groups=channels, bias=False),
+                BN(channels),
+            ))
+        self.deploy = False
+        self.reparam = None
+
+    def _branch_to_kernel_bias(self, branch: nn.Sequential) -> tuple[torch.Tensor, torch.Tensor]:
+        conv = branch[0]
+        bn = branch[1]
+        weight, bias = _fold_conv_bn(conv, bn)
+        if conv.dilation[0] != 1:
+            weight = _expand_dilated_kernel(weight, self.kernel_size, conv.dilation[0])
+        elif weight.shape[-1] != self.kernel_size:
+            pad = (self.kernel_size - weight.shape[-1]) // 2
+            if pad > 0:
+                pad_spec = []
+                for _ in range(self.spatial_dims):
+                    pad_spec.extend((pad, pad))
+                weight = F.pad(weight, tuple(reversed(pad_spec)))
+        return weight, bias
+
+    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回折叠后的等效大核和 bias。"""
+        weight, bias = _fold_conv_bn(self.lk, self.lk_bn)
+        if weight.shape[-1] != self.kernel_size:
+            pad = (self.kernel_size - weight.shape[-1]) // 2
+            if pad > 0:
+                pad_spec = []
+                for _ in range(self.spatial_dims):
+                    pad_spec.extend((pad, pad))
+                weight = F.pad(weight, tuple(reversed(pad_spec)))
+        for branch in self.branches:
+            bw, bb = self._branch_to_kernel_bias(branch)
+            weight = weight + bw
+            bias = bias + bb
+        return weight, bias
+
+    def switch_to_deploy(self) -> "DilatedReparamBlock":
+        """重参数化为单个 depthwise Conv；重复调用保持幂等。"""
+        if self.deploy:
+            return self
+        weight, bias = self.get_equivalent_kernel_bias()
+        Conv = _CONV[self.spatial_dims]
+        reparam = Conv(
+            self.channels, self.channels,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            groups=self.channels,
+            bias=True)
+        reparam.weight.data.copy_(weight)
+        reparam.bias.data.copy_(bias)
+        self.reparam = reparam
+        self.deploy = True
+        del self.lk
+        del self.lk_bn
+        del self.branches
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.deploy:
+            return self.reparam(x)
+        out = self.lk_bn(self.lk(x))
+        for branch in self.branches:
+            out = out + branch(x)
+        return out
+
+
+def reparameterize_model(model: nn.Module) -> nn.Module:
+    """递归调用所有子模块的 ``switch_to_deploy``。"""
+    for module in list(model.modules()):
+        switch = getattr(module, "switch_to_deploy", None)
+        if callable(switch):
+            switch()
+    return model
 
 
 class MedNeXtBlock(nn.Module):
@@ -42,16 +271,25 @@ class MedNeXtBlock(nn.Module):
         drop_path     : float = 0.0,
         attention_type: str = "none",
         use_grn       : bool = False,
-        spatial_dims  : int = 3):
+        spatial_dims  : int = 3,
+        dilated_reparam: bool = False,
+        dilated_reparam_branch_kernel_sizes: list[int] | None = None,
+        dilated_reparam_branch_dilations: list[int] | None = None):
         super().__init__()
         d = spatial_dims
         self.spatial_dims = d
         hidden  = int(dim * expand_ratio)
-        padding = kernel_size // 2
-
-        self.dwconv  = _CONV[d](
-            dim, dim, kernel_size=kernel_size, padding=padding,
-            groups=dim, bias=True)
+        if dilated_reparam:
+            self.dwconv = DilatedReparamBlock(
+                dim, kernel_size,
+                branch_kernel_sizes=dilated_reparam_branch_kernel_sizes,
+                branch_dilations=dilated_reparam_branch_dilations,
+                spatial_dims=d)
+        else:
+            padding = kernel_size // 2
+            self.dwconv  = _CONV[d](
+                dim, dim, kernel_size=kernel_size, padding=padding,
+                groups=dim, bias=True)
         self.norm    = _channelwise_groupnorm(dim)
         self.pwconv1 = _CONV[d](dim, hidden, kernel_size=1, bias=True)
         self.act     = nn.GELU()
@@ -88,7 +326,10 @@ class MedNeXtAdaptBlock(nn.Module):
         drop_path     : float = 0.0,
         attention_type: str = "none",
         use_grn       : bool = False,
-        spatial_dims  : int = 3):
+        spatial_dims  : int = 3,
+        dilated_reparam: bool = False,
+        dilated_reparam_branch_kernel_sizes: list[int] | None = None,
+        dilated_reparam_branch_dilations: list[int] | None = None):
         super().__init__()
         d = spatial_dims
         self.proj = (
@@ -99,7 +340,11 @@ class MedNeXtAdaptBlock(nn.Module):
         self.block = MedNeXtBlock(
             out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
             drop_path=drop_path, attention_type=attention_type,
-            use_grn=use_grn, spatial_dims=d)
+            use_grn=use_grn, spatial_dims=d, dilated_reparam=dilated_reparam,
+            dilated_reparam_branch_kernel_sizes=
+            dilated_reparam_branch_kernel_sizes,
+            dilated_reparam_branch_dilations=
+            dilated_reparam_branch_dilations)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(self.proj(x))
@@ -118,7 +363,10 @@ class MedNeXtStage(nn.Module):
         drop_path_rates: list = None,
         attention_type: str = "none",
         use_grn       : bool = False,
-        spatial_dims  : int = 3):
+        spatial_dims  : int = 3,
+        dilated_reparam: bool = False,
+        dilated_reparam_branch_kernel_sizes: list[int] | None = None,
+        dilated_reparam_branch_dilations: list[int] | None = None):
         super().__init__()
         d = spatial_dims
         if drop_path_rates is None:
@@ -126,14 +374,31 @@ class MedNeXtStage(nn.Module):
         blocks = [MedNeXtAdaptBlock(
             in_ch, out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
             drop_path=drop_path_rates[0], attention_type=attention_type,
-            use_grn=use_grn, spatial_dims=d)]
+            use_grn=use_grn, spatial_dims=d, dilated_reparam=dilated_reparam,
+            dilated_reparam_branch_kernel_sizes=
+            dilated_reparam_branch_kernel_sizes,
+            dilated_reparam_branch_dilations=
+            dilated_reparam_branch_dilations)]
         for i in range(1, num_blocks):
             dp = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
             blocks.append(MedNeXtBlock(
                 out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
                 drop_path=dp, attention_type=attention_type,
-                use_grn=use_grn, spatial_dims=d))
+                use_grn=use_grn, spatial_dims=d, dilated_reparam=dilated_reparam,
+                dilated_reparam_branch_kernel_sizes=
+                dilated_reparam_branch_kernel_sizes,
+                dilated_reparam_branch_dilations=
+                dilated_reparam_branch_dilations))
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.blocks(x)
+
+
+__all__ = [
+    "DilatedReparamBlock",
+    "MedNeXtBlock",
+    "MedNeXtAdaptBlock",
+    "MedNeXtStage",
+    "reparameterize_model",
+]
