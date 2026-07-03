@@ -85,6 +85,14 @@ class DataConfig:
     # True=启动时自动调用 make_data 生成；False=要求手动预生成。
     npz_auto_build: bool = True
 
+    # 物理 spacing 归一化开关（B1）。False=现状（不做任何 target-spacing 重采样）；
+    # True=make_data 烘焙阶段把每卷重采样到 target_spacing，Predictor 推理前镜像
+    # 重采样、概率图再回采到原分辨率。改开关须重新烘焙 npz 才生效。
+    spacing_normalization: bool = False
+    # 目标 spacing [sz, sy, sx]（numpy 轴序 (D,H,W)，单位 mm）。仅 spacing_normalization=True 时用。
+    # None=make_data 扫描全数据集头信息取逐轴中位数（nnU-Net 式指纹）后自动落定。
+    target_spacing: Optional[List[float]] = None
+
     # 样本排除清单路径（每行一个 pid）。空=不过滤。
     exclude_list: str = ""
 
@@ -1483,6 +1491,14 @@ class Config:
                     self.data.z_boundary_mode == "edge_pad",
                     "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
                     f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
+
+        # spacing 归一化：target_spacing 若显式给出须为 3 个正数（(D,H,W) mm）。
+        if self.data.spacing_normalization and self.data.target_spacing is not None:
+            ts = self.data.target_spacing
+            _require(
+                len(ts) == 3 and all(float(s) > 0.0 for s in ts),
+                "data.target_spacing must be 3 positive floats [sz, sy, sx] (mm); "
+                f"got {ts}.")
 
         _require(
             self.data.aug_oversample_ratio >= 1.0,

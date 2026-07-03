@@ -117,6 +117,36 @@ def load_nifti_with_spacing(
     return arr, z_spacing
 
 
+def read_nifti_spacing(path: str) -> "Tuple[float, float, float]":
+    """仅读 NIfTI 头（不解码像素）返 (sz, sy, sx) —— numpy 轴序 (D,H,W) 的 mm spacing。
+    sitk GetSpacing 为 (sx, sy, sz)，此处倒转对齐 numpy。非有限/非正退 1.0。"""
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.ReadImageInformation()
+    sp = reader.GetSpacing()  # (sx, sy, sz)
+    sx = float(sp[0]) if len(sp) >= 1 else 1.0
+    sy = float(sp[1]) if len(sp) >= 2 else 1.0
+    sz = float(sp[2]) if len(sp) >= 3 else 1.0
+    out = []
+    for s in (sz, sy, sx):
+        out.append(s if (np.isfinite(s) and s > 0.0) else 1.0)
+    return (out[0], out[1], out[2])
+
+
+def resample_to_spacing(
+    vol: np.ndarray,
+    src_spacing: "Tuple[float, float, float]",
+    target_spacing: "Tuple[float, float, float]",
+    is_label: bool = False) -> np.ndarray:
+    """(D,H,W) 体积从 src_spacing 重采样到 target_spacing（均为 numpy 轴序 (D,H,W) mm）。
+    新尺寸 = round(shape * src/target)（每轴 >=1）；image order=1 线性、label order=0 近邻。"""
+    D, H, W = vol.shape
+    new = []
+    for n, s, t in zip((D, H, W), src_spacing, target_spacing):
+        new.append(max(1, int(round(n * float(s) / float(t)))))
+    return resize_3d(vol, new[0], new[1], new[2], is_label=is_label)
+
+
 def load_nifti_cropped(
     path: str,
     bbox: "Optional[BBox]" = None,
