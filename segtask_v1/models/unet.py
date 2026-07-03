@@ -374,7 +374,9 @@ class UNet3D(nn.Module):
         self.deep_supervision = deep_supervision
         self.spatial_dims     = spatial_dims
 
-        # 主头读最高分辨率 decoder 特征；stem_stride>1 时 forward 末尾上采回输入分辨率。DS 头保留各自分辨率。
+        # 主头读最高分辨率 decoder 特征。stem_stride>1 时 decoder 最高分辨率仍低于
+        # 输入，forward 不做上采样补偿，而是显式 RuntimeError（要求 decoder 拓扑
+        # 与 stem_stride 配套，保证输出 = 输入分辨率）。DS 头保留各自分辨率。
         self.stem_stride = encoder.stem_stride
         # 主头用单层 1×1 conv 输出 logits（nnU-Net 标准做法）：特征加工已由 decoder
         # 各级 block 完成，输出头只需将最精细特征逐体素线性映射到类别通道。

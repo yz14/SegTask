@@ -162,10 +162,18 @@ class AugConfig:
     random_flip_prob: float = 0.2
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
-    # Affine：小角旋转 + 缩放，合成单次 grid_sample。
+    # Affine：小角旋转 + 缩放 + 平移，合成单次 grid_sample。
     random_affine_prob : float = 0.3
     random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
     random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
+    # 逐轴旋转角范围（(x,y,z)=(W,H,D) 三对 [lo,hi]，度）。None=三轴共用
+    # random_rotate_range。CT 惯例：面内(绕 D 轴，即 z)可大角、出面(绕 W/H)宜小角。
+    random_rotate_range_per_axis: Optional[List[List[float]]] = None
+    # 各向异性长宽比校正：在物理各向同性坐标里做旋转（R←A⁻¹RA，A=diag(W,H,D)），
+    # 消除各向异性 patch 上旋转混入的剪切/非均匀缩放。
+    random_affine_aspect_correct: bool = True
+    # 随机平移范围（affine_grid 归一化坐标，[-1,1] 跨整轴）；[0,0]=禁用。
+    random_translate_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
     # 弹性形变（B-spline 随机位移场）。
     elastic_deform_prob : float = 0.2
@@ -196,6 +204,10 @@ class AugConfig:
     # 模拟低分辨率（下采样后上采样）。
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
+
+    # 强度增强后按增强前逐样本逐通道 min/max 夹取（nnU-Net 惯例），避免
+    # brightness/contrast/noise 叠加产生分布外越界值、污染 gamma 语义。
+    intensity_clamp: bool = True
 
     # weight_map 插值模式："nearest" 保持离散权重（默认，含连续手标 wmap）；
     # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
@@ -464,7 +476,9 @@ class LossConfig:
     tversky_beta: float = 0.7
 
     # True：全 batch+空间上汇总 TP/分母后一次除（nnU-Net Dice 默认）。作用于 Dice/Tversky/FocalTversky/GDL。
-    batch_dice: bool = False
+    # 稀疏前景 patch 训练下 per-sample Dice 在空 GT 类上恒≈1（抬高基线、稀释梯度），
+    # 故默认取 nnU-Net 的 batch_dice=True。
+    batch_dice: bool = True
     # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
     ignore_empty: bool = False
 
@@ -548,6 +562,9 @@ class TrainConfig:
     # EMA。
     use_ema  : bool = True
     ema_decay: float = 0.999
+    # EMA decay warmup（timm 式 ramp）：早期用 min(decay, (1+step)/(10+step))，
+    # 避免随机初始权重长时间拖累 shadow、导致早期 best 判定失真。
+    ema_warmup: bool = True
 
     # Checkpoint 保存。
     output_dir      : str = "outputs"
@@ -1375,6 +1392,17 @@ class Config:
             self.augment.wmap_interp_mode in ("nearest", "bilinear"),
             f"Invalid augment.wmap_interp_mode: {self.augment.wmap_interp_mode!r} "
             "(expected 'nearest' or 'bilinear').")
+        per_axis = self.augment.random_rotate_range_per_axis
+        if per_axis is not None:
+            _require(
+                len(per_axis) == 3
+                and all(len(r) == 2 for r in per_axis),
+                "augment.random_rotate_range_per_axis must be 3 [lo,hi] pairs "
+                f"for axes (x,y,z)=(W,H,D); got {per_axis!r}.")
+        _require(
+            len(self.augment.random_translate_range) == 2,
+            "augment.random_translate_range must be [lo, hi]; got "
+            f"{self.augment.random_translate_range!r}.")
 
     def _validate_loss(self) -> None:
         """loss.* 名称与参数校验。"""

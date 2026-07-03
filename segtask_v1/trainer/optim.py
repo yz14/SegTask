@@ -19,16 +19,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Optimizer factory
 # ---------------------------------------------------------------------------
+def _param_groups(model: nn.Module, weight_decay: float) -> list:
+    """参数分组：ndim<=1（norm affine/bias 等向量参数）免 weight decay，
+    ndim>=2（conv/linear 权重）正常衰减。对向量参数做衰减会把归一化尺度/
+    偏置无理由地拉向 0，是 AdamW 惯例上应避免的。"""
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        (no_decay if p.ndim <= 1 else decay).append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     tc = cfg.train
-    params = [p for p in model.parameters() if p.requires_grad]
+    groups = _param_groups(model, tc.weight_decay)
     if   tc.optimizer == "adamw":
-        return torch.optim.AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
+        return torch.optim.AdamW(groups, lr=tc.lr)
     elif tc.optimizer == "adam":
-        return torch.optim.Adam(params, lr=tc.lr, weight_decay=tc.weight_decay)
+        return torch.optim.Adam(groups, lr=tc.lr)
     elif tc.optimizer == "sgd":
         return torch.optim.SGD(
-            params, lr=tc.lr, weight_decay=tc.weight_decay,
+            groups, lr=tc.lr,
             momentum=tc.momentum, nesterov=tc.nesterov)
     raise ValueError(f"Unknown optimizer: {tc.optimizer}")
 
