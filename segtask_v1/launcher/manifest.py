@@ -274,6 +274,8 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.skip_mode", depends_on=unet),
         # 梯度检查点（所有 backbone 通用）。
         Field("model.grad_checkpointing", depends_on=unet),
+        Field("model.grad_ckpt_encoder_stages",
+              depends_on=unet + [_truthy("model.grad_checkpointing")]),
         # ConvNeXt 专属。
         Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         Field("model.convnext_layer_scale_init", depends_on=unet + [_in("model.backbone", ["convnext"])]),
@@ -380,6 +382,7 @@ def _train_fields() -> List[Field]:
         Field("train.optimizer"),
         Field("train.lr"),
         Field("train.weight_decay"),
+        Field("train.adamw_fused"),
         Field("train.momentum", depends_on=sgd),
         Field("train.nesterov", depends_on=sgd),
         Field("train.scheduler"),
@@ -398,6 +401,7 @@ def _train_fields() -> List[Field]:
         Field("train.use_amp"),
         Field("train.amp_dtype", depends_on=[_truthy("train.use_amp")]),
         Field("train.compile_mode"),
+        Field("train.channels_last"),
         Field("train.use_ema"),
         Field("train.ema_decay", depends_on=[_truthy("train.use_ema")]),
         Field("train.ema_warmup", depends_on=[_truthy("train.use_ema")]),

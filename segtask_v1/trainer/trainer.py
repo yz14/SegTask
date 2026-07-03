@@ -12,6 +12,7 @@ fp32 计算与 breakdown 格式化位于 ``trainer.amp`` / ``trainer.breakdown``
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -34,7 +35,7 @@ from ..data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from ..models.unet import UNet3D
 from ..utils import (
-    AverageMeter, ModelEMA, Timer, compute_dice_per_class,
+    AverageMeter, ModelEMA, Timer, compute_dice_per_class, seed_everything,
 )
 from . import views
 from .amp import (
@@ -70,6 +71,18 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# RNG helper
+# ---------------------------------------------------------------------------
+def _reseed_rank_rng(seed: int, rank: int, epoch: int, deterministic: bool) -> None:
+    """按 rank/epoch 重新分流 RNG。rank0 保持原流不动。"""
+    if int(rank) <= 0:
+        return
+    # resume 后 rank>0 重新分流，避免所有 DDP rank 退化成 rank0 的随机流。
+    mix = int(seed) + int(epoch) * 100003 + int(rank)
+    seed_everything(mix, deterministic)
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 class Trainer:
@@ -90,6 +103,13 @@ class Trainer:
 
         # 顺序：先 to(device)（optimizer/EMA 绑已迁移参数），最后 torch.compile。
         self.model = model.to(device)
+        self._memory_format = None
+        if tc.channels_last:
+            self._memory_format = (
+                torch.channels_last_3d
+                if int(cfg.model.spatial_dims) == 3
+                else torch.channels_last)
+            self.model = self.model.to(memory_format=self._memory_format)
 
         # --- Pipeline (criterion + view ops) -------------------------
         self.base_loss = build_loss(cfg.loss)  # 预设dice/bce等等这些
@@ -127,14 +147,11 @@ class Trainer:
         total_steps     = tc.epochs * steps_per_epoch
         post_warmup     = total_steps - warmup_steps
 
-        # OneCycleLR 自带 warmup，不可与 WarmupScheduler 叠加。
-        if tc.scheduler == "one_cycle" and warmup_steps > 0:
-            raise ValueError(
-                "OneCycleLR has built-in warmup (pct_start). "
-                "Set train.warmup_epochs=0 when using scheduler='one_cycle'.")
-
         base_scheduler = build_scheduler(
             self.optimizer, cfg, steps_per_epoch, post_warmup_steps=post_warmup)
+        # one_cycle 用 warmup_epochs 映射 pct_start，外层不再做线性 warmup，
+        # 避免 warmup 双重叠加。
+        warmup_steps = 0 if tc.scheduler == "one_cycle" else warmup_steps
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
@@ -691,19 +708,27 @@ class Trainer:
 
             # 视图重塑（pipeline 内部决定）
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
+            if self._memory_format is not None:
+                image = image.to(memory_format=self._memory_format)
 
             effective_accum = self._effective_accum(step, total_steps, accum)
+            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
+            # 非边界步免 all-reduce；forward 也必须放进 no_sync。
+            sync_ctx = (self.fwd_model.no_sync()
+                        if (self._is_dist and not is_step_boundary)
+                        else contextlib.nullcontext())
 
             # Forward AMP / Loss fp32（Dice/BCE 在 fp16 下汇总易溢出 → NaN）
-            with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                pred = self.fwd_model(image)
-            breakdown: Dict[str, float] = {}
-            loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
-            collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
-            if effective_accum > 1:
-                loss = loss / effective_accum
+            with sync_ctx:
+                with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                    pred = self.fwd_model(image)
+                breakdown: Dict[str, float] = {}
+                loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
+                if effective_accum > 1:
+                    loss = loss / effective_accum
 
-            self.scaler.scale(loss).backward()
+                self.scaler.scale(loss).backward()
+            collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
 
             # 未缩放损失；非有限值驱动 meter 跳过与无 scaler 路径的优化步保护。
             step_loss = (loss.item() * effective_accum
@@ -728,36 +753,15 @@ class Trainer:
                     else "non-finite loss guard")
 
             # 参数更新
-            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_step_boundary:
-                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
-                # bf16/fp32 无 scaler 保护，本 accum 组内出现非有限 loss 时
-                # 丢弃梯度并跳过 optimizer.step，避免 NaN 永久污染权重与
-                # EMA（scheduler/EMA 照常推进，与 fp16 跳步语义对齐）。
-                skip_optim_step = group_has_nonfinite and not self._scaler_active
-                group_has_nonfinite = False
-                if skip_optim_step:
-                    logger.warning(
-                        "Skipping optimizer step at epoch %d step %d/%d: "
-                        "non-finite loss in this accumulation group "
-                        "(amp_dtype=%s has no GradScaler protection).",
-                        epoch + 1, step + 1, total_steps, self._amp_dtype_name)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    if self.ema is not None:
-                        self.ema.update(unwrap_compile(self.model))
-                    if self._health_monitor:
-                        opt_steps += 1
-                    continue
-                # 健康监测：开 clip 时复用其已算出的范数（零成本）；未开 clip 时
-                # 仅 rank0 按开关手动算一次（AMP fp16 下先 unscale 以免量纲被污染）。
+                # bf16/fp32 无 scaler 保护；这里只复用已算出的范数，不额外引入
+                # per-step 开销。clip 关且健康监测不算范数时，该 guard 不生效。
                 grad_norm_val = None
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
                     gn = nn.utils.clip_grad_norm_(
                         self.model.parameters(), tc.grad_clip_norm)
-                    if self._health_monitor:
-                        grad_norm_val = float(gn)
+                    grad_norm_val = float(gn)
                 elif self._health_monitor and self._health_grad_norm_when_no_clip:
                     try:
                         if self._scaler_active:
@@ -768,6 +772,36 @@ class Trainer:
                             "Health grad-norm computation failed; skipping.",
                             exc_info=True)
                         grad_norm_val = None
+                grad_nonfinite = (
+                    grad_norm_val is not None and not math.isfinite(grad_norm_val))
+                loss_nonfinite = group_has_nonfinite
+
+                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
+                # bf16/fp32 在 loss 或梯度非有限时丢弃本 accum 组梯度，
+                # 避免 NaN 永久污染权重与 EMA（scheduler/EMA 照常推进）。
+                skip_optim_step = (
+                    (loss_nonfinite or grad_nonfinite)
+                    and not self._scaler_active)
+                group_has_nonfinite = False
+                if skip_optim_step:
+                    causes = []
+                    if loss_nonfinite:
+                        causes.append("non-finite loss")
+                    if grad_nonfinite:
+                        causes.append("non-finite gradient")
+                    logger.warning(
+                        "Skipping optimizer step at epoch %d step %d/%d: "
+                        "%s in this accumulation group "
+                        "(amp_dtype=%s has no GradScaler protection).",
+                        epoch + 1, step + 1, total_steps, " and ".join(causes),
+                        self._amp_dtype_name)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    if self.ema is not None:
+                        self.ema.update(unwrap_compile(self.model))
+                    if self._health_monitor:
+                        opt_steps += 1
+                    continue
 
                 # update/weight 比值：每 epoch 仅首个优化步测一次（step 前快照）。
                 pre_step_snapshot = None
@@ -992,6 +1026,10 @@ class Trainer:
                 logger.info("Restored RNG state from checkpoint.")
             except Exception as e:  # pragma: no cover
                 logger.warning("Failed to restore RNG state: %s", e)
+        if self._is_dist and self._rank > 0:
+            _reseed_rank_rng(
+                self.cfg.train.seed, self._rank, self.start_epoch,
+                self.cfg.train.deterministic)
 
         logger.info(
             "Resumed from epoch %d, best=%s=%s (patience=%d)",

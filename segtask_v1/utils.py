@@ -56,33 +56,44 @@ class ModelEMA:
         }
         self._backup: Dict[str, torch.Tensor] = {}
         self._swapped: bool = False
-        # update 热路径缓存：(shadow, live, is_float) 三元组，避免每 step
-        # 重建 state_dict。state_dict 返回的是参数/buffer 本体引用，
-        # 同一 model 实例下跨 step 稳定。
-        self._pairs: Optional[list] = None
+        # update 热路径缓存：按 dtype 分组的 float 列表 + int 配对，避免每步
+        # 逐张量 Python 循环。state_dict 返回参数/buffer 本体引用，同一
+        # model 实例下跨 step 稳定。
+        self._float_groups: Optional[list] = None
+        self._int_pairs: Optional[list] = None
         self._pairs_model_id: Optional[int] = None
 
     def _build_pairs(self, model: nn.Module) -> None:
-        self._pairs = [
-            (self.shadow[k], v, v.is_floating_point())
-            for k, v in model.state_dict().items()
-        ]
+        float_groups = {}
+        int_pairs = []
+        for k, v in model.state_dict().items():
+            shadow = self.shadow[k]
+            if v.is_floating_point():
+                key = (v.device, v.dtype)
+                if key not in float_groups:
+                    float_groups[key] = ([], [])
+                float_groups[key][0].append(shadow)
+                float_groups[key][1].append(v)
+            else:
+                int_pairs.append((shadow, v))
+        self._float_groups = list(float_groups.values())
+        self._int_pairs = int_pairs
         self._pairs_model_id = id(model)
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        if self._pairs is None or self._pairs_model_id != id(model):
+        if self._float_groups is None or self._pairs_model_id != id(model):
             self._build_pairs(model)
         self.num_updates += 1
         decay = self.decay
         if self.warmup:
             decay = min(decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
-        for shadow, live, is_float in self._pairs:
-            if is_float:
-                shadow.mul_(decay).add_(live, alpha=1.0 - decay)
-            else:
-                # 整型 buffer（如 BN num_batches_tracked）直接跟随最新。
-                shadow.copy_(live)
+        for shadow_list, live_list in self._float_groups:
+            torch._foreach_mul_(shadow_list, decay)
+            torch._foreach_add_(shadow_list, live_list, alpha=1.0 - decay)
+        for shadow, live in self._int_pairs:
+            # 整型 buffer（如 BN num_batches_tracked）直接跟随最新。
+            shadow.copy_(live)
 
     @torch.no_grad()
     def apply_shadow(self, model: nn.Module) -> None:
@@ -126,7 +137,8 @@ class ModelEMA:
             self.shadow = {k: v.detach().clone() for k, v in loaded.items()}
             self._backup = {}
             self._swapped = False
-        self._pairs = None
+        self._float_groups = None
+        self._int_pairs = None
         self._pairs_model_id = None
         self.decay = state.get("decay", self.decay)
         self.warmup = state.get("warmup", self.warmup)
@@ -347,6 +359,13 @@ def seed_everything(seed: int, deterministic: bool = False) -> None:
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # Ampere+ 上对残余 fp32 matmul/conv 免费加速；deterministic 下关闭以保证可复现。
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
     else:
         torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     logger.info("Seed set to %d (deterministic=%s)", seed, deterministic)

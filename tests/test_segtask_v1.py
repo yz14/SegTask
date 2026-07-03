@@ -387,6 +387,29 @@ class TestScheduler:
         # LR should have changed
         assert optimizer.param_groups[0]["lr"] != 0.01
 
+    def test_one_cycle_pct_start_follows_warmup_epochs(self):
+        from segtask_v1.config import Config
+        from segtask_v1.trainer import build_scheduler
+
+        cfg = Config()
+        cfg.data.label_values = [0, 1]
+        cfg.data.num_classes = 2
+        cfg.train.scheduler = "one_cycle"
+        cfg.train.epochs = 10
+        cfg.train.warmup_epochs = 2
+        cfg.sync()
+        optimizer = torch.optim.Adam([torch.randn(3, requires_grad=True)], lr=0.01)
+        sched = build_scheduler(
+            optimizer, cfg, steps_per_epoch=5, post_warmup_steps=0)
+        assert sched.total_steps == 50
+        assert sched._schedule_phases[0]["end_step"] + 1 == pytest.approx(10.0, rel=1e-6)
+
+        cfg.train.warmup_epochs = 0
+        cfg.sync()
+        sched0 = build_scheduler(
+            optimizer, cfg, steps_per_epoch=5, post_warmup_steps=0)
+        assert sched0._schedule_phases[0]["end_step"] + 1 == pytest.approx(2.0, rel=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # Region weight map tests (Feature a)

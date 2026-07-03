@@ -38,7 +38,11 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     tc = cfg.train
     groups = _param_groups(model, tc.weight_decay)
     if   tc.optimizer == "adamw":
-        return torch.optim.AdamW(groups, lr=tc.lr)
+        first = next((p for p in model.parameters()), None)
+        on_cuda = first is not None and first.is_cuda
+        use_fused = tc.adamw_fused and torch.cuda.is_available()
+        return torch.optim.AdamW(
+            groups, lr=tc.lr, fused=(use_fused and on_cuda))
     elif tc.optimizer == "adam":
         return torch.optim.Adam(groups, lr=tc.lr)
     elif tc.optimizer == "sgd":
@@ -86,7 +90,7 @@ def build_scheduler(
             optimizer, T_0=max(T_0, 1), T_mult=tc.cosine_restart_mult,
             eta_min=tc.cosine_min_lr)
     elif tc.scheduler == "one_cycle":
-        # 自带 warmup（pct_start）；不可与外层 WarmupScheduler 叠加。
+        # warmup_epochs 映射为 OneCycleLR 的 pct_start；外层 warmup 由 Trainer 关掉。
         total_steps = tc.epochs * steps_per_epoch
         # pct_start 直接按 warmup_epochs/epochs 配比；下限保证 warmup 段
         # 至少 1 个 step（OneCycleLR 要求两段均非空），上限留出退火段。

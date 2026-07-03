@@ -359,7 +359,9 @@ def _resolve_attn_heads(channels: int, num_heads: int, head_dim: int) -> int:
 
 
 class _SoftmaxQKVAttention(nn.Module):
-    """标准多头 softmax 自注意力，输入 qkv=(B, 3*C, N)，输出 (B, C, N)。O(N²)。"""
+    """标准多头 softmax 自注意力，输入 qkv=(B, 3*C, N)，输出 (B, C, N)。
+
+    采用 SDPA，计算仍是 O(N²)，但可走更省显存的 fused backend。"""
 
     def __init__(self, num_heads: int):
         super().__init__()
@@ -368,13 +370,14 @@ class _SoftmaxQKVAttention(nn.Module):
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         bs, width, length = qkv.shape
         ch = width // (3 * self.num_heads)
-        qkv_h = rearrange(qkv, "b (h c) l -> (b h) c l", h=self.num_heads)
-        q, k, v = qkv_h.split(ch, dim=1)
-        scale = 1.0 / math.sqrt(math.sqrt(ch))
-        weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = torch.einsum("bts,bcs->bct", weight, v)
-        return rearrange(a, "(b h) c l -> b (h c) l", h=self.num_heads)
+        qkv_h = rearrange(qkv, "b (h c3) n -> b h c3 n", h=self.num_heads)
+        q, k, v = qkv_h.chunk(3, dim=2)
+        q = q.permute(0, 1, 3, 2)
+        k = k.permute(0, 1, 3, 2)
+        v = v.permute(0, 1, 3, 2)
+        a = F.scaled_dot_product_attention(q, k, v)
+        a = a.permute(0, 1, 3, 2)
+        return rearrange(a, "b h c n -> b (h c) n")
 
 
 class _LinearQKVAttention(nn.Module):

@@ -12,9 +12,11 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import random
 
 import numpy as np
 import torch
+import pytest
 
 # Ensure local import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -285,6 +287,283 @@ def test_bug4_ema_in_place_swap():
     print("[BUG-4] PASS — EMA in-place swap round-trips cleanly.")
 
 
+def test_channels_last_cpu_forward_matches():
+    model_ref = _build_tiny_unet(num_fg=2, deep_supervision=False).eval()
+    model_cl = _build_tiny_unet(num_fg=2, deep_supervision=False).eval()
+    model_cl.load_state_dict(model_ref.state_dict())
+    model_cl = model_cl.to(memory_format=torch.channels_last_3d)
+    x = torch.randn(1, 1, 8, 16, 16)
+    x_cl = x.to(memory_format=torch.channels_last_3d)
+    with torch.no_grad():
+        y_ref = model_ref(x)
+        y_cl = model_cl(x_cl)
+    assert torch.allclose(y_ref, y_cl, atol=1e-6, rtol=1e-5)
+
+
+def test_trainer_channels_last_plumbing_cpu():
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.trainer import Trainer
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.label_values = [0, 1, 2]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.train.channels_last = True
+    cfg.train.use_amp = False
+    cfg.train.use_ema = False
+    cfg.train.compile_mode = "none"
+    cfg.train.epochs = 1
+    cfg.train.val_metric_mode = "medium"
+    cfg.sync()
+    cfg.validate()
+
+    model = build_model(cfg)
+    loader = [{
+        "image": torch.randn(1, cfg.model.in_channels, 8, 16, 16),
+        "label": torch.zeros(1, 1, 8, 16, 16),
+        "weight_map": None,
+    }]
+    trainer = Trainer(model, cfg, loader, loader, torch.device("cpu"))
+    assert trainer._memory_format is torch.channels_last_3d
+    assert next(trainer.model.parameters()).is_contiguous(
+        memory_format=torch.channels_last_3d)
+
+
+def test_compile_eager_ema_smoke_and_prefix_strip():
+    from segtask_v1.trainer.checkpoint import strip_common_prefixes, unwrap_compile
+    from segtask_v1.utils import ModelEMA
+
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile unavailable")
+
+    model = _build_tiny_unet(num_fg=2, deep_supervision=False).eval()
+    compiled = torch.compile(model, backend="eager")
+    base = unwrap_compile(compiled)
+    compiled_sd = compiled.state_dict()
+    assert any(k.startswith("_orig_mod.") for k in compiled_sd)
+    assert set(strip_common_prefixes(compiled_sd).keys()) == set(base.state_dict().keys())
+
+    ema = ModelEMA(base, decay=0.9)
+    assert all(not k.startswith("_orig_mod.") for k in ema.shadow)
+    assert set(ema.shadow.keys()) == set(base.state_dict().keys())
+
+    with torch.no_grad():
+        for p in base.parameters():
+            p.add_(1.0)
+    ema.update(unwrap_compile(compiled))
+    with torch.no_grad():
+        for p in base.parameters():
+            p.add_(2.0)
+    ema.update(unwrap_compile(compiled))
+
+    orig = {k: v.detach().clone() for k, v in base.state_dict().items()}
+    ema.apply_shadow(base)
+    assert set(base.state_dict().keys()) == set(orig.keys())
+    ema.restore(base)
+    for k, v in base.state_dict().items():
+        assert torch.equal(v, orig[k]), k
+
+    synthetic = {
+        "module._orig_mod.foo.weight": torch.ones(1),
+        "_orig_mod.module.bar.bias": torch.ones(1),
+    }
+    stripped = strip_common_prefixes(synthetic)
+    assert set(stripped) == {"foo.weight", "bar.bias"}
+
+
+def test_trainer_one_cycle_warmup_epochs_no_raise():
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.trainer import Trainer
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.label_values = [0, 1]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.train.scheduler = "one_cycle"
+    cfg.train.epochs = 10
+    cfg.train.warmup_epochs = 2
+    cfg.train.use_amp = False
+    cfg.train.use_ema = False
+    cfg.train.compile_mode = "none"
+    cfg.train.val_metric_mode = "medium"
+    cfg.sync()
+    cfg.validate()
+
+    model = build_model(cfg)
+    batch = {
+        "image": torch.randn(1, cfg.model.in_channels, 8, 16, 16),
+        "label": torch.zeros(1, 1, 8, 16, 16),
+        "weight_map": None,
+    }
+    loader = [batch] * 5
+    trainer = Trainer(model, cfg, loader, loader, torch.device("cpu"))
+    assert trainer.scheduler.scheduler.total_steps == 50
+    assert trainer.scheduler.scheduler._schedule_phases[0]["end_step"] + 1 == pytest.approx(10.0, rel=1e-6)
+
+
+def test_trainer_skips_poisoned_nonfinite_grads_on_no_scaler_path():
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.trainer import Trainer
+
+    class _SpyScaler:
+        def __init__(self):
+            self.step_calls = 0
+            self.step_execs = 0
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, optimizer):
+            return None
+
+        def step(self, optimizer):
+            self.step_calls += 1
+            grads_finite = True
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        grads_finite = False
+                        break
+                if not grads_finite:
+                    break
+            if grads_finite:
+                optimizer.step()
+                self.step_execs += 1
+
+        def update(self):
+            return None
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.label_values = [0, 1]
+    cfg.data.num_classes = 2
+    cfg.data.multi_res_scales = [1.0]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.augment.enabled = False
+    cfg.train.epochs = 1
+    cfg.train.scheduler = "cosine"
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_amp = False
+    cfg.train.grad_clip_norm = 1.0
+    cfg.train.use_ema = True
+    cfg.train.compile_mode = "none"
+    cfg.train.val_metric_mode = "medium"
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.train.log_every = 1
+    cfg.train.save_every = 9999
+    cfg.train.val_every = 9999
+    cfg.sync()
+
+    model = build_model(cfg)
+    first_param = next(model.parameters())
+    first_param.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+    batch = {
+        "image": torch.randn(1, cfg.model.in_channels, 8, 16, 16),
+        "label": torch.zeros(1, 1, 8, 16, 16),
+        "weight_map": None,
+    }
+    trainer = Trainer(model, cfg, [batch], [batch], torch.device("cpu"))
+    before = {k: v.detach().clone() for k, v in trainer.model.state_dict().items()}
+
+    trainer._train_epoch(0)
+
+    after = trainer.model.state_dict()
+    for k, v in before.items():
+        assert torch.equal(after[k], v), k
+    assert trainer.scheduler.current_step == 1
+    assert trainer.ema.num_updates == 1
+
+
+def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.trainer import Trainer
+
+    class _SpyScaler:
+        def __init__(self):
+            self.step_calls = 0
+            self.step_execs = 0
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, optimizer):
+            return None
+
+        def step(self, optimizer):
+            self.step_calls += 1
+            grads_finite = True
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        grads_finite = False
+                        break
+                if not grads_finite:
+                    break
+            if grads_finite:
+                optimizer.step()
+                self.step_execs += 1
+
+        def update(self):
+            return None
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.label_values = [0, 1]
+    cfg.data.num_classes = 2
+    cfg.data.multi_res_scales = [1.0]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.augment.enabled = False
+    cfg.train.epochs = 1
+    cfg.train.scheduler = "cosine"
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_amp = False
+    cfg.train.grad_clip_norm = 1.0
+    cfg.train.use_ema = True
+    cfg.train.compile_mode = "none"
+    cfg.train.val_metric_mode = "medium"
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.train.log_every = 1
+    cfg.train.save_every = 9999
+    cfg.train.val_every = 9999
+    cfg.sync()
+
+    model = build_model(cfg)
+    first_param = next(model.parameters())
+    first_param.register_hook(lambda grad: torch.full_like(grad, float("nan")))
+    batch = {
+        "image": torch.randn(1, cfg.model.in_channels, 8, 16, 16),
+        "label": torch.zeros(1, 1, 8, 16, 16),
+        "weight_map": None,
+    }
+    trainer = Trainer(model, cfg, [batch], [batch], torch.device("cpu"))
+    spy = _SpyScaler()
+    trainer.scaler = spy
+    trainer._scaler_active = True
+    before = {k: v.detach().clone() for k, v in trainer.model.state_dict().items()}
+
+    trainer._train_epoch(0)
+
+    after = trainer.model.state_dict()
+    for k, v in before.items():
+        assert torch.equal(after[k], v), k
+    assert spy.step_calls == 1
+    assert spy.step_execs == 0
+    assert trainer.scheduler.current_step == 1
+    assert trainer.ema.num_updates == 1
+
+
 def test_bug5_plateau_mode_from_config():
     """build_scheduler should use plateau mode matching the derived save_best_mode."""
     from segtask_v1.trainer import build_scheduler
@@ -517,6 +796,51 @@ def test_d3_rng_state_roundtrip():
     src_load = inspect.getsource(Trainer._load_checkpoint)
     assert "rng_state" in src_load, "rng_state not restored on load"
     print("[D-3] PASS — rng_state included in save/load paths.")
+
+
+def test_rng_reseed_helper_decorrelates_ranks_after_resume():
+    from segtask_v1.trainer.trainer import _reseed_rank_rng
+    from segtask_v1.utils import seed_everything
+
+    def _sample():
+        return (
+            torch.rand(3).tolist(),
+            np.random.rand(3).tolist(),
+            [random.random() for _ in range(3)],
+        )
+
+    seed_everything(123, deterministic=False)
+    base_t = torch.get_rng_state()
+    base_n = np.random.get_state()
+    base_p = random.getstate()
+
+    def _reset():
+        torch.set_rng_state(base_t)
+        np.random.set_state(base_n)
+        random.setstate(base_p)
+
+    _reset()
+    ref = _sample()
+
+    _reset()
+    _reseed_rank_rng(123, 0, 7, False)
+    rank0 = _sample()
+    assert rank0 == ref
+
+    _reset()
+    _reseed_rank_rng(123, 1, 7, False)
+    rank1 = _sample()
+
+    _reset()
+    _reseed_rank_rng(123, 1, 7, False)
+    rank1_b = _sample()
+    assert rank1 == rank1_b
+
+    _reset()
+    _reseed_rank_rng(123, 2, 7, False)
+    rank2 = _sample()
+
+    assert rank1 != rank2
 
 
 if __name__ == "__main__":

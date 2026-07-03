@@ -320,6 +320,8 @@ class PatchValEvaluator(ValEvaluator):
             label = batch["label"].to(t.device, non_blocking=True).float()
 
             image, label = t.pipeline.prepare_val_batch(image, label)
+            if t._memory_format is not None:
+                image = image.to(memory_format=t._memory_format)
             with autocast(device_type="cuda", enabled=t.use_amp,
                           dtype=t.amp_dtype):
                 pred = t.model(image)
