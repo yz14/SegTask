@@ -53,8 +53,18 @@ class Predictor:
         self.tta_flip = pc.tta_flip
         # TTA flip 变体批量化块大小（None → 退化为 batch_size）；见 forwards._tta_chunk_size。
         self.tta_batch_size: Optional[int] = pc.tta_batch_size
-        self.threshold = pc.threshold
+        # 标量（全类共享）或逐前景类列表；长度校验在 num_fg 确定后（见下方）。
+        self.threshold = (
+            [float(t) for t in pc.threshold]
+            if isinstance(pc.threshold, (list, tuple)) else float(pc.threshold))
+        # 诊断日志用的标量下界（逐类阈值时取最小值）。
+        self.threshold_min = float(np.min(self.threshold))
         self.save_probs = pc.save_probabilities
+        # 滑窗概率累加器 dtype / 落点（大卷 × 多类的显存逃生门）。
+        self.acc_dtype = (torch.float16 if str(pc.acc_dtype) == "fp16"
+                          else torch.float32)
+        self.acc_device = (torch.device("cpu") if pc.accumulate_on_cpu
+                           else device)
         # 逐卷滑窗进度日志开关（运行期内部量，不暴露到配置）：CLI 推理默认 True；
         # 训练内整卷验证（VolumeValEvaluator）会置 False 以免每 epoch 刷屏 81 卷。
         self.log_progress = True
@@ -98,6 +108,11 @@ class Predictor:
         self.patch_D, self.patch_H, self.patch_W = cfg.data.patch_size
         self.label_values = cfg.data.label_values
         self.num_fg = cfg.num_fg_classes
+        if (isinstance(self.threshold, list)
+                and len(self.threshold) != self.num_fg):
+            raise ValueError(
+                f"predict.threshold list length {len(self.threshold)} != "
+                f"num_fg {self.num_fg} (must map 1:1 to label_values[1:]).")
         # 默认单分辨率，避免下游 np.stack 报错。
         self.multi_res_scales = cfg.data.multi_res_scales or [1.0]
         # 与 DataConfig.z_boundary_mode 同步，使训/用边界处理几何一致。
@@ -254,7 +269,7 @@ class Predictor:
         """
         try:
             max_per_vox = prob_volume.max(axis=0)
-            frac_gt_thr = float((max_per_vox >= self.threshold).mean())
+            frac_gt_thr = float((max_per_vox >= self.threshold_min).mean())
             q = np.quantile(prob_volume, [0.5, 0.9, 0.99, 0.999])
             logger.info(
                 "[diag] in-ROI prob volume: shape=%s, min=%.4f, max=%.4f, "
@@ -263,7 +278,7 @@ class Predictor:
                 tuple(prob_volume.shape), float(prob_volume.min()),
                 float(prob_volume.max()), float(prob_volume.mean()),
                 float(q[0]), float(q[1]), float(q[2]), float(q[3]),
-                self.threshold, frac_gt_thr)
+                self.threshold_min, frac_gt_thr)
             if frac_gt_thr > 0.95:
                 logger.warning(
                     "[diag] %.1f%% of in-ROI voxels exceed threshold — "

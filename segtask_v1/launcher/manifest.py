@@ -428,6 +428,8 @@ def _predict_fields(mode: str) -> List[Field]:
         Field("predict.tta_flip"),
         Field("predict.tta_batch_size", depends_on=[_truthy("predict.tta_flip")]),
         Field("predict.threshold"),
+        Field("predict.acc_dtype"),
+        Field("predict.accumulate_on_cpu"),
         # 注：predict.output_dir 始终被 predict.py 以 --output 或派生值覆盖，属
         # "被覆盖字段"，故不在此暴露——输出目录改用 run 组的 --output。
         Field("predict.save_probabilities"),

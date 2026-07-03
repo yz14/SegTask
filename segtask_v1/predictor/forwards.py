@@ -156,7 +156,7 @@ def diag_log_first_batch(p: "Predictor", tag: str,
         pq = _q3(ps, [0.5, 0.9, 0.99])
         n_nan_logits = int(torch.isnan(ls).sum().item())
         n_nan_prob = int(torch.isnan(ps).sum().item())
-        frac_thr = float((ps >= p.threshold).float().mean().item())
+        frac_thr = float((ps >= p.threshold_min).float().mean().item())
         logger.info(
             "[diag/forward %s] input: shape=%s, min=%.4f, max=%.4f, "
             "mean=%.4f, q1=%.4f, q50=%.4f, q99=%.4f",
@@ -176,7 +176,7 @@ def diag_log_first_batch(p: "Predictor", tag: str,
             tag, tuple(ps.shape),
             float(ps.min()), float(ps.max()), float(ps.mean()),
             float(pq[0]), float(pq[1]), float(pq[2]),
-            p.threshold, frac_thr, n_nan_prob)
+            p.threshold_min, frac_thr, n_nan_prob)
         if n_nan_logits > 0 or n_nan_prob > 0:
             logger.error(
                 "[diag/forward %s] NaN detected (logits=%d, prob=%d). "

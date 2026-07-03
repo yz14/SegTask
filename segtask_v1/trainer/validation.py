@@ -401,7 +401,12 @@ class VolumeValEvaluator(ValEvaluator):
                     "Predictor output geometry must match the npz label.")
 
             # 按推理阈值二值化后编码为饱和 logits，复用同一累加算子（避免二次 sigmoid）。
-            pred_bin = (prob_t > predictor.threshold).float()
+            # threshold 可为标量或逐前景类列表（后者按通道广播）。
+            thr_t = torch.as_tensor(
+                predictor.threshold, dtype=prob_t.dtype, device=prob_t.device)
+            if thr_t.ndim == 1:
+                thr_t = thr_t.view(-1, 1, 1, 1)
+            pred_bin = (prob_t > thr_t).float()
             pred_logits = (pred_bin - 0.5) * (2.0 * _SATURATION_LOGIT)
             acc.update(
                 pred_logits.unsqueeze(0), target_t.unsqueeze(0),

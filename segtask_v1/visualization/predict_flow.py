@@ -25,6 +25,13 @@ def _patch_forward_shape(
     return (B, topo.in_channels, pD, pH, pW)
 
 
+def _threshold_str(thr) -> str:
+    """阈值展示串：标量 → '0.5'；逐类列表 → '[0.5, 0.3]'。"""
+    if isinstance(thr, (list, tuple)):
+        return "[" + ", ".join(f"{float(t):g}" for t in thr) + "]"
+    return f"{float(thr):g}"
+
+
 def build_predict_flow(
     cfg: Config, topo: Optional[ModelTopology] = None,
 ) -> VisGraph:
@@ -46,7 +53,7 @@ def build_predict_flow(
         "overlap": f"{pc.z_overlap:g}",
         "blend_mode": pc.blend_mode,
         "tta_flip": str(pc.tta_flip),
-        "threshold": f"{pc.threshold:g}",
+        "threshold": _threshold_str(pc.threshold),
     }
 
     # 1) 输入整卷 -------------------------------------------------------
@@ -146,10 +153,10 @@ def build_predict_flow(
     # 8) 阈值 → 标签 ----------------------------------------------------
     g.add_node(
         "label", "阈值 → 标签", kind="process",
-        key_info={"threshold": f"{pc.threshold:g}",
+        key_info={"threshold": _threshold_str(pc.threshold),
                   "输出": "(D, H, W) int"},
         detail={
-            "threshold": f"{pc.threshold:g}",
+            "threshold": _threshold_str(pc.threshold),
             "label_values": str(list(dc.label_values)),
             "说明": "prob_to_label：逐前景类 sigmoid 概率阈值化为标签图",
         })
