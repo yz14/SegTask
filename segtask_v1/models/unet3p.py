@@ -27,6 +27,7 @@ class UNet3PDecoder(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         skip_attention: bool = False,
+        attn_gate_norm: str = "batch",
         spatial_dims: int = 3,
         grad_checkpointing: bool = False,
     ):
@@ -67,6 +68,8 @@ class UNet3PDecoder(nn.Module):
                     branch_gates.append(
                         AttentionGate3D(
                             x_ch=src_ch, g_ch=encoder_channels[i],
+                            norm_type=attn_gate_norm,
+                            norm_groups=norm_groups,
                             spatial_dims=spatial_dims))
             self.branches.append(branch_convs)
             if skip_attention:

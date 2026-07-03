@@ -273,8 +273,10 @@ class ModelConfig:
     # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
     attention_type: str = "none"
 
-    # skip 连接上的 AttentionGate3D（Oktay 2018）。
+    # skip 连接上的 AttentionGate3D（Oktay 2018）；attn_gate_norm 控制其归一化。
+    # batch 保持旧行为；instance/group 更适合 3D 小 batch，默认不变。
     skip_attention: bool = False
+    attn_gate_norm: str = "batch"
 
     # 深度监督：多 decoder 级输出预测。
     deep_supervision: bool = False
@@ -349,8 +351,11 @@ class ModelConfig:
     # 深层低分辨率 stage 可置 0，省重算开销。
     grad_ckpt_encoder_stages: List[int] = field(default_factory=list)
 
-    # ConvNeXt: drop path / LayerScale / LN-first downsample。
+    # stochastic depth（ResNet / ConvNeXt / MedNeXt 共用；默认 0 = 恒等，无行为变化）。
     drop_path_rate: float = 0.0
+    # ConvNeXt-V2 / MedNeXt 可选 GRN（Global Response Normalization）；gamma/beta 零初始化，
+    # 默认关，开启后初始仍近似恒等。
+    grn_enabled: bool = False
     convnext_layer_scale_init: float = 1e-6  # <=0 禁用
     convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
 
@@ -1064,6 +1069,9 @@ class Config:
                 "relu", "leakyrelu", "gelu", "swish",
             ),
                 f"Invalid activation: {self.model.activation}")
+            _require(
+                self.model.attn_gate_norm in ("batch", "instance", "group"),
+                f"Invalid attn_gate_norm: {self.model.attn_gate_norm}")
             _require(
                 self.model.downsample_mode in (
                 "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",

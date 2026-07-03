@@ -52,6 +52,45 @@ def checkpoint_if(enabled: bool, fn, *args):
     return fn(*args)
 
 
+class DropPath(nn.Module):
+    """残差随机深度：训练时按样本丢弃 residual 分支，eval 直通。"""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        # 先 fp32 采样，避免 AMP 下 bernoulli 后端差异。
+        prob = torch.full(shape, keep, device=x.device, dtype=torch.float32)
+        mask = torch.bernoulli(prob).to(dtype=x.dtype)
+        return x * mask / keep
+
+
+class GlobalResponseNorm(nn.Module):
+    """ConvNeXt-V2 GRN：按通道做全局响应归一化，gamma/beta 零初始化。"""
+
+    def __init__(self, channels: int, spatial_dims: int = 3, eps: float = 1e-6):
+        super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.zeros(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dims = tuple(range(2, x.ndim))
+        gx = torch.sqrt(torch.sum(x * x, dim=dims, keepdim=True) + self.eps)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        pat = "c -> 1 c" + " 1" * self.spatial_dims
+        gamma = rearrange(self.gamma, pat)
+        beta = rearrange(self.beta, pat)
+        return x + gamma * (x * nx) + beta
+
+
 def _as_stride_tuple(stride, spatial_dims: int) -> Tuple[int, ...]:
     """把 int / 序列规整为长度 spatial_dims 的 per-axis stride 元组。
 
@@ -452,9 +491,10 @@ class SelfAttentionBlock(nn.Module):
 
 
 class AttentionGate3D(nn.Module):
-    """UNet skip 加性 attention gate (Oktay 2018)：1×1→ReLU→1×1→sigmoid。inter 默认 x_ch//2。"""
+    """UNet skip 加性 attention gate (Oktay 2018)：1×1→ReLU→1×1→sigmoid；norm_type 可配。"""
 
     def __init__(self, x_ch: int, g_ch: int, inter: int = 0,
+                 norm_type: str = "batch", norm_groups: int = 8,
                  spatial_dims: int = 3):
         super().__init__()
         d = _check_dims(spatial_dims)
@@ -463,15 +503,15 @@ class AttentionGate3D(nn.Module):
             inter = max(x_ch // 2, 1)
         self.W_x = nn.Sequential(
             _CONV[d](x_ch, inter, kernel_size=1, bias=False),
-            _BN[d](inter),
+            get_norm(norm_type, inter, norm_groups, spatial_dims=d),
         )
         self.W_g = nn.Sequential(
             _CONV[d](g_ch, inter, kernel_size=1, bias=False),
-            _BN[d](inter),
+            get_norm(norm_type, inter, norm_groups, spatial_dims=d),
         )
         self.psi = nn.Sequential(
             _CONV[d](inter, 1, kernel_size=1, bias=False),
-            _BN[d](1),
+            get_norm(norm_type, 1, norm_groups, spatial_dims=d),
             nn.Sigmoid(),
         )
         self.relu = nn.ReLU(inplace=True)
