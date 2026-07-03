@@ -742,34 +742,14 @@ class Trainer:
 
             # 参数更新
             if is_step_boundary:
-                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
-                # bf16/fp32 无 scaler 保护，本 accum 组内出现非有限 loss 时
-                # 丢弃梯度并跳过 optimizer.step，避免 NaN 永久污染权重与
-                # EMA（scheduler/EMA 照常推进，与 fp16 跳步语义对齐）。
-                skip_optim_step = group_has_nonfinite and not self._scaler_active
-                group_has_nonfinite = False
-                if skip_optim_step:
-                    logger.warning(
-                        "Skipping optimizer step at epoch %d step %d/%d: "
-                        "non-finite loss in this accumulation group "
-                        "(amp_dtype=%s has no GradScaler protection).",
-                        epoch + 1, step + 1, total_steps, self._amp_dtype_name)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    if self.ema is not None:
-                        self.ema.update(unwrap_compile(self.model))
-                    if self._health_monitor:
-                        opt_steps += 1
-                    continue
-                # 健康监测：开 clip 时复用其已算出的范数（零成本）；未开 clip 时
-                # 仅 rank0 按开关手动算一次（AMP fp16 下先 unscale 以免量纲被污染）。
+                # bf16/fp32 无 scaler 保护；这里只复用已算出的范数，不额外引入
+                # per-step 开销。clip 关且健康监测不算范数时，该 guard 不生效。
                 grad_norm_val = None
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
                     gn = nn.utils.clip_grad_norm_(
                         self.model.parameters(), tc.grad_clip_norm)
-                    if self._health_monitor:
-                        grad_norm_val = float(gn)
+                    grad_norm_val = float(gn)
                 elif self._health_monitor and self._health_grad_norm_when_no_clip:
                     try:
                         if self._scaler_active:
@@ -780,6 +760,36 @@ class Trainer:
                             "Health grad-norm computation failed; skipping.",
                             exc_info=True)
                         grad_norm_val = None
+                grad_nonfinite = (
+                    grad_norm_val is not None and not math.isfinite(grad_norm_val))
+                loss_nonfinite = group_has_nonfinite
+
+                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
+                # bf16/fp32 在 loss 或梯度非有限时丢弃本 accum 组梯度，
+                # 避免 NaN 永久污染权重与 EMA（scheduler/EMA 照常推进）。
+                skip_optim_step = (
+                    (loss_nonfinite or grad_nonfinite)
+                    and not self._scaler_active)
+                group_has_nonfinite = False
+                if skip_optim_step:
+                    causes = []
+                    if loss_nonfinite:
+                        causes.append("non-finite loss")
+                    if grad_nonfinite:
+                        causes.append("non-finite gradient")
+                    logger.warning(
+                        "Skipping optimizer step at epoch %d step %d/%d: "
+                        "%s in this accumulation group "
+                        "(amp_dtype=%s has no GradScaler protection).",
+                        epoch + 1, step + 1, total_steps, " and ".join(causes),
+                        self._amp_dtype_name)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    if self.ema is not None:
+                        self.ema.update(unwrap_compile(self.model))
+                    if self._health_monitor:
+                        opt_steps += 1
+                    continue
 
                 # update/weight 比值：每 epoch 仅首个优化步测一次（step 前快照）。
                 pre_step_snapshot = None
