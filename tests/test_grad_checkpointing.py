@@ -36,6 +36,7 @@ def _make_cfg(
     deep_supervision: bool = True,
     drop_path: float = 0.0,
     grad_checkpointing: bool = False,
+    grad_ckpt_encoder_stages=None,
 ) -> Config:
     cfg = Config()
     cfg.data.patch_mode = patch_mode
@@ -51,6 +52,8 @@ def _make_cfg(
     cfg.model.deep_supervision = deep_supervision
     cfg.model.drop_path_rate = drop_path
     cfg.model.grad_checkpointing = grad_checkpointing
+    if grad_ckpt_encoder_stages is not None:
+        cfg.model.grad_ckpt_encoder_stages = list(grad_ckpt_encoder_stages)
     if decoder_type == "unet3p":
         cfg.model.unet3p_cat_channels = 16
     cfg.sync()
@@ -98,6 +101,29 @@ def test_grad_checkpointing_defaults_off():
     model = build_model(cfg)
     assert model.encoder.grad_checkpointing is False
     assert model.decoder.grad_checkpointing is False
+
+
+def test_encoder_stage_checkpoint_mask():
+    cfg_off = _make_cfg(
+        grad_checkpointing=False,
+        grad_ckpt_encoder_stages=[1, 0, 1],
+    )
+    model_off = build_model(cfg_off)
+    assert model_off.encoder._stage_ckpt == [False, False, False]
+
+    cfg_all = _make_cfg(
+        grad_checkpointing=True,
+        grad_ckpt_encoder_stages=[],
+    )
+    model_all = build_model(cfg_all)
+    assert model_all.encoder._stage_ckpt == [True, True, True]
+
+    cfg_mask = _make_cfg(
+        grad_checkpointing=True,
+        grad_ckpt_encoder_stages=[1, 0, 1],
+    )
+    model_mask = build_model(cfg_mask)
+    assert model_mask.encoder._stage_ckpt == [True, False, True]
 
 
 @pytest.mark.parametrize("decoder_type", ["unet", "unetpp", "unet3p"])
@@ -184,6 +210,15 @@ def test_grad_checkpoint_2_5d_droppath_runs():
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert len(grads) > 0
     assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_config_rejects_bad_grad_ckpt_mask_length():
+    cfg = Config()
+    cfg.model.encoder_channels = [16, 32, 64]
+    cfg.model.grad_checkpointing = True
+    cfg.model.grad_ckpt_encoder_stages = [1, 0]
+    with pytest.raises(AssertionError):
+        cfg.validate()
 
 
 if __name__ == "__main__":
