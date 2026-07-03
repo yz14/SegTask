@@ -23,6 +23,8 @@ from .dataset import (
     load_nifti,
     load_nifti_cropped,
     load_region_weight_volume,
+    read_nifti_spacing,
+    resample_to_spacing,
 )
 from .loader import (
     _filter_by_exclude,
@@ -36,7 +38,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.1"
+_TOOL_VERSION = "make_data/1.2"
 
 # 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -122,8 +124,12 @@ def prepare_one(
     label_values: List[int],
     fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
     compress: bool = False,
-    overwrite: bool = False) -> Dict[str, object]:
-    """为单样本生成 npz 包；默认幂等（除非 overwrite）。返状态 dict (pid/status/size/耗时/...)。"""
+    overwrite: bool = False,
+    spacing_normalization: bool = False,
+    target_spacing: Optional[List[float]] = None) -> Dict[str, object]:
+    """为单样本生成 npz 包；默认幂等（除非 overwrite）。返状态 dict (pid/status/size/耗时/...)。
+    spacing_normalization=True 且 target_spacing 非空时把 image/label/rw 从原生 spacing
+    重采样到 target_spacing（numpy 轴序 (D,H,W) mm）后再落盘。"""
     out_p = Path(out_path)
     if out_p.is_file() and not overwrite:
         return {"pid": pid, "status": "skipped",
@@ -168,6 +174,21 @@ def prepare_one(
                 "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
                 pid, rw_min, rw_max, is_integer_valued)
 
+    # 4.5 物理 spacing 归一化（可选）：把 bbox-裁剪后的体积重采样到 target_spacing。
+    #     在 fg 索引/shape 记录之前做，保证下游全部落在归一化坐标系。
+    orig_spacing: Optional[List[float]] = None
+    spacing_normalized = False
+    if spacing_normalization and target_spacing is not None:
+        src = read_nifti_spacing(image_path)  # (sz, sy, sx) mm
+        orig_spacing = [float(s) for s in src]
+        tgt = tuple(float(s) for s in target_spacing)
+        image = resample_to_spacing(image, src, tgt, is_label=False)
+        label = resample_to_spacing(label, src, tgt, is_label=True)
+        if rw is not None:
+            # rw 为离散权重，用近邻保值。
+            rw = resample_to_spacing(rw, src, tgt, is_label=True)
+        spacing_normalized = True
+
     # 5. 裁剪坐标系下的前景索引（逐类，供类均衡前景采样）。
     (fg_slices, fg_coords, fg_coords_cls,
      fg_slices_cls_z, fg_slices_cls) = _compute_fg_indices(
@@ -187,6 +208,10 @@ def prepare_one(
         "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
         "image_dtype" : str(image.dtype),
         "fg_per_class": True,   # fg_coords 逐类 cap；含 *_cls 类对齐数组
+        "spacing_normalized": spacing_normalized,
+        "orig_spacing" : orig_spacing,   # [sz,sy,sx] mm 或 None（未归一化）
+        "target_spacing": ([float(s) for s in target_spacing]
+                           if spacing_normalized else None),
         "made_at"     : datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
@@ -267,6 +292,30 @@ def _resolve_label_values(
     return list(map(int, detected))
 
 
+def _resolve_target_spacing(
+    cfg: Config, samples: List[Dict[str, Optional[str]]]) -> List[float]:
+    """解析 target_spacing（numpy 轴序 (D,H,W) mm）：显式配置优先；
+    否则扫描所有 image 头信息取逐轴中位数（nnU-Net 式指纹，只读头不解码像素）。"""
+    ts = cfg.data.target_spacing
+    if ts is not None:
+        return [float(s) for s in ts]
+    spacings = []
+    for s in samples:
+        img = s["image"]
+        if img:
+            spacings.append(read_nifti_spacing(img))
+    if not spacings:
+        raise ValueError(
+            "spacing_normalization=True but data.target_spacing is None and no "
+            "image headers could be read to compute a median spacing.")
+    arr = np.asarray(spacings, dtype=np.float64)  # (N, 3) = (sz, sy, sx)
+    median = [float(np.median(arr[:, i])) for i in range(3)]
+    logger.info(
+        "Computed dataset median spacing (D,H,W)=%s mm from %d volumes.",
+        median, len(spacings))
+    return median
+
+
 def prepare_dataset(
     cfg         : Config,
     out_dir     : str,
@@ -288,6 +337,14 @@ def prepare_dataset(
 
     label_values = _resolve_label_values(cfg, samples)
     logger.info("Using label_values=%s (bg=%d)", label_values, label_values[0])
+
+    # spacing 归一化：解析 target_spacing（显式配置优先，否则扫描头信息取逐轴中位数）。
+    spacing_norm = bool(cfg.data.spacing_normalization)
+    target_spacing = _resolve_target_spacing(cfg, samples) if spacing_norm else None
+    if spacing_norm:
+        logger.info(
+            "spacing_normalization=True: resampling every volume to "
+            "target_spacing=%s mm (numpy axis order (D,H,W)).", target_spacing)
 
     tasks: List[Tuple[Dict[str, Optional[str]], str]] = []
     for s in samples:
@@ -316,7 +373,9 @@ def prepare_dataset(
             label_values = label_values,
             fg_subsample = fg_subsample,
             compress     = compress,
-            overwrite    = overwrite)
+            overwrite    = overwrite,
+            spacing_normalization = spacing_norm,
+            target_spacing = target_spacing)
 
     t0 = time.perf_counter()
 

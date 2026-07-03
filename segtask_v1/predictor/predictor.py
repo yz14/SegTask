@@ -18,7 +18,8 @@ import torch
 from ..config import Config
 from ..data.dataset import (
     load_nifti, load_nifti_with_spacing, preprocess_image,
-    compute_bbox_from_volume)
+    compute_bbox_from_volume, read_nifti_spacing, resample_to_spacing,
+    resize_3d)
 from ..models.topology import ModelTopology, build_topology
 from . import blending as _blending
 from . import sliding as _sliding
@@ -103,6 +104,26 @@ class Predictor:
                     "[AdaBN] per_volume enabled: %d BatchNorm layer(s) will "
                     "be re-estimated from each volume before its prediction.",
                     len(self._adabn_bn_modules))
+
+        # 物理 spacing 归一化（B1）：推理前把体积镜像重采样到 target_spacing，
+        # 概率图再回采到原分辨率。须与烘焙用的 target_spacing 一致（自动中位数时
+        # make_data 会把中位数写进日志，须显式填回 cfg.data.target_spacing 以复现）。
+        self.spacing_norm = bool(cfg.data.spacing_normalization)
+        self.target_spacing: Optional[Tuple[float, float, float]] = None
+        if self.spacing_norm:
+            if cfg.data.target_spacing is None:
+                raise ValueError(
+                    "data.spacing_normalization=True requires an explicit "
+                    "data.target_spacing [sz, sy, sx] (mm) for inference so it "
+                    "matches the spacing used when baking npz. If make_data "
+                    "auto-computed the dataset median, copy that logged value "
+                    "into the config before predicting.")
+            self.target_spacing = tuple(
+                float(s) for s in cfg.data.target_spacing)
+            logger.info(
+                "Predictor spacing_normalization=True: resample inputs to "
+                "target_spacing=%s mm (D,H,W), resample probabilities back.",
+                self.target_spacing)
 
         self.patch_mode = cfg.data.patch_mode
         self.patch_D, self.patch_H, self.patch_W = cfg.data.patch_size
@@ -343,6 +364,22 @@ class Predictor:
                     d1 - d0, h1 - h0, w1 - w0)
                 raw_vol = raw_vol[d0:d1, h0:h1, w0:w1]
 
+        # 物理 spacing 归一化：把（可能已 bbox 裁剪的）体积从原生 spacing 镜像重采样
+        # 到 target_spacing，推理后再把概率图回采到此处记录的 pre-resample 形状。
+        pre_resample_shape: Optional[Tuple[int, int, int]] = None
+        if self.spacing_norm and self.target_spacing is not None:
+            src_spacing = read_nifti_spacing(image_path)
+            pre_resample_shape = raw_vol.shape
+            raw_vol = resample_to_spacing(
+                raw_vol, src_spacing, self.target_spacing, is_label=False)
+            logger.info(
+                "spacing_normalization: %s mm → %s mm, shape %s → %s.",
+                src_spacing, self.target_spacing,
+                pre_resample_shape, raw_vol.shape)
+            # 归一化后 z 已是 target_spacing[0]，供 z-interleave 一致选因子。
+            if z_spacing is not None:
+                z_spacing = float(self.target_spacing[0])
+
         vol = preprocess_image(
             raw_vol, dc.intensity_min, dc.intensity_max,
             dc.normalize, dc.global_mean, dc.global_std)
@@ -373,6 +410,13 @@ class Predictor:
         prob_volume = self.predict_preprocessed_array(vol, z_spacing=z_spacing)
 
         self._log_inroi_prob_stats(prob_volume)
+
+        # spacing 归一化：把概率图从 target-spacing 分辨率回采到 pre-resample 形状
+        # （bbox 裁剪后的原生分辨率），随后再走原有 bbox 拼回逻辑。
+        if pre_resample_shape is not None and prob_volume.shape[1:] != pre_resample_shape:
+            prob_volume = resize_3d(
+                prob_volume, pre_resample_shape[0], pre_resample_shape[1],
+                pre_resample_shape[2], is_label=False)
 
         # 拼回原尺寸画布以保 NIfTI affine 一致；bbox 外体素保留 0 概率。
         if bbox is not None:

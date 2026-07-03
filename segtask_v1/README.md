@@ -204,6 +204,7 @@ SegTask/
 - **pid**：`image_path.name` 去掉 `data.image_suffix`（默认 `.nii.gz`）后的部分。整个管线（npz、bbox、region\_weight、exclude\_list）都以 pid 为索引键。
 - **配对契约**：当 `bbox_dir` / `region_weight_dir` / `npz_dir` 非空时，**每个**图像 pid 必须有对应文件，否则 `FileNotFoundError`。这是有意的强契约，避免静默丢样本。
 - **npz 包**（`make_data` 产物）：`<npz_dir>/<pid>.npz`，键 `image / label / [rw] / fg_slices / fg_coords / fg_coords_cls / fg_slices_cls_z / fg_slices_cls / meta`（`*_cls` 为 make_data≥1.1 逐类索引，前景采样先选类再选点；旧 npz 无该键时退回合并采样）。详见 `@d:\codes\work-projects\SegTask\segtask_v1\data\make_data.py:32-70`。
+- **物理 spacing 归一化**（`data.spacing_normalization`，默认 `False`=现状不重采样）：置 `True` 时 `make_data` 烘焙阶段把每卷（bbox 裁剪后）重采样到 `data.target_spacing`（`[sz, sy, sx]` mm，numpy 轴序 (D,H,W)）；`meta` 记 `spacing_normalized / orig_spacing / target_spacing`。`target_spacing=None` 时 `make_data` 扫描全数据集头信息取逐轴中位数（会写进日志）。**推理侧** `Predictor` 会读源 spacing 镜像重采样、概率图再回采到原分辨率，故 `spacing_normalization=True` 时 `data.target_spacing` **必须显式填写**（与烘焙一致；自动中位数须从日志复制回配置），否则报错。做不同尺寸对比实验时保持 `False` 即为原始行为。
 
 ---
 
@@ -422,7 +423,7 @@ segtask_v1/data/
 
 **`make_data.py`** —— 离线 npz 烘焙：
 
-- `prepare_one(pid, image, label, bbox, rw, out_dir, ...)`：单样本 worker，做 bbox 裁剪 + 逐前景类计算 `fg_slices` / `fg_coords`（+`*_cls` 类对齐数组；seed=42，每类子采样到 N≤50000）+ 落盘 `<pid>.npz`。
+- `prepare_one(pid, image, label, bbox, rw, out_dir, ...)`：单样本 worker，做 bbox 裁剪 +（可选）target-spacing 重采样（`data.spacing_normalization=True` 时；image 线性 / label、rw 近邻）+ 逐前景类计算 `fg_slices` / `fg_coords`（+`*_cls` 类对齐数组；seed=42，每类子采样到 N≤50000）+ 落盘 `<pid>.npz`。
 - `_build_sample_table(cfg)` / `_resolve_label_values(cfg, samples)`：把 `Config` 翻译成可并行的样本表。
 - `prepare_dataset(cfg, out_dir, workers, overwrite)`：`ProcessPoolExecutor` 并发执行 + 进度统计 + 失败 CSV。
 - `main()` CLI：`python -m segtask_v1.data.make_data --config ... --out-dir ... --workers 8 [--overwrite]`。
