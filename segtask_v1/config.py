@@ -344,6 +344,10 @@ class ModelConfig:
     # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
     # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。
     grad_checkpointing: bool = False
+    # 逐 encoder stage 检查点掩码（0/1）；空=沿用 grad_checkpointing 对所有 stage 生效（现状）；
+    # 非空长度须==len(encoder_channels)，仅对为 1 的 stage 做检查点；仅在 grad_checkpointing=True 时生效。
+    # 深层低分辨率 stage 可置 0，省重算开销。
+    grad_ckpt_encoder_stages: List[int] = field(default_factory=list)
 
     # ConvNeXt: drop path / LayerScale / LN-first downsample。
     drop_path_rate: float = 0.0
@@ -1182,6 +1186,19 @@ class Config:
             _require(
                 all(b >= 1 for b in dbps),
                 "decoder_blocks_per_stage entries must all be >= 1")
+        ckpt_mask = list(self.model.grad_ckpt_encoder_stages)
+        if ckpt_mask:
+            _require(
+                len(ckpt_mask) == n_levels,
+                f"grad_ckpt_encoder_stages must have {n_levels} entries "
+                f"(= len(encoder_channels)); got {len(ckpt_mask)}")
+            _require(
+                all(int(v) in (0, 1) for v in ckpt_mask),
+                f"grad_ckpt_encoder_stages values must be 0 or 1; got {ckpt_mask}.")
+            if not self.model.grad_checkpointing:
+                logger.warning(
+                    "model.grad_ckpt_encoder_stages 已配置但 model.grad_checkpointing=False，"
+                    "该掩码将被忽略。")
         # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
         sds = self.model.downsample_strides
         if sds:

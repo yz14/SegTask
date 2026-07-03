@@ -37,7 +37,8 @@ class Encoder(nn.Module):
         in_ch_per_view_list  : Optional[List[int]] = None,
         downsample_builder   : Optional[Callable[[int, int], nn.Module]] = None,
         downsample_strides   : Optional[List] = None,
-        grad_checkpointing   : bool = False):
+        grad_checkpointing   : bool = False,
+        grad_ckpt_stages     : Optional[List[int]] = None):
         super().__init__()
 
         self.spatial_dims = spatial_dims
@@ -108,6 +109,16 @@ class Encoder(nn.Module):
                         norm_type=norm_type, norm_groups=norm_groups,
                         mode=downsample_mode, spatial_dims=spatial_dims,
                         stride=self.downsample_strides[i - 1]))
+        if not self.grad_checkpointing:
+            self._stage_ckpt = [False] * len(stage_channels)
+        elif not grad_ckpt_stages:
+            self._stage_ckpt = [True] * len(stage_channels)
+        else:
+            if len(grad_ckpt_stages) != len(stage_channels):
+                raise ValueError(
+                    f"grad_ckpt_stages length ({len(grad_ckpt_stages)}) must "
+                    f"equal len(stage_channels) ({len(stage_channels)}).")
+            self._stage_ckpt = [bool(v) for v in grad_ckpt_stages]
 
         # 仅 hierarchical stem：每级 cat(main, aux) → 1×1 → stage_channels[k-1]。key 为 str(level)。
         self.aux_fuse = nn.ModuleDict()
@@ -147,7 +158,7 @@ class Encoder(nn.Module):
                             f"input spatial dims are divisible by the "
                             f"aux stem stride.")
                     x = self.aux_fuse[str(i)](torch.cat([x, aux], dim=1))
-            x = checkpoint_if(self.grad_checkpointing, stage, x)
+            x = checkpoint_if(self._stage_ckpt[i], stage, x)
             features.append(x)
         return features
 

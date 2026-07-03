@@ -274,6 +274,8 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.skip_mode", depends_on=unet),
         # 梯度检查点（所有 backbone 通用）。
         Field("model.grad_checkpointing", depends_on=unet),
+        Field("model.grad_ckpt_encoder_stages",
+              depends_on=unet + [_truthy("model.grad_checkpointing")]),
         # ConvNeXt 专属。
         Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         Field("model.convnext_layer_scale_init", depends_on=unet + [_in("model.backbone", ["convnext"])]),

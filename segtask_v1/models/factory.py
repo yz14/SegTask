@@ -424,7 +424,8 @@ def build_model(cfg: Config):
         in_ch_per_view_list   = in_ch_per_view_list,
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides,
-        grad_checkpointing    = mc.grad_checkpointing)
+        grad_checkpointing    = mc.grad_checkpointing,
+        grad_ckpt_stages      = mc.grad_ckpt_encoder_stages)
 
     # decoder: unet | unetpp | unet3p
     if   mc.decoder_type == "unet3p":
