@@ -135,14 +135,11 @@ class Trainer:
         total_steps     = tc.epochs * steps_per_epoch
         post_warmup     = total_steps - warmup_steps
 
-        # OneCycleLR 自带 warmup，不可与 WarmupScheduler 叠加。
-        if tc.scheduler == "one_cycle" and warmup_steps > 0:
-            raise ValueError(
-                "OneCycleLR has built-in warmup (pct_start). "
-                "Set train.warmup_epochs=0 when using scheduler='one_cycle'.")
-
         base_scheduler = build_scheduler(
             self.optimizer, cfg, steps_per_epoch, post_warmup_steps=post_warmup)
+        # one_cycle 用 warmup_epochs 映射 pct_start，外层不再做线性 warmup，
+        # 避免 warmup 双重叠加。
+        warmup_steps = 0 if tc.scheduler == "one_cycle" else warmup_steps
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
