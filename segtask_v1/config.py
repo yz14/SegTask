@@ -376,6 +376,12 @@ class ModelConfig:
     mednext_expand_ratio: int = 4
     # 深度卷积核大小（MedNeXt 用 3 或 5；ConvNeXt 固定 7）。
     mednext_kernel_size: int = 3
+    # 仅对 backbone=='mednext' 有效：训练时大核 + 多个空洞分支并行，
+    # 推理时折叠为单一大核 depthwise conv，零额外推理开销。
+    mednext_dilated_reparam: bool = False
+    # 可选显式分支核大小 / dilation 覆盖；空列表=使用默认分支集。
+    mednext_dilated_reparam_kernel_sizes: List[int] = field(default_factory=list)
+    mednext_dilated_reparam_dilations: List[int] = field(default_factory=list)
 
     # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone=='resnet'） ----
     # 把选定 stage 的标准 ResNet 块替换为「多膨胀率并行分支 → 融合」的残差块，
@@ -661,6 +667,10 @@ class TrainConfig:
 
     # checkpoint 含 EMA shadow 时是否优先用 EMA 作初始。默认 False。
     pretrain_load_ema: bool = False
+
+    # 仅对 backbone=='mednext' 有效：将预训练 checkpoint 的深度卷积权重按当前
+    # mednext_kernel_size 做 UpKern 插值迁移（k=3→k=5 等）。
+    pretrain_upkern: bool = False
 
     # ---- 多卡 DDP（DistributedDataParallel）----------------------------
     # 要使用的**物理 GPU 卡号列表**（如 [0, 2, 5, 7]）。
@@ -1189,6 +1199,39 @@ class Config:
                 self.model.mednext_expand_ratio >= 1,
                 f"mednext_expand_ratio must be >= 1; got "
                 f"{self.model.mednext_expand_ratio}.")
+            if self.model.mednext_dilated_reparam:
+                _require(
+                    self.model.backbone == "mednext",
+                    "model.mednext_dilated_reparam=True requires "
+                    "backbone='mednext'.")
+                bk = list(self.model.mednext_dilated_reparam_kernel_sizes)
+                bd = list(self.model.mednext_dilated_reparam_dilations)
+                if bk or bd:
+                    _require(
+                        bk and bd and len(bk) == len(bd),
+                        "mednext_dilated_reparam branch overrides require "
+                        "both kernel_sizes and dilations with the same "
+                        "non-zero length.")
+                    for k, d in zip(bk, bd):
+                        eff = (int(k) - 1) * int(d) + 1
+                        _require(
+                            int(k) % 2 == 1,
+                            f"mednext_dilated_reparam branch kernel must be "
+                            f"odd; got {k}.")
+                        _require(
+                            int(d) >= 1,
+                            f"mednext_dilated_reparam branch dilation must "
+                            f"be >= 1; got {d}.")
+                        _require(
+                            eff % 2 == 1,
+                            f"mednext_dilated_reparam effective kernel must "
+                            f"be odd; got kernel={k}, dilation={d}, "
+                            f"effective={eff}.")
+                        _require(
+                            eff <= self.model.mednext_kernel_size,
+                            f"mednext_dilated_reparam effective kernel "
+                            f"{eff} exceeds mednext_kernel_size="
+                            f"{self.model.mednext_kernel_size}.")
         # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage
@@ -1721,6 +1764,11 @@ class Config:
         _require(
             0.0 <= float(self.train.surface_dice_weight) <= 1.0,
             f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}")
+        if self.train.pretrain_upkern and self.model.backbone != "mednext":
+            logger.warning(
+                "train.pretrain_upkern=True only affects backbone='mednext'; "
+                "current backbone=%r, so UpKern remap will be ignored.",
+                self.model.backbone)
         # 多卡 DDP 选卡列表：物理卡号、非负、互不重复。
         gpus = list(self.train.gpus)
         _require(

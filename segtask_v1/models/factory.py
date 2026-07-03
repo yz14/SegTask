@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
 from typing import Callable, List
 
 import numpy as np
 import torch.nn as nn
 
 from ..config import Config, resolve_selfattn_stage
-from .blocks import Downsample, SelfAttentionBlock, Upsample
+from .blocks import SelfAttentionBlock
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .mednext import MedNeXtStage
 from .resnet import MultiRFStage, ResNetStage
-from .topology import ModelTopology, build_topology
+from .topology import build_topology
 from .unet import Encoder, Decoder, UNet3D
 from .unet3p import UNet3PDecoder
 from .unetpp import UNetPPDecoder
@@ -228,7 +227,12 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
             drop_path_rates = rates,
             attention_type = mc.attention_type,
             use_grn        = mc.grn_enabled,
-            spatial_dims   = spatial_dims)
+            spatial_dims   = spatial_dims,
+            dilated_reparam = mc.mednext_dilated_reparam,
+            dilated_reparam_branch_kernel_sizes = (
+                mc.mednext_dilated_reparam_kernel_sizes or None),
+            dilated_reparam_branch_dilations = (
+                mc.mednext_dilated_reparam_dilations or None))
 
     return _StatefulStageBuilder(factory, counts)
 
