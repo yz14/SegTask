@@ -131,6 +131,8 @@ def _make_resnet_stage_builder(
                 use_rope     = mc.selfattn_rope,
                 use_ffn      = mc.selfattn_ffn,
                 ffn_ratio    = mc.selfattn_ffn_ratio,
+                window_size  = mc.selfattn_window_size,
+                grid_size    = mc.selfattn_grid_size,
                 spatial_dims = spatial_dims))
         return stage
 

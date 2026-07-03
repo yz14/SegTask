@@ -32,7 +32,8 @@ def resolve_selfattn_stage(entry, default_type: str):
     """把单个 selfattn 逐 level 条目解析为注意力类型或 None（该层关）。
 
     取值：0/'none'/'off' → None；1/'on'/'default' → default_type；
-    'softmax' → 'softmax'；'linear' → 'linear'。其它一律报错。
+    'softmax' → 'softmax'；'linear' → 'linear'；'window' → 'window'；
+    'grid' → 'grid'。其它一律报错。
     """
     s = str(entry).strip().lower()
     if s in ("0", "none", "off", "false"):
@@ -43,9 +44,13 @@ def resolve_selfattn_stage(entry, default_type: str):
         return "softmax"
     if s in ("linear", "lin", "linear_qkv"):
         return "linear"
+    if s in ("window", "win", "local"):
+        return "window"
+    if s in ("grid", "grid2", "sparse"):
+        return "grid"
     raise ConfigError(
         f"Invalid selfattn stage entry {entry!r}; expected one of "
-        "0/'none', 1/'default', 'softmax', 'linear'.")
+        "0/'none', 1/'default', 'softmax', 'linear', 'window', 'grid'.")
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +418,9 @@ class ModelConfig:
     # 额外 FFN：GEGLU + zero-init 输出投影；默认关，开后为注意力后再接一层残差 MLP。
     selfattn_ffn: bool = False
     selfattn_ffn_ratio: float = 4.0
+    # Window/Grid 注意力块大小；默认 7 保持不启用时无影响，启用时用于浅层大分辨率 token 分块。
+    selfattn_window_size: int = 7
+    selfattn_grid_size: int = 7
     # 编码器逐 stage 开关（可逐层指定类型）。长度须 == len(encoder_channels)。空=该侧全关。
     # 每个元素：0/'none'=该层关；'softmax'=标准 QKV；'linear'=线性 QKV；1=沿用全局 selfattn_type。
     selfattn_encoder_stages: List = field(default_factory=list)
@@ -1280,9 +1288,9 @@ class Config:
             f"model.selfattn_enabled=True requires backbone='resnet'; "
             f"got {mc.backbone!r}.")
         _require(
-            mc.selfattn_type in ("softmax", "linear"),
+            mc.selfattn_type in ("softmax", "linear", "window", "grid"),
             f"Invalid model.selfattn_type: {mc.selfattn_type!r}; "
-            "expected 'softmax' or 'linear'.")
+            "expected 'softmax', 'linear', 'window' or 'grid'.")
         _require(
             int(mc.selfattn_num_heads) >= 1,
             f"model.selfattn_num_heads must be >= 1; got {mc.selfattn_num_heads}.")
@@ -1293,6 +1301,12 @@ class Config:
         _require(
             float(mc.selfattn_ffn_ratio) > 0.0,
             f"model.selfattn_ffn_ratio must be > 0; got {mc.selfattn_ffn_ratio}.")
+        _require(
+            int(mc.selfattn_window_size) >= 1,
+            f"model.selfattn_window_size must be >= 1; got {mc.selfattn_window_size}.")
+        _require(
+            int(mc.selfattn_grid_size) >= 1,
+            f"model.selfattn_grid_size must be >= 1; got {mc.selfattn_grid_size}.")
         enc_st = list(mc.selfattn_encoder_stages)
         dec_st = list(mc.selfattn_decoder_stages)
         if enc_st:
