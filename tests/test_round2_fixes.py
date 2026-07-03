@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import random
 
 import numpy as np
 import torch
@@ -795,6 +796,51 @@ def test_d3_rng_state_roundtrip():
     src_load = inspect.getsource(Trainer._load_checkpoint)
     assert "rng_state" in src_load, "rng_state not restored on load"
     print("[D-3] PASS — rng_state included in save/load paths.")
+
+
+def test_rng_reseed_helper_decorrelates_ranks_after_resume():
+    from segtask_v1.trainer.trainer import _reseed_rank_rng
+    from segtask_v1.utils import seed_everything
+
+    def _sample():
+        return (
+            torch.rand(3).tolist(),
+            np.random.rand(3).tolist(),
+            [random.random() for _ in range(3)],
+        )
+
+    seed_everything(123, deterministic=False)
+    base_t = torch.get_rng_state()
+    base_n = np.random.get_state()
+    base_p = random.getstate()
+
+    def _reset():
+        torch.set_rng_state(base_t)
+        np.random.set_state(base_n)
+        random.setstate(base_p)
+
+    _reset()
+    ref = _sample()
+
+    _reset()
+    _reseed_rank_rng(123, 0, 7, False)
+    rank0 = _sample()
+    assert rank0 == ref
+
+    _reset()
+    _reseed_rank_rng(123, 1, 7, False)
+    rank1 = _sample()
+
+    _reset()
+    _reseed_rank_rng(123, 1, 7, False)
+    rank1_b = _sample()
+    assert rank1 == rank1_b
+
+    _reset()
+    _reseed_rank_rng(123, 2, 7, False)
+    rank2 = _sample()
+
+    assert rank1 != rank2
 
 
 if __name__ == "__main__":

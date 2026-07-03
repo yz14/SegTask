@@ -35,7 +35,7 @@ from ..data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from ..models.unet import UNet3D
 from ..utils import (
-    AverageMeter, ModelEMA, Timer, compute_dice_per_class,
+    AverageMeter, ModelEMA, Timer, compute_dice_per_class, seed_everything,
 )
 from . import views
 from .amp import (
@@ -68,6 +68,18 @@ from .pipelines import (
 from .validation import build_val_evaluator
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# RNG helper
+# ---------------------------------------------------------------------------
+def _reseed_rank_rng(seed: int, rank: int, epoch: int, deterministic: bool) -> None:
+    """按 rank/epoch 重新分流 RNG。rank0 保持原流不动。"""
+    if int(rank) <= 0:
+        return
+    # resume 后 rank>0 重新分流，避免所有 DDP rank 退化成 rank0 的随机流。
+    mix = int(seed) + int(epoch) * 100003 + int(rank)
+    seed_everything(mix, deterministic)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1026,10 @@ class Trainer:
                 logger.info("Restored RNG state from checkpoint.")
             except Exception as e:  # pragma: no cover
                 logger.warning("Failed to restore RNG state: %s", e)
+        if self._is_dist and self._rank > 0:
+            _reseed_rank_rng(
+                self.cfg.train.seed, self._rank, self.start_epoch,
+                self.cfg.train.deterministic)
 
         logger.info(
             "Resumed from epoch %d, best=%s=%s (patience=%d)",
