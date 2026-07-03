@@ -36,7 +36,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.0"
+_TOOL_VERSION = "make_data/1.1"
 
 # 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -54,25 +54,54 @@ def _stem(path: str, suffix) -> str:
 
 def _compute_fg_indices(
     label: np.ndarray,
-    bg_val: int,
+    label_values: List[int],
     fg_subsample: int,
-    seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 SegDataset3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
+    seed: int = 42) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """逐前景类计算 fg 索引（类均衡采样用，seed=42）。
+
+    返 (fg_slices, fg_coords, fg_coords_cls, fg_slices_cls_z, fg_slices_cls)：
+    - fg_slices    (M,)  全前景 z 切片索引（各类并集，向后兼容）；
+    - fg_coords    (N,3) 逐类 argwhere 后拼接；每类独立 cap 到 fg_subsample，
+      避免稀有小结构被大器官淹没；
+    - fg_coords_cls   (N,) 与 fg_coords 逐行对齐的类值；
+    - fg_slices_cls_z (K,) 逐类 z 切片索引拼接；
+    - fg_slices_cls   (K,) 与之逐行对齐的类值。"""
+    empty = (np.zeros((0,), dtype=np.int32),
+             np.zeros((0, 3), dtype=np.int32),
+             np.zeros((0,), dtype=np.int16),
+             np.zeros((0,), dtype=np.int32),
+             np.zeros((0,), dtype=np.int16))
     if label.size == 0:
-        return (np.zeros((0,), dtype=np.int32),
-                np.zeros((0, 3), dtype=np.int32))
+        return empty
     label_int = label.astype(np.int32, copy=False)
-    fg_mask = label_int != int(bg_val)
-    if not fg_mask.any():
-        return (np.zeros((0,), dtype=np.int32),
-                np.zeros((0, 3), dtype=np.int32))
-    fg_slices = np.where(np.any(fg_mask, axis=(1, 2)))[0].astype(np.int32)
-    coords    = np.argwhere(fg_mask).astype(np.int32)
-    if fg_subsample > 0 and len(coords) > fg_subsample:
-        rng = np.random.RandomState(seed)
-        idx = rng.choice(len(coords), fg_subsample, replace=False)
-        coords = coords[idx]
-    return fg_slices, coords
+    rng = np.random.RandomState(seed)
+
+    coords_parts    : List[np.ndarray] = []
+    coords_cls_parts: List[np.ndarray] = []
+    slices_parts    : List[np.ndarray] = []
+    slices_cls_parts: List[np.ndarray] = []
+    for v in label_values[1:]:
+        cls_mask = label_int == int(v)
+        if not cls_mask.any():
+            continue
+        z = np.where(np.any(cls_mask, axis=(1, 2)))[0].astype(np.int32)
+        c = np.argwhere(cls_mask).astype(np.int32)
+        if fg_subsample > 0 and len(c) > fg_subsample:
+            idx = rng.choice(len(c), fg_subsample, replace=False)
+            c = c[idx]
+        slices_parts.append(z)
+        slices_cls_parts.append(np.full(len(z), int(v), dtype=np.int16))
+        coords_parts.append(c)
+        coords_cls_parts.append(np.full(len(c), int(v), dtype=np.int16))
+
+    if not coords_parts:
+        return empty
+    fg_coords       = np.concatenate(coords_parts, axis=0)
+    fg_coords_cls   = np.concatenate(coords_cls_parts, axis=0)
+    fg_slices_cls_z = np.concatenate(slices_parts, axis=0)
+    fg_slices_cls   = np.concatenate(slices_cls_parts, axis=0)
+    fg_slices       = np.unique(fg_slices_cls_z).astype(np.int32)
+    return fg_slices, fg_coords, fg_coords_cls, fg_slices_cls_z, fg_slices_cls
 
 
 def _bbox_from_mask_path(bbox_path: Optional[str]) -> Optional[BBox]:
@@ -139,9 +168,10 @@ def prepare_one(
                 "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
                 pid, rw_min, rw_max, is_integer_valued)
 
-    # 5. 裁剪坐标系下的前景索引。
-    bg_val = int(label_values[0])
-    fg_slices, fg_coords = _compute_fg_indices(label, bg_val, fg_subsample)
+    # 5. 裁剪坐标系下的前景索引（逐类，供类均衡前景采样）。
+    (fg_slices, fg_coords, fg_coords_cls,
+     fg_slices_cls_z, fg_slices_cls) = _compute_fg_indices(
+        label, label_values, fg_subsample)
 
     # 6. 谱系 meta（自描述）。
     meta = {
@@ -156,6 +186,7 @@ def prepare_one(
         "rw_shift"    : 1.0,
         "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
         "image_dtype" : str(image.dtype),
+        "fg_per_class": True,   # fg_coords 逐类 cap；含 *_cls 类对齐数组
         "made_at"     : datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
@@ -168,6 +199,9 @@ def prepare_one(
         "label"    : label,
         "fg_slices": fg_slices,
         "fg_coords": fg_coords,
+        "fg_coords_cls"  : fg_coords_cls,
+        "fg_slices_cls_z": fg_slices_cls_z,
+        "fg_slices_cls"  : fg_slices_cls,
         "meta"     : meta_arr}
     if rw is not None:
         payload["rw"] = rw
@@ -426,8 +460,8 @@ def main() -> int:
                              "RAM; tune to host memory.")
     parser.add_argument("--fg-subsample", type=int,
                         default=_DEFAULT_FG_SUBSAMPLE,
-                        help="Max stored 3D fg coords per sample "
-                             "(matches SegDataset3DCubic._build_index).")
+                        help="Max stored 3D fg coords per sample per "
+                             "foreground class.")
     parser.add_argument("--compress", action="store_true",
                         help="Use np.savez_compressed (smaller disk, "
                              "but no shared OS page cache and slower load).")
