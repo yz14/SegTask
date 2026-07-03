@@ -22,6 +22,9 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+# 验证集确定性采样的固定基种子（与样本序号组合派生逐样本 RNG）。
+_VAL_SAMPLING_SEED = 0x5EED_2024
+
 
 # ---------------------------------------------------------------------------
 # Volume I/O
@@ -465,6 +468,8 @@ class SegDatasetNpzBase(Dataset):
         # 逐 worker 采样 RNG（惰性创建，见 _rng）。
         self._rng_cache: Optional[np.random.Generator] = None
         self._rng_wid  : Optional[int] = None
+        # 当前样本序号（__getitem__ 入口处写入，驱动验证确定性采样）。
+        self._sample_idx: int = 0
 
     def _rng(self) -> np.random.Generator:
         """逐 worker 采样 RNG。
@@ -481,6 +486,17 @@ class SegDatasetNpzBase(Dataset):
             self._rng_cache = np.random.default_rng(seed % (2 ** 63))
             self._rng_wid = wid
         return self._rng_cache
+
+    def _sample_rng(self) -> np.random.Generator:
+        """patch 采样 RNG。
+
+        训练用逐 worker 流式 RNG（每 epoch 不同，保采样多样性）；验证用
+        当前样本序号派生的确定性 RNG，使每个 epoch 评估同一组 patch，
+        save_best / early-stopping / plateau 不被采样噪声驱动。
+        """
+        if self.is_train:
+            return self._rng()
+        return np.random.default_rng((_VAL_SAMPLING_SEED, self._sample_idx))
 
     # ------------------------------------------------------------------
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
@@ -633,6 +649,7 @@ class SegDataset3D(SegDatasetNpzBase):
         """总是发单 max-FOV z-cube (1, eD_max, eH, eW)，eD_max=round(eD*max_scale)。多分辨率交由
         trainer 中心裁拆视图；2.5D / z_axis 在数据集侧抽取逻辑完全一致。单分辨率时
         max_scale=1.0，eD_max==eD。"""
+        self._sample_idx = idx
         vol_idx  = idx % len(self.image_paths)
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
@@ -683,9 +700,10 @@ class SegDataset3D(SegDatasetNpzBase):
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
-        """采样中心 z：以 fg_ratio 概率从前景切片采样，否则均匀采样。"""
+        """采样中心 z：训练以 fg_ratio 概率从前景切片采样，否则均匀采样；
+        验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
         fg_slices = self._vol_fg_slices[vol_idx]
-        rng = self._rng()
+        rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
             and rng.random() < self.fg_ratio):
@@ -853,6 +871,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """总是发单 max-FOV cube (1, eD_max, eH_max, eW_max)，size = round(extract_size*max_scale)。
         多分辨率交由 trainer 中心裁拆视图。单分辨率时 max_scale=1.0，cube == extract_size。"""
+        self._sample_idx = idx
         vol_idx    = idx % len(self.image_paths)
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         D, H, W    = img.shape
@@ -922,10 +941,11 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
         """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
-        导致>50% 体素来自边界复制（偏移训练分布）。"""
+        导致>50% 体素来自边界复制（偏移训练分布）。验证用逐样本确定性
+        RNG（见 _sample_rng）。"""
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
         fg_coords = self._vol_fg_coords[vol_idx]
-        rng = self._rng()
+        rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
                 and rng.random() < self.fg_ratio):
