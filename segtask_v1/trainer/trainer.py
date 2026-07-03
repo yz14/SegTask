@@ -16,6 +16,7 @@ import logging
 import math
 import os
 import random
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -116,8 +117,12 @@ class Trainer:
         self.needs_crop         = cfg.data.aug_oversample_ratio > 1.0
 
         # --- Optimizer + scheduler ------------------------------------
-        self.optimizer  = build_optimizer(self.model, cfg)
-        steps_per_epoch = len(train_loader)
+        self.optimizer = build_optimizer(self.model, cfg)
+        # 调度器以优化步（optimizer.step 次数）为单位推进：梯度累积下每
+        # epoch 的优化步数为 ceil(micro-batch 数 / accum)（epoch 尾部不满
+        # accum 的尾组也触发一步，见 _train_epoch 的 is_step_boundary）。
+        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
+        steps_per_epoch = math.ceil(len(train_loader) / self.grad_accum_steps)
         warmup_steps    = tc.warmup_epochs * steps_per_epoch
         total_steps     = tc.epochs * steps_per_epoch
         post_warmup     = total_steps - warmup_steps
@@ -151,7 +156,8 @@ class Trainer:
         self.scaler = GradScaler("cuda", enabled=self._scaler_active)
 
         # --- EMA -------------------------------------------------------
-        self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
+        self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup)
+                    if tc.use_ema else None)
 
         # --- torch.compile (最后) -------------------------------------
         self._compile_enabled = False
@@ -206,9 +212,6 @@ class Trainer:
         # --- 增强 ------------------------------------------------------
         _scales = cfg.data.multi_res_scales or [1.0]
         self.augmentor = GPUAugmentor(cfg.augment, max_scale=max(_scales))
-
-        # --- Gradient accumulation ------------------------------------
-        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
 
         # --- Tracking --------------------------------------------------
         self.num_fg           = cfg.num_fg_classes
@@ -540,11 +543,11 @@ class Trainer:
         if self.ema is None:
             yield
             return
-        self.ema.apply_shadow(self.model)
+        self.ema.apply_shadow(unwrap_compile(self.model))
         try:
             yield
         finally:
-            self.ema.restore(self.model)
+            self.ema.restore(unwrap_compile(self.model))
 
     # ------------------------------------------------------------------
     # Effective grad-accum denominator (尾批不满 accum 时取真实尾长)
@@ -670,6 +673,7 @@ class Trainer:
             self._train_sampler.set_epoch(epoch)
 
         self.optimizer.zero_grad(set_to_none=True)
+        group_has_nonfinite = False
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True).float()
@@ -701,9 +705,50 @@ class Trainer:
 
             self.scaler.scale(loss).backward()
 
+            # 未缩放损失；非有限值驱动 meter 跳过与无 scaler 路径的优化步保护。
+            step_loss = (loss.item() * effective_accum
+                         if effective_accum > 1 else loss.item())
+            if math.isfinite(step_loss):
+                loss_meter.update(step_loss, image.shape[0])
+                for name, val in breakdown.items():
+                    if not math.isfinite(val):
+                        continue
+                    if name not in component_meters:
+                        component_meters[name] = AverageMeter()
+                    component_meters[name].update(val, image.shape[0])
+            else:
+                group_has_nonfinite = True
+                nonfinite_steps += 1
+                logger.warning(
+                    "Non-finite train loss (%s) at epoch %d step %d/%d; "
+                    "skipping meter update. The surrounding optimizer step "
+                    "will be skipped (%s).",
+                    step_loss, epoch + 1, step + 1, total_steps,
+                    "by GradScaler" if self._scaler_active
+                    else "non-finite loss guard")
+
             # 参数更新
             is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_step_boundary:
+                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
+                # bf16/fp32 无 scaler 保护，本 accum 组内出现非有限 loss 时
+                # 丢弃梯度并跳过 optimizer.step，避免 NaN 永久污染权重与
+                # EMA（scheduler/EMA 照常推进，与 fp16 跳步语义对齐）。
+                skip_optim_step = group_has_nonfinite and not self._scaler_active
+                group_has_nonfinite = False
+                if skip_optim_step:
+                    logger.warning(
+                        "Skipping optimizer step at epoch %d step %d/%d: "
+                        "non-finite loss in this accumulation group "
+                        "(amp_dtype=%s has no GradScaler protection).",
+                        epoch + 1, step + 1, total_steps, self._amp_dtype_name)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    if self.ema is not None:
+                        self.ema.update(unwrap_compile(self.model))
+                    if self._health_monitor:
+                        opt_steps += 1
+                    continue
                 # 健康监测：开 clip 时复用其已算出的范数（零成本）；未开 clip 时
                 # 仅 rank0 按开关手动算一次（AMP fp16 下先 unscale 以免量纲被污染）。
                 grad_norm_val = None
@@ -740,7 +785,7 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scheduler.step()
                 if self.ema is not None:
-                    self.ema.update(self.model)
+                    self.ema.update(unwrap_compile(self.model))
 
                 if pre_step_snapshot is not None:
                     try:
@@ -776,25 +821,6 @@ class Trainer:
                         "of each epoch as 'GPU peak (epoch N)'.",
                         one_step_peak, accum)
                     self._first_step_mem_logged = True
-
-            # 记录未缩放损失，丢弃非有限值避免污染均值（GradScaler 会跳该 step）
-            step_loss = (loss.item() * effective_accum
-                         if effective_accum > 1 else loss.item())
-            if math.isfinite(step_loss):
-                loss_meter.update(step_loss, image.shape[0])
-                for name, val in breakdown.items():
-                    if not math.isfinite(val):
-                        continue
-                    if name not in component_meters:
-                        component_meters[name] = AverageMeter()
-                    component_meters[name].update(val, image.shape[0])
-            else:
-                nonfinite_steps += 1
-                logger.warning(
-                    "Non-finite train loss (%s) at epoch %d step %d/%d; "
-                    "skipping meter update. GradScaler will skip this "
-                    "optimizer step.",
-                    step_loss, epoch + 1, step + 1, total_steps)
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 with torch.no_grad():
@@ -879,12 +905,12 @@ class Trainer:
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
             if ema_as_primary:
-                self.ema.apply_shadow(self.model)
+                self.ema.apply_shadow(unwrap_compile(self.model))
                 try:
                     state["model_state_dict"] = unwrap_compile(
                         self.model).state_dict()
                 finally:
-                    self.ema.restore(self.model)
+                    self.ema.restore(unwrap_compile(self.model))
                 state["model_online_state_dict"] = online_sd
 
         return state
@@ -904,6 +930,27 @@ class Trainer:
             path = self.output_dir / f"checkpoint_epoch_{epoch + 1}.pth"
             torch.save(state, path)
             logger.debug("Checkpoint saved: %s", path)
+            self._prune_old_checkpoints()
+
+    def _prune_old_checkpoints(self) -> None:
+        """周期 checkpoint 的 keep-last-k 保留：仅留最近 ``save_keep_last`` 个
+        ``checkpoint_epoch_*.pth``，更早的删除；``best_model.pth`` 不受影响。
+        ``save_keep_last <= 0`` 时不清理。仅 rank0 调用（由 ``_save_checkpoint`` 保证）。"""
+        keep = int(self.cfg.train.save_keep_last)
+        if keep <= 0:
+            return
+        ckpts = []
+        for p in self.output_dir.glob("checkpoint_epoch_*.pth"):
+            m = re.fullmatch(r"checkpoint_epoch_(\d+)\.pth", p.name)
+            if m:
+                ckpts.append((int(m.group(1)), p))
+        ckpts.sort(key=lambda t: t[0])
+        for _, p in ckpts[:-keep]:
+            try:
+                p.unlink()
+                logger.debug("Pruned old checkpoint: %s", p)
+            except OSError as e:  # 清理失败不影响训练
+                logger.warning("Failed to prune old checkpoint %s: %s", p, e)
 
     def _load_checkpoint(self, path: str) -> None:
         logger.info("Loading checkpoint: %s", path)

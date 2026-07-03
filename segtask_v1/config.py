@@ -85,6 +85,14 @@ class DataConfig:
     # True=启动时自动调用 make_data 生成；False=要求手动预生成。
     npz_auto_build: bool = True
 
+    # 物理 spacing 归一化开关（B1）。False=现状（不做任何 target-spacing 重采样）；
+    # True=make_data 烘焙阶段把每卷重采样到 target_spacing，Predictor 推理前镜像
+    # 重采样、概率图再回采到原分辨率。改开关须重新烘焙 npz 才生效。
+    spacing_normalization: bool = False
+    # 目标 spacing [sz, sy, sx]（numpy 轴序 (D,H,W)，单位 mm）。仅 spacing_normalization=True 时用。
+    # None=make_data 扫描全数据集头信息取逐轴中位数（nnU-Net 式指纹）后自动落定。
+    target_spacing: Optional[List[float]] = None
+
     # 样本排除清单路径（每行一个 pid）。空=不过滤。
     exclude_list: str = ""
 
@@ -162,10 +170,18 @@ class AugConfig:
     random_flip_prob: float = 0.2
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
-    # Affine：小角旋转 + 缩放，合成单次 grid_sample。
+    # Affine：小角旋转 + 缩放 + 平移，合成单次 grid_sample。
     random_affine_prob : float = 0.3
     random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
     random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
+    # 逐轴旋转角范围（(x,y,z)=(W,H,D) 三对 [lo,hi]，度）。None=三轴共用
+    # random_rotate_range。CT 惯例：面内(绕 D 轴，即 z)可大角、出面(绕 W/H)宜小角。
+    random_rotate_range_per_axis: Optional[List[List[float]]] = None
+    # 各向异性长宽比校正：在物理各向同性坐标里做旋转（R←A⁻¹RA，A=diag(W,H,D)），
+    # 消除各向异性 patch 上旋转混入的剪切/非均匀缩放。
+    random_affine_aspect_correct: bool = True
+    # 随机平移范围（affine_grid 归一化坐标，[-1,1] 跨整轴）；[0,0]=禁用。
+    random_translate_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
     # 弹性形变（B-spline 随机位移场）。
     elastic_deform_prob : float = 0.2
@@ -196,6 +212,10 @@ class AugConfig:
     # 模拟低分辨率（下采样后上采样）。
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
+
+    # 强度增强后按增强前逐样本逐通道 min/max 夹取（nnU-Net 惯例），避免
+    # brightness/contrast/noise 叠加产生分布外越界值、污染 gamma 语义。
+    intensity_clamp: bool = True
 
     # weight_map 插值模式："nearest" 保持离散权重（默认，含连续手标 wmap）；
     # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
@@ -464,7 +484,9 @@ class LossConfig:
     tversky_beta: float = 0.7
 
     # True：全 batch+空间上汇总 TP/分母后一次除（nnU-Net Dice 默认）。作用于 Dice/Tversky/FocalTversky/GDL。
-    batch_dice: bool = False
+    # 稀疏前景 patch 训练下 per-sample Dice 在空 GT 类上恒≈1（抬高基线、稀释梯度），
+    # 故默认取 nnU-Net 的 batch_dice=True。
+    batch_dice: bool = True
     # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
     ignore_empty: bool = False
 
@@ -548,10 +570,16 @@ class TrainConfig:
     # EMA。
     use_ema  : bool = True
     ema_decay: float = 0.999
+    # EMA decay warmup（timm 式 ramp）：早期用 min(decay, (1+step)/(10+step))，
+    # 避免随机初始权重长时间拖累 shadow、导致早期 best 判定失真。
+    ema_warmup: bool = True
 
     # Checkpoint 保存。
     output_dir      : str = "outputs"
     save_every      : int = 10
+    # 周期 checkpoint 保留策略：仅保留最近 k 个 checkpoint_epoch_*.pth，更早的
+    # 自动删除（best_model.pth 不受影响）。<=0 = 不清理（保留全部）。
+    save_keep_last  : int = 3
     # 选模标准（互斥）：
     #   * "loss"              → val_loss ↓
     #   * "dice"              → mean_dice ↑
@@ -765,8 +793,18 @@ class PredictConfig:
     #   显存吃紧时调小（如 2）。AdaBN per_volume 估计阶段会自动退回串行以保 BN 统计一致。
     tta_batch_size: Optional[int] = None
 
-    # sigmoid 二值化阈值。
-    threshold: float = 0.5
+    # sigmoid 二值化阈值：标量（全类共享）或逐前景类列表（长度 = num_fg，与
+    # label_values[1:] 一一对应）。one-vs-rest sigmoid 下不同类的最优操作点常差异
+    # 很大（小结构类宜偏低阈值）。
+    threshold: Union[float, List[float]] = 0.5
+
+    # 滑窗概率累加器 dtype："fp32"（默认）| "fp16"。大卷 × 多类时 fp16 使
+    # acc_pred 显存减半；blend 权重归一后精度足够（nnU-Net 同款做法）。
+    acc_dtype: str = "fp32"
+
+    # 累加器落 CPU 的逃生门：大卷 × 多类在消费级卡 OOM 时开启（每个 batch 多一次
+    # GPU→CPU 拷贝，用速度换显存）。
+    accumulate_on_cpu: bool = False
 
     # 预测输出目录。
     output_dir: str = "predictions"
@@ -1362,6 +1400,17 @@ class Config:
             self.augment.wmap_interp_mode in ("nearest", "bilinear"),
             f"Invalid augment.wmap_interp_mode: {self.augment.wmap_interp_mode!r} "
             "(expected 'nearest' or 'bilinear').")
+        per_axis = self.augment.random_rotate_range_per_axis
+        if per_axis is not None:
+            _require(
+                len(per_axis) == 3
+                and all(len(r) == 2 for r in per_axis),
+                "augment.random_rotate_range_per_axis must be 3 [lo,hi] pairs "
+                f"for axes (x,y,z)=(W,H,D); got {per_axis!r}.")
+        _require(
+            len(self.augment.random_translate_range) == 2,
+            "augment.random_translate_range must be [lo, hi]; got "
+            f"{self.augment.random_translate_range!r}.")
 
     def _validate_loss(self) -> None:
         """loss.* 名称与参数校验。"""
@@ -1442,6 +1491,14 @@ class Config:
                     self.data.z_boundary_mode == "edge_pad",
                     "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
                     f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
+
+        # spacing 归一化：target_spacing 若显式给出须为 3 个正数（(D,H,W) mm）。
+        if self.data.spacing_normalization and self.data.target_spacing is not None:
+            ts = self.data.target_spacing
+            _require(
+                len(ts) == 3 and all(float(s) > 0.0 for s in ts),
+                "data.target_spacing must be 3 positive floats [sz, sy, sx] (mm); "
+                f"got {ts}.")
 
         _require(
             self.data.aug_oversample_ratio >= 1.0,
@@ -1624,7 +1681,25 @@ class Config:
             f"train.gpus must not contain duplicate GPU indices; got {gpus}.")
 
     def _validate_predict(self) -> None:
-        """predict.* z 交错与 AdaBN 校验。"""
+        """predict.* 阈值 / 累加器 / z 交错 / AdaBN 校验。"""
+        # 阈值：标量或逐前景类列表，均须在 [0,1]；列表长度与 num_fg 的匹配在
+        # Predictor 初始化时检查（label_values 可能到数据扫描后才确定）。
+        thr_cfg = self.predict.threshold
+        if isinstance(thr_cfg, (list, tuple)):
+            _require(
+                len(thr_cfg) > 0,
+                "predict.threshold list must be non-empty.")
+            _require(
+                all(0.0 <= float(t) <= 1.0 for t in thr_cfg),
+                f"predict.threshold entries must be in [0,1]; got {thr_cfg}.")
+        else:
+            _require(
+                0.0 <= float(thr_cfg) <= 1.0,
+                f"predict.threshold must be in [0,1]; got {thr_cfg}.")
+        _require(
+            str(self.predict.acc_dtype) in ("fp32", "fp16"),
+            f"predict.acc_dtype must be 'fp32' or 'fp16'; "
+            f"got {self.predict.acc_dtype!r}.")
         # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
             _require(

@@ -37,10 +37,20 @@ class AverageMeter:
 
 
 class ModelEMA:
-    """参数 EMA，支持原地 apply/restore（仅单卡，不兼容 DDP/FSDP）。"""
+    """参数 EMA，支持原地 apply/restore。
 
-    def __init__(self, model: nn.Module, decay: float = 0.999):
+    兼容单卡与 DDP：DDP 反传 all-reduce 后各 rank 参数一致，逐 rank 独立维护
+    shadow 数学上等价于单卡。不兼容 FSDP（参数分片，state_dict key/形状不完整）。
+    所有方法须传入裸模型（``torch.compile`` 包装前 / ``unwrap_compile`` 后），
+    否则 ``_orig_mod.`` 前缀会与 shadow key 不匹配。"""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999,
+                 warmup: bool = True):
         self.decay = decay
+        # decay warmup（timm 式）：有效 decay = min(decay, (1+n)/(10+n))，
+        # 避免从零训练时 shadow 被随机初始权重长时间拖累。
+        self.warmup = warmup
+        self.num_updates = 0
         self.shadow: Dict[str, torch.Tensor] = {
             k: v.detach().clone() for k, v in model.state_dict().items()
         }
@@ -63,9 +73,13 @@ class ModelEMA:
     def update(self, model: nn.Module) -> None:
         if self._pairs is None or self._pairs_model_id != id(model):
             self._build_pairs(model)
+        self.num_updates += 1
+        decay = self.decay
+        if self.warmup:
+            decay = min(decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
         for shadow, live, is_float in self._pairs:
             if is_float:
-                shadow.mul_(self.decay).add_(live, alpha=1.0 - self.decay)
+                shadow.mul_(decay).add_(live, alpha=1.0 - decay)
             else:
                 # 整型 buffer（如 BN num_batches_tracked）直接跟随最新。
                 shadow.copy_(live)
@@ -93,7 +107,8 @@ class ModelEMA:
         self._swapped = False
 
     def state_dict(self) -> Dict:
-        return {"shadow": self.shadow, "decay": self.decay}
+        return {"shadow": self.shadow, "decay": self.decay,
+                "warmup": self.warmup, "num_updates": self.num_updates}
 
     def load_state_dict(self, state: Dict) -> None:
         loaded = state["shadow"]
@@ -114,6 +129,8 @@ class ModelEMA:
         self._pairs = None
         self._pairs_model_id = None
         self.decay = state.get("decay", self.decay)
+        self.warmup = state.get("warmup", self.warmup)
+        self.num_updates = int(state.get("num_updates", self.num_updates))
 
 
 class Timer:

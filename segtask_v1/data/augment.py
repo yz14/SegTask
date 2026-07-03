@@ -48,7 +48,10 @@ class GPUAugmentor:
         image, label, weight_map = _random_affine(
             image, label, c.random_affine_prob, c.random_rotate_range,
             c.random_scale_range, weight_map=weight_map,
-            wmap_mode=self.wmap_interp_mode)
+            wmap_mode=self.wmap_interp_mode,
+            translate_range=c.random_translate_range,
+            rotate_range_per_axis=c.random_rotate_range_per_axis,
+            aspect_correct=c.random_affine_aspect_correct)
         # 按 max_scale 缩小 alpha。
         effective_alpha = c.elastic_deform_alpha / self.max_scale
         image, label, weight_map = _elastic_deform(
@@ -59,13 +62,20 @@ class GPUAugmentor:
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
             c.grid_dropout_holes, weight_map=weight_map)
 
-        # Intensity (image only)
+        # Intensity (image only)。开 intensity_clamp 时记录增强前逐样本逐通道
+        # min/max，全部强度增强后夹回原范围，避免叠加越界。
+        if c.intensity_clamp:
+            reduce_dims = tuple(range(2, image.ndim))
+            clamp_lo = image.amin(dim=reduce_dims, keepdim=True)
+            clamp_hi = image.amax(dim=reduce_dims, keepdim=True)
         image = _random_brightness(image, c.random_brightness_prob, c.random_brightness_range)
         image = _random_contrast(image, c.random_contrast_prob, c.random_contrast_range)
         image = _random_gamma(image, c.random_gamma_prob, c.random_gamma_range)
         image = _gaussian_noise(image, c.gaussian_noise_prob, c.gaussian_noise_std)
         image = _gaussian_blur_3d(image, c.gaussian_blur_prob, c.gaussian_blur_sigma)
         image = _simulate_lowres(image, c.simulate_lowres_prob, c.simulate_lowres_zoom)
+        if c.intensity_clamp:
+            image = torch.maximum(torch.minimum(image, clamp_hi), clamp_lo)
 
         return image, label, weight_map
 
@@ -94,8 +104,17 @@ def _random_affine(
     prob: float, rotate_range: list, scale_range: list,
     weight_map: Optional[torch.Tensor] = None,
     wmap_mode: str = "nearest",
+    translate_range: Optional[list] = None,
+    rotate_range_per_axis: Optional[list] = None,
+    aspect_correct: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本 3D 仿射（欧拉旋转 + 各同性缩放）。三路均用 padding_mode='border' 保边界，避免将 weight_map 背景=1 归零。"""
+    """逐样本 3D 仿射（欧拉旋转 + 各同性缩放 + 可选平移）。三路均用 padding_mode='border' 保边界，避免将 weight_map 背景=1 归零。
+
+    rotate_range_per_axis：3 对 [lo,hi]（度），轴序 (x,y,z)=(W,H,D)；None 时三轴共用 rotate_range。
+    aspect_correct：True 时在物理各向同性坐标里旋转（R←A⁻¹RA，A=diag(W,H,D)），
+    消除各向异性 patch 上 affine_grid 归一化坐标旋转隐含的剪切/非均匀缩放。
+    translate_range：[lo,hi]（归一化坐标，[-1,1] 跨整轴），逐轴独立采样；None/[0,0]=无平移。
+    """
     B, _, D, H, W = image.shape
     device = image.device
 
@@ -106,12 +125,31 @@ def _random_affine(
 
     # 逐样本采样旋转角（弧度）与 scale。
     n = mask.sum().item()
-    lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
-    angles = torch.empty(n, 3, device=device).uniform_(lo, hi)  # (n, 3) for x,y,z
+    if rotate_range_per_axis is not None:
+        angles = torch.empty(n, 3, device=device)  # (n, 3) for x,y,z
+        for ax in range(3):
+            lo = math.radians(rotate_range_per_axis[ax][0])
+            hi = math.radians(rotate_range_per_axis[ax][1])
+            angles[:, ax].uniform_(lo, hi)
+    else:
+        lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
+        angles = torch.empty(n, 3, device=device).uniform_(lo, hi)  # (n, 3) for x,y,z
     scales = torch.empty(n, 1, device=device).uniform_(scale_range[0], scale_range[1])
 
+    translations = None
+    if translate_range is not None and (
+            translate_range[0] != 0.0 or translate_range[1] != 0.0):
+        translations = torch.empty(n, 3, device=device).uniform_(
+            translate_range[0], translate_range[1])
+
+    aspect = None
+    if aspect_correct:
+        # affine_grid 坐标轴序 (x,y,z)=(W,H,D)；只用比例，公共尺度无影响。
+        aspect = torch.tensor(
+            [float(W), float(H), float(D)], device=device, dtype=torch.float32)
+
     # 构建逐样本 3x4 仿射 + grid。
-    affines = _build_rotation_matrices(angles, scales)
+    affines = _build_rotation_matrices(angles, scales, translations, aspect)
     grid = F.affine_grid(affines, [n, 1, D, H, W], align_corners=False)
     idx = mask.nonzero(as_tuple=True)[0]
     image[idx] = F.grid_sample(
@@ -130,8 +168,17 @@ def _random_affine(
 
 
 def _build_rotation_matrices(
-    angles: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    """从欧拉角（N×3 rad）与 scales（N×1）构建 (N,3,4) 仿射矩阵。"""
+    angles: torch.Tensor, scales: torch.Tensor,
+    translations: Optional[torch.Tensor] = None,
+    aspect: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """从欧拉角（N×3 rad）与 scales（N×1）构建 (N,3,4) 仿射矩阵。
+
+    translations：(N,3) 归一化平移；None=无平移。
+    aspect：(3,) 各轴物理尺度比例（轴序 (x,y,z)=(W,H,D)）；非 None 时对旋转
+    做共轭校正 R←A⁻¹RA，使旋转在物理各向同性坐标里进行（各同性 scale
+    与对角阵可交换，不受影响）。
+    """
     N = angles.shape[0]
     device = angles.device
 
@@ -139,8 +186,6 @@ def _build_rotation_matrices(
     sx, sy, sz = angles[:, 0].sin(), angles[:, 1].sin(), angles[:, 2].sin()
 
     # R = Rz @ Ry @ Rx。
-    zeros = torch.zeros(N, device=device)
-
     r00 = cy * cz
     r01 = sx * sy * cz - cx * sz
     r02 = cx * sy * cz + sx * sz
@@ -151,16 +196,25 @@ def _build_rotation_matrices(
     r21 = sx * cy
     r22 = cx * cy
 
-    s = scales.squeeze(-1)  # (N,)
-    # 3x4 = [s*R | 0]。
-    mat = torch.stack([
-        s * r00, s * r01, s * r02, zeros,
-        s * r10, s * r11, s * r12, zeros,
-        s * r20, s * r21, s * r22, zeros,
+    rot = torch.stack([
+        r00, r01, r02,
+        r10, r11, r12,
+        r20, r21, r22,
     ], dim=-1)
-    mat = rearrange(mat, 'n (r c) -> n r c', r=3, c=4)
+    rot = rearrange(rot, 'n (r c) -> n r c', r=3, c=3)
 
-    return mat
+    if aspect is not None:
+        a = aspect.to(device=device, dtype=rot.dtype)
+        rot = torch.diag(1.0 / a) @ rot @ torch.diag(a)
+
+    m = scales.view(N, 1, 1) * rot  # (N,3,3)
+
+    if translations is None:
+        t = torch.zeros(N, 3, 1, device=device, dtype=m.dtype)
+    else:
+        t = translations.view(N, 3, 1).to(m.dtype)
+
+    return torch.cat([m, t], dim=-1)  # (N,3,4)
 
 
 def _elastic_deform(
@@ -342,41 +396,51 @@ def _gaussian_noise(
 
 def _gaussian_blur_3d(
     image: torch.Tensor, prob: float, sigma_range: list) -> torch.Tensor:
-    """可分离 3D 高斯模糊；逐样本独立采样 sigma。"""
+    """可分离 3D 高斯模糊；逐样本独立采样 sigma。
+
+    全部选中样本一次性向量化处理：核长统一取 sigma 上界对应的 ks（小 sigma
+    样本仅多出近零尾部，归一化后等价），逐样本核通过 grouped conv 并行。"""
     if prob <= 0:
         return image
-    B = image.shape[0]
-    mask = torch.rand(B, device=image.device) < prob
+    B, C = image.shape[:2]
+    device = image.device
+    mask = torch.rand(B, device=device) < prob
     if not mask.any():
         return image
 
-    for i in mask.nonzero(as_tuple=True)[0].tolist():
-        sigma = float(torch.empty(1).uniform_(sigma_range[0], sigma_range[1]))
-        ks = max(int(2 * round(3 * sigma) + 1), 3)
-        x = torch.arange(ks, dtype=image.dtype, device=image.device) - ks // 2
-        k1d = torch.exp(-0.5 * (x / sigma) ** 2)
-        k1d = k1d / k1d.sum()
-        pad = ks // 2
+    idx = mask.nonzero(as_tuple=True)[0]
+    n = idx.numel()
+    sigmas = torch.empty(n, device=device, dtype=image.dtype).uniform_(
+        sigma_range[0], sigma_range[1])  # (n,)
+    ks = max(int(2 * round(3 * float(sigma_range[1])) + 1), 3)
+    pad = ks // 2
+    x = torch.arange(ks, dtype=image.dtype, device=device) - pad  # (ks,)
+    k1d = torch.exp(-0.5 * (x[None, :] / sigmas[:, None]) ** 2)   # (n, ks)
+    k1d = k1d / k1d.sum(dim=1, keepdim=True)
+    kc = k1d.repeat_interleave(C, dim=0)  # (n*C, ks)，同样本各通道共用同核
 
-        # 将通道折入 conv3d batch 轴，1D 核作用于每个通道切片。
-        sub = rearrange(image[i:i + 1], 'n c d h w -> (n c) 1 d h w')
+    # 将 (n,C) 折入通道轴，groups=n*C 使每通道用自己的核。
+    sub = rearrange(image[idx], 'n c d h w -> 1 (n c) d h w')
+    nc = n * C
+    for axis_pat, pad_arg in (
+        ('g k -> g 1 k 1 1', [0, 0, 0, 0, pad, pad]),
+        ('g k -> g 1 1 k 1', [0, 0, pad, pad, 0, 0]),
+        ('g k -> g 1 1 1 k', [pad, pad, 0, 0, 0, 0]),
+    ):
+        k = rearrange(kc, axis_pat)
+        sub = F.pad(sub, pad_arg, mode="replicate")
+        sub = F.conv3d(sub, k, groups=nc)
 
-        for axis_pat, pad_arg in (
-            ('k -> 1 1 k 1 1', [0, 0, 0, 0, pad, pad]),
-            ('k -> 1 1 1 k 1', [0, 0, pad, pad, 0, 0]),
-            ('k -> 1 1 1 1 k', [pad, pad, 0, 0, 0, 0]),
-        ):
-            k = rearrange(k1d, axis_pat)
-            sub = F.pad(sub, pad_arg, mode="replicate")
-            sub = F.conv3d(sub, k)
-
-        image[i:i + 1] = rearrange(sub, '(n c) 1 d h w -> n c d h w', n=1)
+    image[idx] = rearrange(sub, '1 (n c) d h w -> n c d h w', n=n)
     return image
 
 
 def _simulate_lowres(
     image: torch.Tensor, prob: float, zoom_range: list) -> torch.Tensor:
-    """trilinear 下采→上采模拟低分辨率；逐样本独立采样 zoom。"""
+    """trilinear 下采→上采模拟低分辨率；逐样本独立采样 zoom。
+
+    zoom 一次性批量采样（单次同步）；目标尺寸相同的样本分组后批量
+    interpolate（不同尺寸无法单次处理，只能逐组）。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -384,14 +448,17 @@ def _simulate_lowres(
     if not mask.any():
         return image
     _, _, D, H, W = image.shape
-    for i in mask.nonzero(as_tuple=True)[0].tolist():
-        z = float(torch.empty(1).uniform_(zoom_range[0], zoom_range[1]))
+    idxs = mask.nonzero(as_tuple=True)[0].tolist()
+    zooms = torch.empty(len(idxs)).uniform_(zoom_range[0], zoom_range[1]).tolist()
+    groups: dict = {}
+    for i, z in zip(idxs, zooms):
         if z >= 0.99:
             continue
+        size = (max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z)))
+        groups.setdefault(size, []).append(i)
+    for size, members in groups.items():
         small = F.interpolate(
-            image[i:i + 1],
-            size=(max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z))),
-            mode="trilinear", align_corners=False)
-        image[i:i + 1] = F.interpolate(
+            image[members], size=size, mode="trilinear", align_corners=False)
+        image[members] = F.interpolate(
             small, size=(D, H, W), mode="trilinear", align_corners=False)
     return image

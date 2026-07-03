@@ -22,6 +22,9 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
+# 验证集确定性采样的固定基种子（与样本序号组合派生逐样本 RNG）。
+_VAL_SAMPLING_SEED = 0x5EED_2024
+
 
 # ---------------------------------------------------------------------------
 # Volume I/O
@@ -114,6 +117,36 @@ def load_nifti_with_spacing(
     return arr, z_spacing
 
 
+def read_nifti_spacing(path: str) -> "Tuple[float, float, float]":
+    """仅读 NIfTI 头（不解码像素）返 (sz, sy, sx) —— numpy 轴序 (D,H,W) 的 mm spacing。
+    sitk GetSpacing 为 (sx, sy, sz)，此处倒转对齐 numpy。非有限/非正退 1.0。"""
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.ReadImageInformation()
+    sp = reader.GetSpacing()  # (sx, sy, sz)
+    sx = float(sp[0]) if len(sp) >= 1 else 1.0
+    sy = float(sp[1]) if len(sp) >= 2 else 1.0
+    sz = float(sp[2]) if len(sp) >= 3 else 1.0
+    out = []
+    for s in (sz, sy, sx):
+        out.append(s if (np.isfinite(s) and s > 0.0) else 1.0)
+    return (out[0], out[1], out[2])
+
+
+def resample_to_spacing(
+    vol: np.ndarray,
+    src_spacing: "Tuple[float, float, float]",
+    target_spacing: "Tuple[float, float, float]",
+    is_label: bool = False) -> np.ndarray:
+    """(D,H,W) 体积从 src_spacing 重采样到 target_spacing（均为 numpy 轴序 (D,H,W) mm）。
+    新尺寸 = round(shape * src/target)（每轴 >=1）；image order=1 线性、label order=0 近邻。"""
+    D, H, W = vol.shape
+    new = []
+    for n, s, t in zip((D, H, W), src_spacing, target_spacing):
+        new.append(max(1, int(round(n * float(s) / float(t)))))
+    return resize_3d(vol, new[0], new[1], new[2], is_label=is_label)
+
+
 def load_nifti_cropped(
     path: str,
     bbox: "Optional[BBox]" = None,
@@ -172,8 +205,11 @@ def load_nifti_cropped(
 #   image int16 (D',H',W') HU bbox-裁剪
 #   label int16 (D',H',W') 原始标签 bbox-裁剪
 #   rw    float32 (D',H',W') +1 偏移后的区域权重（可选）
-#   fg_slices int32 (M,)
-#   fg_coords int32 (N,3) seed=42、cap=50000
+#   fg_slices int32 (M,) 全前景 z 切片并集
+#   fg_coords int32 (N,3) 逐类 argwhere 拼接（seed=42、每类 cap=50000）
+#   fg_coords_cls   int16 (N,) 与 fg_coords 对齐的类值（make_data≥1.1）
+#   fg_slices_cls_z int32 (K,) 逐类 z 切片拼接（make_data≥1.1）
+#   fg_slices_cls   int16 (K,) 与之对齐的类值（make_data≥1.1）
 #   meta  object 0-d dict
 # numpy 对 .npz 忽略 mmap_mode，逐 worker 为 owned ndarray；OS page cache 跨 worker 共享。
 
@@ -232,6 +268,29 @@ def load_npz_fg_coords(path: str) -> np.ndarray:
     """返 npz 内预计算的 (N,3) 前景 voxel 坐标（裁剪后坐标系）。"""
     with _open_npz(path) as f:
         return np.asarray(f["fg_coords"], dtype=np.int32)
+
+
+def _group_fg_coords_by_class(
+    f: "np.lib.npyio.NpzFile", coords: np.ndarray) -> Optional[List[np.ndarray]]:
+    """按 fg_coords_cls 将 coords 分组为逐类非空坐标数组列表；
+    无该键（make_data<1.1 的旧 npz）返 None。"""
+    if "fg_coords_cls" not in f.files:
+        return None
+    cls = np.asarray(f["fg_coords_cls"])
+    groups = [coords[cls == v] for v in np.unique(cls)]
+    return [g for g in groups if len(g)] or None
+
+
+def _group_fg_slices_by_class(
+    f: "np.lib.npyio.NpzFile") -> Optional[List[np.ndarray]]:
+    """按 fg_slices_cls 将 fg_slices_cls_z 分组为逐类非空 z 索引列表；
+    无该键（make_data<1.1 的旧 npz）返 None。"""
+    if "fg_slices_cls" not in f.files or "fg_slices_cls_z" not in f.files:
+        return None
+    cls = np.asarray(f["fg_slices_cls"])
+    zs  = np.asarray(f["fg_slices_cls_z"], dtype=np.int32)
+    groups = [zs[cls == v] for v in np.unique(cls)]
+    return [g for g in groups if len(g)] or None
 
 
 def load_npz_label_for_split(path: str) -> np.ndarray:
@@ -465,6 +524,8 @@ class SegDatasetNpzBase(Dataset):
         # 逐 worker 采样 RNG（惰性创建，见 _rng）。
         self._rng_cache: Optional[np.random.Generator] = None
         self._rng_wid  : Optional[int] = None
+        # 当前样本序号（__getitem__ 入口处写入，驱动验证确定性采样）。
+        self._sample_idx: int = 0
 
     def _rng(self) -> np.random.Generator:
         """逐 worker 采样 RNG。
@@ -481,6 +542,17 @@ class SegDatasetNpzBase(Dataset):
             self._rng_cache = np.random.default_rng(seed % (2 ** 63))
             self._rng_wid = wid
         return self._rng_cache
+
+    def _sample_rng(self) -> np.random.Generator:
+        """patch 采样 RNG。
+
+        训练用逐 worker 流式 RNG（每 epoch 不同，保采样多样性）；验证用
+        当前样本序号派生的确定性 RNG，使每个 epoch 评估同一组 patch，
+        save_best / early-stopping / plateau 不被采样噪声驱动。
+        """
+        if self.is_train:
+            return self._rng()
+        return np.random.default_rng((_VAL_SAMPLING_SEED, self._sample_idx))
 
     # ------------------------------------------------------------------
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
@@ -605,8 +677,10 @@ class SegDataset3D(SegDatasetNpzBase):
                 f"multi-res (max_scale={self._max_scale}) requires "
                 f"z_boundary_mode='edge_pad'; got {self.z_boundary_mode!r}.")
 
-        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样。
+        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样。含 *_cls 键时额外
+        # 构建逐类切片列表，前景采样先选类再选切片（类均衡）。
         self._vol_fg_slices : List[np.ndarray] = []
+        self._vol_fg_slices_by_cls: List[Optional[List[np.ndarray]]] = []
         self._vol_all_slices: List[int] = []
         self._build_index()
 
@@ -622,6 +696,7 @@ class SegDataset3D(SegDatasetNpzBase):
             fg = np.asarray(f["fg_slices"], dtype=np.int32)
             D  = int(f["image"].shape[0])
             self._vol_fg_slices.append(fg)
+            self._vol_fg_slices_by_cls.append(_group_fg_slices_by_class(f))
             self._vol_all_slices.append(D)
             total_fg += len(fg)
             total_slices += D
@@ -633,6 +708,7 @@ class SegDataset3D(SegDatasetNpzBase):
         """总是发单 max-FOV z-cube (1, eD_max, eH, eW)，eD_max=round(eD*max_scale)。多分辨率交由
         trainer 中心裁拆视图；2.5D / z_axis 在数据集侧抽取逻辑完全一致。单分辨率时
         max_scale=1.0，eD_max==eD。"""
+        self._sample_idx = idx
         vol_idx  = idx % len(self.image_paths)
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
@@ -683,12 +759,18 @@ class SegDataset3D(SegDatasetNpzBase):
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
-        """采样中心 z：以 fg_ratio 概率从前景切片采样，否则均匀采样。"""
+        """采样中心 z：训练以 fg_ratio 概率从前景切片采样（npz 含逐类索引时
+        先均匀选类再选该类切片，避免稀有类被大器官挤压），否则均匀采样；
+        验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
         fg_slices = self._vol_fg_slices[vol_idx]
-        rng = self._rng()
+        rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
             and rng.random() < self.fg_ratio):
+            per_cls = self._vol_fg_slices_by_cls[vol_idx]
+            if per_cls:
+                cls_slices = per_cls[int(rng.integers(len(per_cls)))]
+                return int(rng.choice(cls_slices))
             return int(rng.choice(fg_slices))
         return int(rng.integers(0, D_vol))
 
@@ -828,9 +910,11 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         self._max_scale = float(max(self.multi_res_scales))
         self.fg_ratio   = foreground_oversample_ratio
 
-        # 逐卷 3D fg 坐标索引（make_data 预抽：seed=42, cap=50000）驱动 _sample_center 过采样。
+        # 逐卷 3D fg 坐标索引（make_data 预抽：seed=42, 每类 cap=50000）驱动
+        # _sample_center 过采样；含 fg_coords_cls 时逐类分组，先选类再选点。
         self._vol_shapes   : List[Tuple[int, int, int]] = []
         self._vol_fg_coords: List[np.ndarray]           = []
+        self._vol_fg_coords_by_cls: List[Optional[List[np.ndarray]]] = []
         self._build_index()
 
     def _build_index(self) -> None:
@@ -845,6 +929,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             shape  = tuple(int(s) for s in f["image"].shape)
             self._vol_shapes.append(shape)
             self._vol_fg_coords.append(coords)
+            self._vol_fg_coords_by_cls.append(
+                _group_fg_coords_by_class(f, coords))
             total_fg += len(coords)
         logger.info(
             "NPZ cubic index: %d volumes, %d fg voxels sampled",
@@ -853,6 +939,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """总是发单 max-FOV cube (1, eD_max, eH_max, eW_max)，size = round(extract_size*max_scale)。
         多分辨率交由 trainer 中心裁拆视图。单分辨率时 max_scale=1.0，cube == extract_size。"""
+        self._sample_idx = idx
         vol_idx    = idx % len(self.image_paths)
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         D, H, W    = img.shape
@@ -922,13 +1009,18 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
         """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
-        导致>50% 体素来自边界复制（偏移训练分布）。"""
+        导致>50% 体素来自边界复制（偏移训练分布）。验证用逐样本确定性
+        RNG（见 _sample_rng）。"""
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
         fg_coords = self._vol_fg_coords[vol_idx]
-        rng = self._rng()
+        rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
                 and rng.random() < self.fg_ratio):
+            # 含逐类索引时先均匀选类再选点（类均衡）；旧 npz 退回合并采样。
+            per_cls = self._vol_fg_coords_by_cls[vol_idx]
+            if per_cls:
+                fg_coords = per_cls[int(rng.integers(len(per_cls)))]
             idx = int(rng.integers(len(fg_coords)))
             d, h, w = fg_coords[idx]
             # np.clip 上界含于，需 -1。

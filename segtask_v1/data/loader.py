@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 SuffixSpec = Union[str, Sequence[str]]
 
 import numpy as np
-from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
+from torch.utils.data import (
+    ConcatDataset,
+    DataLoader,
+    DistributedSampler,
+    Sampler,
+)
 
 from ..config import Config
 from .dataset import load_nifti, load_npz_label_for_split
@@ -23,6 +28,39 @@ from .mixed_sampler import (
 from .specs import DatasetCommonCfg, SplitPaths, build_data_spec
 
 logger = logging.getLogger(__name__)
+
+
+class ValBatchShardSampler(Sampler):
+    """DDP 验证采样器：按 batch 块把 val 样本不相交地切给各 rank。
+
+    全集按 ``batch_size`` 顺序分块，块序号 ``i % world_size == rank`` 的块归当前
+    rank，块内样本顺序不变。与"逐 rank 完整迭代 val_loader、按 batch 序号跳过"
+    的切分严格同构，但 worker 只生产本 rank 的 batch，验证阶段 DataLoader CPU
+    开销不随卡数翻倍。无 padding / 无重复（各 rank 计数可不等长；指标经
+    all-reduce 汇总，与单进程全集累加严格相等）。
+    """
+
+    def __init__(self, num_samples: int, batch_size: int,
+                 rank: int, world_size: int):
+        self.num_samples = int(num_samples)
+        self.batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        n_batches = (self.num_samples + self.batch_size - 1) // self.batch_size
+        self._blocks = list(range(self.rank, n_batches, self.world_size))
+
+    def __iter__(self):
+        for b in self._blocks:
+            start = b * self.batch_size
+            end = min(start + self.batch_size, self.num_samples)
+            yield from range(start, end)
+
+    def __len__(self) -> int:
+        total = 0
+        for b in self._blocks:
+            start = b * self.batch_size
+            total += min(start + self.batch_size, self.num_samples) - start
+        return total
 
 
 def _load_exclude_pids(exclude_list: str) -> set:
@@ -550,9 +588,10 @@ def build_dataloaders(
     batch 内按 ``data.mix_ratio`` 混合；验证集始终仅取金标准。
 
     ``world_size > 1`` 时为多卡 DDP：训练集用 ``DistributedSampler`` 不相交切分到
-    各 rank（每 epoch 需在外层 ``set_epoch`` 以重新洗牌）。验证集 loader 不在此切分
-    —— 整卷(high)验证按 ``_npz_paths`` 在验证器内按 rank 切，medium 验证在验证器内
-    按 batch 序号切，故 val_loader 保持 ``shuffle=False`` 全集不变。"""
+    各 rank（每 epoch 需在外层 ``set_epoch`` 以重新洗牌）。验证集用
+    ``ValBatchShardSampler`` 按 batch 块不相交切分（worker 只生产本 rank 的
+    batch，无 padding / 无重复）；整卷(high)验证不走 val_loader 的 batch，仍按
+    ``_npz_paths`` 在验证器内逐 rank 切。"""
     dc = cfg.data
     if world_size > 1 and bool(dc.npz_dir_secondary):
         raise ValueError(
@@ -722,10 +761,17 @@ def build_dataloaders(
             drop_last   = True,
             **loader_kwargs)
 
+    # DDP：val 在采样器层按 batch 块切给各 rank，worker 只生产本 rank 的 batch
+    # （否则每 rank 完整生产全集、验证 CPU 开销随卡数线性翻倍）。单进程时保持
+    # shuffle=False 顺序全集。
+    val_sampler = (
+        ValBatchShardSampler(len(val_ds), dc.batch_size, rank, world_size)
+        if world_size > 1 else None)
     val_loader = DataLoader(
         val_ds,
         batch_size  = dc.batch_size,
         shuffle     = False,
+        sampler     = val_sampler,
         num_workers = eff_num_workers,
         pin_memory  = dc.pin_memory,
         drop_last   = False,

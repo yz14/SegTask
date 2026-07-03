@@ -180,7 +180,9 @@ def _train_worker(
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    seed_everything(cfg.train.seed, cfg.train.deterministic)
+    # 逐 rank 偏移种子：解耦各 rank 的增强参数流与 DataLoader worker 采样流
+    # （数据切分由 DistributedSampler 保证，模型初值由 DDP 构造时从 rank0 广播）。
+    seed_everything(cfg.train.seed + local_rank, cfg.train.deterministic)
 
     completed = False
     try:

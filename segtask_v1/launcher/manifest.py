@@ -144,6 +144,9 @@ def _data_fields(mode: str) -> List[Field]:
         Field("data.npz_dir"),
         Field("data.npz_suffix"),
         Field("data.npz_auto_build"),
+        Field("data.spacing_normalization"),
+        Field("data.target_spacing",
+              depends_on=[_truthy("data.spacing_normalization")]),
         Field("data.image_dir"),
         Field("data.label_dir"),
         Field("data.image_suffix"),
@@ -205,6 +208,8 @@ def _augment_fields() -> List[Field]:
         "enabled",
         "random_flip_prob", "random_flip_axes",
         "random_affine_prob", "random_rotate_range", "random_scale_range",
+        "random_rotate_range_per_axis", "random_affine_aspect_correct",
+        "random_translate_range",
         "elastic_deform_prob", "elastic_deform_sigma", "elastic_deform_alpha",
         "grid_dropout_prob", "grid_dropout_ratio", "grid_dropout_holes",
         "random_brightness_prob", "random_brightness_range",
@@ -213,6 +218,7 @@ def _augment_fields() -> List[Field]:
         "gaussian_noise_prob", "gaussian_noise_std",
         "gaussian_blur_prob", "gaussian_blur_sigma",
         "simulate_lowres_prob", "simulate_lowres_zoom",
+        "intensity_clamp",
         "wmap_interp_mode",
     ]
     dep = [_truthy("augment.enabled")]
@@ -394,8 +400,10 @@ def _train_fields() -> List[Field]:
         Field("train.compile_mode"),
         Field("train.use_ema"),
         Field("train.ema_decay", depends_on=[_truthy("train.use_ema")]),
+        Field("train.ema_warmup", depends_on=[_truthy("train.use_ema")]),
         Field("train.output_dir"),
         Field("train.save_every"),
+        Field("train.save_keep_last"),
         Field("train.save_best_criterion"),
         Field("train.surface_dice_tolerance", depends_on=[_in("train.save_best_criterion", ["dice+surface_dice", "balanced"])]),
         Field("train.surface_dice_weight", depends_on=[_in("train.save_best_criterion", ["dice+surface_dice"])]),
@@ -427,6 +435,8 @@ def _predict_fields(mode: str) -> List[Field]:
         Field("predict.tta_flip"),
         Field("predict.tta_batch_size", depends_on=[_truthy("predict.tta_flip")]),
         Field("predict.threshold"),
+        Field("predict.acc_dtype"),
+        Field("predict.accumulate_on_cpu"),
         # 注：predict.output_dir 始终被 predict.py 以 --output 或派生值覆盖，属
         # "被覆盖字段"，故不在此暴露——输出目录改用 run 组的 --output。
         Field("predict.save_probabilities"),
