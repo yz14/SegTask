@@ -175,8 +175,11 @@ def load_nifti_cropped(
 #   image int16 (D',H',W') HU bbox-裁剪
 #   label int16 (D',H',W') 原始标签 bbox-裁剪
 #   rw    float32 (D',H',W') +1 偏移后的区域权重（可选）
-#   fg_slices int32 (M,)
-#   fg_coords int32 (N,3) seed=42、cap=50000
+#   fg_slices int32 (M,) 全前景 z 切片并集
+#   fg_coords int32 (N,3) 逐类 argwhere 拼接（seed=42、每类 cap=50000）
+#   fg_coords_cls   int16 (N,) 与 fg_coords 对齐的类值（make_data≥1.1）
+#   fg_slices_cls_z int32 (K,) 逐类 z 切片拼接（make_data≥1.1）
+#   fg_slices_cls   int16 (K,) 与之对齐的类值（make_data≥1.1）
 #   meta  object 0-d dict
 # numpy 对 .npz 忽略 mmap_mode，逐 worker 为 owned ndarray；OS page cache 跨 worker 共享。
 
@@ -235,6 +238,29 @@ def load_npz_fg_coords(path: str) -> np.ndarray:
     """返 npz 内预计算的 (N,3) 前景 voxel 坐标（裁剪后坐标系）。"""
     with _open_npz(path) as f:
         return np.asarray(f["fg_coords"], dtype=np.int32)
+
+
+def _group_fg_coords_by_class(
+    f: "np.lib.npyio.NpzFile", coords: np.ndarray) -> Optional[List[np.ndarray]]:
+    """按 fg_coords_cls 将 coords 分组为逐类非空坐标数组列表；
+    无该键（make_data<1.1 的旧 npz）返 None。"""
+    if "fg_coords_cls" not in f.files:
+        return None
+    cls = np.asarray(f["fg_coords_cls"])
+    groups = [coords[cls == v] for v in np.unique(cls)]
+    return [g for g in groups if len(g)] or None
+
+
+def _group_fg_slices_by_class(
+    f: "np.lib.npyio.NpzFile") -> Optional[List[np.ndarray]]:
+    """按 fg_slices_cls 将 fg_slices_cls_z 分组为逐类非空 z 索引列表；
+    无该键（make_data<1.1 的旧 npz）返 None。"""
+    if "fg_slices_cls" not in f.files or "fg_slices_cls_z" not in f.files:
+        return None
+    cls = np.asarray(f["fg_slices_cls"])
+    zs  = np.asarray(f["fg_slices_cls_z"], dtype=np.int32)
+    groups = [zs[cls == v] for v in np.unique(cls)]
+    return [g for g in groups if len(g)] or None
 
 
 def load_npz_label_for_split(path: str) -> np.ndarray:
@@ -621,8 +647,10 @@ class SegDataset3D(SegDatasetNpzBase):
                 f"multi-res (max_scale={self._max_scale}) requires "
                 f"z_boundary_mode='edge_pad'; got {self.z_boundary_mode!r}.")
 
-        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样。
+        # 逐卷前景索引（从 npz 读）驱动 _sample_z 过采样。含 *_cls 键时额外
+        # 构建逐类切片列表，前景采样先选类再选切片（类均衡）。
         self._vol_fg_slices : List[np.ndarray] = []
+        self._vol_fg_slices_by_cls: List[Optional[List[np.ndarray]]] = []
         self._vol_all_slices: List[int] = []
         self._build_index()
 
@@ -638,6 +666,7 @@ class SegDataset3D(SegDatasetNpzBase):
             fg = np.asarray(f["fg_slices"], dtype=np.int32)
             D  = int(f["image"].shape[0])
             self._vol_fg_slices.append(fg)
+            self._vol_fg_slices_by_cls.append(_group_fg_slices_by_class(f))
             self._vol_all_slices.append(D)
             total_fg += len(fg)
             total_slices += D
@@ -700,13 +729,18 @@ class SegDataset3D(SegDatasetNpzBase):
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
-        """采样中心 z：训练以 fg_ratio 概率从前景切片采样，否则均匀采样；
+        """采样中心 z：训练以 fg_ratio 概率从前景切片采样（npz 含逐类索引时
+        先均匀选类再选该类切片，避免稀有类被大器官挤压），否则均匀采样；
         验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
         fg_slices = self._vol_fg_slices[vol_idx]
         rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
             and rng.random() < self.fg_ratio):
+            per_cls = self._vol_fg_slices_by_cls[vol_idx]
+            if per_cls:
+                cls_slices = per_cls[int(rng.integers(len(per_cls)))]
+                return int(rng.choice(cls_slices))
             return int(rng.choice(fg_slices))
         return int(rng.integers(0, D_vol))
 
@@ -846,9 +880,11 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         self._max_scale = float(max(self.multi_res_scales))
         self.fg_ratio   = foreground_oversample_ratio
 
-        # 逐卷 3D fg 坐标索引（make_data 预抽：seed=42, cap=50000）驱动 _sample_center 过采样。
+        # 逐卷 3D fg 坐标索引（make_data 预抽：seed=42, 每类 cap=50000）驱动
+        # _sample_center 过采样；含 fg_coords_cls 时逐类分组，先选类再选点。
         self._vol_shapes   : List[Tuple[int, int, int]] = []
         self._vol_fg_coords: List[np.ndarray]           = []
+        self._vol_fg_coords_by_cls: List[Optional[List[np.ndarray]]] = []
         self._build_index()
 
     def _build_index(self) -> None:
@@ -863,6 +899,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             shape  = tuple(int(s) for s in f["image"].shape)
             self._vol_shapes.append(shape)
             self._vol_fg_coords.append(coords)
+            self._vol_fg_coords_by_cls.append(
+                _group_fg_coords_by_class(f, coords))
             total_fg += len(coords)
         logger.info(
             "NPZ cubic index: %d volumes, %d fg voxels sampled",
@@ -949,6 +987,10 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
                 and rng.random() < self.fg_ratio):
+            # 含逐类索引时先均匀选类再选点（类均衡）；旧 npz 退回合并采样。
+            per_cls = self._vol_fg_coords_by_cls[vol_idx]
+            if per_cls:
+                fg_coords = per_cls[int(rng.integers(len(per_cls)))]
             idx = int(rng.integers(len(fg_coords)))
             d, h, w = fg_coords[idx]
             # np.clip 上界含于，需 -1。
