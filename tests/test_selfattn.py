@@ -45,6 +45,26 @@ def test_selfattn_block_shape_and_grad(spatial_dims, shape, attn_type):
     assert x.grad is not None
 
 
+def test_softmax_qkv_attention_matches_sdpa_reference():
+    qkv = torch.randn(2, 96, 64)
+    attn = _SoftmaxQKVAttention(num_heads=4)
+
+    out = attn(qkv)
+
+    h = attn.num_heads
+    c = qkv.shape[1] // (3 * h)
+    qkv_h = qkv.view(qkv.shape[0] * h, 3 * c, qkv.shape[2])
+    q, k, v = qkv_h.split(c, dim=1)
+    scale = 1.0 / torch.sqrt(torch.sqrt(torch.tensor(float(c))))
+    weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
+    weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+    ref = torch.einsum("bts,bcs->bct", weight, v)
+    ref = ref.view(qkv.shape[0], h * c, qkv.shape[2])
+
+    max_diff = (out - ref).abs().max().item()
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5), max_diff
+
+
 @pytest.mark.parametrize("attn_type", ["softmax", "linear"])
 def test_selfattn_zero_init_is_identity(attn_type):
     """zero-init proj => block output == input at initialization (residual)."""
