@@ -81,7 +81,7 @@ Backbone：ResNet（post/pre-act/bottleneck）、ConvNeXt（drop-path + LayerSca
 基线已经相当完善，下面的建议聚焦"还没做、且有公认高质量出处"的增量。
 
 二、模型/算法架构升级建议（按性价比排序）
-A1（高优先）：_SoftmaxQKVAttention 换用 SDPA / FlashAttention
+A1（高优先）：_SoftmaxQKVAttention 换用 SDPA / FlashAttention （做）
 @d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:361-377 手写 einsum + 物化 O(N²) 注意力矩阵。3D 瓶颈层 N=8³=512 尚可，但放到次深层（N=16³=4096）时 fp32 权重矩阵单头就要 64MB+。换 F.scaled_dot_product_attention（PyTorch 2.x 内置 FlashAttention/mem-efficient 后端）：
 
 收益：显存 O(N²)→O(N)，速度 2–4×，数值上等价（且内部自动用 fp32 accumulate，可删掉手写的 softmax(.float()) 处理）；
@@ -92,26 +92,67 @@ A2（高优先）：给自注意力块补齐 Transformer 化的两个缺口
 
 位置信息：QKV 完全内容寻址，无任何位置编码。分割里空间先验重要，推荐 3D 分解式 RoPE（按 D/H/W 轴分配 head_dim，业界 LLM/ViT 公认做法，无参数、对分辨率外推友好）或退而求其次的 learnable 相对位置偏置（Swin 式）。
 FFN 缺失：标准 Transformer 块 = Attn + FFN 成对。可加可配的 GEGLU/SwiGLU FFN（LLaMA 系公认），同样 zero-init 输出投影保持"初始恒等"的现有哲学。
-A3（中优先）：窗口/网格注意力，把 attention 推到更浅层
+A3（中优先）：窗口/网格注意力，把 attention 推到更浅层 （做，我理解的窗口内部做了attn，但是窗口和窗口直接需要联系吗？）
 全局 O(N²) 只能放最深两层。要在高分辨率层获益，推荐实现其一：
 
 Swin 式 window + shift（3D 窗口 4³/8³），SwinUNETR 已验证于医学 3D；
 MaxViT 式 block+grid 交替（局部窗口 + 稀疏全局网格），实现更简单、无 shift mask 麻烦，天然适配你的"逐 stage 可配"框架（新增 selfattn_type='window'|'grid'）。
 配合 A1 的 SDPA，窗口注意力的每窗序列短，速度非常好。
 
-A4（中优先）：大核深度卷积升级 —— MedNeXt 档位 B / 膨胀重参数
+A4（中优先）：大核深度卷积升级 —— MedNeXt 档位 B / 膨胀重参数 （做）
 mednext.py 自己注明档位 B 未做：UpKern（k=3 权重插值初始化 k=5 大核）与重采样残差块，是 MedNeXt 论文报告增益的主要来源之一；
 更进一步可借鉴 UniRepLKNet / RepLK 的 Dilated Reparam Block：训练期"大核 = 并行多支小核+膨胀核"，推理期重参数化合并为单一大核——与你已有的 MultiRFBlock（@d:/codes/work-projects/SegTask/segtask_v1/models/resnet.py:257）思想同源，但推理零开销，等于给 MultiRF 加一个"可折叠"档位。
-A5（中优先）：块级微升级（低风险、逐项可消融）
+A5（中优先）：块级微升级（低风险、逐项可消融） （做，注意力门换成按norm_type构建）
 Stochastic Depth 推广：drop-path 目前仅 ConvNeXt 有；给 ResNet/MedNeXt stage 也加线性递增 drop-path（He/Huang 2016，深 encoder 正则标配）。
 GRN（ConvNeXt-V2, 2023）：在 MedNeXt/ConvNeXt 块 FFN 中加 Global Response Normalization，替代/叠加 LayerScale，V2 论文显示对小模型也有稳定增益，实现约 15 行。
 AttentionGate3D 用 BatchNorm 的隐患：@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:461-472 内部是 _BN，与全库 instance/group norm 及小 batch（3D 常 batch=2）设定相悖，小 batch 下 BN 统计噪声大。建议改为跟随 norm_type（保留 BN 为兼容默认或直接切 GN）。
-A6（选做，方向性）：线性复杂度全局建模 —— Mamba/SSM
+A6（选做，方向性）：线性复杂度全局建模 —— Mamba/SSM （先不做）
 U-Mamba / SegMamba（2024）在 3D 分割上报告了超过 Transformer 基线的结果，O(N) 全局感受野。但：依赖 mamba-ssm+causal-conv1d（CUDA 扩展，Windows 编译困难），且训练稳定性不如 attention 成熟。建议列为观察项而非本轮实现；若要"线性全局"，先用你已有的 linear attention + A2 的 RoPE 组合压榨。
 
-A7（算法层，非结构）：任务相关损失/后处理
+A7（算法层，非结构）：任务相关损失/后处理 （先不做）
 clDice（CVPR 2021）：管状结构（血管/气道）拓扑保持损失，与你的 save_best_preset: vessel/airway 天然配套；
 largest-CC 后处理：即 TODO 进展 P7 的确认项，仍未实现，建议与 clDice 同一轮补。
+
+审查：
+A1（SDPA） — 等价替换，无需新参数，所有 softmax 注意力自动受益。已做
+A5 — drop-path 通用化到 ResNet/MedNeXt + GRN + AttentionGate3D norm 修复，均加开关、默认兼容。已做
+A2（RoPE + FFN） — 单独实现，新增配置项开关。已做
+A3（MaxViT block+grid 窗口注意力） — 单独实现，新增 selfattn_type 选项，依赖 A1。已做
+A4（MedNeXt 档位 B UpKern + MultiRF 膨胀重参数） — 已做
+
+A1 — 把手写 softmax 注意力换成 F.scaled_dot_product_attention（SDPA）｜✅属实，✅强烈推荐
+
+核对：blocks.py:368-377 确实是手写 einsum 且显式物化 N×N 注意力矩阵（weight = einsum("bct,bcs->bts")），还手动 softmax(.float())。全库没有任何 scaled_dot_product_attention 调用。
+大白话：现在算注意力是「先把每个体素和每个体素的关系摊成一张大表，再查表」。这张表大小是 N×N，深层体素多时（N=16³=4096）这表非常吃显存。SDPA 是 PyTorch 2.x 内置的「不摊大表、边算边用」的官方实现（FlashAttention/省显存内核），结果数学上一模一样。
+能不能做：能，且几乎零风险。你的 torch27_env 是 PyTorch 2.7，SDPA 完全支持。QKV 和输出投影都是 Conv1d，权重完全不变、旧 checkpoint 照样能加载，只换中间那步算法。
+怎么做：把 qkv 从 (B,3C,N) reshape 成 (B, heads, N, head_dim)，调用 F.scaled_dot_product_attention(q,k,v)，再 reshape 回去；手写的 softmax(.float()) 可以删掉（SDPA 内部自动高精度累加）。约 10 行。
+收益/成本：显存 O(N²)→O(N)、深层注意力提速 2–4×；工作量最小。建议作为 A 的第一个落地项。
+A2 — 给自注意力块补「位置编码 + FFN」两块缺口｜✅属实，✅可做（真结构改动）
+
+核对：blocks.py:404-448 的 SelfAttentionBlock 结构是 norm→qkv→attn→proj→+x，没有任何位置编码（纯内容寻址），也没有 FFN（标准 Transformer 是 Attn+FFN 成对，这里只有 Attn）。属实。
+大白话：①「没有位置编码」＝模型只看体素长得像不像、不知道它们谁在上谁在下，而分割里空间位置很重要；补 3D RoPE（按 D/H/W 三个方向分配、不增加参数、换分辨率也稳）能让注意力知道方位。②「没有 FFN」＝每个 Transformer 块少了后半段的「逐点小型 MLP 加工」，补一个 GEGLU/SwiGLU FFN（LLaMA 同款）能提表达力。
+能不能做：能。RoPE 无参数、纯数学；FFN 用 zero-init 输出投影，初始等于什么都不做，不破坏现有基线（沿用你「zero-init 残差」的哲学）。
+怎么做：RoPE 在 attn 里对 q、k 施加旋转（需把拍平的 token 还原回 D/H/W 三轴坐标）；FFN 作为可配开关新增一个子层。属真架构改动，建议开关化 + 逐 stage 消融。注意：加了 FFN 会新增权重，旧 checkpoint 对新块不完全兼容（但 zero-init 下行为等价，可继续训练）。
+A3 — 窗口/网格注意力，把注意力推到更浅（高分辨率）层｜✅属实，✅可做（工程量中等）
+
+核对：注意力类型只有 softmax|linear 两种（blocks.py:341-341），没有窗口/网格注意力。全局 O(N²) 现实中只能放最深 1–2 层。属实。
+大白话：全局注意力太贵，只能用在最深、体素最少的层。想在「浅层高分辨率」也用注意力，就得把整张图切成小窗口、每个窗口内部各算各的（Swin），或者「局部窗口 + 稀疏网格」交替（MaxViT）。这样每次注意力只在一小撮体素里算，便宜很多。
+能不能做：能。推荐 MaxViT 式 block+grid（比 Swin 简单，不用处理 shift 的 mask），天然契合你「逐 stage 可配」的现有框架，新增 selfattn_type='window'|'grid'。
+怎么做：新增窗口划分/还原逻辑 + 一个窗口内复用 A1 的 SDPA。依赖 A1 先落地（窗口内序列短，SDPA 更快）。工程量比 A1/A5 大，建议排在 A1、A5 之后。
+A4 — 大核深度卷积升级：MedNeXt 档位 B + 膨胀重参数｜✅属实，⚠️可做但工程量偏大
+
+核对：mednext.py:3-6 明说只做了「档位 A」，UpKern 与原生重采样残差块是「后续档位 B」（未做）；MultiRFBlock（resnet.py:257-264）存在，但没有推理期重参数化（推理时仍保留多分支）。属实。
+大白话：①UpKern＝先用小核（k=3）训好，再把权重插值「撑大」成大核（k=5）继续训，是 MedNeXt 涨点的主要来源之一。②膨胀重参数（RepLK/UniRepLKNet）＝训练时用「多条小核+膨胀核并联」（表达力强），推理时用数学把它们合并成一个大核（速度零额外开销）——正好能给你现有的 MultiRF 加一个「可折叠」档位。
+能不能做：能，但比前面几个都重：UpKern 要写权重迁移逻辑；重参数要写「训练多分支 / 推理合并」的两套路径 + 融合函数，还要保证合并前后数值一致（要写测试卡)。
+怎么做：分两个独立子任务（UpKern、Dilated-Reparam），各自可单独消融。建议放在 A1/A2/A3/A5 之后，或按你对 MedNeXt/MultiRF 的实际使用频率决定优先级。
+A5 — 三个块级微升级（低风险、可逐项消融）｜✅全部属实，✅最容易落地
+
+核对：①drop-path（随机深度）只有 ConvNeXt 有——DropPath 类只在 convnext.py，drop_path_rate 配置也只对 convnext 生效（manifest.py:280-280），ResNet/MedNeXt 拿不到。②没有 GRN（全库无 GlobalResponseNorm）。③AttentionGate3D 内部用的是 BatchNorm（blocks.py:461-472），而全库是 instance/group norm、3D 常 batch=2，小 batch 下 BN 统计噪声大。三点全属实。
+大白话：①让 ResNet/MedNeXt 的深层也能用「随机丢块」正则（深网络标配防过拟合）。②GRN 是 ConvNeXt-V2 的小改（约 15 行），小模型也常有稳定增益。③注意力门里那几个 BatchNorm 在你「batch 只有 2」的 3D 场景容易统计不准，改成跟随全库的 norm_type（或直接 GroupNorm）更稳。
+能不能做：都能，且是风险最低、单项独立的一组。
+怎么做：①把 drop-path 通用化，给 ResNet/MedNeXt stage 也接线性递增的 drop-path 率；②在 MedNeXt/ConvNeXt 块里加可配 GRN；③把 AttentionGate3D 的 _BN 换成按 norm_type 构建（BN 保留为兼容默认）。建议和 A1 一起作为第一批落地（都低风险）。注意 ③改默认可能影响已训权重的数值，建议保留 BN 为默认、新增开关。
+
+
 三、训练加速 / 降显存建议
 B1（高优先，确定性收益）：DDP 梯度累积缺 no_sync()
 _train_epoch 每个 micro-step 都直接 backward()（@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:706），DDP 下每个 micro-batch 都做一次全量梯度 all-reduce。数学上等价（注释也承认），但 grad_accum_steps=k 时白白多付 (k−1)/k 的通信。标准做法：非边界步包 self.fwd_model.no_sync()。多卡+累积场景通信量直接除以 k。
