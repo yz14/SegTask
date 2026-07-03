@@ -1,343 +1,315 @@
 # 2.5D 配置：z_axis 取片 → (B,1,D,H,W)
 # view 0 (前 D 通道) = 1× FOV 主线目标；输出 (B,num_fg*D,H,W) 由 SliceChannelLoss 拆分。
 # 与 seg3d.yaml 差异：patch_mode='2_5d'
+# 说明：model.in_channels / model.spatial_dims 为派生只读量；train.save_best_metric / train.save_best_mode 也由 save_best_criterion 派生，YAML 中不写。
 
 data:
-  image_suffix: ".nii.gz"
-  label_suffix: ".nii.gz"
-  bbox_suffix : ".nii.gz"
-  region_weight_suffix: ".nii.gz"
+  image_suffix: ".nii.gz"              # 图像后缀
+  label_suffix: ".nii.gz"              # 标注后缀
+  bbox_suffix: ".nii.gz"               # bbox 后缀
+  region_weight_suffix: ".nii.gz"      # region weight 后缀
+  npz_suffix: ".npz"                   # 预生成样本后缀
 
   # #### 样例 ####
   image_dir: "F:/Totalsegmentator_dataset_v201/small_data/nii"
   label_dir: "F:/Totalsegmentator_dataset_v201/small_data/mask"
-  bbox_dir : "F:/Totalsegmentator_dataset_v201/small_data/bbox"
-  region_weight_dir : "F:/Totalsegmentator_dataset_v201/small_data/region_weight"
+  bbox_dir: "F:/Totalsegmentator_dataset_v201/small_data/bbox"
+  region_weight_dir: "F:/Totalsegmentator_dataset_v201/small_data/region_weight"
   npz_dir: "F:/Totalsegmentator_dataset_v201/small_data/npz"
 
-  # 第二批(粗标)预生成 npz 目录。空 => 单批金标准(现有行为)。
-  # 非空 => 训练时金/粗按 mix_ratio 在每个 batch 内混合(副源仅训练; val 始终仅金标准)。
+  # 第二批(粗标)预生成 npz 目录。空 => 单批金标准；非空 => 训练时金/粗按 mix_ratio 混合（副源仅训练，val 始终仅金标准）。
   # 副源必须事先离线生成: python -m segtask_v1.data.make_data --config <yaml> --out <dir>
   npz_dir_secondary: ""
-  # 每 batch [金标准, 粗标] 整数权重比; 仅 npz_dir_secondary 非空时生效。
-  # 要求 batch_size 能被 sum(mix_ratio) 整除、两元素均 >=1 (保证每 batch 同含两源)。
-  # 例: batch_size=4, [1,1] => 2金+2粗; [1,3] => 1金+3粗。
+  npz_auto_build: true                  # 是否自动构建/更新 npz 索引
+  # 每 batch [金标准, 粗标] 整数权重比；仅 npz_dir_secondary 非空时生效。
+  # 要求 batch_size 能被 sum(mix_ratio) 整除，且两元素均 >=1。
   mix_ratio: [1, 1]
 
   # #### Total Segmentator ####
   # image_dir: "F:/med_data/Totalsegmentator_dataset_v201/nii"
   # label_dir: "F:/med_data/Totalsegmentator_dataset_v201/lung"
-  # bbox_dir : "F:/med_data/Totalsegmentator_dataset_v201/bone"
+  # bbox_dir: "F:/med_data/Totalsegmentator_dataset_v201/bone"
 
   # #### Lung ####
   # image_dir: "F:/BaiduNetdiskDownload/lung_nii"
   # label_dir: "F:/BaiduNetdiskDownload/lung_bone"
-  # bbox_dir : "F:/CT_data/airway_segment_data/bone_bbox"  # F:/BaiduNetdiskDownload/bone_bbox
+  # bbox_dir: "F:/CT_data/airway_segment_data/bone_bbox"  # F:/BaiduNetdiskDownload/bone_bbox
   # region_weight_dir: "F:/BaiduNetdiskDownload/lung_weight"
   # npz_dir: "F:/BaiduNetdiskDownload/lung_prep"
 
   label_values: [0, 1]  # 标签值
-  num_classes : 2
+  num_classes: 2        # 0 => 自动 = len(label_values)
 
   patch_size: [12, 256, 256]  # 2.5D patch：D=切片数（2D 模型 in_channels）；典型 D=9/12/15, H/W=256/384
-  patch_mode: "2_5d"          # 'z_axis' (3D z轴滑块) | 'cubic' (3D xyz) | 'whole' (3D 整体) | '2_5d' (本配置必须)
+  patch_mode: "2_5d"          # 'z_axis' | 'cubic' | 'whole' | '2_5d'（本配置必须）
 
-  # 多 z-FOV上下文。[0] 必须为 1.0 (主线)；典型 [1.0]/[1.0, 1.5, 2.0]
-  multi_res_scales    : [1.0, 1.5, 2.0]
+  # 多 z-FOV 上下文。[0] 必须为 1.0（主线）；典型 [1.0]/[1.0,1.5,2.0]
+  multi_res_scales: [1.0, 1.5, 2.0]
   aug_oversample_ratio: 1.5  # oversample，仅放大 z 轴，空间有冗余供后续数据增强后中心剪裁
 
-  # Z 边界窗口几何 (scale=1.0 通道; z_axis/2.5D 生效)。
-  #   'stretch'  — 边界不足 eD 时沿 z 拉伸; 物理通道间距中心/边界不一致
-  #   'edge_pad' — 推荐: edge-replicate 补齐到 eD；训练-推理几何严格一致
-  z_boundary_mode: "edge_pad"
+  # Z 边界窗口几何（scale=1.0 通道；z_axis/2.5D 生效）。
+  #   'stretch'  — 边界不足 eD 时沿 z 拉伸；物理通道间距中心/边界不一致
+  #   'edge_pad' — 推荐：edge-replicate 补齐到 eD；训练-推理几何严格一致
+  z_boundary_mode: "edge_pad"  # 仅 z_axis/2.5D
 
-  # 多 FOV 保持原生深度 (仅 2.5D + n_views>1 + aux_seg_supervision=true 生效)。
+  # 多 FOV 保持原生深度（仅 2.5D + n_views>1 + aux_seg_supervision=true 生效）。
   #   false — 每 view 重采样回 D；模型输入 (B,n_views*D,H,W)
-  #   true  — 抽 max_scale cube 增强; trainer 中心裁出各 view 原生 D_k
-  #           拼接为 (B,sum(D_k),H,W); aux head k 预测 (B,num_fg*D_k,H,W) 对应原 D_k label
+  #   true  — 抽 max_scale cube 增强；trainer 中心裁出各 view 原生 D_k
+  #           拼接为 (B,sum(D_k),H,W)；aux head k 预测 (B,num_fg*D_k,H,W) 对应原 D_k label
   # 锁定 z_boundary_mode='edge_pad'
   keep_native_view_depth: true
 
   intensity_min: -1024.0
   intensity_max: 1024.0
-  normalize    : "minmax"
+  normalize: "minmax"                  # 'minmax' | 'zscore'
+  spacing_normalization: false          # 仅 spacing_normalization=true
+  target_spacing: null                  # 仅 spacing_normalization=true
+  global_mean: 0.0                      # 仅 normalize='zscore'
+  global_std: 1.0                       # 仅 normalize='zscore'
+  exclude_list: ""                      # 训练/验证排除列表路径
 
-  val_ratio       : 0.2
-  split_seed      : 42
-  stratified_split: true
+  val_ratio: 0.2                        # 验证集比例
+  split_seed: 42                        # 划分随机种子
+  stratified_split: true                # 是否按主前景类分层
 
-  batch_size     : 4
-  num_workers    : 4
-  prefetch_factor: 4
-  pin_memory     : true
+  batch_size: 4                         # 训练 batch
+  num_workers: 4                        # DataLoader worker 数
+  persistent_workers: true              # 仅 num_workers>0
+  prefetch_factor: 4                    # 仅 num_workers>0 时有效
+  pin_memory: true                      # 是否 pin memory
 
-  foreground_oversample_ratio: 0.3
-  samples_per_volume         : 8
+  foreground_oversample_ratio: 0.3      # 前景中心采样概率
+  samples_per_volume: 8                 # 每卷每 epoch 样本数
 
-  cache_mode       : "memory"
-  cache_max_volumes: 2
+  cache_mode: "memory"                 # 'none' | 'memory'
+  cache_max_volumes: 2                 # 0 = 不限（可能 OOM）
 
-
-# AUGMENT — 3D 增强器在 squeeze 前作用于 (B,1,D,H,W)，语义与 seg3d.yaml 一致
 augment:
-  enabled: true
-
-  random_flip_prob: 0.2
-  random_flip_axes: [2, 3, 4]   # D,H,W; D-flip 仅训练阶段
-
-  random_affine_prob : 0.3
-  random_rotate_range: [-15.0, 15.0]
-  random_scale_range : [0.85, 1.15]
-
-  elastic_deform_prob : 0.0
-  elastic_deform_sigma: 5.0
-  elastic_deform_alpha: 1.0
-
-  random_brightness_prob : 0.3
-  random_brightness_range: [-0.1, 0.1]
-
-  random_contrast_prob : 0.3
-  random_contrast_range: [0.8, 1.2]
-
-  random_gamma_prob : 0.2
+  enabled: true                         # 总开关
+  random_flip_prob: 0.2                 # 随机翻转概率
+  random_flip_axes: [2, 3, 4]           # D,H,W；D-flip 仅训练阶段
+  random_affine_prob: 0.3               # 仿射概率
+  random_rotate_range: [-15.0, 15.0]     # degrees
+  random_scale_range: [0.85, 1.15]      # 缩放范围
+  random_rotate_range_per_axis: null    # 仅需要按轴不同角度时启用
+  random_affine_aspect_correct: true    # 是否做纵横比校正
+  random_translate_range: [-0.1, 0.1]   # 平移比例
+  elastic_deform_prob: 0.0              # 弹性变形概率
+  elastic_deform_sigma: 5.0             # 平滑度
+  elastic_deform_alpha: 1.0             # 幅度（体素）
+  grid_dropout_prob: 0.0                # 网格 dropout 概率
+  grid_dropout_ratio: 0.3               # 挖空比例
+  grid_dropout_holes: 4                 # 挖空块数
+  random_brightness_prob: 0.3           # 亮度扰动概率
+  random_brightness_range: [-0.1, 0.1]  # 加性
+  random_contrast_prob: 0.3             # 对比度扰动概率
+  random_contrast_range: [0.8, 1.2]     # 乘性
+  random_gamma_prob: 0.2                # gamma 扰动概率
   random_gamma_range: [0.8, 1.2]
+  gaussian_noise_prob: 0.2              # 高斯噪声概率
+  gaussian_noise_std: 0.09              # 噪声标准差
+  gaussian_blur_prob: 0.1               # 高斯模糊概率
+  gaussian_blur_sigma: [0.5, 1.5]       # 模糊 sigma
+  simulate_lowres_prob: 0.1             # 低分辨率模拟概率
+  simulate_lowres_zoom: [0.5, 1.0]      # 缩放范围
+  intensity_clamp: true                 # 是否裁 HU
+  wmap_interp_mode: "nearest"          # 'nearest' | 'bilinear'
 
-  gaussian_noise_prob: 0.2
-  gaussian_noise_std : 0.09
-
-  gaussian_blur_prob : 0.1
-  gaussian_blur_sigma: [0.5, 1.5]
-
-  simulate_lowres_prob: 0.1
-  simulate_lowres_zoom: [0.5, 1.0]
-
-
-# MODEL — 2D UNet (spatial_dims=2)
 model:
-  backbone: "resnet"           # 'resnet' | 'convnext'
-  encoder_channels: [32, 64, 128, 256, 256]
-  encoder_blocks_per_stage: [2, 2, 2, 2, 2]    # 长度 == len(encoder_channels)
-  decoder_blocks_per_stage: [2, 2, 2, 2]       # 长度 == len(encoder_channels) - 1
-  # 'basic'(默认) | 'preact' | 'bottleneck' | 'r2plus1d'(需 lift_2_5d_to_3d=true)
-  block_type: "basic"
+  arch: "unet"                         # 'unet' | 'adm' | 'edm2'
+  backbone: "resnet"                   # 'resnet' | 'convnext' | 'mednext'
+  encoder_channels: [32, 64, 128, 256, 256]  # 编码器通道数
+  blocks_per_level: 2                   # 每级 block 数
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]  # 长度 == len(encoder_channels)
+  decoder_blocks_per_stage: [2, 2, 2, 2]     # 长度 == len(encoder_channels)-1
+  resenc_preset: "none"                 # 'none' | 'S' | 'M' | 'L' | 'XL'
+  lift_2_5d_to_3d: false                # 是否真的折叠成 3D
+  norm_type: "batch"                   # 'instance' | 'batch' | 'group'
+  norm_groups: 8                        # 仅 group norm
+  activation: "leakyrelu"              # 'leakyrelu' | 'gelu' | 'relu'
+  dropout: 0.0                          # dropout 比例
+  attention_type: "none"               # 'none' | 'se' | 'eca' | 'cbam' | 'coord'
+  skip_attention: false                # Skip 路 AttentionGate3D
+  attn_gate_norm: "batch"              # 仅 skip_attention=true
+  deep_supervision: true               # 多 decoder 层预测
+  aux_seg_supervision: true            # 仅 2.5D；多 FOV 辅助监督
+  aux_topo_head: false                 # 仅 unet；打开后启用拓扑辅助头
+  aux_topo_target: "centerline"        # 仅 aux_topo_head=true
+  aux_topo_head_mode: "conv"           # 仅 aux_topo_head=true
+  aux_head_mode: "conv"                # 仅 aux_seg_supervision=true；2.5D 下表示 aux-seg head 结构
+  stem_mode: "dual"                   # 'conv3' | 'conv7' | 'dual' | 'patch2' | 'patch4'
+  stem_fusion_mode: "multi_stem_proj"  # 'multi_stem_proj' | 'hierarchical' | 'shared_stem'
+  decoder_type: "unet"                 # 'unet' | 'unetpp' | 'unet3p'
+  downsample_mode: "conv"              # 'conv' | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
+  upsample_mode: "trilinear"           # 'transpose' | 'trilinear' | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
+  upsample_norm_act: true              # 仅 trilinear/nearest
+  skip_mode: "cat"                    # 'cat' | 'add'
+  downsample_strides: []               # 非空时显式覆盖自动推导；每项值∈{1,2}
+  drop_path_rate: 0.0                  # 通用（训练时对残差分支做随机深度）
+  grn_enabled: false                   # 仅 backbone='convnext'/'mednext'
 
-  # Plan A 升维: 2.5D 不折叠走真 3D UNet (spatial_dims=3)。
-  #   false — 默认: D 折入通道， 2D UNet + SliceChannelLoss
-  #   true  — 真 3D: 输入 (B,n_views,D,H,W) → 输出 (B,num_fg,D,H,W); 损失走 MultiResLoss(1)
-  #           限制: 与 keep_native_view_depth 互斥；D 需被 2^(n_levels-1) 整除
-  # 推荐组合: D=16, block_type='r2plus1d', lift=true, aux_seg_supervision=true
-  lift_2_5d_to_3d: false
+  # ---- ConvNeXt 专属（取消注释并把 backbone 改成 "convnext" 才生效） ----
+  # convnext_layer_scale_init: 1.0e-6   # 层缩放初值
+  # convnext_downsample_lnfirst: true   # 下采样前先 LN
 
-  # 'instance' | 'batch' | 'group'
-  # convnext backbone 下 block 内固定 LayerNorm，此项仅作用于 stem / 上下采样 /
-  # decoder skip 投影 / aux head。'group' 相较 'instance':
-  #   (1) 保留组内通道相对响应 → 避免 2.5D 折叠下 stem 把每张切片独立标准化；
-  #   (2) 不抹掉绝对强度尺度 → 与 region_weight 中按 HU 加权的设计兼容更好。
-  norm_type  : "batch"
-  norm_groups: 8
-  activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
-  dropout    : 0.0
-  attention_type: "none"
-  skip_attention: false
-
-  deep_supervision: true
-
-  # 'conv3'(单层 3×3) | 'conv7'(单层 7×7) | 'dual'(两层 3×3, nnU-Net 默认) |
-  # 'patch2'/'patch4'(stride-N PatchEmbed, ConvNeXt/ViT 风格)
-  # 2.5D 折叠下 stem 是 D→features 唯一的"跨切片+空间"非线性入口；
-  # 单层 conv3 容量不足以编码 z 关系，推荐 dual。
-  stem_mode    : "dual"
-
-  # 多 FOV stem 融合 (仅 2_5d + n_views>1)。
-  #   'multi_stem_proj' — Plan A: 每 view 独立 stem + 3×3 融合 (早融合)
-  #   'hierarchical'    — Plan C: view k 经 stride-2^k stem 注入到 encoder stage k
-  #                       需 n_views<=n_levels 且 patch_size[1:] 能被 2^(n_views-1) 整除
-  #   'shared_stem'     — 单 stem 跑 n_views*D 通道 (省参但物理异质共享滤波器)
-  stem_fusion_mode: "multi_stem_proj"
-
-  # 多 FOV 辅助监督 (仅 2_5d + n_views>1)。为 aux view k 外接 head 用重采样后 label 监督。
-  # head 挂点随 stem_fusion_mode 自动选: Plan A并接顶语义层；Plan C 挂 dec_features[-1-k]。
-  # 权重由 loss.aux_supervision_weights 控制；推理阶段 aux head 不使用。
-  aux_seg_supervision: true
-
-  # Aux head 拓扑 (仅 aux_seg_supervision=true)。
-  #   'linear' — 单层 1×1
-  #   'conv'   — 3×3 ConvNormAct+1×1
-  # 注: Plan A 下所有 aux 头与 main 头共享 dec[-1]，多任务线性探针在端到端
-  # 训练里会让 aux 梯度回传到共享特征的能力被压扁，进而削弱 view-specific
-  # 学习。共享挂点时建议用 'conv' 给每个 aux 头一次非线性空间变换。
-  # Plan C aux 挂在低分辨率 decoder 特征上，'conv' 兼有空间聚合作用，同样推荐。
-  aux_head_mode: "conv"
-
-  decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
-  downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
-  upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
-  upsample_norm_act: true         # 仅 trilinear/nearest 生效
-  skip_mode      : "cat"          # 'cat' | 'add'
-
-  drop_path_rate : 0.0
+  # ---- MedNeXt 专属（取消注释并把 backbone 改成 "mednext" 才生效） ----
+  # mednext_expand_ratio: 4
+  # mednext_kernel_size: 3
+  # mednext_dilated_reparam: false
+  # mednext_dilated_reparam_kernel_sizes: []
+  # mednext_dilated_reparam_dilations: []
 
   # ---- 多感受野（空洞卷积多分支融合）MultiRF 示例 ----
-  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合、
-  # axes=hw 只在 H/W 膨胀（肺 CT z 各向异性）。先验证有效再往更多 stage / 解码器铺开。
-  multirf_enabled       : true
-  multirf_dilations     : [1, 2, 3]      # 必须含 1（守门支路）
-  multirf_mode          : "split"        # 'split'(≈等成本) | 'parallel'(≈N×)
-  multirf_fusion        : "concat_proj"  # 'concat_proj' | 'sum'(需 parallel) | 'se'
-  multirf_axes          : "hw"           # 'hw'(保 z, 推荐) | 'all'
-  multirf_encoder_stages: [0, 0, 1, 1, 1]  # 编码器逐 stage（长度=len(encoder_channels)=5；浅→深，末位=bottleneck）。
-  multirf_decoder_stages: [0, 0, 0, 0]  # 解码器逐 level（长度=len(encoder_channels)-1=4；深→浅）。默认关，作为第二轮对照。
-  multirf_branch_norm_act: true   # 注意 split+group：分支通道须被 norm_groups 整除，否则显式报错
+  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合，axes=hw 只在 H/W 膨胀。
+  multirf_enabled: true                # 是否启用多感受野
+  multirf_dilations: [1, 2, 3]         # 必须含 1（守门支路）
+  multirf_mode: "split"               # 'split' | 'parallel'
+  multirf_fusion: "concat_proj"       # 'concat_proj' | 'sum' | 'se'
+  multirf_axes: "hw"                  # 'hw' | 'all'
+  multirf_encoder_stages: [0, 0, 1, 1, 1]  # 编码器逐 stage（长度=len(encoder_channels)=5）
+  multirf_decoder_stages: [0, 0, 0, 0]      # 解码器逐 level（长度=len(encoder_channels)-1=4）
+  multirf_branch_norm_act: true        # split+group 时分支通道须能被 norm_groups 整除
 
+  # 自注意力（仅 backbone='resnet' 且 arch='unet'；列表长度 = encoder_channels / encoder_channels-1）
+  selfattn_enabled: false              # 是否启用自注意力
+  selfattn_type: "softmax"             # 'softmax' | 'linear' | 'window' | 'grid'
+  selfattn_num_heads: 4
+  selfattn_head_dim: -1                # -1 表示自动
+  selfattn_zero_init: true             # 是否零初始化
+  selfattn_rope: false                 # 是否启用 RoPE
+  selfattn_ffn: false                  # 是否在注意力后接 FFN
+  selfattn_ffn_ratio: 4.0              # 仅 selfattn_ffn=true
+  selfattn_window_size: 7              # 仅 type='window'
+  selfattn_grid_size: 7                # 仅 type='grid'
+  selfattn_encoder_stages: []          # 逐 stage 0/1，非空时长度需 = len(encoder_channels)
+  selfattn_decoder_stages: []          # 逐 level 0/1，非空时长度需 = len(encoder_channels)-1
 
-# LOSS — 2.5D 走 SliceChannelLoss 包装; base_loss 在 (B*D,1,H,W) 作为 2D 二值损失
+  # 仅 2.5D 且 arch 改为 "adm" / "edm2" 才生效。
+  # adm_attention_levels: []
+  # adm_num_heads: 4
+  # adm_num_head_channels: -1
+  # adm_linear_attention_levels: []
+  # adm_linear_attention_num_heads: 4
+  # adm_linear_attention_head_dim: 32
+  # edm2_attention_levels: []
+  # edm2_channels_per_head: 64
+  # edm2_res_balance: 0.3
+  # edm2_attn_balance: 0.3
+  # edm2_concat_balance: 0.5
+  # edm2_clip_act: 256.0
+
 loss:
-  name: "dice_focal"               # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
-  compound_weights: [1.0, 1.0]
-
-  class_weights : [1.0, 1.0]       # 长度 = 前景类数 (不含 bg)
-  region_weights: [1.0, 4.0, 2.0]  # 按 label_values 全长 (含 bg)
-
-  dice_smooth : 1.0e-5
-  dice_squared: false
-
-  focal_alpha: 0.5
-  focal_gamma: 2.0
-
-  tversky_alpha: 0.3
-  tversky_beta : 0.7
-
-  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
-
-  # 2.5D Dice 聚合域:
-  #   'per_slice'  — (B*D,1,H,W) 逐切片; 空切片 Dice≈1 稀释梯度
-  #   'per_volume' — (B,num_fg,D,H,W) 逐窗口 3D Dice; 隐式正则 z 一致性
-  slice_loss_reduction: "per_volume"
-
-  # 辅助监督权重 (长度 = n_views-1)。空列表 → 0.5^k 自动衰减。
-  # L = L_main(view_0) + Σ w_k * L_aux(view_k); L_aux 不走 deep supervision
-  aux_supervision_weights: []
-
+  name: "dice_focal"                  # 'dice' | 'bce' | 'focal' | 'tversky' | 'gdl' | 'focal_tversky' | 'lovasz' | 'cldice' | 及复合项
+  compound_weights: [1.0, 1.0]         # [loss1_w, loss2_w] 仅 compound 使用
+  class_weights: [1.0, 1.0]            # 按前景类；长度 = 前景类数（空 = 均匀）
+  region_weights: [1.0, 4.0, 2.0]      # 按 label_values 全长（含 bg）
+  dice_smooth: 1.0e-5                 # 防 0/0
+  dice_squared: false                 # true → Dice^2
+  focal_alpha: 0.5                    # 正类权重
+  focal_gamma: 2.0                    # 难样本指数
+  tversky_alpha: 0.3                  # FP 权重
+  tversky_beta: 0.7                   # FN 权重
+  batch_dice: true                    # nnU-Net 风格 batch+空间聚合
+  ignore_empty: false                 # 仅 per-sample 时跳过缺失前景类
+  gdl_weight_type: "square"          # 仅 loss.name 含 'gdl'；'square' | 'simple' | 'uniform'
+  gdl_w_max: 100000.0                # 仅 loss.name 含 'gdl'
+  focal_tversky_gamma: 1.3333333333333333  # 仅 loss.name 含 'focal_tversky'
+  lovasz_per_sample: true            # 仅 loss.name 含 'lovasz'
+  cldice_iter: 3                     # 仅 loss.name 含 'cldice'
+  cldice_smooth: 1.0                 # 仅 loss.name 含 'cldice'
+  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]  # 深监督每层权重
+  slice_loss_reduction: "per_volume"  # 仅 2.5D
+  aux_supervision_weights: []         # 仅 2.5D + aux_seg_supervision=true；长度 = n_views-1
+  aux_topo_weight: 0.3               # 仅 model.aux_topo_head=true
+  aux_topo_iter: 3                   # 仅 model.aux_topo_head=true
+  aux_topo_loss: "auto"               # 仅 model.aux_topo_head=true
 
 train:
-  epochs: 2
-
-  optimizer   : "adamw"
-  lr          : 1.0e-3
+  epochs: 2                          # 训练轮数
+  gpus: [0]                          # 要用的物理卡号列表；len(gpus)>1 时才进入 DDP
+  ddp_find_unused_parameters: true   # 仅 len(gpus)>1
+  ddp_master_port: 0                 # 仅 len(gpus)>1
+  ddp_scale_dataloader_per_rank: true  # 仅 len(gpus)>1
+  ddp_timeout_minutes: 30            # 仅 len(gpus)>1
+  val_every: 1                       # 每隔多少 epoch 做验证
+  optimizer: "adamw"                # 'adam' | 'adamw' | 'sgd'
+  lr: 1.0e-3
   weight_decay: 1.0e-4
+  momentum: 0.99                     # 仅 optimizer='sgd'
+  nesterov: true                     # 仅 optimizer='sgd'
+  scheduler: "cosine"               # 'cosine' | 'cosine_warm_restarts' | 'poly' | 'step' | 'plateau' | 'one_cycle'
+  warmup_epochs: 5                   # one_cycle 下必须 0（内置 pct_start）
+  warmup_lr: 1.0e-6
+  cosine_min_lr: 1.0e-6              # 仅 scheduler in {'cosine','cosine_warm_restarts','one_cycle'}
+  cosine_restart_period: 50          # 仅 scheduler='cosine_warm_restarts'
+  cosine_restart_mult: 2             # 仅 scheduler='cosine_warm_restarts'
+  poly_power: 0.9                    # 仅 scheduler='poly'
+  step_size: 50                      # 仅 scheduler='step'
+  step_gamma: 0.1                    # 仅 scheduler='step'
+  plateau_patience: 10               # 仅 scheduler='plateau'
+  plateau_factor: 0.5                # 仅 scheduler='plateau'
+  grad_accum_steps: 1                # 等效 batch = batch_size * grad_accum_steps
+  grad_clip_norm: 12.0               # 0 = 禁用
+  use_amp: true                      # 是否使用 AMP
+  amp_dtype: "auto"                  # 'auto' | 'bf16' | 'fp16' | 'fp32'；仅 use_amp=true
+  compile_mode: "default"            # 'none' | 'default' | 'reduce-overhead' | 'max-autotune'
+  channels_last: false               # 是否启用 channels_last
+  use_ema: true                      # 是否启用 EMA
+  ema_decay: 0.999                   # 仅 use_ema=true
+  ema_warmup: true                   # 仅 use_ema=true
+  output_dir: "outputs/base"
+  save_every: 10                     # 每隔多少 epoch 保存一次
+  save_keep_last: 3                  # 保留最近多少个 checkpoint
+  save_best_criterion: "dice"        # 'loss' | 'dice' | 'iou' | 'mcc' | 'min_dice' | 'dice+surface_dice' | 'balanced'；save_best_metric/mode 由此派生
+  surface_dice_tolerance: 1          # 仅 criterion ∈ {dice+surface_dice, balanced}
+  surface_dice_weight: 0.5           # 仅 criterion='dice+surface_dice'
+  save_best_preset: ""               # 非空时覆盖上面三项；'lung'|'vessel'|'airway'|'bone_multi'|'lymph_node'|'lesion_small'|'oar_multi'|'heart_chamber'|'bone_lung_combined'
+  val_metric_mode: "medium"          # 'medium' | 'high'
+  early_stopping: 15                  # 0 = 禁用
+  log_every: 10                       # 训练 loss 记录（micro-step）
+  vis_every: 10                       # 每隔多少 epoch 可视化一次
+  seed: 42                            # 随机种子
+  deterministic: false                # cudnn deterministic（慢）
+  resume: ""                         # 完整 state 恢复（model/optim/sched/ema/rng）
+  pretrain: ""                       # 仅加载权重做初始（迁移学习）；resume 优先
+  pretrain_strict: false              # false 允许 head 形状不一致
+  pretrain_load_ema: false            # ckpt 含 EMA 时是否优先取 shadow
+  pretrain_upkern: false              # 仅 backbone='mednext'；预训练深度卷积权重做 UpKern 插值
 
-  scheduler    : "cosine"
-  warmup_epochs: 5
-  warmup_lr    : 1.0e-6
-  cosine_min_lr: 1.0e-6
-
-  grad_accum_steps: 1
-  grad_clip_norm  : 12.0
-
-  use_amp  : true
-  # 'auto' (推荐 bf16) | 'bf16' | 'fp16' | 'fp32'。bf16 指数范围 ≈ fp32，IN 不会下溢; fp16 可能 NaN。
-  amp_dtype: "auto"
-
-  compile_mode: "default"
-
-  use_ema  : true
-  ema_decay: 0.999
-
-  output_dir      : "outputs/base"
-  save_every      : 10
-
-  # ===== 选模标准（挑 best_model.pth 的依据）=====
-  # save_best_criterion：唯一可写接口；其余为派生只读量。
-  #   'loss'              — val_loss ↓。最通用但对边界/碎点不敏感。
-  #   'dice'              — mean_dice ↑（各前景类等权均值）。大器官易饱和。
-  #   'iou'               — mean_iou ↑（Jaccard，比 dice 对边界更严格）。
-  #   'mcc'               — mean_mcc ↑（类极不平衡稳健；TN 主导时≈√(precision·recall)）。
-  #   'min_dice'          — min_class_dice ↑（短板：守最差类，防漏一块被均值掩盖）。
-  #   'dice+surface_dice' — mean_combined=(1-w)·dice + w·surface_dice ↑（把边界质量拉进选模）。
-  #   'balanced'          — mean_balanced ↑（dice/surface_dice/iou/mcc01 调和均值，短板放大）。
-  # 注：mean_*/min_* 均按"该类在 val 集是否出现 GT"做 ignore-empty 掩码。
-  save_best_criterion: "dice"
-
-  # surface_dice_tolerance：表面 Dice 容差（体素，Chebyshev 邻域；0=严格表面 Dice）。
-  #   仅 criterion ∈ {dice+surface_dice, balanced} 时生效。各向异性数据下 z 向物理
-  #   距离与 xy 不同，需酌情调大。
-  surface_dice_tolerance: 1
-  # surface_dice_weight：dice+surface_dice 组合中 surface_dice 的权重 w∈[0,1]。
-  surface_dice_weight: 0.5
-
-  # save_best_preset：任务化一键预设，非空时覆盖上面三项 (criterion/sd_tol/sd_w)。
-  # 留空 = 不启用，沿用上面显式设置。可选：
-  #   'lung'               — dice+surface_dice, tol=1, w=0.5（大实质器官，边界重要）
-  #   'vessel'             — balanced, tol=2, w=0.5（薄管状，建议配 dice_cldice 损失）
-  #   'airway'             — balanced, tol=1, w=0.5（气道拓扑敏感，建议配 dice_cldice）
-  #   'bone_multi'         — min_dice, tol=1, w=0.5（多块骨头，守最差类）
-  #   'lymph_node'         — mcc, tol=1, w=0.5（小淋巴结，极端不平衡）
-  #   'lesion_small'       — mcc, tol=1, w=0.5（小病灶，同上）
-  #   'oar_multi'          — min_dice, tol=1, w=0.5（多器官大小悬殊，守底线）
-  #   'heart_chamber'      — dice+surface_dice, tol=1, w=0.4（软组织块）
-  #   'bone_lung_combined' — balanced, tol=1, w=0.5（本任务 lung+bone 推荐稳妥折中）
-  save_best_preset: ""
-
-  # 选模严格度：'medium' (默认, 在随机切片/patch 上算指标, 快) | 'high' (对每个 val
-  # 整卷做与部署一致的滑窗推理后再算指标, 最可靠但更慢)。与 save_best_criterion 正交。
-  # 2.5D 下尤其推荐 high：medium 在随机切片上算指标无法反映整卷 z 向一致性。
-  val_metric_mode: "medium"
-
-  early_stopping: 15
-
-  log_every: 10
-  val_every: 1
-  vis_every: 10
-
-  seed: 42
-  deterministic: false
-
-  resume: ""
-
-  # 仅加载权重做迁移学习初始 (不恢复 optim/scheduler/epoch/RNG)。resume 优先。
-  pretrain: ""
-  pretrain_strict: false
-  pretrain_load_ema: false
-
-
-# PREDICT — 2.5D 推理 z 轴滑窗 (几何同 z_axis); 每窗口 squeeze+2D forward+reshape。
-# TTA 仅翻 H/W (D 是 channel 轴，翻转会破坏物理 slice 顺序)。
 predict:
-  z_interleave_enabled   : true
-  z_interleave_thresholds: [1.0, 1.5, 3]   # 覆盖默认阈值/因子
-  z_interleave_factors   : [4, 3, 2, 1]
-  adabn_enabled    : true
-  adabn_mode       : "global"  # 或 "per_volume"
-  adabn_num_volumes: 8         # global 模式预热卷数
-  z_overlap : 0.5
-  blend_mode: "gaussian"                   # 'gaussian' | 'constant'
-  batch_size: 4
-  tta_flip      : false
-  tta_batch_size: 1
-  threshold     : 0.5
+  z_interleave_enabled: true          # 仅 2.5D；启用 z 轴 interleave 推理
+  z_interleave_thresholds: [1.0, 1.5, 3]  # 覆盖默认阈值/因子；仅 z_interleave_enabled=true
+  z_interleave_factors: [4, 3, 2, 1]   # 覆盖默认阈值/因子；仅 z_interleave_enabled=true
+  adabn_enabled: true                 # 仅测试时自适应 BatchNorm
+  adabn_mode: "global"               # 'global' | 'per_volume'
+  adabn_num_volumes: 8               # 仅 adabn_enabled=true 且 adabn_mode='global'
+  z_overlap: 0.5                     # 滑窗重叠（0~0.95）
+  blend_mode: "gaussian"              # 'gaussian' | 'constant'
+  batch_size: 4                      # 推理 batch
+  tta_flip: false                    # 8× forward；仅翻 H/W
+  tta_batch_size: 1                  # 仅 tta_flip=true
+  threshold: 0.5                     # 前景类最大概率 < threshold 则归背景
+  acc_dtype: "fp32"                   # 'fp32' | 'fp16'
+  accumulate_on_cpu: false           # 是否在 CPU 累积推理结果
   output_dir: ""
-  save_probabilities: false
+  save_probabilities: false          # 是否同时保存概率图
 
-
-# VIS — 全流程可视化（数据流 / 模型流 / 预测流 → 自包含 HTML）。
-# 默认关闭、零开销；打开后训练启动时导出到 train.output_dir/visualization/。
-# CPU dummy 张量推导，不读盘、不依赖 GPU/真实数据。详见 README §3.9。
 vis:
-  enabled          : true                 # 设 true 即生成 HTML
-  output_dir       : ""                    # 空 => train.output_dir/visualization/
-  filename         : "pipeline_vis.html"
-  flows            : ["data", "model", "predict"]   # 视图子集 + 标签页顺序
-  trace_shapes     : true                  # 模型流 dummy 前向追踪真实形状
-  max_detail_params: 200                   # 单节点详情最多条数
+  enabled: true                      # 设 true 即生成 HTML
+  output_dir: ""                     # 空 => train.output_dir/visualization/
+  filename: "pipeline_vis.html"
+  flows: ["data", "model", "predict"]  # 视图子集 + 标签页顺序
+  trace_shapes: true                 # 模型流 dummy 前向追踪真实形状
+  max_detail_params: 200             # 单节点详情最多条数
 
-
-# MONITOR — 训练过程监测仪表盘（逐 epoch 损失/指标/逐类/LR/显存曲线 → 自包含 HTML）。
-# 默认关闭、零开销；打开后训练中按 update_every 实时刷新，结束后给出 best 指标卡。
-# 续训安全、异常隔离（失败仅告警不中断训练）。详见 README §3.10。
 monitor:
-  enabled            : true                 # 设 true 即落盘 + 渲染仪表盘
-  output_dir         : ""                   # 空 => train.output_dir（HTML 落此，数据落其 monitor/）
-  filename           : "training_monitor.html"
-  update_every       : 1                    # 每多少 epoch 重渲染（best/末轮总会刷新）
-  auto_reload_seconds: 10                   # 训练中 HTML 自动重载间隔（秒）
-  run_name           : ""                   # 对比页显示名；空 => output_dir 目录名
+  enabled: true                      # 设 true 即落盘 + 渲染仪表盘
+  output_dir: ""                     # 空 => train.output_dir
+  filename: "training_monitor.html"
+  update_every: 1                    # 每多少 epoch 重渲染
+  auto_reload_seconds: 10            # HTML 自动重载间隔（秒）
+  run_name: ""                      # 对比页显示名；空 => output_dir 目录名
+  compare_runs: []                   # 仅 monitor.enabled=true
+  health_monitor: true               # 仅 monitor.enabled=true
+  health_grad_norm_when_no_clip: true # 仅 monitor.enabled=true
+  health_update_ratio: false         # 仅 monitor.enabled=true
