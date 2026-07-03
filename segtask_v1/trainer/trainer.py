@@ -12,6 +12,7 @@ fp32 计算与 breakdown 格式化位于 ``trainer.amp`` / ``trainer.breakdown``
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -693,17 +694,23 @@ class Trainer:
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
 
             effective_accum = self._effective_accum(step, total_steps, accum)
+            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
+            # 非边界步免 all-reduce；forward 也必须放进 no_sync。
+            sync_ctx = (self.fwd_model.no_sync()
+                        if (self._is_dist and not is_step_boundary)
+                        else contextlib.nullcontext())
 
             # Forward AMP / Loss fp32（Dice/BCE 在 fp16 下汇总易溢出 → NaN）
-            with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                pred = self.fwd_model(image)
-            breakdown: Dict[str, float] = {}
-            loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
-            collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
-            if effective_accum > 1:
-                loss = loss / effective_accum
+            with sync_ctx:
+                with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                    pred = self.fwd_model(image)
+                breakdown: Dict[str, float] = {}
+                loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
+                if effective_accum > 1:
+                    loss = loss / effective_accum
 
-            self.scaler.scale(loss).backward()
+                self.scaler.scale(loss).backward()
+            collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
 
             # 未缩放损失；非有限值驱动 meter 跳过与无 scaler 路径的优化步保护。
             step_loss = (loss.item() * effective_accum
@@ -728,7 +735,6 @@ class Trainer:
                     else "non-finite loss guard")
 
             # 参数更新
-            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_step_boundary:
                 # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
                 # bf16/fp32 无 scaler 保护，本 accum 组内出现非有限 loss 时

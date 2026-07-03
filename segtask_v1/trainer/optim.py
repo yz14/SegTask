@@ -38,7 +38,11 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     tc = cfg.train
     groups = _param_groups(model, tc.weight_decay)
     if   tc.optimizer == "adamw":
-        return torch.optim.AdamW(groups, lr=tc.lr)
+        first = next((p for p in model.parameters()), None)
+        on_cuda = first is not None and first.is_cuda
+        use_fused = tc.adamw_fused and torch.cuda.is_available()
+        return torch.optim.AdamW(
+            groups, lr=tc.lr, fused=(use_fused and on_cuda))
     elif tc.optimizer == "adam":
         return torch.optim.Adam(groups, lr=tc.lr)
     elif tc.optimizer == "sgd":

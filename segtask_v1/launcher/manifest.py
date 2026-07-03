@@ -380,6 +380,7 @@ def _train_fields() -> List[Field]:
         Field("train.optimizer"),
         Field("train.lr"),
         Field("train.weight_decay"),
+        Field("train.adamw_fused"),
         Field("train.momentum", depends_on=sgd),
         Field("train.nesterov", depends_on=sgd),
         Field("train.scheduler"),
