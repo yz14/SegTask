@@ -12,10 +12,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 
 from segtask_v1.config import Config, ConfigError, resolve_selfattn_stage
 from segtask_v1.models.blocks import (
-    SelfAttentionBlock, _LinearQKVAttention, _SoftmaxQKVAttention)
+    SelfAttentionBlock, _LinearQKVAttention, _SoftmaxQKVAttention,
+    _apply_rope_nd)
 from segtask_v1.models.factory import build_model
 
 
@@ -65,6 +69,26 @@ def test_softmax_qkv_attention_matches_sdpa_reference():
     assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5), max_diff
 
 
+def test_rope_preserves_norm_and_relative_logits():
+    q = torch.randn(2, 3, 24, 18)
+    k = torch.randn(2, 3, 24, 18)
+    shape = (2, 3, 4)
+    q_rot, k_rot = _apply_rope_nd(q, k, shape)
+    q_shift, k_shift = _apply_rope_nd(q, k, shape, position_offsets=(1, 2, 3))
+
+    assert torch.allclose(q_rot.norm(dim=-1), q.norm(dim=-1), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(k_rot.norm(dim=-1), k.norm(dim=-1), atol=1e-6, rtol=1e-6)
+
+    ref_logits = torch.einsum("bhnd,bhmd->bhnm", q_rot, k_rot)
+    shifted_logits = torch.einsum("bhnd,bhmd->bhnm", q_shift, k_shift)
+    assert torch.allclose(ref_logits, shifted_logits, atol=1e-5, rtol=1e-5)
+
+
+def test_selfattn_rope_rejects_linear():
+    with pytest.raises(ValueError, match="only supported with 'softmax'"):
+        SelfAttentionBlock(16, attn_type="linear", use_rope=True)
+
+
 @pytest.mark.parametrize("attn_type", ["softmax", "linear"])
 def test_selfattn_zero_init_is_identity(attn_type):
     """zero-init proj => block output == input at initialization (residual)."""
@@ -72,6 +96,77 @@ def test_selfattn_zero_init_is_identity(attn_type):
                                spatial_dims=3, zero_init=True)
     x = torch.randn(2, 16, 4, 8, 8)
     assert torch.allclose(block(x), x, atol=1e-6)
+
+
+@pytest.mark.parametrize("spatial_dims,shape", [(2, (8, 8)), (3, (4, 8, 8))])
+def test_selfattn_rope_ffn_shape_and_grad(spatial_dims, shape):
+    block = SelfAttentionBlock(
+        16, attn_type="softmax", num_heads=4, spatial_dims=spatial_dims,
+        zero_init=False, use_rope=True, use_ffn=True)
+    x = torch.randn(2, 16, *shape, requires_grad=True)
+    y = block(x)
+    assert y.shape == x.shape
+    y.sum().backward()
+    assert x.grad is not None
+
+
+def test_selfattn_rope_ffn_zero_init_identity_and_state_dict():
+    block = SelfAttentionBlock(
+        16, attn_type="softmax", num_heads=4, spatial_dims=3,
+        zero_init=True, use_rope=True, use_ffn=True)
+    keys = set(block.state_dict().keys())
+    assert keys == {
+        "norm.weight", "norm.bias",
+        "qkv.weight", "qkv.bias",
+        "proj.weight", "proj.bias",
+        "ffn_norm.weight", "ffn_norm.bias",
+        "ffn_in.weight", "ffn_in.bias",
+        "ffn_out.weight", "ffn_out.bias",
+    }
+    x = torch.randn(2, 16, 4, 8, 8)
+    assert torch.allclose(block(x), x, atol=1e-6)
+
+
+def test_selfattn_ffn_changes_when_perturbed():
+    block = SelfAttentionBlock(
+        16, attn_type="softmax", num_heads=4, spatial_dims=3,
+        zero_init=True, use_ffn=True)
+    x = torch.randn(2, 16, 4, 8, 8)
+    y0 = block(x)
+    assert torch.allclose(y0, x, atol=1e-6)
+    with torch.no_grad():
+        block.ffn_out.weight.normal_()
+        block.ffn_out.bias.normal_()
+    y1 = block(x)
+    assert not torch.allclose(y1, x)
+
+
+def test_selfattn_off_matches_reference_and_state_dict():
+    block = SelfAttentionBlock(
+        16, attn_type="softmax", num_heads=4, spatial_dims=3,
+        zero_init=False, use_rope=False, use_ffn=False)
+    assert set(block.state_dict().keys()) == {
+        "norm.weight", "norm.bias",
+        "qkv.weight", "qkv.bias",
+        "proj.weight", "proj.bias",
+    }
+    x = torch.randn(2, 16, 4, 8, 8)
+    out = block(x)
+
+    spatial = x.shape[2:]
+    h = rearrange(block.norm(x), "b c ... -> b c (...)")
+    h = block.qkv(h)
+    qkv_h = rearrange(h, "b (h c3) n -> b h c3 n", h=block.num_heads)
+    q, k, v = qkv_h.chunk(3, dim=2)
+    q = q.permute(0, 1, 3, 2)
+    k = k.permute(0, 1, 3, 2)
+    v = v.permute(0, 1, 3, 2)
+    ref = F.scaled_dot_product_attention(q, k, v)
+    ref = ref.permute(0, 1, 3, 2)
+    ref = rearrange(ref, "b h c n -> b (h c) n")
+    ref = block.proj(ref).unflatten(-1, spatial)
+    ref = x + ref
+    assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5)
 
 
 def test_selfattn_head_dim_resolution():
@@ -140,6 +235,28 @@ def test_unet_forward_with_selfattn_2_5d():
         y = model(x)
     out = y[0] if isinstance(y, (list, tuple)) else y
     assert out.shape[-2:] == (64, 64)
+
+
+def test_unet_forward_with_selfattn_rope_ffn_threading():
+    cfg = _cfg("z_axis")
+    cfg.model.selfattn_enabled = True
+    cfg.model.selfattn_type = "softmax"
+    cfg.model.selfattn_rope = True
+    cfg.model.selfattn_ffn = True
+    cfg.model.selfattn_ffn_ratio = 2.0
+    cfg.model.selfattn_encoder_stages = [0, 1, 1]
+    cfg.sync()
+    cfg.validate()
+    model = build_model(cfg).eval()
+    blocks = [m for m in model.modules() if isinstance(m, SelfAttentionBlock)]
+    assert blocks
+    assert all(m.use_rope for m in blocks)
+    assert all(m.use_ffn for m in blocks)
+    x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)
+    with torch.no_grad():
+        y = model(x)
+    out = y[0] if isinstance(y, (list, tuple)) else y
+    assert out.shape[-3:] == (16, 64, 64)
 
 
 def test_default_off_is_identical_to_baseline():

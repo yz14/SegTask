@@ -128,6 +128,9 @@ def _make_resnet_stage_builder(
                 head_dim     = mc.selfattn_head_dim,
                 norm_groups  = mc.norm_groups,
                 zero_init    = mc.selfattn_zero_init,
+                use_rope     = mc.selfattn_rope,
+                use_ffn      = mc.selfattn_ffn,
+                ffn_ratio    = mc.selfattn_ffn_ratio,
                 spatial_dims = spatial_dims))
         return stage
 

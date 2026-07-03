@@ -314,6 +314,9 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.selfattn_num_heads", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_head_dim", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_zero_init", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_rope", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_ffn", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_ffn_ratio", depends_on=resnet + [_truthy("model.selfattn_enabled"), _truthy("model.selfattn_ffn")]),
         Field("model.selfattn_encoder_stages", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_decoder_stages", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
     ]

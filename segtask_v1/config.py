@@ -408,6 +408,11 @@ class ModelConfig:
     selfattn_head_dim: int = -1
     # 输出投影 zero-init：训练初始注意力分支输出≈0、整块为恒等残差，几乎不扰动已调好的基线（强烈建议 true）。
     selfattn_zero_init: bool = True
+    # RoPE（参数无关）仅作用于 softmax self-attn；默认关，开后按 2D/3D 位置做旋转编码。
+    selfattn_rope: bool = False
+    # 额外 FFN：GEGLU + zero-init 输出投影；默认关，开后为注意力后再接一层残差 MLP。
+    selfattn_ffn: bool = False
+    selfattn_ffn_ratio: float = 4.0
     # 编码器逐 stage 开关（可逐层指定类型）。长度须 == len(encoder_channels)。空=该侧全关。
     # 每个元素：0/'none'=该层关；'softmax'=标准 QKV；'linear'=线性 QKV；1=沿用全局 selfattn_type。
     selfattn_encoder_stages: List = field(default_factory=list)
@@ -1285,6 +1290,9 @@ class Config:
         _require(
             hd == -1 or hd >= 1,
             f"model.selfattn_head_dim must be -1 or >= 1; got {hd}.")
+        _require(
+            float(mc.selfattn_ffn_ratio) > 0.0,
+            f"model.selfattn_ffn_ratio must be > 0; got {mc.selfattn_ffn_ratio}.")
         enc_st = list(mc.selfattn_encoder_stages)
         dec_st = list(mc.selfattn_decoder_stages)
         if enc_st:
