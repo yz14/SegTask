@@ -32,7 +32,8 @@ def resolve_selfattn_stage(entry, default_type: str):
     """把单个 selfattn 逐 level 条目解析为注意力类型或 None（该层关）。
 
     取值：0/'none'/'off' → None；1/'on'/'default' → default_type；
-    'softmax' → 'softmax'；'linear' → 'linear'。其它一律报错。
+    'softmax' → 'softmax'；'linear' → 'linear'；'window' → 'window'；
+    'grid' → 'grid'。其它一律报错。
     """
     s = str(entry).strip().lower()
     if s in ("0", "none", "off", "false"):
@@ -43,9 +44,13 @@ def resolve_selfattn_stage(entry, default_type: str):
         return "softmax"
     if s in ("linear", "lin", "linear_qkv"):
         return "linear"
+    if s in ("window", "win", "local"):
+        return "window"
+    if s in ("grid", "grid2", "sparse"):
+        return "grid"
     raise ConfigError(
         f"Invalid selfattn stage entry {entry!r}; expected one of "
-        "0/'none', 1/'default', 'softmax', 'linear'.")
+        "0/'none', 1/'default', 'softmax', 'linear', 'window', 'grid'.")
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +278,10 @@ class ModelConfig:
     # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
     attention_type: str = "none"
 
-    # skip 连接上的 AttentionGate3D（Oktay 2018）。
+    # skip 连接上的 AttentionGate3D（Oktay 2018）；attn_gate_norm 控制其归一化。
+    # batch 保持旧行为；instance/group 更适合 3D 小 batch，默认不变。
     skip_attention: bool = False
+    attn_gate_norm: str = "batch"
 
     # 深度监督：多 decoder 级输出预测。
     deep_supervision: bool = False
@@ -349,8 +356,11 @@ class ModelConfig:
     # 深层低分辨率 stage 可置 0，省重算开销。
     grad_ckpt_encoder_stages: List[int] = field(default_factory=list)
 
-    # ConvNeXt: drop path / LayerScale / LN-first downsample。
+    # stochastic depth（ResNet / ConvNeXt / MedNeXt 共用；默认 0 = 恒等，无行为变化）。
     drop_path_rate: float = 0.0
+    # ConvNeXt-V2 / MedNeXt 可选 GRN（Global Response Normalization）；gamma/beta 零初始化，
+    # 默认关，开启后初始仍近似恒等。
+    grn_enabled: bool = False
     convnext_layer_scale_init: float = 1e-6  # <=0 禁用
     convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
 
@@ -403,6 +413,14 @@ class ModelConfig:
     selfattn_head_dim: int = -1
     # 输出投影 zero-init：训练初始注意力分支输出≈0、整块为恒等残差，几乎不扰动已调好的基线（强烈建议 true）。
     selfattn_zero_init: bool = True
+    # RoPE（参数无关）仅作用于 softmax self-attn；默认关，开后按 2D/3D 位置做旋转编码。
+    selfattn_rope: bool = False
+    # 额外 FFN：GEGLU + zero-init 输出投影；默认关，开后为注意力后再接一层残差 MLP。
+    selfattn_ffn: bool = False
+    selfattn_ffn_ratio: float = 4.0
+    # Window/Grid 注意力块大小；默认 7 保持不启用时无影响，启用时用于浅层大分辨率 token 分块。
+    selfattn_window_size: int = 7
+    selfattn_grid_size: int = 7
     # 编码器逐 stage 开关（可逐层指定类型）。长度须 == len(encoder_channels)。空=该侧全关。
     # 每个元素：0/'none'=该层关；'softmax'=标准 QKV；'linear'=线性 QKV；1=沿用全局 selfattn_type。
     selfattn_encoder_stages: List = field(default_factory=list)
@@ -1065,6 +1083,9 @@ class Config:
             ),
                 f"Invalid activation: {self.model.activation}")
             _require(
+                self.model.attn_gate_norm in ("batch", "instance", "group"),
+                f"Invalid attn_gate_norm: {self.model.attn_gate_norm}")
+            _require(
                 self.model.downsample_mode in (
                 "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
             ),
@@ -1267,9 +1288,9 @@ class Config:
             f"model.selfattn_enabled=True requires backbone='resnet'; "
             f"got {mc.backbone!r}.")
         _require(
-            mc.selfattn_type in ("softmax", "linear"),
+            mc.selfattn_type in ("softmax", "linear", "window", "grid"),
             f"Invalid model.selfattn_type: {mc.selfattn_type!r}; "
-            "expected 'softmax' or 'linear'.")
+            "expected 'softmax', 'linear', 'window' or 'grid'.")
         _require(
             int(mc.selfattn_num_heads) >= 1,
             f"model.selfattn_num_heads must be >= 1; got {mc.selfattn_num_heads}.")
@@ -1277,6 +1298,15 @@ class Config:
         _require(
             hd == -1 or hd >= 1,
             f"model.selfattn_head_dim must be -1 or >= 1; got {hd}.")
+        _require(
+            float(mc.selfattn_ffn_ratio) > 0.0,
+            f"model.selfattn_ffn_ratio must be > 0; got {mc.selfattn_ffn_ratio}.")
+        _require(
+            int(mc.selfattn_window_size) >= 1,
+            f"model.selfattn_window_size must be >= 1; got {mc.selfattn_window_size}.")
+        _require(
+            int(mc.selfattn_grid_size) >= 1,
+            f"model.selfattn_grid_size must be >= 1; got {mc.selfattn_grid_size}.")
         enc_st = list(mc.selfattn_encoder_stages)
         dec_st = list(mc.selfattn_decoder_stages)
         if enc_st:

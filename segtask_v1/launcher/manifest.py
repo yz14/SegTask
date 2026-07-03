@@ -259,6 +259,7 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.attention_type", depends_on=unet),
         Field("model.se_reduction", depends_on=unet + [_in("model.attention_type", ["se"])]),
         Field("model.skip_attention", depends_on=unet),
+        Field("model.attn_gate_norm", depends_on=unet + [_truthy("model.skip_attention")]),
         Field("model.deep_supervision", depends_on=unet),
         Field("model.stem_mode"),
         Field("model.decoder_type", depends_on=unet),
@@ -277,7 +278,8 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.grad_ckpt_encoder_stages",
               depends_on=unet + [_truthy("model.grad_checkpointing")]),
         # ConvNeXt 专属。
-        Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["convnext"])]),
+        Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["resnet", "convnext", "mednext"])]),
+        Field("model.grn_enabled", depends_on=unet + [_in("model.backbone", ["convnext", "mednext"])]),
         Field("model.convnext_layer_scale_init", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         Field("model.convnext_downsample_lnfirst", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         # MedNeXt 专属（仅 backbone=='mednext'）。
@@ -312,6 +314,11 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.selfattn_num_heads", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_head_dim", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_zero_init", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_rope", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_ffn", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_ffn_ratio", depends_on=resnet + [_truthy("model.selfattn_enabled"), _truthy("model.selfattn_ffn")]),
+        Field("model.selfattn_window_size", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
+        Field("model.selfattn_grid_size", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_encoder_stages", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
         Field("model.selfattn_decoder_stages", depends_on=resnet + [_truthy("model.selfattn_enabled")]),
     ]

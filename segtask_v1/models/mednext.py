@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .blocks import _CONV, make_attention
+from .blocks import DropPath, GlobalResponseNorm, _CONV, make_attention
 
 
 def _channelwise_groupnorm(num_channels: int) -> nn.GroupNorm:
@@ -39,7 +39,9 @@ class MedNeXtBlock(nn.Module):
         dim           : int,
         expand_ratio  : int = 4,
         kernel_size   : int = 3,
+        drop_path     : float = 0.0,
         attention_type: str = "none",
+        use_grn       : bool = False,
         spatial_dims  : int = 3):
         super().__init__()
         d = spatial_dims
@@ -53,8 +55,10 @@ class MedNeXtBlock(nn.Module):
         self.norm    = _channelwise_groupnorm(dim)
         self.pwconv1 = _CONV[d](dim, hidden, kernel_size=1, bias=True)
         self.act     = nn.GELU()
+        self.grn     = GlobalResponseNorm(hidden, spatial_dims=d) if use_grn else nn.Identity()
         self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
         self.attn    = make_attention(attention_type, dim, spatial_dims=d)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         res = x
@@ -62,9 +66,10 @@ class MedNeXtBlock(nn.Module):
         out = self.norm(out)
         out = self.pwconv1(out)
         out = self.act(out)
+        out = self.grn(out)
         out = self.pwconv2(out)
         out = self.attn(out)
-        return res + out
+        return res + self.drop_path(out)
 
 
 class MedNeXtAdaptBlock(nn.Module):
@@ -80,7 +85,9 @@ class MedNeXtAdaptBlock(nn.Module):
         out_ch        : int,
         expand_ratio  : int = 4,
         kernel_size   : int = 3,
+        drop_path     : float = 0.0,
         attention_type: str = "none",
+        use_grn       : bool = False,
         spatial_dims  : int = 3):
         super().__init__()
         d = spatial_dims
@@ -91,7 +98,8 @@ class MedNeXtAdaptBlock(nn.Module):
             if in_ch != out_ch else nn.Identity())
         self.block = MedNeXtBlock(
             out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
-            attention_type=attention_type, spatial_dims=d)
+            drop_path=drop_path, attention_type=attention_type,
+            use_grn=use_grn, spatial_dims=d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(self.proj(x))
@@ -107,17 +115,24 @@ class MedNeXtStage(nn.Module):
         num_blocks    : int = 2,
         expand_ratio  : int = 4,
         kernel_size   : int = 3,
+        drop_path_rates: list = None,
         attention_type: str = "none",
+        use_grn       : bool = False,
         spatial_dims  : int = 3):
         super().__init__()
         d = spatial_dims
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * num_blocks
         blocks = [MedNeXtAdaptBlock(
             in_ch, out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
-            attention_type=attention_type, spatial_dims=d)]
-        for _ in range(1, num_blocks):
+            drop_path=drop_path_rates[0], attention_type=attention_type,
+            use_grn=use_grn, spatial_dims=d)]
+        for i in range(1, num_blocks):
+            dp = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
             blocks.append(MedNeXtBlock(
                 out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
-                attention_type=attention_type, spatial_dims=d))
+                drop_path=dp, attention_type=attention_type,
+                use_grn=use_grn, spatial_dims=d))
         self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

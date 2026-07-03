@@ -10,25 +10,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from .blocks import _CONV, make_attention
-
-
-class DropPath(nn.Module):
-    """Stochastic depth for residual blocks."""
-
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.drop_prob == 0.0:
-            return x
-        keep = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        # sample mask in fp32 then cast (AMP fp16/bf16 bernoulli backend is flaky)
-        prob = torch.full(shape, keep, device=x.device, dtype=torch.float32)
-        mask = torch.bernoulli(prob).to(dtype=x.dtype)
-        return x * mask / keep
+from .blocks import DropPath, GlobalResponseNorm, _CONV, make_attention
 
 
 class LayerNorm3d(nn.Module):
@@ -59,6 +41,7 @@ class ConvNeXtBlock(nn.Module):
         expand_ratio          : float = 4.0,
         drop_path             : float = 0.0,
         attention_type        : str = "none",
+        use_grn               : bool = False,
         spatial_dims          : int = 3,
         layer_scale_init_value: float = 1e-6):
         super().__init__()
@@ -70,6 +53,7 @@ class ConvNeXtBlock(nn.Module):
         self.norm    = LayerNorm3d(dim)
         self.pwconv1 = _CONV[d](dim, hidden, kernel_size=1, bias=True)
         self.act     = nn.GELU()
+        self.grn     = GlobalResponseNorm(hidden, spatial_dims=d) if use_grn else nn.Identity()
         self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
         self.attn    = make_attention(attention_type, dim, spatial_dims=d)
         # LayerScale: init small → near-identity start; <=0 disables
@@ -86,6 +70,7 @@ class ConvNeXtBlock(nn.Module):
         out = self.norm(out)
         out = self.pwconv1(out)
         out = self.act(out)
+        out = self.grn(out)
         out = self.pwconv2(out)
         out = self.attn(out)
         if self.gamma is not None:
@@ -104,6 +89,7 @@ class ConvNeXtAdaptBlock(nn.Module):
         expand_ratio          : float = 4.0,
         drop_path             : float = 0.0,
         attention_type        : str = "none",
+        use_grn               : bool = False,
         spatial_dims          : int = 3,
         layer_scale_init_value: float = 1e-6):
         super().__init__()
@@ -116,6 +102,7 @@ class ConvNeXtAdaptBlock(nn.Module):
         self.block = ConvNeXtBlock(
             out_ch, expand_ratio, drop_path,
             attention_type=attention_type,
+            use_grn=use_grn,
             spatial_dims=d,
             layer_scale_init_value=layer_scale_init_value)
 
@@ -134,6 +121,7 @@ class ConvNeXtStage(nn.Module):
         expand_ratio          : float = 4.0,
         drop_path_rates       : list = None,
         attention_type        : str = "none",
+        use_grn               : bool = False,
         spatial_dims          : int = 3,
         layer_scale_init_value: float = 1e-6):
         super().__init__()
@@ -143,6 +131,7 @@ class ConvNeXtStage(nn.Module):
         blocks = [ConvNeXtAdaptBlock(
             in_ch, out_ch, expand_ratio,
             drop_path_rates[0], attention_type,
+            use_grn=use_grn,
             spatial_dims=d,
             layer_scale_init_value=layer_scale_init_value)]
         for i in range(1, num_blocks):
@@ -150,6 +139,7 @@ class ConvNeXtStage(nn.Module):
             blocks.append(ConvNeXtAdaptBlock(
                 out_ch, out_ch, expand_ratio,
                 dp, attention_type,
+                use_grn=use_grn,
                 spatial_dims=d,
                 layer_scale_init_value=layer_scale_init_value))
         self.blocks = nn.Sequential(*blocks)

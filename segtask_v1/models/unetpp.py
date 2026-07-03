@@ -28,6 +28,7 @@ class UNetPPDecoder(nn.Module):
         stage_builder,
         upsample_mode: str = "transpose",
         skip_attention: bool = False,
+        attn_gate_norm: str = "batch",
         spatial_dims: int = 3,
         upsample_norm_act: bool = False,
         norm_type: str = "instance",
@@ -73,6 +74,8 @@ class UNetPPDecoder(nn.Module):
                     self.gates[key] = AttentionGate3D(
                         x_ch=encoder_channels[i],
                         g_ch=encoder_channels[i],
+                        norm_type=attn_gate_norm,
+                        norm_groups=norm_groups,
                         spatial_dims=spatial_dims,
                     )
 

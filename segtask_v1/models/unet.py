@@ -175,6 +175,7 @@ class DecoderLevel(nn.Module):
         upsample_mode    : str = "transpose",
         skip_mode        : str = "cat",
         skip_attention   : bool = False,
+        attn_gate_norm   : str = "batch",
         spatial_dims     : int = 3,
         upsample_stride  = 2,
         upsample_norm_act: bool = False,
@@ -203,6 +204,8 @@ class DecoderLevel(nn.Module):
 
         self.attn_gate = (
             AttentionGate3D(x_ch=skip_ch, g_ch=out_ch,
+                            norm_type=attn_gate_norm,
+                            norm_groups=norm_groups,
                             spatial_dims=spatial_dims)
             if skip_attention else None)
         self.stage = stage_builder(fused_ch, out_ch)
@@ -238,6 +241,7 @@ class Decoder(nn.Module):
         upsample_mode     : str = "transpose",
         skip_mode         : str = "cat",
         skip_attention    : bool = False,
+        attn_gate_norm    : str = "batch",
         spatial_dims      : int = 3,
         downsample_strides: Optional[List] = None,
         upsample_norm_act : bool = False,
@@ -275,6 +279,7 @@ class Decoder(nn.Module):
                 upsample_mode  = upsample_mode,
                 skip_mode      = skip_mode,
                 skip_attention = skip_attention,
+                attn_gate_norm = attn_gate_norm,
                 spatial_dims   = spatial_dims,
                 upsample_stride = up_stride,
                 upsample_norm_act = upsample_norm_act,

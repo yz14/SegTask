@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from itertools import product
 from typing import Sequence, Tuple, Type
 
 import torch
@@ -50,6 +51,45 @@ def checkpoint_if(enabled: bool, fn, *args):
         return _torch_checkpoint(
             fn, *args, use_reentrant=False, preserve_rng_state=True)
     return fn(*args)
+
+
+class DropPath(nn.Module):
+    """残差随机深度：训练时按样本丢弃 residual 分支，eval 直通。"""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        # 先 fp32 采样，避免 AMP 下 bernoulli 后端差异。
+        prob = torch.full(shape, keep, device=x.device, dtype=torch.float32)
+        mask = torch.bernoulli(prob).to(dtype=x.dtype)
+        return x * mask / keep
+
+
+class GlobalResponseNorm(nn.Module):
+    """ConvNeXt-V2 GRN：按通道做全局响应归一化，gamma/beta 零初始化。"""
+
+    def __init__(self, channels: int, spatial_dims: int = 3, eps: float = 1e-6):
+        super().__init__()
+        d = _check_dims(spatial_dims)
+        self.spatial_dims = d
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.zeros(channels))
+        self.beta = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dims = tuple(range(2, x.ndim))
+        gx = torch.sqrt(torch.sum(x * x, dim=dims, keepdim=True) + self.eps)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        pat = "c -> 1 c" + " 1" * self.spatial_dims
+        gamma = rearrange(self.gamma, pat)
+        beta = rearrange(self.beta, pat)
+        return x + gamma * (x * nx) + beta
 
 
 def _as_stride_tuple(stride, spatial_dims: int) -> Tuple[int, ...]:
@@ -338,7 +378,7 @@ ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord")
 # linear ：Shen 2021 O(N) 线性注意力（KᵀV 技巧），放次深层。
 # 输出投影可 zero-init → 训练初始为恒等残差，几乎不扰动已调好的基线。
 # ---------------------------------------------------------------------------
-SELFATTN_TYPES = ("softmax", "linear")
+SELFATTN_TYPES = ("softmax", "linear", "window", "grid")
 
 
 def _resolve_attn_heads(channels: int, num_heads: int, head_dim: int) -> int:
@@ -358,16 +398,277 @@ def _resolve_attn_heads(channels: int, num_heads: int, head_dim: int) -> int:
     return num_heads
 
 
+def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.unbind(dim=-1)
+    return torch.stack((-x2, x1), dim=-1)
+
+
+def _apply_rope_nd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    spatial_shape: Sequence[int],
+    position_offsets: Sequence[int] = (),
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """按空间坐标对 q/k 施加 nD RoPE；多余通道保留不转。"""
+    if not spatial_shape:
+        return q, k
+    num_axes = len(spatial_shape)
+    head_dim = q.shape[-1]
+    rot_dim = (head_dim // (2 * num_axes)) * 2
+    if rot_dim < 2:
+        return q, k
+    if position_offsets:
+        if len(position_offsets) != num_axes:
+            raise ValueError(
+                f"RoPE position_offsets length ({len(position_offsets)}) "
+                f"must match spatial axes ({num_axes}).")
+        offsets = [int(v) for v in position_offsets]
+    else:
+        offsets = [0] * num_axes
+
+    coords = [torch.arange(s, device=q.device) + off
+              for s, off in zip(spatial_shape, offsets)]
+    mesh = torch.meshgrid(*coords, indexing="ij")
+    flat_coords = [m.reshape(-1) for m in mesh]
+    tokens = flat_coords[0].numel()
+    rot_pairs = rot_dim // 2
+    q_out = q.clone()
+    k_out = k.clone()
+    for axis, pos in enumerate(flat_coords):
+        start = axis * rot_dim
+        end = start + rot_dim
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(
+                0, rot_dim, 2, device=q.device, dtype=torch.float32) / rot_dim))
+        angles = pos.to(dtype=torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
+        cos = angles.cos().to(dtype=q.dtype).view(1, 1, tokens, rot_pairs, 1)
+        sin = angles.sin().to(dtype=q.dtype).view(1, 1, tokens, rot_pairs, 1)
+
+        q_blk = q_out[..., start:end].reshape(*q_out.shape[:-1], rot_pairs, 2)
+        k_blk = k_out[..., start:end].reshape(*k_out.shape[:-1], rot_pairs, 2)
+        q_out[..., start:end] = (
+            q_blk * cos + _rope_rotate_half(q_blk) * sin).flatten(-2)
+        k_out[..., start:end] = (
+            k_blk * cos + _rope_rotate_half(k_blk) * sin).flatten(-2)
+    return q_out, k_out
+
+
+def _normalize_spatial_sizes(
+    size: int | Sequence[int],
+    spatial_dims: int,
+) -> Tuple[int, ...]:
+    if isinstance(size, int):
+        out = (int(size),) * spatial_dims
+    else:
+        out = tuple(int(v) for v in size)
+    if len(out) != spatial_dims:
+        raise ValueError(
+            f"Expected {spatial_dims} spatial sizes, got {list(out)}.")
+    if any(v < 1 for v in out):
+        raise ValueError(f"Spatial sizes must be >= 1; got {list(out)}.")
+    return out
+
+
+def _pad_spatial_to_multiple(
+    x: torch.Tensor,
+    spatial_shape: Sequence[int],
+    block_sizes: Sequence[int],
+) -> Tuple[torch.Tensor, Tuple[int, ...], Tuple[int, ...]]:
+    padded = tuple(
+        int(math.ceil(s / b)) * b
+        for s, b in zip(spatial_shape, block_sizes))
+    if tuple(spatial_shape) == padded:
+        return x, padded, tuple(spatial_shape)
+    pad = []
+    for cur, target in zip(reversed(spatial_shape), reversed(padded)):
+        pad.extend([0, int(target - cur)])
+    return F.pad(x, pad), padded, tuple(spatial_shape)
+
+
+def _window_partition_tokens(
+    x: torch.Tensor,
+    spatial_shape: Sequence[int],
+    window_size: int | Sequence[int],
+):
+    """把 (B,H,C,*spatial) 切成窗口组 (B*num_win,H,tokens,C)。"""
+    d = len(spatial_shape)
+    ws = _normalize_spatial_sizes(window_size, d)
+    x, padded, orig = _pad_spatial_to_multiple(x, spatial_shape, ws)
+    if d == 2:
+        n1, n2 = padded[0] // ws[0], padded[1] // ws[1]
+        x = rearrange(
+            x, "b h c (n1 w1) (n2 w2) -> (n1 n2 b) h (w1 w2) c",
+            n1=n1, n2=n2, w1=ws[0], w2=ws[1])
+        offsets = [
+            (i * ws[0], j * ws[1])
+            for i, j in product(range(n1), range(n2))
+        ]
+        mask = torch.ones((x.shape[0] // (n1 * n2),) + tuple(orig),
+                          device=x.device, dtype=torch.bool)
+        mask = F.pad(mask, (0, padded[1] - orig[1], 0, padded[0] - orig[0]))
+        mask = rearrange(
+            mask, "b (n1 w1) (n2 w2) -> (n1 n2 b) (w1 w2)",
+            n1=n1, n2=n2, w1=ws[0], w2=ws[1])
+    else:
+        n1, n2, n3 = (
+            padded[0] // ws[0], padded[1] // ws[1], padded[2] // ws[2])
+        x = rearrange(
+            x,
+            "b h c (n1 w1) (n2 w2) (n3 w3) -> (n1 n2 n3 b) h (w1 w2 w3) c",
+            n1=n1, n2=n2, n3=n3, w1=ws[0], w2=ws[1], w3=ws[2])
+        offsets = [
+            (i * ws[0], j * ws[1], k * ws[2])
+            for i, j, k in product(range(n1), range(n2), range(n3))
+        ]
+        mask = torch.ones((x.shape[0] // (n1 * n2 * n3),) + tuple(orig),
+                          device=x.device, dtype=torch.bool)
+        mask = F.pad(
+            mask,
+            (0, padded[2] - orig[2], 0, padded[1] - orig[1],
+             0, padded[0] - orig[0]))
+        mask = rearrange(
+            mask,
+            "b (n1 w1) (n2 w2) (n3 w3) -> (n1 n2 n3 b) (w1 w2 w3)",
+            n1=n1, n2=n2, n3=n3, w1=ws[0], w2=ws[1], w3=ws[2])
+    meta = {
+        "mode": "window",
+        "batch": x.shape[0] // len(offsets),
+        "group_sizes": tuple(p // w for p, w in zip(padded, ws)),
+        "token_sizes": ws,
+        "orig_shape": tuple(orig),
+        "padded_shape": padded,
+        "offsets": offsets,
+        "spatial_dims": d,
+    }
+    return x, mask, meta
+
+
+def _window_unpartition_tokens(x: torch.Tensor, meta: dict) -> torch.Tensor:
+    d = meta["spatial_dims"]
+    b = meta["batch"]
+    group_sizes = meta["group_sizes"]
+    token_sizes = meta["token_sizes"]
+    if d == 2:
+        x = rearrange(
+            x, "(n1 n2 b) h (w1 w2) c -> b h c (n1 w1) (n2 w2)",
+            b=b, n1=group_sizes[0], n2=group_sizes[1],
+            w1=token_sizes[0], w2=token_sizes[1])
+    else:
+        x = rearrange(
+            x,
+            "(n1 n2 n3 b) h (w1 w2 w3) c -> b h c (n1 w1) (n2 w2) (n3 w3)",
+            b=b, n1=group_sizes[0], n2=group_sizes[1], n3=group_sizes[2],
+            w1=token_sizes[0], w2=token_sizes[1], w3=token_sizes[2])
+    orig = meta["orig_shape"]
+    if d == 2:
+        return x[..., :orig[0], :orig[1]]
+    return x[..., :orig[0], :orig[1], :orig[2]]
+
+
+def _grid_partition_tokens(
+    x: torch.Tensor,
+    spatial_shape: Sequence[int],
+    grid_size: int | Sequence[int],
+):
+    """把 (B,H,C,*spatial) 切成网格组 (B*num_grid,H,tokens,C)。"""
+    d = len(spatial_shape)
+    gs = _normalize_spatial_sizes(grid_size, d)
+    strides = tuple(max(1, int(math.ceil(s / g))) for s, g in zip(spatial_shape, gs))
+    x, padded, orig = _pad_spatial_to_multiple(x, spatial_shape, strides)
+    if d == 2:
+        g1, g2 = padded[0] // strides[0], padded[1] // strides[1]
+        x = rearrange(
+            x, "b h c (g1 s1) (g2 s2) -> (s1 s2 b) h (g1 g2) c",
+            g1=g1, g2=g2, s1=strides[0], s2=strides[1])
+        mask = torch.ones((x.shape[0] // (strides[0] * strides[1]),) + tuple(orig),
+                          device=x.device, dtype=torch.bool)
+        mask = F.pad(mask, (0, padded[1] - orig[1], 0, padded[0] - orig[0]))
+        mask = rearrange(
+            mask, "b (g1 s1) (g2 s2) -> (s1 s2 b) (g1 g2)",
+            g1=g1, g2=g2, s1=strides[0], s2=strides[1])
+    else:
+        g1, g2, g3 = (
+            padded[0] // strides[0], padded[1] // strides[1], padded[2] // strides[2])
+        x = rearrange(
+            x,
+            "b h c (g1 s1) (g2 s2) (g3 s3) -> (s1 s2 s3 b) h (g1 g2 g3) c",
+            g1=g1, g2=g2, g3=g3,
+            s1=strides[0], s2=strides[1], s3=strides[2])
+        mask = torch.ones((x.shape[0] // math.prod(strides),) + tuple(orig),
+                          device=x.device, dtype=torch.bool)
+        mask = F.pad(
+            mask,
+            (0, padded[2] - orig[2], 0, padded[1] - orig[1],
+             0, padded[0] - orig[0]))
+        mask = rearrange(
+            mask,
+            "b (g1 s1) (g2 s2) (g3 s3) -> (s1 s2 s3 b) (g1 g2 g3)",
+            g1=g1, g2=g2, g3=g3,
+            s1=strides[0], s2=strides[1], s3=strides[2])
+    meta = {
+        "mode": "grid",
+        "batch": x.shape[0] // math.prod(strides),
+        "group_sizes": strides,
+        "token_sizes": tuple(p // s for p, s in zip(padded, strides)),
+        "orig_shape": tuple(orig),
+        "padded_shape": padded,
+        "offsets": None,
+        "spatial_dims": d,
+    }
+    return x, mask, meta
+
+
+def _grid_unpartition_tokens(x: torch.Tensor, meta: dict) -> torch.Tensor:
+    d = meta["spatial_dims"]
+    b = meta["batch"]
+    group_sizes = meta["group_sizes"]
+    token_sizes = meta["token_sizes"]
+    if d == 2:
+        x = rearrange(
+            x, "(s1 s2 b) h (g1 g2) c -> b h c (g1 s1) (g2 s2)",
+            b=b, s1=group_sizes[0], s2=group_sizes[1],
+            g1=token_sizes[0], g2=token_sizes[1])
+    else:
+        x = rearrange(
+            x,
+            "(s1 s2 s3 b) h (g1 g2 g3) c -> b h c (g1 s1) (g2 s2) (g3 s3)",
+            b=b, s1=group_sizes[0], s2=group_sizes[1], s3=group_sizes[2],
+            g1=token_sizes[0], g2=token_sizes[1], g3=token_sizes[2])
+    orig = meta["orig_shape"]
+    if d == 2:
+        return x[..., :orig[0], :orig[1]]
+    return x[..., :orig[0], :orig[1], :orig[2]]
+
+
+def _sdpa_from_qkv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    spatial_shape: Sequence[int],
+    use_rope: bool = False,
+    position_offsets: Sequence[int] = (),
+    attn_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if use_rope:
+        q, k = _apply_rope_nd(q, k, spatial_shape, position_offsets)
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    return out
+
+
 class _SoftmaxQKVAttention(nn.Module):
     """标准多头 softmax 自注意力，输入 qkv=(B, 3*C, N)，输出 (B, C, N)。
 
-    采用 SDPA，计算仍是 O(N²)，但可走更省显存的 fused backend。"""
+    采用 SDPA，计算仍是 O(N²)，但可走更省显存的 fused backend；可选 RoPE。"""
 
-    def __init__(self, num_heads: int):
+    def __init__(self, num_heads: int, use_rope: bool = False,
+                 spatial_dims: int = 3):
         super().__init__()
         self.num_heads = num_heads
+        self.use_rope = bool(use_rope)
+        self.spatial_dims = _check_dims(spatial_dims)
 
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    def forward(self, qkv: torch.Tensor,
+                spatial_shape: Sequence[int] = ()) -> torch.Tensor:
         bs, width, length = qkv.shape
         ch = width // (3 * self.num_heads)
         qkv_h = rearrange(qkv, "b (h c3) n -> b h c3 n", h=self.num_heads)
@@ -375,9 +676,94 @@ class _SoftmaxQKVAttention(nn.Module):
         q = q.permute(0, 1, 3, 2)
         k = k.permute(0, 1, 3, 2)
         v = v.permute(0, 1, 3, 2)
+        if self.use_rope:
+            if not spatial_shape:
+                raise ValueError("RoPE requires spatial_shape in forward().")
+            q, k = _apply_rope_nd(q, k, spatial_shape)
         a = F.scaled_dot_product_attention(q, k, v)
         a = a.permute(0, 1, 3, 2)
         return rearrange(a, "b h c n -> b (h c) n")
+
+
+class _WindowQKVAttention(nn.Module):
+    """局部窗口注意力：每个窗口独立做 SDPA，2D/3D 通用。"""
+
+    def __init__(self, num_heads: int, window_size: int | Sequence[int],
+                 use_rope: bool = False, spatial_dims: int = 3):
+        super().__init__()
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.use_rope = bool(use_rope)
+        self.spatial_dims = _check_dims(spatial_dims)
+
+    def forward(self, qkv: torch.Tensor,
+                spatial_shape: Sequence[int] = ()) -> torch.Tensor:
+        qkv_h = rearrange(qkv, "b (h c3) n -> b h c3 n", h=self.num_heads)
+        q, k, v = qkv_h.chunk(3, dim=2)
+        q = rearrange(q.permute(0, 1, 3, 2).unflatten(-2, spatial_shape),
+                      "b h ... c -> b h c ...")
+        k = rearrange(k.permute(0, 1, 3, 2).unflatten(-2, spatial_shape),
+                      "b h ... c -> b h c ...")
+        v = rearrange(v.permute(0, 1, 3, 2).unflatten(-2, spatial_shape),
+                      "b h ... c -> b h c ...")
+        q, mask, meta = _window_partition_tokens(q, spatial_shape, self.window_size)
+        k, _, _ = _window_partition_tokens(k, spatial_shape, self.window_size)
+        v, _, _ = _window_partition_tokens(v, spatial_shape, self.window_size)
+        attn_mask = torch.zeros(
+            (mask.shape[0], 1, 1, mask.shape[1]),
+            device=q.device, dtype=q.dtype)
+        attn_mask = attn_mask.masked_fill(~mask[:, None, None, :],
+                                          torch.finfo(q.dtype).min)
+        if self.use_rope:
+            if not meta["offsets"]:
+                raise ValueError("RoPE requires spatial offsets.")
+            q_list = []
+            k_list = []
+            group_tokens = q.shape[0] // len(meta["offsets"])
+            for i, off in enumerate(meta["offsets"]):
+                sl = slice(i * group_tokens, (i + 1) * group_tokens)
+                q_i, k_i = _apply_rope_nd(
+                    q[sl], k[sl], meta["token_sizes"], position_offsets=off)
+                q_list.append(q_i)
+                k_list.append(k_i)
+            q = torch.cat(q_list, dim=0)
+            k = torch.cat(k_list, dim=0)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = _window_unpartition_tokens(out, meta)
+        return rearrange(out, "b h c ... -> b (h c) ...").flatten(2)
+
+
+class _GridQKVAttention(nn.Module):
+    """稀疏网格注意力：按 residue group 做 SDPA。"""
+
+    def __init__(self, num_heads: int, grid_size: int | Sequence[int],
+                 spatial_dims: int = 3):
+        super().__init__()
+        self.num_heads = num_heads
+        self.grid_size = grid_size
+        self.spatial_dims = _check_dims(spatial_dims)
+
+    def forward(self, qkv: torch.Tensor,
+                spatial_shape: Sequence[int] = ()) -> torch.Tensor:
+        qkv_h = rearrange(qkv, "b (h c3) n -> b h c3 n", h=self.num_heads)
+        q, k, v = qkv_h.chunk(3, dim=2)
+        q = rearrange(q.permute(0, 1, 3, 2).unflatten(-2, spatial_shape),
+                      "b h ... c -> b h c ...")
+        k = rearrange(k.permute(0, 1, 3, 2).unflatten(-2, spatial_shape),
+                      "b h ... c -> b h c ...")
+        v = rearrange(v.permute(0, 1, 3, 2).unflatten(-2, spatial_shape),
+                      "b h ... c -> b h c ...")
+        q, mask, meta = _grid_partition_tokens(q, spatial_shape, self.grid_size)
+        k, _, _ = _grid_partition_tokens(k, spatial_shape, self.grid_size)
+        v, _, _ = _grid_partition_tokens(v, spatial_shape, self.grid_size)
+        attn_mask = torch.zeros(
+            (mask.shape[0], 1, 1, mask.shape[1]),
+            device=q.device, dtype=q.dtype)
+        attn_mask = attn_mask.masked_fill(~mask[:, None, None, :],
+                                          torch.finfo(q.dtype).min)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = _grid_unpartition_tokens(out, meta)
+        return rearrange(out, "b h c ... -> b (h c) ...").flatten(2)
 
 
 class _LinearQKVAttention(nn.Module):
@@ -391,7 +777,8 @@ class _LinearQKVAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
 
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    def forward(self, qkv: torch.Tensor,
+                spatial_shape: Sequence[int] = ()) -> torch.Tensor:
         h = self.num_heads
         ch = qkv.shape[1] // (3 * h)
         qkv_h = rearrange(qkv, "b (h c) l -> b h c l", h=h)
@@ -407,8 +794,10 @@ class _LinearQKVAttention(nn.Module):
 class SelfAttentionBlock(nn.Module):
     """内容寻址自注意力残差块（2.5D/3D 通用）。
 
-    结构：x → GroupNorm(PreNorm) → flatten → Conv1d-QKV → {softmax|linear} attn
-    → Conv1d-proj(可 zero-init) → unflatten → + x（残差）。
+    结构：x → GroupNorm(PreNorm) → flatten → Conv1d-QKV →
+    {softmax|linear|window|grid} attn → Conv1d-proj(可 zero-init) →
+    unflatten → + x（残差）。
+    可选 RoPE（仅 softmax）与 GEGLU FFN（zero-init 输出投影）。
     """
 
     def __init__(
@@ -419,6 +808,11 @@ class SelfAttentionBlock(nn.Module):
         head_dim    : int = -1,
         norm_groups : int = 32,
         zero_init   : bool = True,
+        use_rope    : bool = False,
+        use_ffn     : bool = False,
+        ffn_ratio   : float = 4.0,
+        window_size : int | Sequence[int] = 7,
+        grid_size   : int | Sequence[int] = 7,
         spatial_dims: int = 3):
         super().__init__()
         _check_dims(spatial_dims)
@@ -426,35 +820,79 @@ class SelfAttentionBlock(nn.Module):
             raise ValueError(
                 f"Unknown self-attention type: {attn_type!r}; "
                 f"expected one of {SELFATTN_TYPES}.")
+        if use_rope and attn_type == "linear":
+            raise ValueError(
+                "SelfAttentionBlock(use_rope=True) is only supported with "
+                "'softmax' attention; linear attention factorization does not "
+                "support position-coupled q/k rotation.")
+        if use_rope and attn_type == "grid":
+            raise ValueError(
+                "SelfAttentionBlock(use_rope=True) is not supported with "
+                "'grid' attention; the strided grouping is incompatible with "
+                "a single global rotary coordinate system.")
         self.spatial_dims = spatial_dims
+        self.use_rope = bool(use_rope)
         self.num_heads = _resolve_attn_heads(channels, num_heads, head_dim)
+        self.window_size = window_size
+        self.grid_size = grid_size
         g = norm_groups
         while channels % g != 0 and g > 1:
             g //= 2
         self.norm = nn.GroupNorm(g, channels)
         self.qkv = nn.Conv1d(channels, channels * 3, 1)
-        self.attn = (
-            _SoftmaxQKVAttention(self.num_heads) if attn_type == "softmax"
-            else _LinearQKVAttention(self.num_heads))
+        if attn_type == "softmax":
+            self.attn = _SoftmaxQKVAttention(
+                self.num_heads, use_rope=use_rope, spatial_dims=spatial_dims)
+        elif attn_type == "linear":
+            self.attn = _LinearQKVAttention(self.num_heads)
+        elif attn_type == "window":
+            self.attn = _WindowQKVAttention(
+                self.num_heads, window_size=window_size,
+                use_rope=use_rope, spatial_dims=spatial_dims)
+        else:
+            self.attn = _GridQKVAttention(
+                self.num_heads, grid_size=grid_size,
+                spatial_dims=spatial_dims)
         self.proj = nn.Conv1d(channels, channels, 1)
         if zero_init:
             nn.init.zeros_(self.proj.weight)
             nn.init.zeros_(self.proj.bias)
+        self.use_ffn = bool(use_ffn)
+        if self.use_ffn:
+            hidden = max(int(channels * float(ffn_ratio)), 1)
+            self.ffn_norm = nn.GroupNorm(g, channels)
+            self.ffn_in = nn.Conv1d(channels, hidden * 2, 1)
+            self.ffn_out = nn.Conv1d(hidden, channels, 1)
+            nn.init.zeros_(self.ffn_out.weight)
+            nn.init.zeros_(self.ffn_out.bias)
+        else:
+            self.ffn_norm = None
+            self.ffn_in = None
+            self.ffn_out = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial = x.shape[2:]
         h = rearrange(self.norm(x), "b c ... -> b c (...)")
         h = self.qkv(h)
-        h = self.attn(h)
+        h = self.attn(h, spatial_shape=spatial)
         h = self.proj(h)
         h = h.unflatten(-1, spatial)
-        return x + h
+        x = x + h
+        if self.use_ffn:
+            f = rearrange(self.ffn_norm(x), "b c ... -> b c (...)")
+            f = self.ffn_in(f)
+            a, b = f.chunk(2, dim=1)
+            f = a * F.gelu(b)
+            f = self.ffn_out(f)
+            x = x + f.unflatten(-1, spatial)
+        return x
 
 
 class AttentionGate3D(nn.Module):
-    """UNet skip 加性 attention gate (Oktay 2018)：1×1→ReLU→1×1→sigmoid。inter 默认 x_ch//2。"""
+    """UNet skip 加性 attention gate (Oktay 2018)：1×1→ReLU→1×1→sigmoid；norm_type 可配。"""
 
     def __init__(self, x_ch: int, g_ch: int, inter: int = 0,
+                 norm_type: str = "batch", norm_groups: int = 8,
                  spatial_dims: int = 3):
         super().__init__()
         d = _check_dims(spatial_dims)
@@ -463,15 +901,15 @@ class AttentionGate3D(nn.Module):
             inter = max(x_ch // 2, 1)
         self.W_x = nn.Sequential(
             _CONV[d](x_ch, inter, kernel_size=1, bias=False),
-            _BN[d](inter),
+            get_norm(norm_type, inter, norm_groups, spatial_dims=d),
         )
         self.W_g = nn.Sequential(
             _CONV[d](g_ch, inter, kernel_size=1, bias=False),
-            _BN[d](inter),
+            get_norm(norm_type, inter, norm_groups, spatial_dims=d),
         )
         self.psi = nn.Sequential(
             _CONV[d](inter, 1, kernel_size=1, bias=False),
-            _BN[d](1),
+            get_norm(norm_type, 1, norm_groups, spatial_dims=d),
             nn.Sigmoid(),
         )
         self.relu = nn.ReLU(inplace=True)
