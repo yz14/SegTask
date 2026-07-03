@@ -36,6 +36,12 @@ def _resolve_blocks_per_stage(
     return [fallback] * n_stages
 
 
+def _make_drop_path_rates(counts: List[int], drop_path_rate: float) -> List[float]:
+    """按总 block 深度线性增长的 stochastic depth 率。"""
+    total_blocks = sum(counts)
+    return np.linspace(0, drop_path_rate, max(total_blocks, 1)).tolist()
+
+
 class _StatefulStageBuilder:
     """有状态 stage 构建器：逐次调用从 counts[idx] 读 num_blocks。"""
 
@@ -71,10 +77,11 @@ def _make_resnet_stage_builder(
     mc = cfg.model
     spatial_dims = mc.spatial_dims
     attention_type = mc.attention_type
+    dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
     mask = list(multirf_mask) if multirf_mask else []
     sa_types = list(selfattn_types) if selfattn_types else []
 
-    def _build_stage(in_ch: int, out_ch: int, num_blocks: int):
+    def _build_stage(in_ch: int, out_ch: int, num_blocks: int, start: int):
         use_mrf = bool(mask[factory_idx[0]]) if factory_idx[0] < len(mask) else False
         if use_mrf:
             return MultiRFStage(
@@ -90,6 +97,7 @@ def _make_resnet_stage_builder(
                 dropout        = mc.dropout,
                 se_reduction   = mc.se_reduction,
                 attention_type = attention_type,
+                drop_path_rates = dp_rates[start:start + num_blocks],
                 spatial_dims   = spatial_dims,
                 branch_norm_act = mc.multirf_branch_norm_act)
         return ResNetStage(
@@ -102,12 +110,14 @@ def _make_resnet_stage_builder(
             se_reduction   = mc.se_reduction,
             attention_type = attention_type,
             block_type     = mc.block_type,
-            spatial_dims   = spatial_dims)
+            spatial_dims   = spatial_dims,
+            drop_path_rates = dp_rates[start:start + num_blocks])
 
     def factory(in_ch: int, out_ch: int, num_blocks: int):
         # _StatefulStageBuilder 顺序调用，下方按"已构建数"取 mask。
         idx = factory_idx[0]
-        stage = _build_stage(in_ch, out_ch, num_blocks)
+        start = sum(counts[:idx])
+        stage = _build_stage(in_ch, out_ch, num_blocks, start)
         sa_type = sa_types[idx] if idx < len(sa_types) else None
         factory_idx[0] += 1
         if sa_type:
@@ -143,10 +153,8 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             "ConvNeXt blocks: %s. (They still apply to the stem/decoder "
             "skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
-    # 总 block 上线性增的 drop-path。
-    total_blocks = sum(counts)
-    dp_rates     = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
-    rate_idx     = [0]
+    dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
+    rate_idx = [0]
     ls_init      = float(mc.convnext_layer_scale_init)  # <=0 禁用
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
@@ -159,6 +167,7 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             num_blocks             = num_blocks,
             drop_path_rates        = rates,
             attention_type         = mc.attention_type,
+            use_grn                = mc.grn_enabled,
             spatial_dims           = spatial_dims,
             layer_scale_init_value = ls_init)
 
@@ -198,14 +207,22 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
             "IGNORED inside MedNeXt blocks: %s. (They still apply to the "
             "stem/decoder skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
+    dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
+    rate_idx = [0]
 
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> MedNeXtStage:
+        start = rate_idx[0]
+        end = start + num_blocks
+        rates = dp_rates[start:end] if dp_rates else [0.0] * num_blocks
+        rate_idx[0] = end
         return MedNeXtStage(
             in_ch, out_ch,
             num_blocks     = num_blocks,
             expand_ratio   = mc.mednext_expand_ratio,
             kernel_size    = mc.mednext_kernel_size,
+            drop_path_rates = rates,
             attention_type = mc.attention_type,
+            use_grn        = mc.grn_enabled,
             spatial_dims   = spatial_dims)
 
     return _StatefulStageBuilder(factory, counts)
@@ -436,6 +453,7 @@ def build_model(cfg: Config):
             norm_groups=mc.norm_groups,
             activation=mc.activation,
             skip_attention=mc.skip_attention,
+            attn_gate_norm=mc.attn_gate_norm,
             spatial_dims=spatial_dims,
             grad_checkpointing=mc.grad_checkpointing)
     elif mc.decoder_type == "unetpp":
@@ -444,6 +462,7 @@ def build_model(cfg: Config):
             stage_builder=dec_builder,
             upsample_mode=mc.upsample_mode,
             skip_attention=mc.skip_attention,
+            attn_gate_norm=mc.attn_gate_norm,
             spatial_dims=spatial_dims,
             upsample_norm_act=mc.upsample_norm_act,
             norm_type=mc.norm_type,
@@ -457,6 +476,7 @@ def build_model(cfg: Config):
             upsample_mode      = mc.upsample_mode,
             skip_mode          = mc.skip_mode,
             skip_attention     = mc.skip_attention,
+            attn_gate_norm     = mc.attn_gate_norm,
             spatial_dims       = spatial_dims,
             downsample_strides = ds_strides,
             upsample_norm_act  = mc.upsample_norm_act,

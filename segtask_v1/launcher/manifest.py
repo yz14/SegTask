@@ -259,6 +259,7 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.attention_type", depends_on=unet),
         Field("model.se_reduction", depends_on=unet + [_in("model.attention_type", ["se"])]),
         Field("model.skip_attention", depends_on=unet),
+        Field("model.attn_gate_norm", depends_on=unet + [_truthy("model.skip_attention")]),
         Field("model.deep_supervision", depends_on=unet),
         Field("model.stem_mode"),
         Field("model.decoder_type", depends_on=unet),
@@ -277,7 +278,8 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.grad_ckpt_encoder_stages",
               depends_on=unet + [_truthy("model.grad_checkpointing")]),
         # ConvNeXt 专属。
-        Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["convnext"])]),
+        Field("model.drop_path_rate", depends_on=unet + [_in("model.backbone", ["resnet", "convnext", "mednext"])]),
+        Field("model.grn_enabled", depends_on=unet + [_in("model.backbone", ["convnext", "mednext"])]),
         Field("model.convnext_layer_scale_init", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         Field("model.convnext_downsample_lnfirst", depends_on=unet + [_in("model.backbone", ["convnext"])]),
         # MedNeXt 专属（仅 backbone=='mednext'）。

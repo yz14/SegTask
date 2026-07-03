@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from .blocks import (
-    _CONV, _DROP, ConvNormAct, SqueezeExcite3D,
+    DropPath, _CONV, _DROP, ConvNormAct, SqueezeExcite3D,
     get_activation, get_norm, make_attention)
 
 
@@ -25,6 +25,7 @@ class ResNetBlock(nn.Module):
         dropout       : float = 0.0,
         se_reduction  : int = 16,
         attention_type: str = "none",
+        drop_path     : float = 0.0,
         spatial_dims  : int = 3):
         super().__init__()
         d = spatial_dims
@@ -39,6 +40,9 @@ class ResNetBlock(nn.Module):
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.drop_path = (
+            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            else nn.Identity())
 
         self.shortcut = (
             nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
@@ -51,7 +55,7 @@ class ResNetBlock(nn.Module):
         out = self.drop(out)
         out = self.norm2(self.conv2(out))
         out = self.attn(out)
-        return self.act2(out + res)
+        return self.act2(res + self.drop_path(out))
 
 
 class PreActResNetBlock(nn.Module):
@@ -67,6 +71,7 @@ class PreActResNetBlock(nn.Module):
         dropout       : float = 0.0,
         se_reduction  : int = 16,
         attention_type: str = "none",
+        drop_path     : float = 0.0,
         spatial_dims  : int = 3):
         super().__init__()
         d = spatial_dims
@@ -81,6 +86,9 @@ class PreActResNetBlock(nn.Module):
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.drop_path = (
+            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            else nn.Identity())
 
         # shortcut 作用于原 x；通道不匹配时用 1×1 投影（标准 pre-act）。
         self.shortcut = (
@@ -93,7 +101,7 @@ class PreActResNetBlock(nn.Module):
         out = self.drop(out)
         out = self.conv2(self.act2(self.norm2(out)))
         out = self.attn(out)
-        return out + res
+        return self.drop_path(out) + res
 
 
 class BottleneckBlock(nn.Module):
@@ -110,6 +118,7 @@ class BottleneckBlock(nn.Module):
         dropout       : float = 0.0,
         se_reduction  : int = 16,
         attention_type: str = "none",
+        drop_path     : float = 0.0,
         spatial_dims  : int = 3):
         super().__init__()
         d = spatial_dims
@@ -130,6 +139,9 @@ class BottleneckBlock(nn.Module):
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.drop_path = (
+            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            else nn.Identity())
 
         self.shortcut = (
             nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
@@ -143,7 +155,7 @@ class BottleneckBlock(nn.Module):
         out = self.drop(out)
         out = self.norm3(self.conv3(out))
         out = self.attn(out)
-        return self.act3(out + res)
+        return self.act3(res + self.drop_path(out))
 
 
 class R2Plus1DBlock(nn.Module):
@@ -159,6 +171,7 @@ class R2Plus1DBlock(nn.Module):
         dropout        : float = 0.0,
         se_reduction   : int = 16,
         attention_type : str = "none",
+        drop_path      : float = 0.0,
         spatial_dims   : int = 3,
         temporal_kernel: int = 3):
         super().__init__()
@@ -202,6 +215,9 @@ class R2Plus1DBlock(nn.Module):
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.drop_path = (
+            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            else nn.Identity())
 
         self.shortcut = (
             nn.Sequential(
@@ -222,7 +238,7 @@ class R2Plus1DBlock(nn.Module):
         out = self.act_s2(self.norm_s2(self.spatial2(out)))
         out = self.norm_t2(self.temporal2(out))
         out = self.attn(out)
-        return self.act_out(out + res)
+        return self.act_out(res + self.drop_path(out))
 
 
 _BLOCK_REGISTRY = {
@@ -277,6 +293,7 @@ class MultiRFBlock(nn.Module):
         dropout       : float = 0.0,
         se_reduction  : int = 16,
         attention_type: str = "none",
+        drop_path     : float = 0.0,
         spatial_dims  : int = 3,
         branch_norm_act: bool = False):
         super().__init__()
@@ -372,6 +389,9 @@ class MultiRFBlock(nn.Module):
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d,
                                    reduction=se_reduction)
         self.act2 = get_activation(activation)
+        self.drop_path = (
+            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            else nn.Identity())
 
         self.shortcut = (
             nn.Sequential(_CONV[d](in_ch, out_ch, 1, bias=False),
@@ -396,7 +416,7 @@ class MultiRFBlock(nn.Module):
         out = self.drop(out)
         out = self.norm2(self.conv2(out))
         out = self.attn(out)
-        return self.act2(out + res)
+        return self.act2(res + self.drop_path(out))
 
 
 class MultiRFStage(nn.Module):
@@ -417,19 +437,24 @@ class MultiRFStage(nn.Module):
         dropout       : float = 0.0,
         se_reduction  : int = 16,
         attention_type: str = "none",
+        drop_path_rates: List[float] = None,
         spatial_dims  : int = 3,
         branch_norm_act: bool = False):
         super().__init__()
         if num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * num_blocks
         kwargs = dict(
             dilations=dilations, mode=mode, fusion=fusion, axes=axes,
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,
             dropout=dropout, se_reduction=se_reduction,
-            attention_type=attention_type, spatial_dims=spatial_dims,
+            attention_type=attention_type, drop_path=drop_path_rates[0],
+            spatial_dims=spatial_dims,
             branch_norm_act=branch_norm_act)
         blocks = [MultiRFBlock(in_ch, out_ch, **kwargs)]
-        for _ in range(1, num_blocks):
+        for i in range(1, num_blocks):
+            kwargs["drop_path"] = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
             blocks.append(MultiRFBlock(out_ch, out_ch, **kwargs))
         self.blocks = nn.Sequential(*blocks)
 
@@ -453,16 +478,21 @@ class ResNetStage(nn.Module):
         attention_type: str = "none",
         block_type    : str = "basic",
         spatial_dims  : int = 3,
+        drop_path_rates: List[float] = None,
     ):
         super().__init__()
         if num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * num_blocks
         kwargs = dict(
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,
             dropout=dropout, se_reduction=se_reduction,
-            attention_type=attention_type, spatial_dims=spatial_dims)
+            attention_type=attention_type, spatial_dims=spatial_dims,
+            drop_path=drop_path_rates[0])
         blocks = [_make_block(block_type, in_ch, out_ch, **kwargs)]
-        for _ in range(1, num_blocks):
+        for i in range(1, num_blocks):
+            kwargs["drop_path"] = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
             blocks.append(_make_block(block_type, out_ch, out_ch, **kwargs))
         self.blocks = nn.Sequential(*blocks)
 
