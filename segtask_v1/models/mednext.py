@@ -257,6 +257,49 @@ def reparameterize_model(model: nn.Module) -> nn.Module:
     return model
 
 
+def upkern_remap_state_dict(src_sd: dict, target_model: nn.Module) -> dict:
+    """把小核 MedNeXt checkpoint 的深度卷积权重插值到目标大核。
+
+    仅处理与目标参数同名、同 rank、同通道形状的 depthwise-conv-like 权重：
+    ``(C, 1, k, k[, k])``。当仅空间核尺寸不一致时，按空间维做
+    ``bilinear``/``trilinear`` 插值并保留其余张量不变；不在目标模型中的键
+    直接丢弃，无法对齐的张量也保持目标模型初始化值。
+
+    Parameters
+    ----------
+    src_sd:
+        源 checkpoint 的 state_dict。
+    target_model:
+        目标 MedNeXt 模型，用于提供目标形状。
+    """
+    target_sd = target_model.state_dict()
+    remapped = {}
+    for key, src_tensor in src_sd.items():
+        tgt_tensor = target_sd.get(key)
+        if tgt_tensor is None or not torch.is_tensor(src_tensor):
+            continue
+        if not torch.is_tensor(tgt_tensor):
+            continue
+        if src_tensor.shape == tgt_tensor.shape:
+            remapped[key] = src_tensor
+            continue
+        if (src_tensor.ndim not in (4, 5)
+                or tgt_tensor.ndim != src_tensor.ndim
+                or src_tensor.shape[:2] != tgt_tensor.shape[:2]):
+            continue
+        if src_tensor.shape[2:] == tgt_tensor.shape[2:]:
+            remapped[key] = src_tensor
+            continue
+        mode = "bilinear" if src_tensor.ndim == 4 else "trilinear"
+        spatial = tuple(int(s) for s in tgt_tensor.shape[2:])
+        work = src_tensor.detach().to(dtype=torch.float32)
+        work = work.reshape(work.shape[0] * work.shape[1], 1, *work.shape[2:])
+        work = F.interpolate(work, size=spatial, mode=mode, align_corners=True)
+        work = work.reshape(*tgt_tensor.shape).to(dtype=src_tensor.dtype)
+        remapped[key] = work
+    return remapped
+
+
 class MedNeXtBlock(nn.Module):
     """MedNeXt 残差倒瓶颈块（stride=1, in==out）。
 
@@ -401,4 +444,5 @@ __all__ = [
     "MedNeXtAdaptBlock",
     "MedNeXtStage",
     "reparameterize_model",
+    "upkern_remap_state_dict",
 ]
