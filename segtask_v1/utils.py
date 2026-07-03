@@ -37,7 +37,12 @@ class AverageMeter:
 
 
 class ModelEMA:
-    """参数 EMA，支持原地 apply/restore（仅单卡，不兼容 DDP/FSDP）。"""
+    """参数 EMA，支持原地 apply/restore。
+
+    兼容单卡与 DDP：DDP 反传 all-reduce 后各 rank 参数一致，逐 rank 独立维护
+    shadow 数学上等价于单卡。不兼容 FSDP（参数分片，state_dict key/形状不完整）。
+    所有方法须传入裸模型（``torch.compile`` 包装前 / ``unwrap_compile`` 后），
+    否则 ``_orig_mod.`` 前缀会与 shadow key 不匹配。"""
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
