@@ -13,7 +13,7 @@ R6 抽自 ``predictor.py``：
 from __future__ import annotations
 
 import logging
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -79,11 +79,13 @@ def prob_to_label(
     *,
     label_values: Sequence[int],
     num_fg: int,
-    threshold: float,
+    threshold: Union[float, Sequence[float]],
 ) -> np.ndarray:
     """概率体 ``(num_fg, D, H, W)`` → 整数 label map ``(D, H, W)``。
 
     * 逐体素：``max fg 概率 > threshold`` 取对应 ``label_values[1:][argmax]``，否则 ``label_values[0]``
+    * ``threshold`` 可为标量（全类共享）或逐前景类序列（长度 = num_fg，与
+      ``label_values[1:]`` 一一对应）；逐类时每个体素按其 argmax 类的阈值判背景
     * NaN 体素强制为背景并 ``logger.error``（典型成因：fp16 LayerNorm 溢出 → "全前景"假象）
     * 输出 dtype 选能装下所有 ``label_values`` 的最小有符号整型
     """
@@ -108,7 +110,16 @@ def prob_to_label(
     max_prob = prob_volume.max(axis=0)            # (D, H, W)
     max_class = prob_volume.argmax(axis=0)        # (D, H, W)
     label_map = fg_values[max_class]
-    label_map[max_prob < threshold] = bg_val
+    thr = np.asarray(threshold, dtype=np.float32)
+    if thr.ndim == 0:
+        below = max_prob < float(thr)
+    else:
+        if thr.shape != (num_fg,):
+            raise ValueError(
+                f"prob_to_label: per-class threshold length {thr.shape[0]} "
+                f"!= num_fg {num_fg}.")
+        below = max_prob < thr[max_class]
+    label_map[below] = bg_val
     if n_nan > 0:
         label_map[nan_mask] = bg_val
 

@@ -78,17 +78,18 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             "scales=%s, blend=%s",
             pD, stride, len(z_positions), p.multi_res_scales, p.blend_mode)
 
-    # GPU 常驻：体积 + 累加器都在 GPU，F.interpolate 替代 scipy.ndimage.zoom；
-    # 仅最后 blend 后的概率体返 host。
+    # GPU 常驻：体积在 GPU，F.interpolate 替代 scipy.ndimage.zoom；仅最后 blend
+    # 后的概率体返 host。累加器 dtype/落点由 predict.acc_dtype /
+    # accumulate_on_cpu 控制（大卷 × 多类的显存逃生门）。
     vol_t = torch.from_numpy(vol).to(p.device, non_blocking=True)
-    z_weight_t = torch.from_numpy(
-        _blending.build_1d_weight(pD)).to(p.device)   # (pD,)
+    z_weight_t = torch.from_numpy(_blending.build_1d_weight(pD)).to(
+        device=p.acc_device, dtype=p.acc_dtype)       # (pD,)
 
     acc_pred = torch.zeros(
         (p.num_fg, D_orig, H_orig, W_orig),
-        dtype=torch.float32, device=p.device)
+        dtype=p.acc_dtype, device=p.acc_device)
     acc_weight = torch.zeros(
-        (1, D_orig, 1, 1), dtype=torch.float32, device=p.device)
+        (1, D_orig, 1, 1), dtype=p.acc_dtype, device=p.acc_device)
 
     # 多分辨率 z 轴实践上少见（2.5D 强制 [1.0]）；单分辨率走 GPU 抽取路径。
     single_res = (len(p.multi_res_scales) == 1
@@ -163,14 +164,17 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     sub = F.interpolate(
                         sub, size=(ad, H_orig, W_orig),
                         mode="trilinear", align_corners=False)
-                # 逐 ad 对称 blending 权重。
+                # 逐 ad 对称 blending 权重（与累加器同 dtype/device）。
                 if ad == pD:
                     w = z_weight_t
                 else:
                     w = torch.from_numpy(
-                        _blending.build_1d_weight(ad)).to(p.device)
+                        _blending.build_1d_weight(ad)).to(
+                            device=p.acc_device, dtype=p.acc_dtype)
                 w_4d = rearrange(w, 'c -> 1 c 1 1')
 
+                # 一次性转到累加器 dtype/device（CPU 逃生门时为 GPU→CPU 拷贝）。
+                sub = sub.to(device=p.acc_device, dtype=p.acc_dtype)
                 for j, i in enumerate(idxs):
                     zs, ze, _ = patch_metas[i]
                     # in-place fused mul-add。
@@ -185,8 +189,7 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     (idx + 1) % max(1, 10 * p.batch_size) == 0 or is_last):
                 logger.info("  z-window %d/%d", idx + 1, n_windows)
 
-    acc_weight.clamp_(min=1e-8)
-    return (acc_pred / acc_weight).cpu().numpy()
+    return _finalize_accumulators(acc_pred, acc_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -275,16 +278,17 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             pD, pH, pW, stride_d, stride_h, stride_w,
             len(pos_d), len(pos_h), len(pos_w), total_windows, p.blend_mode)
 
-    # GPU 常驻累加：blend 权重与累加器均在 device 上，仅最后一次返 host
-    # （与 z 路径一致，避免逐窗 GPU→CPU 拷贝 + numpy 累加）。
+    # 累加器 dtype/落点由 predict.acc_dtype / accumulate_on_cpu 控制（与 z 路径
+    # 一致；默认 fp32 常驻 device，仅最后一次返 host）。
     weight_3d = torch.from_numpy(
-        _blending.build_3d_weight(pD, pH, pW, p.blend_mode)).to(p.device)
+        _blending.build_3d_weight(pD, pH, pW, p.blend_mode)).to(
+            device=p.acc_device, dtype=p.acc_dtype)
 
     acc_pred = torch.zeros(
         (p.num_fg, D_orig, H_orig, W_orig),
-        dtype=torch.float32, device=p.device)
+        dtype=p.acc_dtype, device=p.acc_device)
     acc_weight = torch.zeros(
-        (1, D_orig, H_orig, W_orig), dtype=torch.float32, device=p.device)
+        (1, D_orig, H_orig, W_orig), dtype=p.acc_dtype, device=p.acc_device)
 
     # 3D cubic ON 路径：体积一次上 GPU，builder 全程 on-device（逐视图一次 F.interpolate，
     # 零 scipy.ndimage.zoom）。OFF 路径保旧 CPU pipeline。
@@ -316,6 +320,8 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 multi_res_scales=p.multi_res_scales,
                 device=p.device)
         probs = _forwards.forward_batch_gpu(p, batch)   # (B, num_fg, pD, pH, pW) on GPU
+        # 一次性转到累加器 dtype/device（CPU 逃生门时为 GPU→CPU 拷贝）。
+        probs = probs.to(device=p.acc_device, dtype=p.acc_dtype)
         for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw) in zip(probs, coords):
             # Trim prediction to actual (non-padded) size in each axis
             pred_trim = pred[:, :ad, :ah, :aw]
@@ -358,8 +364,20 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
 
     _flush()
 
-    acc_weight.clamp_(min=1e-8)
-    return (acc_pred / acc_weight).cpu().numpy()
+    return _finalize_accumulators(acc_pred, acc_weight)
+
+
+def _finalize_accumulators(acc_pred: torch.Tensor,
+                           acc_weight: torch.Tensor) -> np.ndarray:
+    """加权累加器 → fp32 概率体 (numpy)。
+
+    clamp 下界按 dtype 选：fp16 下 1e-8 会下溢为 0 失去保护，改用其最小
+    正规数量级；除法在累加器 dtype 上就地完成（不额外峰值显存），返回前转 fp32。
+    """
+    eps = 6.1e-5 if acc_pred.dtype == torch.float16 else 1e-8
+    acc_weight.clamp_(min=eps)
+    acc_pred /= acc_weight
+    return acc_pred.float().cpu().numpy()
 
 
 __all__ = [

@@ -768,8 +768,18 @@ class PredictConfig:
     #   显存吃紧时调小（如 2）。AdaBN per_volume 估计阶段会自动退回串行以保 BN 统计一致。
     tta_batch_size: Optional[int] = None
 
-    # sigmoid 二值化阈值。
-    threshold: float = 0.5
+    # sigmoid 二值化阈值：标量（全类共享）或逐前景类列表（长度 = num_fg，与
+    # label_values[1:] 一一对应）。one-vs-rest sigmoid 下不同类的最优操作点常差异
+    # 很大（小结构类宜偏低阈值）。
+    threshold: Union[float, List[float]] = 0.5
+
+    # 滑窗概率累加器 dtype："fp32"（默认）| "fp16"。大卷 × 多类时 fp16 使
+    # acc_pred 显存减半；blend 权重归一后精度足够（nnU-Net 同款做法）。
+    acc_dtype: str = "fp32"
+
+    # 累加器落 CPU 的逃生门：大卷 × 多类在消费级卡 OOM 时开启（每个 batch 多一次
+    # GPU→CPU 拷贝，用速度换显存）。
+    accumulate_on_cpu: bool = False
 
     # 预测输出目录。
     output_dir: str = "predictions"
@@ -1627,7 +1637,25 @@ class Config:
             f"train.gpus must not contain duplicate GPU indices; got {gpus}.")
 
     def _validate_predict(self) -> None:
-        """predict.* z 交错与 AdaBN 校验。"""
+        """predict.* 阈值 / 累加器 / z 交错 / AdaBN 校验。"""
+        # 阈值：标量或逐前景类列表，均须在 [0,1]；列表长度与 num_fg 的匹配在
+        # Predictor 初始化时检查（label_values 可能到数据扫描后才确定）。
+        thr_cfg = self.predict.threshold
+        if isinstance(thr_cfg, (list, tuple)):
+            _require(
+                len(thr_cfg) > 0,
+                "predict.threshold list must be non-empty.")
+            _require(
+                all(0.0 <= float(t) <= 1.0 for t in thr_cfg),
+                f"predict.threshold entries must be in [0,1]; got {thr_cfg}.")
+        else:
+            _require(
+                0.0 <= float(thr_cfg) <= 1.0,
+                f"predict.threshold must be in [0,1]; got {thr_cfg}.")
+        _require(
+            str(self.predict.acc_dtype) in ("fp32", "fp16"),
+            f"predict.acc_dtype must be 'fp32' or 'fp16'; "
+            f"got {self.predict.acc_dtype!r}.")
         # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
             _require(
