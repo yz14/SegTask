@@ -537,6 +537,8 @@ class TrainConfig:
     optimizer   : str = "adamw"
     lr          : float = 1e-3
     weight_decay: float = 1e-4
+    # CUDA 下用 fused AdamW，单 kernel 更新全部参数。
+    adamw_fused : bool = True
     momentum    : float = 0.99   # 仅 SGD
     nesterov    : bool = True    # 仅 SGD
 
