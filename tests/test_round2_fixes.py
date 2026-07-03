@@ -373,6 +373,39 @@ def test_compile_eager_ema_smoke_and_prefix_strip():
     assert set(stripped) == {"foo.weight", "bar.bias"}
 
 
+def test_trainer_one_cycle_warmup_epochs_no_raise():
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.trainer import Trainer
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.label_values = [0, 1]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.train.scheduler = "one_cycle"
+    cfg.train.epochs = 10
+    cfg.train.warmup_epochs = 2
+    cfg.train.use_amp = False
+    cfg.train.use_ema = False
+    cfg.train.compile_mode = "none"
+    cfg.train.val_metric_mode = "medium"
+    cfg.sync()
+    cfg.validate()
+
+    model = build_model(cfg)
+    batch = {
+        "image": torch.randn(1, cfg.model.in_channels, 8, 16, 16),
+        "label": torch.zeros(1, 1, 8, 16, 16),
+        "weight_map": None,
+    }
+    loader = [batch] * 5
+    trainer = Trainer(model, cfg, loader, loader, torch.device("cpu"))
+    assert trainer.scheduler.scheduler.total_steps == 50
+    assert trainer.scheduler.scheduler._schedule_phases[0]["end_step"] + 1 == pytest.approx(10.0, rel=1e-6)
+
+
 def test_bug5_plateau_mode_from_config():
     """build_scheduler should use plateau mode matching the derived save_best_mode."""
     from segtask_v1.trainer import build_scheduler
