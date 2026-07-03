@@ -572,6 +572,8 @@ class TrainConfig:
 
     # torch.compile："none" | "default" | "reduce-overhead" | "max-autotune"。
     compile_mode: str = "none"
+    # 可选 channels_last 内存格式；数值等价，Ampere+ 上 3D conv 可能提速但不保证正收益（需 benchmark）；默认关。
+    channels_last: bool = False
 
     # EMA。
     use_ema  : bool = True

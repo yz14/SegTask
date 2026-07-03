@@ -15,6 +15,7 @@ import tempfile
 
 import numpy as np
 import torch
+import pytest
 
 # Ensure local import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -283,6 +284,93 @@ def test_bug4_ema_in_place_swap():
     ema.apply_shadow(model)  # idempotent
     ema.restore(model)
     print("[BUG-4] PASS — EMA in-place swap round-trips cleanly.")
+
+
+def test_channels_last_cpu_forward_matches():
+    model_ref = _build_tiny_unet(num_fg=2, deep_supervision=False).eval()
+    model_cl = _build_tiny_unet(num_fg=2, deep_supervision=False).eval()
+    model_cl.load_state_dict(model_ref.state_dict())
+    model_cl = model_cl.to(memory_format=torch.channels_last_3d)
+    x = torch.randn(1, 1, 8, 16, 16)
+    x_cl = x.to(memory_format=torch.channels_last_3d)
+    with torch.no_grad():
+        y_ref = model_ref(x)
+        y_cl = model_cl(x_cl)
+    assert torch.allclose(y_ref, y_cl, atol=1e-6, rtol=1e-5)
+
+
+def test_trainer_channels_last_plumbing_cpu():
+    from segtask_v1.config import Config
+    from segtask_v1.models.factory import build_model
+    from segtask_v1.trainer import Trainer
+
+    cfg = Config()
+    cfg.data.patch_mode = "z_axis"
+    cfg.data.patch_size = [8, 16, 16]
+    cfg.data.label_values = [0, 1, 2]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.train.channels_last = True
+    cfg.train.use_amp = False
+    cfg.train.use_ema = False
+    cfg.train.compile_mode = "none"
+    cfg.train.epochs = 1
+    cfg.train.val_metric_mode = "medium"
+    cfg.sync()
+    cfg.validate()
+
+    model = build_model(cfg)
+    loader = [{
+        "image": torch.randn(1, cfg.model.in_channels, 8, 16, 16),
+        "label": torch.zeros(1, 1, 8, 16, 16),
+        "weight_map": None,
+    }]
+    trainer = Trainer(model, cfg, loader, loader, torch.device("cpu"))
+    assert trainer._memory_format is torch.channels_last_3d
+    assert next(trainer.model.parameters()).is_contiguous(
+        memory_format=torch.channels_last_3d)
+
+
+def test_compile_eager_ema_smoke_and_prefix_strip():
+    from segtask_v1.trainer.checkpoint import strip_common_prefixes, unwrap_compile
+    from segtask_v1.utils import ModelEMA
+
+    if not hasattr(torch, "compile"):
+        pytest.skip("torch.compile unavailable")
+
+    model = _build_tiny_unet(num_fg=2, deep_supervision=False).eval()
+    compiled = torch.compile(model, backend="eager")
+    base = unwrap_compile(compiled)
+    compiled_sd = compiled.state_dict()
+    assert any(k.startswith("_orig_mod.") for k in compiled_sd)
+    assert set(strip_common_prefixes(compiled_sd).keys()) == set(base.state_dict().keys())
+
+    ema = ModelEMA(base, decay=0.9)
+    assert all(not k.startswith("_orig_mod.") for k in ema.shadow)
+    assert set(ema.shadow.keys()) == set(base.state_dict().keys())
+
+    with torch.no_grad():
+        for p in base.parameters():
+            p.add_(1.0)
+    ema.update(unwrap_compile(compiled))
+    with torch.no_grad():
+        for p in base.parameters():
+            p.add_(2.0)
+    ema.update(unwrap_compile(compiled))
+
+    orig = {k: v.detach().clone() for k, v in base.state_dict().items()}
+    ema.apply_shadow(base)
+    assert set(base.state_dict().keys()) == set(orig.keys())
+    ema.restore(base)
+    for k, v in base.state_dict().items():
+        assert torch.equal(v, orig[k]), k
+
+    synthetic = {
+        "module._orig_mod.foo.weight": torch.ones(1),
+        "_orig_mod.module.bar.bias": torch.ones(1),
+    }
+    stripped = strip_common_prefixes(synthetic)
+    assert set(stripped) == {"foo.weight", "bar.bias"}
 
 
 def test_bug5_plateau_mode_from_config():
