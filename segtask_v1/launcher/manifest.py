@@ -401,6 +401,7 @@ def _train_fields() -> List[Field]:
         Field("train.use_amp"),
         Field("train.amp_dtype", depends_on=[_truthy("train.use_amp")]),
         Field("train.compile_mode"),
+        Field("train.channels_last"),
         Field("train.use_ema"),
         Field("train.ema_decay", depends_on=[_truthy("train.use_ema")]),
         Field("train.ema_warmup", depends_on=[_truthy("train.use_ema")]),

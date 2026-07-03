@@ -91,6 +91,13 @@ class Trainer:
 
         # 顺序：先 to(device)（optimizer/EMA 绑已迁移参数），最后 torch.compile。
         self.model = model.to(device)
+        self._memory_format = None
+        if tc.channels_last:
+            self._memory_format = (
+                torch.channels_last_3d
+                if int(cfg.model.spatial_dims) == 3
+                else torch.channels_last)
+            self.model = self.model.to(memory_format=self._memory_format)
 
         # --- Pipeline (criterion + view ops) -------------------------
         self.base_loss = build_loss(cfg.loss)  # 预设dice/bce等等这些
@@ -692,6 +699,8 @@ class Trainer:
 
             # 视图重塑（pipeline 内部决定）
             image, sup = self.pipeline.prepare_batch(image, label, wmap)
+            if self._memory_format is not None:
+                image = image.to(memory_format=self._memory_format)
 
             effective_accum = self._effective_accum(step, total_steps, accum)
             is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
