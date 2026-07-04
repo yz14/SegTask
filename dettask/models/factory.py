@@ -73,6 +73,12 @@ def build_detector(cfg: SegConfig, det: DetConfig) -> DetectorModel:
             raise ValueError(
                 f"det.fpn_levels {levels} out of range for decoder with "
                 f"{len(dec_channels)} levels.")
+    if det.arch in ("retinanet", "faster_rcnn") and det.anchor_sizes \
+            and len(det.anchor_sizes) != len(levels):
+        raise ValueError(
+            f"det.anchor_sizes has {len(det.anchor_sizes)} entries but "
+            f"{len(levels)} FPN levels are used ({levels}); lengths must "
+            "match (or leave anchor_sizes empty for stride-based auto).")
     sd = int(cfg.model.spatial_dims)
     fpn = FPNAdapter(dec_channels, det.fpn_channels, levels, sd)
     K = resolve_num_classes(det, cfg)

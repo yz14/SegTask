@@ -70,21 +70,23 @@ class DetPredictor:
     def _predict_3d(self, vol: np.ndarray) -> Dict[str, torch.Tensor]:
         offs = [_grid_offsets(d, p, p // 2)
                 for d, p in zip(vol.shape, self.patch)]
+        origins = [(oz, oy, ox) for oz in offs[0]
+                   for oy in offs[1] for ox in offs[2]]
+        bs = max(int(self.det.infer_batch_size), 1)
         boxes_all, scores_all, labels_all = [], [], []
-        for oz in offs[0]:
-            for oy in offs[1]:
-                for ox in offs[2]:
-                    patch = self._extract(vol, (oz, oy, ox))
-                    x = torch.from_numpy(
-                        patch.astype(np.float32, copy=False)
-                    )[None, None].to(self.device)
-                    dets = self.model(x)[0]
-                    shift = torch.tensor(
-                        [oz, oy, ox] * 2, dtype=torch.float32,
-                        device=dets["boxes"].device)
-                    boxes_all.append(dets["boxes"] + shift)
-                    scores_all.append(dets["scores"])
-                    labels_all.append(dets["labels"])
+        for i in range(0, len(origins), bs):
+            chunk = origins[i:i + bs]
+            x = torch.stack([
+                torch.from_numpy(self._extract(vol, o)
+                                 .astype(np.float32, copy=False))
+                for o in chunk])[:, None].to(self.device)
+            for o, dets in zip(chunk, self.model(x)):
+                shift = torch.tensor(
+                    list(o) * 2, dtype=torch.float32,
+                    device=dets["boxes"].device)
+                boxes_all.append(dets["boxes"] + shift)
+                scores_all.append(dets["scores"])
+                labels_all.append(dets["labels"])
         boxes = torch.cat(boxes_all).cpu()
         scores = torch.cat(scores_all).cpu()
         labels = torch.cat(labels_all).cpu()
@@ -97,14 +99,18 @@ class DetPredictor:
         d = self.patch[0]
         # 步长 1 slab 会指数增加算量；取 d//2 重叠保证跨层链接连续性。
         z_offs = _grid_offsets(vol.shape[0], d, max(d // 2, 1))
+        bs = max(int(self.det.infer_batch_size), 1)
         slab_dets, slab_z = [], []
-        for oz in z_offs:
-            patch = self._extract(vol, (oz, 0, 0))
-            x = torch.from_numpy(
-                patch.astype(np.float32, copy=False))[None].to(self.device)
-            dets = self.model(x)[0]
-            slab_dets.append({k: v.cpu() for k, v in dets.items()})
-            slab_z.append([float(oz), float(min(oz + d, vol.shape[0]))])
+        for i in range(0, len(z_offs), bs):
+            chunk = z_offs[i:i + bs]
+            x = torch.stack([
+                torch.from_numpy(self._extract(vol, (oz, 0, 0))
+                                 .astype(np.float32, copy=False))
+                for oz in chunk]).to(self.device)
+            for oz, dets in zip(chunk, self.model(x)):
+                slab_dets.append({k: v.cpu() for k, v in dets.items()})
+                slab_z.append([float(oz),
+                               float(min(oz + d, vol.shape[0]))])
         return stitch_slab_detections(
             slab_dets, slab_z, self.det.stitch_link_iou,
             self.det.stitch_min_span)

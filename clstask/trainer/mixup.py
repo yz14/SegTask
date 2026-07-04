@@ -8,8 +8,7 @@
 from __future__ import annotations
 
 import math
-import random
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -22,8 +21,23 @@ def _to_soft(target: torch.Tensor, num_classes: int) -> torch.Tensor:
     return target.float()
 
 
+def _rand_uniform(generator: Optional[torch.Generator]) -> float:
+    return float(torch.rand((), generator=generator))
+
+
+def _sample_beta(alpha: float,
+                 generator: Optional[torch.Generator]) -> float:
+    """Beta(α, α) 采样（Jöhnk 拒绝法），随机源统一走 ``generator``。"""
+    inv = 1.0 / max(alpha, 1e-8)
+    while True:
+        x = _rand_uniform(generator) ** inv
+        y = _rand_uniform(generator) ** inv
+        if 0.0 < x + y <= 1.0:
+            return x / (x + y)
+
+
 def _rand_box(shape: Tuple[int, ...], lam: float,
-              generator: torch.Generator) -> Tuple[slice, ...]:
+              generator: Optional[torch.Generator]) -> Tuple[slice, ...]:
     """在空间形状 ``shape`` 内取体积占比 (1-λ) 的随机 box。"""
     ratio = (1.0 - lam) ** (1.0 / len(shape))
     slices = []
@@ -42,7 +56,7 @@ def apply_mixup_cutmix(
     mixup_alpha: float,
     cutmix_alpha: float,
     prob: float,
-    generator: torch.Generator = None,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """按配置对一个 batch 应用 mixup 或 cutmix；返回 (images, soft_targets)。
 
@@ -52,10 +66,10 @@ def apply_mixup_cutmix(
     soft = _to_soft(targets, num_classes)
     use_mix = mixup_alpha > 0
     use_cut = cutmix_alpha > 0
-    if (not use_mix and not use_cut) or random.random() >= prob:
+    if (not use_mix and not use_cut) or _rand_uniform(generator) >= prob:
         return images, soft
     if use_mix and use_cut:
-        use_mix = random.random() < 0.5
+        use_mix = _rand_uniform(generator) < 0.5
         use_cut = not use_mix
 
     b = images.shape[0]
@@ -63,12 +77,10 @@ def apply_mixup_cutmix(
         return images, soft
     perm = torch.randperm(b, device=images.device, generator=generator)
     if use_mix:
-        lam = float(torch.distributions.Beta(
-            mixup_alpha, mixup_alpha).sample())
+        lam = _sample_beta(mixup_alpha, generator)
         images = lam * images + (1 - lam) * images[perm]
     else:
-        lam = float(torch.distributions.Beta(
-            cutmix_alpha, cutmix_alpha).sample())
+        lam = _sample_beta(cutmix_alpha, generator)
         box = _rand_box(tuple(images.shape[2:]), lam, generator)
         images = images.clone()
         idx = (slice(None), slice(None)) + box

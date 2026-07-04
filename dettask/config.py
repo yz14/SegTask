@@ -106,6 +106,7 @@ class DetConfig:
     score_thresh: float = 0.05
     nms_iou     : float = 0.3
     max_dets    : int = 50          # 每 patch/slab 检出上限
+    infer_batch_size: int = 4       # 整卷滑窗推理每次前向的 patch/slab 数
 
     # ---- 2.5D 跨层拼接（Plan §3.3 stitching）----------------------------------
     stitch_link_iou: float = 0.3    # 相邻 slab 2D 框链接的最小 IoU
@@ -161,6 +162,8 @@ def validate_det(det: DetConfig, cfg: SegConfig) -> None:
              f"by det.detr_num_heads ({det.detr_num_heads}).")
     _require(det.stitch_min_span >= 1,
              f"det.stitch_min_span must be >= 1; got {det.stitch_min_span}.")
+    _require(det.infer_batch_size >= 1,
+             f"det.infer_batch_size must be >= 1; got {det.infer_batch_size}.")
     _require(det.fpn_channels >= 8,
              f"det.fpn_channels must be >= 8; got {det.fpn_channels}.")
     for name in ("anchor_ratios", "anchor_scales", "anchor_z_scales",
