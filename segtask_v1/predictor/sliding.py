@@ -81,7 +81,12 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     # GPU 常驻：体积在 GPU，F.interpolate 替代 scipy.ndimage.zoom；仅最后 blend
     # 后的概率体返 host。累加器 dtype/落点由 predict.acc_dtype /
     # accumulate_on_cpu 控制（大卷 × 多类的显存逃生门）。
-    vol_t = torch.from_numpy(vol).to(p.device, non_blocking=True)
+    # vol_dtype=fp16 时整卷以半精度常驻（builder 取窗时按窗升回 fp32）；
+    # 默认 fp32 保持原 dtype 路径不变。
+    vol_t = torch.from_numpy(vol).to(
+        device=p.device,
+        dtype=(torch.float16 if p.vol_dtype == torch.float16 else None),
+        non_blocking=True)
     z_weight_t = torch.from_numpy(_blending.build_1d_weight(pD)).to(
         device=p.acc_device, dtype=p.acc_dtype)       # (pD,)
 
@@ -147,6 +152,12 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             groups: Dict[int, List[int]] = {}
             for i, (_, _, ad) in enumerate(patch_metas):
                 groups.setdefault(ad, []).append(i)
+
+            # fp16 累加器时先降精度再插值：后续 resize 瞬态（b×num_fg×ad×H×W）
+            # 减半；插值本身在 fp16 下完成，与先 fp32 插值后 cast 的差异在
+            # 量化噪声量级内（随 acc_dtype=fp16 的 opt-in 一并生效）。
+            if p.acc_dtype == torch.float16 and probs.is_cuda:
+                probs = probs.to(dtype=p.acc_dtype)
 
             for ad, idxs in groups.items():
                 sub = probs[idxs]                     # (b, num_fg, pD, pH, pW)
@@ -294,8 +305,13 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     # 零 scipy.ndimage.zoom）。OFF 路径保旧 CPU pipeline。
     keep_native_3d = bool(p.keep_native_multi_res
                           and p.patch_mode == "cubic")
+    # 同 z 路径：vol_dtype=fp16 时整卷半精度常驻；默认保持原 .float() 行为。
     vol_t: Optional[torch.Tensor] = (
-        torch.from_numpy(vol).float().to(p.device, non_blocking=True)
+        torch.from_numpy(vol).to(
+            device=p.device,
+            dtype=(torch.float16 if p.vol_dtype == torch.float16
+                   else torch.float32),
+            non_blocking=True)
         if keep_native_3d else None)
 
     patches: List[np.ndarray] = []
@@ -377,7 +393,9 @@ def _finalize_accumulators(acc_pred: torch.Tensor,
     eps = 6.1e-5 if acc_pred.dtype == torch.float16 else 1e-8
     acc_weight.clamp_(min=eps)
     acc_pred /= acc_weight
-    return acc_pred.float().cpu().numpy()
+    # 先回 host 再升 fp32：fp16 GPU 累加器下避免在 GPU 上生成 fp32 副本
+    # （瞬时 +2× acc），D2H 传输量也减半；转换顺序不影响数值。
+    return acc_pred.cpu().float().numpy()
 
 
 __all__ = [

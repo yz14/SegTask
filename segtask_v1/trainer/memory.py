@@ -25,6 +25,16 @@ def estimate_train_memory(
                      for p in params if p.requires_grad)
 
     optim_name = type(optimizer).__name__
+    # ZeRO-1 分片：每卡仅持有 1/world_size 的优化器状态；内层优化器类型取自
+    # ZeroRedundancyOptimizer 的构造参数（未取到时按 Adam 族保守估）。
+    zero_shard_div = 1
+    if optim_name == "ZeroRedundancyOptimizer":
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            zero_shard_div = max(dist.get_world_size(), 1)
+        inner_cls = getattr(optimizer, "_optim_constructor", None)
+        if inner_cls is not None:
+            optim_name = getattr(inner_cls, "__name__", optim_name)
     n_train = sum(p.numel() for p in params if p.requires_grad)
     adam_family = {"Adam", "AdamW", "RAdam", "NAdam", "Adamax"}
     if optim_name in adam_family:
@@ -37,14 +47,15 @@ def estimate_train_memory(
         optim_mult = 1
     else:
         optim_mult = 2  # 保守默认
-    optim_bytes = optim_mult * n_train * 4
+    optim_bytes = optim_mult * n_train * 4 // zero_shard_div
 
+    # EMA shadow 只计 GPU 常驻部分（CPU offload 时不占显存）。
     ema_bytes = 0
     if ema is not None:
         shadow = getattr(ema, "shadow", None)
         if shadow is not None:
             ema_bytes = sum(t.numel() * t.element_size()
-                            for t in shadow.values())
+                            for t in shadow.values() if t.is_cuda)
 
     persistent = param_bytes + grad_bytes + optim_bytes + ema_bytes
     return {

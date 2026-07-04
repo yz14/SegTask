@@ -66,6 +66,10 @@ class Predictor:
                           else torch.float32)
         self.acc_device = (torch.device("cpu") if pc.accumulate_on_cpu
                            else device)
+        # GPU 常驻整卷张量的存储 dtype（fp16 = 整卷显存减半；builder 取窗时按窗
+        # 升回 fp32，见 config.PredictConfig.vol_dtype）。
+        self.vol_dtype = (torch.float16 if str(pc.vol_dtype) == "fp16"
+                          else torch.float32)
         # 逐卷滑窗进度日志开关（运行期内部量，不暴露到配置）：CLI 推理默认 True；
         # 训练内整卷验证（VolumeValEvaluator）会置 False 以免每 epoch 刷屏 81 卷。
         self.log_progress = True

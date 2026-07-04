@@ -34,11 +34,13 @@ class GPUAugmentor:
         if not self.enabled:
             return image, label, weight_map
 
-        # 克隆输入，避免原地修改污染调用方持有的张量。
-        image = image.clone()
-        label = label.clone()
-        if weight_map is not None:
-            weight_map = weight_map.clone()
+        # 克隆输入，避免原地修改污染调用方持有的张量；inplace=True（显存快路径）
+        # 时跳过——调用方声明输入张量可被消费（见 AugConfig.inplace 契约）。
+        if not self.cfg.inplace:
+            image = image.clone()
+            label = label.clone()
+            if weight_map is not None:
+                weight_map = weight_map.clone()
 
         c = self.cfg
 

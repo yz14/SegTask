@@ -200,6 +200,24 @@ def _train_worker(
             dist.destroy_process_group()
 
 
+def _maybe_enable_expandable_segments(cfg) -> None:
+    """按 train.cuda_expandable_segments 注入 allocator 碎片治理配置。
+
+    必须在首次 CUDA 分配前设置（含 DDP spawn 前，子进程继承环境）；已有
+    PYTORCH_CUDA_ALLOC_CONF 时不覆盖，尊重用户显式设置。默认开关关闭时
+    零副作用。
+    """
+    if not cfg.train.cuda_expandable_segments:
+        return
+    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+        logging.getLogger(__name__).warning(
+            "train.cuda_expandable_segments=True 但环境已设置 "
+            "PYTORCH_CUDA_ALLOC_CONF=%r，不覆盖。",
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"])
+        return
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
 def main():
     parser = argparse.ArgumentParser(description="3D Segmentation Training")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
@@ -213,6 +231,9 @@ def main():
         apply_overrides(cfg, args.override)
         cfg.sync()
         cfg.validate()
+
+    # 碎片治理：需在任何 CUDA 分配前注入（DDP 子进程经环境继承生效）。
+    _maybe_enable_expandable_segments(cfg)
 
     gpus    = [int(g) for g in cfg.train.gpus]
     cuda_ok = torch.cuda.is_available()

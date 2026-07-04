@@ -45,14 +45,22 @@ class ModelEMA:
     否则 ``_orig_mod.`` 前缀会与 shadow key 不匹配。"""
 
     def __init__(self, model: nn.Module, decay: float = 0.999,
-                 warmup: bool = True):
+                 warmup: bool = True,
+                 offload_device: Optional[str] = None):
         self.decay = decay
         # decay warmup（timm 式）：有效 decay = min(decay, (1+n)/(10+n))，
         # 避免从零训练时 shadow 被随机初始权重长时间拖累。
         self.warmup = warmup
         self.num_updates = 0
+        # shadow 存放设备：None = 跟随模型（现状）；"cpu" = 常驻 CPU，省 1×
+        # 参数量 GPU 显存（update 时经 pinned staging 异步 D2H + 一次流同步，
+        # 数学与跟随模型严格等价）。
+        self.offload_device: Optional[torch.device] = (
+            torch.device(offload_device) if offload_device else None)
         self.shadow: Dict[str, torch.Tensor] = {
-            k: v.detach().clone() for k, v in model.state_dict().items()
+            k: (v.detach().to(self.offload_device, copy=True)
+                if self.offload_device is not None else v.detach().clone())
+            for k, v in model.state_dict().items()
         }
         self._backup: Dict[str, torch.Tensor] = {}
         self._swapped: bool = False
@@ -76,7 +84,19 @@ class ModelEMA:
                 float_groups[key][1].append(v)
             else:
                 int_pairs.append((shadow, v))
-        self._float_groups = list(float_groups.values())
+        # CPU offload 且 live 在 CUDA 时：逐组预分配 pinned staging 缓冲，
+        # update 时先异步 D2H 到 staging，同步一次后在 CPU 上 foreach 更新。
+        groups = []
+        for shadow_list, live_list in float_groups.values():
+            staging = None
+            if (self.offload_device is not None
+                    and self.offload_device.type == "cpu"
+                    and live_list and live_list[0].is_cuda):
+                staging = [
+                    torch.empty_like(v, device="cpu", pin_memory=True)
+                    for v in live_list]
+            groups.append((shadow_list, live_list, staging))
+        self._float_groups = groups
         self._int_pairs = int_pairs
         self._pairs_model_id = id(model)
 
@@ -88,9 +108,19 @@ class ModelEMA:
         decay = self.decay
         if self.warmup:
             decay = min(decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
-        for shadow_list, live_list in self._float_groups:
+        # 先集中发起全部异步 D2H，再一次同步，避免逐组同步的开销。
+        any_staged = False
+        for _, live_list, staging in self._float_groups:
+            if staging is not None:
+                for s, live in zip(staging, live_list):
+                    s.copy_(live, non_blocking=True)
+                any_staged = True
+        if any_staged:
+            torch.cuda.current_stream().synchronize()
+        for shadow_list, live_list, staging in self._float_groups:
+            src = staging if staging is not None else live_list
             torch._foreach_mul_(shadow_list, decay)
-            torch._foreach_add_(shadow_list, live_list, alpha=1.0 - decay)
+            torch._foreach_add_(shadow_list, src, alpha=1.0 - decay)
         for shadow, live in self._int_pairs:
             # 整型 buffer（如 BN num_batches_tracked）直接跟随最新。
             shadow.copy_(live)
@@ -102,7 +132,11 @@ class ModelEMA:
             return
         sd = model.state_dict()
         if not self._backup:
-            self._backup = {k: torch.empty_like(v) for k, v in sd.items()}
+            # offload 模式下 backup 也落 CPU，避免验证换入期间额外占 1× 参数 GPU 显存。
+            self._backup = {
+                k: (torch.empty_like(v, device=self.offload_device)
+                    if self.offload_device is not None else torch.empty_like(v))
+                for k, v in sd.items()}
         for k, live in sd.items():
             self._backup[k].copy_(live)
             live.copy_(self.shadow[k])
@@ -134,7 +168,10 @@ class ModelEMA:
                 "checkpoint. EMA history continuity is preserved only if "
                 "the checkpoint matches the intended architecture.",
                 len(loaded), len(self.shadow))
-            self.shadow = {k: v.detach().clone() for k, v in loaded.items()}
+            self.shadow = {
+                k: (v.detach().to(self.offload_device, copy=True)
+                    if self.offload_device is not None else v.detach().clone())
+                for k, v in loaded.items()}
             self._backup = {}
             self._swapped = False
         self._float_groups = None
