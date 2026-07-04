@@ -22,7 +22,13 @@ from segtask_v1.models.blocks import (
 from segtask_v1.models.convnext import ConvNeXtBlock
 from segtask_v1.models.factory import build_model
 from segtask_v1.models.mednext import MedNeXtBlock
-from segtask_v1.models.resnet import MultiRFBlock, ResNetBlock
+from segtask_v1.models.resnet import (
+    BottleneckBlock,
+    MultiRFBlock,
+    PreActResNetBlock,
+    R2Plus1DBlock,
+    ResNetBlock,
+)
 
 
 def _build_cfg(backbone: str) -> Config:
@@ -113,6 +119,23 @@ def test_mednext_drop_path_identity_and_forced_drop(monkeypatch):
     assert calls, "expected DropPath.forward to be invoked"
     assert y_ref.shape == y_dp.shape == x_ref.shape
     assert not torch.allclose(y_ref, y_dp)
+
+
+@pytest.mark.parametrize(
+    "cls, kwargs",
+    [
+        (ResNetBlock, dict(in_ch=8, out_ch=16, spatial_dims=3)),
+        (PreActResNetBlock, dict(in_ch=8, out_ch=16, spatial_dims=3)),
+        (BottleneckBlock, dict(in_ch=8, out_ch=16, spatial_dims=3)),
+        (R2Plus1DBlock, dict(in_ch=8, out_ch=16, spatial_dims=3)),
+        (MultiRFBlock, dict(
+            in_ch=8, out_ch=16, dilations=[1, 2], mode="split",
+            fusion="concat_proj", spatial_dims=3)),
+    ],
+)
+def test_projection_blocks_keep_drop_path_enabled(cls, kwargs):
+    block = cls(drop_path=0.25, **kwargs)
+    assert not isinstance(block.drop_path, nn.Identity)
 
 
 @pytest.mark.parametrize("backbone", ["resnet", "mednext"])

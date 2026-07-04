@@ -13,7 +13,6 @@ from __future__ import annotations
 import math
 import pytest
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
@@ -21,7 +20,7 @@ from segtask_v1.config import Config, ConfigError, resolve_selfattn_stage
 from segtask_v1.models.blocks import (
     SelfAttentionBlock, _GridQKVAttention, _LinearQKVAttention,
     _SoftmaxQKVAttention, _WindowQKVAttention, _apply_rope_nd,
-    _window_partition_tokens, _window_unpartition_tokens)
+    _window_partition_tokens, _window_unpartition_tokens, _ROPE_ND_CACHE)
 from segtask_v1.models.factory import build_model
 
 
@@ -65,7 +64,7 @@ def test_softmax_qkv_attention_matches_sdpa_reference():
     weight = torch.einsum("bct,bcs->bts", q * scale, k * scale)
     weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
     ref = torch.einsum("bts,bcs->bct", weight, v)
-    ref = ref.view(qkv.shape[0], h * c, qkv.shape[2])
+    ref = ref.reshape(qkv.shape[0], h * c, qkv.shape[2])
 
     max_diff = (out - ref).abs().max().item()
     assert torch.allclose(out, ref, atol=1e-5, rtol=1e-5), max_diff
@@ -84,6 +83,23 @@ def test_rope_preserves_norm_and_relative_logits():
     ref_logits = torch.einsum("bhnd,bhmd->bhnm", q_rot, k_rot)
     shifted_logits = torch.einsum("bhnd,bhmd->bhnm", q_shift, k_shift)
     assert torch.allclose(ref_logits, shifted_logits, atol=1e-5, rtol=1e-5)
+
+
+def test_apply_rope_nd_reuses_cache_for_repeated_calls():
+    cache_before = len(_ROPE_ND_CACHE)
+    q = torch.randn(1, 2, 60, 24)
+    k = torch.randn(1, 2, 60, 24)
+    shape = (2, 5, 6)
+    offsets = (3, 1, 4)
+
+    q1, k1 = _apply_rope_nd(q, k, shape, position_offsets=offsets)
+    cache_mid = len(_ROPE_ND_CACHE)
+    q2, k2 = _apply_rope_nd(q, k, shape, position_offsets=offsets)
+
+    assert cache_mid > cache_before
+    assert len(_ROPE_ND_CACHE) == cache_mid
+    assert torch.allclose(q1, q2)
+    assert torch.allclose(k1, k2)
 
 
 def test_selfattn_rope_rejects_linear():
