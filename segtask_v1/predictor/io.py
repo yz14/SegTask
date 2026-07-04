@@ -115,6 +115,13 @@ def run_inference(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 独立推理入口不经过 utils.seed_everything，默认跑在 cudnn.benchmark=False。
+    # 滑窗窗口形状固定，opt-in 开启 autotune（见 config.PredictConfig.cudnn_benchmark）。
+    if cfg.predict.cudnn_benchmark and device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        logger.info("cudnn.benchmark enabled for inference "
+                    "(predict.cudnn_benchmark=True).")
+
     model = build_model(cfg)
     # weights_only=False：本 trainer ckpt 含 Config / numpy RNG，PyTorch 2.6+ 默认安全模式会拒。
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)

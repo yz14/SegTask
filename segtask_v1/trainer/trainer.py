@@ -596,24 +596,24 @@ class Trainer:
         仅在未开启 grad_clip（无现成范数可复用）且监测需要时手动调用；调用方
         负责在 AMP fp16 下先 ``scaler.unscale_``，以免量纲被 loss scale 污染。
         """
-        sq = 0.0
-        found = False
-        for p in self.model.parameters():
-            if p.grad is None:
-                continue
-            found = True
-            sq += float(p.grad.detach().norm(2).item()) ** 2
-        return math.sqrt(sq) if found else None
+        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+        if not grads:
+            return None
+        # foreach 批量算逐张量范数后聚合，全程仅末尾一次 .item() 同步（逐参数
+        # .item() 会打断 CUDA 流水）。任一梯度含 inf/NaN 时结果同样非有限。
+        norms = torch._foreach_norm(grads, 2)
+        return float(torch.linalg.vector_norm(
+            torch.stack([n.float() for n in norms])).item())
 
     @torch.no_grad()
     def _global_weight_norm(self) -> "float | None":
         """全部参数的全局 L2 范数（每 epoch 仅算一次，开销可忽略）。"""
-        sq = 0.0
-        found = False
-        for p in self.model.parameters():
-            found = True
-            sq += float(p.detach().norm(2).item()) ** 2
-        return math.sqrt(sq) if found else None
+        params = [p.detach() for p in self.model.parameters()]
+        if not params:
+            return None
+        norms = torch._foreach_norm(params, 2)
+        return float(torch.linalg.vector_norm(
+            torch.stack([n.float() for n in norms])).item())
 
     @torch.no_grad()
     def _param_snapshot(self) -> "list":
@@ -627,14 +627,18 @@ class Trainer:
         参数遍历顺序与 ``_param_snapshot`` 一致，逐张量累加更新量与原权重的平方和。
         若原权重范数为 0（理论上不会发生）则返回 ``None`` 以免除零。
         """
-        upd_sq = 0.0
-        w_sq = 0.0
-        for p, w0 in zip(self.model.parameters(), snapshot):
-            upd_sq += float((p.detach() - w0).norm(2).item()) ** 2
-            w_sq += float(w0.norm(2).item()) ** 2
-        if w_sq <= 0.0:
+        params = [p.detach() for p in self.model.parameters()]
+        if not params:
             return None
-        return math.sqrt(upd_sq) / math.sqrt(w_sq)
+        diffs = torch._foreach_sub(params, snapshot)
+        upd = torch.linalg.vector_norm(torch.stack(
+            [n.float() for n in torch._foreach_norm(diffs, 2)]))
+        w = torch.linalg.vector_norm(torch.stack(
+            [n.float() for n in torch._foreach_norm(snapshot, 2)]))
+        w_norm = float(w.item())
+        if w_norm <= 0.0:
+            return None
+        return float(upd.item()) / w_norm
 
     def _collect_health_metrics(
         self,
