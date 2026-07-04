@@ -19,6 +19,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import pytest
+import numpy as np
 import torch
 
 from segtask_v1.config import Config
@@ -28,6 +29,7 @@ from segtask_v1.models.mednext import (
     MedNeXtBlock,
     reparameterize_model,
 )
+from segtask_v1.predictor import io as predictor_io
 
 
 def _make_cfg(
@@ -133,6 +135,19 @@ def test_dilated_reparam_block_eval_deploy_allclose(spatial_dims, xshape):
     assert torch.allclose(y_after, y_after_2, atol=0.0)
 
 
+def test_dilated_reparam_switch_to_deploy_preserves_device_and_dtype():
+    block = DilatedReparamBlock(8, 5, spatial_dims=3).to(dtype=torch.float64)
+    weight, _ = block.get_equivalent_kernel_bias()
+
+    block.switch_to_deploy()
+
+    assert block.deploy is True
+    assert block.reparam.weight.device == weight.device
+    assert block.reparam.weight.dtype == weight.dtype
+    assert block.reparam.bias.device == weight.device
+    assert block.reparam.bias.dtype == weight.dtype
+
+
 @pytest.mark.parametrize("spatial_dims", [2, 3])
 def test_dilated_reparam_kernel_expansion_matches_scatter(spatial_dims):
     block = DilatedReparamBlock(
@@ -230,6 +245,38 @@ def test_build_model_dilated_reparam_train_backward_finite(patch_mode, xshape):
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert torch.isfinite(loss)
     assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+def test_run_inference_reparam_deploy_toggle(monkeypatch, tmp_path):
+    cfg = _make_cfg(patch_mode="z_axis", deep_supervision=False, dilated_reparam=True)
+    cfg.model.reparam_deploy = True
+    cfg.predict.output_dir = str(tmp_path / "predictions")
+    model = build_model(cfg).eval()
+    x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)
+    with torch.no_grad():
+        reference = model(x)
+
+    ckpt_path = tmp_path / "mednext_dilated_reparam.pth"
+    torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
+
+    seen = {}
+
+    class DummyPredictor:
+        def __init__(self, model, cfg_in, device):
+            seen["deploy"] = all(
+                not isinstance(m, DilatedReparamBlock) or m.deploy
+                for m in model.modules())
+            with torch.no_grad():
+                out = model(x)
+            assert torch.allclose(out, reference, atol=1e-5, rtol=1e-5)
+
+        def predict_volume(self, path, output_dir=None, bbox_path=None):
+            return {"label_map": np.zeros((1,), dtype=np.uint8)}
+
+    monkeypatch.setattr(predictor_io, "Predictor", DummyPredictor)
+    predictor_io.run_inference(cfg, str(ckpt_path), ["fake.nii.gz"])
+
+    assert seen["deploy"] is True
 
 
 def test_config_default_and_validation_and_flag_off_structure():

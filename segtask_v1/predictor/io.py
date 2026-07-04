@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from ..config import Config
+from ..models.mednext import reparameterize_model
 from .predictor import Predictor
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,11 @@ def run_inference(
             f"{checkpoint_path} (variant={label}). The checkpoint key "
             f"layout does not match the model — refusing to predict with "
             f"random weights. Unexpected keys: {unexpected[:8]}")
+
+    if cfg.model.reparam_deploy:
+        logger.info(
+            "Applying MedNeXt deploy reparameterization before device transfer.")
+        model = reparameterize_model(model)
 
     model = model.to(device).eval()
     # 推理精度：auto 跟随 train.amp_dtype（默认 bf16 autocast，fp32 权重）；

@@ -672,6 +672,10 @@ class TrainConfig:
     # mednext_kernel_size 做 UpKern 插值迁移（k=3→k=5 等）。
     pretrain_upkern: bool = False
 
+    # 推理前是否将 MedNeXt 的可重参数化深度卷积折叠为 deploy 形态；默认关。
+    # 开启后，io.run_inference 会在 load_state_dict 之后、device 转移之前先折叠。
+    reparam_deploy: bool = False
+
     # ---- 多卡 DDP（DistributedDataParallel）----------------------------
     # 要使用的**物理 GPU 卡号列表**（如 [0, 2, 5, 7]）。
     #   * [] / 单元素                 → 单卡（或 CPU）路径，行为与历史完全一致；

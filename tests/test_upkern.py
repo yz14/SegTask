@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
 
 import pytest
 import torch
+import torch.nn as nn
 
 from segtask_v1.config import Config
 from segtask_v1.models.factory import build_model
@@ -91,6 +92,40 @@ def test_upkern_constant_kernel_stays_constant(spatial_dims):
     weight = remapped[key]
 
     assert torch.allclose(weight, torch.full_like(weight, 2.75))
+
+
+def test_upkern_plain_checkpoint_remaps_into_reparam_target(caplog):
+    src = MedNeXtStage(8, 8, num_blocks=1, kernel_size=3, spatial_dims=3)
+    tgt = MedNeXtStage(
+        8, 8, num_blocks=1, kernel_size=5, spatial_dims=3,
+        dilated_reparam=True)
+
+    key = next(k for k in tgt.state_dict() if k.endswith("dwconv.lk.weight"))
+    initial = tgt.state_dict()[key].clone()
+
+    caplog.set_level("WARNING")
+    remapped = upkern_remap_state_dict(src.state_dict(), tgt)
+
+    assert key in remapped
+    assert remapped[key].shape == tgt.state_dict()[key].shape
+    assert not torch.allclose(remapped[key], initial)
+    assert any(
+        "plain checkpoint -> reparameterized target" in rec.message
+        for rec in caplog.records)
+    assert any("target-init keys stay random" in rec.message
+               for rec in caplog.records)
+
+
+def test_upkern_skips_non_depthwise_resize_and_keeps_target_init(caplog):
+    src = nn.Sequential(nn.Conv3d(4, 4, kernel_size=3, padding=1, bias=False))
+    tgt = nn.Sequential(nn.Conv3d(4, 4, kernel_size=5, padding=2, bias=False))
+
+    caplog.set_level("WARNING")
+    remapped = upkern_remap_state_dict(src.state_dict(), tgt)
+
+    assert "0.weight" not in remapped
+    assert any("skipping non-depthwise tensor" in rec.message
+               for rec in caplog.records)
 
 
 @pytest.mark.parametrize("patch_mode,spatial_dims,input_shape", [
