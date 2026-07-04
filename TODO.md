@@ -72,137 +72,71 @@ b 面内超分（x,y是低分辨率，D,h,w -> D,H,W）
 
 进展：  
 
-一、现状盘点（已实现能力，作为建议的基线）
-Decoder：UNet / UNet++ / UNet3+（@d:/codes/work-projects/SegTask/segtask_v1/models/factory.py:316-321），deep supervision、aux 头、attention gate。
-Backbone：ResNet（post/pre-act/bottleneck）、ConvNeXt（drop-path + LayerScale）、MedNeXt 档位 A、ADM/EDM2 UNet。
-注意力：通道类 SE/ECA/CBAM/Coord（@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:309-331）；内容自注意力 softmax QKV（O(N²)）与 linear attention（Shen 2021），逐 stage 可配、zero-init 残差。
-重采样：BlurPool / PixelShuffle+ICNR / CARAFE / DySample，nnU-Net 式各向异性 stride 调度。
-训练技巧：grad checkpointing（逐 stage/level）、DDP、AMP（fp16+scaler / bf16）、EMA（timm 式 warmup + 热路径缓存）、梯度累积、torch.compile 配置项、cudnn.benchmark、no-decay 参数分组、非有限梯度守卫。
-基线已经相当完善，下面的建议聚焦"还没做、且有公认高质量出处"的增量。
+A1 — SDPA 替换 ✅ 正确实施
+@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:658-685 的 _SoftmaxQKVAttention 已用 F.scaled_dot_product_attention,手写 einsum + fp32 softmax 已删除;QKV/proj 仍为 Conv1d,权重兼容。有等价性测试(但测试本身有 bug,见下)。
 
-二、模型/算法架构升级建议（按性价比排序）
-A1（高优先）：_SoftmaxQKVAttention 换用 SDPA / FlashAttention （做）
-@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:361-377 手写 einsum + 物化 O(N²) 注意力矩阵。3D 瓶颈层 N=8³=512 尚可，但放到次深层（N=16³=4096）时 fp32 权重矩阵单头就要 64MB+。换 F.scaled_dot_product_attention（PyTorch 2.x 内置 FlashAttention/mem-efficient 后端）：
+小瑕疵:
 
-收益：显存 O(N²)→O(N)，速度 2–4×，数值上等价（且内部自动用 fp32 accumulate，可删掉手写的 softmax(.float()) 处理）；
-成本：约 10 行改动，权重全兼容（QKV/proj 卷积不变）；
-这是质量零损、速度显存双赢的第一优先项。
-A2（高优先）：给自注意力块补齐 Transformer 化的两个缺口
-当前 SelfAttentionBlock 是"纯 attention 残差"，对照公认 ViT/LLM 块设计缺两样：
+@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:673 的 ch = width // (3 * self.num_heads) 是死变量;
+@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:643-655 的 _sdpa_from_qkv 全库无任何调用点,是死代码,建议删除。
 
-位置信息：QKV 完全内容寻址，无任何位置编码。分割里空间先验重要，推荐 3D 分解式 RoPE（按 D/H/W 轴分配 head_dim，业界 LLM/ViT 公认做法，无参数、对分辨率外推友好）或退而求其次的 learnable 相对位置偏置（Swin 式）。
-FFN 缺失：标准 Transformer 块 = Attn + FFN 成对。可加可配的 GEGLU/SwiGLU FFN（LLaMA 系公认），同样 zero-init 输出投影保持"初始恒等"的现有哲学。
-A3（中优先）：窗口/网格注意力，把 attention 推到更浅层 （做，我理解的窗口内部做了attn，但是窗口和窗口直接需要联系吗？）
-全局 O(N²) 只能放最深两层。要在高分辨率层获益，推荐实现其一：
+A2 — RoPE + GEGLU FFN ✅ 正确实施
+RoPE(_apply_rope_nd,blocks.py:406-453):按轴分配 head_dim、无参数、支持 position_offsets;数学性质有测试保证(模长保持、相对 logits 平移不变)。
+FFN(blocks.py:860-887):GEGLU + zero-init 输出投影,初始恒等;ffn_norm 独立 PreNorm,符合标准 Transformer 块。
+守卫正确:use_rope 对 linear/grid 显式报错(blocks.py:823-832)。
+配置贯通(config.py:423-426 → factory.py:130-132)、state_dict 键集合测试齐全。
 
-Swin 式 window + shift（3D 窗口 4³/8³），SwinUNETR 已验证于医学 3D；
-MaxViT 式 block+grid 交替（局部窗口 + 稀疏全局网格），实现更简单、无 shift mask 麻烦，天然适配你的"逐 stage 可配"框架（新增 selfattn_type='window'|'grid'）。
-配合 A1 的 SDPA，窗口注意力的每窗序列短，速度非常好。
+A3 — Window/Grid 注意力 ✅ 正确实施,但有一处无效计算
+partition/unpartition、padding mask(finfo.min 加性 mask)、非整除尺寸裁回均正确;locality 测试(窗口内局部、grid 跨窗)验证了语义。
+配置逐 stage 可指定 'window'|'grid',softmax O(N²) 护栏对 window/grid 豁免(config.py:1391-1400 仅对 softmax 生效)——设计正确。
+问题(性能级):@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:717-730 window+RoPE 时按窗口逐个做 Python 循环施加带 offset 的 RoPE。但你们自己的测试 test_window_rope_relative_logits_with_offsets 恰好证明了:同窗口内 q/k 共享同一 offset 时,attention logits 与 offset 无关(RoPE 相对性)。即整个 per-window 循环在数学上等价于一次 offset=0 的全批量调用——浅层窗口数多时(如 16³ 特征 4³ 窗口 = 64 窗)这是 64 次串行 Python 调用的纯浪费。建议直接删循环、统一 offset=0。
 
-A4（中优先）：大核深度卷积升级 —— MedNeXt 档位 B / 膨胀重参数 （做）
-mednext.py 自己注明档位 B 未做：UpKern（k=3 权重插值初始化 k=5 大核）与重采样残差块，是 MedNeXt 论文报告增益的主要来源之一；
-更进一步可借鉴 UniRepLKNet / RepLK 的 Dilated Reparam Block：训练期"大核 = 并行多支小核+膨胀核"，推理期重参数化合并为单一大核——与你已有的 MultiRFBlock（@d:/codes/work-projects/SegTask/segtask_v1/models/resnet.py:257）思想同源，但推理零开销，等于给 MultiRF 加一个"可折叠"档位。
-A5（中优先）：块级微升级（低风险、逐项可消融） （做，注意力门换成按norm_type构建）
-Stochastic Depth 推广：drop-path 目前仅 ConvNeXt 有；给 ResNet/MedNeXt stage 也加线性递增 drop-path（He/Huang 2016，深 encoder 正则标配）。
-GRN（ConvNeXt-V2, 2023）：在 MedNeXt/ConvNeXt 块 FFN 中加 Global Response Normalization，替代/叠加 LayerScale，V2 论文显示对小模型也有稳定增益，实现约 15 行。
-AttentionGate3D 用 BatchNorm 的隐患：@d:/codes/work-projects/SegTask/segtask_v1/models/blocks.py:461-472 内部是 _BN，与全库 instance/group norm 及小 batch（3D 常 batch=2）设定相悖，小 batch 下 BN 统计噪声大。建议改为跟随 norm_type（保留 BN 为兼容默认或直接切 GN）。
-A6（选做，方向性）：线性复杂度全局建模 —— Mamba/SSM （先不做）
-U-Mamba / SegMamba（2024）在 3D 分割上报告了超过 Transformer 基线的结果，O(N) 全局感受野。但：依赖 mamba-ssm+causal-conv1d（CUDA 扩展，Windows 编译困难），且训练稳定性不如 attention 成熟。建议列为观察项而非本轮实现；若要"线性全局"，先用你已有的 linear attention + A2 的 RoPE 组合压榨。
+当前实现每个 stage 只挂一个 SelfAttentionBlock,若只配 window 而不在别处配 grid,跨窗信息只能靠卷积传播——建议文档里点明"window 应与 grid 成对使用"。
 
-A7（算法层，非结构）：任务相关损失/后处理 （先不做）
-clDice（CVPR 2021）：管状结构（血管/气道）拓扑保持损失，与你的 save_best_preset: vessel/airway 天然配套；
-largest-CC 后处理：即 TODO 进展 P7 的确认项，仍未实现，建议与 clDice 同一轮补。
+A4 — UpKern + 膨胀重参数 ✅ 实施正确,但有 3 个实际缺陷
+数值等价性(训练态 vs deploy 态 allclose、dilated kernel scatter 展开、端到端 build_model)测试齐全。但:
 
-审查：
-A1（SDPA） — 等价替换，无需新参数，所有 softmax 注意力自动受益。已做
-A5 — drop-path 通用化到 ResNet/MedNeXt + GRN + AttentionGate3D norm 修复，均加开关、默认兼容。已做
-A2（RoPE + FFN） — 单独实现，新增配置项开关。已做
-A3（MaxViT block+grid 窗口注意力） — 单独实现，新增 selfattn_type 选项，依赖 A1。已做
-A4（MedNeXt 档位 B UpKern + MultiRF 膨胀重参数） — 已做
+设备 bug(会真实咬人):@d:/codes/work-projects/SegTask/segtask_v1/models/mednext.py:227-232 switch_to_deploy 里 Conv(...) 未指定 device/dtype,在 CPU 上创建;GPU 模型调用 reparameterize_model 后 reparam 留在 CPU,下一次 GPU forward 直接报设备不匹配。测试仅覆盖 CPU 所以没暴露。最小修复:创建时传 device=weight.device, dtype=weight.dtype(或建后 .to())。
+reparameterize_model 无调用点:全库只有定义,predictor/推理入口未接线。deploy 收益目前只能靠用户手工调用,建议在推理加载路径加开关。
+checkpoint 兼容断裂未提示:dilated_reparam=True 的键是 dwconv.lk.weight/dwconv.branches.*,plain 训练的 checkpoint 是 dwconv.weight;pretrain_upkern 迁移时这类键会静默丢弃(upkern_remap_state_dict 只按同名匹配),用户从 k=3 plain checkpoint UpKern 到 k=5 reparam 模型时深度卷积全部保持随机初始化,仅有 missing-keys warning 可循。建议在 UpKern 路径显式检测并告警这种组合。
+另两个备注级:upkern_remap_state_dict(mednext.py:286-289)未检查 shape[1]==1,非 depthwise 的同通道 conv 也会被插值(文档声称仅 depthwise);align_corners=True 与 MedNeXt 官方实现(默认 False)不一致——对 3→5 小核影响很小,但消融时应知情。
 
-A1 — 把手写 softmax 注意力换成 F.scaled_dot_product_attention（SDPA）｜✅属实，✅强烈推荐
+A5 — drop-path 通用化 / GRN / AttentionGate norm ✅ 全部实施
+drop-path 已通用到全部 ResNet 变体(basic/preact/bottleneck/r2plus1d/MultiRF)+ MedNeXt,factory 统一 _make_drop_path_rates 线性递增,rates 按全局 block 序切片——正确。
+GRN(blocks.py:74-92)符合 ConvNeXt-V2:空间 L2 → 通道均值除法 → 零初始化 gamma/beta,ConvNeXt/MedNeXt 均接了 grn_enabled。
+AttentionGate(blocks.py:891-914)改为 get_norm(norm_type,...),默认 "batch" 保持兼容,三种 decoder 均传入 attn_gate_norm——完全符合计划。
+一处不一致(设计级):ResNet 系所有块的 drop_path 都被 in_ch == out_ch 门控(如 resnet.py:43-45),即每个 stage 的首块(升通道)永远不生效 drop-path,其分配到的线性递增率被静默丢弃。而 ConvNeXt/MedNeXt 走 AdaptBlock(先 1×1 投影再进块),首块照常有 drop-path。数学上 shortcut 为投影时丢弃 residual 分支同样成立(res + 0 仍是有效路径),该门控过于保守且两族 backbone 行为不一致。建议统一(去掉门控)或在注释里说明理由。
 
-核对：blocks.py:368-377 确实是手写 einsum 且显式物化 N×N 注意力矩阵（weight = einsum("bct,bcs->bts")），还手动 softmax(.float())。全库没有任何 scaled_dot_product_attention 调用。
-大白话：现在算注意力是「先把每个体素和每个体素的关系摊成一张大表，再查表」。这张表大小是 N×N，深层体素多时（N=16³=4096）这表非常吃显存。SDPA 是 PyTorch 2.x 内置的「不摊大表、边算边用」的官方实现（FlashAttention/省显存内核），结果数学上一模一样。
-能不能做：能，且几乎零风险。你的 torch27_env 是 PyTorch 2.7，SDPA 完全支持。QKV 和输出投影都是 Conv1d，权重完全不变、旧 checkpoint 照样能加载，只换中间那步算法。
-怎么做：把 qkv 从 (B,3C,N) reshape 成 (B, heads, N, head_dim)，调用 F.scaled_dot_product_attention(q,k,v)，再 reshape 回去；手写的 softmax(.float()) 可以删掉（SDPA 内部自动高精度累加）。约 10 行。
-收益/成本：显存 O(N²)→O(N)、深层注意力提速 2–4×；工作量最小。建议作为 A 的第一个落地项。
-A2 — 给自注意力块补「位置编码 + FFN」两块缺口｜✅属实，✅可做（真结构改动）
+B1–B3 / P1–P3 交叉核验
+项	状态	证据
+B1 no_sync()	✅ 已修	trainer.py:717-720,forward 也在 no_sync 内
+B2 TF32	✅ 已修	utils.py:363-370,deterministic 时正确关闭
+B2 fused AdamW	✅ 已修	optim.py:43-45,带 CUDA 门控
+B2 EMA foreach	✅ 已修	utils.py:92-93 _foreach_mul_/_foreach_add_,整型 buffer 单独处理
+B3 选择性 checkpoint	✅ 已修	grad_ckpt_encoder_stages 掩码 + 测试
+P1 one_cycle warmup	✅ 已修	optim.py:92-101 映射 pct_start,trainer.py:153-155 关外层 warmup,raise 已删
+P2 resume RNG 同流	✅ 已修	trainer.py:1030-1033 rank>0 重播种
+P3 梯度非有限守卫	✅ 已修	trainer.py:776-785,且 skip 时 scheduler/EMA 照常推进(正确)
+P4 回归测试	✅ 基本补齐	test_todo_p_regressions.py(keep-last-k、aspect 校正、val 确定性等)+ test_round2_fixes.py:337 compile+EMA 冒烟
+二、测试验证结果
+运行 pytest tests/test_selfattn.py test_a5_blocks.py test_dilated_reparam.py test_upkern.py test_mednext.py test_todo_p_regressions.py:108 通过,1 失败。
 
-核对：blocks.py:404-448 的 SelfAttentionBlock 结构是 norm→qkv→attn→proj→+x，没有任何位置编码（纯内容寻址），也没有 FFN（标准 Transformer 是 Attn+FFN 成对，这里只有 Attn）。属实。
-大白话：①「没有位置编码」＝模型只看体素长得像不像、不知道它们谁在上谁在下，而分割里空间位置很重要；补 3D RoPE（按 D/H/W 三个方向分配、不增加参数、换分辨率也稳）能让注意力知道方位。②「没有 FFN」＝每个 Transformer 块少了后半段的「逐点小型 MLP 加工」，补一个 GEGLU/SwiGLU FFN（LLaMA 同款）能提表达力。
-能不能做：能。RoPE 无参数、纯数学；FFN 用 zero-init 输出投影，初始等于什么都不做，不破坏现有基线（沿用你「zero-init 残差」的哲学）。
-怎么做：RoPE 在 attn 里对 q、k 施加旋转（需把拍平的 token 还原回 D/H/W 三轴坐标）；FFN 作为可配开关新增一个子层。属真架构改动，建议开关化 + 逐 stage 消融。注意：加了 FFN 会新增权重，旧 checkpoint 对新块不完全兼容（但 zero-init 下行为等价，可继续训练）。
-A3 — 窗口/网格注意力，把注意力推到更浅（高分辨率）层｜✅属实，✅可做（工程量中等）
-
-核对：注意力类型只有 softmax|linear 两种（blocks.py:341-341），没有窗口/网格注意力。全局 O(N²) 现实中只能放最深 1–2 层。属实。
-大白话：全局注意力太贵，只能用在最深、体素最少的层。想在「浅层高分辨率」也用注意力，就得把整张图切成小窗口、每个窗口内部各算各的（Swin），或者「局部窗口 + 稀疏网格」交替（MaxViT）。这样每次注意力只在一小撮体素里算，便宜很多。
-能不能做：能。推荐 MaxViT 式 block+grid（比 Swin 简单，不用处理 shift 的 mask），天然契合你「逐 stage 可配」的现有框架，新增 selfattn_type='window'|'grid'。
-怎么做：新增窗口划分/还原逻辑 + 一个窗口内复用 A1 的 SDPA。依赖 A1 先落地（窗口内序列短，SDPA 更快）。工程量比 A1/A5 大，建议排在 A1、A5 之后。
-A4 — 大核深度卷积升级：MedNeXt 档位 B + 膨胀重参数｜✅属实，⚠️可做但工程量偏大
-
-核对：mednext.py:3-6 明说只做了「档位 A」，UpKern 与原生重采样残差块是「后续档位 B」（未做）；MultiRFBlock（resnet.py:257-264）存在，但没有推理期重参数化（推理时仍保留多分支）。属实。
-大白话：①UpKern＝先用小核（k=3）训好，再把权重插值「撑大」成大核（k=5）继续训，是 MedNeXt 涨点的主要来源之一。②膨胀重参数（RepLK/UniRepLKNet）＝训练时用「多条小核+膨胀核并联」（表达力强），推理时用数学把它们合并成一个大核（速度零额外开销）——正好能给你现有的 MultiRF 加一个「可折叠」档位。
-能不能做：能，但比前面几个都重：UpKern 要写权重迁移逻辑；重参数要写「训练多分支 / 推理合并」的两套路径 + 融合函数，还要保证合并前后数值一致（要写测试卡)。
-怎么做：分两个独立子任务（UpKern、Dilated-Reparam），各自可单独消融。建议放在 A1/A2/A3/A5 之后，或按你对 MedNeXt/MultiRF 的实际使用频率决定优先级。
-A5 — 三个块级微升级（低风险、可逐项消融）｜✅全部属实，✅最容易落地
-
-核对：①drop-path（随机深度）只有 ConvNeXt 有——DropPath 类只在 convnext.py，drop_path_rate 配置也只对 convnext 生效（manifest.py:280-280），ResNet/MedNeXt 拿不到。②没有 GRN（全库无 GlobalResponseNorm）。③AttentionGate3D 内部用的是 BatchNorm（blocks.py:461-472），而全库是 instance/group norm、3D 常 batch=2，小 batch 下 BN 统计噪声大。三点全属实。
-大白话：①让 ResNet/MedNeXt 的深层也能用「随机丢块」正则（深网络标配防过拟合）。②GRN 是 ConvNeXt-V2 的小改（约 15 行），小模型也常有稳定增益。③注意力门里那几个 BatchNorm 在你「batch 只有 2」的 3D 场景容易统计不准，改成跟随全库的 norm_type（或直接 GroupNorm）更稳。
-能不能做：都能，且是风险最低、单项独立的一组。
-怎么做：①把 drop-path 通用化，给 ResNet/MedNeXt stage 也接线性递增的 drop-path 率；②在 MedNeXt/ConvNeXt 块里加可配 GRN；③把 AttentionGate3D 的 _BN 换成按 norm_type 构建（BN 保留为兼容默认）。建议和 A1 一起作为第一批落地（都低风险）。注意 ③改默认可能影响已训权重的数值，建议保留 BN 为默认、新增开关。
-
-
-三、训练加速 / 降显存建议
-B1（高优先，确定性收益）：DDP 梯度累积缺 no_sync()
-_train_epoch 每个 micro-step 都直接 backward()（@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:706），DDP 下每个 micro-batch 都做一次全量梯度 all-reduce。数学上等价（注释也承认），但 grad_accum_steps=k 时白白多付 (k−1)/k 的通信。标准做法：非边界步包 self.fwd_model.no_sync()。多卡+累积场景通信量直接除以 k。
-
-B2（高优先，零风险三连）
-TF32：全库未开。torch.set_float32_matmul_precision("high") + torch.backends.cudnn.allow_tf32=True，对 AMP 外残留的 fp32 matmul/conv（如 fp32 损失、验证）在 Ampere+ 上有免费加速；
-fused AdamW：torch.optim.AdamW(..., fused=True)（CUDA 下），单 kernel 更新全部参数，参数多的 3D UNet 每步省数百次 kernel launch；
-EMA foreach 化：ModelEMA.update 是 Python 逐张量循环（@d:/codes/work-projects/SegTask/segtask_v1/utils.py:80-85），换 torch._foreach_lerp_，一次调用完成全部 shadow 更新。
-B3（中优先）：选择性激活检查点
-目前 grad_checkpointing 是全 stage 一刀切。3D UNet 激活显存集中在最高分辨率的 1–2 层，只 checkpoint 浅层 stage（如新增 grad_ckpt_stages 掩码，风格与 selfattn_encoder_stages 一致）通常能拿到 ~70% 的省显存效果、只付 ~30% 的重算代价。
-
-B4（中优先）：torch.compile 实用化
-配置项已有但默认关。建议：(a) 文档/预设推荐 mode="default" + regional compile（只 compile stage 而非整模型，规避 2.5D/deep-supervision 动态形状导致的反复重编译）；(b) 落实进展 P4 提到的 compile+EMA 冒烟测试。PyTorch 2.7（你的 torch27_env）对此支持成熟。
-
-B5（选做）
-ZeroRedundancyOptimizer：DDP 下切分 optimizer state（AdamW 的 m/v 是 2× 参数量显存），一行包装；
-channels_last_3d：PyTorch 2.x 对 3D conv 支持渐好，AMP 下可能有 10–20% 提速，但需 benchmark 验证，不保证正收益；
-8-bit optimizer（bitsandbytes）：省 75% optimizer 显存，但引入重依赖 + Windows 支持差，不推荐现在做。
+失败项 test_softmax_qkv_attention_matches_sdpa_reference 是测试自身的 bug,非产品代码问题:
 
 
 
-P1：one_cycle 的 pct_start 是死代码，内建 warmup 实际不可配置
-@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:131-134 强制 one_cycle 必须 warmup_epochs=0，但：
+test_selfattn.py:68
+ref = ref.view(qkv.shape[0], h * c, qkv.shape[2])
+torch.einsum 输出非连续,.view 抛 RuntimeError,应改为 .reshape。这说明该测试在当前环境下从未真正跑通过——SDPA 与旧手写实现的数值等价性实际上没有被回归覆盖住,建议一并修复(一行改动)。
 
+三、全库剩余问题与优化空间(按优先级)
+高(正确性/会咬人)
 
+switch_to_deploy CPU 设备 bug(见 A4-1);
+test_selfattn.py:68 .view→.reshape,恢复 SDPA 等价性回归;
+reparam 与 plain checkpoint 键不兼容的静默丢弃(A4-3)。
+中(性能/一致性) 4. window RoPE per-window 循环删除(数学等价,浅层可省大量 Python 开销); 5. RoPE 的 meshgrid + inv_freq + cos/sin 每次 forward 全量重算、无缓存(blocks.py:429-445)——固定 patch 尺寸下形状恒定,建议按 (spatial_shape, rot_dim) 缓存 cos/sin buffer; 6. ResNet 系 drop-path 的 in_ch==out_ch 门控与 ConvNeXt/MedNeXt 行为不一致(A5); 7. DilatedReparamBlock 内部 BN 在 3D batch=2 下的统计噪声——与你们批评 AttentionGate BN 的理由相同(UniRepLKNet 的 BN 面向大 batch ImageNet);fold 数学确实需要 BN,但训练期噪声风险应在消融中确认或注释点明。
 
-optim.py:93-94
-pct_start = tc.warmup_epochs / max(tc.epochs, 1)
-pct_start = min(max(pct_start, 2.0 / max(total_steps, 4)), 0.9)
-warmup_epochs 恒为 0 → pct_start 恒被夹到 2/total_steps（约 2 步），OneCycle 事实上没有 warmup，而报错文案却声称"OneCycleLR has built-in warmup (pct_start)"。二者自相矛盾：要么允许 warmup_epochs 在 one_cycle 下映射到 pct_start（推荐，删掉 trainer 的 raise），要么给 one_cycle 单独的 pct_start 配置项。
+低(卫生) 8. 死代码:_sdpa_from_qkv、_SoftmaxQKVAttention.forward 的 ch; 9. upkern_remap_state_dict 补 shape[1]==1 检查、align_corners 与官方对齐说明; 10. reparameterize_model 接入推理入口(带配置开关)。
 
-P2：A7 残留——resume 后各 rank RNG 流重新同一
-原进展 A7 已点名"_load_checkpoint 会把 rank0 的 RNG 状态恢复到所有 rank"，此次未修：trainer.py:981-994 在每个 rank 上恢复同一份（rank0 的）RNG 状态，seed + local_rank 的解耦在 resume 后即失效。最小修法：非 rank0 恢复 RNG 后再做一次 manual_seed(restored ⊕ rank) 式偏移，或仅 rank0 恢复、其余 rank 重播种。
-
-P3：A4 残留——"loss 有限但梯度非有限"在 bf16/fp32 下仍会污染权重
-跳步守卫只看 loss（trainer.py:711）。bf16 反传中间溢出可产生 finite loss + NaN 梯度；此时开着 grad_clip_norm（默认 12），clip_grad_norm_ 返回的范数 gn 已经免费拿到（trainer.py:757），却没有用它做非有限检查。零成本改进：skip_optim_step |= not math.isfinite(gn)（scaler 未激活时）。原进展文本中"或检测到梯度非有限"这半句未落实。
-
-P4：缺少针对本轮修复的回归测试
-tests/ 中最新的 test_round2_fixes.py 覆盖的是旧轮次问题。本轮的关键修复均无测试，尤其：
-
-A2：进展文本明确建议"补一条 compile+EMA 冒烟测试"，未见；
-A1：scheduler horizon 与 accum 的对齐（很容易被后续重构再次破坏）；
-A5：val patch 跨"epoch"确定性；C2 keep-last-k；B3 aspect 校正数值（如 90° 面内旋转在 64×128×128 上应精确置换）；D3 逐类阈值。
-P5（备注级）：B9 clamp 范围比 nnU-Net 更激进
-nnU-Net 仅在 contrast 后夹取；当前实现把 brightness/noise/gamma/blur 全部结果夹回增强前 min/max（augment.py:67-78）。对 minmax [0,1] 数据，brightness +0.1 的顶端 10% 动态范围会被削成饱和平台，部分抵消该增强本身。属于可辩护的取舍，但建议在注释或消融里确认无副作用。
-
-P6（备注级）：B3 校正只含体素计数、不含物理 spacing
-A=diag(W,H,D)（augment.py:148-149）只消除 grid 归一化坐标的形状各向异性；spacing_normalization=False 时体素本身的物理各向异性（层厚 vs 面内）仍会使出面旋转失真。开 B1 后此问题自然消解，建议在 random_affine_aspect_correct 注释中点明这一依赖关系。
-
-P7（确认项）：D3 建议的 largest-CC 后处理未实现
-全库无 largest_cc/连通域相关代码。原建议列为"可选"，若是有意延后请在 TODO 中记一笔，避免遗忘。
-
-
+仍在待办池(与 TODO 决定一致,非遗漏):B4 regional compile 实用化、B5(ZeRO/channels_last benchmark)、A6 Mamba、A7 clDice + largest-CC(P7)。
