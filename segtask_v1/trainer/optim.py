@@ -34,21 +34,68 @@ def _param_groups(model: nn.Module, weight_decay: float) -> list:
     ]
 
 
+def _zero_redundancy_enabled(cfg: Config) -> bool:
+    """ZeRO-1 分片是否实际可用：要求显式开启且处于多进程 DDP 环境。"""
+    if not cfg.train.zero_redundancy_optimizer:
+        return False
+    import torch.distributed as dist
+    if (dist.is_available() and dist.is_initialized()
+            and dist.get_world_size() > 1):
+        return True
+    logger.warning(
+        "train.zero_redundancy_optimizer=True 但当前非多卡 DDP 环境；"
+        "无分片收益，回退普通优化器。")
+    return False
+
+
+def _build_zero_optimizer(groups: list, optim_cls, **defaults):
+    """用 ZeroRedundancyOptimizer 包装 ``optim_cls``，保留参数分组语义。
+
+    ZeRO 构造器只接受单个参数列表，其余分组经 ``add_param_group`` 追加
+    （各 rank 调用顺序一致，分片确定性由 ZeRO 保证）。优化器状态均分到
+    world_size 张卡，每卡省 state_bytes×(1−1/N)；step 后各 rank broadcast
+    自己分片的参数，数值与普通 DDP+同优化器严格等价。
+    """
+    from torch.distributed.optim import ZeroRedundancyOptimizer
+
+    non_empty = [g for g in groups if g["params"]]
+    if not non_empty:
+        raise ValueError("No trainable parameters for ZeroRedundancyOptimizer.")
+    first, *rest = non_empty
+    first_kwargs = {k: v for k, v in first.items() if k != "params"}
+    opt = ZeroRedundancyOptimizer(
+        first["params"], optimizer_class=optim_cls,
+        **{**defaults, **first_kwargs})
+    for g in rest:
+        opt.add_param_group(dict(g))
+    logger.info(
+        "ZeroRedundancyOptimizer enabled: %s state sharded across ranks.",
+        optim_cls.__name__)
+    return opt
+
+
 def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     tc = cfg.train
     groups = _param_groups(model, tc.weight_decay)
+    use_zero = _zero_redundancy_enabled(cfg)
     if   tc.optimizer == "adamw":
         first = next((p for p in model.parameters()), None)
         on_cuda = first is not None and first.is_cuda
         use_fused = tc.adamw_fused and torch.cuda.is_available()
-        return torch.optim.AdamW(
-            groups, lr=tc.lr, fused=(use_fused and on_cuda))
+        kwargs = {"lr": tc.lr, "fused": (use_fused and on_cuda)}
+        if use_zero:
+            return _build_zero_optimizer(groups, torch.optim.AdamW, **kwargs)
+        return torch.optim.AdamW(groups, **kwargs)
     elif tc.optimizer == "adam":
+        if use_zero:
+            return _build_zero_optimizer(groups, torch.optim.Adam, lr=tc.lr)
         return torch.optim.Adam(groups, lr=tc.lr)
     elif tc.optimizer == "sgd":
-        return torch.optim.SGD(
-            groups, lr=tc.lr,
-            momentum=tc.momentum, nesterov=tc.nesterov)
+        kwargs = {"lr": tc.lr, "momentum": tc.momentum,
+                  "nesterov": tc.nesterov}
+        if use_zero:
+            return _build_zero_optimizer(groups, torch.optim.SGD, **kwargs)
+        return torch.optim.SGD(groups, **kwargs)
     raise ValueError(f"Unknown optimizer: {tc.optimizer}")
 
 

@@ -226,6 +226,12 @@ class AugConfig:
     # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
     wmap_interp_mode: str = "nearest"
 
+    # 就地增强快路径：True 时跳过入口的 image/label/weight_map clone，直接在
+    # 调用方张量上做增强，省一份 batch 体积的瞬时显存（aug_oversample_ratio>1
+    # 时更明显）。契约：调用方须保证传入张量增强后不再以"原始值"被使用（训练
+    # 循环的 H2D 私有拷贝满足）。默认 False 保持防御性 clone 现状。
+    inplace: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Model configuration
@@ -605,6 +611,23 @@ class TrainConfig:
     # EMA decay warmup（timm 式 ramp）：早期用 min(decay, (1+step)/(10+step))，
     # 避免随机初始权重长时间拖累 shadow、导致早期 best 判定失真。
     ema_warmup: bool = True
+    # EMA shadow 存放位置：""（默认，跟随模型所在设备，行为不变）| "cpu"（shadow /
+    # backup 常驻 pinned CPU，省 1× 参数量的 GPU 常驻显存）。"cpu" 模式每步 update
+    # 多一次 GPU→CPU 参数拷贝（异步 + 一次流同步），数学与 "" 严格等价；验证换入 /
+    # checkpoint 保存均自动跨设备拷贝。仅在显存吃紧时建议开启。
+    ema_device: str = ""
+
+    # CUDA caching allocator 的 expandable segments（PyTorch 2.1+）：多分辨率视图 /
+    # oversample 裁剪 / 滑窗尾窗等形状多变场景下显著缓解显存碎片（reserved >>
+    # allocated 即碎片征兆，epoch 摘要有打印）。实现方式为进程启动早期注入
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（已有该环境变量时不覆盖）。
+    # 默认关，行为与现状一致；个别旧驱动不支持时 PyTorch 自动回退并告警。
+    cuda_expandable_segments: bool = False
+
+    # 整卷验证（val_metric_mode='high'）前后各调一次 torch.cuda.empty_cache()：
+    # 把训练激活占住的 cached blocks 归还，避免滑窗大累加器因碎片 OOM。只影响
+    # allocator、不影响数值；代价是验证前后各一次微小停顿。默认关。
+    val_empty_cache: bool = False
 
     # Checkpoint 保存。
     output_dir      : str = "outputs"
@@ -699,6 +722,16 @@ class TrainConfig:
     # NCCL collective 超时（分钟）。卡住的集合通信超过此时长会被 watchdog abort，
     # 避免某 rank 因 peer 已死而无限等待、永久挂起占显存。默认 30 分钟。
     ddp_timeout_minutes: int = 30
+    # DDP gradient_as_bucket_view：让 param.grad 直接是通信 bucket 的 view，免掉
+    # bucket 与 grad 的双份存储，DDP 下省约 1× 梯度显存（fp32 参数量级）。PyTorch
+    # 官方支持，与 no_sync/梯度累积兼容。默认关（保持现状）。
+    ddp_gradient_as_bucket_view: bool = False
+    # ZeRO-1 优化器状态分片（torch.distributed.optim.ZeroRedundancyOptimizer）：
+    # DDP 下把 AdamW 的 2× 参数 fp32 状态均分到 world_size 张卡，每卡省
+    # 2×参数×4B×(1−1/N)；step 后各 rank broadcast 自己分片的参数（数值与普通
+    # DDP+AdamW 严格等价）。checkpoint 保存时自动 consolidate 到 rank0（全 rank
+    # 集合操作）。单卡 / 非 DDP 下该开关被忽略并告警。默认关。
+    zero_redundancy_optimizer: bool = False
 
     # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
     @property
@@ -841,6 +874,12 @@ class PredictConfig:
     # 滑窗概率累加器 dtype："fp32"（默认）| "fp16"。大卷 × 多类时 fp16 使
     # acc_pred 显存减半；blend 权重归一后精度足够（nnU-Net 同款做法）。
     acc_dtype: str = "fp32"
+
+    # GPU 常驻整卷张量（滑窗 GPU builder 路径的 vol_t）存储 dtype："fp32"（默认）
+    # | "fp16"。fp16 使整卷常驻显存减半；取窗时 builder 会按窗 .float() 升回
+    # fp32 再插值/前向，仅存储精度为 fp16（归一化后输入动态范围小，量化误差
+    # ~1e-3 相对量级）。仅影响 GPU 全流 builder 路径；CPU 退化路径不受影响。
+    vol_dtype: str = "fp32"
 
     # 累加器落 CPU 的逃生门：大卷 × 多类在消费级卡 OOM 时开启（每个 batch 多一次
     # GPU→CPU 拷贝，用速度换显存）。
@@ -1803,6 +1842,18 @@ class Config:
             str(self.predict.acc_dtype) in ("fp32", "fp16"),
             f"predict.acc_dtype must be 'fp32' or 'fp16'; "
             f"got {self.predict.acc_dtype!r}.")
+        _require(
+            str(self.predict.vol_dtype) in ("fp32", "fp16"),
+            f"predict.vol_dtype must be 'fp32' or 'fp16'; "
+            f"got {self.predict.vol_dtype!r}.")
+        _require(
+            str(self.train.ema_device) in ("", "cpu"),
+            f"train.ema_device must be '' (follow model) or 'cpu'; "
+            f"got {self.train.ema_device!r}.")
+        if self.train.zero_redundancy_optimizer and len(self.train.gpus) < 2:
+            logger.warning(
+                "train.zero_redundancy_optimizer=True 但未启用多卡 DDP（需 "
+                "len(train.gpus) >= 2）；单卡下无分片收益，将回退普通优化器。")
         # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
             _require(

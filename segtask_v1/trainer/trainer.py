@@ -174,7 +174,10 @@ class Trainer:
         self.scaler = GradScaler("cuda", enabled=self._scaler_active)
 
         # --- EMA -------------------------------------------------------
-        self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup)
+        # ema_device="cpu" 时 shadow/backup 常驻 CPU（省 1× 参数量 GPU 显存，
+        # 数学等价）；默认 "" 跟随模型设备，行为不变。
+        self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup,
+                             offload_device=(tc.ema_device or None))
                     if tc.use_ema else None)
 
         # --- torch.compile (最后) -------------------------------------
@@ -212,13 +215,16 @@ class Trainer:
             self.fwd_model = nn.parallel.DistributedDataParallel(
                 self.model,
                 find_unused_parameters=bool(tc.ddp_find_unused_parameters),
+                gradient_as_bucket_view=bool(tc.ddp_gradient_as_bucket_view),
                 **ddp_kwargs)
             logger.info(
                 "DDP enabled: rank=%d/%d, device=%s, "
-                "find_unused_parameters=%s. Training grads all-reduce per "
+                "find_unused_parameters=%s, gradient_as_bucket_view=%s. "
+                "Training grads all-reduce per "
                 "backward (math-equivalent to single-GPU under grad-accum).",
                 self._rank, self._world_size, device,
-                tc.ddp_find_unused_parameters)
+                tc.ddp_find_unused_parameters,
+                tc.ddp_gradient_as_bucket_view)
         else:
             self.fwd_model = self.model
 
@@ -902,8 +908,18 @@ class Trainer:
         EMA 换入在此统一处理，保证两种模式都以 EMA 权重评估。
         """
         self.model.eval()
-        with self._ema_swapped():
-            return self.evaluator.evaluate(epoch)
+        # val_empty_cache：验证前后各归还一次 cached blocks，给整卷滑窗大累加器
+        # 腾出连续显存（只影响 allocator，不影响数值）。默认关。
+        _flush = (self.cfg.train.val_empty_cache
+                  and self.device.type == "cuda")
+        if _flush:
+            torch.cuda.empty_cache()
+        try:
+            with self._ema_swapped():
+                return self.evaluator.evaluate(epoch)
+        finally:
+            if _flush:
+                torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)
@@ -951,6 +967,10 @@ class Trainer:
         return state
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+        # ZeRO 优化器状态分片在各 rank：保存前需全 rank 集合式 consolidate 到
+        # rank0（必须在 rank 早退之前调用，否则集合通信挂死）。
+        if hasattr(self.optimizer, "consolidate_state_dict"):
+            self.optimizer.consolidate_state_dict(to=0)
         # 多卡下仅 rank0 落盘，避免多进程写同一文件互相覆盖 / 损坏。
         if not self._is_main:
             return
