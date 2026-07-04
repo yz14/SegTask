@@ -16,6 +16,7 @@ Block（C 通道输入，参照论文 §2.1，3 层 mirror Transformer）:
 
 from __future__ import annotations
 
+import logging
 from itertools import product
 
 import torch
@@ -23,6 +24,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .blocks import DropPath, GlobalResponseNorm, _BN, _CONV, make_attention
+
+logger = logging.getLogger(__name__)
 
 
 def _channelwise_groupnorm(num_channels: int) -> nn.GroupNorm:
@@ -148,7 +151,8 @@ class DilatedReparamBlock(nn.Module):
     depthwise Conv，零额外推理开销。
 
     这里内部使用 BatchNorm 仅为精确 fold 需要；它只存在于训练/折叠前的模块
-    结构中，和 MedNeXt 主干里沿用的通道级 GroupNorm 互不冲突。
+    结构中，和 MedNeXt 主干里沿用的通道级 GroupNorm 互不冲突。它更贴近大
+    batch 的 fold 路径；3D 小 batch 消融时 running stats 可能更噪。
     """
 
     def __init__(
@@ -229,7 +233,9 @@ class DilatedReparamBlock(nn.Module):
             kernel_size=self.kernel_size,
             padding=self.kernel_size // 2,
             groups=self.channels,
-            bias=True)
+            bias=True,
+            device=weight.device,
+            dtype=weight.dtype)
         reparam.weight.data.copy_(weight)
         reparam.bias.data.copy_(bias)
         self.reparam = reparam
@@ -263,7 +269,9 @@ def upkern_remap_state_dict(src_sd: dict, target_model: nn.Module) -> dict:
     仅处理与目标参数同名、同 rank、同通道形状的 depthwise-conv-like 权重：
     ``(C, 1, k, k[, k])``。当仅空间核尺寸不一致时，按空间维做
     ``bilinear``/``trilinear`` 插值并保留其余张量不变；不在目标模型中的键
-    直接丢弃，无法对齐的张量也保持目标模型初始化值。
+    直接丢弃，无法对齐的张量也保持目标模型初始化值。这里沿用
+    ``align_corners=True`` 的现有 UpKern 迁移行为；它与 MedNeXt 官方默认的
+    ``False`` 不同，但对 3→5 这类小核影响很小。
 
     Parameters
     ----------
@@ -274,29 +282,104 @@ def upkern_remap_state_dict(src_sd: dict, target_model: nn.Module) -> dict:
     """
     target_sd = target_model.state_dict()
     remapped = {}
-    for key, src_tensor in src_sd.items():
-        tgt_tensor = target_sd.get(key)
-        if tgt_tensor is None or not torch.is_tensor(src_tensor):
-            continue
-        if not torch.is_tensor(tgt_tensor):
-            continue
+
+    def _prefix_and_kind(key: str) -> tuple[str | None, str | None]:
+        if key.endswith(".dwconv.weight"):
+            return key[:-len(".dwconv.weight")], "plain"
+        if key.endswith(".dwconv.lk.weight"):
+            return key[:-len(".dwconv.lk.weight")], "reparam"
+        return None, None
+
+    def _preview(keys: list[str], n: int = 8) -> str:
+        if not keys:
+            return "[]"
+        head = ", ".join(keys[:n])
+        if len(keys) > n:
+            head += f", ... (+{len(keys) - n} more)"
+        return f"[{head}]"
+
+    def _depthwise_like_tensor(
+        src_tensor: torch.Tensor,
+        tgt_tensor: torch.Tensor,
+        key: str,
+    ) -> torch.Tensor | None:
         if src_tensor.shape == tgt_tensor.shape:
-            remapped[key] = src_tensor
-            continue
+            return src_tensor
         if (src_tensor.ndim not in (4, 5)
                 or tgt_tensor.ndim != src_tensor.ndim
                 or src_tensor.shape[:2] != tgt_tensor.shape[:2]):
-            continue
+            return None
+        if src_tensor.shape[1] != 1:
+            logger.warning(
+                "UpKern remap: skipping non-depthwise tensor %s "
+                "(shape %s -> %s); target keeps its initialization.",
+                key, tuple(src_tensor.shape), tuple(tgt_tensor.shape))
+            return None
         if src_tensor.shape[2:] == tgt_tensor.shape[2:]:
-            remapped[key] = src_tensor
-            continue
+            return src_tensor
+        # 以 float32 完成插值，再回到源 dtype。
         mode = "bilinear" if src_tensor.ndim == 4 else "trilinear"
         spatial = tuple(int(s) for s in tgt_tensor.shape[2:])
         work = src_tensor.detach().to(dtype=torch.float32)
         work = work.reshape(work.shape[0] * work.shape[1], 1, *work.shape[2:])
         work = F.interpolate(work, size=spatial, mode=mode, align_corners=True)
         work = work.reshape(*tgt_tensor.shape).to(dtype=src_tensor.dtype)
-        remapped[key] = work
+        return work
+
+    src_prefixes = {"plain": set(), "reparam": set()}
+    tgt_prefixes = {"plain": set(), "reparam": set()}
+    for key, tensor in src_sd.items():
+        prefix, kind = _prefix_and_kind(key)
+        if prefix and torch.is_tensor(tensor) and tensor.ndim in (4, 5):
+            src_prefixes[kind].add(prefix)
+    for key, tensor in target_sd.items():
+        prefix, kind = _prefix_and_kind(key)
+        if prefix and torch.is_tensor(tensor) and tensor.ndim in (4, 5):
+            tgt_prefixes[kind].add(prefix)
+
+    for prefix in sorted(src_prefixes["plain"] & tgt_prefixes["reparam"]):
+        target_keys = [
+            k for k in target_sd
+            if k.startswith(prefix + ".dwconv.")
+            and not k.endswith(".dwconv.lk.weight")
+        ]
+        logger.warning(
+            "UpKern remap: plain checkpoint -> reparameterized target for "
+            "module prefix %s; target-init keys stay random: %s",
+            prefix, _preview(sorted(target_keys)))
+    for prefix in sorted(src_prefixes["reparam"] & tgt_prefixes["plain"]):
+        source_keys = [
+            k for k in src_sd
+            if k.startswith(prefix + ".dwconv.")
+            and not k.endswith(".dwconv.lk.weight")
+        ]
+        logger.warning(
+            "UpKern remap: reparameterized checkpoint -> plain target for "
+            "module prefix %s; discarded reparam-only keys: %s",
+            prefix, _preview(sorted(source_keys)))
+
+    for key, src_tensor in src_sd.items():
+        tgt_tensor = target_sd.get(key)
+        mapped_key = key
+        if tgt_tensor is None and torch.is_tensor(src_tensor):
+            if key.endswith(".dwconv.weight"):
+                candidate = key[:-len(".weight")] + ".lk.weight"
+                tgt_tensor = target_sd.get(candidate)
+                if tgt_tensor is not None:
+                    mapped_key = candidate
+            elif key.endswith(".dwconv.lk.weight"):
+                candidate = key[:-len(".lk.weight")] + ".weight"
+                tgt_tensor = target_sd.get(candidate)
+                if tgt_tensor is not None:
+                    mapped_key = candidate
+        if tgt_tensor is None or not torch.is_tensor(src_tensor):
+            continue
+        if not torch.is_tensor(tgt_tensor):
+            continue
+        mapped = _depthwise_like_tensor(src_tensor, tgt_tensor, mapped_key)
+        if mapped is not None:
+            remapped[mapped_key] = mapped
+            continue
     return remapped
 
 

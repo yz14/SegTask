@@ -26,6 +26,7 @@ _AMAXPOOL = {2: nn.AdaptiveMaxPool2d, 3: nn.AdaptiveMaxPool3d}
 
 #: F.interpolate 的平滑插值模式。
 INTERP_SMOOTH = {2: "bilinear", 3: "trilinear"}
+_ROPE_ND_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _check_dims(spatial_dims: int) -> int:
@@ -403,6 +404,49 @@ def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1)
 
 
+def _rope_cache_key(
+    spatial_shape: Sequence[int],
+    rot_dim: int,
+    position_offsets: Sequence[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    axis: int,
+) -> tuple:
+    return (
+        tuple(int(s) for s in spatial_shape),
+        int(rot_dim),
+        tuple(int(o) for o in position_offsets),
+        device.type,
+        device.index,
+        dtype,
+        int(axis),
+    )
+
+
+def _rope_axis_cos_sin(
+    pos: torch.Tensor,
+    spatial_shape: Sequence[int],
+    rot_dim: int,
+    position_offsets: Sequence[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    axis: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = _rope_cache_key(
+        spatial_shape, rot_dim, position_offsets, device, dtype, axis)
+    cached = _ROPE_ND_CACHE.get(key)
+    if cached is not None:
+        return cached
+    inv_freq = 1.0 / (
+        10000 ** (torch.arange(
+            0, rot_dim, 2, device=device, dtype=torch.float32) / rot_dim))
+    angles = pos.to(dtype=torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
+    cos = angles.cos().to(dtype=dtype)
+    sin = angles.sin().to(dtype=dtype)
+    _ROPE_ND_CACHE[key] = (cos, sin)
+    return cos, sin
+
+
 def _apply_rope_nd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -426,9 +470,10 @@ def _apply_rope_nd(
     else:
         offsets = [0] * num_axes
 
-    coords = [torch.arange(s, device=q.device) + off
-              for s, off in zip(spatial_shape, offsets)]
-    mesh = torch.meshgrid(*coords, indexing="ij")
+    mesh = torch.meshgrid(*[
+        torch.arange(s, device=q.device) + off
+        for s, off in zip(spatial_shape, offsets)
+    ], indexing="ij")
     flat_coords = [m.reshape(-1) for m in mesh]
     tokens = flat_coords[0].numel()
     rot_pairs = rot_dim // 2
@@ -437,12 +482,10 @@ def _apply_rope_nd(
     for axis, pos in enumerate(flat_coords):
         start = axis * rot_dim
         end = start + rot_dim
-        inv_freq = 1.0 / (
-            10000 ** (torch.arange(
-                0, rot_dim, 2, device=q.device, dtype=torch.float32) / rot_dim))
-        angles = pos.to(dtype=torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
-        cos = angles.cos().to(dtype=q.dtype).view(1, 1, tokens, rot_pairs, 1)
-        sin = angles.sin().to(dtype=q.dtype).view(1, 1, tokens, rot_pairs, 1)
+        cos, sin = _rope_axis_cos_sin(
+            pos, spatial_shape, rot_dim, offsets, q.device, q.dtype, axis)
+        cos = cos.reshape(1, 1, tokens, rot_pairs, 1)
+        sin = sin.reshape(1, 1, tokens, rot_pairs, 1)
 
         q_blk = q_out[..., start:end].reshape(*q_out.shape[:-1], rot_pairs, 2)
         k_blk = k_out[..., start:end].reshape(*k_out.shape[:-1], rot_pairs, 2)
@@ -640,21 +683,6 @@ def _grid_unpartition_tokens(x: torch.Tensor, meta: dict) -> torch.Tensor:
     return x[..., :orig[0], :orig[1], :orig[2]]
 
 
-def _sdpa_from_qkv(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    spatial_shape: Sequence[int],
-    use_rope: bool = False,
-    position_offsets: Sequence[int] = (),
-    attn_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if use_rope:
-        q, k = _apply_rope_nd(q, k, spatial_shape, position_offsets)
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    return out
-
-
 class _SoftmaxQKVAttention(nn.Module):
     """标准多头 softmax 自注意力，输入 qkv=(B, 3*C, N)，输出 (B, C, N)。
 
@@ -669,8 +697,6 @@ class _SoftmaxQKVAttention(nn.Module):
 
     def forward(self, qkv: torch.Tensor,
                 spatial_shape: Sequence[int] = ()) -> torch.Tensor:
-        bs, width, length = qkv.shape
-        ch = width // (3 * self.num_heads)
         qkv_h = rearrange(qkv, "b (h c3) n -> b h c3 n", h=self.num_heads)
         q, k, v = qkv_h.chunk(3, dim=2)
         q = q.permute(0, 1, 3, 2)
@@ -717,17 +743,7 @@ class _WindowQKVAttention(nn.Module):
         if self.use_rope:
             if not meta["offsets"]:
                 raise ValueError("RoPE requires spatial offsets.")
-            q_list = []
-            k_list = []
-            group_tokens = q.shape[0] // len(meta["offsets"])
-            for i, off in enumerate(meta["offsets"]):
-                sl = slice(i * group_tokens, (i + 1) * group_tokens)
-                q_i, k_i = _apply_rope_nd(
-                    q[sl], k[sl], meta["token_sizes"], position_offsets=off)
-                q_list.append(q_i)
-                k_list.append(k_i)
-            q = torch.cat(q_list, dim=0)
-            k = torch.cat(k_list, dim=0)
+            q, k = _apply_rope_nd(q, k, meta["token_sizes"])
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = _window_unpartition_tokens(out, meta)
         return rearrange(out, "b h c ... -> b (h c) ...").flatten(2)
@@ -1020,13 +1036,11 @@ class PixelShuffle3d(nn.Module):
                 f"PixelShuffle3d(spatial_dims={d}) expects rank-{d+2} input, "
                 f"got {x.ndim}")
         B, Crd = x.shape[:2]
-        spatial = list(x.shape[2:])
         rd = r ** d
         if Crd % rd:
             raise ValueError(
                 f"PixelShuffle3d(r={r}, spatial_dims={d}) needs channels "
                 f"divisible by r^d={rd}, got C={Crd}")
-        C = Crd // rd
         # 从 (B, C*r^d, *spatial) 拆出 r-axes 并与原空间轴交错。
         if d == 2:
             return rearrange(

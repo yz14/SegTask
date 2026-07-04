@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from .blocks import (
-    DropPath, _CONV, _DROP, ConvNormAct, SqueezeExcite3D,
+    DropPath, _CONV, _DROP, SqueezeExcite3D,
     get_activation, get_norm, make_attention)
 
 
@@ -41,7 +41,7 @@ class ResNetBlock(nn.Module):
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
         self.drop_path = (
-            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
 
         self.shortcut = (
@@ -87,7 +87,7 @@ class PreActResNetBlock(nn.Module):
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
         self.drop_path = (
-            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
 
         # shortcut 作用于原 x；通道不匹配时用 1×1 投影（标准 pre-act）。
@@ -140,7 +140,7 @@ class BottleneckBlock(nn.Module):
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
         self.drop_path = (
-            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
 
         self.shortcut = (
@@ -216,7 +216,7 @@ class R2Plus1DBlock(nn.Module):
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
         self.drop_path = (
-            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
 
         self.shortcut = (
@@ -390,7 +390,7 @@ class MultiRFBlock(nn.Module):
                                    reduction=se_reduction)
         self.act2 = get_activation(activation)
         self.drop_path = (
-            DropPath(drop_path) if drop_path > 0.0 and in_ch == out_ch
+            DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
 
         self.shortcut = (
