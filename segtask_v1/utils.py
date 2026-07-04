@@ -231,6 +231,7 @@ def dice_batch_stats(
     pred: torch.Tensor,
     target: torch.Tensor,
     threshold: float = 0.5,
+    pred_is_binary: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """逐类汇总 batch 级混淆量，供 nnU-Net 风格 pooled 指标（Σ分子/Σ分母）。
 
@@ -245,8 +246,12 @@ def dice_batch_stats(
     由这五个量可零额外通信地导出 dice / iou / recall / precision /
     volume_similarity / mcc 等指标，详见 ``derive_overlap_metrics``。
     旧字段 ``inter``/``denom``/``n_with_gt`` 完全保留以兼容已有调用方。
+
+    ``pred_is_binary=True`` 时 ``pred`` 已是 {0,1} 二值体，跳过 sigmoid+阈值
+    （与喂饱和 logits 经 sigmoid 阈值后逐位一致，省两次逐元素 pass）。
     """
-    pred_bin = (torch.sigmoid(pred) > threshold).float()
+    pred_bin = (pred.float() if pred_is_binary
+                else (torch.sigmoid(pred) > threshold).float())
     p = rearrange(pred_bin, 'b c ... -> b c (...)')
     t = rearrange(target, 'b c ... -> b c (...)')
     pred_sum   = p.sum(dim=(0, 2))
@@ -346,12 +351,24 @@ def _binary_erosion_pool(mask: torch.Tensor, ndim: int) -> torch.Tensor:
 
 
 def _binary_dilate_pool(mask: torch.Tensor, ndim: int, tol: int) -> torch.Tensor:
-    """Chebyshev-τ 膨胀（kernel=2τ+1 maxpool）。τ=0 直接返回。"""
+    """Chebyshev-τ 膨胀（kernel=2τ+1 maxpool）。τ=0 直接返回。
+
+    τ≥2 时按轴分离（max 可分离，与全核严格等价）：计算量 k^d → d·k；
+    τ=1 小核单次 pool 更快（分离的 kernel-launch/写回开销占主导）。"""
     if tol <= 0:
         return mask
     k = 2 * int(tol) + 1
     pool = F.max_pool2d if ndim == 2 else F.max_pool3d
-    return pool(mask, kernel_size=k, stride=1, padding=int(tol))
+    if tol < 2:
+        return pool(mask, kernel_size=k, stride=1, padding=int(tol))
+    out = mask
+    for ax in range(ndim):
+        ks = [1] * ndim
+        pd = [0] * ndim
+        ks[ax] = k
+        pd[ax] = int(tol)
+        out = pool(out, kernel_size=tuple(ks), stride=1, padding=tuple(pd))
+    return out
 
 
 @torch.no_grad()
@@ -360,11 +377,14 @@ def surface_dice_batch_stats(
     target: torch.Tensor,
     tolerance: int = 1,
     threshold: float = 0.5,
+    pred_is_binary: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """逐类汇总 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice@τ：
     SD[c] = Σ(|B_p ∩ Dil_τ(B_t)| + |B_t ∩ Dil_τ(B_p)|) / Σ(|B_p|+|B_t|)。
-    支持 2D (B,C,H,W) 与 3D (B,C,D,H,W)；外侧体素按背景计入边界。"""
-    pred_bin = (torch.sigmoid(pred) > threshold).float()
+    支持 2D (B,C,H,W) 与 3D (B,C,D,H,W)；外侧体素按背景计入边界。
+    ``pred_is_binary`` 含义同 ``dice_batch_stats``。"""
+    pred_bin = (pred.float() if pred_is_binary
+                else (torch.sigmoid(pred) > threshold).float())
     target_f = target.float()
     ndim = pred_bin.ndim - 2
     assert ndim in (2, 3), f"surface_dice expects 2D/3D spatial, got rank {pred_bin.ndim}"
