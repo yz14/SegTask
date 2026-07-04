@@ -885,6 +885,12 @@ class PredictConfig:
     # GPU→CPU 拷贝，用速度换显存）。
     accumulate_on_cpu: bool = False
 
+    # 独立 CLI 推理（predictor.io.run_inference）开启 cudnn.benchmark：滑窗窗口
+    # 形状固定，让 cuDNN 首个 batch 自动选最优卷积算法（训练入口经
+    # seed_everything 已默认开启，仅独立推理入口缺此设置）。默认关，行为与现状
+    # 一致；开启后首卷首个 batch 有一次性 autotune 开销。
+    cudnn_benchmark: bool = False
+
     # 预测输出目录。
     output_dir: str = "predictions"
 
