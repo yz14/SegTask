@@ -92,18 +92,26 @@ class MetricAccumulator:
         pred_logits: torch.Tensor,
         target: torch.Tensor,
         loss_value: Optional[float] = None,
+        voxels_override: Optional[float] = None,
     ) -> None:
         """累加单 batch / 单卷。
 
         ``pred_logits`` 形如 ``(B, num_fg, ...)`` 的 *logits*（指标算子内部自行做
         sigmoid + 0.5 阈值）；``target`` 同形二值标签。``loss_value`` 为该 batch 的
         标量验证损失，``None`` 时不计入（high 模式无可逆 logits，故不产 val_loss）。
+
+        ``voxels_override``：喂入的张量若已按 pred∪GT bbox 裁剪，传入裁剪前的
+        总体素数（B × 整卷空间体素），使 TN/MCC 仍按整卷口径严格等价。
         """
         if loss_value is not None and math.isfinite(loss_value):
             self.loss_meter.update(loss_value, pred_logits.shape[0])
 
         pred_f = pred_logits.float()
         stats = dice_batch_stats(pred_f, target)
+        if voxels_override is not None:
+            stats["voxels"] = torch.tensor(
+                float(voxels_override), dtype=torch.float64,
+                device=stats["voxels"].device)
         if self._inter is None:
             self._inter = stats["inter"].clone()
             self._pred_sum = stats["pred_sum"].clone()
@@ -349,6 +357,27 @@ class VolumeValEvaluator(ValEvaluator):
 
     log_prefix = "Val[full-3D]"
 
+    @staticmethod
+    @torch.no_grad()
+    def _union_bbox_slices(
+        fg: torch.Tensor, margin: int,
+    ) -> "Optional[tuple]":
+        """前景并集掩膜 ``fg``（空间维 bool）的外接 bbox，逐轴外扩 ``margin``
+        并夹到边界。全背景时返回 ``None``（调用方不裁剪）。"""
+        if not bool(fg.any()):
+            return None
+        slices = []
+        for ax in range(fg.ndim):
+            line = fg
+            for d in range(fg.ndim - 1, -1, -1):
+                if d != ax:
+                    line = line.any(dim=d)
+            idx = torch.nonzero(line).flatten()
+            lo = max(int(idx[0].item()) - margin, 0)
+            hi = min(int(idx[-1].item()) + margin + 1, fg.shape[ax])
+            slices.append(slice(lo, hi))
+        return tuple(slices)
+
     def __init__(self, trainer: "Trainer"):
         super().__init__(trainer)
         self._predictor = None  # 懒构建，复用同一 Predictor（引用 trainer.model）
@@ -409,10 +438,24 @@ class VolumeValEvaluator(ValEvaluator):
             if thr_t.ndim == 1:
                 thr_t = thr_t.view(-1, 1, 1, 1)
             pred_bin = (prob_t > thr_t).float()
+
+            # 可选：按 pred∪GT 并集 bbox 裁剪后再算指标（严格等价，见 config）。
+            # 边距取 surface_dice 容差+1，保证腔蚀/膨胀在裁剪窗内结果不变；
+            # 总体素数按整卷回传，使 TN/MCC 口径不变。
+            voxels_override = None
+            if bool(t.cfg.train.val_metric_bbox_crop):
+                margin = (acc.sd_tol + 1) if acc.compute_sd else 1
+                fg = (pred_bin > 0.5).any(dim=0) | (target_t > 0.5).any(dim=0)
+                sl = self._union_bbox_slices(fg, margin)
+                if sl is not None:
+                    voxels_override = float(target_t.shape[1:].numel())
+                    pred_bin = pred_bin[(slice(None),) + sl]
+                    target_t = target_t[(slice(None),) + sl]
+
             pred_logits = (pred_bin - 0.5) * (2.0 * _SATURATION_LOGIT)
             acc.update(
                 pred_logits.unsqueeze(0), target_t.unsqueeze(0),
-                loss_value=None)
+                loss_value=None, voxels_override=voxels_override)
         acc.all_reduce(t.num_fg, t.device)
         return acc.compute(log_prefix=self.log_prefix, log=is_main_process())
 

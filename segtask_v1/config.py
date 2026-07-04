@@ -668,6 +668,13 @@ class TrainConfig:
     # 默认 "medium" 保持既有行为不变。
     val_metric_mode: str = "medium"
 
+    # 整卷验证（val_metric_mode='high'）指标计算前先按 pred∪GT 并集 bbox 裁剪：
+    # dice/iou/recall/precision/vol_sim 只依赖 TP/FP/FN（全部落在并集 bbox 内），
+    # 裁剪后严格等价；MCC 的 TN 通过按整卷形状回传总体素数保持严格等价；
+    # surface_dice 按 tolerance+1 外扩边距后同样严格等价。前景占比小的整卷上
+    # surface_dice 的 3D maxpool 可省一个量级计算与显存。默认关，行为与现状一致。
+    val_metric_bbox_crop: bool = False
+
     # 提前停止（0=禁用）。
     early_stopping: int = 0
 
