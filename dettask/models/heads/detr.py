@@ -2,8 +2,9 @@
 
 依赖克制（Plan §7-7）：可变形注意力用纯 PyTorch ``grid_sample`` 实现
 （query 预测采样偏移 + 注意力权重，在单尺度特征图上采样），2D/3D 同一实现，
-不引入 CUDA 扩展。查询含可学习参考点，逐层框细化；匈牙利匹配 +
-（focal-BCE + L1 + GIoU）集合损失。
+不引入 CUDA 扩展。查询含可学习参考点，逐解码层框细化（inverse-sigmoid
+空间累加，参考点随层更新）；匈牙利匹配 +（focal-BCE + L1 + GIoU）集合
+损失，各解码层独立匹配求和（aux loss，Deformable-DETR 口径）。
 """
 
 from __future__ import annotations
@@ -122,56 +123,77 @@ class DETRHead(nn.Module):
         nn.init.constant_(self.cls_head.bias, -math.log(99.0))
 
     # ------------------------------------------------------------------
-    def forward(self, feats: List[torch.Tensor], img_size: Sequence[int]
-                ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """→ (cls_logits (B,Q,K), boxes (B,Q,2d) patch 坐标)。"""
+    def _forward_layers(self, feats: List[torch.Tensor],
+                        img_size: Sequence[int]
+                        ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """逐解码层输出 [(cls_logits (B,Q,K), boxes (B,Q,2d) patch 坐标)]。
+
+        参考点逐层细化：每层框中心 = sigmoid(inv_sigmoid(ref) + Δcenter)，
+        并（detach 后）作为下一层的参考点。"""
         feat = self.input_proj(feats[0])            # 最低分辨率层
         B = feat.shape[0]
         q = self.query_embed.weight[None].expand(B, -1, -1)
         ref = self.ref_embed.weight[None].expand(B, -1, -1)  # (B,Q,d) ∈ (0,1)
         size = torch.as_tensor(img_size, dtype=feat.dtype, device=feat.device)
+        outs: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
             q = layer(q, feat, ref)
-        delta = self.box_head(q)                    # (B,Q,2d)
-        center = (_inverse_sigmoid(ref) + delta[..., :self.dim]).sigmoid()
-        scale = (delta[..., self.dim:] - 2.0).sigmoid()   # 初始偏小尺寸
-        boxes = center_size_to_box(center * size, scale * size)
-        return self.cls_head(q), boxes
+            delta = self.box_head(q)                # (B,Q,2d)
+            center = (_inverse_sigmoid(ref) + delta[..., :self.dim]).sigmoid()
+            scale = (delta[..., self.dim:] - 2.0).sigmoid()   # 初始偏小尺寸
+            boxes = center_size_to_box(center * size, scale * size)
+            outs.append((self.cls_head(q), boxes))
+            ref = center.detach()                   # 细化后的参考点传下一层
+        return outs
+
+    def forward(self, feats: List[torch.Tensor], img_size: Sequence[int]
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """→ 最后一层的 (cls_logits (B,Q,K), boxes (B,Q,2d) patch 坐标)。"""
+        return self._forward_layers(feats, img_size)[-1]
 
     # ------------------------------------------------------------------
     def compute_loss(self, feats: List[torch.Tensor],
                      gt_boxes: List[torch.Tensor],
                      gt_labels: List[torch.Tensor],
                      img_size: Sequence[int]) -> Dict[str, torch.Tensor]:
-        cls_l, boxes = self.forward(feats, img_size)
+        """集合损失；各解码层独立匈牙利匹配后求和（aux loss）。"""
+        outs = self._forward_layers(feats, img_size)
         det = self.det
-        size = torch.as_tensor(img_size, dtype=boxes.dtype,
-                               device=boxes.device)
-        total_cls = cls_l.new_zeros(())
-        total_l1 = cls_l.new_zeros(())
-        total_giou = cls_l.new_zeros(())
-        num_pos = 0
-        for b in range(cls_l.shape[0]):
-            gb, gl = gt_boxes[b].to(boxes), gt_labels[b]
-            qi, gi = hungarian_match(
-                cls_l[b], boxes[b], gb, gl, det.detr_cls_weight,
-                det.detr_l1_weight, det.detr_giou_weight, norm_size=size)
-            tgt = torch.zeros_like(cls_l[b])
-            if qi.numel() > 0:
-                tgt[qi, gl[gi]] = 1.0
-                pb = boxes[b][qi].float() / size.repeat(2)
-                tb = gb[gi].float() / size.repeat(2)
-                total_l1 = total_l1 + (pb - tb).abs().sum()
-                giou = generalized_box_iou(boxes[b][qi].float(),
-                                           gb[gi].float()).diagonal()
-                total_giou = total_giou + (1.0 - giou).sum()
-                num_pos += int(qi.numel())
-            total_cls = total_cls + sigmoid_focal_loss(
-                cls_l[b], tgt, det.focal_alpha, det.focal_gamma)
-        norm = max(num_pos, 1)
-        return {"cls": det.detr_cls_weight * total_cls / norm,
-                "l1": det.detr_l1_weight * total_l1 / norm,
-                "giou": det.detr_giou_weight * total_giou / norm}
+        loss_cls = outs[-1][0].new_zeros(())
+        loss_l1 = outs[-1][0].new_zeros(())
+        loss_giou = outs[-1][0].new_zeros(())
+        for cls_l, boxes in outs:
+            size = torch.as_tensor(img_size, dtype=boxes.dtype,
+                                   device=boxes.device)
+            total_cls = cls_l.new_zeros(())
+            total_l1 = cls_l.new_zeros(())
+            total_giou = cls_l.new_zeros(())
+            num_pos = 0
+            for b in range(cls_l.shape[0]):
+                gb, gl = gt_boxes[b].to(boxes), gt_labels[b]
+                qi, gi = hungarian_match(
+                    cls_l[b], boxes[b], gb, gl, det.detr_cls_weight,
+                    det.detr_l1_weight, det.detr_giou_weight, norm_size=size)
+                tgt = torch.zeros_like(cls_l[b])
+                if qi.numel() > 0:
+                    tgt[qi, gl[gi]] = 1.0
+                    pb = boxes[b][qi].float() / size.repeat(2)
+                    tb = gb[gi].float() / size.repeat(2)
+                    total_l1 = total_l1 + (pb - tb).abs().sum()
+                    giou = generalized_box_iou(boxes[b][qi].float(),
+                                               gb[gi].float()).diagonal()
+                    total_giou = total_giou + (1.0 - giou).sum()
+                    num_pos += int(qi.numel())
+                total_cls = total_cls + sigmoid_focal_loss(
+                    cls_l[b], tgt, det.focal_alpha, det.focal_gamma)
+            norm = max(num_pos, 1)
+            loss_cls = loss_cls + total_cls / norm
+            loss_l1 = loss_l1 + total_l1 / norm
+            loss_giou = loss_giou + total_giou / norm
+        n_lvl = len(outs)
+        return {"cls": det.detr_cls_weight * loss_cls / n_lvl,
+                "l1": det.detr_l1_weight * loss_l1 / n_lvl,
+                "giou": det.detr_giou_weight * loss_giou / n_lvl}
 
     # ------------------------------------------------------------------
     @torch.no_grad()

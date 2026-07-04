@@ -44,11 +44,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# 把"已阈值化二值预测"编码成饱和 logits，喂给内部会做 sigmoid+0.5 的指标算子
-# （dice_batch_stats / surface_dice_batch_stats）。±20 经 sigmoid 后 ≈ {1, 0}，
-# 阈值决策已在上游按推理阈值完成，此处仅复用同一套累加算子，避免二次 sigmoid。
-_SATURATION_LOGIT = 20.0
-
 
 # ---------------------------------------------------------------------------
 # Pooled metric accumulator (medium / high 共用)
@@ -92,18 +87,30 @@ class MetricAccumulator:
         pred_logits: torch.Tensor,
         target: torch.Tensor,
         loss_value: Optional[float] = None,
+        voxels_override: Optional[float] = None,
+        pred_is_binary: bool = False,
     ) -> None:
         """累加单 batch / 单卷。
 
         ``pred_logits`` 形如 ``(B, num_fg, ...)`` 的 *logits*（指标算子内部自行做
         sigmoid + 0.5 阈值）；``target`` 同形二值标签。``loss_value`` 为该 batch 的
         标量验证损失，``None`` 时不计入（high 模式无可逆 logits，故不产 val_loss）。
+
+        ``voxels_override``：喂入的张量若已按 pred∪GT bbox 裁剪，传入裁剪前的
+        总体素数（B × 整卷空间体素），使 TN/MCC 仍按整卷口径严格等价。
+
+        ``pred_is_binary=True`` 时 ``pred_logits`` 已是 {0,1} 二值体，指标算子
+        跳过 sigmoid+阈值（high 模式已在上游按推理阈值二值化，结果逐位一致）。
         """
         if loss_value is not None and math.isfinite(loss_value):
             self.loss_meter.update(loss_value, pred_logits.shape[0])
 
         pred_f = pred_logits.float()
-        stats = dice_batch_stats(pred_f, target)
+        stats = dice_batch_stats(pred_f, target, pred_is_binary=pred_is_binary)
+        if voxels_override is not None:
+            stats["voxels"] = torch.tensor(
+                float(voxels_override), dtype=torch.float64,
+                device=stats["voxels"].device)
         if self._inter is None:
             self._inter = stats["inter"].clone()
             self._pred_sum = stats["pred_sum"].clone()
@@ -119,7 +126,8 @@ class MetricAccumulator:
 
         if self.compute_sd:
             sd_stats = surface_dice_batch_stats(
-                pred_f, target, tolerance=self.sd_tol)
+                pred_f, target, tolerance=self.sd_tol,
+                pred_is_binary=pred_is_binary)
             if self._sd_num is None:
                 self._sd_num = sd_stats["sd_num"].clone()
                 self._sd_denom = sd_stats["sd_denom"].clone()
@@ -343,11 +351,32 @@ class VolumeValEvaluator(ValEvaluator):
     """high：对每个 val 整卷复用 ``Predictor`` 做滑窗推理后取指标。
 
     整卷数据直接取自 npz 缓存（与 ``Predictor`` 同款预处理、bbox 已裁），无需磁盘
-    NIfTI / bbox 处理。整卷 blended 概率按推理阈值二值化后编码为饱和 logits，复用
-    与 medium 完全相同的 ``MetricAccumulator``。不产 val_loss（见 ``MetricAccumulator``）。
+    NIfTI / bbox 处理。整卷 blended 概率按推理阈值二值化后以 ``pred_is_binary``
+    直接喂入与 medium 完全相同的 ``MetricAccumulator``。不产 val_loss（见 ``MetricAccumulator``）。
     """
 
     log_prefix = "Val[full-3D]"
+
+    @staticmethod
+    @torch.no_grad()
+    def _union_bbox_slices(
+        fg: torch.Tensor, margin: int,
+    ) -> "Optional[tuple]":
+        """前景并集掩膜 ``fg``（空间维 bool）的外接 bbox，逐轴外扩 ``margin``
+        并夹到边界。全背景时返回 ``None``（调用方不裁剪）。"""
+        if not bool(fg.any()):
+            return None
+        slices = []
+        for ax in range(fg.ndim):
+            line = fg
+            for d in range(fg.ndim - 1, -1, -1):
+                if d != ax:
+                    line = line.any(dim=d)
+            idx = torch.nonzero(line).flatten()
+            lo = max(int(idx[0].item()) - margin, 0)
+            hi = min(int(idx[-1].item()) + margin + 1, fg.shape[ax])
+            slices.append(slice(lo, hi))
+        return tuple(slices)
 
     def __init__(self, trainer: "Trainer"):
         super().__init__(trainer)
@@ -402,17 +431,31 @@ class VolumeValEvaluator(ValEvaluator):
                     f"target shape {tuple(target_t.shape)} for {path}. "
                     "Predictor output geometry must match the npz label.")
 
-            # 按推理阈值二值化后编码为饱和 logits，复用同一累加算子（避免二次 sigmoid）。
-            # threshold 可为标量或逐前景类列表（后者按通道广播）。
+            # 按推理阈值二值化，以 pred_is_binary 直接喂累加算子（免饱和 logits
+            # 往返与二次 sigmoid）。threshold 可为标量或逐前景类列表（按通道广播）。
             thr_t = torch.as_tensor(
                 predictor.threshold, dtype=prob_t.dtype, device=prob_t.device)
             if thr_t.ndim == 1:
                 thr_t = thr_t.view(-1, 1, 1, 1)
             pred_bin = (prob_t > thr_t).float()
-            pred_logits = (pred_bin - 0.5) * (2.0 * _SATURATION_LOGIT)
+
+            # 可选：按 pred∪GT 并集 bbox 裁剪后再算指标（严格等价，见 config）。
+            # 边距取 surface_dice 容差+1，保证腔蚀/膨胀在裁剪窗内结果不变；
+            # 总体素数按整卷回传，使 TN/MCC 口径不变。
+            voxels_override = None
+            if bool(t.cfg.train.val_metric_bbox_crop):
+                margin = (acc.sd_tol + 1) if acc.compute_sd else 1
+                fg = (pred_bin > 0.5).any(dim=0) | (target_t > 0.5).any(dim=0)
+                sl = self._union_bbox_slices(fg, margin)
+                if sl is not None:
+                    voxels_override = float(target_t.shape[1:].numel())
+                    pred_bin = pred_bin[(slice(None),) + sl]
+                    target_t = target_t[(slice(None),) + sl]
+
             acc.update(
-                pred_logits.unsqueeze(0), target_t.unsqueeze(0),
-                loss_value=None)
+                pred_bin.unsqueeze(0), target_t.unsqueeze(0),
+                loss_value=None, voxels_override=voxels_override,
+                pred_is_binary=True)
         acc.all_reduce(t.num_fg, t.device)
         return acc.compute(log_prefix=self.log_prefix, log=is_main_process())
 

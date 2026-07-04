@@ -132,6 +132,8 @@ class DetPatchDataset(Dataset):
         self.fg_ratio = float(fg_oversample_ratio)
         self.min_vis = float(min_visibility)
         self.seed = int(seed)
+        # 逐卷框真值缓存（mask 连通域派生较贵；samples_per_volume > 1 时复用）。
+        self._box_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         logger.info(
             "DetPatchDataset(%s): %d volumes x %d samples, patch=%s, "
             "spatial_dims=%d (%s)",
@@ -167,11 +169,21 @@ class DetPatchDataset(Dataset):
             out = np.pad(out, pads, mode="edge")
         return out
 
+    def _load(self, path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        cached = self._box_cache.get(path)
+        if cached is None:
+            img, boxes_np, labels_np = load_volume_boxes(
+                path, self.fg_values, self.allow_mask, self.min_box_voxels)
+            self._box_cache[path] = (boxes_np, labels_np)
+            return img, boxes_np, labels_np
+        boxes_np, labels_np = cached
+        with np.load(path, allow_pickle=True) as f:
+            img = np.asarray(f["image"])
+        return img, boxes_np, labels_np
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         vol_idx = idx % len(self.paths)
-        img, boxes_np, labels_np = load_volume_boxes(
-            self.paths[vol_idx], self.fg_values, self.allow_mask,
-            self.min_box_voxels)
+        img, boxes_np, labels_np = self._load(self.paths[vol_idx])
         img = preprocess_image(
             img, self.intensity_min, self.intensity_max, self.normalize,
             self.global_mean, self.global_std, inplace=False)

@@ -56,13 +56,22 @@ def _grid_1d(dim: int, patch: int, n: int) -> List[int]:
 
 def grid_centers(shape: Sequence[int], patch: Sequence[int],
                  max_patches: int, spatial_dims: int) -> List[Tuple[int, ...]]:
-    """patch 中心网格。2.5D / z_axis 沿 z 铺格；3D cubic 三轴铺格。"""
+    """patch 中心网格。2.5D / z_axis 沿 z 铺格（H/W 大于 patch 时面内也铺格，
+    保证整卷覆盖）；3D cubic 三轴铺格。总数上限 ``max_patches``。"""
     if spatial_dims == 2:
-        zs = _grid_1d(shape[0], patch[0], max_patches)
-        return [(z, shape[1] // 2, shape[2] // 2) for z in zs]
-    per_axis = max(int(round(max_patches ** (1 / 3))), 1)
-    axes = [_grid_1d(d, p, per_axis) for d, p in zip(shape, patch)]
-    centers = [(z, y, x) for z in axes[0] for y in axes[1] for x in axes[2]]
+        # 面内铺格数：每轴 ceil(dim / patch)（含半窗重叠的贴边覆盖）。
+        ny = -(-shape[1] // patch[1])
+        nx = -(-shape[2] // patch[2])
+        ys = _grid_1d(shape[1], patch[1], ny)
+        xs = _grid_1d(shape[2], patch[2], nx)
+        n_z = max(max_patches // (len(ys) * len(xs)), 1)
+        zs = _grid_1d(shape[0], patch[0], n_z)
+        centers = [(z, y, x) for z in zs for y in ys for x in xs]
+    else:
+        per_axis = max(int(round(max_patches ** (1 / 3))), 1)
+        axes = [_grid_1d(d, p, per_axis) for d, p in zip(shape, patch)]
+        centers = [(z, y, x)
+                   for z in axes[0] for y in axes[1] for x in axes[2]]
     if len(centers) > max_patches:
         idx = np.linspace(0, len(centers) - 1, max_patches).round().astype(int)
         centers = [centers[i] for i in idx]
@@ -103,8 +112,11 @@ class ClsPredictor:
             if self.spatial_dims == 3:
                 t = t.unsqueeze(0)
             batch.append(t)
-        x = torch.stack(batch).to(self.device)
-        logits = self.model(x)
+        # micro-batch 前向，避免大卷一次性堆叠全部 patch 致 OOM。
+        bs = max(int(self.cls.infer_batch_size), 1)
+        logits = torch.cat([
+            self.model(torch.stack(batch[i:i + bs]).to(self.device))
+            for i in range(0, len(batch), bs)])
         single = not self.cls.multi_label
         probs = (torch.softmax(logits, dim=1) if single
                  else torch.sigmoid(logits))

@@ -127,6 +127,8 @@ class ClsConfig:
     # ---- 验证/推理抽样 --------------------------------------------------
     # 验证与推理时每卷的 patch 网格数上限（沿 z / 三轴均匀网格）。
     eval_patches_per_volume: int = 8
+    # 整卷推理每次前向的 patch 数（micro-batch，防大卷 OOM）。
+    infer_batch_size: int = 16
 
     # ---- 选模 -----------------------------------------------------------
     save_best_metric: str = "auc"   # 'auc' | 'f1' | 'acc' | 'loss'
@@ -248,6 +250,8 @@ def validate_cls(cls: ClsConfig, cfg: SegConfig) -> None:
     _require(cls.eval_patches_per_volume >= 1,
              f"cls.eval_patches_per_volume must be >= 1; got "
              f"{cls.eval_patches_per_volume}.")
+    _require(cls.infer_batch_size >= 1,
+             f"cls.infer_batch_size must be >= 1; got {cls.infer_batch_size}.")
     _require(cls.agg_topk >= 1, f"cls.agg_topk must be >= 1; got {cls.agg_topk}.")
 
 
