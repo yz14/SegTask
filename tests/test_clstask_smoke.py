@@ -118,8 +118,9 @@ def test_backbones_forward():
     from clstask.models.factory import build_classifier
     from segtask_v1.config import Config
 
-    def _mk(spatial_dims, backbone, granularity):
+    def _mk(spatial_dims, backbone, granularity, seg_backbone="resnet"):
         cfg = Config()
+        cfg.model.backbone = seg_backbone
         cfg.data.label_values = [0, 1, 2]   # 2 前景类 → K=2
         cfg.data.num_classes = 3
         cfg.data.patch_size = [16, 64, 64]
@@ -144,14 +145,17 @@ def test_backbones_forward():
             x = torch.randn(2, 1, d[0], d[1], d[2])
         return model(x), granularity, d
 
-    for backbone in ("encoder", "densenet", "vit"):
+    for backbone, seg_bb in (("encoder", "resnet"), ("encoder", "convnext"),
+                             ("densenet", "resnet"), ("vit", "resnet")):
         for sd in (3, 2):
-            logits, gran, d = _mk(sd, backbone, "volume")
-            assert tuple(logits.shape) == (2, 2), (backbone, sd, logits.shape)
+            logits, gran, d = _mk(sd, backbone, "volume", seg_bb)
+            assert tuple(logits.shape) == (2, 2), \
+                (backbone, seg_bb, sd, logits.shape)
         # slice 粒度输出 (B, K, D)
-        logits, _, d = _mk(3, backbone, "slice")
+        logits, _, d = _mk(3, backbone, "slice", seg_bb)
         assert tuple(logits.shape) == (2, 2, d[0]), (backbone, logits.shape)
-        _ok(f"backbone_forward:{backbone}", "3D+2.5D volume/slice logits OK")
+        _ok(f"backbone_forward:{backbone}({seg_bb})",
+            "3D+2.5D volume/slice logits OK")
 
 
 def test_losses_metrics():

@@ -145,10 +145,12 @@ class DetTrainer:
         try:
             for batch in self.val_loader:
                 img, boxes, labels = self._to_device(batch)
-                dets = self.model(img)
+                # 金字塔只前向一次，predict 与 loss 共用。
+                feats = self.model.extract_pyramid(img)
+                img_size = list(img.shape[2:])
+                dets = self.model.det_head.predict(feats, img_size)
                 losses = self.model.det_head.compute_loss(
-                    self.model.extract_pyramid(img), boxes, labels,
-                    list(img.shape[2:]))
+                    feats, boxes, labels, img_size)
                 loss_meter.update(float(sum(losses.values()).item()),
                                   img.shape[0])
                 preds.extend(dets)

@@ -116,11 +116,12 @@ class FCOSHead(nn.Module):
                     g = best_g[pos]
                     tgt_cls[pos, gl[g]] = 1.0
                     dpos = dist[pos, g].float()                  # (Np, 2d)
-                    # centerness：逐轴 min/max 比的几何平均。
+                    # centerness：逐轴 min/max 比的几何平均
+                    # （2D 退化为标准 FCOS 的 sqrt(lr·tb)）。
                     lo_d, hi_d = dpos[:, :d], dpos[:, d:]
                     ctr_tgt = ((torch.min(lo_d, hi_d)
                                 / torch.max(lo_d, hi_d).clamp(min=1e-6))
-                               .prod(-1).clamp(min=0).pow(1.0 / d).sqrt())
+                               .prod(-1).clamp(min=0).pow(1.0 / d))
                     pred_box = self._decode(pts[pos], reg_d[b][pos].float())
                     total_reg = total_reg + box_reg_loss(
                         pred_box, gb[g], det.reg_loss if det.reg_loss !=
