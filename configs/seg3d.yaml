@@ -138,7 +138,7 @@ model:
   activation        : "leakyrelu"    # 'relu' | 'leakyrelu' | 'gelu' | 'swish'
   dropout           : 0.0            # dropout 比例
   se_reduction      : 16             # SE reduction ratio
-  attention_type    : "none"         # 'none' | 'se' | 'eca' | 'cbam' | 'coord'
+  attention_type    : "none"         # 'none' | 'se' | 'eca' | 'cbam' | 'coord' | 'lka' | 'msca'
   skip_attention    : false          # Skip 路 AttentionGate3D
   attn_gate_norm    : "batch"        # 仅 skip_attention=true
   deep_supervision  : true           # 多 decoder 层预测
@@ -259,6 +259,9 @@ train:
   use_ema                      : true               # 是否启用 EMA
   ema_decay                    : 0.999              # 仅 use_ema=true
   ema_warmup                   : true               # 仅 use_ema=true
+  swa_enabled                  : false              # SWA 尾段等权权重平均（与 EMA 正交可叠加）
+  swa_start_ratio              : 0.75               # 仅 swa_enabled=true；开始平均的进度比例 (0,1)
+  swa_bn_update_steps          : 50                 # 仅 swa_enabled=true；收尾 BN 统计重估 batch 数（无 BN 自动跳过）
   output_dir                   : "outputs/base3d"
   save_every                   : 10                 # 每隔多少 epoch 保存一次
   save_keep_last               : 3                  # 保留最近多少个 checkpoint

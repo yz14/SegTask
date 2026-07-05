@@ -35,8 +35,10 @@ from ..data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from ..models.unet import UNet3D
 from ..models.mednext import upkern_remap_state_dict
+from ..predictor.adabn import collect_bn_modules, estimate_bn_stats
 from ..utils import (
-    AverageMeter, ModelEMA, Timer, compute_dice_per_class, seed_everything,
+    AverageMeter, ModelEMA, ModelSWA, Timer, compute_dice_per_class,
+    seed_everything,
 )
 from . import views
 from .amp import (
@@ -181,6 +183,12 @@ class Trainer:
         self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup,
                              offload_device=(tc.ema_device or None))
                     if tc.use_ema else None)
+
+        # --- SWA 尾段权重平均（opt-in，见 TrainConfig.swa_enabled）---------
+        self.swa = ModelSWA(self.model) if tc.swa_enabled else None
+        self._swa_start_epoch = (
+            int(math.floor(tc.swa_start_ratio * tc.epochs))
+            if tc.swa_enabled else 0)
 
         # --- torch.compile (最后) -------------------------------------
         self._compile_enabled = False
@@ -376,6 +384,9 @@ class Trainer:
             train_metrics = self._train_epoch(epoch)
             train_time_s = time.time() - epoch_t0
 
+            if self.swa is not None and epoch >= self._swa_start_epoch:
+                self.swa.update(unwrap_compile(self.model))
+
             val_metrics: Dict[str, float] = {}
             val_time_s = 0.0
             if (epoch + 1) % tc.val_every == 0 or epoch == tc.epochs - 1:
@@ -474,6 +485,11 @@ class Trainer:
             logger.info("Training complete. No validation best recorded. "
                         "Time: %s", timer.elapsed_str())
         logger.info("=" * 60)
+        try:
+            self._finalize_swa()
+        except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
+            logger.exception("SWA finalization failed; online/best "
+                             "checkpoints are unaffected.")
         self._monitor_finalize(final_status)
         if self._ckpt_saver is not None:
             # 收尾前排空异步写盘队列；写盘异常在此抛出。
@@ -988,6 +1004,91 @@ class Trainer:
                 torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
+    # SWA finalization（见 TrainConfig.swa_enabled）
+    # ------------------------------------------------------------------
+    def _finalize_swa(self) -> None:
+        """SWA 收尾：换入平均权重 → 重估 BN → 验证 → rank0 另存 swa_model.pth。
+
+        所有 rank 均参与（验证/BN 重估可能含集合通信），仅 rank0 落盘。
+        早停等原因未收集到任何快照时跳过。结束后恢复在线权重。"""
+        if self.swa is None:
+            return
+        tc = self.cfg.train
+        if self.swa.n_averaged == 0:
+            logger.warning(
+                "SWA enabled but no snapshots collected (training ended "
+                "before start epoch %d = swa_start_ratio %.2f x %d epochs); "
+                "skipping SWA finalization.",
+                self._swa_start_epoch + 1, tc.swa_start_ratio, tc.epochs)
+            return
+        bare = unwrap_compile(self.model)
+        self.swa.apply_shadow(bare)
+        try:
+            self.model.eval()
+            self._swa_recalibrate_bn()
+            metrics: Dict[str, float] = {}
+            try:
+                metrics = self.evaluator.evaluate(tc.epochs - 1)
+            except Exception:
+                logger.warning(
+                    "SWA validation failed; saving SWA weights anyway.",
+                    exc_info=True)
+            metric_str = ", ".join(
+                f"{k}={v:.4f}" for k, v in metrics.items()
+                if isinstance(v, (int, float))) or "n/a"
+            logger.info(
+                "SWA (avg of %d epoch snapshots, from epoch %d): %s",
+                self.swa.n_averaged, self._swa_start_epoch + 1, metric_str)
+            if self._is_main:
+                path = self.output_dir / "swa_model.pth"
+                torch.save({
+                    "model_state_dict": bare.state_dict(),
+                    "swa_n_averaged": self.swa.n_averaged,
+                    "swa_val_metrics": metrics,
+                    "config": self.cfg,
+                }, path)
+                logger.info("SWA model saved: %s", path)
+        finally:
+            self.swa.restore(bare)
+
+    def _swa_recalibrate_bn(self) -> None:
+        """在若干 train batch 上重估 BN running stats（AdaBN 同款累积平均）。
+
+        平均权重下各层激活分布改变，BN 的 running stats 不再匹配；用未增强
+        的训练数据前向重估（与推理分布同构）。模型无 BatchNorm（instance/
+        group norm）时为 no-op。"""
+        steps = int(self.cfg.train.swa_bn_update_steps)
+        if steps <= 0:
+            return
+        bn_modules = collect_bn_modules(unwrap_compile(self.model))
+        if not bn_modules:
+            return
+        n_batches = min(steps, len(self.train_loader))
+        logger.info(
+            "SWA: re-estimating %d BatchNorm module(s) running stats on "
+            "%d train batch(es).", len(bn_modules), n_batches)
+
+        @torch.no_grad()
+        def _run_forward() -> None:
+            for step, batch in enumerate(self.train_loader):
+                if step >= steps:
+                    break
+                image = batch["image"].to(self.device, non_blocking=True)
+                label = batch["label"].to(
+                    self.device, non_blocking=True).float()
+                if self.needs_crop:
+                    image, label, _ = views.center_crop(
+                        image, label, None, self.target_patch_size)
+                image, _sup = self.pipeline.prepare_batch(image, label, None)
+                if self._memory_format is not None:
+                    image = image.to(memory_format=self._memory_format)
+                with autocast(device_type="cuda", enabled=self.use_amp,
+                              dtype=self.amp_dtype):
+                    self.model(image)
+
+        estimate_bn_stats(bn_modules, _run_forward)
+
+    # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)
     # ------------------------------------------------------------------
     def _build_state_dict(self, ema_as_primary: bool) -> Dict:
@@ -1018,6 +1119,9 @@ class Trainer:
             "rng_state": rng_state,
             "config": self.cfg,
         }
+
+        if self.swa is not None:
+            state["swa_state_dict"] = self.swa.state_dict()
 
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
@@ -1102,6 +1206,8 @@ class Trainer:
             self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         if self.ema is not None and "ema_state_dict" in ckpt:
             self.ema.load_state_dict(ckpt["ema_state_dict"])
+        if self.swa is not None and "swa_state_dict" in ckpt:
+            self.swa.load_state_dict(ckpt["swa_state_dict"])
 
         self.start_epoch = ckpt.get("epoch", -1) + 1
         default_best = -math.inf if self._best_mode == "max" else math.inf

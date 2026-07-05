@@ -366,9 +366,73 @@ class CoordAttention3D(nn.Module):
         return out
 
 
+# Large Kernel Attention (Guo 2022, VAN)：大核卷积分解为 DW 小核 + DW 膨胀大核 +
+# 1×1，产生空间-通道联合注意力图后逐元素加权；成本远低于自注意力。
+class LKA3D(nn.Module):
+    """nD Large Kernel Attention：DW k1 → DW k2(dilation) → 1×1 → 逐元素门控。
+
+    默认 k1=5、k2=7、dilation=3，等效感受野≈ 21³（VAN 原始配方）。padding
+    对称补齐，任意空间尺寸（含深层小特征图）均合法。注意力图不过 sigmoid
+    （与 VAN 一致，保留负相关抑制能力）。"""
+
+    def __init__(self, channels: int, spatial_dims: int = 3,
+                 kernel_size: int = 5, dilated_kernel_size: int = 7,
+                 dilation: int = 3):
+        super().__init__()
+        d = _check_dims(spatial_dims)
+        conv = _CONV[d]
+        self.dw = conv(channels, channels, kernel_size,
+                       padding=kernel_size // 2, groups=channels)
+        self.dw_dilated = conv(
+            channels, channels, dilated_kernel_size,
+            padding=(dilated_kernel_size // 2) * dilation,
+            dilation=dilation, groups=channels)
+        self.pw = conv(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.pw(self.dw_dilated(self.dw(x)))
+
+
+# Multi-Scale Convolutional Attention (Guo 2022, SegNeXt)：DW 小核局部聚合 +
+# 多尺度逐轴条形 DW 核分支 + 1×1 融合 → 逐元素加权。条形核逐轴独立，对
+# 各向异性医学体数据（大层厚）及细长结构尤其合适。
+class MSCA3D(nn.Module):
+    """nD Multi-Scale Conv Attention（SegNeXt 的 nD 推广）。
+
+    每个尺度分支对各空间轴依次做长度 k 的条形 DW 卷积（2D 即 1×k + k×1，
+    3D 再多一轴）；分支和 + 局部项后经 1×1 混合通道得注意力图。默认
+    scales=(7, 11, 21) 为 SegNeXt 原始配方；padding 对称补齐，任意空间
+    尺寸合法。"""
+
+    def __init__(self, channels: int, spatial_dims: int = 3,
+                 local_kernel_size: int = 5,
+                 scales: Tuple[int, ...] = (7, 11, 21)):
+        super().__init__()
+        d = _check_dims(spatial_dims)
+        conv = _CONV[d]
+        self.local = conv(channels, channels, local_kernel_size,
+                          padding=local_kernel_size // 2, groups=channels)
+        # 每尺度一个分支：逐轴条形 DW 核串接（轴 axis 上长 k，其余轴 1）。
+        self.branches = nn.ModuleList()
+        for k in scales:
+            strips = []
+            for axis in range(d):
+                size = tuple(k if i == axis else 1 for i in range(d))
+                pad  = tuple(k // 2 if i == axis else 0 for i in range(d))
+                strips.append(conv(channels, channels, size,
+                                   padding=pad, groups=channels))
+            self.branches.append(nn.Sequential(*strips))
+        self.pw = conv(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a = self.local(x)
+        attn = a + sum(branch(a) for branch in self.branches)
+        return x * self.pw(attn)
+
+
 def make_attention(name: str, channels: int,
                    spatial_dims: int = 3, **kwargs) -> nn.Module:
-    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'。
+    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'/'lka'/'msca'。
 
     kwargs：``reduction``；``norm_type``/``norm_groups`` 仅 'coord' 使用
     （其余类型无归一化层）。"""
@@ -388,12 +452,16 @@ def make_attention(name: str, channels: int,
                                 spatial_dims=spatial_dims,
                                 norm_type=kwargs.get("norm_type", "group"),
                                 norm_groups=kwargs.get("norm_groups", 8))
+    if name == "lka":
+        return LKA3D(channels, spatial_dims=spatial_dims)
+    if name == "msca":
+        return MSCA3D(channels, spatial_dims=spatial_dims)
     raise ValueError(
         f"Unknown attention type: {name!r}. "
-        f"Valid: none|se|eca|cbam|coord")
+        f"Valid: none|se|eca|cbam|coord|lka|msca")
 
 
-ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord")
+ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord", "lka", "msca")
 
 
 # ---------------------------------------------------------------------------
