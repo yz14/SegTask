@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 _VAL_SAMPLING_SEED = 0x5EED_2024
 
 
+def _halton(i: int, base: int) -> float:
+    """Halton 低差异序列第 i 项（i>=1），返回 [0,1) 内均匀覆盖的确定性分数；
+    不同素数 base 给出准独立维度（val_grid_coverage 的 3D 中心铺点用 2/3/5）。"""
+    f, r = 1.0, 0.0
+    while i > 0:
+        f /= base
+        r += f * (i % base)
+        i //= base
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Volume I/O
 # ---------------------------------------------------------------------------
@@ -502,7 +513,8 @@ class SegDatasetNpzBase(Dataset):
         is_train            : bool,
         cache_enabled       : bool,
         cache_max_volumes   : int,
-        region_weights      : Optional[List[float]]):
+        region_weights      : Optional[List[float]],
+        val_grid_coverage   : bool = False):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert npz_paths is not None and len(npz_paths) == len(image_paths), (
@@ -523,6 +535,7 @@ class SegDatasetNpzBase(Dataset):
         self.samples_per_volume = samples_per_volume
         self.is_train           = is_train
         self.region_weights     = region_weights
+        self.val_grid_coverage  = bool(val_grid_coverage)
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -564,6 +577,14 @@ class SegDatasetNpzBase(Dataset):
         if self.is_train:
             return self._rng()
         return np.random.default_rng((_VAL_SAMPLING_SEED, self._sample_idx))
+
+    def _val_coverage_pos(self) -> Optional[Tuple[int, int]]:
+        """val 确定性网格覆盖（val_grid_coverage=True）：返回当前样本在卷内的
+        序号 j 与每卷样本数 S；未启用或训练态返回 None（回退随机位置）。"""
+        if self.is_train or not self.val_grid_coverage:
+            return None
+        j = self._sample_idx // len(self.image_paths)
+        return j, max(int(self.samples_per_volume), 1)
 
     # ------------------------------------------------------------------
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
@@ -643,7 +664,8 @@ class SegDataset3D(SegDatasetNpzBase):
         cache_max_volumes          : int = 0,
         region_weights             : Optional[List[float]] = None,
         z_boundary_mode            : str = "stretch",
-        npz_paths                  : Optional[List[str]] = None):
+        npz_paths                  : Optional[List[str]] = None,
+        val_grid_coverage          : bool = False):
 
         super().__init__(
             image_paths          = image_paths,
@@ -661,7 +683,8 @@ class SegDataset3D(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            val_grid_coverage    = val_grid_coverage)
         if z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
@@ -773,6 +796,11 @@ class SegDataset3D(SegDatasetNpzBase):
         """采样中心 z：训练以 fg_ratio 概率从前景切片采样（npz 含逐类索引时
         先均匀选类再选该类切片，避免稀有类被大器官挤压），否则均匀采样；
         验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
+        cov = self._val_coverage_pos()
+        if cov is not None:
+            # 网格覆盖：卷内第 j 个样本取 z 轴等距位置（bin 中心）。
+            j, S = cov
+            return min(int((j + 0.5) * D_vol / S), D_vol - 1)
         fg_slices = self._vol_fg_slices[vol_idx]
         rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
@@ -890,7 +918,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         cache_enabled              : bool = True,
         cache_max_volumes          : int = 0,
         region_weights             : Optional[List[float]] = None,
-        npz_paths                  : Optional[List[str]] = None):
+        npz_paths                  : Optional[List[str]] = None,
+        val_grid_coverage          : bool = False):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -907,8 +936,9 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
-            region_weights       = region_weights)
-        
+            region_weights       = region_weights,
+            val_grid_coverage    = val_grid_coverage)
+
         self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
@@ -1027,6 +1057,15 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         导致>50% 体素来自边界复制（偏移训练分布）。验证用逐样本确定性
         RNG（见 _sample_rng）。"""
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
+        cov = self._val_coverage_pos()
+        if cov is not None:
+            # 网格覆盖：卷内第 j 个样本用 Halton(2,3,5) 低差异序列均匀铺满
+            # 安全中心域（任意 S 均可，无需三轴因子分解）。
+            j, _ = cov
+            fd, fh, fw = (_halton(j + 1, b) for b in (2, 3, 5))
+            return (dlo + min(int(fd * (dhi - dlo)), dhi - dlo - 1),
+                    hlo + min(int(fh * (hhi - hlo)), hhi - hlo - 1),
+                    wlo + min(int(fw * (whi - wlo)), whi - wlo - 1))
         fg_coords = self._vol_fg_coords[vol_idx]
         rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0

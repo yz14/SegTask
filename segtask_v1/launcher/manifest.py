@@ -59,6 +59,7 @@ ENUMS: Dict[str, List[str]] = {
     "model.norm_type":             ["batch", "instance", "group"],
     "model.activation":            ["relu", "leakyrelu", "gelu", "swish"],
     "model.attention_type":        ["none", "se", "eca", "cbam", "coord"],
+    "model.attn_gate_norm":        ["auto", "batch", "instance", "group"],
     "model.aux_head_mode":         ["linear", "conv"],
     "model.aux_topo_target":       ["centerline", "distance"],
     "model.aux_topo_head_mode":    ["linear", "conv"],
