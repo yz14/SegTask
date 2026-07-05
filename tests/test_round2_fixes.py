@@ -480,7 +480,8 @@ def test_trainer_skips_poisoned_nonfinite_grads_on_no_scaler_path():
     for k, v in before.items():
         assert torch.equal(after[k], v), k
     assert trainer.scheduler.current_step == 1
-    assert trainer.ema.num_updates == 1
+    # 跳过的优化步不推 EMA（权重未变，num_updates 不应白增）。
+    assert trainer.ema.num_updates == 0
 
 
 def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
@@ -492,12 +493,16 @@ def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
         def __init__(self):
             self.step_calls = 0
             self.step_execs = 0
+            self._scale = 65536.0
 
         def scale(self, loss):
             return loss
 
         def unscale_(self, optimizer):
             return None
+
+        def get_scale(self):
+            return self._scale
 
         def step(self, optimizer):
             self.step_calls += 1
@@ -512,6 +517,9 @@ def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
             if grads_finite:
                 optimizer.step()
                 self.step_execs += 1
+            else:
+                # 仿 GradScaler：跳步时 scale 回退减半。
+                self._scale *= 0.5
 
         def update(self):
             return None
@@ -561,7 +569,8 @@ def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
     assert spy.step_calls == 1
     assert spy.step_execs == 0
     assert trainer.scheduler.current_step == 1
-    assert trainer.ema.num_updates == 1
+    # scale 回退被识别为跳步，EMA 不推进。
+    assert trainer.ema.num_updates == 0
 
 
 def test_bug5_plateau_mode_from_config():
