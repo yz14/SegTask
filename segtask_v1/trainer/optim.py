@@ -231,7 +231,34 @@ class WarmupScheduler:
         self.current_step = int(state.get("current_step", 0))
         base_state = state.get("base_scheduler", None)
         if base_state is not None and self.scheduler is not None:
+            base_state = self._reconcile_one_cycle_horizon(base_state)
             self.scheduler.load_state_dict(base_state)
+
+    def _reconcile_one_cycle_horizon(self, base_state: Dict) -> Dict:
+        """OneCycleLR 的 total_steps 在构建时定死；resume 时若 epochs/累积/数据量
+        变化导致 horizon 漂移，直接恢复旧状态会在超出旧 total_steps 时抛
+        "Tried to step ... times"。这里检出漂移：保留新构建的 horizon/相位边界，
+        仅把已走步数按比例折算进新 horizon 并告警。无漂移时原样返回。"""
+        if not isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            return base_state
+        ckpt_total = base_state.get("total_steps")
+        cur_total = int(self.scheduler.total_steps)
+        if ckpt_total is None or int(ckpt_total) == cur_total:
+            return base_state
+        old_last = int(base_state.get("last_epoch", 0))
+        new_last = min(
+            int(round(old_last / max(int(ckpt_total), 1) * cur_total)),
+            cur_total - 1)
+        logger.warning(
+            "OneCycleLR horizon drift on resume: ckpt total_steps=%s vs "
+            "current=%d (epochs/grad_accum/dataset size changed?). Keeping "
+            "the freshly built schedule and fast-forwarding last_epoch "
+            "%d -> %d proportionally.",
+            ckpt_total, cur_total, old_last, new_last)
+        new_state = self.scheduler.state_dict()
+        new_state["last_epoch"] = new_last
+        new_state["_step_count"] = new_last + 1
+        return new_state
 
 
 __all__ = ["build_optimizer", "build_scheduler", "WarmupScheduler"]

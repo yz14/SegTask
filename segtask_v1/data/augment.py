@@ -44,22 +44,24 @@ class GPUAugmentor:
 
         c = self.cfg
 
-        # Spatial: flip / affine / elastic / grid-dropout
+        # Spatial: flip / (affine+elastic 融合单次 warp) / grid-dropout
         image, label, weight_map = _random_flip(
             image, label, c.random_flip_prob, c.random_flip_axes, weight_map=weight_map)
-        image, label, weight_map = _random_affine(
-            image, label, c.random_affine_prob, c.random_rotate_range,
-            c.random_scale_range, weight_map=weight_map,
+        # 按 max_scale 缩小 alpha。
+        effective_alpha = c.elastic_deform_alpha / self.max_scale
+        image, label, weight_map = _random_affine_elastic(
+            image, label,
+            affine_prob=c.random_affine_prob,
+            rotate_range=c.random_rotate_range,
+            scale_range=c.random_scale_range,
+            elastic_prob=c.elastic_deform_prob,
+            sigma=c.elastic_deform_sigma,
+            alpha=effective_alpha,
+            weight_map=weight_map,
             wmap_mode=self.wmap_interp_mode,
             translate_range=c.random_translate_range,
             rotate_range_per_axis=c.random_rotate_range_per_axis,
             aspect_correct=c.random_affine_aspect_correct)
-        # 按 max_scale 缩小 alpha。
-        effective_alpha = c.elastic_deform_alpha / self.max_scale
-        image, label, weight_map = _elastic_deform(
-            image, label, c.elastic_deform_prob, c.elastic_deform_sigma,
-            effective_alpha, weight_map=weight_map,
-            wmap_mode=self.wmap_interp_mode)
         image, label, weight_map = _grid_dropout(
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
             c.grid_dropout_holes, weight_map=weight_map)
@@ -229,7 +231,8 @@ def _elastic_deform(
     weight_map: Optional[torch.Tensor] = None,
     wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本 3D 弹性形变。sigma 控平滑度（常 4–9）；alpha 控位移幅度体素（常 3–12）。"""
+    """逐样本 3D 弹性形变。sigma 控平滑度（常 4–9）；alpha 控位移幅度体素（常 3–12，
+    近似标称：粗网格 randn 上采平滑使方差 <1，实际典型位移小于 alpha）。"""
     B, _, D, H, W = image.shape
     device = image.device
 
@@ -240,7 +243,24 @@ def _elastic_deform(
     idx = mask.nonzero(as_tuple=True)[0]
     n = idx.shape[0]
 
-    # 粗采样位移，上采平滑。
+    grid = _identity_grid(n, D, H, W, device) + _elastic_grid_disp(
+        n, D, H, W, sigma, alpha, device)
+
+    image[idx] = F.grid_sample(
+        image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
+    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
+    if weight_map is not None:
+        weight_map[idx] = F.grid_sample(
+            weight_map[idx], grid, mode=wmap_mode,
+            padding_mode="border", align_corners=False)
+
+    return image, label, weight_map
+
+
+def _elastic_grid_disp(
+    n: int, D: int, H: int, W: int,
+    sigma: float, alpha: float, device: torch.device) -> torch.Tensor:
+    """采样 n 个弹性位移场，返 (n,D,H,W,3) 归一化 grid 坐标位移（轴序 W,H,D）。"""
     cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
     cW = max(int(round(W / sigma)), 4)
@@ -253,13 +273,84 @@ def _elastic_deform(
                      dtype=disp.dtype, device=device),
         'c -> 1 c 1 1 1')
     disp = disp * alpha * voxel_to_grid
+    return rearrange(disp, 'b c d h w -> b d h w c')
 
-    grid = _identity_grid(n, D, H, W, device) + rearrange(
-        disp, 'b c d h w -> b d h w c')
+
+def _random_affine_elastic(
+    image: torch.Tensor, label: torch.Tensor,
+    affine_prob: float, rotate_range: list, scale_range: list,
+    elastic_prob: float, sigma: float, alpha: float,
+    weight_map: Optional[torch.Tensor] = None,
+    wmap_mode: str = "nearest",
+    translate_range: Optional[list] = None,
+    rotate_range_per_axis: Optional[list] = None,
+    aspect_correct: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """仿射与弹性形变融合为单次 grid_sample。
+
+    两路选中掩码仍逐样本独立采样；对同时选中的样本，合成采样网格
+    G(x) = Θ(x + d(x)) = affine_grid + M·d（M 为 Θ 的 3×3 线性部分），与
+    “先 affine 后 elastic 两次重采样”的采样位置一致，但只插值一次：
+    省一轮 grid_sample，且避免双重插值叠加模糊。各参数语义同
+    ``_random_affine`` / ``_elastic_deform``。"""
+    B, _, D, H, W = image.shape
+    device = image.device
+
+    mask_a = torch.rand(B, device=device) < affine_prob
+    mask_e = torch.rand(B, device=device) < elastic_prob
+    mask = mask_a | mask_e
+    if not mask.any():
+        return image, label, weight_map
+
+    idx = mask.nonzero(as_tuple=True)[0]
+    n = idx.shape[0]
+    sel_a = mask_a[idx]  # (n,) 选中样本内的 affine 子集
+    sel_e = mask_e[idx]
+
+    # 逐样本 3x4 仿射；未选 affine 的样本用单位阵。
+    theta = torch.eye(3, 4, device=device).unsqueeze(0).repeat(n, 1, 1)
+    na = int(sel_a.sum().item())
+    if na:
+        if rotate_range_per_axis is not None:
+            angles = torch.empty(na, 3, device=device)  # (na, 3) for x,y,z
+            for ax in range(3):
+                lo = math.radians(rotate_range_per_axis[ax][0])
+                hi = math.radians(rotate_range_per_axis[ax][1])
+                angles[:, ax].uniform_(lo, hi)
+        else:
+            lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
+            angles = torch.empty(na, 3, device=device).uniform_(lo, hi)
+        scales = torch.empty(na, 1, device=device).uniform_(
+            scale_range[0], scale_range[1])
+
+        translations = None
+        if translate_range is not None and (
+                translate_range[0] != 0.0 or translate_range[1] != 0.0):
+            translations = torch.empty(na, 3, device=device).uniform_(
+                translate_range[0], translate_range[1])
+
+        aspect = None
+        if aspect_correct:
+            # affine_grid 坐标轴序 (x,y,z)=(W,H,D)；只用比例，公共尺度无影响。
+            aspect = torch.tensor(
+                [float(W), float(H), float(D)],
+                device=device, dtype=torch.float32)
+        theta[sel_a] = _build_rotation_matrices(
+            angles, scales, translations, aspect)
+
+    grid = F.affine_grid(theta, [n, 1, D, H, W], align_corners=False)
+
+    ne = int(sel_e.sum().item())
+    if ne:
+        disp = _elastic_grid_disp(ne, D, H, W, sigma, alpha, device)
+        # G(x)=Θ(x+d)=Θx + M·d；d 与 M 均为 (x,y,z) 轴序。
+        m = theta[sel_e][:, :, :3]  # (ne,3,3)
+        grid[sel_e] = grid[sel_e] + torch.einsum('n r c, n d h w c -> n d h w r', m, disp)
 
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
-    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
+    label[idx] = F.grid_sample(
+        label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
     if weight_map is not None:
         weight_map[idx] = F.grid_sample(
             weight_map[idx], grid, mode=wmap_mode,
@@ -294,9 +385,10 @@ def _grid_dropout(
         return image, label, weight_map
 
     frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
-    hd = max(1, int(D * frac))
-    hh = max(1, int(H * frac))
-    hw = max(1, int(W * frac))
+    # 逐轴夹到轴长：frac>1（ratio 大 / holes 少）时洞不得超过该轴，否则索引越界。
+    hd = min(D, max(1, int(D * frac)))
+    hh = min(H, max(1, int(H * frac)))
+    hw = min(W, max(1, int(W * frac)))
 
     # 逐样本 hole 左上角。
     d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)

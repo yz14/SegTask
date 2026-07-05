@@ -147,6 +147,8 @@ class DataConfig:
     samples_per_volume: int = 8
 
     # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
+    # 本 Config 默认 1（每 worker 仅缓最近 1 卷）；Dataset 构造签名的默认 0 只是
+    # 直接实例化时的后备，经 Config 路径始终以此处为准。
     cache_mode       : str = "memory"
     cache_max_volumes: int = 1
 
@@ -175,9 +177,12 @@ class AugConfig:
     random_flip_prob: float = 0.2
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
-    # Affine：小角旋转 + 缩放 + 平移，合成单次 grid_sample。
+    # Affine：小角旋转 + 缩放 + 平移合成单一仿射；与 elastic 形变进一步融合为
+    # 单次 grid_sample（同时选中的样本也只插值一遍）。
     random_affine_prob : float = 0.3
     random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
+    # 缩放作用在采样网格上（反向语义）：>1 采样窗外扩→物体在输出中变小，
+    # <1 反之。范围对称时增强效果等价，仅语义方向与直觉相反。
     random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
     # 逐轴旋转角范围（(x,y,z)=(W,H,D) 三对 [lo,hi]，度）。None=三轴共用
     # random_rotate_range。CT 惯例：面内(绕 D 轴，即 z)可大角、出面(绕 W/H)宜小角。
@@ -191,7 +196,9 @@ class AugConfig:
     # 弹性形变（B-spline 随机位移场）。
     elastic_deform_prob : float = 0.2
     elastic_deform_sigma: float = 5.0   # 位移平滑度
-    elastic_deform_alpha: float = 7.0   # 位移幅度（voxel）
+    # 位移幅度（voxel，近似标称）：位移场由粗网格 randn 上采平滑得到，
+    # 方差衰减使实际典型位移小于该值；多分辨率时另除以 max_scale。
+    elastic_deform_alpha: float = 7.0
 
     # Grid dropout：随机遮挡矩形子区域。
     grid_dropout_prob : float = 0.0

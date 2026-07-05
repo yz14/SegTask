@@ -729,17 +729,25 @@ class Trainer:
                         if (self._is_dist and not is_step_boundary)
                         else contextlib.nullcontext())
 
+            # 分量诊断仅在日志步抽取：breakdown 的逐分量 .item() 会强制
+            # CUDA→CPU 同步，非日志步传 None 让 pipeline 跳过标量抽取。
+            is_log_step = (step + 1) % tc.log_every == 0 or step == 0
+            breakdown: Dict[str, float] = {}
+
             # Forward AMP / Loss fp32（Dice/BCE 在 fp16 下汇总易溢出 → NaN）
             with sync_ctx:
                 with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                     pred = self.fwd_model(image)
-                breakdown: Dict[str, float] = {}
-                loss = self.pipeline.compute_loss(pred, sup, breakdown=breakdown)
+                loss = self.pipeline.compute_loss(
+                    pred, sup, breakdown=breakdown if is_log_step else None)
                 if effective_accum > 1:
                     loss = loss / effective_accum
 
                 self.scaler.scale(loss).backward()
-            collect_multi_res_breakdown(self.criterion, self.aux_loss_fn, breakdown)
+            if is_log_step:
+                # per-res history 在非日志步间累积，pop 时取窗口均值。
+                collect_multi_res_breakdown(
+                    self.criterion, self.aux_loss_fn, breakdown)
 
             # 未缩放损失；非有限值驱动 meter 跳过与无 scaler 路径的优化步保护。
             step_loss = (loss.item() * effective_accum
@@ -789,7 +797,7 @@ class Trainer:
 
                 # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
                 # bf16/fp32 在 loss 或梯度非有限时丢弃本 accum 组梯度，
-                # 避免 NaN 永久污染权重与 EMA（scheduler/EMA 照常推进）。
+                # 避免 NaN 永久污染权重与 EMA（scheduler 照常推进，EMA 不推进）。
                 skip_optim_step = (
                     (loss_nonfinite or grad_nonfinite)
                     and not self._scaler_active)
@@ -808,8 +816,8 @@ class Trainer:
                         self._amp_dtype_name)
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()
-                    if self.ema is not None:
-                        self.ema.update(unwrap_compile(self.model))
+                    # 不推 EMA：权重未变，update 只会白增 num_updates（推进
+                    # warmup decay）并在 CPU offload 时多一次 D2H 同步。
                     if self._health_monitor:
                         opt_steps += 1
                     continue
@@ -825,11 +833,18 @@ class Trainer:
                             "update/weight ratio this epoch.", exc_info=True)
                         pre_step_snapshot = None
 
+                scale_before = (self.scaler.get_scale()
+                                if self._scaler_active else None)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                # GradScaler 跳步（梯度含 inf/NaN）时会把 scale 回退减半；
+                # 据此识别未生效的优化步，不推 EMA。
+                scaler_skipped = (
+                    scale_before is not None
+                    and self.scaler.get_scale() < scale_before)
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scheduler.step()
-                if self.ema is not None:
+                if self.ema is not None and not scaler_skipped:
                     self.ema.update(unwrap_compile(self.model))
 
                 if pre_step_snapshot is not None:
@@ -867,7 +882,7 @@ class Trainer:
                         one_step_peak, accum)
                     self._first_step_mem_logged = True
 
-            if (step + 1) % tc.log_every == 0 or step == 0:
+            if is_log_step:
                 with torch.no_grad():
                     p = self.pipeline.extract_main_pred(pred)        # 主路
                     p_1x, lbl_1x = self.pipeline.split_for_metrics(  # 主路
@@ -881,6 +896,8 @@ class Trainer:
                     step + 1, total_steps, step_loss, mean_dice,
                     self.scheduler.get_lr(), aux_msg)
 
+        # train dice / 分量损失均只在日志步采样，epoch 值为抽样均值（廉价监控），
+        # 与 val 的全量指标口径不同。
         out = {"loss": loss_meter.avg, "dice": dice_meter.avg}
         for name, meter in component_meters.items():
             out[name] = meter.avg
