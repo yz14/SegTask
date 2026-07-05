@@ -335,6 +335,8 @@ class PatchValEvaluator(ValEvaluator):
                 pred = t.model(image)
                 pred = t.pipeline.extract_main_pred(pred)
                 pred_1x, target_1x = t.pipeline.split_for_metrics(pred, label)
+            # val_loss 用裸 base_loss（无 DS/aux/topo 加权），与训练组合损失
+            # 口径不同，两条曲线不可直接对比，仅作趋势监控。
             loss = compute_loss_fp32(t.base_loss, pred_1x, target_1x)
             loss_val = loss.item()
             if not math.isfinite(loss_val):

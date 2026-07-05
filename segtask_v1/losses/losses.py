@@ -738,8 +738,9 @@ class MultiResolutionLoss(nn.Module):
 
         # 诊断：每次 forward 把每个分辨率的损失以 detached tensor 追加到 history
         # （不在热路径上 .item() 同步）。被 DeepSupervisionLoss 多次调用时，
-        # history 会累积多次（每个 DS 尺度一行）。训练循环每个 step 末尾
-        # 调用 pop_per_res_diag() 取行均值并清空（单次同步）。
+        # history 会累积多次（每个 DS 尺度一行）。训练循环仅在日志步
+        # 调用 pop_per_res_diag() 取行均值并清空（单次同步），因此诊断值
+        # 是自上次日志步以来的窗口均值，history 长度上限 ≈ log_every×DS 尺度数。
         self._per_res_history: List[torch.Tensor] = []
 
     def pop_per_res_diag(self) -> Optional[List[float]]:

@@ -972,12 +972,16 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
         result = {
             # 领头 "1" = 压叠 C_res 轴；trainer 逐视图裁+resize。
-            "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
+            # ascontiguousarray：无越界填充时 _extract_cubic_patch 返回的是缓存卷
+            # 的视图，这里复制断开别名，避免下游 in-place 操作污染 LRU 缓存；
+            # 同时保证内存连续，利于 pin_memory。
+            "image": torch.from_numpy(
+                np.ascontiguousarray(img_s[None], dtype=np.float32)),
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
         if rw_s is not None:
             # rw 离散权重，_extract_cubic_patch 已是按位裁剪 + edge-pad，无重采样，无需 nearest。
             result["weight_map"] = torch.from_numpy(
-                rw_s[None].astype(np.float32, copy=False))
+                np.ascontiguousarray(rw_s[None], dtype=np.float32))
         elif self.region_weights:
             rw_s = compute_region_weight_map(
                 lbl_s, self.label_values, self.region_weights)
@@ -1089,6 +1093,7 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             len(self.image_paths), self.extract_size, self.samples_per_volume)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        self._sample_idx = idx
         vol_idx    = idx % len(self.image_paths)
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         eD, eH, eW = self.extract_size

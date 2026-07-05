@@ -229,7 +229,8 @@ def _elastic_deform(
     weight_map: Optional[torch.Tensor] = None,
     wmap_mode: str = "nearest",
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本 3D 弹性形变。sigma 控平滑度（常 4–9）；alpha 控位移幅度体素（常 3–12）。"""
+    """逐样本 3D 弹性形变。sigma 控平滑度（常 4–9）；alpha 控位移幅度体素（常 3–12，
+    近似标称：粗网格 randn 上采平滑使方差 <1，实际典型位移小于 alpha）。"""
     B, _, D, H, W = image.shape
     device = image.device
 
@@ -294,9 +295,10 @@ def _grid_dropout(
         return image, label, weight_map
 
     frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
-    hd = max(1, int(D * frac))
-    hh = max(1, int(H * frac))
-    hw = max(1, int(W * frac))
+    # 逐轴夹到轴长：frac>1（ratio 大 / holes 少）时洞不得超过该轴，否则索引越界。
+    hd = min(D, max(1, int(D * frac)))
+    hh = min(H, max(1, int(H * frac)))
+    hw = min(W, max(1, int(W * frac)))
 
     # 逐样本 hole 左上角。
     d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)

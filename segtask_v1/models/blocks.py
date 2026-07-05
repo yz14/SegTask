@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from itertools import product
 from typing import Sequence, Tuple, Type
 
@@ -26,7 +27,10 @@ _AMAXPOOL = {2: nn.AdaptiveMaxPool2d, 3: nn.AdaptiveMaxPool3d}
 
 #: F.interpolate 的平滑插值模式。
 INTERP_SMOOTH = {2: "bilinear", 3: "trilinear"}
-_ROPE_ND_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+# RoPE cos/sin 有界 LRU 缓存：滑窗推理/多分辨率会产生多种形状 key，
+# 设上限防长期运行时条目单调增长。
+_ROPE_ND_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
+_ROPE_ND_CACHE_MAX = 128
 
 
 def _check_dims(spatial_dims: int) -> int:
@@ -436,6 +440,7 @@ def _rope_axis_cos_sin(
         spatial_shape, rot_dim, position_offsets, device, dtype, axis)
     cached = _ROPE_ND_CACHE.get(key)
     if cached is not None:
+        _ROPE_ND_CACHE.move_to_end(key)
         return cached
     inv_freq = 1.0 / (
         10000 ** (torch.arange(
@@ -444,6 +449,8 @@ def _rope_axis_cos_sin(
     cos = angles.cos().to(dtype=dtype)
     sin = angles.sin().to(dtype=dtype)
     _ROPE_ND_CACHE[key] = (cos, sin)
+    while len(_ROPE_ND_CACHE) > _ROPE_ND_CACHE_MAX:
+        _ROPE_ND_CACHE.popitem(last=False)
     return cos, sin
 
 
