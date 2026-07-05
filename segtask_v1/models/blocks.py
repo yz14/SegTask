@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import OrderedDict
 from itertools import product
@@ -12,6 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
 
 
 # spatial_dims 分派表。
@@ -31,6 +34,9 @@ INTERP_SMOOTH = {2: "bilinear", 3: "trilinear"}
 # 设上限防长期运行时条目单调增长。
 _ROPE_ND_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
 _ROPE_ND_CACHE_MAX = 128
+
+# GroupNorm 组数回退告警去重：同一 (channels, num_groups) 组合只报一次。
+_GN_FALLBACK_WARNED: set = set()
 
 
 def _check_dims(spatial_dims: int) -> int:
@@ -138,8 +144,15 @@ def get_norm(
     elif norm_type == "instance":
         return _IN[d](num_channels, affine=True)
     elif norm_type == "group":
+        requested = num_groups
         while num_channels % num_groups != 0 and num_groups > 1:
             num_groups //= 2
+        if num_groups != requested and (num_channels, requested) not in _GN_FALLBACK_WARNED:
+            _GN_FALLBACK_WARNED.add((num_channels, requested))
+            logger.warning(
+                "GroupNorm fallback: channels=%d not divisible by num_groups=%d; "
+                "using %d group(s) instead (1 group \u2248 LayerNorm).",
+                num_channels, requested, num_groups)
         return nn.GroupNorm(num_groups, num_channels)
     else:
         raise ValueError(f"Unknown norm: {norm_type}")
@@ -296,7 +309,8 @@ class CoordAttention3D(nn.Module):
     """nD Coord Attention（3D 中逐 D/H/W 轴 pool）。"""
 
     def __init__(self, channels: int, reduction: int = 32,
-                 spatial_dims: int = 3):
+                 spatial_dims: int = 3, norm_type: str = "group",
+                 norm_groups: int = 8):
         super().__init__()
         d = _check_dims(spatial_dims)
         self.spatial_dims = d
@@ -309,8 +323,9 @@ class CoordAttention3D(nn.Module):
         ])
 
         # 共享 bottleneck 卷积，作用于列拼后的 rank-(d+2) 张量（首空间轴为拼接轴）。
+        # 小 batch 3D 下 BatchNorm 统计很噪；归一化类型可配，默认 group。
         self.conv1 = _CONV[d](channels, mid, kernel_size=1, bias=False)
-        self.norm1 = _BN[d](mid)
+        self.norm1 = get_norm(norm_type, mid, norm_groups, spatial_dims=d)
         self.act = nn.Hardswish(inplace=True)
 
         # 逐轴输出卷积：mid→channels。
@@ -353,7 +368,10 @@ class CoordAttention3D(nn.Module):
 
 def make_attention(name: str, channels: int,
                    spatial_dims: int = 3, **kwargs) -> nn.Module:
-    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'。"""
+    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'。
+
+    kwargs：``reduction``；``norm_type``/``norm_groups`` 仅 'coord' 使用
+    （其余类型无归一化层）。"""
     name = (name or "none").lower()
     if name == "none":
         return nn.Identity()
@@ -367,7 +385,9 @@ def make_attention(name: str, channels: int,
                       spatial_dims=spatial_dims)
     if name == "coord":
         return CoordAttention3D(channels, reduction=kwargs.get("reduction", 32),
-                                spatial_dims=spatial_dims)
+                                spatial_dims=spatial_dims,
+                                norm_type=kwargs.get("norm_type", "group"),
+                                norm_groups=kwargs.get("norm_groups", 8))
     raise ValueError(
         f"Unknown attention type: {name!r}. "
         f"Valid: none|se|eca|cbam|coord")

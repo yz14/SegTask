@@ -453,6 +453,10 @@ def build_model(cfg: Config):
         grad_checkpointing    = mc.grad_checkpointing,
         grad_ckpt_stages      = mc.grad_ckpt_encoder_stages)
 
+    # attn_gate_norm='auto' 跟随全局 norm_type（避免小 batch 3D 下门控 BN 统计噪）。
+    attn_gate_norm = (mc.norm_type if mc.attn_gate_norm == "auto"
+                      else mc.attn_gate_norm)
+
     # decoder: unet | unetpp | unet3p
     if   mc.decoder_type == "unet3p":
         decoder = UNet3PDecoder(
@@ -462,7 +466,7 @@ def build_model(cfg: Config):
             norm_groups=mc.norm_groups,
             activation=mc.activation,
             skip_attention=mc.skip_attention,
-            attn_gate_norm=mc.attn_gate_norm,
+            attn_gate_norm=attn_gate_norm,
             spatial_dims=spatial_dims,
             grad_checkpointing=mc.grad_checkpointing)
     elif mc.decoder_type == "unetpp":
@@ -471,7 +475,7 @@ def build_model(cfg: Config):
             stage_builder=dec_builder,
             upsample_mode=mc.upsample_mode,
             skip_attention=mc.skip_attention,
-            attn_gate_norm=mc.attn_gate_norm,
+            attn_gate_norm=attn_gate_norm,
             spatial_dims=spatial_dims,
             upsample_norm_act=mc.upsample_norm_act,
             norm_type=mc.norm_type,
@@ -485,7 +489,7 @@ def build_model(cfg: Config):
             upsample_mode      = mc.upsample_mode,
             skip_mode          = mc.skip_mode,
             skip_attention     = mc.skip_attention,
-            attn_gate_norm     = mc.attn_gate_norm,
+            attn_gate_norm     = attn_gate_norm,
             spatial_dims       = spatial_dims,
             downsample_strides = ds_strides,
             upsample_norm_act  = mc.upsample_norm_act,
