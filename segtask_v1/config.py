@@ -177,8 +177,8 @@ class AugConfig:
     random_flip_prob: float = 0.2
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
-    # Affine：小角旋转 + 缩放 + 平移，三者在 affine 内部合成单次 grid_sample；
-    # 但与 elastic 形变各自独立重采样，同时选中的样本会被插值两遍。
+    # Affine：小角旋转 + 缩放 + 平移合成单一仿射；与 elastic 形变进一步融合为
+    # 单次 grid_sample（同时选中的样本也只插值一遍）。
     random_affine_prob : float = 0.3
     random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
     # 缩放作用在采样网格上（反向语义）：>1 采样窗外扩→物体在输出中变小，
