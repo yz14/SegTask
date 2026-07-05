@@ -38,7 +38,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.2"
+_TOOL_VERSION = "make_data/1.3"
 
 # 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -194,6 +194,12 @@ def prepare_one(
      fg_slices_cls_z, fg_slices_cls) = _compute_fg_indices(
         label, label_values, fg_subsample)
 
+    # 5.5 逐值精确体素计数（落盘 label 同坐标系）：供 loader 直接从 meta 读取
+    #     label_values / 分层划分统计，免去启动期全量解码 label。
+    uniq_vals, uniq_counts = np.unique(
+        label.astype(np.int32, copy=False), return_counts=True)
+    label_counts = {int(v): int(c) for v, c in zip(uniq_vals, uniq_counts)}
+
     # 6. 谱系 meta（自描述）。
     meta = {
         "pid"         : pid,
@@ -208,6 +214,7 @@ def prepare_one(
         "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
         "image_dtype" : str(image.dtype),
         "fg_per_class": True,   # fg_coords 逐类 cap；含 *_cls 类对齐数组
+        "label_counts": label_counts,  # {label_value: voxel_count}，精确不抑采（make_data≥1.3）
         "spacing_normalized": spacing_normalized,
         "orig_spacing" : orig_spacing,   # [sz,sy,sx] mm 或 None（未归一化）
         "target_spacing": ([float(s) for s in target_spacing]

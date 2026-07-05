@@ -293,6 +293,17 @@ def _group_fg_slices_by_class(
     return [g for g in groups if len(g)] or None
 
 
+def load_npz_label_counts(path: str) -> Optional[Dict[int, int]]:
+    """返 meta.label_counts（{label_value: voxel_count}，精确不抽采，make_data≥1.3）；
+    旧 npz 无此键返 None。只反序列化小体积 meta，不解码 label 卷。"""
+    with _open_npz(path) as f:
+        meta = f["meta"].item()
+    counts = meta.get("label_counts")
+    if counts is None:
+        return None
+    return {int(v): int(c) for v, c in counts.items()}
+
+
 def load_npz_label_for_split(path: str) -> np.ndarray:
     """owned int16 label copy，供 loader.py 预扫描使用。强制 copy 以免父进程持有 mmap 句柄。"""
     with _open_npz(path) as f:

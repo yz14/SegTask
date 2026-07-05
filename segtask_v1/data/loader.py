@@ -17,7 +17,11 @@ from torch.utils.data import (
 )
 
 from ..config import Config
-from .dataset import load_nifti, load_npz_label_for_split
+from .dataset import (
+    load_nifti,
+    load_npz_label_counts,
+    load_npz_label_for_split,
+)
 from .mixed_sampler import (
     SOURCE_PRIMARY,
     SOURCE_SECONDARY,
@@ -336,11 +340,16 @@ def detect_label_values(
     label_loader_fn=None,
     *,
     return_primaries: bool = False,
+    label_counts_fn=None,
 ) -> Union[List[int], Tuple[List[int], List[Dict[int, int]]]]:
     """自动探测标签取值；默认扫描全部。max_scan 指定部分扫描（会警告）；label_loader_fn 切换读器（NIfTI vs npz）。返按升序整数，含 bg。
 
     ``return_primaries=True`` 时额外返回每个样本的 ``{label_value: voxel_count}``
-    字典列表，供 ``stratified_train_val_split`` 直接使用，避免重复扫描。"""
+    字典列表，供 ``stratified_train_val_split`` 直接使用，避免重复扫描。
+
+    ``label_counts_fn``：可选快路，返该样本的 ``{label_value: voxel_count}``
+    或 ``None``（不可用）。可用时跳过全量解码 label（如从 npz meta 读
+    预计算计数），启动期由逐卷 I/O+扫描降为仅读小体积 meta。"""
     if label_loader_fn is None:
         label_loader_fn = _default_label_loader
     n_total = len(label_paths)
@@ -353,15 +362,24 @@ def detect_label_values(
 
     all_labels: set = set()
     per_sample_counts: List[Dict[int, int]] = []
+    n_fast = 0
     for path in scan_paths:
-        lbl    = label_loader_fn(path)
-        lbl_int = lbl.astype(np.int32, copy=False)
-        unique = np.unique(lbl_int).tolist()
-        all_labels.update(unique)
+        counts = label_counts_fn(path) if label_counts_fn is not None else None
+        if counts is None:
+            lbl    = label_loader_fn(path)
+            lbl_int = lbl.astype(np.int32, copy=False)
+            unique, ucounts = np.unique(lbl_int, return_counts=True)
+            counts = {int(v): int(c) for v, c in zip(unique, ucounts)}
+        else:
+            n_fast += 1
+        all_labels.update(counts.keys())
         if return_primaries:
-            per_sample_counts.append(
-                {int(v): int((lbl_int == v).sum()) for v in unique})
+            per_sample_counts.append(counts)
 
+    if n_fast:
+        logger.info(
+            "Label stats from precomputed npz meta for %d/%d files "
+            "(no full label decode).", n_fast, len(scan_paths))
     result = sorted(all_labels)
     if partial:
         logger.warning(
@@ -646,15 +664,17 @@ def build_dataloaders(
     label_loader_fn = load_npz_label_for_split
 
     # label_values：在主源探测（顺带记录逐样本体素计数供分层划分复用，避免重扫）；
-    # 副源仅取并集补充可能新增的标签值。
+    # 副源仅取并集补充可能新增的标签值。npz meta 含 label_counts（make_data≥1.3）
+    # 时走快路，启动期不解码任何 label 卷。
     per_sample_counts: Optional[List[Dict[int, int]]] = None
     if not dc.label_values:
         dc.label_values, per_sample_counts = detect_label_values(
             primary_paths, label_loader_fn=label_loader_fn,
-            return_primaries=True)
+            return_primaries=True, label_counts_fn=load_npz_label_counts)
         if secondary_paths:
             sec_values = detect_label_values(
-                secondary_paths, label_loader_fn=label_loader_fn)
+                secondary_paths, label_loader_fn=label_loader_fn,
+                label_counts_fn=load_npz_label_counts)
             merged = sorted(set(dc.label_values) | set(sec_values))
             if merged != list(dc.label_values):
                 logger.info(
@@ -668,6 +688,12 @@ def build_dataloaders(
 
     # 主源 train/val 划分（粗标不参与划分，整批用于训练）。
     if dc.stratified_split and dc.num_classes >= 2:
+        if per_sample_counts is None:
+            # label_values 显式配置时未走探测；尝试从 npz meta 取计数，
+            # 全部可用才使用（部分缺失则整体回退逐卷解码，保证划分口径一致）。
+            metas = [load_npz_label_counts(p) for p in primary_paths]
+            if all(m is not None for m in metas):
+                per_sample_counts = metas
         train_idx, val_idx = stratified_train_val_split(
             primary_paths, dc.label_values, dc.val_ratio, dc.split_seed,
             label_loader_fn=label_loader_fn,
