@@ -74,213 +74,310 @@ b 面内超分（x,y是低分辨率，D,h,w -> D,H,W）
 审查主要内容为代码、算法、设计、架构等等：  
 是否正确、合理；是否有优化空间；是否有更好的高质量内容可以借鉴、适配或新增
 
+评审范围与规模
+项目 5 大部分与对应文件已梳理清楚:
+
+1. 数据读取 loader.py(~790行 发现-匹配-切分-建 loader)、dataset.py(~50KB 三个 Dataset + IO/patch/bbox/npz)、specs.py(patch_mode 策略)、make_data.py(npz 预打包)、mixed_sampler.py
+
+2. 模型构建 models/:blocks.py(~57KB 积木)、stem.py(多视图融合)、resnet.py/convnext.py/mednext.py(编码骨干)、unet.py/unetpp.py/unet3p.py(解码)、topology.py+factory.py(装配)、adm_unet.py/edm2_unet.py
+
+3. 数据增强/处理 augment.py(GPU 共享 warp)、dataset.py 内 preprocess/oversample/中心裁剪
+
+4. 训练全流程(含 val) trainer.py(~55KB)、pipelines/(4 种 patch 管线策略)、validation.py、optim.py/amp.py/memory.py/breakdown.py/checkpoint.py/views.py、losses/(~45KB)
+
+5. 推理全流程 predictor/:predictor.py、sliding.py(4 种滑窗)、inputs.py、forwards.py(TTA)、blending.py、io.py、adabn.py
+
+横切:config.py(~108KB dataclass 配置系统),会在各部分评审时按需引用。
+
 进展： 
-数据读取审查报告  
-审查范围：dataset.py（IO/预处理/bbox/缓存/3 个 Dataset）、loader.py（发现-匹配-划分-DataLoader 工厂）、specs.py（策略选择）、mixed_sampler.py（双源混批）、make_data.py（npz 烘焙）。
 
-一、总体评价
-数据层设计成熟、职责清晰，几处工程细节达到业界水准：
+数据读取
+总体评价
+架构成熟、职责分离清晰,是这套代码里质量很高的一层:
 
-npz-only 训练契约（SegDatasetNpzBase.__init__ 的 assert，@/Users/.../dataset.py:497-498）配合 OS page cache 共享的 OOM 论证，取舍合理。
-逐 worker 采样 RNG（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:530-544）正确规避了"DataLoader fork 后各 worker 复制全局 numpy RNG 导致跨 worker 重复采样"这一经典坑。
-验证确定性采样（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:546-555，(seed, sample_idx) 派生）保证 save_best/early-stop 不被采样噪声驱动。
-类均衡前景采样（先选类再选点/切片，@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:770-774 与 :1021-1030）对稀有小结构友好，优于合并前景采样。
-单 max-FOV 一次抽取、多分辨率延迟到 trainer：消除多次 zoom 的高频损失且保证多 view 几何一致，是这套框架的核心亮点。
-二、正确性 / 潜在 Bug
-1. resize_3d 依赖 scipy zoom(factor)，输出尺寸可能 off-by-one（中风险）
+策略模式收敛 patch_mode:specs.py 把"选 Dataset 类 + 模式专属 kwargs"收敛到 3 个 DatasetSpec + build_data_spec,注释明确声明"data 侧唯一允许 patch_mode if/elif 的地方",可扩展性好。
+npz 离线预烘(nnU-Net 风格):make_data.py 先 bbox 裁剪、预算前景索引、ZIP_STORED 不压缩以便多 worker 共享 OS page cache——设计思路专业。
+fork RNG 陷阱已正确处理:_rng()/_sample_rng() 用 torch 逐 worker 种子重建 np.random.Generator,避开了"多 worker 复制 numpy 全局 RNG 导致重复采样"这一经典 bug;验证集用 (_VAL_SAMPLING_SEED, sample_idx) 派生确定性 RNG,保证 best/early-stop 不被采样噪声驱动——很到位。
+单 max-FOV 提取原则:只提一份最大 FOV cube、增强只跑一次共享 warp、逐视图裁剪推迟到 trainer,消除多次 zoom 的高频损失,保证多视图几何一致。
+DDP 细节:ValBatchShardSampler 按 batch 块无 padding/无重复切分;scaled_num_workers 防止每卡 worker/缓存 RAM 随卡数线性翻倍;混合训练与 DDP 的不兼容被显式拒绝。这些都是踩过坑才会有的设计。
 
+正确性问题
+[中] _build_index 泄漏 npz 文件句柄 @d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:694-702 与 @d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:926-934:
 
 
-dataset.py:378-388
-    factors = [target_d / D, target_h / H, target_w / W]
-...
-return zoom(arr, factors, order=order).astype(arr.dtype, copy=False)
-scipy.ndimage.zoom 的输出尺寸是 round(input_size * factor)。当 factor = target/current 时，理论上等于 target，但浮点舍入在某些比值下会得到 target±1。一旦 batch 内不同样本产生不同尺寸，default_collate 的 torch.stack 会直接报错。cubic 多 scale 的"抽取→resize 回"往返最易触发。建议：改用 torch.nn.functional.interpolate(size=...) 或对 zoom 结果做尺寸兜底裁/补，保证输出严格等于目标尺寸。
 
-2. cubic 图像 patch 会 alias 到 LRU 缓存卷（低风险，潜在隐患） _extract_cubic_patch 在无越界填充时返回的是缓存卷的视图：
+python
+for path in self._npz_paths:
+    f = _open_npz(path)          # 未 with / 未 f.close()
+    fg = np.asarray(f["fg_slices"], ...)
+    D  = int(f["image"].shape[0])
+其余读取函数都用 with _open_npz(path) as f,唯独两处 _build_index 没有关闭。大数据集下会在 dataset 初始化期堆积 N 个未关闭的 NpzFile 句柄(依赖 GC 回收),在 Windows/worker 环境下可能触发 "too many open files" 或延迟释放。
 
+[中] _build_index 为取 shape 而全量解码 image 同两处的 f["image"].shape / f["image"].shape[0]:NpzFile["image"] 是惰性的,一旦下标访问就会把整卷 image 从 zip 解出到内存,仅为读一个 shape。相当于 dataset 初始化时把每个样本的整卷 image 都解码一遍,启动开销随数据集规模线性增长。应改为解析 .npy header(np.lib.format.read_array_header_1_0)或把 shape 写进 meta(见优化建议)。这两点(泄漏 + 全解码)是同一处代码最值得修的。
 
+[低] 返回张量可能与 LRU 缓存 numpy 数组别名 _getitem_max_fov 中当 resize_3d 尺寸恰好匹配为 no-op(@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:376-377)时直接返回原数组,随后 torch.from_numpy(img_s[None].astype(..., copy=False)) 与缓存数组共享内存。当前因 GPU 增强前会经 collate(stack 复制)而安全,但属易碎设计:whole 模式或恰好等尺寸时若未来有人在 augment 前做 in-place,会污染缓存。建议在返回前对命中缓存的路径显式 copy 或注释锁定该不变量。
 
-dataset.py:845-855
-patch = vol[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]]
-if any(pb > 0 or pa > 0 ...):
-    patch = np.pad(...)
-return patch
-_getitem_max_fov 对 image 用 astype(np.float32, copy=False)（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:975），image 已是 fp32 → 不复制，返回张量与 _img_cache 中的卷共享内存；label 则用了 np.ascontiguousarray 保护（:976）。当前安全（collate 会 stack 复制、增强在设备端新张量上进行），但只要未来某处对样本做 CPU in-place 操作就会污染缓存。建议：image 同样走 np.ascontiguousarray（顺带修复视图非连续、利于 pin_memory）。
+[低] 随机划分与分层划分的取整不一致 train_val_split 用 int(n*val_ratio)(向下取整,@d:\codes\work-projects\SegTask\segtask_v1\data\loader.py:384),stratified_train_val_split 用 int(round(len*val_ratio))(@d:\codes\work-projects\SegTask\segtask_v1\data\loader.py:451)。同一 val_ratio 在两条路径下 val 比例略有差异,且 n=1 时随机划分会产出空 train。属边界瑕疵。
 
-3. SegDataset3DWhole.__getitem__ 未写 self._sample_idx（极低风险，一致性问题）
+[低] 死分支 _extract_z_single 的 use_padded=False 分支(@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:791-795)在现有调用点(唯一调用处 line 739 传 use_padded=True)从不触达。
 
+优化空间
+把 shape/spacing 写进 npz meta:make_data 的 meta 已含 bbox、label_values 等,补上 image_shape 后,_build_index 只需读 meta(0-d object,极廉价)即可拿到 D/shape,彻底消除上面的全量解码与句柄泄漏两个问题。这是性价比最高的一处改进。
+detect_label_values 全量串行扫描(主进程,@d:\codes\work-projects\SegTask\segtask_v1\data\loader.py:356-363):大数据集下是训练启动的串行瓶颈。既然 make_data 已逐样本落盘 label_values 到 meta,可让 loader 优先从任一 npz 的 meta 读取标签全集,退化时才全量扫描。
+VolumeCache 三份独立缓存:image/label/rw 各持一个 cache_max_volumes LRU,实际内存是 cap × (img+lbl+rw)——loader 的估算已正确反映,但缓存键都是同一 path,可合并为单个按 path 存元组的缓存,减少一次 dict 查找与三份 OrderedDict 开销(优先级低)。
 
+可借鉴 / 建议新增(业界高质量做法)
+前景强度统计归一化(nnU-Net):当前用固定 intensity_min/max 窗 + minmax/zscore。CT 建议在 make_data 阶段采集前景体素的 0.5/99.5 百分位与 mean/std 作为数据集指纹,zscore 用前景统计。这对跨机器/协议的 CT 更稳。spacing 归一化你已按 nnU-Net 中位数指纹实现,强度指纹是自然的下一步。
+划分可复现性增强:目前单一 split_seed。可考虑加入 K-fold(nnU-Net 5 折)接口,分层逻辑已具备,扩展成本低。
 
-dataset.py:1091-1093
-def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-    vol_idx    = idx % len(self.image_paths)
-另两个 dataset 入口都会 self._sample_idx = idx。whole 目前无采样 RNG 依赖故无害，但一致性缺口——若将来 whole 也引入确定性采样会成隐性 bug。建议补一行保持一致。
 
-三、优化空间
-1. 启动期标签扫描重复解码全部 label 卷（性能） build_dataloaders 里 detect_label_values + stratified_train_val_split 通过 load_npz_label_for_split 逐个全量解码 label 卷（@d:\codes\work-projects\SegTask\segtask_v1\data\loader.py:646-674）。而 make_data 早已计算并写入 _manifest.json 的 label_values（@d:\codes\work-projects\SegTask\segtask_v1\data\make_data.py:449），且逐类前景信息已存在每个 npz 的 fg_slices_cls 中。大数据集下这是明显的启动开销。建议：优先读 _manifest.json 的 label_values；分层划分的主类可从 npz 的 fg_coords_cls/fg_slices_cls（已在内存索引里）直接统计，免全量 label 解码。
+数据增强/处理 代码审查
+审查文件：augment.py（GPU 共享 warp）、dataset.py（extract/oversample/edge-pad）、views.py + trainer/pipelines/* + trainer/trainer.py（center-crop、多视图拆分）。
 
-2. 验证集 patch 采样是随机/部分覆盖，指标偏噪（合理性） z_axis/cubic 验证走的是"逐样本确定性但随机位置"的 patch（_sample_z val 分支 rng.integers(0,D_vol)，@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:775；fg_ratio val=0，specs.py:134-136）。虽有确定性，但仍是部分覆盖、位置随机，patch-Dice 噪声较大。项目另有整卷 high-res 验证（validation.py，步骤 4 细看）——若模型选择已完全依赖整卷验证，则 patch-val 主要是训练期廉价监控；否则建议 patch-val 改为系统性网格覆盖以降噪。
+整体数据流（关键前提）： __getitem__ 抽单张 max-FOV cube（含 oversample × max_scale 余量）→ collate → to(GPU) → GPUAugmentor 一次性增强 → views.center_crop 去 oversample 余量 → pipeline.prepare_batch 逐视图 center-crop + resize 拆分。见 @d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:714-721。
 
-3. 默认值文档/代码不一致（低） config.py 中 cache_max_volumes 默认 1（@d:\codes\work-projects\SegTask\segtask_v1\config.py:151），而 SegDataset3D 签名默认 0、README 早期段落也提 0。以 config 为准（=1，安全），但建议统一叙述避免误读。
+总体评价： 这一层设计思路是正确且高质量的——"单次共享 warp + 惰性拆视图"从根上保证了多分辨率几何一致性，这是比"逐视图各自增强"专业得多的做法。下面按你点名的 4 个子项给结论，含少量真问题与若干可优化点。
 
-四、可借鉴 / 可新增（业界做法）
-数据集指纹复用（nnU-Net 风格）：make_data 已产出 manifest（label_values、spacing 中位数思路见 _resolve_target_spacing，@d:\codes\work-projects\SegTask\segtask_v1\data\make_data.py:295-316），但 loader 未复用。把 manifest 作为"指纹单一真相源"接进 loader，可省掉启动扫描，也更接近 nnU-Net 的 fingerprint 流程。
-page-cache 优先的缓存策略：warning 里已建议 cache_mode:"none" 靠 OS page cache 共享（@d:\codes\work-projects\SegTask\segtask_v1\data\loader.py:829-836），可考虑在 npz 模式把它作为默认，减少逐 worker LRU 的 RAM 倍增。
-对 TODO 1（gentask）的直接价值：本层"单 max-FOV 一次抽取 + 增强后中心裁 + oversample 余量 + region_weight 优先级 + 类均衡前景采样"的模式，正是 TODO 1 要复用的 2.5D 读取骨架。SegDataset3D（z 轴滑窗）几乎可原样改造为"z 轴取起止切片做 VFI 输入 / 在 x 轴取切片做 SISR 输入"，只需把 label 从二值通道换成高分辨率 GT。建议后续 gentask 直接拷贝 SegDatasetNpzBase + SegDataset3D 为起点。
+一、共享 warp 的几何一致性 — 正确，无实质问题
+做对的地方：
 
+flip/affine/elastic 每个子阶段对被选样本只算一次 grid/mask，然后 image(bilinear)/label(nearest)/wmap(可配) 用同一 grid、同一 padding_mode='border' 采样（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:159-171、@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:257-266）。采样坐标完全一致、仅插值模式不同 → 几何严格对齐，label 用 nearest 保 one-hot、不产生跨类渗漏。
+所有视图从同一张已增强 cube 里 center-crop/resize 得到（split_views_native_3d/split_views_native_d），因此各 FOV 视图共享同一形变，几何一致性天然成立。
+elastic 位移/单位网格的轴序处理正确：voxel_to_grid=[2/W,2/H,2/D] 配 grid[::-1] 与 align_corners=False，与 affine_grid(align_corners=False) 一致（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:250-277）。
+grid_sample 的 grid 按 batch 广播到所有通道，label 的多前景通道与 image 单通道共用同一 grid → 正确。
+已知限制（非 bug，文档已明示）： aspect_correct 只按 voxel-count 比例（W,H,D）校正，不含真实 spacing；spacing_normalization=False 时厚层 z 的 out-of-plane 旋转物理不准（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:114-123）。这点标注得很清楚，可接受。
 
-模型构建审查报告
-审查范围：models/ 全部——拓扑派生(topology.py)、装配(factory.py)、UNet 主体(unet.py)、三种 decoder(unet/unetpp/unet3p)、四类骨干(resnet/convnext/mednext + block 仓库 blocks.py)、stem 与多 FOV 融合(stem.py)。
+二、多 FOV 安全性 — 机制健全，一处需注意
+做对的地方：
 
-一、总体评价
-模型层是整个项目最出彩的部分，架构清晰、可组合性强、算法实现忠于原论文：
+patch3d 交叉校验每个视图 native 尺寸 ≤ max-FOV target，拦截浮点漂移（@d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\patch3d.py:79-87）。
+multi_res_scales[0]==1.0、全部 ≥1.0 断言；max_scale>1.0 强制 edge_pad（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:672-678）——否则 stretch 会破坏跨 scale 物理 z-FOV 一致性。这是正确的硬约束。
+elastic 的 alpha /= max_scale，使最大物理位移随 FOV 归一（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:57-62），考虑周到。
+cubic 的 _safe_center_range 把中心夹到界内，避免 max-scale cube >50% 体素来自边界复制（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:988-1008）。
+[中] random_translate_range 与 oversample 余量未协调（多 FOV / 前景采样安全性）： 平移在 max-FOV cube 上、center-crop 之前施加，量级是归一化 [-1,1] 全轴（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:145-149）。若平移量超过 oversample 余量，_sample_z/_sample_center 精心保证的前景中心会被平移出最终裁剪窗，稀释 foreground_oversample_ratio 的前景过采样保证，且大平移会把 border-复制内容推进有效区。建议：把平移上限与 oversample 余量挂钩，或在文档里明确"translate 需 ≤ (oversample-1)/2 的归一化占比"。默认若为 [0,0] 则无影响。
 
-拓扑单一真相源（build_topology，@d:\codes\work-projects\SegTask\segtask_v1\models\topology.py:74-160）把 in_channels/out_classes/spatial_dims/aux 拓扑 一次算齐，Config.sync 与 factory 都只读不再重推——这是很好的防漂移设计。
-工厂 + 有状态 stage builder + block 注册表（factory.py、resnet._BLOCK_REGISTRY）让"骨干 × decoder × block × 注意力 × 上下采样"任意拼装，扩展成本低。
-积木库覆盖面达到业界水准：SE/ECA/CBAM/Coord 注意力；自注意力 softmax/linear/window/grid + nD RoPE + GEGLU FFN + zero-init 残差；BlurPool、CARAFE、DySample、PixelShuffle(+ICNR)；MedNeXt 的 UniRepLKNet 式 DilatedReparamBlock（训练多分支、推理重参数化）与 UpKern 权重迁移。均忠实对应论文。
-nnU-Net 式各向异性下采样自动调度（_auto_anisotropic_strides，@d:\codes\work-projects\SegTask\segtask_v1\models\factory.py:257-283）配合 encoder/decoder stride 镜像（unet.py Decoder），对薄 z 轴医学体积很关键，且对 unetpp/unet3p/ConvNeXt-LN 下采样做了明确的兼容性拦截。
-深监督 / 多 FOV aux 头 / 拓扑 aux 头、逐 stage 梯度检查点（checkpoint_if 用 use_reentrant=False + preserve_rng_state=True）都实现正确。
-二、正确性 / 潜在 Bug
-1. patch2/patch4 stem 与 UNet decoder 拓扑冲突，主输出必然分辨率不匹配（高价值，需确认） config.py:315 注释称 "patchN 降 N 倍分辨率（UNet3D 主输出加上采样）"，但 UNet3D 明确声明不做上采样补偿、不匹配即 RuntimeError：
+三、oversample + 中心裁剪去边界 — 逻辑正确，两处不对称
+做对的地方： 两类余量被正确区分——center_crop 只去 oversample 余量（target=round(p*max_scale)，needs_crop = oversample>1.0），max_scale 余量保留给大 FOV 视图（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:716-718、@d:\codes\work-projects\SegTask\segtask_v1\trainer\views.py:20-34）。拆视图时 native-d/native-3d 还断言深度轴已等于 target，确保 oversample 余量确实被去掉（@d:\codes\work-projects\SegTask\segtask_v1\trainer\views.py:134-139）。设计闭环、自检到位。
 
+[中] z_axis 的 oversample 是 z-only，面内旋转 border 伪影无余量吸收： SegDataset3D.extract_size=(round(pD*oversample), pH, pW)（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:659-661），面内直接 resize 到 (pH,pW)，无过采样余量。而 SegDataset3DCubic 是三轴同乘 oversample（@d:\codes\work-projects\SegTask\segtask_v1\data\dataset.py:901-902）。后果：2.5D 里最常见的面内旋转（绕 z）产生的 border 复制伪影落在 H/W 边缘，没有余量可裁除，会残留进每张 slab。这与"oversample 后中心裁去边界"的初衷在面内是没有实现的。取舍上可接受（nnU-Net patch 边缘同样有），但值得在设计上明确：z_axis 若开面内旋转，H/W 边缘伪影是固有的。
 
+[低] grid_dropout 在 oversample 余量区打的洞会被裁掉，稀释有效 dropout 比例： 洞随机落在整张 max-FOV cube（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:301-320），center-crop 后靠近边缘的洞被丢弃，最终 patch 上的有效遮挡比例低于配置值且空间非均匀（中心洞更易保留）。gaussian noise/blur/gamma 是位置无关的，不受影响；仅 grid_dropout 有此偏差。低优先级，若要精确可在 crop 后再做 dropout。
 
-unet.py:393-396
-# 主头读最高分辨率 decoder 特征。stem_stride>1 时 decoder 最高分辨率仍低于
-# 输入，forward 不做上采样补偿，而是显式 RuntimeError（要求 decoder 拓扑
-# 与 stem_stride 配套，保证输出 = 输入分辨率）。DS 头保留各自分辨率。
-而 Decoder 的上采样级数恒为 n_levels-1，只镜像 encoder 各 stage 间的 n-1 次下采样，不包含 stem 的 N 倍下采样（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:271-288）。因此 stem_mode=patch2/patch4 时主头输出恒为 输入/N，必触发 unet.py:495 的 RuntimeError。config.validate 也未禁止该组合。结论：patchN stem 对 decoder_type='unet' 分割实际不可用，且 config 注释与实现自相矛盾。建议二选一——要么在 UNet3D 主/DS/aux 头后补一次 stem_stride 上采样（兑现 config 注释），要么在 validate 里显式禁止 patchN × unet decoder 并更正注释。
+四、GPU 增强数值/边界处理 — 稳健，无严重数值 bug
+做对的地方：
 
-2. DualConvStem 文档与实现不符（低，误导性）
+_gaussian_blur_3d：可分离卷积 + F.pad(mode="replicate") 避免暗边；核长统一取 sigma 上界、逐样本核归一化（小 sigma 仅多近零尾部），grouped-conv 向量化正确（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:403-441）。数值健全。
+_random_gamma：先逐通道 minmax 归一到 [0,1] 再 pow，rng.clamp(min=1e-7) 处理常数通道，负值（zscore）也安全（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:361-386）。仅空间轴 reduce、通道独立 → 多分辨率安全。
+_simulate_lowres：按目标尺寸分组批量 interpolate，max(1,int(D*z)) 防零维（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:444-470）。正确。
+clone/inplace 契约清晰，默认克隆不污染上游、且 collate 已复制，快路径安全（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:37-43）。
+强度增强逐样本逐通道 reduce（reduce_dims=range(2,ndim)），对 2.5D 折通道前的 rank-5 也成立。
+[低] intensity_clamp 语义较激进（已文档化）： 记录增强前逐样本逐通道 min/max，全部强度增强后夹回（@d:\codes\work-projects\SegTask\segtask_v1\data\augment.py:70-81）。这会把 brightness/noise 越界部分压回原范围，等于部分抵消增强强度。注释已声明"比 nnU-Net 更激进、可关"。属设计取舍，非 bug；建议默认关或明确推荐值。
 
+[低] 无显式 NaN/inf 兜底： intensity_clamp 关闭时，brightness/gaussian_noise 可把值推出归一化范围；一般训练可接受，但缺少极端值保护。低优先级。
 
+未发现的严重问题： flip 的 image[idx]=torch.flip(image[idx],[axis]) 高级索引 scatter-写回正确；affine 各向异性共轭 A⁻¹RA 只对旋转生效（各同性 scale 与对角阵可交换）数学正确；elastic 与 affine 的 align_corners/轴序一致。这些都对。
 
-stem.py:20-35
-class DualConvStem(nn.Module):
-    """两个堆叠 3×3×3 conv-norm-act（nnU-Net stem）。"""
-    ...
-        self.block1 = ConvNormAct(
-            in_ch, out_ch, kernel_size=7, stride=1, padding=3,  # 第一层用7x7x7会不会好？
-docstring 说"两个 3×3×3"，实现却是 7×7×7 + 3×3×3，且留有未决问句注释。参数量/感受野与描述不符，建议更正 docstring 或定回 3×3（并移除临时注释，符合规则五）。
+结论汇总（按优先级）
+[中] translate 量级与 oversample 余量未协调（augment.py:145-149）：大平移会把前景中心移出最终裁剪窗，稀释前景过采样并引入 border 内渗。
+[中] z_axis 面内无 oversample 余量（dataset.py:659-661）：面内旋转 border 伪影无法被中心裁去除，与 cubic 的三轴过采样不对称。
+[低] grid_dropout 洞落在被裁余量里 → 有效遮挡比例被稀释且空间非均匀（augment.py:301-320）。
+[低] intensity_clamp 偏激进、无 NaN/inf 兜底（augment.py:70-81）：属可配置取舍。
+共享 warp 的几何一致性、多 FOV 尺寸校验/edge_pad 约束、oversample 双余量区分、GPU 核数值处理——均正确且实现质量高。
 
-3. 全局 RoPE cos/sin 缓存无界增长（低，长跑内存） _ROPE_ND_CACHE（@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:29）以 (spatial_shape, device, dtype, axis, ...) 为键缓存且从不淘汰。滑窗推理/多分辨率训练会不断产生新形状键，长期运行缓存条目单调增长。建议改为有界 LRU 或按 module 生命周期管理。
 
-三、优化空间
-1. 小 batch 3D 下多处硬编码 BatchNorm（合理性/稳定性） CoordAttention3D（@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:309 用 _BN）与 AttentionGate3D 默认 norm_type='batch'——其 psi 甚至在 1 通道特征图上做 BatchNorm（blocks.py:926-929）。3D 分割常用 batch_size=2（config 默认，见步骤 1），此时 BN 统计极噪。建议这些注意力/门控子模块的 norm 跟随全局 norm_type（instance/group）或至少默认 group，避免与主干 InstanceNorm 的稳定性取向相悖。
+模型构建代码审查
+总体评价
+装配架构成熟、分层清晰，是高质量的一层：build_topology 单一真相源把 patch_mode × mode-flags → 全部派生量 收敛到一处决策树；block 仓库用统一 Stage(in,out,num_blocks) 接口 + _StatefulStageBuilder 让 4 种 backbone（resnet/convnext/mednext + adm/edm2）可插拔；上/下采样算子（BlurPool/PixelShuffle/CARAFE/DySample）与注意力（SE/ECA/CBAM/Coord + softmax/linear/window/grid 自注意力 + RoPE）覆盖面广且维度无关（spatial_dims 分派）。ICNR、DropPath fp32 采样、zero-init proj、checkpoint_if 的 use_reentrant=False+preserve_rng_state 都是踩过坑的细节。
 
-2. get_norm group 回退是静默降级（可维护性）
+下面按你点名的 5 个子项给结论，含 2 处真 bug。
 
+一、topology 单一真相源 — 设计正确，一处未彻底
+build_topology 把三处历史重复推导收敛为唯一入口（@d:\codes\work-projects\SegTask\segtask_v1\models\topology.py:74-160），决策树覆盖 2.5D lift/native_d/普通 与 3D 三分支，num_fg_classes property 反算自洽。正确。
 
+[低] build_model 未完全走单一真相源：build_model 大部分读 topo.*，但 encoder 的 in_channels 直接读 mc.in_channels（@d:\codes\work-projects\SegTask\segtask_v1\models\factory.py:439），而非 topo.in_channels。二者仅在 Config.sync 已把 topology 写回 mc.in_channels 时才一致——这依赖调用时序，弱化了"唯一入口"的保证。建议统一用 topo.in_channels（out_classes 已经这么做了）。
 
-blocks.py:136-139
-elif norm_type == "group":
-    while num_channels % num_groups != 0 and num_groups > 1:
-        num_groups //= 2
-    return nn.GroupNorm(num_groups, num_channels)
-不整除时静默把组数折半（最坏退化为 1 组 ≈ LayerNorm）。MultiRFBlock 已选择显式报错（resnet.py:351-362），但全局其余路径仍静默。建议至少 warning 一次，避免用户以为在用 8 组实则 1 组。
+二、多视图融合 Plan A / Plan C — 发现一处会崩溃的 bug
+[高] Plan C（hierarchical）aux 分割头分辨率不匹配，训练首个 forward 即 RuntimeError。
 
-3. _LinearQKVAttention 的数值细节（低） 线性注意力对 K 在 token 维 softmax（blocks.py:803），当序列很长时 KᵀV 聚合可行但对分布偏移较敏感；当前无 eps 稳定项。属可接受实现，若后续放到浅层大分辨率处使用，建议加小 eps/温度以稳住训练早期。
+构造期：hierarchical 分支让 aux 头 k 读低分辨率特征 dec_features[n_dec-1-k]（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:462-467）。
+前向期：对每个 aux 输出断言 ao.shape[2:] == target_size（=输入尺寸），否则 raise RuntimeError，且不做上采样（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:503-511）。
+由于 feat_idx = n_dec-1-k（k≥1）恒低于最高分辨率 dec[-1]，其空间尺寸 = 输入/2^k ≠ 输入 → 必然触发 RuntimeError。
+这与两处 docstring 明确承诺的"aux 上采到 main 尺寸"（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:363 与 :415-416）直接矛盾。Plan A（shared_stem/multi_stem_proj）因 aux 都读 dec[-1]（=input 尺寸）不受影响；只要用户同时开 stem_fusion_mode='hierarchical' + aux_seg_supervision=True 就崩，而 config 层对二者无互斥校验。修法：aux 输出在尺寸检查前 F.interpolate 到 target_size（兑现 docstring），或仅对 Plan A 保留等尺寸断言。
 
-四、可借鉴 / 可新增（业界做法）
-对 TODO 1（gentask 超分/VFI）的直接价值最大：blocks.py 里的 PixelShuffle3d(+ICNR)、CARAFE3d、DySample3d、BlurPool3d 正是超分/插帧上采样的主力算子，可直接迁移到 gentask 的上采样端；SelfAttentionBlock（window/grid/RoPE）可作为 SISR transformer 分支的骨架。这套 dim-agnostic(2D/3D) block 仓库让 gentask "在 z 轴 SISR / 在 x 轴取切片" 的两种方案都能复用同一批算子。
-MedNeXt 档位 B 补全：当前 mednext.py 档位 A 复用通用重采样，原生"重采样残差块"（stride 融进深度卷积 + 1×1 残差）与更完整的 UpKern 尚未落地（文件头已注明）。若追求 MedNeXt SOTA 表现值得补齐。
-`nnU-Net ResEnc 预设 + 各向异性调度已具备，可进一步引入 nnU-Net v2 的"逐轴 kernel size 各向异性"（薄 z 轴用 1×3×3 卷积核），当前各向异性只体现在 stride，卷积核仍各向同性 3。
-arch=adm|edm2 生成式骨干已在库中（magnitude-preserving conv/SiLU），是 gentask 的现成参考实现，TODO 1 可优先评估复用。
+其余 Plan A/C 机制正确：MultiStemProj 逐 view stem→cat→1×1、HierarchicalStems 的 aux stem stride=s0·2^k 对齐 encoder 第 k 级、Encoder.aux_fuse 逐级 cat→1×1、以及 forward 内对 aux 空间不匹配的显式 RuntimeError 护栏（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:150-160）都对。
 
+三、编解码装配 — 发现一处 patchN stem 失效
+[中] patch2/patch4 stem 与 UNet 解码拓扑不配套，主头 forward 会 RuntimeError。
 
-数据增强 / 处理 审查报告
-审查范围：augment.py（GPU 空间/强度增强）、views.py（center_crop / 3D·2.5D 懒多分辨率拆分 / 2.5D fold）、trainer/pipelines/*（6 类 ViewPipeline 的 prepare_batch 视图重塑）、trainer.py:705-723 的「H2D→增强→中心裁→视图重塑」时序、config.py 的 AugConfig。
+stem_mode=patchN 使 stem 各向同性降 N 倍（@d:\codes\work-projects\SegTask\segtask_v1\models\stem.py:107-114），config/stem 注释均称"UNet 末尾上采补回 / 主输出加上采样"（config.py:315、stem.py:3）。
+但 Decoder 只镜像 encoder 的 n-1 次 stage 间下采样（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:271-288），没有任何一级补偿 stem 的 N 倍。总下采样 = N·2^(n-1)，解码只还原 2^(n-1)，主输出停在 输入/N。
+UNet3D.forward 又断言 main_out.shape[2:] == target_size 否则 raise（@d:\codes\work-projects\SegTask\segtask_v1\models\unet.py:494-499），且注释坦承"forward 不做上采样补偿"（:393-395）——与 config 注释自相矛盾。
+结果：patchN 目前对 unet/unetpp/unet3p 三种 decoder 都不可用。修法二选一：在主头/DS 头输出后按 stem_stride 补一次上采样；或从 STEM_MODES 暂时下线 patchN 并更正注释。unetpp/unet3p 有 F.interpolate 回退保尺寸对齐（unetpp.py:97-108、unet3p.py:81-91），装配本身正确。
 
-一、总体评价
-增强/处理层与数据读取层衔接自洽，几处设计达到业界水准：
+编解码其余部分正确：out_channels 全程 low-res→high-res 一致；DS 头用 ConvSegHead（3×3+1×1）、主头 1×1（nnU-Net 风）；各向异性 stride 的兼容性校验（拒绝 convnext LN-first / 非 unet decoder / 不兼容的 up/down mode）在 factory.py:413-435 到位。
 
-单 max-FOV 抽取 + 增强后中心裁 + 懒多分辨率闭环完整：dataset 只发一份 max-FOV cube，trainer 先在带 oversample 余量的张量上做空间增强、再 views.center_crop 回 target_patch_size（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:714-718），最后由 pipeline 懒拆多分辨率视图。空间增强只做一次、几何天然一致，是核心亮点，也正是 TODO 1(gentask) 要复用的骨架。
-增强全程 GPU、逐样本独立：flip/affine/elastic/dropout 用逐样本 Bernoulli mask + nonzero 选中子集处理，grid_sample 一次对整个选中子集向量化，weight_map 随空间变换同步（插值模式可配）。
-ViewPipeline 策略化彻底消除模式分支漂移：build_pipeline（@d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\factory.py:44-68）是唯一 if/elif 处，派生量全来自 ModelTopology；prepare_batch/compute_loss/prepare_val_batch 三接口把「视图重塑 + 损失聚合」封装干净，Trainer._train_epoch 无需预知任何模式。
-强度增强 nnU-Net 式 clamp：增强前记录逐样本逐通道 min/max、全部强度增强后夹回（augment.py:70-81），避免 brightness/contrast/noise 叠加越界污染 gamma 语义。
-gamma 仅在空间轴 reduce、通道独立（augment.py:372-386），对 eager 多分辨率(每通道不同 scale 不同强度范围)是正确的；gaussian_blur 用 groups=n*C 分组卷积把「逐样本不同 σ」一次并行，工程实现优雅。
-二、正确性 / 潜在 Bug
-1. _grid_dropout 在 hole 尺寸 ≥ 维度长时会索引越界（低风险，边界）
+四、注意力算子 — 正确，两处工程建议
+softmax 走 SDPA（可选 RoPE）、linear 是 Shen 2021 的 KᵀV O(N)、window/grid 各自 partition + padding mask + SDPA，RoPE 对 linear/grid 显式拒绝（@d:\codes\work-projects\SegTask\segtask_v1\models\blocks.py:839-848）——数学与边界都对；proj/FFN zero-init 保证初始恒等残差。
+[中] self-attention 与 MultiRF 仅对 backbone='resnet' 生效：factory.py:371-407 只在 resnet 分支解析 selfattn/multirf 逐 stage 配置，convnext/mednext 分支静默忽略。用户在 convnext/mednext 下开这些开关不会报错也不会生效。建议在非 resnet backbone 且开关开启时 logger.warning。
 
+[低] Coord/AttentionGate 默认 BatchNorm：CoordAttention3D 用 _BN[d]（blocks.py:309）、AttentionGate3D 默认 norm_type='batch'（blocks.py:911）。3D 小 batch 下 BN 统计噪声大；建议默认 instance/group 或文档提示。
 
+五、上/下采样算子 — 稳健，无实质问题
+Downsample/Upsample 各向异性 stride 与核结构约束一致（blurpool/pixelshuffle/carafe/dysample 因核结构限各向同性 2，已显式报错，blocks.py:1113-1130、1328-1353）。
+CARAFE 的 reassembly、DySample 的 offset 归一化+分组 grid_sample、ICNR 与 PixelShuffle 的 (c r1 r2 r3) 通道分组匹配（repeat_interleave(rd) → NN 初始化）均正确。
+trilinear/nearest 在 bf16/fp16 下先转 fp32 再插值，兼顾后端支持与确定性。
+[低] DropPath 也施加于 decoder：enc/dec 共用同一 _make_*_stage_builder，各自按 np.linspace(0, drop_path_rate, ...) 生成随机深度（factory.py:38-41）。惯例上 stochastic depth 只用于 encoder；decoder 也开是非主流取舍，值得确认是否有意。
 
-augment.py:296-304
-frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
-hd = max(1, int(D * frac))
-...
-d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)
-当 hd > D（即 ratio 很大或 num_holes 很小导致 frac>1）时，max(D-hd,1)=1 → d0=0，而 ds = d0 + arange(hd) 会达到 hd-1 > D-1，hole_mask[..., ds, ...] 越界报错。默认 ratio=0.3, holes=4（frac≈0.42）安全，但缺乏对 hd/hh/hw ≤ D/H/W 的兜底。建议：hd = min(D, max(1, int(D*frac)))（三轴同理）。
+可借鉴 / 建议新增（业界高质量做法）
+MedNeXt UpKern / DilatedReparam 已实现（mednext.py），质量高；但 upkern_remap 用 align_corners=True（注释已说明与官方 False 不同），小核影响小，建议对齐官方默认以免复现差异。
+多视图融合可考虑加轻量 cross-view attention：当前 Plan A 是 cat→1×1 早融合，可选加一层 view 维注意力（复用已有 SelfAttentionBlock）作为 Plan B 消融。
+get_norm 的 group 静默折半（blocks.py:137-138）：MedNeXt 分支已改成显式报错，建议全局统一为显式报错或至少一次性 warning，避免 group 数被悄悄退化到 1 组。
+结论汇总（按优先级）
+[高] Plan C hierarchical + aux_seg_supervision → aux 头读低分辨率特征却断言等于输入尺寸、未上采样 → 训练即 RuntimeError（unet.py:462-511，与 docstring 矛盾）。
+[中] patch2/patch4 stem 无解码端补偿 → 主头 forward RuntimeError；config/stem 注释宣称的"末尾上采补回"未实现（stem.py:107-114 vs unet.py:494-499）。
+[中] selfattn/multirf 仅 resnet 生效，convnext/mednext 静默忽略，缺 warning（factory.py:371-407）。
+[低] build_model encoder 用 mc.in_channels 而非 topo.in_channels，弱化单一真相源；Coord/AttentionGate 默认 BN 小 batch 不稳；DropPath 亦作用于 decoder；get_norm group 静默折半。
+其余（topology 决策树、Plan A、注意力数学与边界、上/下采样各向异性约束、ICNR/DropPath/checkpoint 细节）均正确且实现质量高。
 
-2. 弹性形变 alpha 与「体素位移」语义不严格一致（低，文档性） disp 由粗网格 randn(std=1) 经 trilinear 上采样得到（augment.py:247-248），插值使内部点方差 <1，故真实最大位移 < alpha·(2/N) 体素，config 注释「位移幅度(voxel)常 3–12」略高估实际幅度；再叠加 effective_alpha = alpha/max_scale(augment.py:58)。功能正确，仅标称单位偏乐观。建议：注释注明「近似幅度、受平滑衰减」，或对位移场按范数归一后乘 alpha 以兑现「最大体素位移」语义。
 
-3. config 注释「Affine…合成单次 grid_sample」与实际两次重采样（低，误导性） config.py:178 称仿射合成单次 grid_sample —— 对 affine 自身成立，但 __call__ 中 _random_affine 与 _elastic_deform 是两次独立 grid_sample（augment.py:50-62），选中样本被连续重采样两遍，产生双重插值模糊。属实现取舍，但注释易让人以为全空间变换只采样一次。建议：把 affine 的仿射位移与 elastic 位移场相加后合成单次 grid_sample（既消双重模糊又省一次重采样，见优化 1）。
+训练全流程(含 val) 代码审查
+审查文件:trainer.py、trainer/pipelines/*(base/vanilla3d/patch3d/slab25d/lift25d/factory)、optim.py、amp.py、validation.py、views.py、breakdown.py、checkpoint.py、losses.py,并交叉核对 utils.py(ModelEMA / pooled 指标)与 config.py(选模派生量)。
 
-4. scale_range 的 grid_sample 语义为「反向」（低，文档性） m = scales * rot（augment.py:216）作用在采样网格坐标上：scale>1 使网格坐标外扩、采样范围变大 → 物体在输出中变小。直觉上 random_scale_range=[0.85,1.15] 的「1.15」实际是缩小而非放大。功能对称无害，但语义方向与直觉相反，值得在注释澄清。
+总体评价
+这是全项目成熟度最高的一层之一。Trainer 被彻底收窄为"编排器",所有"如何把 batch 拆成 (model_input, supervision)、如何折损失"的模式分支全部下沉到 ViewPipeline 策略对象(唯一 if/elif 在 factory.py,且派生量与 models.factory 共用 ModelTopology 单一真相源)。fp32 损失、GradScaler 跳步保护、尾组有效 accum、EMA CPU offload、RNG 位精确 resume、ZeRO consolidate 早于 rank 早退、DDP no_sync 把 forward 一并纳入、验证 EMA try/finally 换回、pooled 指标 all-reduce 的严格可加性——都是踩过坑才有的实现。下面按你点名的 6 个子项给结论。
 
-以上均非高危项——数据增强层未发现会导致训练崩溃或标签错配的正确性硬伤（flip/affine/elastic 对 image/label/wmap 用同一变换、label/wmap 走 nearest 保离散，均正确）。
-
-三、优化空间
-1. Affine + Elastic 融合为单次 grid_sample（性能 + 质量） 当前对同一批选中样本先仿射重采样、再弹性重采样两遍。可将仿射网格与弹性位移场在归一化坐标里相加后只 grid_sample 一次：减少一次三线性重采样开销，并消除双重插值导致的额外高频损失。nnU-Net/MONAI 的 RandDeformGrid+Affine 组合即走单次 warp。
-
-2. 每个增强算子的隐式 device 同步累积（性能） _random_affine 的 mask.sum().item()（augment.py:133）、_random_contrast 的 mask.sum().item()（:356）、_simulate_lowres 的 .tolist()（:457-458），以及各算子的 mask.nonzero()（flip/affine/elastic/noise/blur）——每个都会强制一次 CUDA→CPU 同步。一个 step 约 8–10 次同步，掩盖 H2D 与 kernel 重叠。建议：整批处理 + torch.where(mask, aug, orig) 混合代替 nonzero+scatter，或一次性预采样所有 Bernoulli mask，减少同步点。
-
-3. inplace=False 下的多次额外分配（显存/性能） 入口 clone 一份后，brightness/contrast/gamma 各返回新张量（image + shift 等），叠加时产生多份 batch 体积的瞬时分配。可让强度算子在选中子集上做 in-place（如 image[idx].add_(shift)）以复用缓冲；与已存在的 inplace 契约方向一致。
-
-4. grid_dropout 的 python for k in range(num_holes) 循环（低） 逐 hole 循环做高级索引赋值；holes 少时无所谓，可用一次性构造 mask 的向量化写法，属可选清理。
-
-四、可借鉴 / 可新增（业界做法）
-对 TODO 1(gentask) 的直接价值最大：
-空间增强(flip/affine/elastic)天然对 image 与 label 施加同一几何变换，SR/VFI 的「退化 LR ↔ 高清 GT」正需要这种成对一致变换，可原样复用。
-_simulate_lowres（augment.py:444-470，trilinear 下采→上采）本质就是一个退化模型，是 gentask「面内超分/厚层模拟」degradation pipeline 的现成起点；可扩展各向异性 zoom（仅 z 轴下采样以模拟厚层部分容积效应）。
-views.split_views_native_d（2.5D 逐视图抽 slab）与 split_views_native_3d（多 FOV 中心裁+resize）正是 gentask「z 轴取起止切片做 VFI / x 轴取切片做 SISR」的多 FOV 读取骨架。
-物理 spacing-aware 旋转：当前 aspect_correct 只按 voxel-count 各向同性校正（augment.py:151-155,212-214），未含真实 spacing；docstring 已注明局限。可在 data.spacing_normalization=False 时引入按物理 spacing 的出面旋转限幅（nnU-Net 对薄 z 轴限制 out-of-plane 旋转角），避免厚层数据的几何失真。
-gamma invert / 通道级 gamma（nnU-Net 对反相图再做一次 gamma）与 mirroring-consistent TTA 可作为廉价增益补充。
-MONAI/nnU-Net 的融合 warp 与 batched RandGaussianNoise：若后续追求吞吐，可对齐其「单 warp + 少同步」实现范式。
-
-
-训练全流程(含val流程) 审查报告
-审查范围：train.py（CLI 入口 / DDP spawn / 信号与孤儿兜底）、trainer/trainer.py（fit 主循环、_train_epoch、_validate、checkpoint/resume/pretrain、健康监测）、trainer/optim.py（optimizer/scheduler 工厂 + WarmupScheduler）、trainer/amp.py（AMP shim + fp32 损失）、trainer/validation.py（MetricAccumulator + medium/high 两 evaluator）、trainer/pipelines/*（compute_loss 聚合）、trainer/dist_utils.py、trainer/memory.py、trainer/checkpoint.py、utils.py（ModelEMA、pooled 指标算子）。
-
-一、总体评价
-训练层是工程完成度最高的一层，若干处达到或超过业界主流框架水准：
-
-模式无关的训练循环：``Trainer._train_epoch`` 完全不判训练模式，所有「视图重塑 + 损失聚合」经 ``self.pipeline``（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:721,737）归口，Trainer 只协调 optimizer/scaler/EMA/DDP。这套 R2 重构消除了模式分支漂移，扩展新任务（如 gentask）只需换 pipeline+loss+metric。
-AMP 数值取舍正确：forward 走 autocast、损失强制 fp32（@d:\codes\work-projects\SegTask\segtask_v1\trainer\amp.py:73-94，logit 先 clamp(±50) 再 fp32 dice/bce），从源头规避 fp16 下 Dice/BCE 汇总溢出→NaN 的经典坑；``amp_dtype='auto'`` 按 bf16 能力自动择型（amp.py:66-70）。
-非有限值的双路防护：fp16 交给 GradScaler 跳步；bf16/fp32 无 scaler 保护时显式丢弃整个 accum 组梯度（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:786-815），且 scheduler/EMA 照常推进——避免 NaN 永久污染权重/EMA，这是很多自研 trainer 缺失的护栏。
-梯度累积 × DDP 数学等价：非边界步用 ``fwd_model.no_sync()`` 免 all-reduce（trainer.py:727-733），边界步按有符号尾长 ``_effective_accum`` 归一（trainer.py:579-587），配合 DDP 的 mean-all-reduce，等效 batch=batch_size×accum×world_size 与单卡严格等价，遵循 PyTorch 官方 no_sync 惯例。
-pooled 指标累加器（nnU-Net 风格）：``MetricAccumulator`` 逐 batch 累加 inter/pred_sum/target_sum/voxels/cov（@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:84-138），闭式一次导出 dice/iou/recall/precision/vol_sim/mcc/surface_dice/balanced，且多卡 all-reduce(SUM) 与单卡累加逐位相等（validation.py:140-188）——因混淆量可加，这是最正确的分布式指标聚合方式（优于各 rank 求 dice 再平均）。
-medium/high 双评估策略同构输出：两 evaluator 唯一差别是 (pred,target) 来源，累加/导出共用 MetricAccumulator，故选模/调度/ckpt 无需分支（validation.py:290-471）。high 模式直接复用 ``Predictor`` 整卷滑窗并按推理阈值二值化喂入（``pred_is_binary``，validation.py:434-458），与部署口径一致。
-resume 的位精确性与 DDP 分流：checkpoint 快照 torch/cuda/numpy/python 四路 RNG（trainer.py:937-944），resume 后 rank>0 用 ``_reseed_rank_rng`` 重新分流避免所有 rank 退化成 rank0 随机流（trainer.py:77-83,1054-1057）。best_model 以 EMA 为主权重、在线权重另存 ``model_online_state_dict``（trainer.py:960-969），resume 优先读在线权重、pretrain 可选读 EMA，方向正确。
-进程健壮性：DDP 子进程 ``PR_SET_PDEATHSIG`` 父死即死 + SIGTERM/SIGINT 优雅销毁 pg + NCCL 异步超时（@d:\codes\work-projects\SegTask\segtask_v1\train.py:110-200），是"孤儿进程卡 NCCL 永久占卡"的成熟兜底，工业级细节。
-监测/健康指标全程异常隔离（trainer.py:505-559,881-898）：任何监测失败仅告警、绝不打断训练，符合"副作用不影响主流程"的设计纪律。
-
-二、正确性 / 潜在 Bug
-1. 每 micro-step 多次 ``.item()`` 强制 host-device 同步（中风险·性能正确性） ``_train_epoch`` 每步都传入非空 breakdown 调 ``compute_loss``，pipeline 内对 ``L_main/L_aux_k/L_total`` 逐个 ``.detach().item()``（如 @d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\slab25d.py:50,202,206），叠加主循环 ``step_loss = loss.item()``（trainer.py:745-746）。即使当前 step 不打日志（``log_every`` 未命中），这些 ``.item()`` 也照常执行——每 step 约 3~5 次 CUDA→CPU 同步，打断 forward/backward 与 H2D 重叠。这与「数据增强报告」里指出的同步问题同源。建议：分量在 GPU 上以张量累加，仅在 ``log_every`` / epoch 末一次性 ``.item()``；或让 ``compute_loss`` 在 ``breakdown is None`` 时跳过标量抽取，主循环仅在需要写 meter 的步传 breakdown。
-
-2. EMA 在"被跳过的优化步"上仍 ``update()``（低风险，副作用） fp16 scaler 跳步路径（trainer.py:828-833）与 bf16 显式跳步路径（trainer.py:811-812）都会调用 ``self.ema.update()``。权重未变时 shadow 向同值收敛，数值无害，但 ``num_updates`` 仍自增，推进 EMA warmup 的有效 decay ``(1+n)/(10+n)``（@d:\codes\work-projects\SegTask\segtask_v1\utils.py:109-110），且在 ema_device='cpu' 时白白触发一次 D2H staging 同步（utils.py:111-119）。建议：优化步真正生效后再 ``ema.update()``（把 update 移入未跳步分支）。
-
-3. 训练 loss 与验证 loss 口径不一致（低风险，监控口径） medium 验证 loss 用裸 ``base_loss`` 在 1x reshape 后的张量上算（@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:338），而训练 loss 走 ``SliceChannelLoss``/``MultiResolutionLoss``（含 reduction、DS、aux 加权）。两者非同一泛函，监控面板上 train_loss 与 val_loss 不可直接比较；high 模式更是不产 val_loss（validation.py:97,355）。功能无误（选模只用 mean_dice/combined 等，不用 val_loss），但建议在文档/图例注明口径差异，避免误读为过拟合/欠拟合信号。
-
-4. OneCycleLR 与 total_steps 的强耦合在 resume 漂移下会抛错（低风险，边界） OneCycle 的 ``total_steps = epochs×steps_per_epoch``（@d:\codes\work-projects\SegTask\segtask_v1\trainer\optim.py:141-148），且每个边界步（含被跳过的优化步）都调用一次 ``scheduler.step()``。正常/早停下 step 次数 ≤ total_steps 安全；但 resume 时若改了 ``epochs``/``grad_accum_steps``/数据量，恢复的 OneCycle 内部计数与新 total_steps 不符，可能触发 "Tried to step N times but total_steps=M"。``WarmupScheduler.load_state_dict`` 已对 warmup 漂移告警（optim.py:210-234），但未覆盖 base scheduler 的 horizon 漂移。建议：resume 时对 one_cycle 检测 total_steps 变化并告警/兜底重建。
-
-5. 训练期 ``"dice"`` 为稀疏抽样、却按 epoch 级上报（低风险，监控口径） train dice 仅在 ``(step+1)%log_every==0 or step==0`` 时计算并入 ``dice_meter``（trainer.py:870-877），故 ``train_metrics["dice"]`` 是抽样均值而非全 epoch。作为廉价训练监控可接受，但严格说与 val dice 不同口径，建议注明或按需全量。
-
-以上均非会导致训练崩溃/标签错配的高危硬伤；#1 为最值得优先处理项（吞吐相关，改动局部）。
-
-三、优化空间
-1. 消除每步同步点（吞吐） 同「二.1」。foreach 化的健康指标已很克制（trainer.py:592-641 仅每 epoch 少量 ``.item()``），但主损失/分量的 per-step ``.item()`` 是稳态吞吐的主要隐性同步源。GPU 端累加、稀疏落地即可显著改善 GPU 利用率，尤其小 batch 3D。
-
-2. high 验证每 epoch 全量整卷滑窗成本高（可配置降频） ``VolumeValEvaluator.evaluate`` 每次验证对全部 val 卷做一遍部署级滑窗推理（@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:396-460），最可靠但最慢。当前靠 ``val_every`` 全局降频。建议提供「前中期 medium、后段/里程碑 high」的混合策略，或对 high 单独设更大间隔，兼顾选模可靠性与训练墙钟。
-
-3. 验证前后 ``empty_cache`` 仅在 ``val_empty_cache`` 且 CUDA 时（trainer.py:917-926） 对整卷大累加器 OOM 是有效兜底，但默认关。可在 val_metric_mode='high' 时默认开启（high 才需要连续大显存），减少用户踩坑。
-
-4. checkpoint 保存为阻塞 ``torch.save``（trainer.py:986,990） 大模型 + 频繁 save_every 时阻塞主进程。可选异步/后台线程落盘（rank0），或对周期 ckpt 采用 ``torch.save(..., _use_new_zipfile_serialization=True)`` 之外的分离 I/O。属可选优化。
-
-四、可借鉴 / 可新增（业界做法）
-对 TODO 1(gentask) 的直接价值最大：整套 Trainer 骨架（AMP-fp32 损失、EMA、DS、grad-accum、DDP no_sync、warmup+scheduler 工厂、resume/pretrain/UpKern、健康监测、监测隔离）几乎可原样迁移到 gentask，只需替换 ①pipeline（SR/VFI 的退化-重建视图重塑）②loss（L1/Charbonnier/感知/SSIM/GAN）③metric。EMA 对 SR/超分尤其关键（SOTA SR 普遍用 EMA 稳定），此处实现（含 CPU offload、foreach、warmup）可直接复用。
-指标累加器的可加性前提需注意：``MetricAccumulator`` 依赖「混淆量跨样本可加」才能 pooled + all-reduce 严格等价（validation.py:140-188）。PSNR/SSIM 不是线性可加量（PSNR 含 log、SSIM 为比值），gentask 若照搬需改为「逐卷算指标再算数平均 + 计数 all-reduce」，或累加 MSE(可加) 后统一转 PSNR。建议在 gentask 复用时显式区分「可加混淆量」与「不可加评分」。
-high 模式的整卷滑窗验证正是 SR 的部署级评估范式（validation.py:350-460）：gentask 可复用「val 阶段跑一遍与推理一致的滑窗/拼接」来对齐训练-部署差异。
-选模标准的单一真相源（save_best_criterion→(metric,mode) 派生，config.py:743-754,831）值得推广到 gentask：把 "psnr/ssim/lpips/combined" 也做成映射表，避免 metric 名与 mode 手配不一致。
-可新增：梯度累积下的 BN/统计校正——若 gentask 用 BatchNorm 且 batch 很小，可引入 nnU-Net 式 batch_dice 类比的「跨累积组统计」或改 GroupNorm（与模型报告中「小 batch 3D 慎用 BN」呼应）。
-可新增：EMA 权重同时保存"在线+EMA"已具备（trainer.py:960-969），但验证仅用 EMA；建议提供「同一 epoch 同时报 online 与 EMA 指标」的可选诊断，便于判断 EMA 是否真正带来增益（长跑早期 EMA 可能拖累）。
+一、Trainer 控制流 — 正确,一处注释过强
+fit → _train_epoch / _validate 主干清晰:优化步以 ceil(len/accum) 对齐 scheduler horizon;尾组不满 accum 时 _effective_accum 用真实尾长作分母(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:579-587),is_step_boundary 用 (step+1)==total_steps 兜住尾组触发一步——与 scheduler 步数自洽。非有限 loss:fp16 交 GradScaler 跳步,bf16/fp32 走 skip_optim_step 丢弃本组梯度但仍推进 scheduler/EMA(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:786-815),避免 NaN 永久污染权重/EMA。DDP no_sync 正确包住 forward+backward(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:727-741),_save_checkpoint 先 consolidate_state_dict(to=0) 再 if not is_main: return(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:974-980)——顺序对,否则集合通信挂死。
+
+[中] "math-equivalent to single-GPU under grad-accum" 的注释对"区域比值型"损失过强(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:222-224、738-741)。 该等价只对逐样本可分损失(BCE/Focal/per-sample Dice 的样本均值)成立:此时 loss/accum 求和 + DDP 梯度均值 = 全局样本均值。但 batch_dice=True 的 Dice / Tversky / GDL 是在 batch 维汇总分子分母的比值,其"批"在实现里 = 单卡单 micro-batch;grad-accum 越大或卡越多,batch_dice 的有效统计窗越小、越抖,与"single-GPU 全 batch pooled dice"并不等价。这不是 bug(与 nnU-Net 不用 accum 的取舍一致),但注释会误导用 batch_dice+大 accum 的用户。建议注释区分"样本可分损失严格等价、比值型损失仅近似"。
+
+二、pipelines 策略 — 设计正确,实现干净
+7 个 pipeline 各司其职:Vanilla3D(pass-through/eager MR)、Patch3DNativeMultiRes(懒 MR,max-FOV cube 逐视图裁+resize 堆通道)、Slab2_5D{,-Aux,-NativeD}、Lift2_5D{,-Aux}。SupervisionPack 只填各自需要的字段(@d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\base.py:34-49),compute_loss 内 arity 校验齐全(preds/weights/losses/labels 四元对齐,见 @d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\slab25d.py:314-320)。split_views_native_3d/_d 都断言"增强 oversample 余量已被中心裁去掉"(@d:\codes\work-projects\SegTask\segtask_v1\trainer\views.py:62-67、134-139),自检闭环。aux 权重缺省几何衰减 0.5^(k+1)(@d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\slab25d.py:36-37),契合"FOV 越宽对齐越差权重越小"。topo 辅助头损失由 factory 统一注入、与具体 pipeline 解耦(@d:\codes\work-projects\SegTask\segtask_v1\trainer\pipelines\factory.py:70-77)。此项未见正确性问题。
+
+三、AMP / EMA / grad-clip / scheduler
+AMP: amp_dtype='auto' 按设备解析 bf16/fp16;scaler 仅 fp16 启用(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:170-174);损失强制 fp32 且 logits clamp ±50 防 BCE 出 NaN(@d:\codes\work-projects\SegTask\segtask_v1\trainer\amp.py:73-94)。正确。[低] 该 clamp 在 bf16/fp32 下也生效,对 |logit|>50 的梯度有极小改变,可忽略。
+
+EMA: foreach 向量化 + dtype 分组;CPU offload 用 pinned staging 异步 D2H+单次流同步,数学等价(@d:/codes/work-projects/SegTask/segtask_v1/utils.py:103-127);整型 buffer 直接跟随;apply/restore 用 _swapped 防重入;pretrain 后重对齐 shadow 防随机初始泄露(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:1117-1123)。正确。
+
+grad-clip: 仅边界步 unscale_ 后 clip_grad_norm_,复用范数喂健康监测(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:770-785)。fp16 下即便 clip 把 inf 梯度缩成 NaN,scaler.step 仍会跳步,不污染权重——安全。
+
+scheduler: WarmupScheduler 线性 warmup→base;one_cycle 关外层 warmup 用 pct_start 映射,避免双重叠加(@d:\codes\work-projects\SegTask\segtask_v1\trainer\optim.py:139-148、trainer.py:153-158);cosine/poly/step horizon 按 post_warmup_steps 对齐,退火恰好到尾。resume 校验 warmup 配置漂移。
+
+[低/设计] 跳步仍推进 scheduler/EMA。 bf16/fp32 guard-skip 明确推进(已文档化、内部一致);但 fp16 下 scaler.step 内部跳步对 Trainer 不可见(未比较 get_scale() 前后),scheduler.step()(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:831)照常推进,启动期标定的少数跳步会让 LR 提前漂移几步。影响很小,可选:检测 scale 下降来判定跳步。
+[低/设计] plateau 的 patience 单位是"验证 epoch"而非 epoch。 step_epoch 仅在 metric is not None 时步进(@d:\codes\work-projects\SegTask\segtask_v1\trainer\optim.py:189-194),而 metric 只在 val epoch 有值,故有效耐心 ≈ plateau_patience × val_every。文档提示即可。
+四、DS / MultiRes / aux 损失组合 — 正确
+DS×MR 组合口径一致: DeepSupervisionLoss 对每个低分辨率 pred 把整数 label_raw(B,C_res,*) 与 wmap 一起 nearest 下采到 pred 尺寸,再交 MultiResolutionLoss 按通道 [:, r*num_fg:(r+1)*num_fg] / label[:, r] 拆分(@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py:324-340、762-777)。C_res 通道在下采样中保留,layout 严格一致。
+诊断无热路径同步: MR 每次 forward 只 detach 追加历史,pop_per_res_diag 每步一次 .item();DS 多次调用时对尺度取均(@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py:745-753、breakdown.py:24-39)。设计好。
+DS 权重归一化(@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py:301-306)使各尺度权重和为 1,主损失量纲稳定;数量不匹配显式 ValueError(:318-321)。
+SliceChannelLoss 逐类单通道喂 base_loss、per_slice/per_volume 两种 reduction、_aggregate_per_class 重读 base_loss.class_weights 做归一化加权均(@d:\codes\work-projects\SegTask\segtask_v1\losses\losses.py:974-1015)——避免 cw 在包装层被"折叠成无操作"。正确。
+aux 三条路径(folded 共享 / native_d 逐视图 / lift MR)标签取用与损失函数选择均与 image 折叠方式对应,无错位。
+未发现该子项的正确性问题。 唯一提示:DS 权重默认 4 项,若模型实际 DS 头数不同则运行时 ValueError——建议 config 层预校验 len(deep_supervision_weights) 与解码深度一致(属模型装配交叉项,可选)。
+
+五、validation 的 pooled Dice — 正确且 nnU-Net 一致
+MetricAccumulator 逐 batch/卷累加 inter/pred_sum/target_sum/voxels/cov(+可选 sd 分子分母),compute() 末闭式导出 dice/iou/recall/precision/vol_sim/mcc/surface_dice/balanced(@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:114-268)。pooled dice = (2ΣTP+ε)/(2ΣTP+ΣFP+ΣFN+ε),是 nnU-Net 训练期"global/pseudo dice"口径。做对的关键:
+
+多卡严格等价: 各 rank 处理不相交样本,可加混淆量 all-reduce(SUM) 后与单卡在全集累加逐位相等;空 rank 按正确 shape/dtype 零初始化避免 collective 死锁,voxels 保 float64 防大计数溢出(@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:140-188)。
+coverage 掩码: 全 val 无 GT 的类(cov==0)从 mean/min 剔除,全空退回全类(@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:222-232)——nnU-Net ignore_empty 思想。
+high 模式 bbox 裁剪后回传整卷 voxels 使 MCC 的 TN 口径不变、sd 按 tol+1 外扩边距保严格等价(@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:442-458)。
+选模一致性(核对确认非 bug):save_best_metric/mode 是 save_best_criterion 的派生只读 property(@d:\codes\work-projects\SegTask\segtask_v1\config.py:743-754),而 MetricAccumulator 也用 save_best_criterion 决定是否算 surface/balanced——被追踪指标必然被产出,不会出现"设了指标却从不置 best"的坑。
+[中] medium 与 high 的二值化阈值不一致。 medium 走 dice_batch_stats 内固定 sigmoid>0.5(@d:/codes/work-projects/SegTask/segtask_v1/utils.py:253-254),high 用 predictor.threshold(可为逐类调优阈值,@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:436-440)。若部署阈值≠0.5,medium 选出的 best 未必对齐部署行为。属口径差异(medium 本就文档化为"快而乐观"),但值得在文档明确:medium 选模恒在 0.5 阈值下进行。
+[低,已文档化] pooled≠mean-per-case: pooled dice 会被大目标主导、掩盖个别病例失败;且 medium 是"每卷一 patch"上 pooled,偏乐观。用于选模可接受(与 nnU-Net 一致),但最终报告建议另算 per-case。
+六、checkpoint / resume — 正确
+在线权重存 model_state_dict,best 时把 EMA 提为 primary、在线放 model_online_state_dict(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:960-969);resume 优先读 model_online_state_dict 续训、RNG 四源(torch cpu/cuda+numpy+python)快照恢复、rank>0 resume 后 _reseed_rank_rng 防各卡 RNG 退化成 rank0(@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:1039-1057);keep-last-k 剪枝不动 best。pretrain 仅载权重、UpKern 重映射、不动 optim/RNG/epoch。正确。
+
+结论汇总(按优先级)
+[中] grad-accum/DDP 的"与单卡严格等价"注释对 batch_dice/Dice/Tversky/GDL 等区域比值型损失过强;其有效统计窗是单卡单 micro-batch,随 accum/卡数缩小(trainer.py:222-224、738-741)。非 bug,注释需修正。
+[中] medium(0.5)与 high(predictor.threshold)验证阈值不一致,medium 选模不反映调优阈值(validation.py vs utils.py:253)。
+[低/设计] fp16 scaler 跳步对 Trainer 不可见,scheduler 仍推进,启动期 LR 微漂;plateau patience 实为"验证 epoch"单位(=plateau_patience×val_every)。
+[低] compute_loss_fp32 在 bf16/fp32 下也 clamp logits ±50(可忽略);DS 权重数与解码深度仅运行时 ValueError,建议 config 预校验。
+正确且高质量: pipeline 策略收敛、DS×MR×aux 损失组合口径一致、fp32 损失与跳步保护、EMA offload/换回、pooled 指标多卡严格可加与 coverage 掩码、选模单一真相源、RNG 位精确 resume、ZeRO consolidate 顺序——均无实质问题。
+
+
+推理全流程代码审查
+审查范围
+predictor.py(调度/单卷编排)、sliding.py(4 种滑窗 + blend 累加)、blending.py(位置/权重/prob→label)、forwards.py(3 种 forward + TTA)、inputs.py(6 个窗口 builder)、adabn.py(测试时 BN 自适应)、io.py(ckpt/精度/run_inference),并交叉核对 config.PredictConfig。
+
+总体评价
+这一层与训练层同为高成熟度：Predictor 只做编排,几何/权重下沉到 blending,窗口构造下沉到 inputs(纯函数 + 类侧 shim),forward/TTA 下沉到 forwards,mode 派生量统一来自 ModelTopology 单一真相源(消除了与 Config.sync/build_model 的三处重复)。累加器 dtype/落点(acc_dtype/accumulate_on_cpu)、整卷 vol_dtype=fp16 常驻、fp32 sigmoid、NaN→背景兜底 + 诊断、ckpt 的 compile/EMA/best-primary 兼容、< 半参数加载即硬错——都是踩过坑的实现。下面按你点名的 5 个子项给结论,含 2 处真问题。
+
+一、滑窗与高斯融合 — 机制正确,发现一处 blend_mode 失效
+做对的地方:
+
+compute_1d_positions 尾窗反推 (length-patch, length) 保证全覆盖;length<=patch 单窗;stride=max(1,·) 防死循环(@d:\codes\work-projects\SegTask\segtask_v1\predictor\blending.py:34-43)。正确。
+z 轴累加器 acc_weight 形状 (1,D,1,1) 只沿 z,H/W 每 z 恒一窗全覆盖 → 广播正确;cubic 用可分离 3D 外积权重 + 按 [:ad,:ah,:aw] trim 尾窗(@d:\codes\work-projects\SegTask\segtask_v1\predictor\sliding.py:341-347)。自归一化加权平均 acc_pred/acc_weight 数学正确。
+edge_pad+ad<pD 时对称去 pad(pad_before=(pD-ad)//2)取中心 ad 切片、build_1d_weight(ad) 对称权重(@d:\codes\work-projects\SegTask\segtask_v1\predictor\sliding.py:167-184);且该分支仅在小卷单窗触达,尾窗恒 ad==pD。闭环。
+fp16 累加器 eps 按 dtype 抬到 6.1e-5 防下溢清零(@d:\codes\work-projects\SegTask\segtask_v1\predictor\sliding.py:393)。稳健。
+[中] z 轴滑窗恒用 gaussian,忽略 blend_mode="average"。 sliding_window_z 的两处权重 build_1d_weight(pD) 与 build_1d_weight(ad)(@d:\codes\work-projects\SegTask\segtask_v1\predictor\sliding.py:90、183)均未传 mode,而 build_1d_weight 默认 mode="gaussian"(@d:\codes\work-projects\SegTask\segtask_v1\predictor\blending.py:49)。因此无论 predict.blend_mode 设成 "average" 与否,z 轴/2.5D 路径始终高斯融合;偏偏日志还打印 blend=%s(@d:\codes\work-projects\SegTask\segtask_v1\predictor\sliding.py:78)会显示 average,误导。cubic 路径经 build_3d_weight(...,p.blend_mode) 正确响应(@d:\codes\work-projects\SegTask\segtask_v1\predictor\sliding.py:295)。属真实不一致:要么把 p.blend_mode 传进两处 build_1d_weight,要么在 z 路径日志显式标注"z 轴恒 gaussian"。因 gaussian 是默认且推荐值,实际影响面小,但语义与日志确实错位。
+
+[低] 高斯 σ=n/4 比 nnU-Net 的 n/8 平缓(@d:\codes\work-projects\SegTask\segtask_v1\predictor\blending.py:57):窗边权重 ≈exp(-2)=0.135 偏高、中心加权更弱、更接近均匀,缝合处抑制略逊于 nnU-Net 默认。可选调优,非 bug。
+
+二、TTA — 正确,批量化与串行严格等价
+规格表 _FLIP_SPECS_3D(7 组 D/H/W)与 _FLIP_SPECS_2_5D(仅 H/W,不翻通道轴 D)分别记录 x 与 prob 的翻转轴(布局不同),映射正确(@d:\codes\work-projects\SegTask\segtask_v1\predictor\forwards.py:47-58)。2.5D 不翻 D(输入通道轴,翻转会打乱物理切片顺序)——判断正确。
+_flip_tta_batched 按 tta_batch_size 沿 batch cat 成大 batch 一次前向、逐变体反 flip 后累加、除以 1+len(specs)(@d:\codes\work-projects\SegTask\segtask_v1\predictor\forwards.py:74-97);eval 下 BN 用 running stats、变体间无 batch 耦合,与逐变体串行逐像素等价,累加顺序保持"原图→变体序"浮点同序。正确。
+所有 TTA 调用都发生在各 forward 的 autocast 上下文内(@d:\codes\work-projects\SegTask\segtask_v1\predictor\forwards.py:257-268、285-294、305-318),精度一致;post_fn 统一 sigmoid(pred.float()) fp32。lift 模式复用 3D ensemble(D 为真空间轴,翻转合法)。未见正确性问题。
+三、bbox — 逻辑正确,顺序闭环
+bbox 形状对齐检查在裁剪/重采样之前对原始 raw_vol 做(@d:\codes\work-projects\SegTask\segtask_v1\predictor\predictor.py:352-356);空 bbox 警告并回退全卷(bbox=None,不裁不拼)。
+顺序正确:bbox 裁剪 → pre_resample_shape=裁剪后形状 → spacing 重采样 → 推理 → 概率回采到裁剪原生分辨率 → 贴回 (num_fg,D_orig,H_orig,W_orig) 画布、bbox 外留 0(@d:\codes\work-projects\SegTask\segtask_v1\predictor\predictor.py:371-431)。read_nifti_spacing 取整图 spacing(与是否裁剪无关)喂重采样,正确。_log_inroi_prob_stats 在贴回前算,避免 ROI 外 0 偏移统计。未见问题。
+四、AdaBN — 发现一处 global 与 per_volume 的语义不一致
+做对的地方:collect_bn_modules 只纳入 track_running_stats=True 且 buffer 非空的 _BatchNorm(instance/group 自动排除);bn_estimation_mode 临时 train()+momentum=None(累积平均)配合 reset_running_stats,退出恢复 training/momentum 而保留新 running stats,且全程 no_grad(@d:\codes\work-projects\SegTask\segtask_v1\predictor\adabn.py:33-97)。per_volume 双趟(先估计再预测)、_diag_first_batch_logged 护孔管理均正确(@d:\codes\work-projects\SegTask\segtask_v1\predictor\predictor.py:394-412)。
+
+[中] global AdaBN 未设 _adabn_estimating → BN 估计期 TTA 变体被拼成大 batch。 per_volume 路径明确置 self._adabn_estimating=True,使 _tta_chunk_size 强制返回 1、串行前向,理由是"BN 处于 train+累积平均,把多个 flip 变体拼成大 batch 会改变 BN 见到的 batch 统计构成与 running stats 累积"(@d:\codes\work-projects\SegTask\segtask_v1\predictor\forwards.py:61-71、@d:\codes\work-projects\SegTask\segtask_v1\predictor\predictor.py:401-409)。但 global 模式的 _warmup 里 predict_volume 全程都没有置该标志(@d:\codes\work-projects\SegTask\segtask_v1\predictor\io.py:197-208),于是 global BN 重估时 TTA 仍按 tta_batch_size 批量化,momentum=None 的逐 forward 累积平均对 batch 构成敏感 → global 的 BN 统计会依赖 tta_batch_size,与 per_volume 刻意规避的语义直接矛盾。修法:global 预热前后同样置/复位 _adabn_estimating(或预热时临时关 tta_flip)。
+
+[低] 两种模式的 BN 估计都在跑 TTA(把翻转输入喂进 BN 统计估计)。 conv 非 flip-等变,翻转输入会产生不同激活,相当于用增广样本估 BN。虽不致命,但纯粹的目标域 BN 统计通常只用原图前向;可考虑估计期一律关 TTA(顺带解决上一条)。
+
+五、精度 / ckpt 加载 — 正确
+_select_state_dict 的 auto 优先 EMA、ema 缺失回退 online 并警告、online 取 model_online_state_dict(@d:\codes\work-projects\SegTask\segtask_v1\predictor\io.py:42-66);与训练侧"best 把 EMA 提为 primary、online 另存"契合——best ckpt 无独立 ema_state_dict 时 auto 落到 primary(即 EMA),结果正确。_unwrap_ema_state 拆 {shadow,decay}、_strip_compile_prefix 在选权重后剥 _orig_mod.,次序对。
+load_state_dict(strict=False) 后 加载 <半数参数即硬错,拒绝随机权重静默推理(@d:\codes\work-projects\SegTask\segtask_v1\predictor\io.py:131-144);weights_only=False 有注释说明(ckpt 含 Config/RNG,PyTorch 2.6+ 需显式)。MedNeXt reparam_deploy 在 .to(device) 前 reparameterize(@d:\codes\work-projects\SegTask\segtask_v1\predictor\io.py:146-149),次序对。
+精度:auto 跟随 train.amp_dtype,fp16 仅 CUDA 下 model.half() 并醒目警告 LayerNorm 溢出;Predictor 侧检测到 fp16/bf16 权重时关 autocast 改为逐前向 cast 输入(@d:\codes\work-projects\SegTask\segtask_v1\predictor\predictor.py:243-249、@d:\codes\work-projects\SegTask\segtask_v1\predictor\io.py:154-168)。逻辑自洽。
+[低] CPU + precision=fp16 静默降级。 io.py:155 仅在 device.type=="cuda" 时 half(),CPU 上请求 fp16 会静默按 fp32 跑(use_amp 亦为 False)。合理但无提示,可补一行 info。
+
+[低] whole/cubic 的 CPU-blend 路径(forward_batch_numpy)不发 forward 诊断,仅 GPU 路径发(@d:\codes\work-projects\SegTask\segtask_v1\predictor\forwards.py:275-281)。已文档化,属复刻旧行为的取舍。
+
+结论汇总(按优先级)
+[中] z 轴滑窗恒用 gaussian,忽略 blend_mode="average"(build_1d_weight 两处未传 mode),日志却打印 blend_mode,与 cubic 不一致(sliding.py:90、183 vs blending.py:49)。
+[中] global AdaBN 未置 _adabn_estimating,BN 重估期 TTA flip 变体被批量化拼 batch,使 BN 统计依赖 tta_batch_size,与 per_volume 明确规避的语义矛盾(io.py:197-208 vs forwards.py:61-71)。
+[低] AdaBN 估计期(两模式)仍跑 TTA,把翻转输入喂入 BN 统计估计——建议估计期一律关 TTA。
+[低] 高斯 σ=n/4 较 nnU-Net(n/8)平缓;CPU+fp16 静默降级;whole/cubic-CPU 路径不发 diag(已文档化)。
+正确且高质量:滑窗全覆盖与自归一化加权、cubic 可分离权重与尾窗 trim、TTA 批量化↔串行严格等价与轴映射、bbox 裁剪/重采样/贴回顺序闭环、AdaBN 的 BN 收集与累积平均/状态恢复、ckpt 的 EMA/compile/best-primary 兼容与半参数硬错、精度分派——均无实质问题。
+
+跨模块代码审查  
+一、跨模块一致性
+已贯通的高质量横切模式(值得保留)
+单一真相源 ModelTopology 真正落地:build_topology(cfg) 一处把 patch_mode × 5 flag 派生成全部几何/通道量,Config.sync 写回只读 property,models.factory / pipelines.factory / predictor 三处均读它(@d:\codes\work-projects\SegTask\segtask_v1\models\topology.py:1-160)。新增 patch_mode 只改一处决策树——架构收敛干净。
+Config.validate() 作为统一前置门:_validate_model 覆盖 arch×patch_mode、r2plus1d×2.5D、save_best_criterion='loss'×high 模式等大量跨模块互斥(@d:\codes\work-projects\SegTask\segtask_v1\config.py:1119-1345),质量很高。
+RNG 确定性纪律一致:data(逐 worker 重建)、val(确定性种子)、trainer(四源位精确 resume)口径统一。
+共享 warp 几何一致性链:augment 单次 warp → views/pipelines 逐视图裁剪 → losses(MR/DS)通道 layout,端到端严格对齐。
+pooled Dice 口径 train↔(high)inference 一致,与 nnU-Net global dice 对齐。
+真正的跨模块不一致(按优先级)
+[高] config↔model 校验缺口 → hierarchical + aux_seg_supervision 首个 forward 崩:_validate_model 对 arch=='unet' 放行 stem_fusion_mode='hierarchical'(@d:\codes\work-projects\SegTask\segtask_v1\config.py:1188-1192),但与 aux_seg_supervision=True 无互斥校验,而 aux 头读低分辨率特征却断言等于输入尺寸(unet.py:462-511)。这是"强 validate 层里的一个精确漏检"。
+[中] config↔model 校验缺口 → patchN stem 无解码补偿:config 注释宣称"末尾上采补回",但 validate 未校验 decoder 是否补偿 N 倍下采样(stem.py:107-114 vs unet.py:494-499)。
+[中] trainer/utils ↔ predictor 二值化阈值不统一:medium 恒 sigmoid>0.5(utils.py:253),high 用 predictor.threshold(validation.py:436)。部署阈值≠0.5 时,medium 选出的 best 不反映部署行为。
+[中] config↔predictor blend_mode 语义/日志错位:z 轴/2.5D 滑窗恒 gaussian、忽略 blend_mode='average',日志却打印 blend_mode(sliding.py:90/183 vs blending.py:49)。
+[中] trainer↔losses 注释过强:"grad-accum/DDP 与单卡严格等价"仅对逐样本可分损失成立,对 batch_dice/Tversky/GDL 等区域比值型不成立(trainer.py:222-224)。
+[中] predictor 内部语义不一致:global AdaBN 未置 _adabn_estimating,BN 重估期 TTA 变体被拼 batch,与 per_volume 刻意规避的语义矛盾(io.py:197-208 vs forwards.py:61-71)。
+纠错(交叉核验推翻了原模型评审的一条)
+原"模型构建"评审记:selfattn/multirf 在 convnext/mednext 下静默忽略、缺 warning。实际不成立:_validate_selfattn/_validate_multirf 均 硬报错 backbone=='resnet'(@d:\codes\work-projects\SegTask\segtask_v1\config.py:1385-1388、1479-1482)。因此这不是"静默 no-op",而是启动即 ConfigError。这一条应从模型评审的 [中] 缺陷里撤下(config 层已正确拦截)。
+二、架构级建议(按优先级)
+[最高性价比] 把剩余跨模块互斥/依赖补进既有 Config.validate()。项目已有成熟 validate 框架,只需补 3 条 _require,即可把"运行期首个 forward 崩"提前到"启动即清晰报错":
+hierarchical + aux_seg_supervision 互斥(或改为 aux 头上采,兑现 docstring)。
+stem_mode ∈ {patch2,patch4} 时要求主头/DS 头有对应上采补偿。
+len(deep_supervision_weights) == 实际解码 DS 头数(现仅运行时 ValueError)。
+统一 train↔inference 口径的单一来源:threshold / blend_mode / 二值化方式应从同一 config 字段派生、两侧一致消费,消除 #3、#4 两处一致性缺口。
+单一真相源再彻底一步:build_model 的 encoder in_channels 改读 topo.in_channels(现读 mc.in_channels,依赖 sync 时序);DS 头数由 topo 派生并回校权重长度。
+引入"数据集指纹"元数据层:在 make_data 的 meta 里补 image_shape/spacing/前景强度统计。一处架构改动同时解决:_build_index 句柄泄漏 + 全量解码(dataset.py:694/926)、detect_label_values 主进程串行瓶颈(loader.py:356)、以及下面的强度归一化——是回报最高的抽象。
+三、可借鉴的业界高质量做法(nnU-Net / MONAI,按优先级)
+高
+nnU-Net 前景强度指纹归一化:采集前景体素 0.5/99.5 百分位 + mean/std,CT 先 clip 再 zscore。你已实现 spacing 中位数指纹,强度指纹是自然下一步,跨机构/协议 CT 更稳(接建议 #4 一并落)。
+滑窗高斯 σ 对齐 nnU-Net 的 n/8(你用 n/4 偏平缓,窗边权重≈0.135),改善缝合抑制,近乎零成本。
+中
+nnU-Net 5-fold 交叉验证接口:分层划分逻辑已具备,扩展成本低,提升选模稳健性与可复现性。
+per-case Dice 报告:pooled 用于选模(与 nnU-Net 一致),但最终报告另算 per-case,避免大目标掩盖个别病例失败。
+MONAI MetaTensor / 真实 spacing 追踪:可解决 aspect_correct 不含真实 spacing 导致厚层 out-of-plane 旋转物理不准的已知限制(augment.py:114-123)。
+AdaBN 估计期一律关 TTA:纯目标域 BN 统计只用原图前向,顺带解决 #6(global/per_volume 语义分歧)。
+低
+以 MONAI SlidingWindowInferer / DynUNet 作对照基线,给你的滑窗/装配做回归验证(不引入运行期依赖,仅测试期)。
+四、单一优先级 backlog(合并全部模块真问题,供执行排期)
+P0 [高]:hierarchical+aux 崩(unet.py:462-511)+ config 前置校验。
+P1 [中]:patchN stem 无解码补偿崩(stem.py vs unet.py:494);_build_index 句柄泄漏+全量解码(改 meta shape);translate 与 oversample 余量未协调(augment.py:145);z 轴忽略 blend_mode(sliding.py:90/183);global AdaBN estimating flag(io.py:197);medium/high 阈值不一致。
+P2 [中/注释]:batch_dice 等价注释修正(trainer.py:222);z_axis 面内无 oversample 余量说明。
+纠错:selfattn/multirf 非 resnet —— config 已硬报错,非缺陷,从模型评审移除。
