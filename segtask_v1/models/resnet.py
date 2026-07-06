@@ -39,7 +39,8 @@ class ResNetBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction,
+                                   norm_type=norm_type, norm_groups=norm_groups)
         self.drop_path = (
             DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
@@ -85,7 +86,8 @@ class PreActResNetBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction,
+                                   norm_type=norm_type, norm_groups=norm_groups)
         self.drop_path = (
             DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
@@ -138,7 +140,8 @@ class BottleneckBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction,
+                                   norm_type=norm_type, norm_groups=norm_groups)
         self.drop_path = (
             DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
@@ -214,7 +217,8 @@ class R2Plus1DBlock(nn.Module):
 
         self.drop = _DROP[d](dropout) if dropout > 0 else nn.Identity()
 
-        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction)
+        self.attn = make_attention(attention_type, out_ch, spatial_dims=d, reduction=se_reduction,
+                                   norm_type=norm_type, norm_groups=norm_groups)
         self.drop_path = (
             DropPath(drop_path) if drop_path > 0.0
             else nn.Identity())
@@ -387,7 +391,8 @@ class MultiRFBlock(nn.Module):
         self.norm2 = get_norm(norm_type, out_ch, norm_groups, spatial_dims=d)
 
         self.attn = make_attention(attention_type, out_ch, spatial_dims=d,
-                                   reduction=se_reduction)
+                                   reduction=se_reduction,
+                                   norm_type=norm_type, norm_groups=norm_groups)
         self.act2 = get_activation(activation)
         self.drop_path = (
             DropPath(drop_path) if drop_path > 0.0

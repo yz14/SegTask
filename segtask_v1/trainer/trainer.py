@@ -35,8 +35,10 @@ from ..data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from ..models.unet import UNet3D
 from ..models.mednext import upkern_remap_state_dict
+from ..predictor.adabn import collect_bn_modules, estimate_bn_stats
 from ..utils import (
-    AverageMeter, ModelEMA, Timer, compute_dice_per_class, seed_everything,
+    AverageMeter, ModelEMA, ModelSWA, Timer, compute_dice_per_class,
+    seed_everything,
 )
 from . import views
 from .amp import (
@@ -47,7 +49,9 @@ from .amp import (
 )
 from .breakdown import collect_multi_res_breakdown, format_breakdown
 from .checkpoint import (
+    AsyncCheckpointSaver,
     extract_model_state_dict,
+    state_to_cpu,
     strip_common_prefixes,
     unwrap_compile,
 )
@@ -180,6 +184,12 @@ class Trainer:
                              offload_device=(tc.ema_device or None))
                     if tc.use_ema else None)
 
+        # --- SWA 尾段权重平均（opt-in，见 TrainConfig.swa_enabled）---------
+        self.swa = ModelSWA(self.model) if tc.swa_enabled else None
+        self._swa_start_epoch = (
+            int(math.floor(tc.swa_start_ratio * tc.epochs))
+            if tc.swa_enabled else 0)
+
         # --- torch.compile (最后) -------------------------------------
         self._compile_enabled = False
         self._first_step_mem_logged = False
@@ -256,6 +266,12 @@ class Trainer:
         # --- Output directory -----------------------------------------
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Async checkpoint saver（opt-in，仅 rank0）-------------------
+        # save_async=True 时权重先深拷到 CPU，后台线程 torch.save，主循环
+        # 不再被写盘阻塞；fit 收尾 wait+close 保证全部落盘。
+        self._ckpt_saver = (AsyncCheckpointSaver()
+                            if tc.save_async and self._is_main else None)
 
         # --- Resume / Pretrain ----------------------------------------
         # resume：全状态恢复；pretrain：仅加载权重。同设优先 resume。
@@ -368,6 +384,9 @@ class Trainer:
             train_metrics = self._train_epoch(epoch)
             train_time_s = time.time() - epoch_t0
 
+            if self.swa is not None and epoch >= self._swa_start_epoch:
+                self.swa.update(unwrap_compile(self.model))
+
             val_metrics: Dict[str, float] = {}
             val_time_s = 0.0
             if (epoch + 1) % tc.val_every == 0 or epoch == tc.epochs - 1:
@@ -466,7 +485,16 @@ class Trainer:
             logger.info("Training complete. No validation best recorded. "
                         "Time: %s", timer.elapsed_str())
         logger.info("=" * 60)
+        try:
+            self._finalize_swa()
+        except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
+            logger.exception("SWA finalization failed; online/best "
+                             "checkpoints are unaffected.")
         self._monitor_finalize(final_status)
+        if self._ckpt_saver is not None:
+            # 收尾前排空异步写盘队列；写盘异常在此抛出。
+            self._ckpt_saver.close()
+            self._ckpt_saver = None
         # DDP：收尾屏障，确保 rank0 完成 best/checkpoint 落盘后各进程再退出。
         barrier()
         return best_metrics
@@ -702,6 +730,36 @@ class Trainer:
 
         self.optimizer.zero_grad(set_to_none=True)
         group_has_nonfinite = False
+
+        # 未缩放损失先以 GPU 张量缓存，延迟到真正需要标量的时刻（日志步；无
+        # GradScaler 时还有 accum 边界的非有限 guard）单次 stack+tolist 取回，
+        # 避免每 micro-step 一次 loss.item() 的 device→host 同步。
+        pending: "list[tuple[int, torch.Tensor, int]]" = []
+
+        def _flush_pending() -> "float | None":
+            """单次同步取回缓存损失并更新 meter；返回最后一步的损失值。"""
+            nonlocal group_has_nonfinite, nonfinite_steps
+            if not pending:
+                return None
+            vals = torch.stack([t for _, t, _ in pending]).tolist()
+            last: "float | None" = None
+            for (s, _, bs), v in zip(pending, vals):
+                last = v
+                if math.isfinite(v):
+                    loss_meter.update(v, bs)
+                else:
+                    group_has_nonfinite = True
+                    nonfinite_steps += 1
+                    logger.warning(
+                        "Non-finite train loss (%s) at epoch %d step %d/%d; "
+                        "skipping meter update. The surrounding optimizer "
+                        "step will be skipped (%s).",
+                        v, epoch + 1, s + 1, total_steps,
+                        "by GradScaler" if self._scaler_active
+                        else "non-finite loss guard")
+            pending.clear()
+            return last
+
         for step, batch in enumerate(self.train_loader):
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True).float()
@@ -749,27 +807,23 @@ class Trainer:
                 collect_multi_res_breakdown(
                     self.criterion, self.aux_loss_fn, breakdown)
 
-            # 未缩放损失；非有限值驱动 meter 跳过与无 scaler 路径的优化步保护。
-            step_loss = (loss.item() * effective_accum
-                         if effective_accum > 1 else loss.item())
-            if math.isfinite(step_loss):
-                loss_meter.update(step_loss, image.shape[0])
+            # 未缩放损失留在 GPU 缓存；仅在日志步（需标量打印）或无 scaler
+            # 路径的 accum 边界（非有限 guard 需在 skip 判定前知晓）单次同步。
+            detached = loss.detach()
+            if effective_accum > 1:
+                detached = detached * effective_accum
+            pending.append((step, detached, image.shape[0]))
+
+            step_loss: "float | None" = None
+            if is_log_step or (is_step_boundary and not self._scaler_active):
+                step_loss = _flush_pending()
+            if step_loss is not None and math.isfinite(step_loss):
                 for name, val in breakdown.items():
                     if not math.isfinite(val):
                         continue
                     if name not in component_meters:
                         component_meters[name] = AverageMeter()
                     component_meters[name].update(val, image.shape[0])
-            else:
-                group_has_nonfinite = True
-                nonfinite_steps += 1
-                logger.warning(
-                    "Non-finite train loss (%s) at epoch %d step %d/%d; "
-                    "skipping meter update. The surrounding optimizer step "
-                    "will be skipped (%s).",
-                    step_loss, epoch + 1, step + 1, total_steps,
-                    "by GradScaler" if self._scaler_active
-                    else "non-finite loss guard")
 
             # 参数更新
             if is_step_boundary:
@@ -893,8 +947,12 @@ class Trainer:
                 aux_msg = format_breakdown(breakdown)
                 logger.debug(
                     "  [%d/%d] loss=%.4f dice=%.4f lr=%.2e%s",
-                    step + 1, total_steps, step_loss, mean_dice,
-                    self.scheduler.get_lr(), aux_msg)
+                    step + 1, total_steps,
+                    step_loss if step_loss is not None else float("nan"),
+                    mean_dice, self.scheduler.get_lr(), aux_msg)
+
+        # epoch 末把尚未取回的缓存损失一次性落入 meter。
+        _flush_pending()
 
         # train dice / 分量损失均只在日志步采样，epoch 值为抽样均值（廉价监控），
         # 与 val 的全量指标口径不同。
@@ -930,9 +988,12 @@ class Trainer:
         """
         self.model.eval()
         # val_empty_cache：验证前后各归还一次 cached blocks，给整卷滑窗大累加器
-        # 腾出连续显存（只影响 allocator，不影响数值）。默认关。
-        _flush = (self.cfg.train.val_empty_cache
-                  and self.device.type == "cuda")
+        # 腾出连续显存（只影响 allocator，不影响数值）。None=自动：high 模式开。
+        _empty = self.cfg.train.val_empty_cache
+        if _empty is None:
+            _empty = (
+                str(self.cfg.train.val_metric_mode).lower().strip() == "high")
+        _flush = _empty and self.device.type == "cuda"
         if _flush:
             torch.cuda.empty_cache()
         try:
@@ -941,6 +1002,91 @@ class Trainer:
         finally:
             if _flush:
                 torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # SWA finalization（见 TrainConfig.swa_enabled）
+    # ------------------------------------------------------------------
+    def _finalize_swa(self) -> None:
+        """SWA 收尾：换入平均权重 → 重估 BN → 验证 → rank0 另存 swa_model.pth。
+
+        所有 rank 均参与（验证/BN 重估可能含集合通信），仅 rank0 落盘。
+        早停等原因未收集到任何快照时跳过。结束后恢复在线权重。"""
+        if self.swa is None:
+            return
+        tc = self.cfg.train
+        if self.swa.n_averaged == 0:
+            logger.warning(
+                "SWA enabled but no snapshots collected (training ended "
+                "before start epoch %d = swa_start_ratio %.2f x %d epochs); "
+                "skipping SWA finalization.",
+                self._swa_start_epoch + 1, tc.swa_start_ratio, tc.epochs)
+            return
+        bare = unwrap_compile(self.model)
+        self.swa.apply_shadow(bare)
+        try:
+            self.model.eval()
+            self._swa_recalibrate_bn()
+            metrics: Dict[str, float] = {}
+            try:
+                metrics = self.evaluator.evaluate(tc.epochs - 1)
+            except Exception:
+                logger.warning(
+                    "SWA validation failed; saving SWA weights anyway.",
+                    exc_info=True)
+            metric_str = ", ".join(
+                f"{k}={v:.4f}" for k, v in metrics.items()
+                if isinstance(v, (int, float))) or "n/a"
+            logger.info(
+                "SWA (avg of %d epoch snapshots, from epoch %d): %s",
+                self.swa.n_averaged, self._swa_start_epoch + 1, metric_str)
+            if self._is_main:
+                path = self.output_dir / "swa_model.pth"
+                torch.save({
+                    "model_state_dict": bare.state_dict(),
+                    "swa_n_averaged": self.swa.n_averaged,
+                    "swa_val_metrics": metrics,
+                    "config": self.cfg,
+                }, path)
+                logger.info("SWA model saved: %s", path)
+        finally:
+            self.swa.restore(bare)
+
+    def _swa_recalibrate_bn(self) -> None:
+        """在若干 train batch 上重估 BN running stats（AdaBN 同款累积平均）。
+
+        平均权重下各层激活分布改变，BN 的 running stats 不再匹配；用未增强
+        的训练数据前向重估（与推理分布同构）。模型无 BatchNorm（instance/
+        group norm）时为 no-op。"""
+        steps = int(self.cfg.train.swa_bn_update_steps)
+        if steps <= 0:
+            return
+        bn_modules = collect_bn_modules(unwrap_compile(self.model))
+        if not bn_modules:
+            return
+        n_batches = min(steps, len(self.train_loader))
+        logger.info(
+            "SWA: re-estimating %d BatchNorm module(s) running stats on "
+            "%d train batch(es).", len(bn_modules), n_batches)
+
+        @torch.no_grad()
+        def _run_forward() -> None:
+            for step, batch in enumerate(self.train_loader):
+                if step >= steps:
+                    break
+                image = batch["image"].to(self.device, non_blocking=True)
+                label = batch["label"].to(
+                    self.device, non_blocking=True).float()
+                if self.needs_crop:
+                    image, label, _ = views.center_crop(
+                        image, label, None, self.target_patch_size)
+                image, _sup = self.pipeline.prepare_batch(image, label, None)
+                if self._memory_format is not None:
+                    image = image.to(memory_format=self._memory_format)
+                with autocast(device_type="cuda", enabled=self.use_amp,
+                              dtype=self.amp_dtype):
+                    self.model(image)
+
+        estimate_bn_stats(bn_modules, _run_forward)
 
     # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)
@@ -974,6 +1120,9 @@ class Trainer:
             "config": self.cfg,
         }
 
+        if self.swa is not None:
+            state["swa_state_dict"] = self.swa.state_dict()
+
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
             if ema_as_primary:
@@ -1000,13 +1149,26 @@ class Trainer:
 
         if is_best:
             path = self.output_dir / "best_model.pth"
-            torch.save(state, path)
-            logger.info("Best model saved: %s", path)
+            if self._ckpt_saver is not None:
+                self._ckpt_saver.submit(
+                    state_to_cpu(state), path,
+                    on_done=lambda p=path: logger.info(
+                        "Best model saved: %s", p))
+            else:
+                torch.save(state, path)
+                logger.info("Best model saved: %s", path)
         else:
             path = self.output_dir / f"checkpoint_epoch_{epoch + 1}.pth"
-            torch.save(state, path)
-            logger.debug("Checkpoint saved: %s", path)
-            self._prune_old_checkpoints()
+            if self._ckpt_saver is not None:
+                # 清理在写完后的后台回调里做，保证 keep-last-k 计数含本次。
+                def _on_done(p=path):
+                    logger.debug("Checkpoint saved: %s", p)
+                    self._prune_old_checkpoints()
+                self._ckpt_saver.submit(state_to_cpu(state), path, _on_done)
+            else:
+                torch.save(state, path)
+                logger.debug("Checkpoint saved: %s", path)
+                self._prune_old_checkpoints()
 
     def _prune_old_checkpoints(self) -> None:
         """周期 checkpoint 的 keep-last-k 保留：仅留最近 ``save_keep_last`` 个
@@ -1044,6 +1206,8 @@ class Trainer:
             self.scaler.load_state_dict(ckpt["scaler_state_dict"])
         if self.ema is not None and "ema_state_dict" in ckpt:
             self.ema.load_state_dict(ckpt["ema_state_dict"])
+        if self.swa is not None and "swa_state_dict" in ckpt:
+            self.swa.load_state_dict(ckpt["swa_state_dict"])
 
         self.start_epoch = ckpt.get("epoch", -1) + 1
         default_best = -math.inf if self._best_mode == "max" else math.inf

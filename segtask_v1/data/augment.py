@@ -1,4 +1,9 @@
-"""GPU 3D 分割数据增强。空间变换（flip/affine/elastic/grid-dropout）逐样本独立；强度变换仅作用于 image。weight_map 同步受空间变换，插值由 AugConfig.wmap_interp_mode 控制。"""
+"""GPU 3D 分割数据增强。空间变换（flip/affine/elastic/grid-dropout）逐样本独立；强度变换仅作用于 image。weight_map 同步受空间变换，插值由 AugConfig.wmap_interp_mode 控制。
+
+同步点约束：选样 Bernoulli 掩码与逐样本标量参数（角度/scale/sigma/zoom 等）均在
+CPU 上采样（``_bernoulli_mask``），再异步搬到设备；避免 ``mask.any()`` /
+``mask.sum().item()`` / ``mask.nonzero()`` 对 CUDA RNG 结果的隐式 device→host
+同步打断流水（一个 step 可累计 8–10 次）。元素级张量运算仍全部在 GPU 上。"""
 
 from __future__ import annotations
 
@@ -10,6 +15,11 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from ..config import AugConfig
+
+
+def _bernoulli_mask(n: int, prob: float) -> torch.Tensor:
+    """CPU 上采样 (n,) bool 选样掩码；后续 any/sum/nonzero 均零同步。"""
+    return torch.rand(n) < prob
 
 
 class GPUAugmentor:
@@ -94,9 +104,9 @@ def _random_flip(
     """逐样本随机翻转；每轴独立采样。"""
     B = image.shape[0]
     for axis in axes:
-        mask = torch.rand(B, device=image.device) < prob  # (B,) bool
+        mask = _bernoulli_mask(B, prob)  # (B,) bool，CPU
         if mask.any():
-            idx        = mask.nonzero(as_tuple=True)[0]
+            idx        = mask.nonzero(as_tuple=True)[0].to(image.device)
             image[idx] = torch.flip(image[idx], [axis])  # axis indexes into (B,C,D,H,W)
             label[idx] = torch.flip(label[idx], [axis])
             if weight_map is not None:
@@ -126,29 +136,31 @@ def _random_affine(
     B, _, D, H, W = image.shape
     device = image.device
 
-    # 选择被增强的样本。
-    mask = torch.rand(B, device=device) < prob
+    # 选择被增强的样本（CPU 采样，零同步）。
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image, label, weight_map
 
-    # 逐样本采样旋转角（弧度）与 scale。
-    n = mask.sum().item()
+    # 逐样本采样旋转角（弧度）与 scale（CPU 采样后异步搬设备）。
+    n = int(mask.sum())
     if rotate_range_per_axis is not None:
-        angles = torch.empty(n, 3, device=device)  # (n, 3) for x,y,z
+        angles = torch.empty(n, 3)  # (n, 3) for x,y,z
         for ax in range(3):
             lo = math.radians(rotate_range_per_axis[ax][0])
             hi = math.radians(rotate_range_per_axis[ax][1])
             angles[:, ax].uniform_(lo, hi)
     else:
         lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
-        angles = torch.empty(n, 3, device=device).uniform_(lo, hi)  # (n, 3) for x,y,z
-    scales = torch.empty(n, 1, device=device).uniform_(scale_range[0], scale_range[1])
+        angles = torch.empty(n, 3).uniform_(lo, hi)  # (n, 3) for x,y,z
+    angles = angles.to(device, non_blocking=True)
+    scales = torch.empty(n, 1).uniform_(
+        scale_range[0], scale_range[1]).to(device, non_blocking=True)
 
     translations = None
     if translate_range is not None and (
             translate_range[0] != 0.0 or translate_range[1] != 0.0):
-        translations = torch.empty(n, 3, device=device).uniform_(
-            translate_range[0], translate_range[1])
+        translations = torch.empty(n, 3).uniform_(
+            translate_range[0], translate_range[1]).to(device, non_blocking=True)
 
     aspect = None
     if aspect_correct:
@@ -159,7 +171,7 @@ def _random_affine(
     # 构建逐样本 3x4 仿射 + grid。
     affines = _build_rotation_matrices(angles, scales, translations, aspect)
     grid = F.affine_grid(affines, [n, 1, D, H, W], align_corners=False)
-    idx = mask.nonzero(as_tuple=True)[0]
+    idx = mask.nonzero(as_tuple=True)[0].to(device)
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
 
@@ -236,11 +248,11 @@ def _elastic_deform(
     B, _, D, H, W = image.shape
     device = image.device
 
-    mask = torch.rand(B, device=device) < prob
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image, label, weight_map
 
-    idx = mask.nonzero(as_tuple=True)[0]
+    idx = mask.nonzero(as_tuple=True)[0].to(device)
     n = idx.shape[0]
 
     grid = _identity_grid(n, D, H, W, device) + _elastic_grid_disp(
@@ -296,38 +308,42 @@ def _random_affine_elastic(
     B, _, D, H, W = image.shape
     device = image.device
 
-    mask_a = torch.rand(B, device=device) < affine_prob
-    mask_e = torch.rand(B, device=device) < elastic_prob
+    # 选样与标量参数全部 CPU 采样（零同步），仅参数张量异步搬设备。
+    mask_a = _bernoulli_mask(B, affine_prob)
+    mask_e = _bernoulli_mask(B, elastic_prob)
     mask = mask_a | mask_e
     if not mask.any():
         return image, label, weight_map
 
-    idx = mask.nonzero(as_tuple=True)[0]
-    n = idx.shape[0]
-    sel_a = mask_a[idx]  # (n,) 选中样本内的 affine 子集
-    sel_e = mask_e[idx]
+    idx_cpu = mask.nonzero(as_tuple=True)[0]
+    idx = idx_cpu.to(device)
+    n = idx_cpu.shape[0]
+    sel_a = mask_a[idx_cpu]  # (n,) 选中样本内的 affine 子集（CPU）
+    sel_e = mask_e[idx_cpu]
 
     # 逐样本 3x4 仿射；未选 affine 的样本用单位阵。
     theta = torch.eye(3, 4, device=device).unsqueeze(0).repeat(n, 1, 1)
-    na = int(sel_a.sum().item())
+    na = int(sel_a.sum())
     if na:
         if rotate_range_per_axis is not None:
-            angles = torch.empty(na, 3, device=device)  # (na, 3) for x,y,z
+            angles = torch.empty(na, 3)  # (na, 3) for x,y,z
             for ax in range(3):
                 lo = math.radians(rotate_range_per_axis[ax][0])
                 hi = math.radians(rotate_range_per_axis[ax][1])
                 angles[:, ax].uniform_(lo, hi)
         else:
             lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
-            angles = torch.empty(na, 3, device=device).uniform_(lo, hi)
-        scales = torch.empty(na, 1, device=device).uniform_(
-            scale_range[0], scale_range[1])
+            angles = torch.empty(na, 3).uniform_(lo, hi)
+        angles = angles.to(device, non_blocking=True)
+        scales = torch.empty(na, 1).uniform_(
+            scale_range[0], scale_range[1]).to(device, non_blocking=True)
 
         translations = None
         if translate_range is not None and (
                 translate_range[0] != 0.0 or translate_range[1] != 0.0):
-            translations = torch.empty(na, 3, device=device).uniform_(
-                translate_range[0], translate_range[1])
+            translations = torch.empty(na, 3).uniform_(
+                translate_range[0],
+                translate_range[1]).to(device, non_blocking=True)
 
         aspect = None
         if aspect_correct:
@@ -335,17 +351,19 @@ def _random_affine_elastic(
             aspect = torch.tensor(
                 [float(W), float(H), float(D)],
                 device=device, dtype=torch.float32)
-        theta[sel_a] = _build_rotation_matrices(
+        theta[sel_a.to(device)] = _build_rotation_matrices(
             angles, scales, translations, aspect)
 
     grid = F.affine_grid(theta, [n, 1, D, H, W], align_corners=False)
 
-    ne = int(sel_e.sum().item())
+    ne = int(sel_e.sum())
     if ne:
+        sel_e_dev = sel_e.to(device)
         disp = _elastic_grid_disp(ne, D, H, W, sigma, alpha, device)
         # G(x)=Θ(x+d)=Θx + M·d；d 与 M 均为 (x,y,z) 轴序。
-        m = theta[sel_e][:, :, :3]  # (ne,3,3)
-        grid[sel_e] = grid[sel_e] + torch.einsum('n r c, n d h w c -> n d h w r', m, disp)
+        m = theta[sel_e_dev][:, :, :3]  # (ne,3,3)
+        grid[sel_e_dev] = grid[sel_e_dev] + torch.einsum(
+            'n r c, n d h w c -> n d h w r', m, disp)
 
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
@@ -380,7 +398,7 @@ def _grid_dropout(
     B, _, D, H, W = image.shape
     device = image.device
 
-    selected = torch.rand(B, device=device) < prob  # (B,)
+    selected = _bernoulli_mask(B, prob)  # (B,) bool，CPU
     if not selected.any():
         return image, label, weight_map
 
@@ -412,7 +430,7 @@ def _grid_dropout(
         ] = 0
 
     # effective = selected ? hole_mask : 1。
-    gate = rearrange(selected, 'b -> b 1 1 1 1').to(image.dtype)
+    gate = rearrange(selected.to(device), 'b -> b 1 1 1 1').to(image.dtype)
     effective = hole_mask * gate + (1.0 - gate)
     return image * effective, label, weight_map
 
@@ -424,12 +442,12 @@ def _random_brightness(
     if prob <= 0:
         return image
     B = image.shape[0]
-    mask = torch.rand(B, device=image.device) < prob
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image
-    shift = torch.empty(B, 1, 1, 1, 1, device=image.device).uniform_(brange[0], brange[1])
+    shift = torch.empty(B, 1, 1, 1, 1).uniform_(brange[0], brange[1])
     shift[~mask] = 0
-    return image + shift
+    return image + shift.to(image.device, non_blocking=True)
 
 
 def _random_contrast(
@@ -438,16 +456,15 @@ def _random_contrast(
     if prob <= 0:
         return image
     B = image.shape[0]
-    mask = torch.rand(B, device=image.device) < prob
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image
     spatial_dims = tuple(range(2, image.ndim))
     mean = image.mean(dim=spatial_dims, keepdim=True)
-    factor = torch.ones(B, 1, 1, 1, 1, device=image.device)
+    factor = torch.ones(B, 1, 1, 1, 1)
     factor[mask] = torch.empty(
-        mask.sum().item(), 1, 1, 1, 1, device=image.device
-    ).uniform_(crange[0], crange[1])
-    return (image - mean) * factor + mean
+        int(mask.sum()), 1, 1, 1, 1).uniform_(crange[0], crange[1])
+    return (image - mean) * factor.to(image.device, non_blocking=True) + mean
 
 
 def _random_gamma(
@@ -456,8 +473,7 @@ def _random_gamma(
     if prob <= 0:
         return image
     B = image.shape[0]
-    device = image.device
-    mask = torch.rand(B, device=device) < prob  # (B,)
+    mask = _bernoulli_mask(B, prob)  # (B,) bool，CPU
     if not mask.any():
         return image
 
@@ -468,9 +484,10 @@ def _random_gamma(
     rng = (mx - mn).clamp(min=1e-7)
     normed = ((image - mn) / rng).clamp(0.0, 1.0)
 
-    # 未选中样本 gamma=1。
-    gamma = torch.empty(B, device=device).uniform_(grange[0], grange[1])
+    # 未选中样本 gamma=1（CPU 采样后异步搬设备）。
+    gamma = torch.empty(B).uniform_(grange[0], grange[1])
     gamma = torch.where(mask, gamma, torch.ones_like(gamma))
+    gamma = gamma.to(image.device, non_blocking=True)
     # 动态阐 (B,) → (B, 1, 1, ..., 1) 以适应 image.ndim。
     gpattern = 'b -> b' + ' 1' * (image.ndim - 1)
     gamma = rearrange(gamma, gpattern).to(image.dtype)
@@ -484,10 +501,10 @@ def _gaussian_noise(
     if prob <= 0:
         return image
     B = image.shape[0]
-    mask = torch.rand(B, device=image.device) < prob
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image
-    idx = mask.nonzero(as_tuple=True)[0]
+    idx = mask.nonzero(as_tuple=True)[0].to(image.device)
     image[idx] = image[idx] + torch.randn_like(image[idx]) * std
     return image
 
@@ -502,14 +519,14 @@ def _gaussian_blur_3d(
         return image
     B, C = image.shape[:2]
     device = image.device
-    mask = torch.rand(B, device=device) < prob
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image
 
-    idx = mask.nonzero(as_tuple=True)[0]
+    idx = mask.nonzero(as_tuple=True)[0].to(device)
     n = idx.numel()
-    sigmas = torch.empty(n, device=device, dtype=image.dtype).uniform_(
-        sigma_range[0], sigma_range[1])  # (n,)
+    sigmas = torch.empty(n, dtype=image.dtype).uniform_(
+        sigma_range[0], sigma_range[1]).to(device, non_blocking=True)  # (n,)
     ks = max(int(2 * round(3 * float(sigma_range[1])) + 1), 3)
     pad = ks // 2
     x = torch.arange(ks, dtype=image.dtype, device=device) - pad  # (ks,)
@@ -542,7 +559,7 @@ def _simulate_lowres(
     if prob <= 0:
         return image
     B = image.shape[0]
-    mask = torch.rand(B, device=image.device) < prob
+    mask = _bernoulli_mask(B, prob)
     if not mask.any():
         return image
     _, _, D, H, W = image.shape

@@ -197,7 +197,8 @@ class ZCubeSpec(DatasetSpec):
             foreground_oversample_ratio = self._fg_ratio(is_train),
             samples_per_volume          = self._samples_per_volume(is_train),
             is_train                    = is_train,
-            z_boundary_mode             = dc.z_boundary_mode)
+            z_boundary_mode             = dc.z_boundary_mode,
+            val_grid_coverage           = dc.val_grid_coverage)
 
 
 class CubicSpec(DatasetSpec):
@@ -225,7 +226,8 @@ class CubicSpec(DatasetSpec):
             multi_res_scales            = list(dc.multi_res_scales),
             foreground_oversample_ratio = self._fg_ratio(is_train),
             samples_per_volume          = self._samples_per_volume(is_train),
-            is_train=is_train)
+            is_train                    = is_train,
+            val_grid_coverage           = dc.val_grid_coverage)
 
 
 # ---------------------------------------------------------------------------

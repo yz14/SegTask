@@ -146,6 +146,12 @@ class DataConfig:
     # 每体积每 epoch 采样次数。
     samples_per_volume: int = 8
 
+    # medium 验证 patch 位置的确定性网格覆盖（opt-in，仅作用于 val split）：
+    # False（默认）= 现行为，逐样本确定性 RNG 随机位置（epoch 间一致但空间
+    # 覆盖随机）；True = 卷内第 j 个样本取均匀网格位置（z 轴等距；cubic 用
+    # Halton 序列），epoch 间指标可比性更强、噪声更小。train split 不受影响。
+    val_grid_coverage: bool = False
+
     # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
     # 本 Config 默认 1（每 worker 仅缓最近 1 卷）；Dataset 构造签名的默认 0 只是
     # 直接实例化时的后备，经 Config 路径始终以此处为准。
@@ -288,13 +294,17 @@ class ModelConfig:
 
     se_reduction: int = 16
 
-    # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
+    # 块内注意力："none" | "se" | "eca" | "cbam" | "coord" | "lka" | "msca"。
+    # lka = 大核注意力（VAN，DW5+DW7@dil3+1×1，等效感受野≈21³）；
+    # msca = 多尺度条形核注意力（SegNeXt，逐轴 7/11/21 条形 DW 核，适合
+    # 各向异性体数据与细长结构）。两者均纯卷积、无归一化层。
     attention_type: str = "none"
 
     # skip 连接上的 AttentionGate3D（Oktay 2018）；attn_gate_norm 控制其归一化。
-    # batch 保持旧行为；instance/group 更适合 3D 小 batch，默认不变。
+    # "auto"（默认）跟随全局 norm_type（3D 小 batch 下避免 BatchNorm 统计噪）；
+    # 也可显式指定 batch/instance/group。
     skip_attention: bool = False
-    attn_gate_norm: str = "batch"
+    attn_gate_norm: str = "auto"
 
     # 深度监督：多 decoder 级输出预测。
     deep_supervision: bool = False
@@ -624,6 +634,18 @@ class TrainConfig:
     # checkpoint 保存均自动跨设备拷贝。仅在显存吃紧时建议开启。
     ema_device: str = ""
 
+    # SWA 尾段等权权重平均（Izmailov 2018，opt-in，与 EMA 正交可叠加）。
+    # True 时从 swa_start_ratio*epochs 起每 epoch 将在线权重纳入等权平均
+    # （shadow 常驻 CPU、fp32 累积，零显存开销，不影响训练/选模）；训练
+    # 收尾时换入平均权重 → 重估 BN running stats（模型无 BN 则跳过）→
+    # 跑一次验证并另存 swa_model.pth，best_model.pth 选模逻辑不变。
+    swa_enabled: bool = False
+    # 开始平均的训练进度比例（(0,1) 开区间）：0.75 = 最后 25% epoch 参与。
+    swa_start_ratio: float = 0.75
+    # 收尾 BN 统计重估用的 train batch 数（<=0 跳过重估；仅对含 BatchNorm
+    # 的模型有效，instance/group norm 无 running stats 自动跳过）。
+    swa_bn_update_steps: int = 50
+
     # CUDA caching allocator 的 expandable segments（PyTorch 2.1+）：多分辨率视图 /
     # oversample 裁剪 / 滑窗尾窗等形状多变场景下显著缓解显存碎片（reserved >>
     # allocated 即碎片征兆，epoch 摘要有打印）。实现方式为进程启动早期注入
@@ -631,10 +653,11 @@ class TrainConfig:
     # 默认关，行为与现状一致；个别旧驱动不支持时 PyTorch 自动回退并告警。
     cuda_expandable_segments: bool = False
 
-    # 整卷验证（val_metric_mode='high'）前后各调一次 torch.cuda.empty_cache()：
-    # 把训练激活占住的 cached blocks 归还，避免滑窗大累加器因碎片 OOM。只影响
-    # allocator、不影响数值；代价是验证前后各一次微小停顿。默认关。
-    val_empty_cache: bool = False
+    # 整卷验证前后各调一次 torch.cuda.empty_cache()：把训练激活占住的 cached
+    # blocks 归还，避免滑窗大累加器因碎片 OOM。只影响 allocator、不影响数值；
+    # 代价是验证前后各一次微小停顿。None（默认）= 自动：val_metric_mode='high'
+    # 时开（整卷滑窗最需要连续显存），'medium' 时关；也可显式 True/False 覆盖。
+    val_empty_cache: Optional[bool] = None
 
     # Checkpoint 保存。
     output_dir      : str = "outputs"
@@ -642,6 +665,10 @@ class TrainConfig:
     # 周期 checkpoint 保留策略：仅保留最近 k 个 checkpoint_epoch_*.pth，更早的
     # 自动删除（best_model.pth 不受影响）。<=0 = 不清理（保留全部）。
     save_keep_last  : int = 3
+    # 异步 checkpoint 保存（仅 rank0）：权重先深拷到 CPU，后台线程 torch.save，
+    # 训练主循环不被写盘阻塞（大模型/频繁 save 时可省数秒到数十秒/次）；
+    # 代价是保存时刻额外一份 CPU 内存快照。默认关（保持同步写盘旧行为）。
+    save_async      : bool = False
     # 选模标准（互斥）：
     #   * "loss"              → val_loss ↓
     #   * "dice"              → mean_dice ↑
@@ -1156,7 +1183,7 @@ class Config:
             ),
                 f"Invalid activation: {self.model.activation}")
             _require(
-                self.model.attn_gate_norm in ("batch", "instance", "group"),
+                self.model.attn_gate_norm in ("auto", "batch", "instance", "group"),
                 f"Invalid attn_gate_norm: {self.model.attn_gate_norm}")
             _require(
                 self.model.downsample_mode in (
@@ -1230,7 +1257,7 @@ class Config:
         if arch == "unet":
             _require(
                 self.model.attention_type in (
-                "none", "se", "eca", "cbam", "coord",
+                "none", "se", "eca", "cbam", "coord", "lka", "msca",
             ),
                 f"Invalid attention_type: {self.model.attention_type}")
             _require(
@@ -1870,6 +1897,11 @@ class Config:
             str(self.train.ema_device) in ("", "cpu"),
             f"train.ema_device must be '' (follow model) or 'cpu'; "
             f"got {self.train.ema_device!r}.")
+        if self.train.swa_enabled:
+            _require(
+                0.0 < float(self.train.swa_start_ratio) < 1.0,
+                f"train.swa_start_ratio must be in (0, 1); "
+                f"got {self.train.swa_start_ratio}")
         if self.train.zero_redundancy_optimizer and len(self.train.gpus) < 2:
             logger.warning(
                 "train.zero_redundancy_optimizer=True 但未启用多卡 DDP（需 "

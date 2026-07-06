@@ -182,6 +182,85 @@ class ModelEMA:
         self.num_updates = int(state.get("num_updates", self.num_updates))
 
 
+class ModelSWA:
+    """尾段等权权重平均（SWA, Izmailov 2018），支持原地 apply/restore。
+
+    训练尾段每 epoch ``update`` 一次，对在线权重做等权平均：收敛盆地内多点
+    平均落在更平坦区域，泛化通常优于任一单点。与 ModelEMA（指数加权）正交，
+    可同时开启。shadow 常驻 CPU 并以 fp32 累积（零 GPU 显存占用、数值稳）。
+    DDP 下各 rank 参数一致，逐 rank 独立维护数学等价。所有方法须传入裸模型
+    （``unwrap_compile`` 后），否则 ``_orig_mod.`` 前缀会与 shadow key 不匹配。
+    权重换入后若模型含 BatchNorm，须重估 running stats（平均权重下激活分布
+    改变）；InstanceNorm/GroupNorm 无此需要。"""
+
+    def __init__(self, model: nn.Module):
+        self.n_averaged = 0
+        # 浮点参数/缓冲以 fp32 在 CPU 累积；整型 buffer（如 BN
+        # num_batches_tracked）跟随最新。首次 update 直接覆盖此占位快照。
+        self.shadow: Dict[str, torch.Tensor] = {
+            k: (v.detach().to("cpu", torch.float32, copy=True)
+                if v.is_floating_point()
+                else v.detach().to("cpu", copy=True))
+            for k, v in model.state_dict().items()}
+        self._backup: Dict[str, torch.Tensor] = {}
+        self._swapped: bool = False
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """纳入一次快照：avg ← avg + (w − avg)/n（每 epoch 一次，无需热路径优化）。"""
+        self.n_averaged += 1
+        n = self.n_averaged
+        for k, v in model.state_dict().items():
+            s = self.shadow[k]
+            if not v.is_floating_point():
+                s.copy_(v.detach())
+            elif n == 1:
+                s.copy_(v.detach().to(torch.float32))
+            else:
+                s.add_((v.detach().to("cpu", torch.float32) - s) / n)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module) -> None:
+        """将平均权重换入 model；live 权重存 CPU backup 供 restore()。"""
+        if self._swapped:
+            return
+        sd = model.state_dict()
+        if not self._backup:
+            self._backup = {k: torch.empty_like(v, device="cpu")
+                            for k, v in sd.items()}
+        for k, live in sd.items():
+            self._backup[k].copy_(live)
+            live.copy_(self.shadow[k])  # copy_ 自动转回 live dtype/device
+        self._swapped = True
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if not self._swapped:
+            return
+        for k, live in model.state_dict().items():
+            live.copy_(self._backup[k])
+        self._swapped = False
+
+    def state_dict(self) -> Dict:
+        return {"shadow": self.shadow, "n_averaged": self.n_averaged}
+
+    def load_state_dict(self, state: Dict) -> None:
+        loaded = state["shadow"]
+        if set(loaded.keys()) == set(self.shadow.keys()):
+            for k, v in loaded.items():
+                self.shadow[k].copy_(v)
+        else:
+            logger.warning(
+                "ModelSWA.load_state_dict: shadow keys mismatch current "
+                "model (loaded=%d, current=%d) — rebuilding shadow from "
+                "checkpoint.", len(loaded), len(self.shadow))
+            self.shadow = {k: v.detach().to("cpu", copy=True)
+                           for k, v in loaded.items()}
+        self.n_averaged = int(state.get("n_averaged", 0))
+        self._backup = {}
+        self._swapped = False
+
+
 class Timer:
     """计时器。"""
 
