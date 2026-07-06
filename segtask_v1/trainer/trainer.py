@@ -230,8 +230,12 @@ class Trainer:
             logger.info(
                 "DDP enabled: rank=%d/%d, device=%s, "
                 "find_unused_parameters=%s, gradient_as_bucket_view=%s. "
-                "Training grads all-reduce per "
-                "backward (math-equivalent to single-GPU under grad-accum).",
+                "Training grads all-reduce per backward. Note: math-equivalence "
+                "to single-GPU under grad-accum holds for per-sample separable "
+                "losses (BCE/Focal/per-sample Dice); batch-pooled ratio losses "
+                "(batch_dice/Tversky/GDL) pool over the per-rank micro-batch, "
+                "so their effective statistics window shrinks with accum/ranks "
+                "(approximate, not strictly equivalent).",
                 self._rank, self._world_size, device,
                 tc.ddp_find_unused_parameters,
                 tc.ddp_gradient_as_bucket_view)

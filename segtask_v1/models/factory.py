@@ -436,7 +436,7 @@ def build_model(cfg: Config):
 
     # Build encoder
     encoder = Encoder(
-        in_channels           = mc.in_channels,
+        in_channels           = topo.in_channels,
         stage_channels        = enc_channels,
         stage_builder         = enc_builder,
         norm_type             = mc.norm_type,

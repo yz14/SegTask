@@ -38,7 +38,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.3"
+_TOOL_VERSION = "make_data/1.4"
 
 # 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -213,6 +213,7 @@ def prepare_one(
         "rw_shift"    : 1.0,
         "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
         "image_dtype" : str(image.dtype),
+        "image_shape" : [int(s) for s in image.shape],  # (D,H,W)，供 dataset 免解码读形状（make_data≥1.4）
         "fg_per_class": True,   # fg_coords 逐类 cap；含 *_cls 类对齐数组
         "label_counts": label_counts,  # {label_value: voxel_count}，精确不抑采（make_data≥1.3）
         "spacing_normalized": spacing_normalized,
