@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import math
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Sequence, Union
 
 import torch
 
@@ -63,9 +63,15 @@ class MetricAccumulator:
         criterion: str,
         surface_dice_tolerance: int,
         surface_dice_weight: float,
+        threshold: Union[float, Sequence[float]] = 0.5,
     ):
         crit = str(criterion).lower().strip()
         self._crit = crit
+        # 二值化阈值：标量或逐前景类列表（与 predict.threshold 同源，使 medium 选模
+        # 与部署阈值口径一致）。
+        self._threshold = (
+            float(threshold) if isinstance(threshold, (int, float))
+            else [float(t) for t in threshold])
         # balanced 也需要 surface dice 参与调和均值。
         self.compute_sd = crit in ("dice+surface_dice", "balanced")
         self.sd_tol = int(surface_dice_tolerance)
@@ -93,7 +99,7 @@ class MetricAccumulator:
         """累加单 batch / 单卷。
 
         ``pred_logits`` 形如 ``(B, num_fg, ...)`` 的 *logits*（指标算子内部自行做
-        sigmoid + 0.5 阈值）；``target`` 同形二值标签。``loss_value`` 为该 batch 的
+        sigmoid + 阈值，阈值来自 ``predict.threshold``，默认 0.5）；``target`` 同形二值标签。``loss_value`` 为该 batch 的
         标量验证损失，``None`` 时不计入（high 模式无可逆 logits，故不产 val_loss）。
 
         ``voxels_override``：喂入的张量若已按 pred∪GT bbox 裁剪，传入裁剪前的
@@ -106,7 +112,14 @@ class MetricAccumulator:
             self.loss_meter.update(loss_value, pred_logits.shape[0])
 
         pred_f = pred_logits.float()
-        stats = dice_batch_stats(pred_f, target, pred_is_binary=pred_is_binary)
+        thr = self._threshold
+        if isinstance(thr, list):
+            # 逐类阈值广播到 (C, 1, ..., 1)，右对齐后 C 对应通道轴。
+            thr = torch.as_tensor(
+                thr, dtype=pred_f.dtype, device=pred_f.device).view(
+                    -1, *([1] * (pred_f.ndim - 2)))
+        stats = dice_batch_stats(
+            pred_f, target, threshold=thr, pred_is_binary=pred_is_binary)
         if voxels_override is not None:
             stats["voxels"] = torch.tensor(
                 float(voxels_override), dtype=torch.float64,
@@ -127,7 +140,7 @@ class MetricAccumulator:
         if self.compute_sd:
             sd_stats = surface_dice_batch_stats(
                 pred_f, target, tolerance=self.sd_tol,
-                pred_is_binary=pred_is_binary)
+                threshold=thr, pred_is_binary=pred_is_binary)
             if self._sd_num is None:
                 self._sd_num = sd_stats["sd_num"].clone()
                 self._sd_denom = sd_stats["sd_denom"].clone()
@@ -304,7 +317,8 @@ class ValEvaluator(ABC):
         return MetricAccumulator(
             criterion=str(tc.save_best_criterion),
             surface_dice_tolerance=int(tc.surface_dice_tolerance),
-            surface_dice_weight=float(tc.surface_dice_weight))
+            surface_dice_weight=float(tc.surface_dice_weight),
+            threshold=self.trainer.cfg.predict.threshold)
 
     @abstractmethod
     def evaluate(self, epoch: int) -> Dict[str, float]:

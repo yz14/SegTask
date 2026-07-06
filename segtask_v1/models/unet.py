@@ -18,6 +18,21 @@ from .stem import HierarchicalStems, build_context_stem, build_stem
 logger = logging.getLogger(__name__)
 
 
+def _resize_logits(x: torch.Tensor, size, spatial_dims: int) -> torch.Tensor:
+    """把 logits 插值到目标空间尺寸（bilinear/trilinear）。半精度先转 fp32 再插值，
+    兼顾后端支持与确定性（与 blocks.Upsample 的插值路径一致）。"""
+    if x.shape[2:] == size:
+        return x
+    orig_dtype = x.dtype
+    if orig_dtype in (torch.bfloat16, torch.float16):
+        x = x.float()
+    x = F.interpolate(x, size=size, mode=INTERP_SMOOTH[spatial_dims],
+                      align_corners=False)
+    if x.dtype != orig_dtype:
+        x = x.to(orig_dtype)
+    return x
+
+
 class Encoder(nn.Module):
     """UNet encoder：stem + N 个 stage（中间下采样）。返回 [level_0, ..., bottleneck]，level_0 最高分辨率。"""
 
@@ -390,9 +405,9 @@ class UNet3D(nn.Module):
         self.deep_supervision = deep_supervision
         self.spatial_dims     = spatial_dims
 
-        # 主头读最高分辨率 decoder 特征。stem_stride>1 时 decoder 最高分辨率仍低于
-        # 输入，forward 不做上采样补偿，而是显式 RuntimeError（要求 decoder 拓扑
-        # 与 stem_stride 配套，保证输出 = 输入分辨率）。DS 头保留各自分辨率。
+        # 主头读最高分辨率 decoder 特征。stem_stride>1（patchN stem）时 decoder 最高
+        # 分辨率为输入/stem_stride，forward 对主头/topo 头输出插值上采补回输入分辨率；
+        # 其余尺寸不匹配仍显式 RuntimeError。DS 头保留各自分辨率（损失侧下采 label 适配）。
         self.stem_stride = encoder.stem_stride
         # 主头用单层 1×1 conv 输出 logits（nnU-Net 标准做法）：特征加工已由 decoder
         # 各级 block 完成，输出头只需将最精细特征逐体素线性映射到类别通道。
@@ -492,6 +507,9 @@ class UNet3D(nn.Module):
         target_size  = x.shape[2:]
 
         main_out = self.seg_head(dec_features[-1])
+        # patchN stem：decoder 最高分辨率 = 输入/stem_stride，主输出上采补回。
+        if self.stem_stride > 1:
+            main_out = _resize_logits(main_out, target_size, self.spatial_dims)
         if main_out.shape[2:] != target_size:
             raise RuntimeError(
                 f"Main seg head output size mismatch: "
@@ -503,17 +521,17 @@ class UNet3D(nn.Module):
         if self.aux_seg_supervision and self.training:
             for head, feat_idx in zip(self.aux_heads, self.aux_feat_indices):
                 ao = head(dec_features[feat_idx])
-                if ao.shape[2:] != target_size:
-                    raise RuntimeError(
-                        f"Aux seg head (feat_idx={feat_idx}) output size mismatch: "
-                        f"got {tuple(ao.shape[2:])}, expected {tuple(target_size)}. "
-                        f"Check stem_stride / encoder downsampling vs input spatial dims.")
+                # hierarchical 的 aux 头读低分辨率 dec 特征（stem_stride>1 时 Plan A
+                # 亦低于输入），统一上采到 main 尺寸后监督。
+                ao = _resize_logits(ao, target_size, self.spatial_dims)
                 aux_outs.append(ao)
 
         # 中心线/距离场辅助头：仅训练时输出，与主头同形（读最高分辨率 dec 特征）。
         topo_out: Optional[torch.Tensor] = None
         if self.aux_topo_head and self.training:
             topo_out = self.topo_head(dec_features[-1])
+            if self.stem_stride > 1:
+                topo_out = _resize_logits(topo_out, target_size, self.spatial_dims)
             if topo_out.shape[2:] != target_size:
                 raise RuntimeError(
                     f"Topo aux head output size mismatch: "

@@ -87,7 +87,8 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         device=p.device,
         dtype=(torch.float16 if p.vol_dtype == torch.float16 else None),
         non_blocking=True)
-    z_weight_t = torch.from_numpy(_blending.build_1d_weight(pD)).to(
+    z_weight_t = torch.from_numpy(
+        _blending.build_1d_weight(pD, p.blend_mode)).to(
         device=p.acc_device, dtype=p.acc_dtype)       # (pD,)
 
     acc_pred = torch.zeros(
@@ -180,7 +181,7 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     w = z_weight_t
                 else:
                     w = torch.from_numpy(
-                        _blending.build_1d_weight(ad)).to(
+                        _blending.build_1d_weight(ad, p.blend_mode)).to(
                             device=p.acc_device, dtype=p.acc_dtype)
                 w_4d = rearrange(w, 'c -> 1 c 1 1')
 

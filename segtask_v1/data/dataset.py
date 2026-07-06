@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import zipfile
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -228,6 +229,25 @@ def load_nifti_cropped(
 def _open_npz(path: str) -> "np.lib.npyio.NpzFile":
     """打开 npz（仅解析 zip 目录）。allow_pickle=True 供 meta dict 反序列。"""
     return np.load(path, allow_pickle=True)
+
+
+def _read_npz_image_shape(
+    f: "np.lib.npyio.NpzFile", path: str) -> Tuple[int, ...]:
+    """免解码读 npz 内 image 形状：优先 meta.image_shape（make_data≥1.4）；旧 npz
+    退回解析 image.npy 文件头（不解压数据）。NpzFile["image"] 下标访问会把整卷
+    从 zip 解出，仅为读形状时应避免。"""
+    if "meta" in f.files:
+        shape = f["meta"].item().get("image_shape")
+        if shape is not None:
+            return tuple(int(s) for s in shape)
+    with zipfile.ZipFile(path) as zf:
+        with zf.open("image.npy") as fh:
+            version = np.lib.format.read_magic(fh)
+            if version == (1, 0):
+                shape, _, _ = np.lib.format.read_array_header_1_0(fh)
+            else:
+                shape, _, _ = np.lib.format.read_array_header_2_0(fh)
+    return tuple(int(s) for s in shape)
 
 
 def load_npz_image(
@@ -726,11 +746,11 @@ class SegDataset3D(SegDatasetNpzBase):
         total_fg     = 0
         total_slices = 0
         for path in self._npz_paths:
-            f  = _open_npz(path)
-            fg = np.asarray(f["fg_slices"], dtype=np.int32)
-            D  = int(f["image"].shape[0])
-            self._vol_fg_slices.append(fg)
-            self._vol_fg_slices_by_cls.append(_group_fg_slices_by_class(f))
+            with _open_npz(path) as f:
+                fg = np.asarray(f["fg_slices"], dtype=np.int32)
+                D  = int(_read_npz_image_shape(f, path)[0])
+                self._vol_fg_slices.append(fg)
+                self._vol_fg_slices_by_cls.append(_group_fg_slices_by_class(f))
             self._vol_all_slices.append(D)
             total_fg += len(fg)
             total_slices += D
@@ -965,13 +985,13 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             len(self._npz_paths))
         total_fg = 0
         for path in self._npz_paths:
-            f      = _open_npz(path)
-            coords = np.asarray(f["fg_coords"], dtype=np.int32)
-            shape  = tuple(int(s) for s in f["image"].shape)
-            self._vol_shapes.append(shape)
-            self._vol_fg_coords.append(coords)
-            self._vol_fg_coords_by_cls.append(
-                _group_fg_coords_by_class(f, coords))
+            with _open_npz(path) as f:
+                coords = np.asarray(f["fg_coords"], dtype=np.int32)
+                shape  = _read_npz_image_shape(f, path)
+                self._vol_shapes.append(shape)
+                self._vol_fg_coords.append(coords)
+                self._vol_fg_coords_by_cls.append(
+                    _group_fg_coords_by_class(f, coords))
             total_fg += len(coords)
         logger.info(
             "NPZ cubic index: %d volumes, %d fg voxels sampled",

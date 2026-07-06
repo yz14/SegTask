@@ -6,7 +6,7 @@ import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -309,7 +309,7 @@ def compute_dice_per_class(
 def dice_batch_stats(
     pred: torch.Tensor,
     target: torch.Tensor,
-    threshold: float = 0.5,
+    threshold: Union[float, torch.Tensor] = 0.5,
     pred_is_binary: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """逐类汇总 batch 级混淆量，供 nnU-Net 风格 pooled 指标（Σ分子/Σ分母）。
@@ -325,6 +325,8 @@ def dice_batch_stats(
     由这五个量可零额外通信地导出 dice / iou / recall / precision /
     volume_similarity / mcc 等指标，详见 ``derive_overlap_metrics``。
     旧字段 ``inter``/``denom``/``n_with_gt`` 完全保留以兼容已有调用方。
+
+    ``threshold`` 支持标量或可广播到 ``(C, 1, ..., 1)`` 的逐类阈值张量。
 
     ``pred_is_binary=True`` 时 ``pred`` 已是 {0,1} 二值体，跳过 sigmoid+阈值
     （与喂饱和 logits 经 sigmoid 阈值后逐位一致，省两次逐元素 pass）。
@@ -455,7 +457,7 @@ def surface_dice_batch_stats(
     pred: torch.Tensor,
     target: torch.Tensor,
     tolerance: int = 1,
-    threshold: float = 0.5,
+    threshold: Union[float, torch.Tensor] = 0.5,
     pred_is_binary: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """逐类汇总 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice@τ：
