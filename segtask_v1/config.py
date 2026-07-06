@@ -197,6 +197,10 @@ class AugConfig:
     # 消除各向异性 patch 上旋转混入的剪切/非均匀缩放。
     random_affine_aspect_correct: bool = True
     # 随机平移范围（affine_grid 归一化坐标，[-1,1] 跨整轴）；[0,0]=禁用。
+    # 平移/旋转以 padding_mode='border' 复制边缘填充；边缘伪影可由
+    # data.aug_oversample_ratio 的中心裁剪余量裁掉（幅度超出余量时启动期警告）。
+    # 固有限制：z_axis 模式 H/W 取全尺寸、无余量可裁，面内旋转/平移的边缘
+    # 复制伪影会保留在训练样本内。
     random_translate_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
     # 弹性形变（B-spline 随机位移场）。
@@ -1595,6 +1599,23 @@ class Config:
             len(self.augment.random_translate_range) == 2,
             "augment.random_translate_range must be [lo, hi]; got "
             f"{self.augment.random_translate_range!r}.")
+        # 平移把 padding_mode='border' 的复制边缘卷进 patch；oversample 余量
+        # （增强后中心裁回）可把伪影裁掉。translate 幅度超出余量时仅警告。
+        tr = self.augment.random_translate_range
+        max_tr = max(abs(float(tr[0])), abs(float(tr[1])))
+        if max_tr > 0.0:
+            # 归一化坐标 [-1,1] 跨整轴：平移 t 卷入约 t/2 轴长的边缘复制带；
+            # oversample 余量约 (ratio-1)/(2*ratio) 轴长。
+            margin = ((self.data.aug_oversample_ratio - 1.0)
+                      / (2.0 * self.data.aug_oversample_ratio))
+            if max_tr / 2.0 > margin:
+                logger.warning(
+                    "augment.random_translate_range=%s 引入的边缘复制带（约 "
+                    "%.1f%% 轴长）超过 data.aug_oversample_ratio=%.2f 的中心裁剪"
+                    "余量（约 %.1f%% 轴长），border 复制伪影会留在训练 patch 内。"
+                    "建议增大 aug_oversample_ratio 或减小平移幅度。",
+                    tr, max_tr / 2.0 * 100.0,
+                    self.data.aug_oversample_ratio, margin * 100.0)
 
     def _validate_loss(self) -> None:
         """loss.* 名称与参数校验。"""
@@ -1623,6 +1644,22 @@ class Config:
             self.loss.slice_loss_reduction in ("per_slice", "per_volume"),
             f"Invalid slice_loss_reduction: {self.loss.slice_loss_reduction!r}; "
             "expected 'per_slice' or 'per_volume'.")
+        # 深监督权重预校验：forward 返回 n_levels-1 个预测（main + DS 头），
+        # 长度不符会在首个训练 step 才由 DeepSupervisionLoss 报错，这里提前警示。
+        # （只警告不硬错：默认权重表按典型 5 级配置给出，小模型可能沿用默认。）
+        if self.model.deep_supervision and self.loss.deep_supervision_weights:
+            ds_w = self.loss.deep_supervision_weights
+            expected = len(self.model.encoder_channels) - 1
+            if len(ds_w) != expected:
+                logger.warning(
+                    "loss.deep_supervision_weights 长度 %d 与深监督预测数 %d "
+                    "(= len(model.encoder_channels) - 1，main + DS 头) 不符；"
+                    "首个训练 step 将由 DeepSupervisionLoss 报错。weights=%s。",
+                    len(ds_w), expected, ds_w)
+            _require(
+                all(float(w) >= 0.0 for w in ds_w) and sum(ds_w) > 0,
+                f"loss.deep_supervision_weights must be non-negative with a "
+                f"positive sum; got {ds_w}.")
 
     def _validate_data(self) -> None:
         """data.* patch/multi-res/keep_native 校验。"""

@@ -195,15 +195,22 @@ def run_inference(
                 len(bn_modules), n_warm)
 
             def _warmup() -> None:
-                for j, wp in enumerate(warm_paths, 1):
-                    logger.info("[AdaBN] warmup [%d/%d]: %s", j, n_warm, wp)
-                    try:
-                        # 整卷预热（不裁 bbox / 不落盘），仅为驱动前向更新 BN 统计。
-                        predictor.predict_volume(wp, output_dir=None,
-                                                  bbox_path=None)
-                    except Exception as e:  # 单卷失败不应中断整体预热。
-                        logger.warning(
-                            "[AdaBN] warmup failed on %s: %s", wp, e)
+                # 估计期强制 TTA 串行（同 per_volume 路径，见 Predictor._adabn_estimating
+                # 注释）：BN 处于 train+累积平均，flip 变体拼大 batch 会让 running
+                # stats 依赖 tta_batch_size。
+                predictor._adabn_estimating = True
+                try:
+                    for j, wp in enumerate(warm_paths, 1):
+                        logger.info("[AdaBN] warmup [%d/%d]: %s", j, n_warm, wp)
+                        try:
+                            # 整卷预热（不裁 bbox / 不落盘），仅为驱动前向更新 BN 统计。
+                            predictor.predict_volume(wp, output_dir=None,
+                                                      bbox_path=None)
+                        except Exception as e:  # 单卷失败不应中断整体预热。
+                            logger.warning(
+                                "[AdaBN] warmup failed on %s: %s", wp, e)
+                finally:
+                    predictor._adabn_estimating = False
 
             estimate_bn_stats(bn_modules, _warmup)
             logger.info(
