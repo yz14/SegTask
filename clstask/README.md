@@ -1,87 +1,63 @@
 # clstask — 3D / 2.5D 医学影像分类
 
-复用 segtask_v1 基建（配置 / 几何拓扑 / 预处理 / Encoder / 优化器 / AMP / EMA）的
-分类工程。SSL（ssltask）预训练 encoder 权重可直接迁移。
+clstask 复用 `segtask_v1` 的配置、几何拓扑、预处理、优化器、AMP 和 EMA 基建，提供医学影像分类训练与推理闭环。它支持 3D 与 2.5D 两种几何，能够直接接入 ssltask 预训练的 encoder 权重，也能用自己的分类骨干单独训练。
 
-## 双几何
+## 模块树
 
-与分割同一套 `patch_mode` 语义，由 `segtask_v1` topology 单一真相源派生
-`spatial_dims` / `in_channels`：
-
-| 几何 | patch_mode | spatial_dims | 输入布局 |
-|------|-----------|--------------|----------|
-| 3D   | `whole` / `z_axis` / `cubic` | 3 | `(B, 1, D, H, W)` |
-| 2.5D | `2_5d`（slab 深度折进通道） | 2 | `(B, D, H, W)` |
-
-2.5D 目前限单 FOV（`multi_res_scales: [1.0]`），与 image-only SSL 预训练几何
-一致；不支持 `lift_2_5d_to_3d`。
-
-## 四个 backbone 模板
-
-| 模板 | 配置 | SSL 迁移 |
-|------|------|---------|
-| ResNet   | `cls.backbone: encoder` + `model.backbone: resnet`   | ✅（同一构建路径） |
-| ConvNeXt | `cls.backbone: encoder` + `model.backbone: convnext` | ✅ |
-| DenseNet-BC | `cls.backbone: densenet`（`clstask/models/densenet.py`，2D/3D） | ✗ |
-| ViT      | `cls.backbone: vit`（`clstask/models/vit.py`，2D/3D，位置编码可插值） | ✗ |
-
-## 标签
-
-* **粒度** `cls.label_granularity`：
-  * `volume` —— 对整个 patch/样本分类，logits `(B, K)`；
-  * `slice` —— 对每个 z 切片分类，logits `(B, K, D)`（2.5D 头把特征图按 D
-    切片池化；3D 头沿 z 保留分辨率）。
-* **来源** `cls.label_source`：
-  * `mask` —— 由分割 mask 派生弱标签（每前景类"是否出现"），volume/slice 均支持；
-  * `table` —— 显式标签表 csv（`pid,label` 或 `pid,c1..cK`）/ json，仅 volume；
-    `cls.multi_label=false` 时为单标签 softmax CE。
-
-## 损失 / 增强 / 选模
-
-* 损失：`bce`（多标签）/ `focal` / `ce`（单标签），支持 label smoothing、
-  class weights，fp32 计算 + logit clamp（承接 segtask AMP 口径）。
-* Mixup / CutMix（仅 volume 粒度）：软标签，CutMix λ 按实际裁剪体积重算。
-* 选模：`cls.save_best_metric ∈ {auc, f1, acc, loss}`；AUC 为无第三方依赖的
-  秩统计实现（Mann-Whitney，带并列校正）。
-
-## SSL / 分割权重迁移
-
-```yaml
-cls:
-  backbone: encoder
-  pretrained_ckpt: outputs/ssl_xxx/best.pt   # 只取 encoder.*，strict=False
-  freeze_encoder: false                       # true = linear probe
-  encoder_lr_mult: 0.1                        # encoder 参数组学习率倍率
+```text
+clstask/
+├── README.md  # 本文件
+├── __init__.py  # 包入口与对外导出
+├── __main__.py  # python -m clstask 入口
+├── config.py  # 分类配置、YAML I/O、校验
+├── train.py  # 训练 CLI
+├── predict.py  # 推理 CLI
+├── data/  # 数据发现与样本构建
+│   ├── __init__.py  # 数据包入口
+│   ├── cls_dataset.py  # 分类样本、标签派生与读取逻辑
+│   └── loader.py  # 配对、切分与 dataloader 工厂
+├── docs/  # 方案与模型综述
+│   └── classification_models_survey.md  # 分类骨干与设计备忘
+├── losses/  # 分类损失
+│   ├── __init__.py  # 损失包入口
+│   └── cls_loss.py  # CE / BCE / focal 等分类损失
+├── metrics.py  # AUC / F1 / ACC 等指标
+├── models/  # 分类模型与骨干
+│   ├── __init__.py  # 模型包入口
+│   ├── classifier.py  # 分类模型封装
+│   ├── densenet.py  # DenseNet 骨干
+│   ├── factory.py  # backbone 装配与迁移入口
+│   └── vit.py  # ViT 分类骨干
+├── predictor/  # 推理器
+│   ├── __init__.py  # 推理包入口
+│   └── cls_predictor.py  # 整例 / 整卷分类推理与聚合
+└── trainer/  # 训练循环
+    ├── __init__.py  # 训练包入口
+    ├── cls_trainer.py  # 训练、验证与选模
+    └── mixup.py  # mixup / cutmix 增强
 ```
 
-命中/缺失张量数打日志；0 命中直接报错（几何或 backbone 不匹配时不静默）。
+## 关键概念
 
-## 推理（patch → volume 的 MIL 聚合）
+- **双几何**：`patch_mode` 沿用分割仓库的语义。3D 使用 `(B, 1, D, H, W)`，2.5D 把 slab 深度折进通道，使用 `(B, D, H, W)` 形式。
+- **四个 backbone 模板**：`resnet`、`convnext`、`densenet`、`vit` 四条路线覆盖常见分类实验，其中前两者可直接复用 SSL 预训练 encoder。
+- **标签契约**：支持 `mask` 派生弱标签与 `table` 显式标签表两种来源；`volume` 和 `slice` 粒度的输出形状不同，配置需要和数据源对齐。
+- **损失与增强**：支持 BCE、focal、CE、label smoothing、class weights，以及仅在卷级分类上启用的 mixup / cutmix。
+- **SSL 迁移**：`pretrained_ckpt` 只加载 encoder 相关权重，几何或 backbone 不一致时直接报错，不做静默降级。
+- **推理聚合**：推理时先做 patch 级预测，再按几何与 `agg_mode` 聚合成卷级结果；slice 粒度还会保留逐层输出。
 
-`ClsPredictor` 按几何做网格采样（2.5D 沿 z；3D cubic 三轴网格），patch 概率经
-`cls.agg_mode ∈ {mean, max, lse, topk}` 聚合为卷级概率；slice 粒度另输出逐
-z-slice 概率（重叠 patch 取 max）。
-
-## 使用
+## 用法
 
 ```bash
-# 训练（3D cubic / 2.5D 折叠两套参考配置）
+# 训练
 python -m clstask.train --config configs/cls3d_cubic.yaml
-python -m clstask.train --config configs/cls2_5d.yaml \
-    --override train.epochs=100 cls.agg_mode=topk
+python -m clstask.train --config configs/cls2_5d.yaml
 
 # 推理
 python -m clstask.predict --config configs/cls3d_cubic.yaml \
-    --ckpt outputs/cls3d_cubic/best_model.pth \
-    --npz-dir /path/to/npz --out-dir predictions/cls [--use-ema]
-```
+  --ckpt outputs/cls3d_cubic/best_model.pth \
+  --npz-dir /path/to/npz --out-dir predictions/cls
 
-## 冒烟测试
-
-```bash
+# 冒烟测试
 python tests/test_clstask_smoke.py
 ```
-
-覆盖：双几何配置派生、数据集形状、损失/指标、四模板×双几何前向、
-table 标签 + mixup/cutmix、双几何 3-epoch 训练（loss 下降 + val AUC）、
-ckpt `encoder.*` 键 + strict=False 迁移命中、整卷推理。
