@@ -193,7 +193,12 @@ def load_nifti_cropped(
             if d1c > d0c and h1c > h0c and w1c > w0c:
                 reader.SetExtractIndex([w0c, h0c, d0c])
                 reader.SetExtractSize([w1c - w0c, h1c - h0c, d1c - d0c])
-            # 空 bbox 退为全卷读；保留明确分支供下游错误信息体现。
+            else:
+                # 空 bbox 退为全卷读：大概率是 bbox 文件与影像不匹配，显式告警。
+                logger.warning(
+                    "Empty/out-of-range bbox %s for %s (volume size D=%d H=%d "
+                    "W=%d); falling back to full-volume read.",
+                    bbox, path, full_d, full_h, full_w)
         if sitk_pixel is not None:
             # 强制 fp32/fp64 输出；sitk 在转型中应用 scl_slope/inter。
             reader.SetOutputPixelType(sitk_pixel)
@@ -382,11 +387,15 @@ def preprocess_image(
 def compute_region_weight_map(
     volume: np.ndarray, label_values: List[int],
     region_weights: List[float]) -> np.ndarray:
-    """由整数 label 与逐值权重生成 (1,D,H,W) fp32 区域权重图；未命中标签赋 1.0。"""
-    vol  = np.round(volume).astype(np.int16)  # int16已经足够
-    wmap = np.ones_like(vol, dtype=np.float32)
+    """由整数 label 与逐值权重生成 (1,D,H,W) fp32 区域权重图。
+
+    与逐样本权重文件路径（load_region_weight_volume）同一语义：最终权重 =
+    配置值 + 1（配 0 → 权重 1）；未命中标签赋 1.0。"""
+    # 四舍五入后浮点直接比较（整数值在 fp32 下精确），免除 int16 截断风险。
+    vol  = np.rint(volume)
+    wmap = np.ones(vol.shape, dtype=np.float32)
     for lv, w in zip(label_values, region_weights):
-        wmap[vol == lv] = w
+        wmap[vol == lv] = w + 1.0
     return wmap[np.newaxis]  # (1, D, H, W)
 
 
@@ -426,8 +435,17 @@ def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_l
     else:
         raise ValueError(f"Expected 3D or 4D array, got {arr.ndim}D")
     order = 0 if is_label else 1
-    # zoom 已返输入 dtype；copy=False 避免冷拷贝。
-    return zoom(arr, factors, order=order).astype(arr.dtype, copy=False)
+    # zoom 的输出形状 = round(in*factor)，可能比目标差 ±1（浮点因子累积），
+    # 且默认 mode='constant' cval=0 会在边界注入 0。这里 mode='nearest'
+    # 复制边界，再对形状做一次防御性校正到精确目标。
+    out = zoom(arr, factors, order=order, mode="nearest")
+    tgt = (target_d, target_h, target_w) if arr.ndim == 3 else (
+        arr.shape[0], target_d, target_h, target_w)
+    if out.shape != tgt:
+        slices = tuple(slice(0, t) for t in tgt)
+        pad = [(0, max(0, t - s)) for t, s in zip(tgt, out.shape)]
+        out = np.pad(out[slices], pad, mode="edge")
+    return out.astype(arr.dtype, copy=False)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +459,7 @@ def compute_bbox_from_volume(vol: np.ndarray) -> Optional[BBox]:
     """计算 (D,H,W) ROI 掩膜非零区域的轴齐包围盒；掩膜全空返 None。使用 np.any 逐轴崩装，比 argwhere 快且低内存。"""
     if vol.ndim != 3:
         raise ValueError(f"BBox volume must be 3D (D,H,W), got {vol.ndim}D")
-    mask = np.round(vol).astype(np.int16) != 0
+    mask = np.rint(vol) != 0  # 浮点直接比较，免 int16 截断
     if not mask.any():
         return None
     d_any = np.any(mask, axis=(1, 2))

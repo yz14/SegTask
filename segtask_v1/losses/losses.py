@@ -994,6 +994,11 @@ class SliceChannelLoss(nn.Module):
             target_5d = self._label_to_binary_5d(label_raw)    # (B, num_fg, D, H, W)
             wm_5d     = self._wmap_to_5d(weight_map, self.num_slices)
 
+            # 单前景类：逐类循环退化为单次调用，直接短路（与聚合路径数学恒等：
+            # 均值/加权均值对单项都是恒等变换）。
+            if self.num_fg == 1:
+                return self.base_loss(pred_5d, target_5d, weight_map=wm_5d)
+
             # 3D 二值分割逐类循环：Dice/Tversky 跨 (D,H,W) 汇总，空切与非空切共享分母。
             terms: List[torch.Tensor] = []
             for c in range(self.num_fg):
@@ -1006,6 +1011,10 @@ class SliceChannelLoss(nn.Module):
         pred_flat   = self._split_pred(pred)                # (B*D, num_fg, H, W)
         target_flat = self._label_to_binary(label_raw)      # (B*D, num_fg, H, W)
         wm_flat     = self._flatten_weight_map(weight_map, self.num_slices)
+
+        # 单前景类短路（同 per_volume 分支，数学恒等）。
+        if self.num_fg == 1:
+            return self.base_loss(pred_flat, target_flat, weight_map=wm_flat)
 
         # 逐 fg 类传单通道二值张量使 base_loss 作为独立 2D 二值分割。
         terms = []

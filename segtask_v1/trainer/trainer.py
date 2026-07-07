@@ -56,6 +56,7 @@ from .checkpoint import (
     unwrap_compile,
 )
 from .dist_utils import (
+    all_reduce_flag_any,
     barrier,
     get_rank,
     get_world_size,
@@ -831,18 +832,21 @@ class Trainer:
 
             # 参数更新
             if is_step_boundary:
-                # bf16/fp32 无 scaler 保护；这里只复用已算出的范数，不额外引入
-                # per-step 开销。clip 关且健康监测不算范数时，该 guard 不生效。
+                # 梯度范数：clip 开时复用其范数；bf16/fp32 无 scaler 保护，clip
+                # 关时也在所有 rank 上算一次全局范数作非有限守护（DDP
+                # all-reduce 后各 rank 梯度一致，范数天然跨 rank 一致），
+                # 与仅 rank0 的健康监测采集解耦。
                 grad_norm_val = None
                 if tc.grad_clip_norm > 0:
                     self.scaler.unscale_(self.optimizer)
                     gn = nn.utils.clip_grad_norm_(
                         self.model.parameters(), tc.grad_clip_norm)
                     grad_norm_val = float(gn)
+                elif not self._scaler_active:
+                    grad_norm_val = self._global_grad_norm()
                 elif self._health_monitor and self._health_grad_norm_when_no_clip:
                     try:
-                        if self._scaler_active:
-                            self.scaler.unscale_(self.optimizer)
+                        self.scaler.unscale_(self.optimizer)
                         grad_norm_val = self._global_grad_norm()
                     except Exception:  # 监测失败绝不打断训练
                         logger.warning(
@@ -853,12 +857,16 @@ class Trainer:
                     grad_norm_val is not None and not math.isfinite(grad_norm_val))
                 loss_nonfinite = group_has_nonfinite
 
-                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；
-                # bf16/fp32 在 loss 或梯度非有限时丢弃本 accum 组梯度，
-                # 避免 NaN 永久污染权重与 EMA（scheduler 照常推进，EMA 不推进）。
-                skip_optim_step = (
-                    (loss_nonfinite or grad_nonfinite)
-                    and not self._scaler_active)
+                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步（基于
+                # all-reduce 后一致的梯度，各 rank 天然同步）；bf16/fp32 在
+                # loss 或梯度非有限时丢弃本 accum 组梯度，避免 NaN 永久污染
+                # 权重与 EMA（scheduler 照常推进，EMA 不推进）。loss 非有限
+                # 是各 rank 本地信息，跳步决策需 all-reduce(any) 统一，维持
+                # DDP 各副本施加相同更新的不变量。
+                skip_optim_step = False
+                if not self._scaler_active:
+                    skip_optim_step = all_reduce_flag_any(
+                        loss_nonfinite or grad_nonfinite, self.device)
                 group_has_nonfinite = False
                 if skip_optim_step:
                     causes = []
@@ -870,7 +878,9 @@ class Trainer:
                         "Skipping optimizer step at epoch %d step %d/%d: "
                         "%s in this accumulation group "
                         "(amp_dtype=%s has no GradScaler protection).",
-                        epoch + 1, step + 1, total_steps, " and ".join(causes),
+                        epoch + 1, step + 1, total_steps,
+                        " and ".join(causes) if causes
+                        else "non-finite on a peer rank",
                         self._amp_dtype_name)
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()

@@ -389,7 +389,10 @@ class Predictor:
             dc.normalize, dc.global_mean, dc.global_std)
 
         self._log_normalized_input_stats(vol)
-        # AdaBN per_volume：用该卷自身先跑一遍前向重估 BN running stats，再冻结预测。
+        # AdaBN per_volume：用该卷自身先跑一遍前向重估 BN running stats，再冻结预测
+        # （每卷推理成本 2×）。估计期 TTA 仅降为串行、flip 变体仍前向，故 BN
+        # 统计含原图+各 flip 的混合分布——与真实预测（也含 TTA）自洽，属有意取舍；
+        # 若期望 BN 只反映原图分布，需在估计期跳过 TTA。
         # 估计期暂时抑制 forward 诊断（置护孔为已记录），随后再重置以让真实预测发一次。
         if (self.adabn_enabled and self.adabn_mode == "per_volume"
                 and self._adabn_bn_modules):
@@ -413,6 +416,8 @@ class Predictor:
 
         prob_volume = self.predict_preprocessed_array(vol, z_spacing=z_spacing)
 
+        # 备忘：此诊断在 spacing 回采之前，spacing_normalization=True 时统计口径
+        # 是 target-spacing 分辨率而非原生分辨率（仅展示层，数值影响可忽）。
         self._log_inroi_prob_stats(prob_volume)
 
         # spacing 归一化：把概率图从 target-spacing 分辨率回采到 pre-resample 形状

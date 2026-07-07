@@ -42,7 +42,10 @@ def _make_drop_path_rates(counts: List[int], drop_path_rate: float) -> List[floa
 
 
 class _StatefulStageBuilder:
-    """有状态 stage 构建器：逐次调用从 counts[idx] 读 num_blocks。"""
+    """有状态 stage 构建器：逐次调用从 counts[idx] 读 num_blocks。
+
+    stage 索引由本类单一计数器维护并传给 factory_fn，避免 factory 闭包
+    另设计数器产生双计数器漂移。"""
 
     def __init__(self, factory_fn, counts: List[int]):
         self._fn     = factory_fn
@@ -54,9 +57,10 @@ class _StatefulStageBuilder:
             raise RuntimeError(
                 f"StageBuilder exhausted after {self._idx} calls, "
                 f"counts={self._counts}")
-        n_blocks = self._counts[self._idx]
+        idx = self._idx
+        n_blocks = self._counts[idx]
         self._idx += 1
-        return self._fn(in_ch, out_ch, n_blocks)
+        return self._fn(in_ch, out_ch, n_blocks, idx)
 
 
 def _make_resnet_stage_builder(
@@ -80,8 +84,9 @@ def _make_resnet_stage_builder(
     mask = list(multirf_mask) if multirf_mask else []
     sa_types = list(selfattn_types) if selfattn_types else []
 
-    def _build_stage(in_ch: int, out_ch: int, num_blocks: int, start: int):
-        use_mrf = bool(mask[factory_idx[0]]) if factory_idx[0] < len(mask) else False
+    def _build_stage(
+        in_ch: int, out_ch: int, num_blocks: int, start: int, stage_idx: int):
+        use_mrf = bool(mask[stage_idx]) if stage_idx < len(mask) else False
         if use_mrf:
             return MultiRFStage(
                 in_ch, out_ch,
@@ -112,13 +117,11 @@ def _make_resnet_stage_builder(
             spatial_dims   = spatial_dims,
             drop_path_rates = dp_rates[start:start + num_blocks])
 
-    def factory(in_ch: int, out_ch: int, num_blocks: int):
-        # _StatefulStageBuilder 顺序调用，下方按"已构建数"取 mask。
-        idx = factory_idx[0]
-        start = sum(counts[:idx])
-        stage = _build_stage(in_ch, out_ch, num_blocks, start)
-        sa_type = sa_types[idx] if idx < len(sa_types) else None
-        factory_idx[0] += 1
+    def factory(in_ch: int, out_ch: int, num_blocks: int, stage_idx: int):
+        # stage_idx 由 _StatefulStageBuilder 的单一计数器传入。
+        start = sum(counts[:stage_idx])
+        stage = _build_stage(in_ch, out_ch, num_blocks, start, stage_idx)
+        sa_type = sa_types[stage_idx] if stage_idx < len(sa_types) else None
         if sa_type:
             return nn.Sequential(stage, SelfAttentionBlock(
                 out_ch,
@@ -135,7 +138,6 @@ def _make_resnet_stage_builder(
                 spatial_dims = spatial_dims))
         return stage
 
-    factory_idx = [0]
     return _StatefulStageBuilder(factory, counts)
 
 
@@ -158,14 +160,14 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             "skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
     dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
-    rate_idx = [0]
     ls_init      = float(mc.convnext_layer_scale_init)  # <=0 禁用
 
-    def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
-        start = rate_idx[0]
+    def factory(
+        in_ch: int, out_ch: int, num_blocks: int, stage_idx: int
+        ) -> ConvNeXtStage:
+        start = sum(counts[:stage_idx])
         end   = start + num_blocks
         rates = dp_rates[start:end] if dp_rates else [0.0] * num_blocks
-        rate_idx[0] = end
         return ConvNeXtStage(
             in_ch, out_ch,
             num_blocks             = num_blocks,
@@ -212,13 +214,13 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
             "stem/decoder skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
     dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
-    rate_idx = [0]
 
-    def factory(in_ch: int, out_ch: int, num_blocks: int) -> MedNeXtStage:
-        start = rate_idx[0]
+    def factory(
+        in_ch: int, out_ch: int, num_blocks: int, stage_idx: int
+        ) -> MedNeXtStage:
+        start = sum(counts[:stage_idx])
         end = start + num_blocks
         rates = dp_rates[start:end] if dp_rates else [0.0] * num_blocks
-        rate_idx[0] = end
         return MedNeXtStage(
             in_ch, out_ch,
             num_blocks     = num_blocks,
@@ -424,6 +426,15 @@ def build_model(cfg: Config):
                 f"Anisotropic downsampling currently supports only "
                 f"decoder_type='unet'; got {mc.decoder_type!r}. "
                 f"(unetpp/unet3p decoders use isotropic ×2 up/down.)")
+        if mc.stem_fusion_mode == "hierarchical" and num_stem_fusion_views > 1:
+            # hierarchical aux-stem 注入尺寸假定各级各向同性 ×2 下采；
+            # 构造期报错，避免 forward 期才因空间尺寸不匹配失败。
+            raise ValueError(
+                "Anisotropic downsampling is not supported with "
+                "stem_fusion_mode='hierarchical': aux-view injection sizes "
+                "assume isotropic x2 encoder downsampling. Use "
+                "'shared_stem'/'multi_stem_proj', or disable "
+                "anisotropic_pooling/downsample_strides.")
         if mc.downsample_mode not in _ANISO_DOWN_MODES:
             raise ValueError(
                 f"Anisotropic downsampling requires downsample_mode in "

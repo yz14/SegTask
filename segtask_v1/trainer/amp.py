@@ -32,6 +32,8 @@ _AMP_DTYPES = {
 
 # logit 夹匯上限：fp16 可能产生 ±inf —— 导致 BCEWithLogits 出 NaN。
 # sigmoid(50) ≈ 1.0，不影响正常训练（|x|≪20）行为。
+# 备忘：bf16/fp32 不会溢出 ±inf，无条件 clamp 属保守设计——正常训练不触发，
+# 越界 logit 梯度置 0 无害，故不按 amp_dtype 分支。
 _LOGIT_CLAMP: float = 50.0
 
 

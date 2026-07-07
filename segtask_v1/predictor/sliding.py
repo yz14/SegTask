@@ -144,7 +144,10 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
 
         is_last = idx == n_windows - 1
         if len(window_inputs) >= p.batch_size or is_last:
-            # (B, C_res, pD, pH, pW)
+            # 默认路径：wi_np rank-4 (C_res,pD,pH,pW) → batch rank-5
+            # (B,C_res,pD,pH,pW)；keep_native_view_depth 路径：wi_np rank-3
+            # (sum(D_k),pH,pW) → batch rank-4 (B,sum(D_k),pH,pW)。
+            # torch.stack 对两者均正确，下游 forward 按 rank 分派。
             batch = torch.stack(window_inputs, dim=0).float()
             # (B, num_fg, pD, pH, pW) on GPU
             probs = _forwards.forward_batch_gpu(p, batch)
@@ -339,10 +342,13 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         probs = _forwards.forward_batch_gpu(p, batch)   # (B, num_fg, pD, pH, pW) on GPU
         # 一次性转到累加器 dtype/device（CPU 逃生门时为 GPU→CPU 拷贝）。
         probs = probs.to(device=p.acc_device, dtype=p.acc_dtype)
-        for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw) in zip(probs, coords):
+        for pred, (d0, d1, h0, h1, w0, w1, ad, ah, aw,
+                   pb_d, pb_h, pb_w) in zip(probs, coords):
             # Trim prediction to actual (non-padded) size in each axis
-            pred_trim = pred[:, :ad, :ah, :aw]
-            w_trim = weight_3d[:ad, :ah, :aw].unsqueeze(0)   # (1, ad, ah, aw)
+            # （居中填充：真实内容从 pad_before 偏移处开始）。
+            pred_trim = pred[:, pb_d:pb_d + ad, pb_h:pb_h + ah, pb_w:pb_w + aw]
+            w_trim = weight_3d[pb_d:pb_d + ad, pb_h:pb_h + ah,
+                               pb_w:pb_w + aw].unsqueeze(0)   # (1, ad, ah, aw)
             acc_pred[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw].addcmul_(
                 pred_trim, w_trim, value=1.0)
             acc_weight[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw].add_(w_trim)
@@ -361,9 +367,16 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 patch = vol[d0:d1, h0:h1, w0:w1]
                 ad, ah, aw = patch.shape
 
-                # 填短尾窗口到 (pD,pH,pW)。默认 mode='edge' 复制边界（归一化后 0 不是空气）。
+                # 填短尾窗口到 (pD,pH,pW)：居中 edge-pad（默认复制边界，归一化后
+                # 0 不是空气），与训练侧 _extract_cubic_patch / keep_native
+                # builder 的居中几何一致。
+                pb_d = pb_h = pb_w = 0
                 if ad < pD or ah < pH or aw < pW:
-                    pad_width = ((0, pD - ad), (0, pH - ah), (0, pW - aw))
+                    pb_d, pb_h, pb_w = (
+                        (pD - ad) // 2, (pH - ah) // 2, (pW - aw) // 2)
+                    pad_width = ((pb_d, pD - ad - pb_d),
+                                 (pb_h, pH - ah - pb_h),
+                                 (pb_w, pW - aw - pb_w))
                     if p.pad_value is None:
                         patch = np.pad(patch, pad_width, mode="edge")
                     else:
@@ -372,7 +385,8 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                             constant_values=p.pad_value)
 
                 patches.append(patch)
-                coords.append((d0, d1, h0, h1, w0, w1, ad, ah, aw))
+                coords.append(
+                    (d0, d1, h0, h1, w0, w1, ad, ah, aw, pb_d, pb_h, pb_w))
                 centers.append(
                     ((d0 + d1) // 2, (h0 + h1) // 2, (w0 + w1) // 2))
 

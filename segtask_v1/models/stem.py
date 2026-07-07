@@ -18,7 +18,9 @@ STEM_MODES = ("conv3", "conv7", "dual", "patch2", "patch4")
 
 
 class DualConvStem(nn.Module):
-    """两个堆叠 3×3×3 conv-norm-act（nnU-Net stem）。"""
+    """7×7×7 + 3×3×3 两层堆叠 conv-norm-act（nnU-Net 双卷积 stem 的大核首层变体）。
+
+    第一层用 7×7×7 大核扩大入口感受野，第二层 3×3×3 精炼；两层均 stride=1。"""
 
     def __init__(
         self,
@@ -30,7 +32,7 @@ class DualConvStem(nn.Module):
         spatial_dims: int = 3):
         super().__init__()
         self.block1 = ConvNormAct(
-            in_ch, out_ch, kernel_size=7, stride=1, padding=3,  # 第一层用7x7x7会不会好？
+            in_ch, out_ch, kernel_size=7, stride=1, padding=3,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=spatial_dims)
         self.block2 = ConvNormAct(
@@ -97,7 +99,7 @@ def build_stem(
             activation=activation, spatial_dims=spatial_dims)
         return stem, 1
 
-    if mode == "dual":  # 双层 3x3
+    if mode == "dual":  # 7x7 + 3x3 双层
         stem = DualConvStem(
             in_ch, out_ch,
             norm_type=norm_type, norm_groups=norm_groups,

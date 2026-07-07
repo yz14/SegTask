@@ -275,9 +275,7 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
 def forward_batch_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
     """numpy-返版 forward：``(B, num_fg, D, H, W)`` fp32。等价于
     ``forward_batch_gpu(...).cpu().numpy()``，保留这个独立入口仅为类侧 shim 命名一致。
-
-    注意：与 ``forward_batch_gpu`` 的细微差别——重构前的 numpy 返回版 forward
-    *不* 调 diag logger（仅 GPU 路径调）。本函数复刻该行为，禁用 diag。
+    与 GPU 路径同样输出首 batch 诊断（NaN/饱和排查对 whole/cubic-CPU 路径同样有用）。
     """
     if p.patch_mode == "2_5d":
         return forward_batch_2_5d_numpy(p, x)
@@ -290,6 +288,7 @@ def forward_batch_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
             f"Model output has {pred.shape[1]} channels; "
             f"expected at least num_fg={p.num_fg} at 1x resolution.")
         prob = torch.sigmoid(pred.float())[:, :p.num_fg]
+        diag_log_first_batch(p, "3D numpy", x, pred[:, :p.num_fg], prob)
         if p.tta_flip:
             prob = tta_flip_ensemble(p, x, prob)
     return prob.float().cpu().numpy()
@@ -313,6 +312,8 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
                     f"channels at dim 1; expected at least "
                     f"num_fg={p.num_fg}.")
             prob = torch.sigmoid(pred.float())[:, :p.num_fg]
+            diag_log_first_batch(
+                p, "2.5D lift numpy", x, pred[:, :p.num_fg], prob)
             if p.tta_flip:
                 prob = tta_flip_ensemble(p, x, prob)
         return prob.float().cpu().numpy()
@@ -331,6 +332,7 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
         pred_5d = rearrange(
             pred, 'b (c d) h w -> b c d h w', c=p.num_fg, d=D)
         prob = torch.sigmoid(pred_5d.float())
+        diag_log_first_batch(p, "2.5D folded numpy", x_2d, pred_5d, prob)
         if p.tta_flip:
             prob = tta_flip_ensemble_2_5d(p, x_2d, prob)
     return prob.float().cpu().numpy()

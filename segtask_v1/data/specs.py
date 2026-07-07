@@ -156,11 +156,14 @@ class WholeSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         # whole 在 Config.validate 中已强制 multi_res_scales=[1.0]、忽略 fg 过采样。
+        # val 无增强、整卷输入确定：spv>1 只是等比重复同一样本（pooled Dice
+        # 数值不变，纯白算），固定 1。
         return SegDataset3DWhole(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio = self._aug_oversample(is_train),
-            samples_per_volume   = self._samples_per_volume(is_train),
+            samples_per_volume   = (self._samples_per_volume(True)
+                                    if is_train else 1),
             is_train=is_train)
 
 

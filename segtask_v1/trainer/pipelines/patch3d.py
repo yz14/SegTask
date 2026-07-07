@@ -110,6 +110,8 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
         main_pred, _aux, topo_pred = self.split_pred(pred)
         loss = compute_loss_fp32(
             self.criterion, main_pred, sup.label_main, weight_map=sup.wmap_main)
+        if breakdown is not None:
+            breakdown["L_main"] = float(loss.detach().item())
         loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
         if breakdown is not None:
             breakdown["L_total"] = float(loss.detach().item())

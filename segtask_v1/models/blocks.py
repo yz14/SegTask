@@ -1371,6 +1371,10 @@ class Upsample(nn.Module):
     ``stride`` 支持 int（各向同性，默认 2）或 per-axis 元组（各向异性，须与对应
     encoder Downsample 的 stride 镜像一致）。各向异性仅 'transpose'/'trilinear'/
     'nearest' 支持；'pixelshuffle'/'carafe'/'dysample' 只支持各向同性 stride 2。
+
+    ``norm_act`` 仅对插值模式 'trilinear'/'nearest' 生效（在精修 conv 后接
+    norm+act）；'transpose'/'pixelshuffle'/'carafe'/'dysample' 忽略该选项
+    （这些模式本身即含可学变换）。
     """
 
     VALID_MODES = ("transpose", "trilinear", "nearest", "pixelshuffle",

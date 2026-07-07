@@ -399,7 +399,11 @@ def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], Lis
     """随机（非分层）按索引划分 train/val。"""
     rng = np.random.RandomState(seed)
     indices = rng.permutation(n).tolist()
-    n_val = max(1, int(n * val_ratio))
+    # 至少留 1 个训练样本（n==1 或 val_ratio 过大时防止 train 集为空）。
+    n_val = min(max(1, int(n * val_ratio)), n - 1) if n > 1 else 0
+    if n_val == 0:
+        logger.warning(
+            "train_val_split: only %d sample(s); validation set is empty.", n)
     return indices[n_val:], indices[:n_val]
 
 

@@ -20,6 +20,7 @@ __all__ = [
     "is_main_process",
     "barrier",
     "all_reduce_sum_",
+    "all_reduce_flag_any",
     "shard_for_rank",
 ]
 
@@ -64,6 +65,21 @@ def all_reduce_sum_(tensor: torch.Tensor) -> torch.Tensor:
     if is_dist_avail_and_initialized() and get_world_size() > 1:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return tensor
+
+
+@torch.no_grad()
+def all_reduce_flag_any(flag: bool, device: torch.device) -> bool:
+    """跨 rank 对布尔标志做 any 归并（all-reduce MAX）；非分布式时原样返回。
+
+    用于必须全 rank 一致的控制流决策（如跳过优化步）：任一 rank 为 True
+    则全体为 True，避免各 rank 依据本地信息做出不同决策而破坏 DDP 副本一致性。
+    注意：分布式下是集体通信，所有 rank 必须在相同步调对齐调用。
+    """
+    if not (is_dist_avail_and_initialized() and get_world_size() > 1):
+        return flag
+    t = torch.tensor(1.0 if flag else 0.0, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return bool(t.item() > 0)
 
 
 def shard_for_rank(items: List) -> List:

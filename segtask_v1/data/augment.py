@@ -54,6 +54,13 @@ class GPUAugmentor:
 
         c = self.cfg
 
+        # 开 intensity_clamp 时在任何增强前记录逐样本逐通道 min/max，
+        # 确保基准是真正的"增强前"范围（不受 border 复制/dropout 置零影响）。
+        if c.intensity_clamp:
+            reduce_dims = tuple(range(2, image.ndim))
+            clamp_lo = image.amin(dim=reduce_dims, keepdim=True)
+            clamp_hi = image.amax(dim=reduce_dims, keepdim=True)
+
         # Spatial: flip / (affine+elastic 融合单次 warp) / grid-dropout
         image, label, weight_map = _random_flip(
             image, label, c.random_flip_prob, c.random_flip_axes, weight_map=weight_map)
@@ -76,13 +83,9 @@ class GPUAugmentor:
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
             c.grid_dropout_holes, weight_map=weight_map)
 
-        # Intensity (image only)。开 intensity_clamp 时记录增强前逐样本逐通道
-        # min/max，全部强度增强后夹回原范围；这是比 nnU-Net 更激进的取舍，
-        # 可关掉 intensity_clamp。这样会把所有强度增强都压回增强前范围。
-        if c.intensity_clamp:
-            reduce_dims = tuple(range(2, image.ndim))
-            clamp_lo = image.amin(dim=reduce_dims, keepdim=True)
-            clamp_hi = image.amax(dim=reduce_dims, keepdim=True)
+        # Intensity (image only)。全部强度增强后夹回增强前范围（clamp_lo/hi
+        # 在所有增强前采集）；这是比 nnU-Net 更激进的取舍，可关掉
+        # intensity_clamp。
         image = _random_brightness(image, c.random_brightness_prob, c.random_brightness_range)
         image = _random_contrast(image, c.random_contrast_prob, c.random_contrast_range)
         image = _random_gamma(image, c.random_gamma_prob, c.random_gamma_range)
@@ -111,79 +114,6 @@ def _random_flip(
             label[idx] = torch.flip(label[idx], [axis])
             if weight_map is not None:
                 weight_map[idx] = torch.flip(weight_map[idx], [axis])
-    return image, label, weight_map
-
-
-def _random_affine(
-    image: torch.Tensor, label: torch.Tensor,
-    prob: float, rotate_range: list, scale_range: list,
-    weight_map: Optional[torch.Tensor] = None,
-    wmap_mode: str = "nearest",
-    translate_range: Optional[list] = None,
-    rotate_range_per_axis: Optional[list] = None,
-    aspect_correct: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本 3D 仿射（欧拉旋转 + 各同性缩放 + 可选平移）。三路均用 padding_mode='border' 保边界，避免将 weight_map 背景=1 归零。
-
-    rotate_range_per_axis：3 对 [lo,hi]（度），轴序 (x,y,z)=(W,H,D)；None 时三轴共用 rotate_range。
-    aspect_correct：True 时在物理各向同性坐标里旋转（R←A⁻¹RA，A=diag(W,H,D)），
-    消除各向异性 patch 上 affine_grid 归一化坐标旋转隐含的剪切/非均匀缩放；
-    这里只修正 voxel-count 维度比例，不含真实物理 spacing。若 data.spacing_normalization=False，
-    厚切片 z 与面内 spacing 不一致时，out-of-plane 旋转仍会受物理各向异性影响；要做物理正确旋转，
-    需要先启用 data.spacing_normalization 统一到 isotropic target_spacing。
-    translate_range：[lo,hi]（归一化坐标，[-1,1] 跨整轴），逐轴独立采样；None/[0,0]=无平移。
-    """
-    B, _, D, H, W = image.shape
-    device = image.device
-
-    # 选择被增强的样本（CPU 采样，零同步）。
-    mask = _bernoulli_mask(B, prob)
-    if not mask.any():
-        return image, label, weight_map
-
-    # 逐样本采样旋转角（弧度）与 scale（CPU 采样后异步搬设备）。
-    n = int(mask.sum())
-    if rotate_range_per_axis is not None:
-        angles = torch.empty(n, 3)  # (n, 3) for x,y,z
-        for ax in range(3):
-            lo = math.radians(rotate_range_per_axis[ax][0])
-            hi = math.radians(rotate_range_per_axis[ax][1])
-            angles[:, ax].uniform_(lo, hi)
-    else:
-        lo, hi = math.radians(rotate_range[0]), math.radians(rotate_range[1])
-        angles = torch.empty(n, 3).uniform_(lo, hi)  # (n, 3) for x,y,z
-    angles = angles.to(device, non_blocking=True)
-    scales = torch.empty(n, 1).uniform_(
-        scale_range[0], scale_range[1]).to(device, non_blocking=True)
-
-    translations = None
-    if translate_range is not None and (
-            translate_range[0] != 0.0 or translate_range[1] != 0.0):
-        translations = torch.empty(n, 3).uniform_(
-            translate_range[0], translate_range[1]).to(device, non_blocking=True)
-
-    aspect = None
-    if aspect_correct:
-        # affine_grid 坐标轴序 (x,y,z)=(W,H,D)；只用比例，公共尺度无影响。
-        aspect = torch.tensor(
-            [float(W), float(H), float(D)], device=device, dtype=torch.float32)
-
-    # 构建逐样本 3x4 仿射 + grid。
-    affines = _build_rotation_matrices(angles, scales, translations, aspect)
-    grid = F.affine_grid(affines, [n, 1, D, H, W], align_corners=False)
-    idx = mask.nonzero(as_tuple=True)[0].to(device)
-    image[idx] = F.grid_sample(
-        image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
-
-    # label 用 nearest 保二值。
-    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
-
-    # wmap：nearest 保离散权重；bilinear 平滑连续权重。
-    if weight_map is not None:
-        weight_map[idx] = F.grid_sample(
-            weight_map[idx], grid, mode=wmap_mode,
-            padding_mode="border", align_corners=False)
-
     return image, label, weight_map
 
 
@@ -237,38 +167,6 @@ def _build_rotation_matrices(
     return torch.cat([m, t], dim=-1)  # (N,3,4)
 
 
-def _elastic_deform(
-    image: torch.Tensor, label: torch.Tensor,
-    prob: float, sigma: float, alpha: float,
-    weight_map: Optional[torch.Tensor] = None,
-    wmap_mode: str = "nearest",
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本 3D 弹性形变。sigma 控平滑度（常 4–9）；alpha 控位移幅度体素（常 3–12，
-    近似标称：粗网格 randn 上采平滑使方差 <1，实际典型位移小于 alpha）。"""
-    B, _, D, H, W = image.shape
-    device = image.device
-
-    mask = _bernoulli_mask(B, prob)
-    if not mask.any():
-        return image, label, weight_map
-
-    idx = mask.nonzero(as_tuple=True)[0].to(device)
-    n = idx.shape[0]
-
-    grid = _identity_grid(n, D, H, W, device) + _elastic_grid_disp(
-        n, D, H, W, sigma, alpha, device)
-
-    image[idx] = F.grid_sample(
-        image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
-    label[idx] = F.grid_sample(label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
-    if weight_map is not None:
-        weight_map[idx] = F.grid_sample(
-            weight_map[idx], grid, mode=wmap_mode,
-            padding_mode="border", align_corners=False)
-
-    return image, label, weight_map
-
-
 def _elastic_grid_disp(
     n: int, D: int, H: int, W: int,
     sigma: float, alpha: float, device: torch.device) -> torch.Tensor:
@@ -303,8 +201,14 @@ def _random_affine_elastic(
     两路选中掩码仍逐样本独立采样；对同时选中的样本，合成采样网格
     G(x) = Θ(x + d(x)) = affine_grid + M·d（M 为 Θ 的 3×3 线性部分），与
     “先 affine 后 elastic 两次重采样”的采样位置一致，但只插值一次：
-    省一轮 grid_sample，且避免双重插值叠加模糊。各参数语义同
-    ``_random_affine`` / ``_elastic_deform``。"""
+    省一轮 grid_sample，且避免双重插值叠加模糊。
+
+    仿射：欧拉旋转 + 各同性缩放 + 可选平移；rotate_range_per_axis 为 3 对
+    [lo,hi]（度），轴序 (x,y,z)=(W,H,D)，None 时三轴共用 rotate_range；
+    aspect_correct=True 时在 voxel-count 各向同性坐标里旋转（R←A⁻¹RA，
+    A=diag(W,H,D)），不代替真实 spacing 校正；translate_range 为归一化
+    坐标 [-1,1]。弹性：sigma 控平滑度（常 4–9），alpha 控位移幅度体素
+    （常 3–12，近似标称）。三路 grid_sample 均 padding_mode='border'。"""
     B, _, D, H, W = image.shape
     device = image.device
 
@@ -375,15 +279,6 @@ def _random_affine_elastic(
             padding_mode="border", align_corners=False)
 
     return image, label, weight_map
-
-
-def _identity_grid(
-    N: int, D: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-    """grid_sample(align_corners=False) 用的单位网格，范围 [-1+1/s, 1-1/s]。"""
-    vecs = [torch.linspace(-1 + 1/s, 1 - 1/s, s, device=device) for s in (D, H, W)]
-    grids = torch.meshgrid(*vecs, indexing="ij")  # (D, H, W) each
-    grid = torch.stack(grids[::-1], dim=-1)  # (D,H,W,3)；grid_sample 顺序 W,H,D
-    return grid.unsqueeze(0).expand(N, -1, -1, -1, -1)
 
 
 def _grid_dropout(

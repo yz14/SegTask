@@ -128,6 +128,20 @@ def run_inference(
     sd, label = _select_state_dict(ckpt, weight_variant)
     sd = _strip_compile_prefix(sd)
 
+    # 形状预校验：共有键形状不一致（典型：num_classes/label_values 与训练时
+    # 不同导致输出 head 尺寸变化）时给出明确错误，而非底层 size-mismatch 堆栈。
+    model_sd = model.state_dict()
+    shape_mismatch = [
+        f"{k}: ckpt{tuple(v.shape)} vs model{tuple(model_sd[k].shape)}"
+        for k, v in sd.items()
+        if k in model_sd and tuple(model_sd[k].shape) != tuple(v.shape)]
+    if shape_mismatch:
+        raise RuntimeError(
+            f"Checkpoint/model shape mismatch for {len(shape_mismatch)} "
+            f"key(s) (first 8): {shape_mismatch[:8]}. If the mismatch is in "
+            "seg/aux heads, cfg.data.label_values / num_classes likely "
+            "differ from the training config.")
+
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
         logger.warning("Missing keys when loading checkpoint: %s", missing)

@@ -354,7 +354,7 @@ config.py
                           # threshold / output_dir / save_probabilities
 ```
 
-- `Config.sync()`：把派生字段填齐——`num_classes ← len(label_values)`、`z_boundary_mode` 自动升级到 `edge_pad`、`resenc_preset` 展开成 `encoder_blocks_per_stage` / `decoder_blocks_per_stage`；**`spatial_dims` / `in_channels` 由 `models.topology.build_topology` 一次性算出再写回 `cfg.model`**（R5：单一真相源，避免与 `factory.build_model` 重复推导）。
+- `Config.sync()`：把派生字段填齐——`num_classes ← len(label_values)`、`z_boundary_mode` 自动升级到 `edge_pad`（`stretch` 已废弃，配置后警告并升级）、`resenc_preset` 展开成 `encoder_blocks_per_stage` / `decoder_blocks_per_stage`；**`spatial_dims` / `in_channels` 由 `models.topology.build_topology` 一次性算出再写回 `cfg.model`**（R5：单一真相源，避免与 `factory.build_model` 重复推导）。
 - `Config.validate()`：所有枚举字段全 `assert`；强制禁掉 `r2plus1d × 2.5D`、`lift_2_5d_to_3d × keep_native_view_depth` 等不合理组合。
 - `load_config(path)`：YAML → 嵌套 dict → `_dataclass_from_dict` 递归构造 → `sync()` + `validate()`。
 - `save_config(cfg, path)`：`asdict` → YAML 落盘到 `output_dir/resolved_config.yaml`。
@@ -391,7 +391,7 @@ segtask_v1/data/
   - `load_nifti(path, dtype)`：sitk 读 → numpy `(D, H, W)`。
   - `load_nifti_cropped(path, bbox, dtype)`：bbox-stream 读，不解码整卷（在 `bbox_dir` 模式省内存）。
 - *npz IO（mmap）*：`_open_npz / load_npz_image / load_npz_label / load_npz_region_weight / npz_has_rw / load_npz_fg_slices / load_npz_fg_coords / load_npz_label_for_split`。
-- *预处理*：`preprocess_image`（窗位 + minmax/zscore 归一化）、`preprocess_label`（整型标签 → per-fg-class 二值通道）、`load_region_weight_volume`（+1 shift）、`compute_region_weight_map`（按 `loss.region_weights` 静态生成）、`resize_3d`（image/label 区分插值阶数）。
+- *预处理*：`preprocess_image`（窗位 + minmax/zscore 归一化）、`preprocess_label`（整型标签 → per-fg-class 二值通道）、`load_region_weight_volume`（+1 shift）、`compute_region_weight_map`（按 `loss.region_weights` 静态生成，同为 +1 shift 语义）、`resize_3d`（image/label 区分插值阶数）。
 - *bbox*：`compute_bbox_from_volume / apply_bbox / precompute_bboxes`。
 - *Patch 抽取（z 边界安全）*：`extract_z_patch_padded`（沿 z 边缘 replicate）、`_extract_cubic_patch`（3D 立方 + zero-pad）。
 - *Volume LRU 缓存*：`VolumeCache(max_volumes)` —— 线程安全 OrderedDict，按 `cache_mode=memory` + `cache_max_volumes` 配置。
@@ -456,7 +456,7 @@ segtask_v1/models/
 
 **`stem.py`** —— 输入层 + 多 FOV 融合：
 
-- 单视图 stem（`build_stem`）：`conv3` / `conv7` / `dual`（nnU-Net）/ `patch2` / `patch4`（Swin / ConvNeXt 标准）。
+- 单视图 stem（`build_stem`）：`conv3` / `conv7` / `dual`（7×7 + 3×3 双层，nnU-Net 双卷积 stem 的大核首层变体）/ `patch2` / `patch4`（Swin / ConvNeXt 标准）。
 - 多视图融合（`build_context_stem(mode, fusion, n_views, ...)`）：
   - `shared_stem` —— 所有 `n_views·D` 通道一起进同一个 stem（最便宜）。
   - `multi_stem_proj` —— **Plan A**：`n_views` 个独立 stem → 通道拼接 → 1×1 fuse，推荐默认。

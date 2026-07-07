@@ -42,7 +42,11 @@ class ModelEMA:
     兼容单卡与 DDP：DDP 反传 all-reduce 后各 rank 参数一致，逐 rank 独立维护
     shadow 数学上等价于单卡。不兼容 FSDP（参数分片，state_dict key/形状不完整）。
     所有方法须传入裸模型（``torch.compile`` 包装前 / ``unwrap_compile`` 后），
-    否则 ``_orig_mod.`` 前缀会与 shadow key 不匹配。"""
+    否则 ``_orig_mod.`` 前缀会与 shadow key 不匹配。
+
+    注意：浮点 buffer（含 BatchNorm running_mean/var）也按同一 decay 平滑，
+    且无 SWA 式收尾 BN 重校准。默认架构用 instance/group norm（无 running
+    stats）不受影响；若引入 BN backbone，建议以 EMA 权重评估前重估 BN 统计。"""
 
     def __init__(self, model: nn.Module, decay: float = 0.999,
                  warmup: bool = True,

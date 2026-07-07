@@ -158,7 +158,8 @@ class DataConfig:
     cache_mode       : str = "memory"
     cache_max_volumes: int = 1
 
-    # z 轴边界填充（z_axis/2.5D）："stretch" 范围内拉伸；"edge_pad" 边缘复制后 resize（推荐）。
+    # z 轴边界填充（z_axis/2.5D）：恒为 "edge_pad"（边缘复制）。"stretch" 已废弃，
+    # sync() 会警告并自动升级为 edge_pad（训练侧从未实际使用 stretch 几何）。
     z_boundary_mode: str = "edge_pad"
 
     # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
@@ -216,6 +217,8 @@ class AugConfig:
     grid_dropout_holes: int = 4
 
     # --- 强度变换（仅 image） ---
+    # 注意：brightness/noise 的幅值为绝对量，隐含 image≈[0,1]（minmax 归一）。
+    # zscore（std=1）下同一数值的扰动相对偏弱且量纲不同，需自行按幅度改配。
     random_brightness_prob : float = 0.3
     random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
 
@@ -523,7 +526,9 @@ class LossConfig:
     # 逐类损失权重（空=均匀）；长度 = num_fg_classes。
     class_weights: List[float] = field(default_factory=list)
 
-    # 逐区域空间权重：按 label 取值一个权重（含 bg）。例：[1.0, 2.0, 2.0, 1.0, 1.0] → label 1/2 位置损失×2。空=禁用。
+    # 逐区域空间权重：按 label 取值一个权重（含 bg）。与 data.region_weight_dir 文件
+    # 同一语义：最终权重 = 配置值 + 1（配 0 → 权重 1，背景默认 1）。
+    # 例：[0.0, 1.0, 1.0, 0.0, 0.0] → label 1/2 位置损失×2，其余 ×1。空=禁用。
     region_weights: List[float] = field(default_factory=list)
 
     # Dice 参数。
@@ -543,6 +548,8 @@ class LossConfig:
     # 故默认取 nnU-Net 的 batch_dice=True。
     batch_dice: bool = True
     # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
+    # 边界：2.5D per_slice reduction 下每切片是独立样本，无 GT 切片的损失
+    # 被计为 0 后仍占均值分母（稀释总损失），而非被剔除。
     ignore_empty: bool = False
 
     # GDL 体积加权："square"（论文）| "simple"（w=1/Σt）| "uniform"（禁用）。
@@ -608,10 +615,12 @@ class TrainConfig:
     poly_power           : float = 0.9
     step_size            : int = 50
     step_gamma           : float = 0.1
-    plateau_patience     : int = 10
+    plateau_patience     : int = 10   # 单位为验证次数（非 epoch），见 early_stopping 注。
     plateau_factor       : float = 0.5
 
     # 梯度累积（有效 batch = batch_size * accum_steps）。
+    # 注意：比值型 batch 池化损失（batch_dice/GDL/Tversky 等）的统计窗口
+    # 仍是单个 micro-batch（=batch_size），不随 accum 扩大（单卡亦然）。
     grad_accum_steps: int = 1
 
     # 梯度裁剪。
@@ -713,7 +722,8 @@ class TrainConfig:
     # surface_dice 的 3D maxpool 可省一个量级计算与显存。默认关，行为与现状一致。
     val_metric_bbox_crop: bool = False
 
-    # 提前停止（0=禁用）。
+    # 提前停止（0=禁用）。单位是“验证次数”而非 epoch：val_every>1 时
+    # N 次无提升 ≈ N*val_every 个 epoch（plateau_patience 同理）。
     early_stopping: int = 0
 
     # 日志。
@@ -1064,6 +1074,18 @@ class Config:
         """
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
+
+        # z_boundary_mode='stretch' 已废弃：训练侧 dataset 恒走 edge-pad 几何
+        # （stretch 在训练抽取中无分支），而推理侧会生效，薄卷（D <
+        # patch 深度）时造成训练-推理几何不一致。统一自动升级为 edge_pad。
+        if self.data.z_boundary_mode == "stretch":
+            logger.warning(
+                "data.z_boundary_mode='stretch' is deprecated: training-side "
+                "extraction always uses edge-pad geometry, so stretch would "
+                "only take effect at inference and desync train/infer "
+                "geometry for volumes thinner than the patch depth. "
+                "Auto-upgraded to 'edge_pad'.")
+            self.data.z_boundary_mode = "edge_pad"
 
         # z_boundary_mode 自动升级（lazy multi-res 隐式要求 edge_pad）—— 此为
         # *data 侧* 副作用，不属 ModelTopology 范畴。
