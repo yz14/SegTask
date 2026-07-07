@@ -674,14 +674,14 @@ def test_diffusion_model_end_to_end():
 
 
 def test_diffusion_requires_adm_or_edm2():
-    from gentask.models.factory import build_model
+    from gentask.config.dataclasses import ConfigError
 
-    cfg = _cfg("diffusion", arch="unet")
+    # validate() 即拦截（早于 build_model），无需等到构建期才报错。
     try:
-        build_model(cfg)
-    except ValueError:
+        _cfg("diffusion", arch="unet")
+    except ConfigError:
         return
-    raise AssertionError("diffusion + arch='unet' 应当报错")
+    raise AssertionError("diffusion + arch='unet' 应当在 validate() 报错")
 
 
 # ---------------------------------------------------------------------------

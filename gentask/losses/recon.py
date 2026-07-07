@@ -161,11 +161,14 @@ def ssim(
 
 @torch.no_grad()
 def psnr(pred: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> float:
-    """峰值信噪比（dB），整 batch 均方误差版。"""
-    mse = F.mse_loss(pred.float(), target.float()).item()
-    if mse <= 1e-12:
-        return 99.0
-    return 10.0 * math.log10((data_range ** 2) / mse)
+    """峰值信噪比（dB）：逐样本 MSE→dB 再取均值（batch 维为第 0 维）。
+
+    逐图平均是 SR 文献的标准口径；整 batch 合并 MSE 会被难样本主导、
+    且随 batch 组成变化不可比。单样本 dB 上限 99（mse→0 时）。
+    """
+    mse = (pred.float() - target.float()).pow(2).flatten(1).mean(dim=1)
+    db = 10.0 * torch.log10((data_range ** 2) / mse.clamp_min(1e-12))
+    return float(db.clamp(max=99.0).mean().item())
 
 
 # ---------------------------------------------------------------------------

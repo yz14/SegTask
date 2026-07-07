@@ -11,7 +11,7 @@ R5 后：
 * ``Config.sync``         —— 调用 ``build_topology`` 写入 ``cfg.model`` 的私有 backing 字段；``cfg.model.{in_channels, spatial_dims}`` 对外是只读 property（不可写、不进 YAML）
 * ``Config.per_view_depths`` —— 委托 ``build_topology(self).per_view_depths``
 * ``models.factory.build_model`` —— 读 ``Topology`` 全字段，不再自行推导
-* ``trainer.pipelines.factory.build_pipeline`` —— 读 ``Topology`` 决策（不再自行 ``len(cfg.data.multi_res_scales)``）
+* ``models.generation.build_generation_model`` / ``GenerationTrainer`` —— 读 ``Topology`` 派生的 ``spatial_dims``（``trainer/pipelines`` 多视图消费管线尚未移植，落地后同样只读 ``Topology``）
 
 新增 patch_mode：仅需修改 ``build_topology`` 内的决策树。
 """

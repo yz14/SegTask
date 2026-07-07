@@ -211,8 +211,10 @@ def build_generation_model(cfg) -> nn.Module:
         raise ValueError(
             f"task.degradation must be 'superres'; got {task.degradation!r}")
 
-    spatial_dims = 2 if cfg.data.patch_mode == "2_5d" else 3
     topology = build_topology(cfg)
+    # 单一真相源：由 topology 派生（2.5D+lift_2_5d_to_3d 时为 3，退化/打包均按
+    # 真 3D 空间轴处理），不在此处重复推导。
+    spatial_dims = int(topology.spatial_dims)
     degradation = build_degradation(task, spatial_dims=spatial_dims)
     algo = str(task.algorithm).lower()
 

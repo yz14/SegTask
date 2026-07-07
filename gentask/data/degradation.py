@@ -3,7 +3,10 @@
 当前仅实现 **超分（super-resolution）** 退化：把干净的高分图（HR）下采样到
 ``1/scale`` 再上采样回原尺寸，得到与 HR 同尺寸的低分图（LR），作为模型输入；
 HR 本身作为重建目标（pre-upsampling SISR，类 SRCNN / VDSR 设定，输入输出同尺寸，
-可直接复用编解码同尺寸的 U-Net）。可选在 LR 上叠加高斯噪声模拟采集噪声。
+可直接复用编解码同尺寸的 U-Net）。下采样核（``sr_kernel``，默认 area ≈ 层内均值，
+对应部分容积效应）与上采样核（``sr_kernel_up``，默认 trilinear，对应临床重建后
+线性插值到目标层厚）分开配置。可选高斯噪声模拟采集噪声，噪声施加在 **LR 域**
+（下采样后、上采样前），与真实采集链路一致（噪声经插值后呈空间相关）。
 
 退化倍率支持 **各向同性**（标量 ``sr_scale`` 各轴同倍）或 **各向异性**
 （``sr_scale_per_axis`` 逐空间轴单独配置）。后者用于 CT 「厚层→薄层」：仅 z 轴是
@@ -46,10 +49,6 @@ def _interp_mode(sr_kernel: str, spatial_dims: int) -> str:
     return table[sr_kernel]
 
 
-# VFI（插帧）上采样用线性插值在保留帧之间补片。
-_LINEAR_MODES = {2: "bilinear", 3: "trilinear"}
-
-
 class SuperResDegradation:
     """超分退化：HR → LR（同尺寸，已上采样回原大小）。
 
@@ -58,11 +57,14 @@ class SuperResDegradation:
 
     ``sampling`` 选退化方式：
 
-    * ``"blur"``（SISR）：下采样到 ``1/scale`` 再上采样回原尺寸，造成同尺寸模糊。
+    * ``"blur"``（SISR）：下采样到 ``1/scale``（``kernel``，默认 area）再用
+      ``kernel_up``（默认 trilinear）上采样回原尺寸，造成同尺寸模糊。
       下采样尺寸由原尺寸除以倍率取整，上采样显式还原原尺寸避免 ±1 偏差。
     * ``"decimate"``（VFI 插帧）：沿退化轴按 ``scale`` 抽稀保留帧（``[::sc]``），再用
-      线性插值填回原尺寸（在保留帧之间插出中间片）。对应「取稀疏厚层切片、
-      模型补足中间薄层」的帧插值设定（线性插值作为天真 baseline，模型学残差）。
+      相位对齐的逐轴线性插值填回原尺寸：保留帧在 LR 中逐体素精确保留
+      （``lr[k*sc] == hr[k*sc]``），仅在保留帧之间插出中间片，末尾越界复制最后
+      一帧。对应「取稀疏厚层切片、模型补足中间薄层」的帧插值设定
+      （线性插值作为天真 baseline，模型学残差）。
     """
 
     def __init__(
@@ -70,6 +72,7 @@ class SuperResDegradation:
         scale: int,
         spatial_dims: int,
         kernel: str = "area",
+        kernel_up: str = "trilinear",
         noise_std: float = 0.0,
         axis_scales: Optional[Sequence[int]] = None,
         sampling: str = "blur"):
@@ -96,11 +99,11 @@ class SuperResDegradation:
         self.spatial_dims = int(spatial_dims)
         self.sampling = sampling
         self.mode = _interp_mode(kernel, spatial_dims)
+        self.mode_up = _interp_mode(kernel_up, spatial_dims)
         self.noise_std = float(noise_std)
         # area / nearest 不支持 align_corners；线性族传 False 保持几何一致。
         self._align = None if self.mode in ("area", "nearest") else False
-        # decimate 用线性上采样在保留帧间插值。
-        self._up_mode = _LINEAR_MODES[spatial_dims]
+        self._align_up = None if self.mode_up in ("area", "nearest") else False
         self._is_identity = all(s == 1 for s in axes)
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
@@ -109,34 +112,64 @@ class SuperResDegradation:
             return hr.clone()
 
         spatial = tuple(int(s) for s in hr.shape[-self.spatial_dims:])
-        if not self._is_identity:
-            if self.sampling == "decimate":
-                lr = self._decimate_interp(hr, spatial)
-            else:
-                low = [max(int(round(s / sc)), 1)
-                       for s, sc in zip(spatial, self.axis_scales)]
-                down = F.interpolate(
-                    hr, size=tuple(low), mode=self.mode, align_corners=self._align)
-                lr = F.interpolate(
-                    down, size=spatial, mode=self.mode, align_corners=self._align)
-        else:
+        if self._is_identity:
             lr = hr.clone()
+            if self.noise_std > 0.0:
+                lr = lr + torch.randn_like(lr) * self.noise_std
+            return lr
 
-        if self.noise_std > 0.0:
-            lr = lr + torch.randn_like(lr) * self.noise_std
-        return lr
+        if self.sampling == "decimate":
+            return self._decimate_interp(hr, spatial)
+
+        low = [max(int(round(s / sc)), 1)
+               for s, sc in zip(spatial, self.axis_scales)]
+        down = F.interpolate(
+            hr, size=tuple(low), mode=self.mode, align_corners=self._align)
+        if self.noise_std > 0.0:  # 噪声在 LR 域施加，再随插值上采。
+            down = down + torch.randn_like(down) * self.noise_std
+        return F.interpolate(
+            down, size=spatial, mode=self.mode_up, align_corners=self._align_up)
 
     def _decimate_interp(
         self, hr: torch.Tensor, spatial: Tuple[int, ...]) -> torch.Tensor:
-        """沿倍率>1 的轴抽稀保留帧，再线性插值填回原尺寸（VFI 输入）。"""
+        """沿倍率>1 的轴抽稀保留帧，再逐轴相位对齐线性插值填回原尺寸（VFI 输入）。
+
+        保留帧位于原始网格索引 ``0, sc, 2sc, ...``，输出在这些位置逐体素等于 HR
+        （无相位偏移）；末尾超出最后一个保留帧的位置复制最后一帧。多轴退化时
+        逐轴串行施加（线性插值可分离）。"""
         first = hr.ndim - self.spatial_dims
         idx = [slice(None)] * hr.ndim
         for i, sc in enumerate(self.axis_scales):
             if sc > 1:
                 idx[first + i] = slice(0, None, sc)
         kept = hr[tuple(idx)]
-        return F.interpolate(
-            kept, size=spatial, mode=self._up_mode, align_corners=False)
+        if self.noise_std > 0.0:  # 噪声施加在保留帧（LR 域）。
+            kept = kept + torch.randn_like(kept) * self.noise_std
+        lr = kept
+        for i, sc in enumerate(self.axis_scales):
+            if sc > 1:
+                lr = _phase_aligned_linear_upsample(
+                    lr, dim=first + i, scale=int(sc), out_size=int(spatial[i]))
+        return lr
+
+
+def _phase_aligned_linear_upsample(
+    x: torch.Tensor, dim: int, scale: int, out_size: int) -> torch.Tensor:
+    """沿 ``dim`` 把抽稀序列线性插值回 ``out_size``，保留帧相位精确对齐。
+
+    ``x`` 沿 ``dim`` 的第 ``k`` 个样本对应原始网格索引 ``k*scale``；输出索引 ``j``
+    由相邻保留帧 ``k=j//scale`` 与 ``k+1`` 线性混合，末尾 ``k+1`` 越界时钳位到
+    最后一帧（等价 edge 复制）。"""
+    n_kept = x.shape[dim]
+    j = torch.arange(out_size, device=x.device)
+    k = torch.div(j, scale, rounding_mode="floor").clamp(max=n_kept - 1)
+    k_next = (k + 1).clamp(max=n_kept - 1)
+    frac = ((j - k * scale).to(x.dtype) / scale)
+    a = x.index_select(dim, k)
+    b = x.index_select(dim, k_next)
+    shape = [1] * x.ndim
+    shape[dim] = out_size
+    return a + (b - a) * frac.view(shape)
 
 
 def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegradation:
@@ -153,6 +186,7 @@ def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegrad
         scale=int(cfg_task.sr_scale),
         spatial_dims=spatial_dims,
         kernel=str(cfg_task.sr_kernel).lower(),
+        kernel_up=str(cfg_task.sr_kernel_up).lower(),
         noise_std=float(cfg_task.sr_noise_std),
         axis_scales=per_axis if per_axis else None,
         sampling=str(cfg_task.sr_sampling).lower())

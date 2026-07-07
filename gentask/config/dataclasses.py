@@ -394,10 +394,15 @@ class TaskConfig:
     # 下采样倍率（各空间轴一致）。LR = down(HR, 1/scale) 再 up 回 HR 尺寸作输入。
     sr_scale: int = 2
     # 各向异性逐空间轴倍率（覆盖 sr_scale）；空=各向同性。
-    # 顺序按空间轴：3D 为 (D,H,W)，2.5D 为 (H,W)。CT 厚层→薄层用 [2,1,1] 只超分 z 轴。
+    # 顺序按空间轴（长度=model.spatial_dims）：3D / 2.5D+lift 为 (D,H,W)，
+    # 2.5D（未 lift）为 (H,W)。CT 厚层→薄层用 [2,1,1] 只超分 z 轴。
     sr_scale_per_axis: List[int] = field(default_factory=list)
-    # 制作 LR 的下/上采样插值："trilinear" | "area" | "nearest"。area≈抗锯齿平均池化。
+    # 制作 LR 的下采样插值："trilinear" | "area" | "nearest"。area≈抗锯齿平均池化
+    # （对应部分容积效应）。
     sr_kernel: str = "area"
+    # LR 上采样回原尺寸的插值："trilinear" | "area" | "nearest"。默认 trilinear
+    # （对应临床重建后线性插值到目标层厚；area 上采≈nearest，会产生块状 LR）。
+    sr_kernel_up: str = "trilinear"
     # 退化采样方式："blur"（SISR，降采样模糊）| "decimate"（VFI 插帧，抽稀帧+线性插值填补）。
     sr_sampling: str = "blur"
     # LR 上附加高斯噪声（模拟采集噪声）；0=禁用。

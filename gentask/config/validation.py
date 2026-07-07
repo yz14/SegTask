@@ -131,12 +131,18 @@ class Config:
         _require(
             str(t.sr_sampling).lower() in ("blur", "decimate"),
             f"Invalid task.sr_sampling: {t.sr_sampling!r}. Valid: 'blur' | 'decimate'.")
+        _require(
+            str(t.sr_kernel_up).lower() in ("trilinear", "area", "nearest"),
+            f"Invalid task.sr_kernel_up: {t.sr_kernel_up!r}. "
+            "Valid: 'trilinear' | 'area' | 'nearest'.")
         if t.sr_scale_per_axis:
-            sdims = 2 if str(self.data.patch_mode).lower() == "2_5d" else 3
+            # 退化在模型空间轴上施加：用 topology 派生的 model.spatial_dims
+            # （2.5D+lift 为 3），与 build_degradation 的调用方保持一致。
+            sdims = int(self.model.spatial_dims)
             _require(
                 len(t.sr_scale_per_axis) == sdims,
-                f"task.sr_scale_per_axis length must equal spatial_dims ({sdims}) "
-                f"for patch_mode={self.data.patch_mode!r}; got {t.sr_scale_per_axis}.")
+                f"task.sr_scale_per_axis length must equal model.spatial_dims "
+                f"({sdims}); got {t.sr_scale_per_axis}.")
             _require(
                 all(int(s) >= 1 for s in t.sr_scale_per_axis),
                 f"each task.sr_scale_per_axis entry must be >= 1; got {t.sr_scale_per_axis}.")
@@ -153,6 +159,15 @@ class Config:
             _require(t.ssim_window >= 3 and t.ssim_window % 2 == 1,
                      f"task.ssim_window must be odd and >= 3; got {t.ssim_window}.")
         else:  # diffusion
+            _require(
+                str(self.model.arch).lower() in ("adm", "edm2"),
+                "task.algorithm='diffusion' requires model.arch in "
+                "('adm','edm2') (paper-faithful \u03c3/timestep conditioning); "
+                f"got {self.model.arch!r}.")
+            _require(
+                not self.model.lift_2_5d_to_3d,
+                "task.algorithm='diffusion' is 2.5D-only (ADM/EDM2 nets are 2D); "
+                "incompatible with model.lift_2_5d_to_3d=True.")
             _require(
                 not self.model.deep_supervision,
                 "model.deep_supervision is only supported for generation "

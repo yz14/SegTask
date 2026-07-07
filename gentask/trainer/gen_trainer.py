@@ -53,18 +53,31 @@ class GenerationTrainer:
         tc = cfg.train
 
         self.is_diffusion = str(cfg.task.algorithm).lower() == "diffusion"
-        self.spatial_dims = 2 if cfg.data.patch_mode == "2_5d" else 3
+        # 单一真相源：topology 派生量（sync() 写入），2.5D+lift 时为 3。
+        self.spatial_dims = int(cfg.model.spatial_dims)
+        # 验证指标的像素动态范围与损失侧一致：minmax≈[0,1]，zscore≈±1。
+        self._minmax = str(cfg.data.normalize).lower() == "minmax"
+        self.val_data_range = 1.0 if self._minmax else 2.0
         if self.is_diffusion:
             self.loss_fn: nn.Module = DiffusionLoss()
         else:
             self.loss_fn = build_recon_loss(cfg)
 
         self.optimizer = build_optimizer(self.model, cfg)
+        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
+        # scheduler.step() 每个优化器步触发一次，horizon 按优化器步计（而非
+        # 批次数），否则 grad_accum_steps>1 时 warmup/退火时长被放大 accum 倍。
         steps_per_epoch = max(len(train_loader), 1)
-        warmup_steps = tc.warmup_epochs * steps_per_epoch
-        total_steps = tc.epochs * steps_per_epoch
+        updates_per_epoch = max(math.ceil(steps_per_epoch / self.grad_accum_steps), 1)
+        warmup_steps = tc.warmup_epochs * updates_per_epoch
+        if tc.scheduler == "one_cycle" and warmup_steps > 0:
+            # OneCycleLR 自带 warmup（pct_start），不叠加外层线性 warmup。
+            logger.info("scheduler='one_cycle' has built-in warmup; "
+                        "outer linear warmup disabled.")
+            warmup_steps = 0
+        total_steps = tc.epochs * updates_per_epoch
         base_scheduler = build_scheduler(
-            self.optimizer, cfg, steps_per_epoch,
+            self.optimizer, cfg, updates_per_epoch,
             post_warmup_steps=total_steps - warmup_steps)
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
@@ -79,7 +92,6 @@ class GenerationTrainer:
             "cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
 
         self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
-        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
 
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +100,33 @@ class GenerationTrainer:
         self.best_epoch = 0
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _check_supported_data_options(cfg: Config) -> None:
+        """拒绝 dataset 会发出但本训练器尚无法消费的数据配置（fit 入口检查）。
+
+        SuperResDataset 总是发单 max-FOV 过采样 z-cube，预期由 trainer 中心
+        裁剪/拆视图；该管线（trainer/pipelines）尚待移植，直接喂模型会产生
+        错误几何；实现前显式报错而非静默错训。
+        """
+        problems = []
+        if len(cfg.data.multi_res_scales) > 1:
+            problems.append(
+                f"multi_res_scales={cfg.data.multi_res_scales} (multi-FOV "
+                "oversized cubes need a crop/split pipeline)")
+        if float(cfg.data.aug_oversample_ratio) != 1.0:
+            problems.append(
+                f"aug_oversample_ratio={cfg.data.aug_oversample_ratio} "
+                "(augment + center-crop pipeline not implemented)")
+        if cfg.data.keep_native_view_depth or cfg.data.keep_native_multi_res:
+            problems.append(
+                "keep_native_view_depth / keep_native_multi_res "
+                "(multi-view consumption pipeline missing)")
+        if problems:
+            raise NotImplementedError(
+                "GenerationTrainer does not yet support: "
+                + "; ".join(problems)
+                + ". Use multi_res_scales=[1.0], aug_oversample_ratio=1.0.")
+
     def _hr_batch(self, batch) -> torch.Tensor:
         """取干净高分图（忽略分割标签）。"""
         return batch["image"].to(self.device, non_blocking=True).float()
@@ -236,11 +275,16 @@ class GenerationTrainer:
                 cond = self._cond_batch(batch)
                 bare = unwrap_compile(self.model)
                 lr = bare.degrade(hr)
-                rec = bare.restore(lr, cond=cond).clamp(0.0, 1.0)
-                psnr_m.update(float(psnr(rec, hr)), hr.shape[0])
+                rec = bare.restore(lr, cond=cond)
+                if self._minmax:  # zscore 无固定值域，不钳位。
+                    rec = rec.clamp(0.0, 1.0)
+                    lr = lr.clamp(0.0, 1.0)
+                dr = self.val_data_range
+                psnr_m.update(float(psnr(rec, hr, data_range=dr)), hr.shape[0])
                 ssim_m.update(
-                    float(ssim(rec, hr, self.spatial_dims)), hr.shape[0])
-                base_m.update(float(psnr(lr.clamp(0, 1), hr)), hr.shape[0])
+                    float(ssim(rec, hr, self.spatial_dims, data_range=dr)),
+                    hr.shape[0])
+                base_m.update(float(psnr(lr, hr, data_range=dr)), hr.shape[0])
         finally:
             if self.ema is not None:
                 self.ema.restore(self.model)
@@ -262,6 +306,7 @@ class GenerationTrainer:
                     self.best_metric, epoch + 1)
 
     def fit(self) -> Dict[str, float]:
+        self._check_supported_data_options(self.cfg)
         last: Dict[str, float] = {}
         for epoch in range(self.cfg.train.epochs):
             tr = self._train_epoch(epoch)
