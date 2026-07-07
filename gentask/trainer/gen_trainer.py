@@ -23,11 +23,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..config import Config
+from ..data.augment import GPUAugmentor
 from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
 from ..utils import AverageMeter, ModelEMA
 from .amp import GradScaler, resolve_auto_amp_dtype
 from .checkpoint import unwrap_compile
 from .optim import WarmupScheduler, build_optimizer, build_scheduler
+from .pipelines import build_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,13 @@ class GenerationTrainer:
             self.loss_fn: nn.Module = DiffusionLoss()
         else:
             self.loss_fn = build_recon_loss(cfg)
+
+        # batch 几何准备管线（过采样余量裁剪 / 多视图拆分打包）与 GPU 增强。
+        self.pipeline = build_pipeline(cfg)
+        scales = cfg.data.multi_res_scales or [1.0]
+        self.augmentor = (GPUAugmentor(cfg.augment,
+                                       max_scale=float(max(scales)))
+                          if cfg.augment.enabled else None)
 
         self.optimizer = build_optimizer(self.model, cfg)
         self.grad_accum_steps = max(tc.grad_accum_steps, 1)
@@ -102,30 +111,17 @@ class GenerationTrainer:
     # ------------------------------------------------------------------
     @staticmethod
     def _check_supported_data_options(cfg: Config) -> None:
-        """拒绝 dataset 会发出但本训练器尚无法消费的数据配置（fit 入口检查）。
+        """拒绝本训练器尚无法消费的数据配置（fit 入口检查）。
 
-        SuperResDataset 总是发单 max-FOV 过采样 z-cube，预期由 trainer 中心
-        裁剪/拆视图；该管线（trainer/pipelines）尚待移植，直接喂模型会产生
-        错误几何；实现前显式报错而非静默错训。
+        多视图 / 过采样已由 trainer/pipelines 消费；仅剩扩散算法的多视图
+        （DiffusionModel 无多视图目标对齐逻辑）显式报错而非静默错训。
         """
-        problems = []
-        if len(cfg.data.multi_res_scales) > 1:
-            problems.append(
-                f"multi_res_scales={cfg.data.multi_res_scales} (multi-FOV "
-                "oversized cubes need a crop/split pipeline)")
-        if float(cfg.data.aug_oversample_ratio) != 1.0:
-            problems.append(
-                f"aug_oversample_ratio={cfg.data.aug_oversample_ratio} "
-                "(augment + center-crop pipeline not implemented)")
-        if cfg.data.keep_native_view_depth or cfg.data.keep_native_multi_res:
-            problems.append(
-                "keep_native_view_depth / keep_native_multi_res "
-                "(multi-view consumption pipeline missing)")
-        if problems:
+        if (str(cfg.task.algorithm).lower() == "diffusion"
+                and len(cfg.data.multi_res_scales) > 1):
             raise NotImplementedError(
-                "GenerationTrainer does not yet support: "
-                + "; ".join(problems)
-                + ". Use multi_res_scales=[1.0], aug_oversample_ratio=1.0.")
+                "DiffusionModel does not support multi-view inputs "
+                f"(multi_res_scales={cfg.data.multi_res_scales}); use "
+                "multi_res_scales=[1.0] or task.algorithm='regression'.")
 
     def _hr_batch(self, batch) -> torch.Tensor:
         """取干净高分图（忽略分割标签）。"""
@@ -236,6 +232,12 @@ class GenerationTrainer:
             hr = self._hr_batch(batch)
             cond = self._cond_batch(batch)
             weight_map = batch.get("weight_map")
+            if weight_map is not None:
+                weight_map = weight_map.to(self.device, non_blocking=True).float()
+            if self.augmentor is not None:
+                hr, weight_map, cond = self.augmentor(hr, weight_map, cond)
+            hr, weight_map, cond = self.pipeline.prepare_batch(
+                hr, weight_map, cond)
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.use_amp, dtype=self.amp_dtype):
                 out = self.model(hr, cond=cond)
@@ -273,18 +275,21 @@ class GenerationTrainer:
             for batch in self.val_loader:
                 hr = self._hr_batch(batch)
                 cond = self._cond_batch(batch)
+                hr, _, cond = self.pipeline.prepare_batch(hr, None, cond)
                 bare = unwrap_compile(self.model)
                 lr = bare.degrade(hr)
                 rec = bare.restore(lr, cond=cond)
+                # 多视图时模型只复原主视图；hr / lr 裁对齐到 rec 通道布局。
+                rec, hr_m, lr_m = self.pipeline.metric_views(rec, hr, lr)
                 if self._minmax:  # zscore 无固定值域，不钳位。
                     rec = rec.clamp(0.0, 1.0)
-                    lr = lr.clamp(0.0, 1.0)
+                    lr_m = lr_m.clamp(0.0, 1.0)
                 dr = self.val_data_range
-                psnr_m.update(float(psnr(rec, hr, data_range=dr)), hr.shape[0])
+                psnr_m.update(float(psnr(rec, hr_m, data_range=dr)), hr_m.shape[0])
                 ssim_m.update(
-                    float(ssim(rec, hr, self.spatial_dims, data_range=dr)),
-                    hr.shape[0])
-                base_m.update(float(psnr(lr, hr, data_range=dr)), hr.shape[0])
+                    float(ssim(rec, hr_m, self.spatial_dims, data_range=dr)),
+                    hr_m.shape[0])
+                base_m.update(float(psnr(lr_m, hr_m, data_range=dr)), hr_m.shape[0])
         finally:
             if self.ema is not None:
                 self.ema.restore(self.model)

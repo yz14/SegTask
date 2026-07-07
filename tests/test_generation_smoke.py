@@ -802,6 +802,136 @@ def test_generation_trainer_runs():
 
 
 # ---------------------------------------------------------------------------
+# R2 多视图消费管线 + GPU 增强（trainer/pipelines, data/augment）
+# ---------------------------------------------------------------------------
+def _dataset_loader(shape, n=1):
+    """dataset 布局 batch：单条 max-FOV 过采样 cube (B, 1, eD, eH, eW)。"""
+    return [{"image": torch.rand(*shape),
+             "label": torch.zeros(*shape)} for _ in range(n)]
+
+
+def _fit_once(cfg, loader):
+    from gentask.models.factory import build_model
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_amp = False
+    model = build_model(cfg)
+    tr = GenerationTrainer(model, cfg, loader, loader, torch.device("cpu"))
+    res = tr.fit()
+    assert np.isfinite(res["best_psnr"])
+    return res
+
+
+def test_pipeline_multi_view_2_5d_stacked_fit():
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.sync()
+    cfg.validate()
+    # dataset 发 (B, 1, eD_max=round(4*2.0)=8, 16, 16)。
+    _fit_once(cfg, _dataset_loader((2, 1, 8, 16, 16)))
+
+
+def test_pipeline_multi_view_lift_fit():
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.model.lift_2_5d_to_3d = True
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.sync()
+    cfg.validate()
+    assert cfg.model.spatial_dims == 3
+    _fit_once(cfg, _dataset_loader((2, 1, 8, 16, 16)))
+
+
+def test_pipeline_native_view_depth_fit():
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.data.keep_native_view_depth = True
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.sync()
+    cfg.validate()
+    # per_view_depths=[4,8] → in_ch=12；dataset 发 (B,1,8,16,16)。
+    _fit_once(cfg, _dataset_loader((2, 1, 8, 16, 16)))
+
+
+def test_pipeline_zaxis_multi_view_oversample_fit():
+    cfg = _cfg("regression", mode="z_axis")
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.data.aug_oversample_ratio = 1.5
+    cfg.data.z_boundary_mode = "edge_pad"
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.sync()
+    cfg.validate()
+    # eD = round(8*1.5)=12, eD_max = round(12*2)=24 → (B,1,24,16,16)。
+    _fit_once(cfg, _dataset_loader((2, 1, 24, 16, 16)))
+
+
+def test_pipeline_vanilla_oversample_crop():
+    cfg = _cfg("regression", mode="z_axis")
+    cfg.data.aug_oversample_ratio = 1.5
+    cfg.train.output_dir = tempfile.mkdtemp()
+    cfg.sync()
+    cfg.validate()
+    # 单视图过采样：eD = round(8*1.5)=12 → pipeline 中心裁回 8。
+    _fit_once(cfg, _dataset_loader((2, 1, 12, 16, 16)))
+
+
+def test_pipeline_prepare_batch_shapes():
+    from gentask.trainer.pipelines import build_pipeline
+
+    cfg = _cfg("regression", mode="2_5d")
+    cfg.data.multi_res_scales = [1.0, 2.0]
+    cfg.sync()
+    pipe = build_pipeline(cfg)
+    img = torch.rand(2, 1, 8, 16, 16)
+    wmap = torch.rand(2, 1, 8, 16, 16)
+    out, w, _ = pipe.prepare_batch(img, wmap, None)
+    assert out.shape == (2, 2, 4, 16, 16), out.shape
+    assert w.shape == (2, 1, 4, 16, 16), w.shape
+    # rank-4 预打包输入透传（合成测试 batch 兼容）。
+    packed = torch.rand(2, 8, 16, 16)
+    out2, _, _ = pipe.prepare_batch(packed, None, None)
+    assert out2 is packed
+
+
+def test_gpu_augmentor_shapes_and_sync():
+    from gentask.config import AugConfig
+    from gentask.data.augment import GPUAugmentor
+
+    aug_cfg = AugConfig(random_flip_prob=1.0, random_affine_prob=1.0,
+                        elastic_deform_prob=1.0, random_brightness_prob=1.0,
+                        random_contrast_prob=1.0, random_gamma_prob=1.0,
+                        gaussian_noise_prob=1.0, gaussian_blur_prob=1.0,
+                        simulate_lowres_prob=1.0, grid_dropout_prob=1.0)
+    aug = GPUAugmentor(aug_cfg, max_scale=2.0)
+    img = torch.rand(2, 1, 8, 16, 16)
+    wmap = torch.ones(2, 1, 8, 16, 16)
+    cond = torch.rand(2, 2, 8, 16, 16)
+    out, w, c = aug(img, wmap, cond)
+    assert out.shape == img.shape
+    assert w.shape == wmap.shape
+    assert c.shape == cond.shape
+    assert torch.isfinite(out).all() and torch.isfinite(c).all()
+    # intensity_clamp：增强后不超增强前逐样本值域。
+    assert out.max() <= img.max() + 1e-5 and out.min() >= img.min() - 1e-5
+    # rank-4 输入（2.5D 预打包）自动升维再还原。
+    out4, _, _ = aug(torch.rand(2, 8, 16, 16))
+    assert out4.shape == (2, 8, 16, 16)
+
+
+def test_augmentor_disabled_passthrough():
+    from gentask.config import AugConfig
+    from gentask.data.augment import GPUAugmentor
+
+    aug = GPUAugmentor(AugConfig(enabled=False))
+    img = torch.rand(2, 1, 8, 16, 16)
+    out, w, c = aug(img)
+    assert out is img and w is None and c is None
+
+
+# ---------------------------------------------------------------------------
 # 推理
 # ---------------------------------------------------------------------------
 def test_generation_predictor_restore_volume():

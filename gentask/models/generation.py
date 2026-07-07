@@ -43,7 +43,8 @@ class RegressionModel(nn.Module):
         residual: bool = False,
         spatial_dims: int = 2,
         view_depths: Optional[Sequence[int]] = None,
-        aux_views_active: bool = False):
+        aux_views_active: bool = False,
+        main_channels: Optional[int] = None):
         super().__init__()
         self.net = net
         self.degradation = degradation
@@ -51,6 +52,10 @@ class RegressionModel(nn.Module):
         self.spatial_dims = int(spatial_dims)
         self.view_depths = tuple(int(v) for v in view_depths) if view_depths else ()
         self.aux_views_active = bool(aux_views_active)
+        # 3D 多视图（lift_2_5d_to_3d 多分辨率）：输入通道 = n_views，但网络只重建
+        # 主视图；main_channels 指定主视图领头通道数，residual 基线与 target 均取
+        # 前 main_channels 通道。None = 无通道裁剪（预测与输入同通道）。
+        self.main_channels = int(main_channels) if main_channels else None
 
     def _is_multi_view_2_5d(self) -> bool:
         return self.spatial_dims == 2 and len(self.view_depths) > 1
@@ -86,6 +91,8 @@ class RegressionModel(nn.Module):
                 f"match view_depths={self.view_depths}.") from exc
 
     def _main_view(self, x: torch.Tensor) -> torch.Tensor:
+        if self.main_channels is not None and x.shape[1] > self.main_channels:
+            return x[:, : self.main_channels]
         return self._view_splits(x)[0]
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
@@ -128,9 +135,12 @@ class RegressionModel(nn.Module):
         return self._heads(lr, base_lr=base_lr)[0][0]
 
     def _target_views(self, hr: torch.Tensor) -> List[torch.Tensor]:
-        if not self._is_multi_view_2_5d():
-            return [self._pack_2_5d(hr)]
-        return self._view_splits(hr)
+        if self._is_multi_view_2_5d():
+            return self._view_splits(hr)
+        hr = self._pack_2_5d(hr)
+        if self.main_channels is not None and hr.shape[1] > self.main_channels:
+            return [hr[:, : self.main_channels]]
+        return [hr]
 
     def forward(self, hr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         hr = self._pack_2_5d(hr)
@@ -226,13 +236,20 @@ def build_generation_model(cfg) -> nn.Module:
                 view_depths = [topology.slab_depth] * topology.n_views
         else:
             view_depths = None
+        # lift 多视图：输入 (B, n_views, D, H, W) 但预测仅主视图（out_channels
+        # 通道）；residual / target 需裁到前 main_channels 通道对齐。
+        main_channels = None
+        if (topology.patch_mode == "2_5d" and topology.lift_2_5d_to_3d
+                and topology.n_views > 1):
+            main_channels = int(task.out_channels)
         net = build_backbone(cfg)  # 复用图到图 backbone（输出通道按 out_channels）
         return RegressionModel(net, degradation, residual=bool(task.residual),
                                spatial_dims=spatial_dims,
                                view_depths=view_depths,
                                aux_views_active=(topology.aux_seg_active
                                                  and topology.patch_mode == "2_5d"
-                                                 and not topology.lift_2_5d_to_3d))
+                                                 and not topology.lift_2_5d_to_3d),
+                               main_channels=main_channels)
 
     if algo == "diffusion":
         arch = str(cfg.model.arch).lower()

@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Union
 
 from .dataclasses import (
-    ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
+    AugConfig, ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
     TaskConfig, TrainConfig, _require,
 )
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Config:
@@ -21,6 +24,7 @@ class Config:
     train  : TrainConfig   = field(default_factory=TrainConfig)
     predict: PredictConfig = field(default_factory=PredictConfig)
     task   : TaskConfig    = field(default_factory=TaskConfig)
+    augment: AugConfig     = field(default_factory=AugConfig)
 
     def sync(self) -> None:
         """同步跨子配置的对应字段。
@@ -103,6 +107,7 @@ class Config:
         self._validate_train()
         self._validate_predict()
         self._validate_task()
+        self._validate_augment()
         if not self.is_generation and self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)
@@ -436,9 +441,11 @@ class Config:
                 _require(
                     depths[0] == self.data.patch_size[0],
                     f"per_view_depths[0] must equal patch_size[0]={self.data.patch_size[0]}; got {depths[0]}.")
+                from ..models.topology import build_topology
                 _require(
-                    self.model.in_ch_per_view_list is not None,
-                    "keep_native_view_depth=True requires in_ch_per_view_list to be set by sync().")
+                    build_topology(self).in_ch_per_view_list is not None,
+                    "keep_native_view_depth=True requires in_ch_per_view_list "
+                    "(derived by build_topology).")
             if self.model.aux_seg_supervision:
                 _require(
                     n_views > 1,
@@ -449,6 +456,64 @@ class Config:
                         n_views < n_levels,
                         f"aux_seg_supervision + hierarchical requires n_views < n_levels; "
                         f"got n_views={n_views}, n_levels={n_levels}.")
+
+    def _validate_augment(self) -> None:
+        """augment.* 校验：概率界、区间合法性、插值模式与翻转轴。"""
+        a = self.augment
+        probs = {
+            "random_flip_prob": a.random_flip_prob,
+            "random_affine_prob": a.random_affine_prob,
+            "elastic_deform_prob": a.elastic_deform_prob,
+            "grid_dropout_prob": a.grid_dropout_prob,
+            "random_brightness_prob": a.random_brightness_prob,
+            "random_contrast_prob": a.random_contrast_prob,
+            "random_gamma_prob": a.random_gamma_prob,
+            "gaussian_noise_prob": a.gaussian_noise_prob,
+            "gaussian_blur_prob": a.gaussian_blur_prob,
+            "simulate_lowres_prob": a.simulate_lowres_prob,
+        }
+        for name, p in probs.items():
+            _require(0.0 <= float(p) <= 1.0,
+                     f"augment.{name} must be in [0,1]; got {p}.")
+        ranges = {
+            "random_rotate_range": a.random_rotate_range,
+            "random_scale_range": a.random_scale_range,
+            "random_translate_range": a.random_translate_range,
+            "random_brightness_range": a.random_brightness_range,
+            "random_contrast_range": a.random_contrast_range,
+            "random_gamma_range": a.random_gamma_range,
+            "gaussian_blur_sigma": a.gaussian_blur_sigma,
+            "simulate_lowres_zoom": a.simulate_lowres_zoom,
+        }
+        for name, r in ranges.items():
+            _require(
+                len(r) == 2 and float(r[0]) <= float(r[1]),
+                f"augment.{name} must be [lo, hi] with lo <= hi; got {r}.")
+        if a.random_rotate_range_per_axis is not None:
+            _require(
+                len(a.random_rotate_range_per_axis) == 3
+                and all(len(rr) == 2 and float(rr[0]) <= float(rr[1])
+                        for rr in a.random_rotate_range_per_axis),
+                "augment.random_rotate_range_per_axis must be 3 pairs of "
+                f"[lo, hi]; got {a.random_rotate_range_per_axis}.")
+        _require(
+            a.wmap_interp_mode in ("nearest", "bilinear"),
+            f"Invalid augment.wmap_interp_mode: {a.wmap_interp_mode!r}; "
+            "expected 'nearest' or 'bilinear'.")
+        _require(
+            all(int(ax) in (2, 3, 4) for ax in a.random_flip_axes),
+            f"augment.random_flip_axes entries must be in (2,3,4) "
+            f"(axes of (B,C,D,H,W)); got {a.random_flip_axes}.")
+        _require(a.elastic_deform_sigma > 0.0,
+                 "augment.elastic_deform_sigma must be > 0.")
+        _require(a.elastic_deform_alpha >= 0.0,
+                 "augment.elastic_deform_alpha must be >= 0.")
+        _require(0.0 <= a.grid_dropout_ratio <= 1.0,
+                 "augment.grid_dropout_ratio must be in [0,1].")
+        _require(a.grid_dropout_holes >= 1,
+                 "augment.grid_dropout_holes must be >= 1.")
+        _require(a.gaussian_noise_std >= 0.0,
+                 "augment.gaussian_noise_std must be >= 0.")
 
     def _validate_train(self) -> None:
         """train.* 优化器/调度器校验。"""

@@ -440,5 +440,77 @@ class TaskConfig:
 
 
 # ---------------------------------------------------------------------------
+# Augmentation configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class AugConfig:
+    """GPU 数据增强（生成任务变体：无 label，作用于 image + cond + weight_map）。
+
+    与 segtask 同名字段保持一致以便配置迁移；默认取"生成安全"的保守参数：
+    空间变换保留（image/cond 同步 warp，重建目标 = 增强后的 image 自身，
+    空间一致性不受影响）；破坏 HR 目标保真度的强度增强（noise / blur /
+    lowres / dropout）默认关闭，仅保留温和的亮度 / 对比度 / gamma。
+    """
+
+    enabled: bool = True
+
+    # --- 空间变换（image + cond + weight_map 同步） ---
+    random_flip_prob: float = 0.2
+    random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
+
+    # Affine：小角旋转 + 缩放 + 平移合成单一仿射；与 elastic 融合为单次 grid_sample。
+    random_affine_prob : float = 0.3
+    random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
+    # 缩放作用在采样网格上（反向语义）：>1 采样窗外扩→物体在输出中变小。
+    random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
+    # 逐轴旋转角范围（(x,y,z)=(W,H,D) 三对 [lo,hi]，度）。None=三轴共用 random_rotate_range。
+    random_rotate_range_per_axis: Optional[List[List[float]]] = None
+    # 各向异性长宽比校正：在 voxel-count 各向同性坐标里旋转（R←A⁻¹RA）。
+    random_affine_aspect_correct: bool = True
+    # 随机平移范围（affine_grid 归一化坐标）；[0,0]=禁用。
+    random_translate_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
+
+    # 弹性形变（B-spline 随机位移场）。
+    elastic_deform_prob : float = 0.2
+    elastic_deform_sigma: float = 5.0
+    elastic_deform_alpha: float = 7.0
+
+    # Grid dropout：随机遮挡矩形子区域。生成任务默认关闭（洞会进入重建目标）。
+    grid_dropout_prob : float = 0.0
+    grid_dropout_ratio: float = 0.3
+    grid_dropout_holes: int = 4
+
+    # --- 强度变换（仅 image；cond 是独立模态、有自己的归一化，不动） ---
+    random_brightness_prob : float = 0.15
+    random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
+
+    random_contrast_prob : float = 0.15
+    random_contrast_range: List[float] = field(default_factory=lambda: [0.9, 1.1])
+
+    random_gamma_prob : float = 0.1
+    random_gamma_range: List[float] = field(default_factory=lambda: [0.9, 1.1])
+
+    # 以下强度退化增强破坏 HR 目标保真度（超分目标 = 增强后 image 自身），
+    # 生成任务默认关闭；如确有需要可显式开启。
+    gaussian_noise_prob: float = 0.0
+    gaussian_noise_std : float = 0.05
+
+    gaussian_blur_prob : float = 0.0
+    gaussian_blur_sigma: List[float] = field(default_factory=lambda: [0.5, 1.5])
+
+    simulate_lowres_prob: float = 0.0
+    simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
+
+    # 强度增强后按增强前逐样本逐通道 min/max 夹取（nnU-Net 惯例）。
+    intensity_clamp: bool = True
+
+    # weight_map 插值模式："nearest" 保持离散权重；"bilinear" 仅适连续场。
+    wmap_interp_mode: str = "nearest"
+
+    # 就地增强快路径：True 时跳过入口 clone（调用方须保证输入张量可被消费）。
+    inplace: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Top-level configuration
 # ---------------------------------------------------------------------------

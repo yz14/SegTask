@@ -10,7 +10,7 @@ from typing import Any, Dict, Union
 import yaml
 
 from .dataclasses import (
-    ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
+    AugConfig, ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
     TaskConfig, TrainConfig, _require,
 )
 from .validation import Config
@@ -27,6 +27,7 @@ _SUB_CONFIGS = {
     "train": TrainConfig,
     "predict": PredictConfig,
     "task": TaskConfig,
+    "augment": AugConfig,
 }
 
 
