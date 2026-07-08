@@ -73,34 +73,45 @@ data:
 augment:
   enabled                     : true            # 总开关
   inplace                     : false           # 就地增强快路径：跳过入口 clone，省一份 batch 体积瞬时显存
+  intensity_clamp             : true            # 是否裁 HU
+  wmap_interp_mode            : "nearest"       # 'nearest' | 'bilinear'
+
   random_flip_prob            : 0.2             # 随机翻转概率
   random_flip_axes            : [2, 3, 4]       # D,H,W；D-flip 仅训练阶段
+
   random_affine_prob          : 0.3             # 仿射概率
   random_rotate_range         : [-15.0, 15.0]   # degrees
   random_scale_range          : [0.85, 1.15]    # 缩放范围
   random_rotate_range_per_axis: null            # 仅需要按轴不同角度时启用
   random_affine_aspect_correct: true            # 是否做纵横比校正
   random_translate_range      : [-0.1, 0.1]     # 平移比例
+
   elastic_deform_prob         : 0.0             # 弹性变形概率
   elastic_deform_sigma        : 5.0             # 平滑度
   elastic_deform_alpha        : 1.0             # 幅度（体素）
+
   grid_dropout_prob           : 0.0             # 网格 dropout 概率
   grid_dropout_ratio          : 0.3             # 挖空比例
   grid_dropout_holes          : 4               # 挖空块数
+
   random_brightness_prob      : 0.3             # 亮度扰动概率
   random_brightness_range     : [-0.1, 0.1]     # 加性
+
   random_contrast_prob        : 0.3             # 对比度扰动概率
   random_contrast_range       : [0.8, 1.2]      # 乘性
+
   random_gamma_prob           : 0.2             # gamma 扰动概率
   random_gamma_range          : [0.8, 1.2]
+
   gaussian_noise_prob         : 0.2             # 高斯噪声概率
   gaussian_noise_std          : 0.09            # 噪声标准差
+
   gaussian_blur_prob          : 0.1             # 高斯模糊概率
   gaussian_blur_sigma         : [0.5, 1.5]      # 模糊 sigma
+
   simulate_lowres_prob        : 0.1             # 低分辨率模拟概率
   simulate_lowres_zoom        : [0.5, 1.0]      # 缩放范围
-  intensity_clamp             : true            # 是否裁 HU
-  wmap_interp_mode            : "nearest"       # 'nearest' | 'bilinear'
+
 
 model:
   arch                    : "unet"                    # 'unet' | 'adm' | 'edm2'
@@ -152,8 +163,8 @@ model:
   # mednext_dilated_reparam_kernel_sizes: []
   # mednext_dilated_reparam_dilations: []
 
-  # ---- 多感受野（空洞卷积多分支融合）MultiRF 示例 ----
-  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合，axes=hw 只在 H/W 膨胀。
+  # ---- 多感受野（空洞卷积多分支融合）MultiRF ----
+  # 只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合，axes=hw 只在 H/W 膨胀。
   multirf_enabled        : true              # 是否启用多感受野
   multirf_dilations      : [1, 2, 3]         # 必须含 1（守门支路）
   multirf_mode           : "split"           # 'split' | 'parallel'
@@ -220,13 +231,13 @@ loss:
 train:
   epochs                       : 2                # 训练轮数
   gpus                         : [0]              # 要用的物理卡号列表；len(gpus)>1 时才进入 DDP
-  ddp_find_unused_parameters   : true             # 仅 len(gpus)>1
-  ddp_static_graph             : false            # 仅 len(gpus)>1；计算图逐步固定时可开，免每步 unused-parameter 遍历（建议配 find_unused_parameters=false）
-  ddp_gradient_as_bucket_view  : false            # 仅 len(gpus)>1；grad 直接作为通信 bucket 的 view，省约 1× 梯度显存（数学等价）
+  ddp_find_unused_parameters   : false            # 仅 len(gpus)>1
+  ddp_static_graph             : true             # 仅 len(gpus)>1；计算图逐步固定时可开，免每步 unused-parameter 遍历（建议配 find_unused_parameters=false）
+  ddp_gradient_as_bucket_view  : true             # 仅 len(gpus)>1；grad 直接作为通信 bucket 的 view，省约 1× 梯度显存（数学等价）
   ddp_master_port              : 0                # 仅 len(gpus)>1
   ddp_scale_dataloader_per_rank: true             # 仅 len(gpus)>1
   ddp_timeout_minutes          : 30               # 仅 len(gpus)>1
-  zero_redundancy_optimizer    : false            # 仅 len(gpus)>1；ZeRO-1 优化器状态分片（数值严格等价），单卡忽略并告警
+  zero_redundancy_optimizer    : true             # 仅 len(gpus)>1；ZeRO-1 优化器状态分片（数值严格等价），单卡忽略并告警
   val_every                    : 1                # 每隔多少 epoch 做验证
   optimizer                    : "adamw"          # 'adam' | 'adamw' | 'sgd'
   adamw_fused                  : true             # CUDA 下用 fused AdamW，单 kernel 更新全部参数
@@ -264,7 +275,7 @@ train:
   output_dir                   : "outputs/base"
   save_every                   : 10               # 每隔多少 epoch 保存一次
   save_keep_last               : 3                # 保留最近多少个 checkpoint
-  save_async                   : false            # 异步 checkpoint 保存（后台线程写盘，不阻塞训练；多占一份 CPU 内存快照）
+  save_async                   : true             # 异步 checkpoint 保存（后台线程写盘，不阻塞训练；多占一份 CPU 内存快照）
   save_best_criterion          : "dice"           # 'loss' | 'dice' | 'iou' | 'mcc' | 'min_dice' | 'dice+surface_dice' | 'balanced'；save_best_metric/mode 由此派生
   surface_dice_tolerance       : 1                # 仅 criterion ∈ {dice+surface_dice, balanced}
   surface_dice_weight          : 0.5              # 仅 criterion='dice+surface_dice'
