@@ -257,7 +257,7 @@ train:
 
   # ---- DDP 多卡 ----
   ddp_find_unused_parameters   : false            # 仅 DDP；每步扫描未参与反传的参数（多头/深监督保正确）；确认全参与时关掉可提速
-  ddp_static_graph             : true             # 仅 DDP；声明计算图固定，免每步 unused-parameter 遍历并启用图级优化；建议配 find_unused_parameters=false
+  ddp_static_graph             : false            # 仅 DDP；声明计算图固定，免每步 unused-parameter 遍历并启用图级优化；建议配 find_unused_parameters=false
   ddp_gradient_as_bucket_view  : true             # 仅 DDP；grad 直接作为通信 bucket 的 view，省约 1× 梯度显存（数学等价）
   ddp_master_port              : 0                # 仅 DDP；rendezvous 端口；0=自动挑空闲端口（混用机防冲突）
   ddp_scale_dataloader_per_rank: true             # 仅 DDP；每卡 num_workers 平摊为 1/world_size，全机总 worker 数/缓存 RAM 与单卡一致
@@ -293,7 +293,7 @@ train:
   # ---- 混合精度 / 编译 / 显存 ----
   use_amp                      : true             # 混合精度训练（省显存提速；损失恒 fp32 计算）
   amp_dtype                    : "auto"           # 仅 use_amp=true；低精度类型；'auto'=Ampere+ 自动选 bf16 否则 fp16 | 'bfloat16'/'bf16'=免 GradScaler | 'float16'/'fp16'=需 GradScaler
-  compile_mode                 : "default"        # torch.compile 编译级别；'none'=不编译 | 'default' | 'reduce-overhead' | 'max-autotune'
+  compile_mode                 : "none"           # torch.compile 编译级别；'none'=不编译 | 'default' | 'reduce-overhead' | 'max-autotune'
   channels_last                : false            # 训练用 channels_last 内存排布（数值等价，Ampere+ 卷积可能提速，需 benchmark）
   cuda_expandable_segments     : false            # CUDA allocator 用 expandable segments，缓解形状多变场景的显存碎片（PyTorch 2.1+，旧驱动自动回退）
   val_empty_cache              : null             # 整卷验证前后 empty_cache 归还缓存块、防滑窗大累加器碎片 OOM；null=自动（high 开/medium 关） | true | false
