@@ -22,6 +22,20 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def _to_channels_last(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
+    """``predict.channels_last=True`` 时把输入批转为 channels-last 排布（数值
+    等价）：rank-5 → ``channels_last_3d``，rank-4 → ``channels_last``，与模型权重
+    的排布（Predictor.__init__ 转换）匹配，避免 cuDNN 逐层隐式重排。开关关闭
+    时原样透传。"""
+    if not p.channels_last:
+        return x
+    if x.ndim == 5:
+        return x.contiguous(memory_format=torch.channels_last_3d)
+    if x.ndim == 4:
+        return x.contiguous(memory_format=torch.channels_last)
+    return x
+
+
 # ---------------------------------------------------------------------------
 # 2.5D input reshape  (folded layout: rank-5 → rank-4)
 # ---------------------------------------------------------------------------
@@ -87,7 +101,7 @@ def _flip_tta_batched(p: "Predictor", x: torch.Tensor,
     for start in range(0, len(flip_specs), chunk):
         specs = flip_specs[start:start + chunk]
         x_cat = torch.cat([torch.flip(x, fx) for fx, _ in specs], dim=0)
-        pred = p.model(x_cat.to(p.model_dtype))
+        pred = p.model(_to_channels_last(p, x_cat.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
         prob_cat = post_fn(pred)                  # (B*g, num_fg, ...)
@@ -210,7 +224,7 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
                     f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
             with autocast(device_type="cuda", enabled=p.use_amp,
                           dtype=p.amp_dtype):
-                pred = p.model(x.to(p.model_dtype))
+                pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
                 if isinstance(pred, list):
                     pred = pred[0]
                 if pred.shape[1] < p.num_fg:
@@ -237,7 +251,7 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
         D = p.patch_D
         with autocast(device_type="cuda", enabled=p.use_amp,
                       dtype=p.amp_dtype):
-            pred = p.model(x_2d.to(p.model_dtype))
+            pred = p.model(_to_channels_last(p, x_2d.to(p.model_dtype)))
             if isinstance(pred, list):
                 pred = pred[0]
             expected_c = p.num_fg * D
@@ -256,7 +270,7 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
     # 3D
     with autocast(device_type="cuda", enabled=p.use_amp,
                   dtype=p.amp_dtype):
-        pred = p.model(x.to(p.model_dtype))
+        pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
         assert pred.shape[1] >= p.num_fg, (
@@ -281,7 +295,7 @@ def forward_batch_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
         return forward_batch_2_5d_numpy(p, x)
 
     with autocast(device_type="cuda", enabled=p.use_amp, dtype=p.amp_dtype):
-        pred = p.model(x.to(p.model_dtype))
+        pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
         assert pred.shape[1] >= p.num_fg, (
@@ -303,7 +317,7 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
                 f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
         with autocast(device_type="cuda", enabled=p.use_amp,
                       dtype=p.amp_dtype):
-            pred = p.model(x.to(p.model_dtype))
+            pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
             if isinstance(pred, list):
                 pred = pred[0]
             if pred.shape[1] < p.num_fg:
@@ -321,7 +335,7 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
     x_2d = reshape_2_5d_input(p, x)                # (B, C_res*D, H, W)
     D = p.patch_D
     with autocast(device_type="cuda", enabled=p.use_amp, dtype=p.amp_dtype):
-        pred = p.model(x_2d.to(p.model_dtype))
+        pred = p.model(_to_channels_last(p, x_2d.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
         expected_c = p.num_fg * D

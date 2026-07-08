@@ -227,10 +227,17 @@ class Trainer:
                 self.model,
                 find_unused_parameters=bool(tc.ddp_find_unused_parameters),
                 gradient_as_bucket_view=bool(tc.ddp_gradient_as_bucket_view),
+                static_graph=bool(tc.ddp_static_graph),
                 **ddp_kwargs)
+            if tc.ddp_static_graph and tc.ddp_find_unused_parameters:
+                logger.warning(
+                    "ddp_static_graph=True 与 ddp_find_unused_parameters=True "
+                    "同时开启：static_graph 首步后会接管 unused-parameter 处理，"
+                    "建议将 ddp_find_unused_parameters 设为 False 以免首步额外开销。")
             logger.info(
                 "DDP enabled: rank=%d/%d, device=%s, "
-                "find_unused_parameters=%s, gradient_as_bucket_view=%s. "
+                "find_unused_parameters=%s, gradient_as_bucket_view=%s, "
+                "static_graph=%s. "
                 "Training grads all-reduce per backward. Note: math-equivalence "
                 "to single-GPU under grad-accum holds for per-sample separable "
                 "losses (BCE/Focal/per-sample Dice); batch-pooled ratio losses "
@@ -239,7 +246,8 @@ class Trainer:
                 "(approximate, not strictly equivalent).",
                 self._rank, self._world_size, device,
                 tc.ddp_find_unused_parameters,
-                tc.ddp_gradient_as_bucket_view)
+                tc.ddp_gradient_as_bucket_view,
+                tc.ddp_static_graph)
         else:
             self.fwd_model = self.model
 
@@ -841,7 +849,14 @@ class Trainer:
                     self.scaler.unscale_(self.optimizer)
                     gn = nn.utils.clip_grad_norm_(
                         self.model.parameters(), tc.grad_clip_norm)
-                    grad_norm_val = float(gn)
+                    # 懒同步（grad_norm_lazy_sync）：fp16+GradScaler 且健康监控
+                    # 关闭时，该范数无任何消费者（非有限守护由 scaler 完成），
+                    # 跳过 float(gn) 的 D2H 同步；裁剪本身已照常执行。
+                    if (tc.grad_norm_lazy_sync and self._scaler_active
+                            and not self._health_monitor):
+                        grad_norm_val = None
+                    else:
+                        grad_norm_val = float(gn)
                 elif not self._scaler_active:
                     grad_norm_val = self._global_grad_norm()
                 elif self._health_monitor and self._health_grad_norm_when_no_clip:

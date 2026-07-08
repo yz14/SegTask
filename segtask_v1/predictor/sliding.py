@@ -108,8 +108,23 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     patch_metas: List[Tuple[int, int, int]] = []   # (z0, z1, actual_d)
 
     n_windows = len(z_positions)
+    n_skipped = 0
     for idx, (z0, z1) in enumerate(z_positions):
         actual_d = z1 - z0
+        is_last = idx == n_windows - 1
+        # 跳过纯背景窗：归一化后窗内最大值 <= 阈值 → 不前向、不累加（该
+        # 区域概率保持 0 = 背景）。在 CPU numpy 上判据，不引入 GPU 同步。
+        if (p.skip_empty_windows
+                and float(vol[z0:z1].max()) <= p.skip_empty_threshold):
+            n_skipped += 1
+            if is_last and window_inputs:
+                batch = torch.stack(window_inputs, dim=0).float()
+                probs = _forwards.forward_batch_gpu(p, batch)
+                _blend_z_batch(p, probs, patch_metas, acc_pred, acc_weight,
+                               z_weight_t, pD, pH, pW, H_orig, W_orig)
+                window_inputs.clear()
+                patch_metas.clear()
+            continue
         if p.keep_native_view_depth:
             # 2.5D ON: rank-3 (sum(D_k), pH, pW)。
             window_inputs.append(
@@ -142,7 +157,6 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 torch.from_numpy(wi_np).to(p.device, non_blocking=True))
         patch_metas.append((z0, z1, actual_d))
 
-        is_last = idx == n_windows - 1
         if len(window_inputs) >= p.batch_size or is_last:
             # 默认路径：wi_np rank-4 (C_res,pD,pH,pW) → batch rank-5
             # (B,C_res,pD,pH,pW)；keep_native_view_depth 路径：wi_np rank-3
@@ -151,51 +165,8 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             batch = torch.stack(window_inputs, dim=0).float()
             # (B, num_fg, pD, pH, pW) on GPU
             probs = _forwards.forward_batch_gpu(p, batch)
-
-            # 按 actual_d 分组 → 合并为一次 F.interpolate。常见场景 ad==pD，仅一次上采样。
-            groups: Dict[int, List[int]] = {}
-            for i, (_, _, ad) in enumerate(patch_metas):
-                groups.setdefault(ad, []).append(i)
-
-            # fp16 累加器时先降精度再插值：后续 resize 瞬态（b×num_fg×ad×H×W）
-            # 减半；插值本身在 fp16 下完成，与先 fp32 插值后 cast 的差异在
-            # 量化噪声量级内（随 acc_dtype=fp16 的 opt-in 一并生效）。
-            if p.acc_dtype == torch.float16 and probs.is_cuda:
-                probs = probs.to(dtype=p.acc_dtype)
-
-            for ad, idxs in groups.items():
-                sub = probs[idxs]                     # (b, num_fg, pD, pH, pW)
-
-                # 倒 resize 回原几何：edge_pad+ad<pD 时仅取中心 ad 切片不插值 z（H/W 可 resize）；
-                # 其余走一次性 trilinear resize 到 (ad, H_orig, W_orig)。
-                if p.z_boundary_mode == "edge_pad" and ad < pD:
-                    pad_before = (pD - ad) // 2
-                    sub = sub[:, :, pad_before:pad_before + ad, :, :]
-                    if (H_orig != pH) or (W_orig != pW):
-                        sub = F.interpolate(
-                            sub, size=(ad, H_orig, W_orig),
-                            mode="trilinear", align_corners=False)
-                elif (ad != pD) or (H_orig != pH) or (W_orig != pW):
-                    sub = F.interpolate(
-                        sub, size=(ad, H_orig, W_orig),
-                        mode="trilinear", align_corners=False)
-                # 逐 ad 对称 blending 权重（与累加器同 dtype/device）。
-                if ad == pD:
-                    w = z_weight_t
-                else:
-                    w = torch.from_numpy(
-                        _blending.build_1d_weight(ad, p.blend_mode)).to(
-                            device=p.acc_device, dtype=p.acc_dtype)
-                w_4d = rearrange(w, 'c -> 1 c 1 1')
-
-                # 一次性转到累加器 dtype/device（CPU 逃生门时为 GPU→CPU 拷贝）。
-                sub = sub.to(device=p.acc_device, dtype=p.acc_dtype)
-                for j, i in enumerate(idxs):
-                    zs, ze, _ = patch_metas[i]
-                    # in-place fused mul-add。
-                    acc_pred[:, zs:ze, :, :].addcmul_(
-                        sub[j], w_4d, value=1.0)
-                    acc_weight[:, zs:ze, :, :].add_(w_4d)
+            _blend_z_batch(p, probs, patch_metas, acc_pred, acc_weight,
+                           z_weight_t, pD, pH, pW, H_orig, W_orig)
 
             window_inputs.clear()
             patch_metas.clear()
@@ -204,7 +175,66 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     (idx + 1) % max(1, 10 * p.batch_size) == 0 or is_last):
                 logger.info("  z-window %d/%d", idx + 1, n_windows)
 
+    if n_skipped and p.log_progress:
+        logger.info(
+            "  skip_empty_windows: skipped %d/%d pure-background z-windows "
+            "(window max <= %.4g).", n_skipped, n_windows,
+            p.skip_empty_threshold)
     return _finalize_accumulators(acc_pred, acc_weight)
+
+
+def _blend_z_batch(p: "Predictor", probs: torch.Tensor,
+                   patch_metas: List[Tuple[int, int, int]],
+                   acc_pred: torch.Tensor, acc_weight: torch.Tensor,
+                   z_weight_t: torch.Tensor,
+                   pD: int, pH: int, pW: int,
+                   H_orig: int, W_orig: int) -> None:
+    """z 路径一个 batch 的概率 → 倒 resize 回原几何 + blending 累加（从
+    ``sliding_window_z`` 主循环提取，逻辑逐行不变）。"""
+    # 按 actual_d 分组 → 合并为一次 F.interpolate。常见场景 ad==pD，仅一次上采样。
+    groups: Dict[int, List[int]] = {}
+    for i, (_, _, ad) in enumerate(patch_metas):
+        groups.setdefault(ad, []).append(i)
+
+    # fp16 累加器时先降精度再插值：后续 resize 瞬态（b×num_fg×ad×H×W）
+    # 减半；插值本身在 fp16 下完成，与先 fp32 插值后 cast 的差异在
+    # 量化噪声量级内（随 acc_dtype=fp16 的 opt-in 一并生效）。
+    if p.acc_dtype == torch.float16 and probs.is_cuda:
+        probs = probs.to(dtype=p.acc_dtype)
+
+    for ad, idxs in groups.items():
+        sub = probs[idxs]                     # (b, num_fg, pD, pH, pW)
+
+        # 倒 resize 回原几何：edge_pad+ad<pD 时仅取中心 ad 切片不插值 z（H/W 可 resize）；
+        # 其余走一次性 trilinear resize 到 (ad, H_orig, W_orig)。
+        if p.z_boundary_mode == "edge_pad" and ad < pD:
+            pad_before = (pD - ad) // 2
+            sub = sub[:, :, pad_before:pad_before + ad, :, :]
+            if (H_orig != pH) or (W_orig != pW):
+                sub = F.interpolate(
+                    sub, size=(ad, H_orig, W_orig),
+                    mode="trilinear", align_corners=False)
+        elif (ad != pD) or (H_orig != pH) or (W_orig != pW):
+            sub = F.interpolate(
+                sub, size=(ad, H_orig, W_orig),
+                mode="trilinear", align_corners=False)
+        # 逐 ad 对称 blending 权重（与累加器同 dtype/device）。
+        if ad == pD:
+            w = z_weight_t
+        else:
+            w = torch.from_numpy(
+                _blending.build_1d_weight(ad, p.blend_mode)).to(
+                    device=p.acc_device, dtype=p.acc_dtype)
+        w_4d = rearrange(w, 'c -> 1 c 1 1')
+
+        # 一次性转到累加器 dtype/device（CPU 逃生门时为 GPU→CPU 拷贝）。
+        sub = sub.to(device=p.acc_device, dtype=p.acc_dtype)
+        for j, i in enumerate(idxs):
+            zs, ze, _ = patch_metas[i]
+            # in-place fused mul-add。
+            acc_pred[:, zs:ze, :, :].addcmul_(
+                sub[j], w_4d, value=1.0)
+            acc_weight[:, zs:ze, :, :].add_(w_4d)
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +352,7 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     coords: List[Tuple[int, int, int, int, int, int, int, int, int]] = []
     centers: List[Tuple[int, int, int]] = []
     processed = 0
+    n_skipped = 0
 
     def _flush() -> None:
         nonlocal processed
@@ -367,6 +398,13 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 patch = vol[d0:d1, h0:h1, w0:w1]
                 ad, ah, aw = patch.shape
 
+                # 跳过纯背景窗：归一化后窗内最大值 <= 阈值 → 不前向、不累加
+                # （该区域概率保持 0 = 背景）。CPU numpy 判据，无 GPU 同步。
+                if (p.skip_empty_windows
+                        and float(patch.max()) <= p.skip_empty_threshold):
+                    n_skipped += 1
+                    continue
+
                 # 填短尾窗口到 (pD,pH,pW)：居中 edge-pad（默认复制边界，归一化后
                 # 0 不是空气），与训练侧 _extract_cubic_patch / keep_native
                 # builder 的居中几何一致。
@@ -395,6 +433,11 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
 
     _flush()
 
+    if n_skipped and p.log_progress:
+        logger.info(
+            "  skip_empty_windows: skipped %d/%d pure-background cubic "
+            "windows (window max <= %.4g).", n_skipped, total_windows,
+            p.skip_empty_threshold)
     return _finalize_accumulators(acc_pred, acc_weight)
 
 

@@ -625,6 +625,12 @@ class TrainConfig:
 
     # 梯度裁剪。
     grad_clip_norm: float = 12.0
+    # 梯度裁剪范数的懒同步：clip_grad_norm_ 返回的范数是 GPU 标量，默认每个
+    # 优化步 float(gn) 会强制一次 D2H 同步。开启后，仅在“fp16+GradScaler 且
+    # 健康监控关闭”（该值无任何消费者：非有限守护由 scaler 自行完成）时跳过
+    # 同步；裁剪本身照常执行，bf16/fp32 路径（范数参与非有限守护）与健康
+    # 监控开启时行为完全不变。数值等价。默认关（保持现状）。
+    grad_norm_lazy_sync: bool = False
 
     # AMP。amp_dtype 示例："float16"（需 GradScaler）、"bfloat16"（Ampere+，无需 scaler）。还有 "auto"（探测 BF16 否则回退 fp16）。
     use_amp  : bool = True
@@ -781,6 +787,12 @@ class TrainConfig:
     # bucket 与 grad 的双份存储，DDP 下省约 1× 梯度显存（fp32 参数量级）。PyTorch
     # 官方支持，与 no_sync/梯度累积兼容。默认关（保持现状）。
     ddp_gradient_as_bucket_view: bool = False
+    # DDP static_graph：告知 PyTorch 计算图逐步固定（参与反传的参数集合不变），
+    # 免除每步的 unused-parameter 全图遍历，并启用通信/计算重叠等图级优化；
+    # 与激活检查点的组合也更稳。建议与 ddp_find_unused_parameters=False 搭配。
+    # 若模型存在逐步变化的控制流（某些参数时而参与时而不参与反传）则不可开。
+    # 默认关（保持现状）。
+    ddp_static_graph: bool = False
     # ZeRO-1 优化器状态分片（torch.distributed.optim.ZeroRedundancyOptimizer）：
     # DDP 下把 AdamW 的 2× 参数 fp32 状态均分到 world_size 张卡，每卡省
     # 2×参数×4B×(1−1/N)；step 后各 rank broadcast 自己分片的参数（数值与普通
@@ -945,6 +957,32 @@ class PredictConfig:
     # seed_everything 已默认开启，仅独立推理入口缺此设置）。默认关，行为与现状
     # 一致；开启后首卷首个 batch 有一次性 autotune 开销。
     cudnn_benchmark: bool = False
+
+    # 推理前向用 torch.inference_mode() 替代 torch.no_grad()：在免记梯度之上
+    # 进一步免除 autograd 的 version-counter/view 追踪簿记，纯速度收益、
+    # 数值完全等价。AdaBN per_volume 的 BN 重估阶段自动回退 no_grad（避免
+    # 对 BN buffer 原地更新的兼容性风险）。默认关（保持现状）。
+    use_inference_mode: bool = False
+
+    # 滑窗跳过纯背景窗口（z_axis / 2_5d / cubic 路径）：取窗前先看该窗在
+    # **归一化后**体素上的最大值，若 <= skip_empty_threshold 则不前向、不累加
+    # （该区域概率保持 0 = 背景）。CT + minmax 归一化下，<= intensity_min 的
+    # 空气体素被钳到 0，默认阈值 0.0 即“整窗全为钳底空气”才跳过，判据保守；
+    # 其它归一化（z-score 等）需自行按归一化后的空气值调阈。注意与不跳过相比
+    # 并非逐位等价：被跳过窗覆盖的重叠区不再被该窗的预测稀释（等效于空窗预测
+    # 恒为背景 0）——对训练好的模型，空气窗预测本应 ≈0，实际差异可忽略。
+    # whole 模式无滑窗，不受影响。默认关（保持现状）。
+    skip_empty_windows: bool = False
+    # 跳窗判据：窗内（归一化后）最大值 <= 此值才跳过。仅 skip_empty_windows
+    # 开启时生效。
+    skip_empty_threshold: float = 0.0
+
+    # 推理侧 channels_last 内存排布（与 TrainConfig.channels_last 同义，作用于
+    # 推理模型与输入窗口）：数值等价，Ampere+ 上 conv 可能提速（需 benchmark
+    # 验证正收益）。注：训练内整卷验证与训练共享同一模型对象，开启后排布
+    # 转换会持续到训练侧（仍数值等价）；训练侧同样需求请用 train.channels_last。
+    # 默认关（保持现状）。
+    channels_last: bool = False
 
     # 预测输出目录。
     output_dir: str = "predictions"

@@ -7,6 +7,7 @@ ckpt 加载（兼容 torch.compile / EMA / best-model EMA-primary）。
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -66,6 +67,23 @@ class Predictor:
                           else torch.float32)
         self.acc_device = (torch.device("cpu") if pc.accumulate_on_cpu
                            else device)
+        # 推理前向用 inference_mode 替代 no_grad（数值等价，免 version-counter
+        # 簿记）；AdaBN per_volume 估计期自动回退 no_grad，见 _forward_grad_ctx。
+        self.use_inference_mode = bool(pc.use_inference_mode)
+        # 滑窗跳过纯背景窗（归一化后窗内最大值 <= 阈值 → 不前向、概率保持 0）。
+        self.skip_empty_windows = bool(pc.skip_empty_windows)
+        self.skip_empty_threshold = float(pc.skip_empty_threshold)
+        # 推理侧 channels_last：数值等价的内存排布转换（仅 CUDA 有意义）。
+        # 模型权重此处转换；输入窗口在 forwards._to_channels_last 逐 batch 转换。
+        self.channels_last = bool(pc.channels_last) and device.type == "cuda"
+        if self.channels_last:
+            fmt = (torch.channels_last_3d
+                   if int(cfg.model.spatial_dims) == 3
+                   else torch.channels_last)
+            self.model = self.model.to(memory_format=fmt)
+            logger.info(
+                "Predictor channels_last=True: model converted to %s "
+                "(numerically equivalent memory-format change).", fmt)
         # GPU 常驻整卷张量的存储 dtype（fp16 = 整卷显存减半；builder 取窗时按窗
         # 升回 fp32，见 config.PredictConfig.vol_dtype）。
         self.vol_dtype = (torch.float16 if str(pc.vol_dtype) == "fp16"
@@ -462,16 +480,30 @@ class Predictor:
         ``z_spacing`` 仅 2.5D z-交错需要；为 ``None`` 时即便 ``z_interleave_enabled``
         也回退到标准 z 轴滑窗（npz 缓存无物理 spacing 的场景）。
         """
-        if self.patch_mode == "whole":
-            return _sliding.whole_volume_forward(self, vol)
-        if self.patch_mode == "cubic":
-            return _sliding.sliding_window_cubic(self, vol)
-        if self.z_interleave_enabled and z_spacing is not None:
-            # 2.5D z-交错；k≤1 时会退化为标准 sliding_window_z。
-            return _sliding.sliding_window_z_interleaved(
-                self, vol, float(z_spacing))
-        # z_axis / 2_5d 几何同，forward 侧区别。
-        return _sliding.sliding_window_z(self, vol)
+        with self._forward_grad_ctx():
+            if self.patch_mode == "whole":
+                return _sliding.whole_volume_forward(self, vol)
+            if self.patch_mode == "cubic":
+                return _sliding.sliding_window_cubic(self, vol)
+            if self.z_interleave_enabled and z_spacing is not None:
+                # 2.5D z-交错；k≤1 时会退化为标准 sliding_window_z。
+                return _sliding.sliding_window_z_interleaved(
+                    self, vol, float(z_spacing))
+            # z_axis / 2_5d 几何同，forward 侧区别。
+            return _sliding.sliding_window_z(self, vol)
+
+    def _forward_grad_ctx(self):
+        """推理前向的免梯度上下文：``use_inference_mode=True`` 时用
+        ``torch.inference_mode()``（在外层 ``no_grad`` 基础上再免除 autograd
+        簿记，数值等价）；否则为空上下文（沿用装饰器的 ``no_grad``，行为不变）。
+
+        AdaBN per_volume 估计期（``self._adabn_estimating``）固定回退空上下文：
+        该阶段 BN 处于 train 模式、需原地更新 running-stats buffer，避开
+        inference_mode 对原地更新的限制。
+        """
+        if self.use_inference_mode and not self._adabn_estimating:
+            return torch.inference_mode()
+        return contextlib.nullcontext()
 
     # ==================================================================
     # NIfTI I/O
