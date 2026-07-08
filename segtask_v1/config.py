@@ -58,37 +58,80 @@ def resolve_selfattn_stage(entry, default_type: str):
 # ---------------------------------------------------------------------------
 @dataclass
 class DataConfig:
-    """Data paths and preprocessing."""
+    """Data paths and preprocessing.
 
-    image_dir: str = ""
-    label_dir: str = ""
+    字段分组与 configs/seg*.yaml 一一对应：
+    后缀 → 路径/数据源 → 标签 → patch 抽取 → 强度归一化 → 划分 → DataLoader → 采样 → 缓存。
+    """
+
+    # ---- 文件后缀 ----
     # 后缀：单值或候选列表（取首个存在）。例：".nii.gz" 或 [".nii.gz", "-seg.nii.gz"]。
     image_suffix: Union[str, List[str]] = ".nii.gz"
     label_suffix: Union[str, List[str]] = ".nii.gz"
-
-    # 可选 ROI bbox 掩码目录；设置后按 bbox 裁剪。空=禁用。
-    bbox_dir   : str = ""
     bbox_suffix: Union[str, List[str]] = ".nii.gz"
-
-    # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > loss.region_weights。
-    region_weight_dir   : str = ""
     region_weight_suffix: Union[str, List[str]] = ".nii.gz"
-
-    # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
-    npz_dir   : str = ""
     npz_suffix: str = ".npz"
+
+    # ---- 路径 / 数据源 ----
+    image_dir: str = ""
+    label_dir: str = ""
+    # 可选 ROI bbox 掩码目录；设置后按 bbox 裁剪。空=禁用。
+    bbox_dir: str = ""
+    # 可选逐样本区域权重目录（值 +1）。优先级：此目录 > loss.region_weights。
+    region_weight_dir: str = ""
+    # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
+    npz_dir: str = ""
 
     # 第二批（粗标）预生成 npz 包目录。空=单批金标准（现有行为）。
     # 非空时与第一批（金标准）按 mix_ratio 在每个 train batch 内混合；
     # 副源仅用于训练，验证集始终仅取金标准。
     npz_dir_secondary: str = ""
-
+    # True=启动时自动调用 make_data 生成；False=要求手动预生成。
+    npz_auto_build: bool = True
     # 每个 train batch 内 [金标准, 粗标] 的整数权重比；仅 npz_dir_secondary 非空时生效。
     # 要求 batch_size 能被 sum(mix_ratio) 整除、两元素均 >= 1（保证每 batch 同时含两源）。
     mix_ratio: List[int] = field(default_factory=lambda: [1, 1])
 
-    # True=启动时自动调用 make_data 生成；False=要求手动预生成。
-    npz_auto_build: bool = True
+    # ---- 标签 ----
+    # 标签取值集（0=背景）。空=从数据自动探测。
+    label_values: List[int] = field(default_factory=list)
+    num_classes: int = 0  # 由 label_values 自动设置
+
+    # ---- Patch 抽取 ----
+    # 3D patch 尺寸 [D, H, W]。
+    patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
+
+    # Patch 抽取模式。示例："z_axis"（仅 z 滑块，H/W 全尺寸）、"2_5d"（D 折叠为通道驱动 2D UNet）。
+    # 其他："cubic" 3 轴中心抽取；"whole" 整体 resize。
+    patch_mode: str = "z_axis"
+
+    # 多分辨率 FOV：各 scale 同中心抽更宽 FOV，resize 后作额外输入通道。
+    # 示例：[1.0] 单通道；[1.0, 1.5, 2.0] 3 通道。cubic 作用 3 轴，z_axis 仅 z 轴。
+    multi_res_scales: List[float] = field(default_factory=lambda: [1.0])
+
+    # 增强过采样比：先抽 round(patch_size*ratio)，增强后中心裁回。1.0=禁用；affine/elastic 建议 1.4–1.5。
+    aug_oversample_ratio: float = 1.0
+
+    # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
+    # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
+    keep_native_view_depth: bool = False
+
+    # 3D 多 FOV 懒加载单 cube（z_axis/cubic）。True：dataset 发单 cube，trainer 逐视图裁剪/重采样。
+    # 约束：scales[0]==1.0；与 keep_native_view_depth 互斥；z_axis 强制 edge_pad。
+    keep_native_multi_res: bool = False
+
+    # z 轴边界填充（z_axis/2.5D）：恒为 "edge_pad"（边缘复制）。"stretch" 已废弃，
+    # sync() 会警告并自动升级为 edge_pad（训练侧从未实际使用 stretch 几何）。
+    z_boundary_mode: str = "edge_pad"
+
+    # ---- 强度归一化 / spacing ----
+    # 强度窗（CT HU）。
+    intensity_min: float = -1024.0
+    intensity_max: float = 1024.0
+    # 归一化："minmax"→[0,1]；"zscore"→零均值单位方差。
+    normalize  : str = "minmax"
+    global_mean: float = 0.0
+    global_std : float = 1.0
 
     # 物理 spacing 归一化开关（B1）。False=现状（不做任何 target-spacing 重采样）；
     # True=make_data 烘焙阶段把每卷重采样到 target_spacing，Predictor 推理前镜像
@@ -101,45 +144,20 @@ class DataConfig:
     # 样本排除清单路径（每行一个 pid）。空=不过滤。
     exclude_list: str = ""
 
-    # 标签取值集（0=背景）。空=从数据自动探测。
-    label_values: List[int] = field(default_factory=list)
-    num_classes : int = 0  # 由 label_values 自动设置
-
-    # 3D patch 尺寸 [D, H, W]。
-    patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
-
-    # Patch 抽取模式。示例："z_axis"（仅 z 滑块，H/W 全尺寸）、"2_5d"（D 折叠为通道驱动 2D UNet）。
-    # 其他："cubic" 3 轴中心抽取；"whole" 整体 resize。
-    patch_mode: str = "z_axis"
-
-    # 增强过采样比：先抽 round(patch_size*ratio)，增强后中心裁回。1.0=禁用；affine/elastic 建议 1.4–1.5。
-    aug_oversample_ratio: float = 1.0
-
-    # 多分辨率 FOV：各 scale 同中心抽更宽 FOV，resize 后作额外输入通道。
-    # 示例：[1.0] 单通道；[1.0, 1.5, 2.0] 3 通道。cubic 作用 3 轴，z_axis 仅 z 轴。
-    multi_res_scales: List[float] = field(default_factory=lambda: [1.0])
-
-    # 强度窗（CT HU）。
-    intensity_min: float = -1024.0
-    intensity_max: float = 1024.0
-    # 归一化："minmax"→[0,1]；"zscore"→零均值单位方差。
-    normalize  : str = "minmax"
-    global_mean: float = 0.0
-    global_std : float = 1.0
-
-    # 训/验划分。
+    # ---- 训/验划分 ----
     val_ratio : float = 0.2
     split_seed: int = 42
     # 按首个前景类分层；样本太少时回退随机。
     stratified_split: bool = True
 
-    # DataLoader。
+    # ---- DataLoader ----
     batch_size        : int = 2
     num_workers       : int = 4
     pin_memory        : bool = True
     persistent_workers: bool = True
     prefetch_factor   : int = 4
 
+    # ---- 采样 ----
     # 前景过采样：中心点落在前景上的概率。
     foreground_oversample_ratio: float = 0.5
 
@@ -152,23 +170,12 @@ class DataConfig:
     # Halton 序列），epoch 间指标可比性更强、噪声更小。train split 不受影响。
     val_grid_coverage: bool = False
 
+    # ---- 缓存 ----
     # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
     # 本 Config 默认 1（每 worker 仅缓最近 1 卷）；Dataset 构造签名的默认 0 只是
     # 直接实例化时的后备，经 Config 路径始终以此处为准。
     cache_mode       : str = "memory"
     cache_max_volumes: int = 1
-
-    # z 轴边界填充（z_axis/2.5D）：恒为 "edge_pad"（边缘复制）。"stretch" 已废弃，
-    # sync() 会警告并自动升级为 edge_pad（训练侧从未实际使用 stretch 几何）。
-    z_boundary_mode: str = "edge_pad"
-
-    # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
-    # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
-    keep_native_view_depth: bool = False
-
-    # 3D 多 FOV 懒加载单 cube（z_axis/cubic）。True：dataset 发单 cube，trainer 逐视图裁剪/重采样。
-    # 约束：scales[0]==1.0；与 keep_native_view_depth 互斥；z_axis 强制 edge_pad。
-    keep_native_multi_res: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +183,29 @@ class DataConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class AugConfig:
-    """GPU 数据增强。所有空间变换逐样本独立。"""
+    """GPU 数据增强。所有空间变换逐样本独立。
 
+    字段分组与 configs/seg*.yaml 一一对应：总控 → 空间变换 → 强度变换。
+    """
+
+    # ---- 总控 ----
     enabled: bool = True
 
-    # --- 空间变换（image + label 同步） ---
+    # 就地增强快路径：True 时跳过入口的 image/label/weight_map clone，直接在
+    # 调用方张量上做增强，省一份 batch 体积的瞬时显存（aug_oversample_ratio>1
+    # 时更明显）。契约：调用方须保证传入张量增强后不再以"原始值"被使用（训练
+    # 循环的 H2D 私有拷贝满足）。默认 False 保持防御性 clone 现状。
+    inplace: bool = False
+
+    # 强度增强后按增强前逐样本逐通道 min/max 夹取（nnU-Net 惯例），避免
+    # brightness/contrast/noise 叠加产生分布外越界值、污染 gamma 语义。
+    intensity_clamp: bool = True
+
+    # weight_map 插值模式："nearest" 保持离散权重（默认，含连续手标 wmap）；
+    # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
+    wmap_interp_mode: str = "nearest"
+
+    # ---- 空间变换（image + label 同步） ----
     random_flip_prob: float = 0.2
     random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
 
@@ -216,7 +241,7 @@ class AugConfig:
     grid_dropout_ratio: float = 0.3
     grid_dropout_holes: int = 4
 
-    # --- 强度变换（仅 image） ---
+    # ---- 强度变换（仅 image） ----
     # 注意：brightness/noise 的幅值为绝对量，隐含 image≈[0,1]（minmax 归一）。
     # zscore（std=1）下同一数值的扰动相对偏弱且量纲不同，需自行按幅度改配。
     random_brightness_prob : float = 0.3
@@ -238,28 +263,19 @@ class AugConfig:
     simulate_lowres_prob: float = 0.1
     simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
 
-    # 强度增强后按增强前逐样本逐通道 min/max 夹取（nnU-Net 惯例），避免
-    # brightness/contrast/noise 叠加产生分布外越界值、污染 gamma 语义。
-    intensity_clamp: bool = True
-
-    # weight_map 插值模式："nearest" 保持离散权重（默认，含连续手标 wmap）；
-    # "bilinear" 仅在确认权重为平滑连续场且可接受插值混合时使用。
-    wmap_interp_mode: str = "nearest"
-
-    # 就地增强快路径：True 时跳过入口的 image/label/weight_map clone，直接在
-    # 调用方张量上做增强，省一份 batch 体积的瞬时显存（aug_oversample_ratio>1
-    # 时更明显）。契约：调用方须保证传入张量增强后不再以"原始值"被使用（训练
-    # 循环的 H2D 私有拷贝满足）。默认 False 保持防御性 clone 现状。
-    inplace: bool = False
-
 
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
-    """模型架构设置。"""
+    """模型架构设置。
 
+    字段分组与 configs/seg*.yaml 一一对应：架构与规模 → 归一化/激活/正则 →
+    拓扑 → 注意力 → 监督头 → 2.5D 专属 → 显存 → 各 backbone/模块专属组。
+    """
+
+    # ---- 架构与规模 ----
     # 架构族。示例："unet"（本项目 UNet，读下面 backbone/block/norm 等）、"adm"（ADM U-Net，仅 2.5D，读 adm_*）。
     # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）。
     arch: str = "unet"
@@ -279,10 +295,6 @@ class ModelConfig:
     # 每级 block 数默认值（仅在 encoder/decoder_blocks_per_stage 都为空时使用）。
     blocks_per_level: int = 2
 
-    # 残差块变体（仅 resnet）。示例："basic" 标准 ResNet；"r2plus1d" (1,3,3)+(3,1,1) 分解卷积（需 spatial_dims=3）。
-    # 还有 "preact" / "bottleneck"。
-    block_type: str = "basic"
-
     # 逐级 block 数（nnU-Net ResEncUNet 风格）。非空时长度须与网络深度匹配。
     encoder_blocks_per_stage: List[int] = field(default_factory=list)
     decoder_blocks_per_stage: List[int] = field(default_factory=list)
@@ -290,6 +302,11 @@ class ModelConfig:
     # nnU-Net ResEnc 预设："none" | "S" | "M" | "L" | "XL"。非 none 且 *_blocks_per_stage 为空时 sync() 自填。
     resenc_preset: str = "none"
 
+    # 残差块变体（仅 resnet）。示例："basic" 标准 ResNet；"r2plus1d" (1,3,3)+(3,1,1) 分解卷积（需 spatial_dims=3）。
+    # 还有 "preact" / "bottleneck"。
+    block_type: str = "basic"
+
+    # ---- 归一化 / 激活 / 正则 ----
     # 归一化："batch" | "instance" | "group"。
     norm_type  : str = "instance"
     norm_groups: int = 8
@@ -299,49 +316,12 @@ class ModelConfig:
 
     dropout: float = 0.0
 
-    se_reduction: int = 16
+    # stochastic depth（ResNet / ConvNeXt / MedNeXt 共用；默认 0 = 恒等，无行为变化）。
+    drop_path_rate: float = 0.0
 
-    # 块内注意力："none" | "se" | "eca" | "cbam" | "coord" | "lka" | "msca"。
-    # lka = 大核注意力（VAN，DW5+DW7@dil3+1×1，等效感受野≈21³）；
-    # msca = 多尺度条形核注意力（SegNeXt，逐轴 7/11/21 条形 DW 核，适合
-    # 各向异性体数据与细长结构）。两者均纯卷积、无归一化层。
-    attention_type: str = "none"
-
-    # skip 连接上的 AttentionGate3D（Oktay 2018）；attn_gate_norm 控制其归一化。
-    # "auto"（默认）跟随全局 norm_type（3D 小 batch 下避免 BatchNorm 统计噪）；
-    # 也可显式指定 batch/instance/group。
-    skip_attention: bool = False
-    attn_gate_norm: str = "auto"
-
-    # 深度监督：多 decoder 级输出预测。
-    deep_supervision: bool = False
-
-    # 多 FOV 辅助分割监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，辅助 view k 输出 (B, num_fg*D, H, W)。
-    # 损失权重见 loss.aux_supervision_weights（空则默认 0.5^k）。单视图/3D 不生效。
-    aux_seg_supervision: bool = False
-
-    # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
-    aux_head_mode: str = "linear"
-
-    # 中心线/距离场辅助头（拓扑感知多任务监督，仅 arch=='unet'）。与多 FOV aux_seg_supervision 相互独立，
-    # 可同时开启。该头与主分割头同形（out_channels 相同、读最高分辨率 decoder 特征），仅训练期前向，
-    # eval 不输出（零推理开销）。target 由 label 即时派生：见 aux_topo_target。
-    aux_topo_head: bool = False
-    # 辅助目标："centerline" 软骨架（clDice 同款，保拓扑）；"distance" 形态学到边界距离/血管半径场。
-    aux_topo_target: str = "centerline"
-    # 辅助头拓扑："linear" 1×1；"conv" ConvNormAct(3×3)→1×1（细结构推荐）。
-    aux_topo_head_mode: str = "conv"
-
-    # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
-    # 与 data.keep_native_view_depth 互斥，仅在 2.5D 生效。
-    lift_2_5d_to_3d: bool = False
-
+    # ---- 拓扑：stem / decoder / 上下采样 / skip ----
     # Stem / patch-embed："conv3" | "conv7" | "dual" | "patch2" | "patch4"。patchN 降 N 倍分辨率（UNet3D 主输出加上采样）。
     stem_mode: str = "conv3"
-
-    # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
-    # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
-    stem_fusion_mode: str = "multi_stem_proj"
 
     # Decoder 拓扑："unet" 对称（默认）；"unetpp" 嵌套稠密；"unet3p" 全尺度 skip。
     decoder_type: str = "unet"
@@ -374,6 +354,51 @@ class ModelConfig:
     # skip："cat" 或 "add"。
     skip_mode: str = "cat"
 
+    # ---- 注意力（块内 / skip 门控） ----
+    # 块内注意力："none" | "se" | "eca" | "cbam" | "coord" | "lka" | "msca"。
+    # lka = 大核注意力（VAN，DW5+DW7@dil3+1×1，等效感受野≈21³）；
+    # msca = 多尺度条形核注意力（SegNeXt，逐轴 7/11/21 条形 DW 核，适合
+    # 各向异性体数据与细长结构）。两者均纯卷积、无归一化层。
+    attention_type: str = "none"
+
+    se_reduction: int = 16
+
+    # skip 连接上的 AttentionGate3D（Oktay 2018）；attn_gate_norm 控制其归一化。
+    # "auto"（默认）跟随全局 norm_type（3D 小 batch 下避免 BatchNorm 统计噪）；
+    # 也可显式指定 batch/instance/group。
+    skip_attention: bool = False
+    attn_gate_norm: str = "auto"
+
+    # ---- 监督头 ----
+    # 深度监督：多 decoder 级输出预测。
+    deep_supervision: bool = False
+
+    # 多 FOV 辅助分割监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，辅助 view k 输出 (B, num_fg*D, H, W)。
+    # 损失权重见 loss.aux_supervision_weights（空则默认 0.5^k）。单视图/3D 不生效。
+    aux_seg_supervision: bool = False
+
+    # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
+    aux_head_mode: str = "linear"
+
+    # 中心线/距离场辅助头（拓扑感知多任务监督，仅 arch=='unet'）。与多 FOV aux_seg_supervision 相互独立，
+    # 可同时开启。该头与主分割头同形（out_channels 相同、读最高分辨率 decoder 特征），仅训练期前向，
+    # eval 不输出（零推理开销）。target 由 label 即时派生：见 aux_topo_target。
+    aux_topo_head: bool = False
+    # 辅助目标："centerline" 软骨架（clDice 同款，保拓扑）；"distance" 形态学到边界距离/血管半径场。
+    aux_topo_target: str = "centerline"
+    # 辅助头拓扑："linear" 1×1；"conv" ConvNormAct(3×3)→1×1（细结构推荐）。
+    aux_topo_head_mode: str = "conv"
+
+    # ---- 2.5D 专属 ----
+    # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
+    # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
+    stem_fusion_mode: str = "multi_stem_proj"
+
+    # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
+    # 与 data.keep_native_view_depth 互斥，仅在 2.5D 生效。
+    lift_2_5d_to_3d: bool = False
+
+    # ---- 显存 ----
     # 梯度检查点（gradient checkpointing）：以约 +20~33% 算力换取激活显存大幅下降，可放大
     # 3D patch/batch（利于气道/血管等需大上下文的细结构）或更深更宽的 backbone。覆盖 encoder
     # 各 stage 与 decoder（unet/unetpp/unet3p）各节点；stem/上下采样/头不包裹（开销小）。
@@ -386,8 +411,7 @@ class ModelConfig:
     # 深层低分辨率 stage 可置 0，省重算开销。
     grad_ckpt_encoder_stages: List[int] = field(default_factory=list)
 
-    # stochastic depth（ResNet / ConvNeXt / MedNeXt 共用；默认 0 = 恒等，无行为变化）。
-    drop_path_rate: float = 0.0
+    # ---- ConvNeXt / MedNeXt 专属 ----
     # ConvNeXt-V2 / MedNeXt 可选 GRN（Global Response Normalization）；gamma/beta 零初始化，
     # 默认关，开启后初始仍近似恒等。
     grn_enabled: bool = False
@@ -515,8 +539,12 @@ class ModelConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class LossConfig:
-    """损失函数设置。输出为逐类独立 sigmoid，每个前景类产生 (B, 1, D, H, W) 二值输出。"""
+    """损失函数设置。输出为逐类独立 sigmoid，每个前景类产生 (B, 1, D, H, W) 二值输出。
 
+    字段分组与 configs/seg*.yaml 一一对应：损失名与权重 → 监督权重 → 逐损失参数 → 聚合方式。
+    """
+
+    # ---- 损失名与权重 ----
     # 损失名：常用 "dice_bce" 或 "dice_focal"；其他选项见 validate() 白名单。
     name: str = "dice_bce"
 
@@ -531,6 +559,27 @@ class LossConfig:
     # 例：[0.0, 1.0, 1.0, 0.0, 0.0] → label 1/2 位置损失×2，其余 ×1。空=禁用。
     region_weights: List[float] = field(default_factory=list)
 
+    # 2.5D 损失聚合（仅 patch_mode=="2_5d"）："per_slice" 逐 slice 独立（空 slice Dice≈1 零梯度）；
+    # "per_volume" 按整体在 (D,H,W) 上聚合（2.5D 推荐）。仅影响 Dice 系。
+    slice_loss_reduction: str = "per_slice"
+
+    # ---- 监督权重 ----
+    # 深度监督逐级权重。
+    deep_supervision_weights: List[float] = field(
+        default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
+
+    # 2.5D 多 FOV 辅助头权重（仅 model.aux_seg_supervision=True）：长度 = n_views-1。空 = trainer 自填 0.5^k。
+    aux_supervision_weights: List[float] = field(default_factory=list)
+
+    # 中心线/距离场辅助头损失（仅 model.aux_topo_head=True）。
+    # 权重：总损失 += aux_topo_weight * topo_loss。
+    aux_topo_weight: float = 0.3
+    # soft-skeleton 迭代 / 距离场最大腐蚀步数：2D 用 3，3D 取 3–10。
+    aux_topo_iter: int = 3
+    # 损失类型："auto"（centerline→soft-dice，distance→smooth_l1）| "dice" | "bce" | "smooth_l1" | "mse"。
+    aux_topo_loss: str = "auto"
+
+    # ---- 逐损失参数 ----
     # Dice 参数。
     dice_smooth: float = 1e-5
     dice_squared: bool = False
@@ -542,15 +591,6 @@ class LossConfig:
     # Tversky 参数（alpha=FP权重, beta=FN权重）。
     tversky_alpha: float = 0.3
     tversky_beta: float = 0.7
-
-    # True：全 batch+空间上汇总 TP/分母后一次除（nnU-Net Dice 默认）。作用于 Dice/Tversky/FocalTversky/GDL。
-    # 稀疏前景 patch 训练下 per-sample Dice 在空 GT 类上恒≈1（抬高基线、稀释梯度），
-    # 故默认取 nnU-Net 的 batch_dice=True。
-    batch_dice: bool = True
-    # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
-    # 边界：2.5D per_slice reduction 下每切片是独立样本，无 GT 切片的损失
-    # 被计为 0 后仍占均值分母（稀释总损失），而非被剔除。
-    ignore_empty: bool = False
 
     # GDL 体积加权："square"（论文）| "simple"（w=1/Σt）| "uniform"（禁用）。
     gdl_weight_type: str = "square"
@@ -566,24 +606,15 @@ class LossConfig:
     cldice_iter: int = 3
     cldice_smooth: float = 1.0
 
-    # 深度监督逐级权重。
-    deep_supervision_weights: List[float] = field(
-        default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
-
-    # 2.5D 损失聚合（仅 patch_mode=="2_5d"）："per_slice" 逐 slice 独立（空 slice Dice≈1 零梯度）；
-    # "per_volume" 按整体在 (D,H,W) 上聚合（2.5D 推荐）。仅影响 Dice 系。
-    slice_loss_reduction: str = "per_slice"
-
-    # 2.5D 多 FOV 辅助头权重（仅 model.aux_seg_supervision=True）：长度 = n_views-1。空 = trainer 自填 0.5^k。
-    aux_supervision_weights: List[float] = field(default_factory=list)
-
-    # 中心线/距离场辅助头损失（仅 model.aux_topo_head=True）。
-    # 权重：总损失 += aux_topo_weight * topo_loss。
-    aux_topo_weight: float = 0.3
-    # soft-skeleton 迭代 / 距离场最大腐蚀步数：2D 用 3，3D 取 3–10。
-    aux_topo_iter: int = 3
-    # 损失类型："auto"（centerline→soft-dice，distance→smooth_l1）| "dice" | "bce" | "smooth_l1" | "mse"。
-    aux_topo_loss: str = "auto"
+    # ---- 聚合方式 ----
+    # True：全 batch+空间上汇总 TP/分母后一次除（nnU-Net Dice 默认）。作用于 Dice/Tversky/FocalTversky/GDL。
+    # 稀疏前景 patch 训练下 per-sample Dice 在空 GT 类上恒≈1（抬高基线、稀释梯度），
+    # 故默认取 nnU-Net 的 batch_dice=True。
+    batch_dice: bool = True
+    # 仅 per-sample：无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误。
+    # 边界：2.5D per_slice reduction 下每切片是独立样本，无 GT 切片的损失
+    # 被计为 0 后仍占均值分母（稀释总损失），而非被剔除。
+    ignore_empty: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -591,19 +622,74 @@ class LossConfig:
 # ---------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    """训练循环设置。"""
+    """训练循环设置。
 
+    字段分组与 configs/seg*.yaml 一一对应：基本 → DDP 多卡 → 优化器 → 学习率调度 →
+    梯度 → 混合精度/编译/显存 → EMA/SWA → 验证与选模 → checkpoint 保存 → 日志 →
+    恢复/预训练。
+    """
+
+    # ---- 基本 ----
     epochs: int = 200
 
+    seed         : int = 42
+    deterministic: bool = False
+
+    # 要使用的**物理 GPU 卡号列表**（如 [0, 2, 5, 7]）。
+    #   * [] / 单元素                 → 单卡（或 CPU）路径，行为与历史完全一致；
+    #                                   非空单元素时即用该物理卡（混用机选卡）。
+    #   * 长度 >= 2 且 CUDA 可用        → 每卡 spawn 一个进程跑 DDP，训练样本经
+    #                                   DistributedSampler 切分、整卷验证按 rank
+    #                                   切分后 all-reduce（数值与单卡严格相等）。
+    # 仅占用列出的卡，与他人共用机器互不干扰。
+    gpus: List[int] = field(default_factory=list)
+
+    # 输出根目录（checkpoint/日志/可视化/监控）。
+    output_dir: str = "outputs"
+
+    # ---- DDP 多卡（DistributedDataParallel） ----
+    # DDP 是否启用 find_unused_parameters（深监督 / 多头若有未参与反传的参数则需开）。
+    # 默认 True 以保正确性；确认所有参数每步都参与时可设 False 提一点速度。
+    ddp_find_unused_parameters: bool = True
+    # DDP static_graph：告知 PyTorch 计算图逐步固定（参与反传的参数集合不变），
+    # 免除每步的 unused-parameter 全图遍历，并启用通信/计算重叠等图级优化；
+    # 与激活检查点的组合也更稳。建议与 ddp_find_unused_parameters=False 搭配。
+    # 若模型存在逐步变化的控制流（某些参数时而参与时而不参与反传）则不可开。
+    # 默认关（保持现状）。
+    ddp_static_graph: bool = False
+    # DDP gradient_as_bucket_view：让 param.grad 直接是通信 bucket 的 view，免掉
+    # bucket 与 grad 的双份存储，DDP 下省约 1× 梯度显存（fp32 参数量级）。PyTorch
+    # 官方支持，与 no_sync/梯度累积兼容。默认关（保持现状）。
+    ddp_gradient_as_bucket_view: bool = False
+    # DDP rendezvous 端口。0 = 启动时自动挑选空闲端口（混用机避免端口冲突）。
+    ddp_master_port: int = 0
+    # DDP 下是否按 world_size 把每卡 DataLoader 的 num_workers 平摊到 1/world_size
+    # （向下取整、至少 1）。每个 rank 是独立进程、各自 fork num_workers 个 worker 且各
+    # 持一份逐 worker LRU 卷缓存——不分摊则 worker 进程数与缓存 RAM 都随卡数线性翻倍
+    # （8 卡混用机上易触发 CPU 超额订阅 / 换页抖动 / 内核 soft-lockup）。分摊后**全机
+    # 聚合** worker 数与缓存 RAM 与单卡基线一致。默认 True；置 False 保留旧行为（每卡满额）。
+    ddp_scale_dataloader_per_rank: bool = True
+    # NCCL collective 超时（分钟）。卡住的集合通信超过此时长会被 watchdog abort，
+    # 避免某 rank 因 peer 已死而无限等待、永久挂起占显存。默认 30 分钟。
+    ddp_timeout_minutes: int = 30
+    # ZeRO-1 优化器状态分片（torch.distributed.optim.ZeroRedundancyOptimizer）：
+    # DDP 下把 AdamW 的 2× 参数 fp32 状态均分到 world_size 张卡，每卡省
+    # 2×参数×4B×(1−1/N)；step 后各 rank broadcast 自己分片的参数（数值与普通
+    # DDP+AdamW 严格等价）。checkpoint 保存时自动 consolidate 到 rank0（全 rank
+    # 集合操作）。单卡 / 非 DDP 下该开关被忽略并告警。默认关。
+    zero_redundancy_optimizer: bool = False
+
+    # ---- 优化器 ----
     # 优化器："adam" | "adamw" | "sgd"。
     optimizer   : str = "adamw"
-    lr          : float = 1e-3
-    weight_decay: float = 1e-4
     # CUDA 下用 fused AdamW，单 kernel 更新全部参数。
     adamw_fused : bool = True
+    lr          : float = 1e-3
+    weight_decay: float = 1e-4
     momentum    : float = 0.99   # 仅 SGD
     nesterov    : bool = True    # 仅 SGD
 
+    # ---- 学习率调度 ----
     # 调度器："cosine" | "cosine_warm_restarts" | "poly" | "step" | "plateau" | "one_cycle"。
     scheduler    : str = "cosine"
     warmup_epochs: int = 5
@@ -618,6 +704,7 @@ class TrainConfig:
     plateau_patience     : int = 10   # 单位为验证次数（非 epoch），见 early_stopping 注。
     plateau_factor       : float = 0.5
 
+    # ---- 梯度 ----
     # 梯度累积（有效 batch = batch_size * accum_steps）。
     # 注意：比值型 batch 池化损失（batch_dice/GDL/Tversky 等）的统计窗口
     # 仍是单个 micro-batch（=batch_size），不随 accum 扩大（单卡亦然）。
@@ -632,6 +719,7 @@ class TrainConfig:
     # 监控开启时行为完全不变。数值等价。默认关（保持现状）。
     grad_norm_lazy_sync: bool = False
 
+    # ---- 混合精度 / 编译 / 显存 ----
     # AMP。amp_dtype 示例："float16"（需 GradScaler）、"bfloat16"（Ampere+，无需 scaler）。还有 "auto"（探测 BF16 否则回退 fp16）。
     use_amp  : bool = True
     amp_dtype: str = "float16"
@@ -641,7 +729,20 @@ class TrainConfig:
     # 可选 channels_last 内存格式；数值等价，Ampere+ 上 3D conv 可能提速但不保证正收益（需 benchmark）；默认关。
     channels_last: bool = False
 
-    # EMA。
+    # CUDA caching allocator 的 expandable segments（PyTorch 2.1+）：多分辨率视图 /
+    # oversample 裁剪 / 滑窗尾窗等形状多变场景下显著缓解显存碎片（reserved >>
+    # allocated 即碎片征兆，epoch 摘要有打印）。实现方式为进程启动早期注入
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（已有该环境变量时不覆盖）。
+    # 默认关，行为与现状一致；个别旧驱动不支持时 PyTorch 自动回退并告警。
+    cuda_expandable_segments: bool = False
+
+    # 整卷验证前后各调一次 torch.cuda.empty_cache()：把训练激活占住的 cached
+    # blocks 归还，避免滑窗大累加器因碎片 OOM。只影响 allocator、不影响数值；
+    # 代价是验证前后各一次微小停顿。None（默认）= 自动：val_metric_mode='high'
+    # 时开（整卷滑窗最需要连续显存），'medium' 时关；也可显式 True/False 覆盖。
+    val_empty_cache: Optional[bool] = None
+
+    # ---- EMA / SWA 权重平均 ----
     use_ema  : bool = True
     ema_decay: float = 0.999
     # EMA decay warmup（timm 式 ramp）：早期用 min(decay, (1+step)/(10+step))，
@@ -665,29 +766,26 @@ class TrainConfig:
     # 的模型有效，instance/group norm 无 running stats 自动跳过）。
     swa_bn_update_steps: int = 50
 
-    # CUDA caching allocator 的 expandable segments（PyTorch 2.1+）：多分辨率视图 /
-    # oversample 裁剪 / 滑窗尾窗等形状多变场景下显著缓解显存碎片（reserved >>
-    # allocated 即碎片征兆，epoch 摘要有打印）。实现方式为进程启动早期注入
-    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True（已有该环境变量时不覆盖）。
-    # 默认关，行为与现状一致；个别旧驱动不支持时 PyTorch 自动回退并告警。
-    cuda_expandable_segments: bool = False
+    # ---- 验证与选模 ----
+    val_every: int = 1
 
-    # 整卷验证前后各调一次 torch.cuda.empty_cache()：把训练激活占住的 cached
-    # blocks 归还，避免滑窗大累加器因碎片 OOM。只影响 allocator、不影响数值；
-    # 代价是验证前后各一次微小停顿。None（默认）= 自动：val_metric_mode='high'
-    # 时开（整卷滑窗最需要连续显存），'medium' 时关；也可显式 True/False 覆盖。
-    val_empty_cache: Optional[bool] = None
+    # 选模严格度（与 save_best_criterion 正交：criterion 决定"看哪个指标"，
+    # 本项决定"指标在什么预测上算"）：
+    #   * "medium" — 现状：在 val_loader 的随机 patch/切片上前向并算指标，快但
+    #                非整卷，z 向上下文被切断，指标偏乐观/抖动。
+    #   * "high"   — 严格：对每个 val 整卷做与部署一致的滑窗推理后再算指标，
+    #                最可靠但更慢（每次验证多一遍整卷推理）。npz 无物理 z-spacing，
+    #                故 high 不启用 predict.z_interleave，其余几何与推理一致。
+    # 默认 "medium" 保持既有行为不变。
+    val_metric_mode: str = "medium"
 
-    # Checkpoint 保存。
-    output_dir      : str = "outputs"
-    save_every      : int = 10
-    # 周期 checkpoint 保留策略：仅保留最近 k 个 checkpoint_epoch_*.pth，更早的
-    # 自动删除（best_model.pth 不受影响）。<=0 = 不清理（保留全部）。
-    save_keep_last  : int = 3
-    # 异步 checkpoint 保存（仅 rank0）：权重先深拷到 CPU，后台线程 torch.save，
-    # 训练主循环不被写盘阻塞（大模型/频繁 save 时可省数秒到数十秒/次）；
-    # 代价是保存时刻额外一份 CPU 内存快照。默认关（保持同步写盘旧行为）。
-    save_async      : bool = False
+    # 整卷验证（val_metric_mode='high'）指标计算前先按 pred∪GT 并集 bbox 裁剪：
+    # dice/iou/recall/precision/vol_sim 只依赖 TP/FP/FN（全部落在并集 bbox 内），
+    # 裁剪后严格等价；MCC 的 TN 通过按整卷形状回传总体素数保持严格等价；
+    # surface_dice 按 tolerance+1 外扩边距后同样严格等价。前景占比小的整卷上
+    # surface_dice 的 3D maxpool 可省一个量级计算与显存。默认关，行为与现状一致。
+    val_metric_bbox_crop: bool = False
+
     # 选模标准（互斥）：
     #   * "loss"              → val_loss ↓
     #   * "dice"              → mean_dice ↑
@@ -711,35 +809,25 @@ class TrainConfig:
     #   oar_multi / heart_chamber / bone_lung_combined
     save_best_preset: str = ""
 
-    # 选模严格度（与 save_best_criterion 正交：criterion 决定"看哪个指标"，
-    # 本项决定"指标在什么预测上算"）：
-    #   * "medium" — 现状：在 val_loader 的随机 patch/切片上前向并算指标，快但
-    #                非整卷，z 向上下文被切断，指标偏乐观/抖动。
-    #   * "high"   — 严格：对每个 val 整卷做与部署一致的滑窗推理后再算指标，
-    #                最可靠但更慢（每次验证多一遍整卷推理）。npz 无物理 z-spacing，
-    #                故 high 不启用 predict.z_interleave，其余几何与推理一致。
-    # 默认 "medium" 保持既有行为不变。
-    val_metric_mode: str = "medium"
-
-    # 整卷验证（val_metric_mode='high'）指标计算前先按 pred∪GT 并集 bbox 裁剪：
-    # dice/iou/recall/precision/vol_sim 只依赖 TP/FP/FN（全部落在并集 bbox 内），
-    # 裁剪后严格等价；MCC 的 TN 通过按整卷形状回传总体素数保持严格等价；
-    # surface_dice 按 tolerance+1 外扩边距后同样严格等价。前景占比小的整卷上
-    # surface_dice 的 3D maxpool 可省一个量级计算与显存。默认关，行为与现状一致。
-    val_metric_bbox_crop: bool = False
-
     # 提前停止（0=禁用）。单位是“验证次数”而非 epoch：val_every>1 时
     # N 次无提升 ≈ N*val_every 个 epoch（plateau_patience 同理）。
     early_stopping: int = 0
 
-    # 日志。
+    # ---- checkpoint 保存 ----
+    save_every      : int = 10
+    # 周期 checkpoint 保留策略：仅保留最近 k 个 checkpoint_epoch_*.pth，更早的
+    # 自动删除（best_model.pth 不受影响）。<=0 = 不清理（保留全部）。
+    save_keep_last  : int = 3
+    # 异步 checkpoint 保存（仅 rank0）：权重先深拷到 CPU，后台线程 torch.save，
+    # 训练主循环不被写盘阻塞（大模型/频繁 save 时可省数秒到数十秒/次）；
+    # 代价是保存时刻额外一份 CPU 内存快照。默认关（保持同步写盘旧行为）。
+    save_async      : bool = False
+
+    # ---- 日志 ----
     log_every: int = 10
-    val_every: int = 1
     vis_every: int = 10
 
-    seed         : int = 42
-    deterministic: bool = False
-
+    # ---- 恢复 / 预训练 ----
     # Resume：从 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
     resume: str = ""
 
@@ -759,46 +847,6 @@ class TrainConfig:
     # 推理前是否将 MedNeXt 的可重参数化深度卷积折叠为 deploy 形态；默认关。
     # 开启后，io.run_inference 会在 load_state_dict 之后、device 转移之前先折叠。
     reparam_deploy: bool = False
-
-    # ---- 多卡 DDP（DistributedDataParallel）----------------------------
-    # 要使用的**物理 GPU 卡号列表**（如 [0, 2, 5, 7]）。
-    #   * [] / 单元素                 → 单卡（或 CPU）路径，行为与历史完全一致；
-    #                                   非空单元素时即用该物理卡（混用机选卡）。
-    #   * 长度 >= 2 且 CUDA 可用        → 每卡 spawn 一个进程跑 DDP，训练样本经
-    #                                   DistributedSampler 切分、整卷验证按 rank
-    #                                   切分后 all-reduce（数值与单卡严格相等）。
-    # 仅占用列出的卡，与他人共用机器互不干扰。
-    gpus: List[int] = field(default_factory=list)
-    # DDP 是否启用 find_unused_parameters（深监督 / 多头若有未参与反传的参数则需开）。
-    # 默认 True 以保正确性；确认所有参数每步都参与时可设 False 提一点速度。
-    ddp_find_unused_parameters: bool = True
-    # DDP rendezvous 端口。0 = 启动时自动挑选空闲端口（混用机避免端口冲突）。
-    ddp_master_port: int = 0
-    # DDP 下是否按 world_size 把每卡 DataLoader 的 num_workers 平摊到 1/world_size
-    # （向下取整、至少 1）。每个 rank 是独立进程、各自 fork num_workers 个 worker 且各
-    # 持一份逐 worker LRU 卷缓存——不分摊则 worker 进程数与缓存 RAM 都随卡数线性翻倍
-    # （8 卡混用机上易触发 CPU 超额订阅 / 换页抖动 / 内核 soft-lockup）。分摊后**全机
-    # 聚合** worker 数与缓存 RAM 与单卡基线一致。默认 True；置 False 保留旧行为（每卡满额）。
-    ddp_scale_dataloader_per_rank: bool = True
-    # NCCL collective 超时（分钟）。卡住的集合通信超过此时长会被 watchdog abort，
-    # 避免某 rank 因 peer 已死而无限等待、永久挂起占显存。默认 30 分钟。
-    ddp_timeout_minutes: int = 30
-    # DDP gradient_as_bucket_view：让 param.grad 直接是通信 bucket 的 view，免掉
-    # bucket 与 grad 的双份存储，DDP 下省约 1× 梯度显存（fp32 参数量级）。PyTorch
-    # 官方支持，与 no_sync/梯度累积兼容。默认关（保持现状）。
-    ddp_gradient_as_bucket_view: bool = False
-    # DDP static_graph：告知 PyTorch 计算图逐步固定（参与反传的参数集合不变），
-    # 免除每步的 unused-parameter 全图遍历，并启用通信/计算重叠等图级优化；
-    # 与激活检查点的组合也更稳。建议与 ddp_find_unused_parameters=False 搭配。
-    # 若模型存在逐步变化的控制流（某些参数时而参与时而不参与反传）则不可开。
-    # 默认关（保持现状）。
-    ddp_static_graph: bool = False
-    # ZeRO-1 优化器状态分片（torch.distributed.optim.ZeroRedundancyOptimizer）：
-    # DDP 下把 AdamW 的 2× 参数 fp32 状态均分到 world_size 张卡，每卡省
-    # 2×参数×4B×(1−1/N)；step 后各 rank broadcast 自己分片的参数（数值与普通
-    # DDP+AdamW 严格等价）。checkpoint 保存时自动 consolidate 到 rank0（全 rank
-    # 集合操作）。单卡 / 非 DDP 下该开关被忽略并告警。默认关。
-    zero_redundancy_optimizer: bool = False
 
     # ---- 派生只读量（不暴露写接口；由 save_best_criterion 单一决定）----
     @property
@@ -911,8 +959,13 @@ def _norm_crit(crit: Any) -> str:
 # ---------------------------------------------------------------------------
 @dataclass
 class PredictConfig:
-    """推理设置（z 轴滑动窗口）。"""
+    """推理设置（z 轴滑动窗口）。
 
+    字段分组与 configs/seg*.yaml 一一对应：滑窗核心 → TTA 与阈值 → 精度/显存 →
+    提速开关 → AdaBN 域适应 → 2.5D 专属 z 交错 → 输出。
+    """
+
+    # ---- 滑窗核心 ----
     # z 轴重叠比（0.0 = 不重叠，0.5 = 50%）。
     z_overlap: float = 0.5
 
@@ -922,6 +975,7 @@ class PredictConfig:
     # 推理 batch 大小。
     batch_size: int = 2
 
+    # ---- TTA 与阈值 ----
     # TTA flip。
     tta_flip: bool = False
 
@@ -938,6 +992,7 @@ class PredictConfig:
     # 很大（小结构类宜偏低阈值）。
     threshold: Union[float, List[float]] = 0.5
 
+    # ---- 精度 / 显存 ----
     # 滑窗概率累加器 dtype："fp32"（默认）| "fp16"。大卷 × 多类时 fp16 使
     # acc_pred 显存减半；blend 权重归一后精度足够（nnU-Net 同款做法）。
     acc_dtype: str = "fp32"
@@ -952,6 +1007,7 @@ class PredictConfig:
     # GPU→CPU 拷贝，用速度换显存）。
     accumulate_on_cpu: bool = False
 
+    # ---- 提速开关 ----
     # 独立 CLI 推理（predictor.io.run_inference）开启 cudnn.benchmark：滑窗窗口
     # 形状固定，让 cuDNN 首个 batch 自动选最优卷积算法（训练入口经
     # seed_everything 已默认开启，仅独立推理入口缺此设置）。默认关，行为与现状
@@ -963,6 +1019,13 @@ class PredictConfig:
     # 数值完全等价。AdaBN per_volume 的 BN 重估阶段自动回退 no_grad（避免
     # 对 BN buffer 原地更新的兼容性风险）。默认关（保持现状）。
     use_inference_mode: bool = False
+
+    # 推理侧 channels_last 内存排布（与 TrainConfig.channels_last 同义，作用于
+    # 推理模型与输入窗口）：数值等价，Ampere+ 上 conv 可能提速（需 benchmark
+    # 验证正收益）。注：训练内整卷验证与训练共享同一模型对象，开启后排布
+    # 转换会持续到训练侧（仍数值等价）；训练侧同样需求请用 train.channels_last。
+    # 默认关（保持现状）。
+    channels_last: bool = False
 
     # 滑窗跳过纯背景窗口（z_axis / 2_5d / cubic 路径）：取窗前先看该窗在
     # **归一化后**体素上的最大值，若 <= skip_empty_threshold 则不前向、不累加
@@ -977,30 +1040,7 @@ class PredictConfig:
     # 开启时生效。
     skip_empty_threshold: float = 0.0
 
-    # 推理侧 channels_last 内存排布（与 TrainConfig.channels_last 同义，作用于
-    # 推理模型与输入窗口）：数值等价，Ampere+ 上 conv 可能提速（需 benchmark
-    # 验证正收益）。注：训练内整卷验证与训练共享同一模型对象，开启后排布
-    # 转换会持续到训练侧（仍数值等价）；训练侧同样需求请用 train.channels_last。
-    # 默认关（保持现状）。
-    channels_last: bool = False
-
-    # 预测输出目录。
-    output_dir: str = "predictions"
-
-    # 是否保存概率图（在二值 mask 之外）。
-    save_probabilities: bool = False
-
-    # z 轴交错多流推理（仅 2.5D）：按 z 拆 k 个子体 (slices i,i+k,...)，独立推理后缝回原 z。
-    # 动机：加宽 z 感受野。警告：子流表现为 k * z_spacing。
-    z_interleave_enabled: bool = False
-
-    # k 按物理 z 间距（mm）选择。thresholds 升序，factors 长度 = len(thresholds)+1（含 fallback）。
-    # 默认：z<=1.0 → k=3；1.0<z<=1.5 → k=2；z>1.5 → k=1。
-    z_interleave_thresholds: List[float] = field(
-        default_factory=lambda: [1.0, 1.5])
-    z_interleave_factors: List[int] = field(
-        default_factory=lambda: [3, 2, 1])
-
+    # ---- AdaBN 域适应 ----
     # 测试时自适应 BatchNorm (AdaBN)：推理阶段用目标域前向重估 BN running stats，
     # 无需标签、不重训，针对跨数据集域漂移导致的假阳。仅当 model.norm_type=='batch'
     # 时有效（instance/group norm 为 no-op）。
@@ -1012,6 +1052,25 @@ class PredictConfig:
 
     # global 模式预热用的目标域整卷数；per_volume 模式忽略。
     adabn_num_volumes: int = 8
+
+    # ---- 2.5D 专属：z 交错 ----
+    # z 轴交错多流推理（仅 2.5D）：按 z 拆 k 个子体 (slices i,i+k,...)，独立推理后缝回原 z。
+    # 动机：加宽 z 感受野。警告：子流表现为 k * z_spacing。
+    z_interleave_enabled: bool = False
+
+    # k 按物理 z 间距（mm）选择。thresholds 升序，factors 长度 = len(thresholds)+1（含 fallback）。
+    # 默认：z<=1.0 → k=3；1.0<z<=1.5 → k=2；z>1.5 → k=1。
+    z_interleave_thresholds: List[float] = field(
+        default_factory=lambda: [1.0, 1.5])
+    z_interleave_factors: List[int] = field(
+        default_factory=lambda: [3, 2, 1])
+
+    # ---- 输出 ----
+    # 预测输出目录。
+    output_dir: str = "predictions"
+
+    # 是否保存概率图（在二值 mask 之外）。
+    save_probabilities: bool = False
 
 
 # ---------------------------------------------------------------------------

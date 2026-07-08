@@ -18,38 +18,32 @@ data:
   npz_dir          : "F:/Totalsegmentator_dataset_v201/small_data/npz"            # 预生成 npz 包目录；非空=直读 npz、忽略上面 NIfTI 目录
 
   # 第二批(粗标)预生成 npz 目录。空 => 单批金标准；非空 => 训练时金/粗按 mix_ratio 混合（副源仅训练，val 始终仅金标准）。
-  # 副源必须事先离线生成: python -m segtask_v1.data.make_data --config <yaml> --out <dir>
   npz_dir_secondary: ""
-  npz_auto_build   : true     # 开启后：启动时自动调用 make_data 生成/更新 npz；关=要求手动预生成
-  mix_ratio        : [1, 1]   # 仅 npz_dir_secondary 非空；每 batch [金标准, 粗标] 整数权重比，batch_size 须能被 sum 整除、两元素均 >=1
+  npz_auto_build   : true     # 启动时自动调用 make_data 生成/更新 npz；关=要求手动预生成
+  mix_ratio        : [1, 1]   # 仅 npz_dir_secondary 非空；每 batch [金标准, 粗标] 整数权重比，batch_size 须能被 sum 整除
 
   label_values: [0, 1]   # label 整数取值 [bg, fg1, ...]；空 => 首次运行自动探测
   num_classes : 2        # 类别总数；0 => 自动 = len(label_values)
 
   patch_size: [16, 128, 128]   # 训练 patch [D, H, W]
-  # patch_mode — 训练样本抽取方式：
-  #   'z_axis' — 沿 z 轴滑块；x,y resize 到 (pH,pW)。支持 multi_res (仅 z)
-  #   'cubic'  — 中心点抽 3D cube。支持 multi_res (3 轴同比)
-  #   'whole'  — 整卷 resize 到 patch_size。multi_res 必须 [1.0]
-  #   '2_5d'   — 见 configs/seg2_5d.yaml
-  patch_mode: "z_axis"
+  patch_mode: "z_axis"         # 训练样本抽取方式；'z_axis'=沿 z 滑块，x/y resize 到 (pH,pW)（本模板） | 'cubic'=3 轴中心 cube | 'whole'=整卷 resize（multi_res 必须 [1.0]） | '2_5d'=见 configs/seg2_5d.yaml
 
-  # 增强过采样比：先抽 ratio 倍大 patch，增强后中心裁回，抵消旋转/形变黑边角。
-  # z_axis 仅放大 z；cubic/whole 三轴同比。1.0=禁用，开 affine/elastic 建议 1.3~1.5
-  aug_oversample_ratio: 1.5
-
-  # 多分辨率输入（多 FOV）：各 scale 同中心抽更宽 FOV 作额外输入通道。[1.0]=单分辨率；[1.0,1.5,2.0]=3 通道。whole 必须 [1.0]
-  multi_res_scales: [1.0, 1.5, 2.0]
+  # 多分辨率输入（多 FOV）：各 scale 同中心抽更宽 FOV 作额外输入通道。[0] 必须为 1.0（主线）；[1.0]=单分辨率，典型 [1.0,1.5,2.0]
+  multi_res_scales    : [1.0, 1.5, 2.0]
+  aug_oversample_ratio: 1.5               # 增强过采样比：先抽 ratio 倍大 patch，增强后中心裁回（去黑边角）；1.0=禁用；z_axis 仅放大 z，cubic/whole 三轴同比
 
   # 3D 多分辨率 lazy 单 cube 提取（仅 z_axis/cubic + n_views>1 生效）。
   # 开启后：只抽 max-FOV cube 增强 1 次，trainer 逐 view crop+interpolate（几何一致、省增强算力）；
   # 锁定 edge_pad，要求 scales[0]=1.0；与 keep_native_view_depth 互斥。关=每 scale 独立 scipy.zoom。
   keep_native_multi_res: true
 
+  # Z 边界窗口几何（scale=1.0 通道；z_axis 生效）
+  z_boundary_mode: "edge_pad"  # edge-replicate 补齐到 eD；训练-推理几何严格一致
+
   intensity_min        : -1024.0    # HU 窗下界（低于此值钳到下界）
   intensity_max        : 1024.0     # HU 窗上界
   normalize            : "minmax"   # 强度归一化方式；'minmax'=缩到 [0,1] | 'zscore'=(x-mean)/std（需 global_mean/std）
-  spacing_normalization: false      # 开启后：npz 烘焙时重采样到 target_spacing，推理镜像重采样再回采；改动须重新烘焙 npz
+  spacing_normalization: false      # npz 烘焙时重采样到 target_spacing，推理镜像重采样再回采；改动须重新烘焙 npz
   target_spacing       : null       # 仅 spacing_normalization=true；目标 spacing [sz,sy,sx]（mm）；null=自动取全数据集逐轴中位数
   global_mean          : 0.0        # 仅 normalize='zscore'；全局均值
   global_std           : 1.0        # 仅 normalize='zscore'；全局标准差
@@ -57,145 +51,150 @@ data:
 
   val_ratio       : 0.2    # 验证集占比 (0~1)
   split_seed      : 42     # 训/验划分随机种子（固定则划分可复现）
-  stratified_split: true   # 开启后：按首个前景类有无分层划分训/验（样本太少自动回退随机）
+  stratified_split: true   # 按首个前景类有无分层划分训/验（样本太少自动回退随机）
 
   batch_size        : 2      # 训练 batch 大小
   num_workers       : 4      # DataLoader 子进程数；0=主进程加载
-  persistent_workers: true   # 仅 num_workers>0；开启后 epoch 间保留 worker 进程（免反复启动）
+  persistent_workers: true   # 仅 num_workers>0；epoch 间保留 worker 进程（免反复启动）
   prefetch_factor   : 4      # 仅 num_workers>0；每 worker 预取 batch 数
-  pin_memory        : true   # 开启后：用锁页内存加速 CPU→GPU 拷贝
+  pin_memory        : true   # 用锁页内存加速 CPU→GPU 拷贝
 
   foreground_oversample_ratio: 0.3   # patch 中心点落在前景体素上的概率 (0~1)；whole 模式忽略
   samples_per_volume         : 8     # 每卷每 epoch 抽样次数
-  val_grid_coverage          : false # 仅 val split + medium 验证；开启后 patch 位置改用确定性均匀网格（epoch 间指标更可比，train 不受影响）
+  val_grid_coverage          : false # 仅 val split + medium 验证；patch 位置改用确定性均匀网格（epoch 间指标更可比，train 不受影响）
 
-  cache_mode       : "memory"     # 卷缓存；'none'=不缓存 | 'memory'=每 worker LRU 内存缓存
-  cache_max_volumes: 1            # 仅 cache_mode='memory'；每 worker 最多缓存卷数；0=不限（OOM 风险）
-  z_boundary_mode  : "edge_pad"   # z 边界窗口几何（z_axis 生效）；'edge_pad'=edge-replicate 补齐（推荐） | 'stretch'=已废弃，自动升级为 edge_pad
+  cache_mode       : "memory"   # 卷缓存；'none'=不缓存 | 'memory'=每 worker LRU 内存缓存
+  cache_max_volumes: 1          # 仅 cache_mode='memory'；每 worker 最多缓存卷数；0=不限（OOM 风险）
 
 augment:
-  enabled         : true        # 数据增强总开关；关=以下全部跳过
-  inplace         : false       # 开启后：跳过入口 clone 就地增强，省一份 batch 体积瞬时显存（要求调用方不再复用原始张量，训练循环满足）
-  random_flip_prob: 0.5         # 随机翻转概率（逐样本）
-  random_flip_axes: [2, 3, 4]   # 参与翻转的轴（相对 B,C,D,H,W：2=D, 3=H, 4=W）
+  enabled                     : true            # 数据增强总开关
+  inplace                     : false           # 跳过入口 clone 就地增强，省一份 batch 体积瞬时显存（要求调用方不再复用原始张量，训练循环满足）
+  intensity_clamp             : true            # 强度增强后按增强前逐样本 min/max 夹取，防越界值污染
+  wmap_interp_mode            : "nearest"       # weight_map 空间变换插值；'nearest'=保持离散权重 | 'bilinear'=平滑连续权重场可用
 
-  # affine = 旋转+缩放+平移合成单一仿射，与 elastic 融合为同一次 grid_sample
-  random_affine_prob          : 0.3             # 仿射触发概率
+  random_flip_prob            : 0.5             # 随机翻转概率（逐样本）
+  random_flip_axes            : [2, 3, 4]       # 参与翻转的轴（相对 B,C,D,H,W：2=D, 3=H, 4=W）
+
+  random_affine_prob          : 0.3             # 仿射（旋转+缩放+平移合成单次 grid_sample）触发概率
   random_rotate_range         : [-30.0, 30.0]   # 旋转角范围（度）
   random_scale_range          : [0.65, 1.25]    # 缩放范围；作用于采样网格（反向语义：>1 物体在输出中变小）
   random_rotate_range_per_axis: null            # 逐轴角度范围（(W,H,D) 三对 [lo,hi]，度）；null=三轴共用 random_rotate_range
-  random_affine_aspect_correct: true            # 开启后：在物理各向同性坐标系里旋转，消除各向异性 patch 旋转混入的剪切/非均匀缩放
+  random_affine_aspect_correct: true            # 在物理各向同性坐标系里旋转，消除各向异性 patch 旋转混入的剪切/非均匀缩放
   random_translate_range      : [-0.1, 0.1]     # 平移范围（归一化坐标，[-1,1] 跨整轴）；[0,0]=禁用
 
-  # B-spline 随机位移场
-  elastic_deform_prob : 0.02   # 弹性变形概率
-  elastic_deform_sigma: 5.0    # 位移场平滑度（越大越平滑）
-  elastic_deform_alpha: 1.0    # 位移标称幅度（voxel；实际典型位移略小于该值）
+  elastic_deform_prob         : 0.02            # 弹性形变（B-spline 随机位移场）概率
+  elastic_deform_sigma        : 5.0             # 位移场平滑度（越大越平滑）
+  elastic_deform_alpha        : 1.0             # 位移标称幅度（voxel；实际典型位移略小于该值）
 
-  # 随机挖掉矩形块（强正则）
-  grid_dropout_prob : 0.0   # 网格挖空概率
-  grid_dropout_ratio: 0.3   # 挖空块相对边长比例
-  grid_dropout_holes: 4     # 挖空块数
+  grid_dropout_prob           : 0.0             # 随机挖空矩形块概率（强正则）
+  grid_dropout_ratio          : 0.3             # 挖空块相对边长比例
+  grid_dropout_holes          : 4               # 挖空块数
 
-  random_brightness_prob : 0.3               # 亮度扰动概率
-  random_brightness_range: [-0.1, 0.1]       # 加性幅度（绝对量，隐含 image≈[0,1]；zscore 下需自行改配）
-  random_contrast_prob   : 0.3               # 对比度扰动概率
-  random_contrast_range  : [0.8, 1.2]        # 乘性系数范围
-  random_gamma_prob      : 0.2               # gamma 校正扰动概率
-  random_gamma_range     : [0.8, 1.2]        # gamma 指数范围
-  gaussian_noise_prob    : 0.2               # 高斯噪声概率
-  gaussian_noise_std     : 0.1               # 噪声标准差（绝对量，隐含 image≈[0,1]）
-  gaussian_blur_prob     : 0.1               # 高斯模糊概率
-  gaussian_blur_sigma    : [0.5, 1.5]        # 模糊 sigma 采样范围
+  random_brightness_prob      : 0.3             # 亮度扰动概率
+  random_brightness_range     : [-0.1, 0.1]     # 加性幅度（绝对量，隐含 image≈[0,1]；zscore 下需自行改配）
 
-  simulate_lowres_prob: 0.1          # 模拟低分辨率（降采后插回原分辨率）概率
-  simulate_lowres_zoom: [0.5, 1.0]   # 降采倍率采样范围
-  intensity_clamp     : true         # 开启后：强度增强后按增强前逐样本 min/max 夹取，防越界值污染 gamma（nnU-Net 惯例）
-  wmap_interp_mode    : "nearest"    # weight_map 空间变换插值；'nearest'=保持离散权重（推荐） | 'bilinear'=平滑连续权重场可用
+  random_contrast_prob        : 0.3             # 对比度扰动概率
+  random_contrast_range       : [0.8, 1.2]      # 乘性系数范围
+
+  random_gamma_prob           : 0.2             # gamma 校正扰动概率
+  random_gamma_range          : [0.8, 1.2]      # gamma 指数范围
+
+  gaussian_noise_prob         : 0.2             # 高斯噪声概率
+  gaussian_noise_std          : 0.1             # 噪声标准差（绝对量，隐含 image≈[0,1]）
+
+  gaussian_blur_prob          : 0.1             # 高斯模糊概率
+  gaussian_blur_sigma         : [0.5, 1.5]      # 模糊 sigma 采样范围
+
+  simulate_lowres_prob        : 0.1             # 模拟低分辨率（降采后插回原分辨率）概率
+  simulate_lowres_zoom        : [0.5, 1.0]      # 降采倍率采样范围
+
 
 model:
-  arch    : "unet"     # 网络架构族；'unet'=本项目 UNet（读下方 backbone 等） | 'adm'/'edm2'=扩散式 U-Net（仅 2.5D，3D 下不可用）
-  backbone: "resnet"   # 编码器 block 风格；'resnet' | 'convnext' | 'mednext'
-
-  # 注：in_channels / spatial_dims 由 patch_mode / multi_res_scales 自动派生，设了也会被忽略。
+  # ---- 架构与规模 ----
+  arch                    : "unet"                    # 网络架构族；'unet' | 'adm'/'edm2'=扩散式 U-Net（仅 2.5D，3D 下不可用）
+  backbone                : "resnet"                  # 编码器 block 风格；'resnet' | 'convnext' | 'mednext'
   encoder_channels        : [32, 64, 128, 256, 256]   # 每级编码器通道数；长度=级数（网络深度）
   blocks_per_level        : 2                         # 每级默认 block 数；仅 *_blocks_per_stage 为空时使用
-  encoder_blocks_per_stage: []                        # 逐级 encoder block 数（ResEnc 风格）；空=由 blocks_per_level/resenc_preset 推导；非空长度须 = len(encoder_channels)
+  encoder_blocks_per_stage: []                        # 逐级 encoder block 数；空=推导；非空长度须 = len(encoder_channels)
   decoder_blocks_per_stage: []                        # 逐级 decoder block 数；空=推导；非空长度须 = len(encoder_channels)-1
-  resenc_preset           : "none"                    # nnU-Net ResEnc 预设（*_blocks_per_stage 为空时自动填）；'none'=不用 | 'S' | 'M' | 'L' | 'XL'
+  resenc_preset           : "none"                    # nnU-Net 预设（*_blocks_per_stage 为空时自动填）；'none'=不用 | 'S' | 'M' | 'L' | 'XL'
   block_type              : "basic"                   # 仅 backbone='resnet'；残差块变体；'basic'=标准 | 'preact'=预激活（深网） | 'bottleneck'=瓶颈（ResEnc-XL） | 'r2plus1d'=(1,3,3)+(3,1,1) 分解（3D 专属，z 上下文）
 
-  # 归一化层类型；'batch' | 'instance' | 'group'
-  # 'group' 相较 'instance':
+  # ---- 归一化 / 激活 / 正则 ----
+  # norm_type='group' 相较 'instance'：
   #   (1) 不抹掉每 channel 的绝对强度尺度 → 保留 HU 信号 → 与 region_weight 的按 HU 区域加权哲学兼容；
   #   (2) 组内多通道联合统计 → 跨通道相对响应保留 → 利于深层 z-axis 上下文学习。
-  norm_type         : "group"
-  norm_groups       : 8              # 仅 norm_type='group'；组数（须整除通道数）
-  activation        : "leakyrelu"    # 激活函数；'relu' | 'leakyrelu' | 'gelu' | 'swish'
-  dropout           : 0.0            # dropout 比例；0=禁用
-  se_reduction      : 16             # 仅 attention_type='se'；SE 通道压缩比
-  attention_type    : "none"         # 块内注意力；'none'=无 | 'se'=通道重标定 | 'eca' | 'cbam' | 'coord' | 'lka'=大核注意力（感受野≈21³） | 'msca'=多尺度条形核（适合细长结构）
-  skip_attention    : false          # 开启后：skip 连接上加 AttentionGate3D（用深层特征门控 skip 特征）
-  attn_gate_norm    : "batch"        # 仅 skip_attention=true；门控内归一化；'auto'=跟随 norm_type | 'batch' | 'instance' | 'group'
-  deep_supervision  : true           # 开启后：多个 decoder 级都输出预测并计损失（逐级权重见 loss.deep_supervision_weights）
-  aux_topo_head     : false          # 仅 arch='unet'；开启后加中心线/距离场辅助头（拓扑监督，仅训练期前向，零推理开销）
-  aux_topo_target   : "centerline"   # 仅 aux_topo_head=true；辅助目标；'centerline'=软骨架（保拓扑） | 'distance'=到边界距离场
-  aux_topo_head_mode: "conv"         # 仅 aux_topo_head=true；头结构；'linear'=单 1×1 | 'conv'=3×3+1×1（细结构推荐）
+  norm_type               : "group"                   # 归一化层类型；'batch' | 'instance' | 'group'
+  norm_groups             : 8                         # 仅 norm_type='group'；组数（须整除通道数）
+  activation              : "leakyrelu"               # 激活函数；'relu' | 'leakyrelu' | 'gelu' | 'swish'
+  dropout                 : 0.0                       # dropout 比例；0=禁用
+  drop_path_rate          : 0.0                       # stochastic depth：训练时按此比例随机丢残差分支；0=禁用
 
-  stem_mode          : "conv3"       # 入口 stem；'conv3' | 'conv7' | 'dual'=双支 | 'patch2'/'patch4'=patch-embed 降 2/4 倍（主输出补插值上采）
-  decoder_type       : "unet"        # decoder 拓扑；'unet'=对称（默认） | 'unetpp'=嵌套稠密 | 'unet3p'=全尺度 skip
-  unet3p_cat_channels: 64            # 仅 decoder_type='unet3p'；各聚合分支通道数
-  downsample_mode    : "conv"        # 下采样方式；'conv' | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
-  upsample_mode      : "trilinear"   # 上采样方式；'transpose' | 'trilinear' | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
-  upsample_norm_act  : false         # 仅 upsample_mode∈{trilinear,nearest}；开启后插值+conv 之后再接 norm+act，使插值支路成为非线性变换
+  # ---- 拓扑：stem / decoder / 上下采样 / skip ----
+  stem_mode               : "conv3"                   # 入口 stem；'conv3' | 'conv7' | 'dual'=双支 | 'patch2'/'patch4'=patch-embed 降 2/4 倍（主输出补插值上采）
+  decoder_type            : "unet"                    # decoder 拓扑；'unet'=对称 | 'unetpp'=嵌套稠密 | 'unet3p'=全尺度 skip
+  unet3p_cat_channels     : 64                        # 仅 decoder_type='unet3p'；各聚合分支通道数
+  downsample_mode         : "conv"                    # 下采样方式；'conv' | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
+  downsample_strides      : []                        # 显式逐级下采样 stride，非空覆盖自动推导；长度=级数-1，每项长=spatial_dims，值∈{1,2}
+  anisotropic_pooling     : true                      # 按 patch_size 自动推导逐级 per-axis stride，薄轴分辨率落后才降采（nnU-Net 思路）；仅 decoder_type='unet' + downsample_mode∈{conv,maxpool,avgpool} + upsample_mode∈{transpose,trilinear,nearest}
+  upsample_mode           : "trilinear"               # 上采样方式；'transpose' | 'trilinear' | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
+  upsample_norm_act       : false                     # 仅 upsample_mode∈{trilinear,nearest}；插值+conv 之后再接 norm+act，使插值支路成为非线性变换
+  skip_mode               : "cat"                     # skip 融合方式；'cat'=拼接 | 'add'=相加
 
-  # 各向异性下采样：薄 z 轴时各向同性 ×2 会把 z 压得过快；开启后按 patch_size 自动推导逐级 per-axis stride，
-  # 薄轴分辨率落后才不降采样（nnU-Net 思路，保持各轴分辨率 2× 以内）。
-  # 仅支持 decoder_type='unet' + downsample_mode∈{conv,maxpool,avgpool} + upsample_mode∈{transpose,trilinear,nearest}。
-  anisotropic_pooling: true   # 开启后：自动推导各向异性 stride（见上）
-  downsample_strides : []     # 显式逐级下采样 stride，非空覆盖自动推导；长度=级数-1，每项长=spatial_dims，值∈{1,2}
+  # ---- 注意力（块内 / skip 门控） ----
+  attention_type          : "none"                    # 块内注意力；'none'=无 | 'se'=通道重标定 | 'eca' | 'cbam' | 'coord' | 'lka'=大核注意力（感受野≈21³） | 'msca'=多尺度条形核（适合细长结构）
+  se_reduction            : 16                        # 仅 attention_type='se'；SE 通道压缩比
+  skip_attention          : false                     # skip 连接上加 AttentionGate3D（用深层特征门控 skip 特征）
+  attn_gate_norm          : "batch"                   # 仅 skip_attention=true；门控内归一化；'auto'=跟随 norm_type | 'batch' | 'instance' | 'group'
 
-  skip_mode               : "cat"   # skip 融合方式；'cat'=拼接 | 'add'=相加
-  grad_checkpointing      : false   # 开启后：encoder/decoder 各 stage 反向重算激活，约 +20~33% 算力换激活显存大降（数值/收敛与关闭一致）
-  grad_ckpt_encoder_stages: []      # 仅 grad_checkpointing=true；逐 encoder stage 0/1 掩码；空=全部 stage 检查点；深层低分辨率 stage 可置 0 省重算
-  drop_path_rate          : 0.0     # stochastic depth：训练时按此比例随机丢残差分支；0=禁用
-  grn_enabled             : false   # 仅 backbone='convnext'/'mednext'；开启后块内加 GRN（零初始化，初始近恒等）
+  # ---- 监督头 ----
+  deep_supervision        : true                      # 多个 decoder 级都输出预测并计损失（逐级权重见 loss.deep_supervision_weights）
+  aux_topo_head           : false                     # 仅 arch='unet'；开启后加中心线/距离场辅助头（拓扑监督，仅训练期前向，零推理开销）
+  aux_topo_target         : "centerline"              # 仅 aux_topo_head=true；辅助目标；'centerline'=软骨架（保拓扑） | 'distance'=到边界距离场
+  aux_topo_head_mode      : "conv"                    # 仅 aux_topo_head=true；头结构；'linear'=单 1×1 | 'conv'=3×3+1×1（细结构推荐）
 
-  # ---- ConvNeXt 专属（取消注释并把 backbone 改为 "convnext" 才生效） ----
-  # convnext_layer_scale_init: 1.0e-6   # 层缩放初值；<=0 禁用
-  # convnext_downsample_lnfirst: true   # 开启后：下采样前先 LN（ConvNeXt 原版）；关=通用 Downsample（消融用）
+  # ---- 显存 ----
+  grad_checkpointing      : false                     # encoder/decoder 各 stage 反向重算激活，约 +20~33% 算力换激活显存大降（数值/收敛与关闭一致）
+  grad_ckpt_encoder_stages: []                        # 仅 grad_checkpointing=true；逐 encoder stage 0/1 掩码；空=全部 stage 检查点；深层低分辨率 stage 可置 0 省重算
 
-  # ---- MedNeXt 专属（取消注释并把 backbone 改为 "mednext" 才生效） ----
-  # mednext_expand_ratio: 4                    # 倒瓶颈扩张比 R（MedNeXt 用 2/3/4/8）
-  # mednext_kernel_size: 3                     # 深度卷积核大小（3 或 5）
-  # mednext_dilated_reparam: false             # 开启后：训练大核+多空洞分支并行，推理折叠为单核（零额外推理开销）
-  # mednext_dilated_reparam_kernel_sizes: []   # 显式分支核大小覆盖；空=默认分支集
-  # mednext_dilated_reparam_dilations: []      # 显式分支 dilation 覆盖；空=默认分支集
+  # ---- ConvNeXt / MedNeXt 专属 ----
+  grn_enabled             : false                     # 仅 backbone='convnext'/'mednext'；开启后块内加 GRN（零初始化，初始近恒等）
+
+  # ---- ConvNeXt 专属（把 backbone = "convnext" 才生效） ----
+  # convnext_layer_scale_init  : 1.0e-6   # 层缩放初值；<=0 禁用
+  # convnext_downsample_lnfirst: true     # 开启后：下采样前先 LN（ConvNeXt 原版）；关=通用 Downsample（消融用）
+
+  # ---- MedNeXt 专属（把 backbone = "mednext" 才生效） ----
+  # mednext_expand_ratio                : 4      # 倒瓶颈扩张比 R（MedNeXt 用 2/3/4/8）
+  # mednext_kernel_size                 : 3      # 深度卷积核大小（3 或 5）
+  # mednext_dilated_reparam             : false  # 开启后：训练大核+多空洞分支并行，推理折叠为单核（零额外推理开销）
+  # mednext_dilated_reparam_kernel_sizes: []     # 显式分支核大小覆盖；空=默认分支集
+  # mednext_dilated_reparam_dilations   : []     # 显式分支 dilation 覆盖；空=默认分支集
 
   # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone='resnet'） ----
-  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合，axes=hw 只在 H/W 膨胀。
-  multirf_enabled        : true              # 开启后：选定 stage 的残差块换成「多膨胀率并行分支→融合」块，同分辨率获多感受野（类 ASPP）
+  multirf_enabled        : true              # 选定 stage 的残差块换成「多膨胀率并行分支→融合」块，同分辨率获多感受野（类 ASPP）
   multirf_dilations      : [1, 2, 3]         # 各分支膨胀率；必须含 1（守门支路，抗网格效应/保细管）
-  multirf_mode           : "split"           # 分支通道分配；'split'=各分支均分通道（≈等成本，推荐） | 'parallel'=各分支全宽（≈N× 成本）
-  multirf_fusion         : "concat_proj"     # 分支融合；'concat_proj'=concat→1×1（推荐） | 'sum'=逐元素相加（需 parallel） | 'se'=concat→SE→1×1
+  multirf_mode           : "split"           # 分支通道分配；'split'=各分支均分通道（≈等成本） | 'parallel'=各分支全宽（≈N× 成本）
+  multirf_fusion         : "concat_proj"     # 分支融合；'concat_proj'=concat→1×1 | 'sum'=逐元素相加（需 parallel） | 'se'=concat→SE→1×1
   multirf_axes           : "hw"              # 膨胀作用轴；'hw'=仅 H/W、z 恒 dilation=1（各向异性数据推荐） | 'all'=D/H/W 全膨胀
   multirf_encoder_stages : [0, 0, 1, 1, 1]   # 编码器逐 stage 0/1 开关；长度须 = len(encoder_channels)；空=该侧全关
   multirf_decoder_stages : [0, 0, 0, 0]      # 解码器逐 level 0/1 开关；长度须 = len(encoder_channels)-1；空=全关；仅 decoder_type='unet'
-  multirf_branch_norm_act: true              # 开启后：各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除
+  multirf_branch_norm_act: true              # 各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除
 
   # ---- 自注意力（仅 backbone='resnet' 且 arch='unet'）：选定 stage 末尾追加自注意力残差块，全局 token 交互 ----
-  selfattn_enabled       : false       # 开启后：按下方 stages 列表在指定层追加自注意力块
+  selfattn_enabled       : false       # 按下方 stages 列表在指定层追加自注意力块
   selfattn_type          : "softmax"   # 全局默认注意力类型（逐层写 1 时沿用）；'softmax'=标准 O(N²)（放最深层） | 'linear'=O(N)（次深层） | 'window'=窗口内局部 | 'grid'=跨窗格稀疏
   selfattn_num_heads     : 4           # 头数；仅 selfattn_head_dim=-1 时使用
   selfattn_head_dim      : -1          # 每头维度；-1=自动（用 num_heads）；否则 heads = channels // head_dim
-  selfattn_zero_init     : true        # 开启后：输出投影零初始化，初始为恒等残差、几乎不扰动已调好的基线（强烈建议开）
-  selfattn_rope          : false       # 开启后：softmax 注意力加 RoPE 旋转位置编码（参数无关）
-  selfattn_ffn           : false       # 开启后：注意力后再接一层 GEGLU FFN 残差
+  selfattn_zero_init     : true        # 输出投影零初始化，初始为恒等残差、几乎不扰动已调好的基线（强烈建议开）
+  selfattn_rope          : false       # softmax 注意力加 RoPE 旋转位置编码
+  selfattn_ffn           : false       # 注意力后再接一层 GEGLU FFN 残差
   selfattn_ffn_ratio     : 4.0         # 仅 selfattn_ffn=true；FFN 扩张比
   selfattn_window_size   : 7           # 仅 type='window'；窗口边长
   selfattn_grid_size     : 7           # 仅 type='grid'；网格数
   selfattn_encoder_stages: []          # 编码器逐 stage 开关；0/'none'=关 | 1=用全局 type | 'softmax'/'linear'/'window'/'grid'=逐层指定；非空长度须 = len(encoder_channels)
   selfattn_decoder_stages: []          # 解码器逐 level 开关（取值同上）；非空长度须 = len(encoder_channels)-1；仅 decoder_type='unet'
+
   # 注：adm_* / edm2_* 为 2D(2.5D) 专属 arch 字段，3D 模板下永不生效，故不列（见 configs/seg2_5d.yaml）。
 
 loss:
@@ -203,42 +202,61 @@ loss:
   compound_weights        : [1.0, 1.0]                # 仅复合损失；两项权重 [loss1_w, loss2_w]
   class_weights           : [1.0, 1.0]                # 逐前景类损失权重；长度=前景类数；空=均匀
   region_weights          : [1.0, 2.0]                # 按 label 取值的空间权重（含 bg，最终权重=配置值+1）；空=禁用；data.region_weight_dir 优先
-  dice_smooth             : 1.0e-5                    # Dice 平滑项，防 0/0
-  dice_squared            : false                     # 开启后：Dice 分母用概率平方和（Dice² 变体）
-  focal_alpha             : 0.5                       # 仅含 'focal'；正类权重
-  focal_gamma             : 2.0                       # 仅含 'focal'；难样本聚焦指数
-  tversky_alpha           : 0.3                       # 仅含 'tversky'；FP 权重
-  tversky_beta            : 0.7                       # 仅含 'tversky'；FN 权重
-  batch_dice              : true                      # 开启后：全 batch+空间汇总 TP/分母后一次除（nnU-Net 式，稀疏前景推荐）；关=逐样本（空 GT 类 Dice≈1 稀释梯度）
-  ignore_empty            : false                     # 仅 batch_dice=false；开启后无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误
-  gdl_weight_type         : "square"                  # 仅含 'gdl'；体积加权；'square'=1/体积²（论文） | 'simple'=1/体积 | 'uniform'=等权
-  gdl_w_max               : 100000.0                  # 仅含 'gdl'；体积倒数权重上限（防小类爆权）
-  focal_tversky_gamma     : 1.3333333333333333        # 仅含 'focal_tversky'；(1-TI)^gamma 的 gamma（>=1）
-  lovasz_per_sample       : true                      # 仅含 'lovasz'；开=逐 (B,C) 排序取均；关=批级排序（小 patch 更平滑）
-  cldice_iter             : 3                         # 仅含 'cldice'；软骨架化迭代次数（2D 用 3，3D 取 3~10）
-  cldice_smooth           : 1.0                       # 仅含 'cldice'；平滑项
   deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]   # 仅 model.deep_supervision=true；逐级权重（高→低分辨率）
+
   aux_topo_weight         : 0.3                       # 仅 model.aux_topo_head=true；辅助拓扑损失权重（总损失 += w * topo_loss）
   aux_topo_iter           : 3                         # 仅 model.aux_topo_head=true；软骨架/距离场迭代步数（2D 用 3，3D 取 3~10）
   aux_topo_loss           : "auto"                    # 仅 model.aux_topo_head=true；'auto'=centerline→soft-dice、distance→smooth_l1 | 'dice' | 'bce' | 'smooth_l1' | 'mse'
 
+  dice_smooth             : 1.0e-5                    # Dice 平滑项，防 0/0
+  dice_squared            : false                     # Dice 分母用概率平方和（Dice² 变体）
+
+  focal_alpha             : 0.5                       # 仅含 'focal'；正类权重
+  focal_gamma             : 2.0                       # 仅含 'focal'；难样本聚焦指数
+
+  tversky_alpha           : 0.3                       # 仅含 'tversky'；FP 权重
+  tversky_beta            : 0.7                       # 仅含 'tversky'；FN 权重
+
+  gdl_weight_type         : "square"                  # 仅含 'gdl'；体积加权；'square'=1/体积²（论文） | 'simple'=1/体积 | 'uniform'=等权
+  gdl_w_max               : 100000.0                  # 仅含 'gdl'；体积倒数权重上限（防小类爆权）
+
+  focal_tversky_gamma     : 1.3333333333333333        # 仅含 'focal_tversky'；(1-TI)^gamma 的 gamma（>=1）
+
+  lovasz_per_sample       : true                      # 仅含 'lovasz'；开=逐 (B,C) 排序取均；关=批级排序（小 patch 更平滑）
+
+  cldice_iter             : 3                         # 仅含 'cldice'；软骨架化迭代次数（2D 用 3，3D 取 3~10）
+  cldice_smooth           : 1.0                       # 仅含 'cldice'；平滑项
+
+  batch_dice              : true                      # 全 batch+空间汇总 TP/分母后一次除；关=逐样本（空 GT 类 Dice≈1 稀释梯度）
+  ignore_empty            : false                     # 仅 batch_dice=false；开启后无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误
+
+
 train:
+  # ---- 基本 ----
   epochs                       : 2                  # 总训练轮数
+  seed                         : 42                 # 全局随机种子
+  deterministic                : false              # cudnn 确定性算法，结果可复现但更慢
   gpus                         : [0]                # 物理卡号列表（如 [0,2]）；[]/单元素=单卡（或 CPU），len>1 才进入 DDP
-  ddp_find_unused_parameters   : true               # 仅 DDP；开启后每步扫描未参与反传的参数（多头/深监督保正确）；确认全参与时关掉可提速
-  ddp_static_graph             : false              # 仅 DDP；开启后声明计算图固定，免每步 unused-parameter 遍历并启用图级优化；建议配 find_unused_parameters=false
-  ddp_gradient_as_bucket_view  : false              # 仅 DDP；开启后 grad 直接作为通信 bucket 的 view，省约 1× 梯度显存（数学等价）
+  output_dir                   : "outputs/base3d"   # 输出根目录（checkpoint/日志/可视化/监控）
+
+  # ---- DDP 多卡 ----
+  ddp_find_unused_parameters   : true               # 仅 DDP；每步扫描未参与反传的参数（多头/深监督保正确）；确认全参与时关掉可提速
+  ddp_static_graph             : false              # 仅 DDP；声明计算图固定，免每步 unused-parameter 遍历并启用图级优化；建议配 find_unused_parameters=false
+  ddp_gradient_as_bucket_view  : false              # 仅 DDP；grad 直接作为通信 bucket 的 view，省约 1× 梯度显存（数学等价）
   ddp_master_port              : 0                  # 仅 DDP；rendezvous 端口；0=自动挑空闲端口（混用机防冲突）
-  ddp_scale_dataloader_per_rank: true               # 仅 DDP；开启后每卡 num_workers 平摊为 1/world_size，全机总 worker 数/缓存 RAM 与单卡一致
+  ddp_scale_dataloader_per_rank: true               # 仅 DDP；每卡 num_workers 平摊为 1/world_size，全机总 worker 数/缓存 RAM 与单卡一致
   ddp_timeout_minutes          : 30                 # 仅 DDP；NCCL 集合通信超时（分钟），超时 watchdog abort 防某 rank 挂死后其余永久等待
-  zero_redundancy_optimizer    : false              # 仅 DDP；开启后 ZeRO-1 优化器状态分片，每卡省 2×参数×4B×(1-1/N)（数值严格等价）；单卡忽略并告警
-  val_every                    : 1                  # 每多少 epoch 验证一次
+  zero_redundancy_optimizer    : false              # 仅 DDP；ZeRO-1 优化器状态分片，每卡省 2×参数×4B×(1-1/N)（数值严格等价）；单卡忽略并告警
+
+  # ---- 优化器 ----
   optimizer                    : "adamw"            # 优化器；'adam' | 'adamw' | 'sgd'
-  adamw_fused                  : true               # 开启后：CUDA 下用 fused AdamW，单 kernel 更新全部参数（数值等价提速）
+  adamw_fused                  : true               # CUDA 下用 fused AdamW，单 kernel 更新全部参数（数值等价提速）
   lr                           : 1.0e-3             # 初始学习率
   weight_decay                 : 1.0e-4             # 权重衰减
   momentum                     : 0.99               # 仅 optimizer='sgd'；动量
-  nesterov                     : true               # 仅 optimizer='sgd'；开启后用 Nesterov 动量
+  nesterov                     : true               # 仅 optimizer='sgd'；用 Nesterov 动量
+
+  # ---- 学习率调度 ----
   scheduler                    : "cosine"           # 学习率调度；'cosine' | 'cosine_warm_restarts' | 'poly' | 'step' | 'plateau' | 'one_cycle'
   warmup_epochs                : 5                  # 线性 warmup 轮数；one_cycle 下必须 0（自带 pct_start）
   warmup_lr                    : 1.0e-6             # warmup 起始学习率
@@ -250,81 +268,104 @@ train:
   step_gamma                   : 0.1                # 仅 scheduler='step'；每次衰减倍率
   plateau_patience             : 10                 # 仅 scheduler='plateau'；容忍无提升的验证次数（单位=验证次数，非 epoch）
   plateau_factor               : 0.5                # 仅 scheduler='plateau'；触发时 lr 乘的系数
+
+  # ---- 梯度 ----
   grad_accum_steps             : 1                  # 梯度累积步数；等效 batch = batch_size × 此值（batch 池化损失统计窗口仍是单 micro-batch）
   grad_clip_norm               : 12.0               # 全局梯度范数裁剪上限；0=禁用
-  grad_norm_lazy_sync          : false              # 开启后：fp16+GradScaler 且健康监控关闭（范数无消费者）时跳过范数的 GPU→CPU 同步；其余路径行为不变（数值等价）
-  use_amp                      : true               # 开启后：混合精度训练（省显存提速；损失恒 fp32 计算）
+  grad_norm_lazy_sync          : false              # fp16+GradScaler 且健康监控关闭（范数无消费者）时跳过范数的 GPU→CPU 同步；其余路径行为不变（数值等价）
+
+  # ---- 混合精度 / 编译 / 显存 ----
+  use_amp                      : true               # 混合精度训练（省显存提速；损失恒 fp32 计算）
   amp_dtype                    : "bfloat16"         # 仅 use_amp=true；低精度类型；'auto'=Ampere+ 自动选 bf16 否则 fp16 | 'bfloat16'/'bf16'=免 GradScaler | 'float16'/'fp16'=需 GradScaler
   compile_mode                 : "none"             # torch.compile 编译级别；'none'=不编译 | 'default' | 'reduce-overhead' | 'max-autotune'
-  channels_last                : false              # 开启后：训练用 channels_last 内存排布（数值等价，Ampere+ 卷积可能提速，需 benchmark）
-  cuda_expandable_segments     : false              # 开启后：CUDA allocator 用 expandable segments，缓解形状多变场景的显存碎片（PyTorch 2.1+，旧驱动自动回退）
+  channels_last                : false              # 训练用 channels_last 内存排布（数值等价，Ampere+ 卷积可能提速，需 benchmark）
+  cuda_expandable_segments     : false              # CUDA allocator 用 expandable segments，缓解形状多变场景的显存碎片（PyTorch 2.1+，旧驱动自动回退）
   val_empty_cache              : null               # 整卷验证前后 empty_cache 归还缓存块、防滑窗大累加器碎片 OOM；null=自动（high 开/medium 关） | true | false
-  use_ema                      : true               # 开启后：维护权重指数滑动平均（EMA）副本用于验证/选模
+
+  # ---- EMA / SWA 权重平均 ----
+  use_ema                      : true               # 维护权重指数滑动平均（EMA）副本用于验证/选模
   ema_decay                    : 0.999              # 仅 use_ema=true；EMA 衰减系数（越大越平滑）
-  ema_warmup                   : true               # 仅 use_ema=true；开启后早期用较小 decay 爬坡（timm 式），防随机初始权重拖累 shadow
+  ema_warmup                   : true               # 仅 use_ema=true；早期用较小 decay 爬坡（timm 式），防随机初始权重拖累 shadow
   ema_device                   : ""                 # 仅 use_ema=true；shadow 存放位置；""=跟随模型设备 | 'cpu'=常驻 pinned CPU，省 1× 参数显存（严格等价，每步多一次异步拷贝）
-  swa_enabled                  : false              # 开启后：训练尾段等权权重平均（SWA），收尾重估 BN 并另存 swa_model.pth；与 EMA 正交可叠加，不影响选模
+  swa_enabled                  : false              # 训练尾段等权权重平均（SWA），收尾重估 BN 并另存 swa_model.pth；与 EMA 正交可叠加，不影响选模
   swa_start_ratio              : 0.75               # 仅 swa_enabled=true；开始平均的训练进度比例，(0,1) 开区间（0.75=最后 25% epoch 参与）
   swa_bn_update_steps          : 50                 # 仅 swa_enabled=true；收尾 BN 统计重估用 train batch 数；<=0 跳过（无 BN 自动跳过）
-  output_dir                   : "outputs/base3d"   # 输出根目录（checkpoint/日志/可视化/监控）
-  save_every                   : 10                 # 每多少 epoch 存一次周期 checkpoint
-  save_keep_last               : 3                  # 仅保留最近 k 个周期 checkpoint（best_model.pth 不受影响）；<=0=全保留
-  save_async                   : false              # 开启后：checkpoint 由后台线程写盘、不阻塞训练；代价是保存时刻多一份 CPU 内存快照
+
+  # ---- 验证与选模 ----
+  val_every                    : 1                  # 每多少 epoch 验证一次
+  val_metric_mode              : "medium"           # 指标在什么预测上算；'medium'=val 随机 patch 上（快，偏乐观/抖动） | 'high'=整卷滑窗推理后（最可靠，更慢）
+  val_metric_bbox_crop         : false              # 仅 val_metric_mode='high'；指标计算前按 pred∪GT bbox 裁剪（严格等价，省算省显存）
   save_best_criterion          : "dice"             # 选模标准（看哪个指标）；'loss'=val_loss↓ | 'dice'=mean_dice↑ | 'iou'↑ | 'mcc'↑（类不平衡稳健） | 'min_dice'=最差类↑ | 'dice+surface_dice'↑ | 'balanced'=四指标调和均值↑
   surface_dice_tolerance       : 1                  # 仅 criterion∈{dice+surface_dice, balanced}；表面容差（体素，Chebyshev；0=严格表面）
   surface_dice_weight          : 0.5                # 仅 criterion='dice+surface_dice'；combined = (1-w)*dice + w*sd 的 w
   save_best_preset             : ""                 # 任务预设，非空时一键覆盖上面三项；空=不启用；'lung'|'vessel'|'airway'|'bone_multi'|'lymph_node'|'lesion_small'|'oar_multi'|'heart_chamber'|'bone_lung_combined'
-  val_metric_mode              : "medium"           # 指标在什么预测上算；'medium'=val 随机 patch 上（快，偏乐观/抖动） | 'high'=整卷滑窗推理后（最可靠，更慢）
-  val_metric_bbox_crop         : false              # 仅 val_metric_mode='high'；开启后指标计算前按 pred∪GT bbox 裁剪（严格等价，省算省显存）
   early_stopping               : 15                 # 连续 N 次验证无提升即停；0=禁用（单位=验证次数，非 epoch）
+
+  # ---- checkpoint 保存 ----
+  save_every                   : 10                 # 每多少 epoch 存一次周期 checkpoint
+  save_keep_last               : 3                  # 仅保留最近 k 个周期 checkpoint（best_model.pth 不受影响）；<=0=全保留
+  save_async                   : false              # checkpoint 由后台线程写盘、不阻塞训练；代价是保存时刻多一份 CPU 内存快照
+
+  # ---- 日志 ----
   log_every                    : 10                 # 每多少 micro-step 记录一次训练 loss
   vis_every                    : 10                 # 每多少 epoch 保存一次可视化
-  seed                         : 42                 # 全局随机种子
-  deterministic                : false              # 开启后：cudnn 确定性算法，结果可复现但更慢
+
+  # ---- 恢复 / 预训练 ----
   resume                       : ""                 # checkpoint 路径，完整恢复训练状态（model/optim/sched/ema/rng）；空=从头训
   pretrain                     : ""                 # 权重路径，仅加载 model 权重做初始化（迁移学习）；resume 存在时被忽略
-  pretrain_strict              : false              # 开启后：严格匹配加载；关=允许 head 形状不一致（跳过不匹配层）
-  pretrain_load_ema            : false              # 开启后：ckpt 含 EMA shadow 时优先取 shadow 作初始权重
-  pretrain_upkern              : false              # 仅 backbone='mednext'；开启后预训练深度卷积权重按当前 kernel_size 做 UpKern 插值迁移（k=3→5 等）
-  reparam_deploy               : false              # 仅 backbone='mednext'；开启后推理加载权重时先把可重参数化深度卷积折叠为单核 deploy 形态
+  pretrain_strict              : false              # 严格匹配加载；关=允许 head 形状不一致（跳过不匹配层）
+  pretrain_load_ema            : false              # ckpt 含 EMA shadow 时优先取 shadow 作初始权重
+  pretrain_upkern              : false              # 仅 backbone='mednext'；预训练深度卷积权重按当前 kernel_size 做 UpKern 插值迁移（k=3→5 等）
+  reparam_deploy               : false              # 仅 backbone='mednext'；推理加载权重时先把可重参数化深度卷积折叠为单核 deploy 形态
 
 predict:
+  # ---- 滑窗核心 ----
   z_overlap           : 0.5             # 相邻滑窗重叠比（0~0.95）；越大越平滑越慢
   blend_mode          : "gaussian"      # 重叠区融合权重；'gaussian'=中心高边缘低（推荐） | 'average'=等权平均
   batch_size          : 2               # 滑窗推理每次前向的窗口数
-  tta_flip            : false           # 开启后：翻转 TTA，各翻转变体预测取平均（3D 翻 D/H/W 共 8× 前向）
+
+  # ---- TTA 与阈值 ----
+  tta_flip            : false           # 翻转 TTA，各翻转变体预测取平均（3D 翻 D/H/W 共 8× 前向）
   tta_batch_size      : 1               # 仅 tta_flip=true；每次前向合并的 flip 变体数（显存≈batch_size×此值）；null=退化为 batch_size
   threshold           : 0.5             # sigmoid 二值化阈值；标量全类共享或逐前景类列表（小结构类宜偏低）；前景最大概率<阈值 → 背景
+
+  # ---- 精度 / 显存 ----
   acc_dtype           : "fp32"          # 滑窗概率累加器精度；'fp32' | 'fp16'=大卷×多类显存减半（blend 归一后精度足够）
   vol_dtype           : "fp32"          # GPU 常驻整卷张量存储精度；'fp32' | 'fp16'=常驻显存减半（取窗时升回 fp32，仅存储量化 ~1e-3 级）
-  accumulate_on_cpu   : false           # 开启后：概率累加器放 CPU（大卷 OOM 逃生门；每 batch 多一次 GPU→CPU 拷贝，用速度换显存）
-  cudnn_benchmark     : false           # 开启后：独立 CLI 推理开 cudnn.benchmark，首 batch 自动选优卷积算法（滑窗形状固定最适合）
-  use_inference_mode  : false           # 开启后：前向用 inference_mode 替代 no_grad，免 autograd 簿记（数值等价纯提速；AdaBN 估计期自动回退）
-  channels_last       : false           # 开启后：推理侧 channels_last 内存排布（数值等价，Ampere+ 可能提速，需 benchmark）
-  skip_empty_windows  : false           # 开启后：滑窗跳过纯背景窗（归一化后窗内 max<=阈值 → 不前向，概率保持 0；空气窗预测本应≈0，差异可忽略）
+  accumulate_on_cpu   : false           # 概率累加器放 CPU（大卷 OOM 逃生门；每 batch 多一次 GPU→CPU 拷贝，用速度换显存）
+
+  # ---- 提速开关 ----
+  cudnn_benchmark     : false           # 独立 CLI 推理开 cudnn.benchmark，首 batch 自动选优卷积算法（滑窗形状固定最适合）
+  use_inference_mode  : false           # 前向用 inference_mode 替代 no_grad，免 autograd 簿记（数值等价纯提速；AdaBN 估计期自动回退）
+  channels_last       : false           # 推理侧 channels_last 内存排布（数值等价，Ampere+ 可能提速，需 benchmark）
+  skip_empty_windows  : false           # 滑窗跳过纯背景窗（归一化后窗内 max<=阈值 → 不前向，概率保持 0；空气窗预测本应≈0，差异可忽略）
   skip_empty_threshold: 0.0             # 仅 skip_empty_windows=true；跳窗判据（minmax 归一化下 0.0=整窗钳底空气，判据保守；zscore 需自行调阈）
-  output_dir          : "predictions"   # 预测结果输出目录
-  save_probabilities  : false           # 开启后：除二值 mask 外另存概率图
-  adabn_enabled       : false           # 仅 model.norm_type='batch'；开启后推理时用目标域数据重估 BN 统计（对抗域漂移，无需标签不重训）
+
+  # ---- AdaBN 域适应 ----
+  adabn_enabled       : false           # 仅 model.norm_type='batch'；推理时用目标域数据重估 BN 统计（对抗域漂移，无需标签不重训）
   adabn_mode          : "global"        # AdaBN 统计来源；'global'=先用 N 卷预热一次全程复用 | 'per_volume'=每卷各自重估再冻结预测
   adabn_num_volumes   : 8               # 仅 adabn_mode='global'；预热用的目标域卷数
 
+  # ---- 输出 ----
+  output_dir          : "predictions"   # 预测结果输出目录
+  save_probabilities  : false           # 除二值 mask 外另存概率图
+
 vis:
-  enabled          : true                           # 开启后：训练启动时导出自包含 HTML（数据流/模型流/预测流三视图，CPU dummy 生成）；关=零开销
+  enabled          : true                           # 训练启动时导出自包含 HTML（数据流/模型流/预测流三视图，CPU dummy 生成）；关=零开销
   output_dir       : ""                             # 输出目录；空 => train.output_dir/visualization/
   filename         : "pipeline_vis.html"            # 输出 HTML 文件名（单文件多标签页）
   flows            : ["data", "model", "predict"]   # 生成的视图子集，顺序即标签页顺序；可选 'data' | 'model' | 'predict'
-  trace_shapes     : true                           # 开启后：CPU dummy 前向 + hook 追踪模型流真实张量形状；关=纯结构图
+  trace_shapes     : true                           # CPU dummy 前向 + hook 追踪模型流真实张量形状；关=纯结构图
   max_detail_params: 200                            # 单节点详情面板最多展示的参数条数（防爆）
 
 monitor:
-  enabled                      : true                      # 开启后：逐 epoch 落盘指标 jsonl + 周期渲染训练仪表盘 HTML（失败被隔离不中断训练）；关=零开销
+  enabled                      : true                      # 逐 epoch 落盘指标 jsonl + 周期渲染训练仪表盘 HTML（失败被隔离不中断训练）；关=零开销
   output_dir                   : ""                        # 输出目录；空 => train.output_dir/monitor
   filename                     : "training_monitor.html"   # 仪表盘 HTML 文件名
   update_every                 : 1                         # 每多少 epoch 重渲染 HTML（jsonl 每 epoch 都写；best 刷新/收尾强制重渲染）
   auto_reload_seconds          : 10                        # HTML 自动刷新间隔（秒）；<=0=关闭（训练后静态复看）
   run_name                     : ""                        # 图例/标题显示名；空 => 取 output_dir 末级目录名
   compare_runs                 : []                        # 训练结束后生成多 run 对比 HTML 的参照 run 目录列表；空=不生成
-  health_monitor               : true                      # 开启后：逐 epoch 聚合梯度范数/非有限步计数/裁剪比例/权重范数/scaler 标度等健康指标（成本极低）
-  health_grad_norm_when_no_clip: true                      # 仅 health_monitor=true；开启后未开 grad_clip 时也每优化步算一次梯度范数；关=不记录（零额外开销）
-  health_update_ratio          : false                     # 仅 health_monitor=true；开启后每 epoch 首个优化步测一次 ‖Δw‖/‖w‖（健康区间≈1e-3；瞬时多一份参数显存）
+  health_monitor               : true                      # 逐 epoch 聚合梯度范数/非有限步计数/裁剪比例/权重范数/scaler 标度等健康指标（成本极低）
+  health_grad_norm_when_no_clip: true                      # 仅 health_monitor=true；未开 grad_clip 时也每优化步算一次梯度范数；关=不记录（零额外开销）
+  health_update_ratio          : false                     # 仅 health_monitor=true；每 epoch 首个优化步测一次 ‖Δw‖/‖w‖（健康区间≈1e-3；瞬时多一份参数显存）
