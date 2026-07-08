@@ -65,12 +65,14 @@ data:
 
   foreground_oversample_ratio: 0.3   # 前景中心采样概率
   samples_per_volume         : 8     # 每卷每 epoch 样本数
+  val_grid_coverage          : false # 仅 val split；medium 验证 patch 位置改用确定性均匀网格（epoch 间指标更可比）
 
   cache_mode       : "memory"   # 'none' | 'memory'
   cache_max_volumes: 2          # 0 = 不限（可能 OOM）
 
 augment:
   enabled                     : true            # 总开关
+  inplace                     : false           # 就地增强快路径：跳过入口 clone，省一份 batch 体积瞬时显存
   random_flip_prob            : 0.2             # 随机翻转概率
   random_flip_axes            : [2, 3, 4]       # D,H,W；D-flip 仅训练阶段
   random_affine_prob          : 0.3             # 仿射概率
@@ -108,11 +110,13 @@ model:
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]           # 长度 == len(encoder_channels)
   decoder_blocks_per_stage: [2, 2, 2, 2]              # 长度 == len(encoder_channels)-1
   resenc_preset           : "none"                    # 'none' | 'S' | 'M' | 'L' | 'XL'
+  block_type              : "basic"                   # 仅 resnet；'basic' | 'preact' | 'bottleneck' | 'r2plus1d'(需 3D)
   lift_2_5d_to_3d         : false                     # 是否真的折叠成 3D
   norm_type               : "batch"                   # 'instance' | 'batch' | 'group'
   norm_groups             : 8                         # 仅 group norm
   activation              : "leakyrelu"               # 'leakyrelu' | 'gelu' | 'relu'
   dropout                 : 0.0                       # dropout 比例
+  se_reduction            : 16                        # SE reduction ratio；仅 attention_type='se'
   attention_type          : "none"                    # 'none' | 'se' | 'eca' | 'cbam' | 'coord' | 'lka' | 'msca'
   skip_attention          : false                     # Skip 路 AttentionGate3D
   attn_gate_norm          : "batch"                   # 仅 skip_attention=true
@@ -125,11 +129,15 @@ model:
   stem_mode               : "dual"                    # 'conv3' | 'conv7' | 'dual' | 'patch2' | 'patch4'
   stem_fusion_mode        : "multi_stem_proj"         # 'multi_stem_proj' | 'hierarchical' | 'shared_stem'
   decoder_type            : "unet"                    # 'unet' | 'unetpp' | 'unet3p'
+  unet3p_cat_channels     : 64                        # 仅 decoder_type='unet3p'
   downsample_mode         : "conv"                    # 'conv' | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
   upsample_mode           : "trilinear"               # 'transpose' | 'trilinear' | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
   upsample_norm_act       : true                      # 仅 trilinear/nearest
   skip_mode               : "cat"                     # 'cat' | 'add'
+  anisotropic_pooling     : false                     # 按 patch_size 自动推导逐级 per-axis stride；2.5D 下仅作用于 H/W（通常无实质变化）
   downsample_strides      : []                        # 非空时显式覆盖自动推导；每项值∈{1,2}
+  grad_checkpointing      : false                     # 是否启用梯度检查点
+  grad_ckpt_encoder_stages: []                        # 仅 grad_checkpointing=true；逐 encoder stage 0/1，空=全部 stage
   drop_path_rate          : 0.0                       # 通用（训练时对残差分支做随机深度）
   grn_enabled             : false                     # 仅 backbone='convnext'/'mednext'
 
@@ -213,11 +221,15 @@ train:
   epochs                       : 2                # 训练轮数
   gpus                         : [0]              # 要用的物理卡号列表；len(gpus)>1 时才进入 DDP
   ddp_find_unused_parameters   : true             # 仅 len(gpus)>1
+  ddp_static_graph             : false            # 仅 len(gpus)>1；计算图逐步固定时可开，免每步 unused-parameter 遍历（建议配 find_unused_parameters=false）
+  ddp_gradient_as_bucket_view  : false            # 仅 len(gpus)>1；grad 直接作为通信 bucket 的 view，省约 1× 梯度显存（数学等价）
   ddp_master_port              : 0                # 仅 len(gpus)>1
   ddp_scale_dataloader_per_rank: true             # 仅 len(gpus)>1
   ddp_timeout_minutes          : 30               # 仅 len(gpus)>1
+  zero_redundancy_optimizer    : false            # 仅 len(gpus)>1；ZeRO-1 优化器状态分片（数值严格等价），单卡忽略并告警
   val_every                    : 1                # 每隔多少 epoch 做验证
   optimizer                    : "adamw"          # 'adam' | 'adamw' | 'sgd'
+  adamw_fused                  : true             # CUDA 下用 fused AdamW，单 kernel 更新全部参数
   lr                           : 1.0e-3
   weight_decay                 : 1.0e-4
   momentum                     : 0.99             # 仅 optimizer='sgd'
@@ -235,24 +247,30 @@ train:
   plateau_factor               : 0.5              # 仅 scheduler='plateau'
   grad_accum_steps             : 1                # 等效 batch = batch_size * grad_accum_steps
   grad_clip_norm               : 12.0             # 0 = 禁用
+  grad_norm_lazy_sync          : false            # 仅 fp16+GradScaler 且健康监控关闭时跳过范数的 D2H 同步（数值等价）
   use_amp                      : true             # 是否使用 AMP
   amp_dtype                    : "auto"           # 'auto' | 'bf16' | 'fp16' | 'fp32'；仅 use_amp=true
   compile_mode                 : "default"        # 'none' | 'default' | 'reduce-overhead' | 'max-autotune'
   channels_last                : false            # 是否启用 channels_last
+  cuda_expandable_segments     : false            # CUDA allocator expandable segments，缓解形状多变场景的显存碎片
+  val_empty_cache              : null             # 整卷验证前后 empty_cache；null=自动（high 开/medium 关）| true | false
   use_ema                      : true             # 是否启用 EMA
   ema_decay                    : 0.999            # 仅 use_ema=true
   ema_warmup                   : true             # 仅 use_ema=true
+  ema_device                   : ""               # 仅 use_ema=true；""=跟随模型设备 | 'cpu'=shadow 常驻 pinned CPU，省 1× 参数显存（严格等价）
   swa_enabled                  : false            # SWA 尾段等权权重平均（与 EMA 正交可叠加）
   swa_start_ratio              : 0.75             # 仅 swa_enabled=true；开始平均的进度比例 (0,1)
   swa_bn_update_steps          : 50               # 仅 swa_enabled=true；收尾 BN 统计重估 batch 数（无 BN 自动跳过）
   output_dir                   : "outputs/base"
   save_every                   : 10               # 每隔多少 epoch 保存一次
   save_keep_last               : 3                # 保留最近多少个 checkpoint
+  save_async                   : false            # 异步 checkpoint 保存（后台线程写盘，不阻塞训练；多占一份 CPU 内存快照）
   save_best_criterion          : "dice"           # 'loss' | 'dice' | 'iou' | 'mcc' | 'min_dice' | 'dice+surface_dice' | 'balanced'；save_best_metric/mode 由此派生
   surface_dice_tolerance       : 1                # 仅 criterion ∈ {dice+surface_dice, balanced}
   surface_dice_weight          : 0.5              # 仅 criterion='dice+surface_dice'
   save_best_preset             : ""               # 非空时覆盖上面三项；'lung'|'vessel'|'airway'|'bone_multi'|'lymph_node'|'lesion_small'|'oar_multi'|'heart_chamber'|'bone_lung_combined'
   val_metric_mode              : "medium"         # 'medium' | 'high'
+  val_metric_bbox_crop         : false            # 仅 val_metric_mode='high'；指标计算前按 pred∪GT bbox 裁剪（严格等价，省算省显存）
   early_stopping               : 15               # 0 = 禁用
   log_every                    : 10               # 训练 loss 记录（micro-step）
   vis_every                    : 10               # 每隔多少 epoch 可视化一次
@@ -263,6 +281,7 @@ train:
   pretrain_strict              : false            # false 允许 head 形状不一致
   pretrain_load_ema            : false            # ckpt 含 EMA 时是否优先取 shadow
   pretrain_upkern              : false            # 仅 backbone='mednext'；预训练深度卷积权重做 UpKern 插值
+  reparam_deploy               : false            # 仅 backbone='mednext'；推理前将可重参数化深度卷积折叠为 deploy 形态
 
 predict:
   z_interleave_enabled   : true            # 仅 2.5D；启用 z 轴 interleave 推理
@@ -278,7 +297,13 @@ predict:
   tta_batch_size         : 1               # 仅 tta_flip=true
   threshold              : 0.5             # 前景类最大概率 < threshold 则归背景
   acc_dtype              : "fp32"          # 'fp32' | 'fp16'
+  vol_dtype              : "fp32"          # 'fp32' | 'fp16'；GPU 常驻整卷张量存储精度（fp16 减半常驻显存，取窗时升回 fp32）
   accumulate_on_cpu      : false           # 是否在 CPU 累积推理结果
+  cudnn_benchmark        : false           # 独立 CLI 推理开启 cudnn.benchmark（滑窗形状固定，首 batch 自动选优）
+  use_inference_mode     : false           # 前向用 inference_mode 替代 no_grad（数值等价，纯提速；AdaBN 估计期自动回退）
+  channels_last          : false           # 推理侧 channels_last 内存排布（数值等价，Ampere+ 可能提速，需 benchmark）
+  skip_empty_windows     : false           # 滑窗跳过纯背景窗（归一化后窗内 max<=阈值 → 不前向，概率保持 0）
+  skip_empty_threshold   : 0.0             # 仅 skip_empty_windows=true；跳窗判据（minmax 归一化下 0.0=整窗钳底空气）
   output_dir             : ""
   save_probabilities     : false           # 是否同时保存概率图
 
