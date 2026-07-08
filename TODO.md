@@ -146,7 +146,489 @@ gentask 工程质量高但仍带分割起源骨架 + 「HR+器官label→合成L
 - 第4层(工程)：续训(M14)/3D滑窗(M15)/缓存(M1)/死代码/命名/stale docs。
 建议顺序：先定契约 → 补多FOV+中心裁+几何增强管线 → 落地经典 SISR+真正增采头(先 1b 面内超分风险最低，再 1a z-SISR/VFI 借鉴 CT 专用切片插值) → 修 bug/真实性/评估推理 → 补工程完整性。
 
-审查完成（R1–R6 全部完成；本任务全程未改动任何项目代码/文档，仅记录进展）。
+审查完成（R1–R6 全部完成；审查阶段未改动任何项目代码/文档，仅记录进展）。
+
+## 复检对账（2026-07-08，对照当前代码逐条核验）
+自审查以来代码已大量整改（新增 data/augment.py、trainer/views.py、trainer/pipelines/{base,vanilla,stacked,native_d,factory}.py 等）。逐条核验结果如下。
+
+### 已修复（核验确认）
+- H1+H5 多FOV/oversample/增强管线：完整落地。GPU 增强（augment.py：flip/affine+elastic 融合单次 warp/grid-dropout + 强度类，image/cond/wmap 同步）在 max-FOV cube 上执行 → pipelines 中心裁过采样余量 → 逐视图拆分/resize/打包（vanilla/stacked/native_d 三管线，factory 与 build_topology 决策对齐）。R6-①契约漂移同步解除。
+- H6 spatial_dims：generation.py:227 改由 topology.spatial_dims 单一真相源；sync() 统一写回 model._spatial_dims。R6-②解除。
+- M1 缓存：VolumeCache 有 cache_max_volumes 上限（LRU）。
+- M2 z 采样：z 抽取走 edge-pad 路径（_extract_z_patch_padded），不再中心夹带来的重复/错位。
+- M5 decimate：改相位对齐线性插值（_phase_aligned_linear_upsample），保留帧逐体素精确保留（lr[k*sc]==hr[k*sc]），无相位偏移；噪声施加在保留帧（LR 域）。
+- M12 累积调度：horizon 按优化器步 ceil(steps/accum) 计（gen_trainer.py:79-93）；one_cycle 自动禁用外层 warmup（原 L 项 one_cycle 冲突一并解除）。
+- M19 校验放行：validate 已补 keep_native_view_depth / keep_native_multi_res / multi_res 组合、whole 模式限制等；diffusion×多视图在 trainer fit 入口显式拒绝。
+- L 项部分：diffusion+arch=unet 已在 validate 拦截；_extract_z_single 已被实际调用（不再是死分支）。
+
+### 部分修复
+- H3/H4 数据契约：npz 新增 cond 槽位（cond_dirs → 与 image 同 bbox 裁剪、独立归一化、训练/推理全链路可用），真实 LR 可作为条件体进入模型。但契约主体未变：image 仍必须是干净 HR（make_data 仍强制 image==label 同 shape）、训练输入 LR 仍 100% 在线合成——「真实 LR 直接作为网络输入」的配对训练仍不支持，仅有 cond 旁路。
+- M9 3D 扩散：仍不可用，但已由 validate 显式拦截（diffusion 限 2.5D、禁 lift），从"静默崩溃"降级为"显式拒绝"。
+- M13 验证口径：PSNR 改逐图平均（recon.py:163-171，SR 标准口径）；data_range 与 normalize 匹配（minmax=1.0 / zscore=2.0），zscore 不再错误 clamp。仍是 patch 级验证（非整卷、与部署不一致）——剩余部分未做。
+
+### 仍未处理（对齐原编号）
+- 阻塞 TODO 1：H2（z_axis/2_5d 面内整幅 resize 到 patch 尺寸，不保留原生面内像素；1b 需用 cubic 模式规避）、H7（无专用 SISR/VFI 架构，factory 仍仅 unet/adm/edm2）、H8（整网同尺寸 in→out，无 post-upsampling 增采头）、H9（推理直接 restore，真实厚层输入不重采样到 HR 网格、z 维不增采——核心缺口）。
+- 真实性/效果：M4（无 SSP/高斯层敏感度剖面核）、M6（无随机退化池）、M7（npz 不烘 spacing、sr_scale 固定 int）、M8（扩散数据尺度 minmax[0,1] vs 零中心假设，validate 亦无警告）、M3（面内无过采样余量，z_axis/2_5d 仅 z 有余量；grid_sample border padding 部分缓解）。
+- 工程：M10（EDM sampler=='ddim' 实为关 Heun 的 Euler，命名误导仍在）、M14（TrainConfig 有 resume/save_every/early_stopping/val_every 字段但 gen_trainer 全未实现；_save_best 仍不存 optimizer/scheduler/scaler，无法断点续训）、M15（3D 模式仍整卷单次前向，无 3D 滑窗）、M16（2.5D 滑窗步长=slab 深、除尾窗外不重叠+均匀平均，无高斯融合）、M17（短体零填充 vs 训练 edge_pad）、M18（输出不反归一化回 HU）。
+- 低项：每步 loss.item() 同步、NaN 损失静默跳过、扩散推理无种子、predict 默认 input=image_dir（HR）语义混淆、compute_loss_fp32/estimate_train_memory 死代码、preprocess_label 死导入 等大多仍在。
+
+### 新发现（本轮补充审查）
+- 高 H10：多视图训练-推理不对称。多视图（multi_res_scales>1 / keep_native_view_depth）训练侧已由 pipelines 完整支持，但 GenerationPredictor 完全按单视图工作（2.5D 只喂 depth=patch_size[0] 的单 slab、3D 整卷单视图），多视图模型 in_channels 不匹配 → 推理直接崩溃；predict 入口与 validate 均无拦截。当前多视图"只能训、不能推"。修法：predictor 按 view_sizes 从整卷构造多 FOV 视图（与训练 pipelines 同几何），或至少 validate 拒绝多视图配置进入 predict。
+- 低 L25：gen_trainer 为单进程单卡（无 DDP），train.gpus 等多卡字段对 gentask 无效；val_every 字段同样未消费（每 epoch 必验）。属工程完整性，与 M14 同层。
+
+### 复检后的路线图（更新）
+- 第1层（阻塞 TODO 1）：仅剩 ③增采架构+推理网格（H8/H9）与 ④经典 SISR/VFI（H7）；①数据契约剩「真实 LR 作输入」半截（H4 残留 + M7 spacing），②多FOV管线已完成但需补 H10 推理侧对称。
+- 第2层（正确性）：H10（新）＞ M8 扩散尺度 ＞ M10 命名。
+- 第3层（真实性/效果）：M4/M6/M7、H2 面内原生像素、M13 整卷验证、M16 高斯融合、M18 反归一化。
+- 第4层（工程）：M14 续训/周期保存/早停、M15 3D 滑窗、M17、L 项清理。
+建议顺序不变：先补 H8/H9+H10（推理能真正增采并支持多视图）→ 落地经典 SISR（1b 先行）→ 真实性/评估 → 工程完整性。
 
 
-3 
+3 分割训练在服务器报错
+
+data:
+  npz_dir: "/data0/yzhen/data/tx_ves/npz_data"
+
+  label_values: [0, 1]
+  num_classes : 2
+
+  patch_size: [12, 320, 400]  ##################################################################
+  patch_mode: "2_5d"          ##################################################################
+
+  multi_res_scales    : [1.0, 1.5, 2.0]
+  aug_oversample_ratio: 1.5
+
+  keep_native_view_depth: true
+
+  z_boundary_mode: "edge_pad"
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  val_ratio       : 0.2
+  split_seed      : 42
+  stratified_split: true
+
+  batch_size     : 8
+  num_workers    : 24
+  prefetch_factor: 8
+  pin_memory     : true
+
+  foreground_oversample_ratio: 0.5
+  samples_per_volume         : 8
+
+  cache_mode       : "memory"
+  cache_max_volumes: 24
+
+
+augment:
+  enabled         : true
+  intensity_clamp : true
+  wmap_interp_mode: "nearest"
+
+  random_flip_prob: 0.2
+  random_flip_axes: [2, 3, 4]
+
+  random_affine_prob          : 0.3
+  random_rotate_range         : [-20.0, 20.0]
+  random_scale_range          : [0.80, 1.2]
+  random_translate_range      : [-0.1, 0.1]
+  random_affine_aspect_correct: true
+
+  elastic_deform_prob : 0.0
+  elastic_deform_sigma: 5.0
+  elastic_deform_alpha: 1.0
+
+  random_brightness_prob : 0.3
+  random_brightness_range: [-0.1, 0.1]
+
+  random_contrast_prob : 0.3
+  random_contrast_range: [0.8, 1.2]
+
+  random_gamma_prob : 0.2
+  random_gamma_range: [0.8, 1.2]
+
+  gaussian_noise_prob: 0.2
+  gaussian_noise_std : 0.09
+
+  gaussian_blur_prob : 0.2
+  gaussian_blur_sigma: [0.5, 1.5]
+
+  simulate_lowres_prob: 0.2
+  simulate_lowres_zoom: [0.5, 1.0]
+
+
+model:
+  arch                    : "unet"
+  backbone                : "resnet"
+  encoder_channels        : [64, 128, 256, 512, 512]
+  blocks_per_level        : 2
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type              : "basic"
+
+  norm_type               : "batch"
+  norm_groups             : 8
+  activation              : "leakyrelu"
+  dropout                 : 0.0
+  drop_path_rate          : 0.0
+
+  stem_mode               : "dual"
+  decoder_type            : "unet"
+  downsample_mode         : "conv"
+  downsample_strides      : []
+  anisotropic_pooling     : false
+  upsample_mode           : "trilinear"
+  upsample_norm_act       : true
+  skip_mode               : "cat"
+
+  attention_type          : "none"  ##################################################################
+  se_reduction            : 16
+  skip_attention          : false
+  attn_gate_norm          : "batch"
+
+  deep_supervision        : true
+  aux_seg_supervision     : true
+  aux_head_mode           : "conv"
+
+  stem_fusion_mode        : "multi_stem_proj"
+  lift_2_5d_to_3d         : false
+
+  grad_checkpointing      : true
+  grad_ckpt_encoder_stages: []
+
+  multirf_enabled       : true
+  multirf_dilations     : [1, 2, 3]
+  multirf_mode          : "split"
+  multirf_fusion        : "concat_proj"
+  multirf_axes          : "hw"
+  multirf_encoder_stages: [0, 1, 1, 1, 1]
+  multirf_decoder_stages: [1, 1, 1, 0]
+  multirf_branch_norm_act: true
+
+  selfattn_enabled       : true
+  selfattn_type          : "softmax"
+  selfattn_num_heads     : 4
+  selfattn_head_dim      : -1
+  selfattn_zero_init     : true
+  selfattn_rope          : false
+  selfattn_ffn           : false
+  selfattn_ffn_ratio     : 4.0
+  selfattn_encoder_stages: [0, 0, 0, 0, softmax]  ##################################################################
+  selfattn_decoder_stages: [0, 0, 0, 0]
+
+
+loss:
+  name                    : "dice_focal"
+  compound_weights        : [1.0, 1.0]
+  class_weights           : [1.0]
+  region_weights          : [0.0, 4.0]
+  slice_loss_reduction    : "per_volume"
+  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+  aux_supervision_weights : [0.5, 0.5]
+
+  batch_dice              : true
+  ignore_empty            : false
+
+  dice_smooth : 1.0e-5
+  dice_squared: false
+
+  focal_alpha: 0.5
+  focal_gamma: 2.0
+
+  tversky_alpha: 0.3
+  tversky_beta : 0.7
+
+
+train:
+  epochs                       : 1000
+  seed                         : 42
+  deterministic                : false
+  gpus                         : [1,3]
+  output_dir                   : "outputs/ves_multirf2d_mmore_attn2"  ##################################################################
+
+  ddp_find_unused_parameters   : false
+  ddp_static_graph             : true
+  ddp_gradient_as_bucket_view  : true
+  ddp_master_port              : 0
+  ddp_scale_dataloader_per_rank: true
+  ddp_timeout_minutes          : 30
+  zero_redundancy_optimizer    : true
+
+  optimizer                    : "adamw"
+  adamw_fused                  : true
+  lr                           : 1.0e-4
+  weight_decay                 : 1.0e-4
+
+  scheduler                    : "cosine"
+  warmup_epochs                : 5
+  warmup_lr                    : 1.0e-6
+  cosine_min_lr                : 1.0e-6
+
+  grad_accum_steps             : 2
+  grad_clip_norm               : 12.0
+
+  use_amp                      : true
+  amp_dtype                    : "auto"
+  compile_mode                 : "default"
+  channels_last                : false
+  cuda_expandable_segments     : false
+  val_empty_cache              : null
+
+  use_ema                      : true
+  ema_decay                    : 0.999
+  ema_warmup                   : true
+  ema_device                   : ""
+  swa_enabled                  : false  ##################################################################
+  swa_start_ratio              : 0.75
+  swa_bn_update_steps          : 50
+
+  val_every                    : 1
+  val_metric_mode              : "high"
+  val_metric_bbox_crop         : true
+  surface_dice_tolerance       : 1
+  surface_dice_weight          : 0.5
+  save_best_preset             : "vessel"
+  early_stopping               : 0
+
+  save_every                   : 10
+  save_keep_last               : 3
+  save_async                   : true
+
+  log_every                    : 10
+  vis_every                    : 10
+
+  resume                       : ""
+  pretrain                     : ""
+  pretrain_strict              : false
+  pretrain_load_ema            : true
+
+
+predict:
+  z_overlap              : 0.5
+  blend_mode             : "gaussian"
+  batch_size             : 2
+
+  tta_flip               : true
+  tta_batch_size         : 1
+  threshold              : 0.5
+
+  acc_dtype              : "fp32"
+  vol_dtype              : "fp32"
+  accumulate_on_cpu      : false
+
+  cudnn_benchmark        : false
+  use_inference_mode     : true
+  channels_last          : false
+
+  z_interleave_enabled   : false
+  z_interleave_thresholds: [1.0, 1.5, 3]
+  z_interleave_factors   : [4, 3, 2, 1]
+
+  output_dir             : ""
+  save_probabilities     : false
+
+
+vis:
+  enabled          : true
+  output_dir       : ""
+  filename         : "pipeline_vis.html"
+  flows            : ["data", "model", "predict"]
+  trace_shapes     : true
+  max_detail_params: 200
+
+
+monitor:
+  enabled            : true
+  output_dir         : ""
+  filename           : "training_monitor.html"
+  update_every       : 1
+  auto_reload_seconds: 10
+  run_name           : ""
+  compare_runs                 : []
+  health_monitor               : true
+  health_grad_norm_when_no_clip: true
+  health_update_ratio          : false
+
+est$ python -m segtask_v1.train --config configs/segtest0.yaml
+[2026-07-08 15:05:43] INFO __mp_main__: DDP launched: world_size=2 on physical GPUs [1, 3] (MASTER_PORT=38171).
+[2026-07-08 15:05:43] INFO segtask_v1.utils: Seed set to 42 (deterministic=False)
+[2026-07-08 15:05:43] INFO segtask_v1.data.loader: DDP dataloader scaling: num_workers 24 -> 12 per rank (world_size=2; aggregate 24 workers across ranks matches the single-GPU baseline). Per-worker LRU cache is unchanged, so aggregate cache RAM also matches single-GPU. Set train.ddp_scale_dataloader_per_rank=false to keep full num_workers on every rank.
+[2026-07-08 15:05:43] INFO segtask_v1.data.loader: Primary (gold) training source: npz packages under /data0/yzhen/data/tx_ves/npz_data (suffix=.npz). NIfTI fields image_dir/label_dir/bbox_dir/region_weight_dir are consumed only by make_data when the npz cache must be built.
+[2026-07-08 15:05:43] INFO segtask_v1.data.loader: Discovered 110 npz package(s) under /data0/yzhen/data/tx_ves/npz_data.
+[2026-07-08 15:05:43] INFO segtask_v1.data.loader: Label values: [0, 1], num_classes: 2, num_fg: 1
+[2026-07-08 15:05:55] INFO segtask_v1.data.loader: Stratified split: 88 train, 22 val (strata sizes: {'1': 110})
+[2026-07-08 15:05:55] INFO segtask_v1.data.specs: Using 2_5D patch mode (oversample=1.50, scales=[1.0, 1.5, 2.0], n_views=3, max_scale=2.00, z_boundary=edge_pad) — SINGLE max-FOV z-cube extraction; trainer crops+resizes per view before forward.
+[2026-07-08 15:05:55] INFO segtask_v1.data.dataset: Loading pre-computed fg indices from 88 npz packages...
+[2026-07-08 15:05:55] INFO segtask_v1.data.dataset: NPZ index built: 88 volumes, 20793/25183 foreground slices
+[2026-07-08 15:05:55] INFO segtask_v1.data.dataset: Loading pre-computed fg indices from 22 npz packages...
+[2026-07-08 15:05:55] INFO segtask_v1.data.dataset: NPZ index built: 22 volumes, 5279/6409 foreground slices
+[2026-07-08 15:05:55] INFO segtask_v1.data.loader: DDP DistributedSampler: rank=0/2, ~352 samples/rank (train).
+[2026-07-08 15:05:55] INFO segtask_v1.data.loader: DataLoader: batch_size=8, num_workers=12 (per rank), pin_memory=True, persistent_workers=True, prefetch_factor=8
+[2026-07-08 15:05:55] INFO segtask_v1.data.loader: Volume cache estimate: ~233.06 MiB per volume (image fp32 + label int16 + region_weight fp32, bbox-cropped); effective cap=24, num_workers=12 => up to ~65.55 GiB RAM (all workers, caches only; transient decode peaks add ~93.22 MiB/worker) [per rank; x2 ranks => ~131.10 GiB machine-wide aggregate].
+[2026-07-08 15:05:55] INFO segtask_v1.models.factory: MultiRF ENABLED: dilations=[1, 2, 3], mode=split, fusion=concat_proj, axes=hw, enc_stages=[0, 1, 1, 1, 1], dec_stages=[1, 1, 1, 0]
+[2026-07-08 15:05:55] INFO segtask_v1.models.factory: SelfAttention ENABLED: default_type=softmax, num_heads=4, head_dim=-1, zero_init=True, enc_types=[None, None, None, None, 'softmax'], dec_types=[None, None, None, None]
+[2026-07-08 15:05:55] INFO segtask_v1.models.factory: Built UNet3D [resnet/basic, decoder=unet, preset=none]: enc=24.66M, dec=20.97M, total=48.82M, channels=[64, 128, 256, 512, 512], enc_blocks=[2, 2, 2, 2, 2], dec_blocks=[2, 2, 2, 2], out_classes=12 (fg=1, res=1), stem=dual(stride=1, n_views=3, fusion=multi_stem_proj), down=conv, up=trilinear, skip=cat, attn=none, skip_attn=False, ds=True, aux_seg=True(n_aux_heads=2, mode=conv), grad_ckpt=True
+[2026-07-08 15:05:55] INFO segtask_v1.trainer.pipelines.factory: ViewPipeline selected: Slab2_5DNativeDPipeline (patch_mode=2_5d, n_views=3)
+[2026-07-08 15:05:55] INFO segtask_v1.trainer.pipelines.slab25d: Aux seg supervision: ENABLED (native depth), n_aux_views=2, per-view depths=[18, 24], weights=[0.5, 0.5], fusion=multi_stem_proj
+[2026-07-08 15:05:55] INFO segtask_v1.trainer.pipelines.slab25d: Trainer keep_native_view_depth=True: max-FOV crop D=24, per-view depths=[12, 18, 24], channel layout sum=54.
+[2026-07-08 15:05:57] INFO segtask_v1.visualization: Pipeline visualization HTML written: outputs/ves_multirf2d_mmore_attn2/visualization/pipeline_vis.html
+[2026-07-08 15:05:57] INFO __mp_main__: Pipeline visualization written to: outputs/ves_multirf2d_mmore_attn2/visualization/pipeline_vis.html
+[2026-07-08 15:05:57] INFO segtask_v1.trainer.pipelines.factory: ViewPipeline selected: Slab2_5DNativeDPipeline (patch_mode=2_5d, n_views=3)
+[2026-07-08 15:05:57] INFO segtask_v1.trainer.pipelines.slab25d: Aux seg supervision: ENABLED (native depth), n_aux_views=2, per-view depths=[18, 24], weights=[0.5, 0.5], fusion=multi_stem_proj
+[2026-07-08 15:05:57] INFO segtask_v1.trainer.pipelines.slab25d: Trainer keep_native_view_depth=True: max-FOV crop D=24, per-view depths=[12, 18, 24], channel layout sum=54.
+/data0/yzhen/timm_test/segtask_v1/trainer/optim.py:59: DeprecationWarning: `TorchScript` support for functional optimizers is deprecated and will be removed in a future PyTorch release. Consider using the `torch.compile` optimizer instead.
+  from torch.distributed.optim import ZeroRedundancyOptimizer
+/data0/yzhen/timm_test/segtask_v1/trainer/optim.py:59: DeprecationWarning: `TorchScript` support for functional optimizers is deprecated and will be removed in a future PyTorch release. Consider using the `torch.compile` optimizer instead.
+  from torch.distributed.optim import ZeroRedundancyOptimizer
+[2026-07-08 15:05:57] INFO segtask_v1.trainer.optim: ZeroRedundancyOptimizer enabled: AdamW state sharded across ranks.
+[2026-07-08 15:05:57] INFO segtask_v1.trainer.trainer: amp_dtype='auto' resolved to 'bfloat16' (device=cuda:1).
+[2026-07-08 15:05:57] INFO segtask_v1.trainer.trainer: Compiling model with mode='default'
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: DDP enabled: rank=0/2, device=cuda:1, find_unused_parameters=False, gradient_as_bucket_view=True, static_graph=True. Training grads all-reduce per backward. Note: math-equivalence to single-GPU under grad-accum holds for per-sample separable losses (BCE/Focal/per-sample Dice); batch-pooled ratio losses (batch_dice/Tversky/GDL) pool over the per-rank micro-batch, so their effective statistics window shrinks with accum/ranks (approximate, not strictly equivalent).
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Validation metric mode: high (evaluator=VolumeValEvaluator)
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Training monitor enabled → metrics: outputs/ves_multirf2d_mmore_attn2/monitor | dashboard: outputs/ves_multirf2d_mmore_attn2/training_monitor.html
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: ============================================================
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Training: 1000 epochs, device=cuda:1
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Model params: 48.82M
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Static GPU mem (persistent, excl. activations): param=186.3 + grad=186.3 + optim(AdamW,2x)=186.3 + ema=186.4 = 745.2 MiB (real peak reported per-epoch as 'GPU peak')
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Gradient checkpointing: ON — encoder/decoder activations recomputed in backward (~+20-33%% compute, much lower activation memory; numerics unchanged vs OFF).
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: CUDA mem at training start: allocated=566.8 MiB, reserved=768.0 MiB (model already on device; activations/workspace will add on top during forward).
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Train batches: 44, Val batches: 6
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: AMP=True (dtype=auto, resolved=bfloat16, scaler=False), EMA=True (decay=0.9990)
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Grad accum=2, Effective batch=16
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: Pipeline=Slab2_5DNativeDPipeline | n_views=3, n_aux_views=2, num_res_groups=1, slab_depth=12 | fg_classes=1, Loss=dice_focal
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: torch.compile mode: default (active=True)
+[2026-07-08 15:06:00] INFO segtask_v1.trainer.trainer: ============================================================
+W0708 15:06:47.291000 140518365775680 torch/multiprocessing/spawn.py:146] Terminating process 2497284 via signal SIGTERM
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/data0/yzhen/timm_test/segtask_v1/train.py", line 276, in <module>
+    main()
+  File "/data0/yzhen/timm_test/segtask_v1/train.py", line 245, in main
+    mp.spawn(
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/multiprocessing/spawn.py", line 282, in spawn
+    return start_processes(fn, args, nprocs, join, daemon, start_method="spawn")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/multiprocessing/spawn.py", line 238, in start_processes
+    while not context.join():
+              ^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/multiprocessing/spawn.py", line 189, in join
+    raise ProcessRaisedException(msg, error_index, failed_process.pid)
+torch.multiprocessing.spawn.ProcessRaisedException:
+
+-- Process 0 terminated with the following error:
+Traceback (most recent call last):
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/multiprocessing/spawn.py", line 76, in _wrap
+    fn(i, *args)
+  File "/data0/yzhen/timm_test/segtask_v1/train.py", line 189, in _train_worker
+    _build_and_fit(cfg, device)
+  File "/data0/yzhen/timm_test/segtask_v1/train.py", line 105, in _build_and_fit
+    best_metrics = trainer.fit()
+                   ^^^^^^^^^^^^^
+  File "/data0/yzhen/timm_test/segtask_v1/trainer/trainer.py", line 397, in fit
+    train_metrics = self._train_epoch(epoch)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/timm_test/segtask_v1/trainer/trainer.py", line 811, in _train_epoch
+    pred = self.fwd_model(image)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1636, in forward
+    else self._run_ddp_forward(*inputs, **kwargs)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1454, in _run_ddp_forward
+    return self.module(*inputs, **kwargs)  # type: ignore[index]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 433, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 1110, in __call__
+    return hijacked_callback(
+           ^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 948, in __call__
+    result = self._inner_convert(
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 472, in __call__
+    return _compile(
+           ^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_utils_internal.py", line 84, in wrapper_function
+    return StrobelightCompileTimeProfiler.profile_compile_time(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_strobelight/compile_time_profiler.py", line 129, in profile_compile_time
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/contextlib.py", line 81, in inner
+    return func(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 817, in _compile
+    guarded_code = compile_inner(code, one_graph, hooks, transform)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 231, in time_wrapper
+    r = func(*args, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 636, in compile_inner
+    out_code = transform_code_object(code, transform)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/bytecode_transformation.py", line 1185, in transform_code_object
+    transformations(instructions, code_options)
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 178, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py", line 582, in transform
+    tracer.run()
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 2451, in run
+    super().run()
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 893, in run
+    while self.step():
+          ^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 805, in step
+    self.dispatch_table[inst.opcode](self, inst)
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 2642, in RETURN_VALUE
+    self._return(inst)
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/symbolic_convert.py", line 2627, in _return
+    self.output.compile_subgraph(
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/output_graph.py", line 1123, in compile_subgraph
+    self.compile_and_call_fx_graph(tx, pass2.graph_output_vars(), root)
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/contextlib.py", line 81, in inner
+    return func(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/output_graph.py", line 1318, in compile_and_call_fx_graph
+    compiled_fn = self.call_user_compiler(gm)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/utils.py", line 231, in time_wrapper
+    r = func(*args, **kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/output_graph.py", line 1409, in call_user_compiler
+    raise BackendCompilerFailed(self.compiler_fn, e).with_traceback(
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/output_graph.py", line 1390, in call_user_compiler
+    compiled_fn = compiler_fn(gm, self.example_inputs())
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data0/yzhen/py3/envs/llm/lib/python3.12/site-packages/torch/_dynamo/backends/distributed.py", line 490, in compile_fn
+    raise NotImplementedError(
+torch._dynamo.exc.BackendCompilerFailed: backend='compile_fn' raised:
+NotImplementedError: DDPOptimizer backend: Found a higher order op in the graph. This is not supported. Please turn off DDP optimizer using torch._dynamo.config.optimize_ddp=False. Note that this can cause performance degradation because there will be one bucket for the entire Dynamo graph. Please refer to this issue - https://github.com/pytorch/pytorch/issues/104674.
+
+Set TORCH_LOGS="+dynamo" and TORCHDYNAMO_VERBOSE=1 for more information
+
+
+You can suppress this exception and fall back to eager by setting:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True

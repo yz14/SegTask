@@ -57,7 +57,6 @@ gentask/
     ├── amp.py  # AMP / GradScaler 工具
     ├── checkpoint.py  # checkpoint 读写与兼容
     ├── gen_trainer.py  # generation 训练循环
-    ├── memory.py  # 显存统计工具
     ├── optim.py  # 优化器 / 调度器 / warmup
     └── pipelines/  # 生成训练管线预留目录
 ```

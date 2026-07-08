@@ -105,7 +105,7 @@ class EDMDiffusion(nn.Module):
         x = torch.randn(
             cond.shape[0], ch, *cond.shape[2:], device=cond.device,
             dtype=cond.dtype, generator=generator) * sigmas[0]
-        deterministic_euler = self.sampler == "ddim"
+        deterministic_euler = self.sampler == "edm_euler"
         for i in range(self.sample_steps):
             s = sigmas[i]
             s_next = sigmas[i + 1]

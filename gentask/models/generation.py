@@ -101,10 +101,17 @@ class RegressionModel(nn.Module):
         return self.degradation.degrade(hr)
 
     def _add_residual(self, out: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-        """残差基线：全分辨率头加 ``lr``；下采样头加 ``lr`` 缩放到该头尺寸。"""
-        if out.shape[-self.spatial_dims:] != base.shape[-self.spatial_dims:]:
+        """残差基线：全分辨率头加 ``lr``；尺寸不一致时把 ``lr`` 缩放到该头尺寸
+        （下采头用 area；post-upsampling 真 LR 输入时用线性插值上采）。"""
+        out_sp = out.shape[-self.spatial_dims:]
+        base_sp = base.shape[-self.spatial_dims:]
+        if out_sp != base_sp:
+            up = any(o > b for o, b in zip(out_sp, base_sp))
+            mode = (("bilinear" if self.spatial_dims == 2 else "trilinear")
+                    if up else "area")
             base = F.interpolate(
-                base, size=tuple(out.shape[-self.spatial_dims:]), mode="area")
+                base, size=tuple(out_sp), mode=mode,
+                align_corners=False if up else None)
         if out.shape[1] != base.shape[1]:
             raise ValueError(
                 "residual=True requires net out channels == base channels "
@@ -225,7 +232,10 @@ def build_generation_model(cfg) -> nn.Module:
     # 单一真相源：由 topology 派生（2.5D+lift_2_5d_to_3d 时为 3，退化/打包均按
     # 真 3D 空间轴处理），不在此处重复推导。
     spatial_dims = int(topology.spatial_dims)
-    degradation = build_degradation(task, spatial_dims=spatial_dims)
+    # 经典 SISR（post-upsampling）：退化产出真 LR 尺寸，网络上采头放大回 HR。
+    net_upsamples = str(cfg.model.arch).lower() in ("edsr", "rcan")
+    degradation = build_degradation(
+        task, spatial_dims=spatial_dims, keep_lr_size=net_upsamples)
     algo = str(task.algorithm).lower()
 
     if algo == "regression":

@@ -113,6 +113,23 @@ def load_nifti_with_spacing(
     return arr, z_spacing
 
 
+def read_nifti_spacing_zyx(path: str) -> Tuple[float, float, float]:
+    """仅读 NIfTI 头信息返 (sz, sy, sx) spacing（mm，与体轴 (D,H,W) 同序）。
+    缺失/非法分量退 1.0。"""
+    def _read() -> "sitk.Image":
+        reader = sitk.ImageFileReader()
+        reader.SetFileName(str(path))
+        reader.ReadImageInformation()
+        return reader
+    reader = _sitk_read_with_retry(_read, path)
+    sp = reader.GetSpacing()  # (sx, sy, sz)
+    out = []
+    for i in (2, 1, 0):
+        v = float(sp[i]) if len(sp) > i else 1.0
+        out.append(v if np.isfinite(v) and v > 0.0 else 1.0)
+    return (out[0], out[1], out[2])
+
+
 def load_nifti_cropped(
     path: str,
     bbox: "Optional[BBox]" = None,
@@ -243,6 +260,18 @@ def load_npz_fg_coords(path: str) -> np.ndarray:
         return np.asarray(f["fg_coords"], dtype=np.int32)
 
 
+def load_npz_spacing(path: str) -> Optional[Tuple[float, float, float]]:
+    """返 npz meta 中烘焙的 (sz, sy, sx) spacing（mm）；旧包无该字段返 None。"""
+    with _open_npz(path) as f:
+        if "meta" not in f.files:
+            return None
+        meta = f["meta"].item()
+    sp = meta.get("spacing_zyx") if isinstance(meta, dict) else None
+    if not sp or len(sp) != 3:
+        return None
+    return (float(sp[0]), float(sp[1]), float(sp[2]))
+
+
 def load_npz_label_for_split(path: str) -> np.ndarray:
     """owned int16 label copy，供 loader.py 预扫描使用。强制 copy 以免父进程持有 mmap 句柄。"""
     with _open_npz(path) as f:
@@ -287,6 +316,30 @@ def preprocess_image(
     return vol
 
 
+def denormalize_image(
+    volume: np.ndarray,
+    intensity_min: float,
+    intensity_max: float,
+    normalize: str,
+    global_mean: float = 0.0,
+    global_std: float = 1.0) -> np.ndarray:
+    """``preprocess_image`` 的逆变换：归一化域 → 原强度（HU）。
+
+    minmax: ``x*(max-min)+min``；zscore: ``x*std+mean``。返回 fp32 新数组
+    （不修改输入）。用于推理写出时恢复物理标定。
+    """
+    vol = np.asarray(volume, dtype=np.float32).copy()
+    if normalize == "minmax":
+        vol *= float(intensity_max - intensity_min)
+        vol += float(intensity_min)
+    elif normalize == "zscore":
+        vol *= float(global_std)
+        vol += float(global_mean)
+    else:
+        raise ValueError(f"Unknown normalize: {normalize}")
+    return vol
+
+
 def compute_region_weight_map(
     volume: np.ndarray, label_values: List[int],
     region_weights: List[float]) -> np.ndarray:
@@ -305,15 +358,6 @@ def load_region_weight_volume(
     rw = load_nifti_cropped(path, bbox=bbox, dtype=np.float32)
     rw += 1.0
     return rw
-
-
-def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
-    """整数 label → 逐前景类二值掊叠 (num_fg,D,H,W) fp32；label_values 首位为背景。"""
-    vol = np.round(volume).astype(np.int32)
-    fg_values = label_values[1:]
-    # 向量化比较：(C,1,1,1) == (D,H,W) → (C,D,H,W)。
-    lv = np.array(fg_values, dtype=np.int32).reshape(-1, *([1] * vol.ndim))
-    return (vol[np.newaxis] == lv).astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------

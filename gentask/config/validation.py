@@ -129,13 +129,40 @@ class Config:
             f"Invalid task.degradation: {t.degradation!r}. Only 'superres' supported.")
         _require(t.out_channels >= 1, f"task.out_channels must be >= 1; got {t.out_channels}.")
         _require(t.sr_scale >= 1, f"task.sr_scale must be >= 1; got {t.sr_scale}.")
+        _kernels = ("trilinear", "area", "nearest", "gauss", "tri")
         _require(
-            str(t.sr_kernel).lower() in ("trilinear", "area", "nearest"),
-            f"Invalid task.sr_kernel: {t.sr_kernel!r}. Valid: 'trilinear' | 'area' | 'nearest'.")
+            str(t.sr_kernel).lower() in _kernels,
+            f"Invalid task.sr_kernel: {t.sr_kernel!r}. Valid: {list(_kernels)}.")
         _require(t.sr_noise_std >= 0.0, "task.sr_noise_std must be >= 0.")
         _require(
             str(t.sr_sampling).lower() in ("blur", "decimate"),
             f"Invalid task.sr_sampling: {t.sr_sampling!r}. Valid: 'blur' | 'decimate'.")
+        is_blur = str(t.sr_sampling).lower() == "blur"
+        if str(t.sr_kernel).lower() in ("gauss", "tri"):
+            _require(
+                is_blur,
+                "SSP kernels ('gauss'/'tri') require sr_sampling=='blur'; "
+                f"got sr_sampling={t.sr_sampling!r}.")
+        if t.sr_kernel_pool:
+            _require(
+                is_blur,
+                "task.sr_kernel_pool only applies to sr_sampling=='blur' "
+                "(decimate ignores the down kernel); got "
+                f"sr_sampling={t.sr_sampling!r}.")
+            for k in t.sr_kernel_pool:
+                _require(
+                    str(k).lower() in _kernels,
+                    f"Invalid task.sr_kernel_pool entry: {k!r}. "
+                    f"Valid: {list(_kernels)}.")
+        if t.sr_noise_std_range:
+            _require(
+                len(t.sr_noise_std_range) == 2,
+                "task.sr_noise_std_range must be [lo, hi]; got "
+                f"{t.sr_noise_std_range}.")
+            lo, hi = float(t.sr_noise_std_range[0]), float(t.sr_noise_std_range[1])
+            _require(
+                0.0 <= lo <= hi,
+                f"task.sr_noise_std_range must satisfy 0 <= lo <= hi; got {t.sr_noise_std_range}.")
         _require(
             str(t.sr_kernel_up).lower() in ("trilinear", "area", "nearest"),
             f"Invalid task.sr_kernel_up: {t.sr_kernel_up!r}. "
@@ -185,30 +212,77 @@ class Config:
                 str(t.beta_schedule).lower() in ("linear", "cosine"),
                 f"Invalid task.beta_schedule: {t.beta_schedule!r}. Valid: 'linear' | 'cosine'.")
             _require(
-                str(t.sampler).lower() in ("edm_heun", "ddpm", "ddim"),
-                f"Invalid task.sampler: {t.sampler!r}. Valid: 'edm_heun' | 'ddpm' | 'ddim'.")
+                str(t.sampler).lower() in (
+                    "edm_heun", "edm_euler", "ddpm", "ddim"),
+                f"Invalid task.sampler: {t.sampler!r}. Valid: "
+                "'edm_heun' | 'edm_euler' | 'ddpm' | 'ddim'.")
             _require(t.num_train_timesteps >= 1, "task.num_train_timesteps must be >= 1.")
             _require(t.sample_steps >= 1, "task.sample_steps must be >= 1.")
             _require(0.0 < t.sigma_min < t.sigma_max, "require 0 < sigma_min < sigma_max.")
             _require(t.sigma_data > 0.0, "task.sigma_data must be > 0.")
             _require(t.rho > 0.0, "task.rho must be > 0.")
-            # ddpm_eps 采样必须用 ddpm/ddim；edm_heun 仅适用于 edm 预条件。
+            # ddpm_eps 采样必须用 ddpm/ddim；edm_* 仅适用于 edm 预条件。
             if str(t.parameterization).lower() == "ddpm_eps":
                 _require(
                     str(t.sampler).lower() in ("ddpm", "ddim"),
                     "parameterization='ddpm_eps' requires sampler in ('ddpm','ddim').")
             else:
                 _require(
-                    str(t.sampler).lower() == "edm_heun",
-                    "parameterization='edm' requires sampler='edm_heun'.")
+                    str(t.sampler).lower() in ("edm_heun", "edm_euler"),
+                    "parameterization='edm' requires sampler in "
+                    "('edm_heun','edm_euler').")
+
+    def _validate_sisr_arch(self, arch: str) -> None:
+        """经典 SISR（EDSR/RCAN，post-upsampling）的组合约束。"""
+        _require(
+            self.is_generation
+            and str(self.task.algorithm).lower() == "regression",
+            f"model.arch={arch!r} requires task.type='generation' with "
+            f"task.algorithm='regression'.")
+        _require(
+            len(self.data.multi_res_scales) <= 1,
+            f"model.arch={arch!r} does not support multi-view "
+            f"(data.multi_res_scales); use a single view.")
+        _require(
+            not self.model.lift_2_5d_to_3d,
+            f"model.arch={arch!r} does not support lift_2_5d_to_3d.")
+        _require(
+            not self.model.deep_supervision,
+            f"model.arch={arch!r} does not support deep_supervision "
+            "(single full-resolution head).")
+        _require(
+            not self.data.cond_dirs,
+            f"model.arch={arch!r} does not support cond_dirs: conditioning "
+            "images live on the HR grid while the net input is the true LR "
+            "grid.")
+        _require(
+            self.model.sisr_channels > 0 and self.model.sisr_num_blocks > 0
+            and self.model.sisr_num_groups > 0,
+            "sisr_channels/sisr_num_blocks/sisr_num_groups must be > 0.")
+        # 模型空间轴 patch 尺寸须能被逐轴倍率整除（LR = patch/scale 为整）。
+        sdims = 2 if self.data.patch_mode == "2_5d" else 3
+        per_axis = list(self.task.sr_scale_per_axis)
+        scales = ([int(s) for s in per_axis] if per_axis
+                  else [int(self.task.sr_scale)] * sdims)
+        if self.data.patch_mode != "whole":
+            patch = [int(p) for p in self.data.patch_size]
+            spatial = patch[1:] if sdims == 2 else patch
+            for n, sc in zip(spatial, scales):
+                _require(
+                    n % sc == 0,
+                    f"model.arch={arch!r} requires model-space patch sizes "
+                    f"divisible by sr scales; got size {n} vs scale {sc}.")
 
     def _validate_model(self) -> None:
         """model.* 架构选项与逐级拓扑长度校验。"""
         arch = str(self.model.arch).lower()
         _require(
-            arch in ("unet", "adm", "edm2"),
-            f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
-        if arch == "unet":
+            arch in ("unet", "adm", "edm2", "edsr", "rcan"),
+            f"Invalid model.arch: {arch!r}. "
+            f"Valid: 'unet' | 'adm' | 'edm2' | 'edsr' | 'rcan'.")
+        if arch in ("edsr", "rcan"):
+            self._validate_sisr_arch(arch)
+        elif arch == "unet":
             _require(
                 self.model.backbone in ("resnet", "convnext"),
                 f"Invalid backbone: {self.model.backbone}")
@@ -525,12 +599,48 @@ class Config:
             "cosine", "cosine_warm_restarts", "poly", "step", "plateau", "one_cycle",
         ),
             f"Invalid scheduler: {self.train.scheduler}")
+        _require(
+            int(self.train.val_full_volume_max) >= 0,
+            "train.val_full_volume_max must be >= 0; got "
+            f"{self.train.val_full_volume_max}.")
+        if bool(self.train.val_full_volume):
+            _require(
+                self.is_generation,
+                "train.val_full_volume is only supported for "
+                "task.type='generation'.")
 
     def _validate_predict(self) -> None:
         """predict.* 校验。"""
         _require(
             bool(self.predict.output_dir),
             "predict.output_dir must be non-empty.")
+        _require(
+            str(self.predict.input_grid).lower() in ("hr", "lr"),
+            f"Invalid predict.input_grid: {self.predict.input_grid!r}. "
+            "Valid: 'hr' | 'lr'.")
+        _require(
+            0.0 <= float(self.predict.overlap) < 1.0,
+            f"predict.overlap must be in [0, 1); got {self.predict.overlap}.")
+        _require(
+            str(self.predict.blend).lower() in ("gaussian", "uniform"),
+            f"Invalid predict.blend: {self.predict.blend!r}. "
+            "Valid: 'gaussian' | 'uniform'.")
+        tz = float(self.predict.target_z_spacing)
+        _require(tz >= 0.0,
+                 f"predict.target_z_spacing must be >= 0; got {tz}.")
+        if tz > 0.0:
+            _require(
+                str(self.predict.input_grid).lower() == "lr",
+                "predict.target_z_spacing requires predict.input_grid='lr' "
+                "(spacing-aware resampling only applies to true-LR input).")
+            _require(
+                int(self.model.spatial_dims) == 3,
+                "predict.target_z_spacing requires a 3D model space "
+                "(z axis degraded); 2.5D folds z into channels.")
+            _require(
+                str(self.model.arch).lower() not in ("edsr", "rcan"),
+                "predict.target_z_spacing is incompatible with "
+                "post-upsampling SISR (fixed upsample-head factors).")
 
 
     @property

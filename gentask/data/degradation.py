@@ -26,7 +26,9 @@ HR 本身作为重建目标（pre-upsampling SISR，类 SRCNN / VDSR 设定，�
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+import math
+import random
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -39,6 +41,11 @@ _SCALABLE_MODES = {
     3: {"trilinear": "trilinear", "area": "area", "nearest": "nearest"},
 }
 
+# CT 层敏感度剖面（SSP）核：层内响应非理想 box，近高斯 / 三角（M4）。
+_SSP_KINDS = ("gauss", "tri")
+_VALID_DOWN_KERNELS = tuple(sorted(
+    set(_SCALABLE_MODES[3]) | set(_SSP_KINDS)))
+
 
 def _interp_mode(sr_kernel: str, spatial_dims: int) -> str:
     """把配置里的 ``sr_kernel`` 映射到 ``F.interpolate`` 的 mode（按空间维度）。"""
@@ -47,6 +54,49 @@ def _interp_mode(sr_kernel: str, spatial_dims: int) -> str:
         raise ValueError(
             f"Unknown sr_kernel {sr_kernel!r}; valid: {sorted(table)}.")
     return table[sr_kernel]
+
+
+def _ssp_kernel_1d(
+    kind: str, scale: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """1D SSP 核（归一化，奇长）。尺度以 HR 体素计，层厚 ≈ ``scale``。
+
+    * ``gauss``：FWHM = 层厚 → σ = scale/2.3548，支撑 ±⌈ 3σ ⌉。
+    * ``tri``：三角剖面，半宽 = 层厚，支撑 (-scale, scale)。
+    """
+    if kind == "gauss":
+        sigma = scale / 2.3548200450309493  # FWHM → σ
+        r = max(1, int(math.ceil(3.0 * sigma)))
+        x = torch.arange(-r, r + 1, device=device, dtype=dtype)
+        k = torch.exp(-0.5 * (x / sigma) ** 2)
+    else:  # "tri"
+        r = max(1, int(scale) - 1)
+        x = torch.arange(-r, r + 1, device=device, dtype=dtype)
+        k = 1.0 - x.abs() / float(scale)
+    return k / k.sum()
+
+
+def _ssp_downsample_axis(
+    x: torch.Tensor, dim: int, scale: int, k: torch.Tensor) -> torch.Tensor:
+    """沿 ``dim`` 用 1D SSP 核平滑 + 按 ``scale`` 抽样（边界 replicate）。
+
+    输出长度 = round(n/scale)，输出 j 的窗口中心 ≈ ``j*scale + (scale-1)//2``
+    （与 area 降采样的窗口中心 ``(j+0.5)*scale-0.5`` 对齐，偶倍率差 0.5 体素，
+    已被平滑核支撑覆盖）。"""
+    n = x.shape[dim]
+    low = max(int(round(n / scale)), 1)
+    length = k.numel()
+    center = (length - 1) // 2
+    pad_l = center - (scale - 1) // 2
+    pad_r = (low - 1) * scale + length - n - pad_l
+    xt = x.movedim(dim, -1)
+    lead = xt.shape[:-1]
+    xt = xt.reshape(-1, 1, n)
+    xt = F.pad(xt, (max(pad_l, 0), max(pad_r, 0)), mode="replicate")
+    if pad_l < 0 or pad_r < 0:  # 核支撑小于步长时裁掉多余输入
+        xt = xt[..., max(-pad_l, 0): xt.shape[-1] - max(-pad_r, 0)]
+    y = F.conv1d(xt, k.view(1, 1, -1).to(xt.dtype), stride=int(scale))
+    return y.reshape(*lead, low).movedim(-1, dim)
 
 
 class SuperResDegradation:
@@ -65,6 +115,20 @@ class SuperResDegradation:
       （``lr[k*sc] == hr[k*sc]``），仅在保留帧之间插出中间片，末尾越界复制最后
       一帧。对应「取稀疏厚层切片、模型补足中间薄层」的帧插值设定
       （线性插值作为天真 baseline，模型学残差）。
+
+    ``keep_lr_size=True``（post-upsampling SISR，如 EDSR/RCAN）：省去「上采回
+    HR 尺寸」步骤，直接返回真 LR 尺寸的张量（blur 为降采样结果，decimate 为
+    保留帧），由网络的上采头把 LR 放大回 HR 网格。
+
+    下采核除 F.interpolate 模式外支持 CT 层敏感度剖面（SSP）核
+    ``'gauss'`` / ``'tri'``（M4，仅 blur 模式）：沿退化轴分离地用 1D SSP 核
+    平滑后抽样，比 box 均值更贴近真实厚层重建。
+
+    随机退化池（M6，Real-ESRGAN 风格的轻量版）：``kernel_pool`` 非空时每次
+    ``degrade`` 随机抽一个下采核；``noise_std_range=(lo,hi)`` 非空时噪声 std
+    每次均匀采样（覆盖 ``noise_std``）。仅在梯度开启时（训练前向）随机；
+    验证/推理（``torch.no_grad``）固定用基础 ``kernel`` / ``noise_std``，
+    保证指标可比。
     """
 
     def __init__(
@@ -75,7 +139,10 @@ class SuperResDegradation:
         kernel_up: str = "trilinear",
         noise_std: float = 0.0,
         axis_scales: Optional[Sequence[int]] = None,
-        sampling: str = "blur"):
+        sampling: str = "blur",
+        keep_lr_size: bool = False,
+        kernel_pool: Optional[Sequence[str]] = None,
+        noise_std_range: Optional[Sequence[float]] = None):
         if spatial_dims not in (2, 3):
             raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}.")
         sampling = str(sampling).lower()
@@ -98,40 +165,94 @@ class SuperResDegradation:
         self.scale = max(axes)
         self.spatial_dims = int(spatial_dims)
         self.sampling = sampling
-        self.mode = _interp_mode(kernel, spatial_dims)
+        self.kernel = str(kernel).lower()
+        self._check_down_kernel(self.kernel)
         self.mode_up = _interp_mode(kernel_up, spatial_dims)
         self.noise_std = float(noise_std)
-        # area / nearest 不支持 align_corners；线性族传 False 保持几何一致。
-        self._align = None if self.mode in ("area", "nearest") else False
+        self.kernel_pool: List[str] = [
+            str(k).lower() for k in (kernel_pool or [])]
+        for k in self.kernel_pool:
+            self._check_down_kernel(k)
+        if noise_std_range:
+            lo, hi = (float(noise_std_range[0]), float(noise_std_range[1]))
+            if not (0.0 <= lo <= hi):
+                raise ValueError(
+                    f"noise_std_range must satisfy 0 <= lo <= hi; got "
+                    f"({lo}, {hi}).")
+            self.noise_std_range: Optional[Tuple[float, float]] = (lo, hi)
+        else:
+            self.noise_std_range = None
         self._align_up = None if self.mode_up in ("area", "nearest") else False
         self._is_identity = all(s == 1 for s in axes)
+        self.keep_lr_size = bool(keep_lr_size)
+        self._ssp_cache: Dict[Tuple[str, int, torch.device, torch.dtype],
+                              torch.Tensor] = {}
+
+    @staticmethod
+    def _check_down_kernel(kernel: str) -> None:
+        if kernel not in _VALID_DOWN_KERNELS:
+            raise ValueError(
+                f"Unknown sr_kernel {kernel!r}; valid: "
+                f"{list(_VALID_DOWN_KERNELS)}.")
+
+    def _sample_params(self) -> Tuple[str, float]:
+        """本次 degrade 的 (下采核, 噪声 std)。随机池仅在梯度开启时生效。"""
+        kernel, std = self.kernel, self.noise_std
+        if torch.is_grad_enabled():
+            if self.kernel_pool:
+                kernel = random.choice(self.kernel_pool)
+            if self.noise_std_range is not None:
+                std = random.uniform(*self.noise_std_range)
+        return kernel, std
+
+    def _ssp_k(
+        self, kind: str, scale: int, device: torch.device,
+        dtype: torch.dtype) -> torch.Tensor:
+        key = (kind, int(scale), device, dtype)
+        k = self._ssp_cache.get(key)
+        if k is None:
+            k = _ssp_kernel_1d(kind, int(scale), device, dtype)
+            self._ssp_cache[key] = k
+        return k
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
-        """从干净 HR 生成同尺寸 LR。``hr`` 形如 ``(B, C, *spatial)``。"""
-        if self._is_identity and self.noise_std == 0.0:
+        """从干净 HR 生成 LR。``hr`` 形如 ``(B, C, *spatial)``。"""
+        kernel, noise_std = self._sample_params()
+        if self._is_identity and noise_std == 0.0:
             return hr.clone()
 
         spatial = tuple(int(s) for s in hr.shape[-self.spatial_dims:])
         if self._is_identity:
-            lr = hr.clone()
-            if self.noise_std > 0.0:
-                lr = lr + torch.randn_like(lr) * self.noise_std
-            return lr
+            return hr + torch.randn_like(hr) * noise_std
 
         if self.sampling == "decimate":
-            return self._decimate_interp(hr, spatial)
+            return self._decimate_interp(hr, spatial, noise_std)
 
-        low = [max(int(round(s / sc)), 1)
-               for s, sc in zip(spatial, self.axis_scales)]
-        down = F.interpolate(
-            hr, size=tuple(low), mode=self.mode, align_corners=self._align)
-        if self.noise_std > 0.0:  # 噪声在 LR 域施加，再随插值上采。
-            down = down + torch.randn_like(down) * self.noise_std
+        if kernel in _SSP_KINDS:  # SSP 平滑 + 抽样（逐退化轴分离）
+            down = hr
+            first = hr.ndim - self.spatial_dims
+            for i, sc in enumerate(self.axis_scales):
+                if sc > 1:
+                    down = _ssp_downsample_axis(
+                        down, first + i, int(sc),
+                        self._ssp_k(kernel, sc, hr.device, hr.dtype))
+        else:
+            mode = _interp_mode(kernel, self.spatial_dims)
+            align = None if mode in ("area", "nearest") else False
+            low = [max(int(round(s / sc)), 1)
+                   for s, sc in zip(spatial, self.axis_scales)]
+            down = F.interpolate(
+                hr, size=tuple(low), mode=mode, align_corners=align)
+        if noise_std > 0.0:  # 噪声在 LR 域施加，再随插值上采。
+            down = down + torch.randn_like(down) * noise_std
+        if self.keep_lr_size:
+            return down
         return F.interpolate(
             down, size=spatial, mode=self.mode_up, align_corners=self._align_up)
 
     def _decimate_interp(
-        self, hr: torch.Tensor, spatial: Tuple[int, ...]) -> torch.Tensor:
+        self, hr: torch.Tensor, spatial: Tuple[int, ...],
+        noise_std: float) -> torch.Tensor:
         """沿倍率>1 的轴抽稀保留帧，再逐轴相位对齐线性插值填回原尺寸（VFI 输入）。
 
         保留帧位于原始网格索引 ``0, sc, 2sc, ...``，输出在这些位置逐体素等于 HR
@@ -143,8 +264,10 @@ class SuperResDegradation:
             if sc > 1:
                 idx[first + i] = slice(0, None, sc)
         kept = hr[tuple(idx)]
-        if self.noise_std > 0.0:  # 噪声施加在保留帧（LR 域）。
-            kept = kept + torch.randn_like(kept) * self.noise_std
+        if noise_std > 0.0:  # 噪声施加在保留帧（LR 域）。
+            kept = kept + torch.randn_like(kept) * noise_std
+        if self.keep_lr_size:
+            return kept
         lr = kept
         for i, sc in enumerate(self.axis_scales):
             if sc > 1:
@@ -172,7 +295,9 @@ def _phase_aligned_linear_upsample(
     return a + (b - a) * frac.view(shape)
 
 
-def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegradation:
+def build_degradation(
+    cfg_task: TaskConfig, spatial_dims: int,
+    keep_lr_size: bool = False) -> SuperResDegradation:
     """按 ``task`` 配置构造退化算子。当前仅 'superres'。
 
     ``task.sr_scale_per_axis`` 非空时走各向异性（逐空间轴倍率），否则用
@@ -189,7 +314,10 @@ def build_degradation(cfg_task: TaskConfig, spatial_dims: int) -> SuperResDegrad
         kernel_up=str(cfg_task.sr_kernel_up).lower(),
         noise_std=float(cfg_task.sr_noise_std),
         axis_scales=per_axis if per_axis else None,
-        sampling=str(cfg_task.sr_sampling).lower())
+        sampling=str(cfg_task.sr_sampling).lower(),
+        keep_lr_size=keep_lr_size,
+        kernel_pool=list(cfg_task.sr_kernel_pool),
+        noise_std_range=list(cfg_task.sr_noise_std_range))
 
 
 

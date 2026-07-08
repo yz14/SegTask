@@ -381,9 +381,51 @@ def _build_unet_backbone(cfg: Config):
     return model
 
 
+def _model_axis_scales(cfg: Config, spatial_dims: int) -> List[int]:
+    """模型空间轴的逐轴超分倍率（与退化算子 axis_scales 一致）。"""
+    per_axis = list(cfg.task.sr_scale_per_axis)
+    if per_axis:
+        return [int(s) for s in per_axis]
+    return [int(cfg.task.sr_scale)] * spatial_dims
+
+
+def _build_sisr_backbone(cfg: Config):
+    """构建经典 SISR backbone（EDSR / RCAN，post-upsampling）。
+
+    输入为真 LR 网格（配套 ``SuperResDegradation(keep_lr_size=True)``），
+    上采头按逐轴倍率把特征放大回 HR 网格。
+    """
+    from .sisr import SISRNet
+
+    mc = cfg.model
+    topo = build_topology(cfg)
+    factors = _model_axis_scales(cfg, topo.spatial_dims)
+    model = SISRNet(
+        in_channels  = mc.in_channels,
+        out_channels = topo.out_classes,
+        factors      = factors,
+        arch         = str(mc.arch).lower(),
+        channels     = mc.sisr_channels,
+        num_blocks   = mc.sisr_num_blocks,
+        num_groups   = mc.sisr_num_groups,
+        res_scale    = mc.sisr_res_scale,
+        activation   = mc.activation,
+        se_reduction = mc.se_reduction,
+        spatial_dims = topo.spatial_dims)
+    logger.info(
+        "Built SISRNet [%s]: total=%.2fM, channels=%d, blocks=%d, groups=%d, "
+        "factors=%s, in_ch=%d, out_ch=%d, spatial_dims=%d",
+        mc.arch, model.param_count()["total"] / 1e6, mc.sisr_channels,
+        mc.sisr_num_blocks, mc.sisr_num_groups, factors,
+        mc.in_channels, topo.out_classes, topo.spatial_dims)
+    return model
+
+
 def build_backbone(cfg: Config):
-    """按 `model.arch` 构造共享 backbone：UNet、ADM、EDM2。"""
+    """按 `model.arch` 构造共享 backbone：UNet、ADM、EDM2、EDSR/RCAN。"""
     arch = str(cfg.model.arch).lower()
+    if arch in ("edsr", "rcan"):
+        return _build_sisr_backbone(cfg)
     if arch == "adm":
         from .adm_unet import build_adm_backbone
         return build_adm_backbone(cfg)
@@ -392,5 +434,6 @@ def build_backbone(cfg: Config):
         return build_edm2_backbone(cfg)
     if arch != "unet":
         raise ValueError(
-            f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
+            f"Unknown model.arch: {arch!r}. "
+            f"Valid: 'unet' | 'adm' | 'edm2' | 'edsr' | 'rcan'.")
     return _build_unet_backbone(cfg)

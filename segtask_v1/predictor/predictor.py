@@ -22,6 +22,7 @@ from ..data.dataset import (
     compute_bbox_from_volume, read_nifti_spacing, resample_to_spacing,
     resize_3d)
 from ..models.topology import ModelTopology, build_topology
+from ..trainer.amp import resolve_auto_amp_dtype
 from . import blending as _blending
 from . import sliding as _sliding
 
@@ -242,8 +243,11 @@ class Predictor:
             self._mr_target_shape = (
                 int(self.patch_D), int(self.patch_H), int(self.patch_W))
 
-        # AMP：与训练同 dtype。未知值退 bf16 避免静默切换。
+        # AMP：与训练同 dtype（'auto' 按与 trainer 相同规则按设备解析）。
+        # 未知值退 bf16 避免静默切换。
         amp_name = cfg.train.amp_dtype
+        if amp_name == "auto":
+            amp_name = resolve_auto_amp_dtype(device)
         if amp_name not in _AMP_DTYPES:
             logger.warning("Unknown amp_dtype=%r, falling back to bfloat16.",
                            amp_name)

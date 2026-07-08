@@ -142,7 +142,8 @@ class ModelConfig:
     """模型架构设置。"""
 
     # 架构族。示例："unet"（本项目 UNet，读下面 backbone/block/norm 等）、"adm"（ADM U-Net，仅 2.5D，读 adm_*）。
-    # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）。
+    # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）；"edsr" | "rcan"（经典 SISR，post-upsampling，
+    # 仅生成回归任务，读 sisr_*）。
     arch: str = "unet"
 
     # Backbone："resnet" 或 "convnext"。
@@ -260,6 +261,16 @@ class ModelConfig:
     adm_linear_attention_num_heads: int = 4
     adm_linear_attention_head_dim: int = 32
 
+    # ---- 经典 SISR 专用（arch in ("edsr","rcan")，post-upsampling） ----
+    # 特征通道数（EDSR baseline 64）。
+    sisr_channels: int = 64
+    # EDSR 残差块数 / RCAN 每组 RCAB 数（EDSR baseline 16，RCAN 论文 20）。
+    sisr_num_blocks: int = 16
+    # RCAN 残差组数（EDSR 忽略；RCAN 论文 10）。
+    sisr_num_groups: int = 10
+    # EDSR 块残差缩放（大模型建议 0.1 稳定训练；RCAN 忽略）。
+    sisr_res_scale: float = 1.0
+
     # ---- EDM2 专用（arch=="edm2"） ----
     # 带自注意力的级索引。空=默认仅 bottleneck。
     edm2_attention_levels: List[int] = field(default_factory=list)
@@ -341,6 +352,12 @@ class TrainConfig:
     log_every: int = 10
     val_every: int = 1
     vis_every: int = 10
+    # 整卷验证（M13，仅生成任务）：与部署同口径——在线退化整卷 → 推理器
+    # 滑窗复原（复用 predict.overlap/blend 路径）→ 逐卷 PSNR/SSIM 平均；
+    # 启用后选模/早停改用整卷 PSNR（patch 级指标仍一并报告）。
+    val_full_volume: bool = False
+    # 整卷验证最多评前 N 卷（控耗时）；0=全部 val 卷。
+    val_full_volume_max: int = 0
     seed         : int = 42
     deterministic: bool = False
     resume: str = ""
@@ -357,6 +374,28 @@ class PredictConfig:
     """Generation inference output settings."""
 
     output_dir: str = "predictions"
+
+    # 输入所在网格："hr"（输入已在 HR 网格上，例如已插值好的体 / 在线退化实验）
+    # | "lr"（真实低分辨率输入，如原生厚层 CT）。"lr" 时先按 task.sr_scale
+    # (_per_axis) 与训练一致的方式重采样到 HR 网格再入网：sr_sampling=='blur'
+    # 用 sr_kernel_up 插值；'decimate' 用相位对齐线性插值（与训练退化对偶）。
+    input_grid: str = "hr"
+
+    # True：写出前把归一化域反变换回原强度（HU），并保留物理标定；
+    # False：直接写归一化值（调试用）。
+    denormalize: bool = True
+
+    # 滑窗重叠比（每轴 stride = size*(1-overlap)）；0 = 不重叠。
+    overlap: float = 0.5
+
+    # 重叠区融合权重：'gaussian'（中心高权，消接缝）| 'uniform'（等权平均）。
+    blend: str = "gaussian"
+
+    # spacing 感知 z 倍率（仅 input_grid=='lr'）：>0 时逐体读 NIfTI z spacing，
+    # 以 round(z_spacing / target_z_spacing) 覆盖配置的 z 轴倍率（异质层厚数据
+    # 下每体自适应）；0=禁用，用 task.sr_scale(_per_axis) 固定倍率。
+    # 不支持 post-upsampling SISR（edsr/rcan 上采头倍率固定）。
+    target_z_spacing: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +436,10 @@ class TaskConfig:
     # 顺序按空间轴（长度=model.spatial_dims）：3D / 2.5D+lift 为 (D,H,W)，
     # 2.5D（未 lift）为 (H,W)。CT 厚层→薄层用 [2,1,1] 只超分 z 轴。
     sr_scale_per_axis: List[int] = field(default_factory=list)
-    # 制作 LR 的下采样插值："trilinear" | "area" | "nearest"。area≈抗锯齿平均池化
-    # （对应部分容积效应）。
+    # 制作 LR 的下采样核："trilinear" | "area" | "nearest"（F.interpolate）
+    # | "gauss" | "tri"（CT 层敏感度剖面 SSP 核，仅 sr_sampling=='blur'：逐退化轴
+    # 1D 平滑后抽样，gauss FWHM=层厚、tri 半宽=层厚，比 box 均值更真实）。
+    # area≈抗锯齿平均池化（对应理想 box 部分容积效应）。
     sr_kernel: str = "area"
     # LR 上采样回原尺寸的插值："trilinear" | "area" | "nearest"。默认 trilinear
     # （对应临床重建后线性插值到目标层厚；area 上采≈nearest，会产生块状 LR）。
@@ -407,6 +448,12 @@ class TaskConfig:
     sr_sampling: str = "blur"
     # LR 上附加高斯噪声（模拟采集噪声）；0=禁用。
     sr_noise_std: float = 0.0
+    # 随机退化池（轻量 Real-ESRGAN 风格）：非空时训练每次前向从中随机抽一个
+    # 下采核（取值同 sr_kernel）；验证/推理固定用 sr_kernel，指标可比。
+    sr_kernel_pool: List[str] = field(default_factory=list)
+    # 噪声 std 随机范围 [lo, hi]（训练每次均匀采样，覆盖 sr_noise_std）；
+    # 空=固定用 sr_noise_std。验证/推理固定用 sr_noise_std。
+    sr_noise_std_range: List[float] = field(default_factory=list)
 
     # --- 回归算法（algorithm=="regression"）---
     # 残差学习：模型预测 (HR − LR_up)，最终输出 = pred + LR_up（DnCNN/VDSR 思路）。
@@ -430,7 +477,8 @@ class TaskConfig:
     sigma_data: float = 0.5
     p_mean: float = -1.2
     p_std: float = 1.2
-    # 采样器："edm_heun"（EDM 二阶）| "ddpm"（祖先采样）| "ddim"。
+    # 采样器：EDM 预条件用 "edm_heun"（二阶）| "edm_euler"（一阶确定性）；
+    # DDPM 预条件用 "ddpm"（祖先采样）| "ddim"。
     sampler: str = "edm_heun"
     sample_steps: int = 18
     sigma_min: float = 0.002

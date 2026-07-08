@@ -14,6 +14,7 @@ import os
 import signal
 import socket
 import sys
+import warnings
 from datetime import timedelta
 from pathlib import Path
 
@@ -28,6 +29,11 @@ from .models.factory import build_model
 from .trainer import Trainer
 from .trainer.dist_utils import get_rank, get_world_size, is_main_process
 from .utils import seed_everything
+
+# torch 2.4 的 torch.utils.checkpoint 内部仍调用已弃用的 torch.cpu.amp.autocast，
+# 属 torch 自身告警；定向静默（本模块在 spawn 子进程中会重新 import，各 rank 均生效）。
+warnings.filterwarnings(
+    "ignore", message=r".*torch\.cpu\.amp\.autocast.*", category=FutureWarning)
 
 
 def setup_logging(output_dir: str, level: str = "INFO") -> None:

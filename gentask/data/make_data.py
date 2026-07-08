@@ -23,6 +23,7 @@ from .dataset import (
     load_nifti,
     load_nifti_cropped,
     load_region_weight_volume,
+    read_nifti_spacing_zyx,
 )
 from .loader import (
     _filter_by_exclude,
@@ -109,6 +110,8 @@ def prepare_one(
     bbox = _bbox_from_mask_path(bbox_path)
 
     # 2-3. 读 image (raw HU int16) 与 label (int16)，按 bbox 裁剪。
+    # 体素 spacing 由头信息读出并烘进 meta（M7，供 spacing-aware 退化）。
+    spacing_zyx = read_nifti_spacing_zyx(image_path)
     image = load_nifti_cropped(image_path, bbox=bbox, dtype=np.int16)
     label = load_nifti_cropped(label_path, bbox=bbox, dtype=np.int16)
 
@@ -168,6 +171,7 @@ def prepare_one(
         "src_cond"    : list(map(str, cond_paths)) if cond_paths else [],
         "bbox"        : (list(map(list, bbox)) if bbox is not None else None),
         "label_values": list(map(int, label_values)),
+        "spacing_zyx" : [float(s) for s in spacing_zyx],
         "has_rw"      : rw is not None,
         "has_cond"    : cond is not None,
         "rw_shift"    : 1.0,

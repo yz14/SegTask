@@ -13,11 +13,13 @@ AMP / EMA），针对图像复原实现训练与验证：
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,9 +106,11 @@ class GenerationTrainer:
 
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        # 选模指标：PSNR 越大越好。
+        # 选模指标：PSNR 越大越好；启用整卷验证时改用整卷 PSNR（M13）。
         self.best_metric = -math.inf
         self.best_epoch = 0
+        self.val_full_volume = bool(tc.val_full_volume)
+        self._vol_predictor = None
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -281,6 +285,12 @@ class GenerationTrainer:
                 rec = bare.restore(lr, cond=cond)
                 # 多视图时模型只复原主视图；hr / lr 裁对齐到 rec 通道布局。
                 rec, hr_m, lr_m = self.pipeline.metric_views(rec, hr, lr)
+                if lr_m.shape[2:] != hr_m.shape[2:]:
+                    # post-upsampling SISR：真 LR 尺寸的基线先线性插回 HR 网格。
+                    mode = "bilinear" if self.spatial_dims == 2 else "trilinear"
+                    lr_m = F.interpolate(
+                        lr_m, size=hr_m.shape[2:], mode=mode,
+                        align_corners=False)
                 if self._minmax:  # zscore 无固定值域，不钳位。
                     rec = rec.clamp(0.0, 1.0)
                     lr_m = lr_m.clamp(0.0, 1.0)
@@ -290,10 +300,80 @@ class GenerationTrainer:
                     float(ssim(rec, hr_m, self.spatial_dims, data_range=dr)),
                     hr_m.shape[0])
                 base_m.update(float(psnr(lr_m, hr_m, data_range=dr)), hr_m.shape[0])
+            metrics = {"psnr": psnr_m.avg, "ssim": ssim_m.avg,
+                       "psnr_lr": base_m.avg}
+            if self.val_full_volume:
+                metrics.update(self._validate_volumes())
         finally:
             if self.ema is not None:
                 self.ema.restore(self.model)
-        return {"psnr": psnr_m.avg, "ssim": ssim_m.avg, "psnr_lr": base_m.avg}
+        return metrics
+
+    # ------------------------------------------------------------------
+    # 整卷验证（M13）：与部署同口径，复用推理器滑窗路径
+    # ------------------------------------------------------------------
+    def _get_vol_predictor(self):
+        """懒构造整卷验证用推理器（与 self.model 共享权重，EMA 影子生效）。"""
+        if self._vol_predictor is None:
+            from ..predictor.gen_predictor import GenerationPredictor
+            cfg = copy.deepcopy(self.cfg)
+            # 验证输入由在线退化产生：SISR（post-upsampling）吃真 LR 网格，
+            # 其余已在 HR 网格；不走逐体 spacing 覆盖。
+            cfg.predict.input_grid = (
+                "lr" if str(cfg.model.arch).lower() in ("edsr", "rcan")
+                else "hr")
+            cfg.predict.target_z_spacing = 0.0
+            self._vol_predictor = GenerationPredictor(
+                self.model, cfg, self.device)
+        return self._vol_predictor
+
+    def _validate_volumes(self) -> Dict[str, float]:
+        """整卷验证：退化整卷 → 滑窗复原 → 逐卷 PSNR/SSIM 平均。
+
+        退化在 no_grad 下固定用基础核/噪声（随机池不生效），指标可比。"""
+        ds = self.val_loader.dataset
+        pred = self._get_vol_predictor()
+        bare = unwrap_compile(self.model)
+        n = len(ds._npz_paths)
+        limit = int(self.cfg.train.val_full_volume_max)
+        if limit > 0:
+            n = min(n, limit)
+        psnr_m, ssim_m, base_m = AverageMeter(), AverageMeter(), AverageMeter()
+        dr = self.val_data_range
+        for i in range(n):
+            hr_np = ds._load_image(i)
+            cond_np = ds._load_cond(i)
+            hr = torch.from_numpy(
+                np.ascontiguousarray(hr_np)).float().to(self.device)
+            if pred.net_upsamples:
+                # post-upsampling SISR：裁到倍率整除，复原网格与 HR 对齐。
+                sc = pred.vol_axis_scales
+                crop = [(s // k) * k for s, k in zip(hr.shape, sc)]
+                hr = hr[:crop[0], :crop[1], :crop[2]]
+                if cond_np is not None:
+                    cond_np = cond_np[:, :crop[0], :crop[1], :crop[2]]
+            # 2.5D（未 lift）退化作用在 (H,W)，z 当通道；3D/lift 作用在 (D,H,W)。
+            x = hr[None, None] if self.spatial_dims == 3 else hr[None]
+            lr = bare.degrade(x)
+            lr_vol = lr[0, 0] if lr.ndim == 5 else lr[0]  # (d,h,w)
+            rec_np = pred.restore_volume(
+                lr_vol.float().cpu().numpy(), cond_vol=cond_np)
+            rec = torch.from_numpy(rec_np).to(self.device)[None, None]
+            hr_t = hr[None, None]
+            lr_up = lr_vol[None, None]
+            if lr_up.shape[2:] != hr_t.shape[2:]:
+                # 真 LR 尺寸基线先线性插回 HR 网格（与 patch 级口径一致）。
+                lr_up = F.interpolate(
+                    lr_up, size=hr_t.shape[2:], mode="trilinear",
+                    align_corners=False)
+            if self._minmax:
+                rec = rec.clamp(0.0, 1.0)
+                lr_up = lr_up.clamp(0.0, 1.0)
+            psnr_m.update(float(psnr(rec, hr_t, data_range=dr)))
+            ssim_m.update(float(ssim(rec, hr_t, 3, data_range=dr)))
+            base_m.update(float(psnr(lr_up, hr_t, data_range=dr)))
+        return {"vol_psnr": psnr_m.avg, "vol_ssim": ssim_m.avg,
+                "vol_psnr_lr": base_m.avg}
 
     def _save_best(self, epoch: int) -> None:
         bare = unwrap_compile(self.model)
@@ -310,22 +390,96 @@ class GenerationTrainer:
         logger.info("Best generation model saved (PSNR=%.3f) @ epoch %d",
                     self.best_metric, epoch + 1)
 
+    # ------------------------------------------------------------------
+    # 断点续训（M14）：last_checkpoint 保存完整训练状态
+    # ------------------------------------------------------------------
+    def _save_checkpoint(self, epoch: int) -> None:
+        """周期保存可续训 checkpoint（模型 + optimizer/scheduler/scaler/EMA）。"""
+        bare = unwrap_compile(self.model)
+        state = {
+            "epoch": epoch,
+            "model_state_dict": bare.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "best_metric": self.best_metric,
+            "best_epoch": self.best_epoch,
+            "config": self.cfg,
+        }
+        if self.ema is not None:
+            state["ema_state_dict"] = self.ema.state_dict()
+        path = self.output_dir / "last_checkpoint.pth"
+        tmp = path.with_suffix(".pth.tmp")  # 原子替换，防中断写坏
+        torch.save(state, tmp)
+        tmp.replace(path)
+        logger.info("Checkpoint saved @ epoch %d -> %s", epoch + 1, path)
+
+    def _load_resume(self, path: str) -> int:
+        """从 checkpoint 恢复完整训练状态；返回续训起始 epoch。"""
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        bare = unwrap_compile(self.model)
+        bare.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if self.ema is not None and "ema_state_dict" in ckpt:
+            self.ema.load_state_dict(ckpt["ema_state_dict"])
+        self.best_metric = float(ckpt.get("best_metric", -math.inf))
+        self.best_epoch = int(ckpt.get("best_epoch", 0))
+        start = int(ckpt.get("epoch", -1)) + 1
+        logger.info(
+            "Resumed from %s: start_epoch=%d, best_PSNR=%.3f @ epoch %d",
+            path, start + 1, self.best_metric, self.best_epoch + 1)
+        return start
+
     def fit(self) -> Dict[str, float]:
         self._check_supported_data_options(self.cfg)
+        tc = self.cfg.train
+        start_epoch = self._load_resume(tc.resume) if tc.resume else 0
+        val_every = max(int(tc.val_every), 1)
+        save_every = max(int(tc.save_every), 1)
         last: Dict[str, float] = {}
-        for epoch in range(self.cfg.train.epochs):
+        for epoch in range(start_epoch, tc.epochs):
             tr = self._train_epoch(epoch)
-            val = self._validate(epoch)
-            self.scheduler.step_epoch(val.get("psnr"))
-            logger.info(
-                "Epoch %d/%d: train_loss=%.4f val_PSNR=%.3f (LR=%.3f) val_SSIM=%.4f",
-                epoch + 1, self.cfg.train.epochs, tr["loss"],
-                val["psnr"], val["psnr_lr"], val["ssim"])
-            if val["psnr"] > self.best_metric:
-                self.best_metric = val["psnr"]
-                self.best_epoch = epoch
-                self._save_best(epoch)
-            last = {**tr, **val}
+            is_last = (epoch + 1) == tc.epochs
+            do_val = ((epoch + 1) % val_every == 0) or is_last
+            if do_val:
+                val = self._validate(epoch)
+                # 启用整卷验证时，退火/选模以整卷 PSNR 为准（与部署一致）。
+                select = val.get("vol_psnr", val["psnr"])
+                self.scheduler.step_epoch(select)
+                logger.info(
+                    "Epoch %d/%d: train_loss=%.4f val_PSNR=%.3f (LR=%.3f) val_SSIM=%.4f",
+                    epoch + 1, tc.epochs, tr["loss"],
+                    val["psnr"], val["psnr_lr"], val["ssim"])
+                if "vol_psnr" in val:
+                    logger.info(
+                        "  full-volume: PSNR=%.3f (LR=%.3f) SSIM=%.4f",
+                        val["vol_psnr"], val["vol_psnr_lr"], val["vol_ssim"])
+                if select > self.best_metric:
+                    self.best_metric = select
+                    self.best_epoch = epoch
+                    self._save_best(epoch)
+                last = {**tr, **val}
+            else:
+                logger.info("Epoch %d/%d: train_loss=%.4f (val skipped, "
+                            "val_every=%d)", epoch + 1, tc.epochs,
+                            tr["loss"], val_every)
+                last = {**tr}
+            if ((epoch + 1) % save_every == 0) or is_last:
+                self._save_checkpoint(epoch)
+            # 早停：连续 early_stopping 个 epoch 无提升即止（按 epoch 计）。
+            if (tc.early_stopping > 0 and do_val
+                    and epoch - self.best_epoch >= int(tc.early_stopping)):
+                logger.info(
+                    "Early stopping @ epoch %d (no improvement for %d "
+                    "epochs; best @ epoch %d).",
+                    epoch + 1, epoch - self.best_epoch, self.best_epoch + 1)
+                self._save_checkpoint(epoch)
+                break
         return {"best_psnr": self.best_metric, "best_epoch": self.best_epoch,
                 **last}
 

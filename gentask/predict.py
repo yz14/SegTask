@@ -42,6 +42,10 @@ def main():
     parser.add_argument("--weights", choices=["auto", "ema", "online"],
                         default="auto",
                         help="Which weights to load from checkpoint")
+    parser.add_argument("--input-grid", choices=["hr", "lr"], default=None,
+                        help="Input grid: 'hr' (already on HR grid) or 'lr' "
+                             "(real low-res, resampled to HR grid before the "
+                             "network); default cfg.predict.input_grid")
     parser.add_argument("--no-recursive", action="store_true",
                         help="Do not search subdirectories of --input")
     parser.add_argument("--override", nargs="*", default=[],
@@ -70,6 +74,9 @@ def main():
         input_path = cfg.data.image_dir or ""
         if not input_path:
             parser.error("--input not given and cfg.data.image_dir is empty.")
+
+    if args.input_grid:
+        cfg.predict.input_grid = args.input_grid
 
     if args.output:
         cfg.predict.output_dir = args.output

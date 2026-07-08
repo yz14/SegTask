@@ -17,7 +17,7 @@ from .io import (
     load_npz_cond, load_npz_label, load_npz_label_for_split,
     load_npz_region_weight,
     load_region_weight_volume, npz_has_rw, preprocess_image,
-    preprocess_label, resize_3d, _open_npz,
+    resize_3d, _open_npz,
 )
 
 logger = logging.getLogger(__name__)
