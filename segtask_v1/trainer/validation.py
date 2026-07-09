@@ -282,11 +282,14 @@ class MetricAccumulator:
 
         cov = self._cov.cpu().tolist()
         if log:
+            loss_str = (
+                "N/A" if self.loss_meter.count == 0
+                else f"{metrics['val_loss']:.4f}")
             logger.info(
-                "  %s: loss=%.4f, pooled_mean_dice=%.4f, per_class=%s, "
+                "  %s: loss=%s, pooled_mean_dice=%.4f, per_class=%s, "
                 "iou=%.4f, recall=%.4f, precision=%.4f, vol_sim=%.4f, "
                 "mcc=%.4f, min_class_dice=%.4f, coverage=%s/%d samples%s%s",
-                log_prefix, metrics["val_loss"], metrics["mean_dice"],
+                log_prefix, loss_str, metrics["mean_dice"],
                 [f"{d:.4f}" for d in dice_per_class.tolist()],
                 metrics["mean_iou"], metrics["mean_recall"],
                 metrics["mean_precision"], metrics["mean_vol_sim"],

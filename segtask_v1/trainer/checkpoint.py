@@ -11,23 +11,133 @@ from __future__ import annotations
 import logging
 import threading
 from queue import Queue
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+# ``_build_state_dict`` 写入的 RNG 快照键集合；``state_to_cpu`` 据此识别并走
+# bytes 打包路径，避免 ``.clone()`` 把 ``ByteTensor`` 降级为普通 ``uint8 Tensor``。
+_RNG_STATE_MARKERS = frozenset({"torch_cpu", "numpy", "python"})
+
+
+def _looks_like_rng_state(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    keys = set(obj.keys())
+    return _RNG_STATE_MARKERS.issubset(keys)
+
+
+def _tensor_to_rng_bytes(tensor: torch.Tensor) -> bytes:
+    return tensor.detach().cpu().to(torch.uint8).contiguous().numpy().tobytes()
+
+
+def _rng_bytes_to_cpu_tensor(data: object) -> torch.Tensor:
+    """反序列化 RNG 字节或历史 Tensor 为 ``set_rng_state`` 可接受的 CPU uint8 张量。"""
+    if isinstance(data, (bytes, bytearray)):
+        return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+    if isinstance(data, torch.Tensor):
+        return data.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    raise TypeError(
+        f"RNG cpu state must be bytes or Tensor, got {type(data).__name__}")
+
+
+def pack_rng_state_for_save(rng: dict) -> dict:
+    """把 RNG 快照打成 pickle 安全的 bytes 布局（供 async ``state_to_cpu`` 使用）。"""
+    out: dict = {}
+    tc = rng.get("torch_cpu")
+    if tc is not None:
+        out["torch_cpu"] = _tensor_to_rng_bytes(tc)
+    tcuda = rng.get("torch_cuda")
+    if tcuda is not None:
+        out["torch_cuda"] = [_tensor_to_rng_bytes(t) for t in tcuda]
+    if "numpy" in rng:
+        out["numpy"] = rng["numpy"]
+    if "python" in rng:
+        out["python"] = rng["python"]
+    return out
+
+
+def restore_rng_state(rng: dict) -> None:
+    """从 checkpoint 恢复 RNG（兼容 bytes 打包与历史 Tensor 格式）。"""
+    tc = rng.get("torch_cpu")
+    if tc is not None:
+        torch.set_rng_state(_rng_bytes_to_cpu_tensor(tc))
+    tcuda = rng.get("torch_cuda")
+    if tcuda is not None and torch.cuda.is_available():
+        restored = [_rng_bytes_to_cpu_tensor(t) for t in tcuda]
+        torch.cuda.set_rng_state_all(restored)
+    np_state = rng.get("numpy")
+    if np_state is not None:
+        import numpy as np
+        np.random.set_state(np_state)
+    py_state = rng.get("python")
+    if py_state is not None:
+        import random
+        random.setstate(py_state)
+
+
+def _iter_leaf_optimizers(
+    optimizer: torch.optim.Optimizer,
+) -> Iterable[torch.optim.Optimizer]:
+    """遍历实际持有 ``.state`` 的叶子优化器（含 ZeRO 内层 ``.optim``）。"""
+    seen: set[int] = set()
+    stack = [optimizer]
+    while stack:
+        opt = stack.pop()
+        oid = id(opt)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        inner = getattr(opt, "optim", None)
+        if inner is not None and inner is not opt:
+            stack.append(inner)
+        if hasattr(opt, "param_groups") and hasattr(opt, "state"):
+            yield opt
+
+
+def relocate_optimizer_state(optimizer: torch.optim.Optimizer) -> int:
+    """把 per-param optimizer state 张量搬到对应参数所在 device。
+
+    Resume 时 checkpoint 经 CPU 落盘 + ``map_location`` 重载后，Adam(fused) 的
+    ``step`` / ``exp_avg`` 等可能分裂在 CPU 与 GPU 上，ZeRO 重分片会加剧这一问题；
+    在 ``load_state_dict`` 之后统一对齐可避免 fused kernel 设备不一致错误。
+    """
+    relocated = 0
+    for opt in _iter_leaf_optimizers(optimizer):
+        for group in opt.param_groups:
+            for param in group["params"]:
+                if param is None:
+                    continue
+                state = opt.state.get(param)
+                if not state:
+                    continue
+                target = param.device
+                for key, value in list(state.items()):
+                    if (isinstance(value, torch.Tensor)
+                            and value.device != target):
+                        state[key] = value.to(device=target, non_blocking=True)
+                        relocated += 1
+    if relocated:
+        logger.debug(
+            "Relocated %d optimizer state tensor(s) onto param devices.",
+            relocated)
+    return relocated
+
 
 def state_to_cpu(obj):
     """递归把嵌套 state 里的张量深拷贝到 CPU（``detach().clone().cpu()``）。
 
     异步保存前必须做：state_dict 中的张量与在线参数共享存储，训练继续推进会
-    原地改写；拷贝后后台线程持有的快照与训练解耦。非张量对象原样返回（RNG
-    state / 标量 / config 等本身即不可变或已是拷贝）。"""
+    原地改写；拷贝后后台线程持有的快照与训练解耦。RNG 快照走 ``bytes`` 打包，
+    避免破坏 ``torch.set_rng_state`` 所需的 uint8 语义。"""
     if isinstance(obj, torch.Tensor):
         return obj.detach().clone().cpu()
     if isinstance(obj, dict):
+        if _looks_like_rng_state(obj):
+            return pack_rng_state_for_save(obj)
         return type(obj)((k, state_to_cpu(v)) for k, v in obj.items())
     if isinstance(obj, (list, tuple)):
         return type(obj)(state_to_cpu(v) for v in obj)
@@ -150,7 +260,12 @@ def strip_common_prefixes(sd):
 
 
 __all__ = [
+    "AsyncCheckpointSaver",
+    "state_to_cpu",
     "unwrap_compile",
     "extract_model_state_dict",
     "strip_common_prefixes",
+    "pack_rng_state_for_save",
+    "restore_rng_state",
+    "relocate_optimizer_state",
 ]

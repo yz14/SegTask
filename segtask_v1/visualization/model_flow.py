@@ -1,31 +1,25 @@
 """模型流 builder：``输入 → encoder → decoder → 各输出头 → 损失``。
 
-与旧实现（按叶子 hook 的执行先后串成一条线性链）不同，这里**按真实张量数据流重建
-DAG**，从而正确呈现：并联分支（如 multi-stem 三路并行）、残差捷径、encoder→decoder
-跳连、多输入融合，以及各输出头的真实来源。
+追踪引擎为 **torchlens**（eager 逐 op 追踪）：跑一次 dummy 前向，拿到
+「op 级真值 DAG + 每个 op 的模块归属链 + 形状」，再映射到 ``VisGraph``：
 
-采集与重建策略：
-1. 用一份 **CPU dummy 全零张量**（batch=1，尺寸取 pipeline 目标 patch）跑一次前向，
-   对**所有模块**（含容器）注册 forward-pre / forward hook，记录每个模块输入/输出
-   **张量的 ``id()``** 与真实形状；
-2. 前向在 ``model.train()`` 下进行（``no_grad``），以便 aux / deep-supervision / topo
-   等"仅训练期输出"的头也被激活、出现在图中；
-3. 由"叶子输出张量 id → 产出叶子"建立产出映射；对每个图节点，用其**自身输入张量 id**
-   反查上游产出节点 → 得到真实连边（天然含并联扇入扇出、跳连、多输入融合）；
-4. 残差捷径按 block 类型结构化识别后单独画一条 ``residual`` 边；
-5. 前向若抛错（自定义 forward 签名等），降级为 ``eval()`` 重试；仍失败则退化为
-   **纯结构图**（只读 ``named_modules`` 层级，按声明序线性链）。
+* **分组 = 模块树本身**：容器框 = 前向中被真实调用的 nn.Module（含嵌套），
+  不依赖任何容器命名白名单——新增模块自动获得正确的框；
+* **连边 = op 级 DAG 收缩 + 按层级上提**：叶子模块内部的多个 op 收缩为单节点，
+  functional 算子（reshape/permute/interpolate…）作为"导线"透传；每条收缩边
+  上提到两端在**最近公共容器**下的兄弟层级发射，天然支持折叠展示；
+* **残差/融合 = DAG 结构判定**：任何有 ≥2 个不同上游的 cat/+/× 算子即为融合点
+  （显式 merge 节点）；若融合的某一路上游可沿 DAG 到达另一路，则该边为残差捷径。
+  不依赖 block 类型清单与 shortcut 属性名。
 
-叶子按所属容器（encoder.stem / encoder.stages.k / decoder.levels.k / *_head）聚合成
-可折叠 stage 大框；容器内再按 block（``blocks.k`` / ``stems.k`` / ``proj`` …）分组。
+torchlens 不可用或前向失败时，退化为**纯结构图**（按 ``named_modules`` 声明序
+线性链），保证任何情况下都有可读骨架。
 """
 
 from __future__ import annotations
 
-import inspect
 import logging
-import weakref
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,14 +30,6 @@ from .data_flow import _model_input_shape
 from .graph import VisGraph, assign_grid_layout, shape_str
 
 logger = logging.getLogger(__name__)
-
-# ``register_forward_pre_hook(..., with_kwargs=True)`` 仅 PyTorch >= 2.0 支持。旧版本
-# 调用会抛 TypeError，导致数据流追踪整体失败、退化为纯结构图。这里一次性特性探测：
-# 支持则按 kwargs-aware 注册（可捕获以关键字传入子模块的张量）；不支持则退回不带该
-# 参数的注册——pre-hook 签名 ``(_mod, args, kwargs=None)`` 对两种调用约定都兼容（旧版
-# 仅缺少关键字参数的血缘，属可接受降级），从而在旧 torch 上仍能正常产出数据流图。
-_PRE_HOOK_SUPPORTS_KWARGS: bool = "with_kwargs" in inspect.signature(
-    nn.Module.register_forward_pre_hook).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -104,235 +90,7 @@ def _leaf_params(m: nn.Module) -> Dict[str, object]:
     return p
 
 
-# ---------------------------------------------------------------------------
-# 容器 / block 分组
-# ---------------------------------------------------------------------------
-# 透明包裹容器名：分组时跳过（仅作语义包裹，无需单独成框）。
-_WRAPPER_SEGS = {"stage"}
-
-
-# encoder/decoder 下"按索引切分"的 ModuleList 容器段：每个索引各成一个顶层框。
-# 覆盖标准 UNet（stages/downsamples/levels/upsamples）、ADM（levels）、
-# EDM2（level_blocks/level_entries）、UNet++/UNet3+（blocks/upsamples/gates/
-# branches/fusions，键可为 i_j 复合）。
-_INDEXED_SEGS = {
-    "stages", "downsamples", "levels", "upsamples", "level_blocks",
-    "level_entries", "blocks", "gates", "branches", "fusions",
-}
-
-
-def _top_key(name: str) -> str:
-    """叶子限定名 → 所属**顶层容器**键（encoder.stem / encoder.stages.k / …）。
-
-    与旧 ``_stage_key`` 的关键区别：``encoder.stem.stems.k`` 不再各自成顶层框，而是
-    统一归到单一 ``encoder.stem`` 容器（其内部三路并联另由 block 分组呈现）；并对各
-    decoder 变体（UNet/UNet++/UNet3+/ADM/EDM2）按索引切分出每级一框。
-    """
-    parts = name.split(".")
-    p0 = parts[0]
-    if p0 in ("encoder", "decoder"):
-        if p0 == "encoder" and len(parts) >= 2 and parts[1] == "stem":
-            return "encoder.stem"
-        if p0 == "encoder" and len(parts) >= 2 and parts[1] == "aux_fuse":
-            return "encoder.aux_fuse"
-        # 按索引切分的 ModuleList 段：索引可为数字或 i_j 复合键。
-        if (len(parts) >= 3 and parts[1] in _INDEXED_SEGS
-                and (parts[2].isdigit() or "_" in parts[2])):
-            return f"{p0}.{parts[1]}.{parts[2]}"
-        return ".".join(parts[:2]) if len(parts) >= 2 else p0
-    if p0 in ("seg_head", "topo_head", "recon_head"):
-        return p0
-    if p0 in ("ds_heads", "aux_heads") and len(parts) >= 2:
-        return f"{p0}.{parts[1]}"
-    return p0
-
-
-def _block_key(name: str, top: str) -> Optional[str]:
-    """容器内的 block 级分组键（``blocks.k`` / ``stems.k`` / ``proj`` / ``upsample`` …）。
-
-    返回的是**真实模块路径**（保留 ``stage`` 等包裹段，以便后续按路径取回模块做
-    类型 / 残差判定）；显示标题由 ``_block_label`` 去掉包裹段。``None`` 表示该叶子
-    直接挂在顶层容器下（无中间 block 层）。
-    """
-    if not name.startswith(top + "."):
-        return None
-    rem = name[len(top) + 1:].split(".")
-    segs: List[str] = []
-    i = 0
-    while i < len(rem):
-        seg = rem[i]
-        segs.append(seg)
-        if seg in _WRAPPER_SEGS:           # 'stage' 等透明包裹：保留路径但继续下探
-            i += 1
-            continue
-        if i + 1 < len(rem) and rem[i + 1].isdigit():
-            segs.append(rem[i + 1])        # 形如 blocks.0 / stems.1 的索引块
-        break
-    if not segs:
-        return None
-    block = top + "." + ".".join(segs)
-    if block == name:                      # block 即叶子本身 → 视为直接子节点
-        return None
-    return block
-
-
-def _top_label(key: str) -> str:
-    """顶层容器键 → 人类可读标题。"""
-    parts = key.split(".")
-    pretty = {
-        "encoder.stem": "Encoder Stem",
-        "encoder.aux_fuse": "Encoder Aux-Fuse",
-        "seg_head": "Seg Head (main)",
-        "topo_head": "Topo Head",
-        "recon_head": "Recon Head",
-    }
-    if key in pretty:
-        return pretty[key]
-    if len(parts) == 3:
-        p0, seg, idx = parts
-        enc = p0 == "encoder"
-        seg_label = {
-            "stages": "Encoder Stage", "downsamples": "Downsample",
-            "levels": ("Encoder Level" if enc else "Decoder Level"),
-            "upsamples": "Upsample",
-            "level_blocks": ("Enc Blocks" if enc else "Dec Blocks"),
-            "level_entries": ("Enc Entry" if enc else "Dec Entry"),
-            "branches": "Dec Branches", "fusions": "Dec Fuse",
-        }.get(seg)
-        if seg_label:
-            return f"{seg_label} {idx}"
-        if p0 == "decoder" and seg in ("blocks", "gates"):
-            # UNet++ 嵌套节点 X[i,j]（键形如 i_j）。
-            return f"Decoder X[{idx.replace('_', ',')}]"
-        if p0 == "decoder":
-            return f"Decoder {seg} {idx}"
-    if len(parts) == 2 and parts[0] == "ds_heads":
-        return f"DS Head {parts[1]}"
-    if len(parts) == 2 and parts[0] == "aux_heads":
-        return f"Aux Head {parts[1]}"
-    return key
-
-
-def _block_label(block_key: str, top: str) -> str:
-    """block 键 → 框内子标题（取相对 top 的尾段，去掉 ``stage`` 等包裹段）。"""
-    rel = block_key[len(top) + 1:] if block_key.startswith(top + ".") else block_key
-    parts = [p for p in rel.split(".") if p not in _WRAPPER_SEGS]
-    return ".".join(parts) if parts else rel
-
-
-def _is_head(key: str) -> bool:
-    return (key in ("seg_head", "topo_head", "recon_head")
-            or key.startswith("ds_heads.")
-            or key.startswith("aux_heads."))
-
-
-def _head_edge_label(key: str) -> str:
-    if key == "seg_head":
-        return "main"
-    if key == "topo_head":
-        return "topo"
-    if key.startswith("ds_heads."):
-        return "ds"
-    if key.startswith("aux_heads."):
-        return "aux"
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# 残差 block 识别
-# ---------------------------------------------------------------------------
-def _residual_block_types() -> Tuple[type, ...]:
-    """已知"自带残差/捷径"的 block 类型（懒导入，缺失则跳过）。"""
-    types: List[type] = []
-    try:
-        from ..models.resnet import (
-            BottleneckBlock, PreActResNetBlock, R2Plus1DBlock, ResNetBlock,
-        )
-        types += [ResNetBlock, PreActResNetBlock, BottleneckBlock, R2Plus1DBlock]
-    except Exception as e:  # pragma: no cover - 仅日志
-        logger.debug("model_flow: 导入 resnet 残差块类型失败: %s", e)
-    try:
-        from ..models.convnext import ConvNeXtBlock
-        types.append(ConvNeXtBlock)
-    except Exception as e:  # pragma: no cover
-        logger.debug("model_flow: 导入 convnext 残差块类型失败: %s", e)
-    try:  # 扩散系 backbone 的残差块（输出 = 残差支 + skip(输入)）
-        from ..models.adm_unet import _ResBlockNoEmb
-        types.append(_ResBlockNoEmb)
-    except Exception as e:  # pragma: no cover
-        logger.debug("model_flow: 导入 adm 残差块类型失败: %s", e)
-    try:
-        from ..models.edm2_unet import _Block as _EDM2Block
-        types.append(_EDM2Block)
-    except Exception as e:  # pragma: no cover
-        logger.debug("model_flow: 导入 edm2 残差块类型失败: %s", e)
-    return tuple(types)
-
-
-# 残差捷径子模块的常见命名（不同 backbone 各异）。
-_SHORTCUT_ATTRS = ("shortcut", "skip_connection", "conv_skip")
-
-
-def _has_residual(m: nn.Module, residual_types: Tuple[type, ...]) -> bool:
-    """该 block 是否含残差捷径（``out = 残差支 + skip(x)`` 形态）。"""
-    if residual_types and isinstance(m, residual_types):
-        return True
-    # 通用启发：含名为 shortcut / skip_connection / conv_skip 的子模块即视为残差块。
-    return any(isinstance(getattr(m, a, None), nn.Module) for a in _SHORTCUT_ATTRS)
-
-
-# ---------------------------------------------------------------------------
-# 张量数据流追踪
-# ---------------------------------------------------------------------------
-class _ModuleRec:
-    """单个模块一次前向的输入/输出张量 id 与形状记录。"""
-
-    __slots__ = ("name", "module", "order", "in_ids", "out_ids",
-                 "in_shape", "out_shape", "in_prov", "in_src", "in_op")
-
-    def __init__(self, name: str, module: nn.Module):
-        self.name = name
-        self.module = module
-        self.order: int = -1
-        self.in_ids: Tuple[int, ...] = ()
-        self.out_ids: Tuple[int, ...] = ()
-        self.in_shape: Optional[Tuple[int, ...]] = None
-        self.out_shape: Optional[Tuple[int, ...]] = None
-        # 各输入张量在 pre_hook 时刻解析出的血缘（上游叶子名集合），与 in_ids 对齐。
-        # 在 pre_hook 解析可保证此刻输入张量仍存活、id 唯一，从而 prov 命中正确，
-        # 既免去张量钉住（省内存），又杜绝 id 复用导致的 build 期陈旧读。
-        self.in_prov: Tuple["frozenset[str]", ...] = ()
-        # 各输入张量的**直接产出叶子**名（weakref 校验，非直接产出则为 None），
-        # 供 block 内叶子流式连边；同样在 pre_hook 解析以规避 id 复用。
-        self.in_src: Tuple[Optional[str], ...] = ()
-        # 各输入张量若由**多源融合算子**（cat/+/…）产生，则记其归一化符号（"cat"/
-        # "+"/…），否则为 None；供步骤 D 在融合点插入显式 merge 节点并正确标注。
-        self.in_op: Tuple[Optional[str], ...] = ()
-
-
-def _iter_tensors(obj) -> List[torch.Tensor]:
-    """从任意 args / kwargs 结构里扁平收集张量。"""
-    out: List[torch.Tensor] = []
-    if torch.is_tensor(obj):
-        out.append(obj)
-    elif isinstance(obj, (list, tuple)):
-        for x in obj:
-            out += _iter_tensors(x)
-    elif isinstance(obj, dict):
-        for x in obj.values():
-            out += _iter_tensors(x)
-    return out
-
-
-# 张量血缘（provenance）：tensor id → 产出它的上游叶子名集合（含哨兵 "input"）。
-# functional 算子（cat / +/ interpolate / pool …）不产生 module，纯靠 module hook
-# 无法连边；用 TorchFunctionMode 拦截这些算子，把输出张量的血缘并为各输入血缘之并，
-# 从而下游 module 的输入张量能反查到真实的多个上游叶子（多输入融合 / 跳连 / 残差）。
-Provenance = Dict[int, "frozenset[str]"]
-# 融合算子标记：tensor id → 归一化符号。仅当某算子**实际合并 ≥ 2 个带血缘的输入**时
-# 记录其输出张量，供步骤 D 在融合点插入显式 merge 节点并正确标注（cat / + / × …）。
-MergeOps = Dict[int, str]
-# torch 函数名 → 展示符号。未登记的多源融合算子回退到通用 "merge"。
+# torch 函数名 → 融合点展示符号。未登记的多源算子回退到通用 "merge"。
 _MERGE_OP_SYMBOLS: Dict[str, str] = {
     "cat": "cat", "concat": "cat", "concatenate": "cat", "stack": "cat",
     "hstack": "cat", "vstack": "cat", "dstack": "cat", "column_stack": "cat",
@@ -340,189 +98,361 @@ _MERGE_OP_SYMBOLS: Dict[str, str] = {
     "sub": "−", "sub_": "−", "subtract": "−", "__sub__": "−",
     "mul": "×", "mul_": "×", "multiply": "×", "__mul__": "×",
     "maximum": "max", "max": "max", "minimum": "min", "min": "min",
+    # lerp(a, b, w) = a + w·(b−a)：幅度保持网络（如 EDM2）用作加性融合。
+    "lerp": "lerp", "lerp_": "lerp",
 }
+_ADDITIVE_SYMBOLS = {"+", "−", "×", "lerp"}
 
 
-def _op_symbol(func) -> str:
-    """torch 函数对象 → merge 节点展示符号（默认 ``merge``）。"""
-    return _MERGE_OP_SYMBOLS.get(getattr(func, "__name__", ""), "merge")
+# ---------------------------------------------------------------------------
+# torchlens 追踪
+# ---------------------------------------------------------------------------
+class _Op:
+    """torchlens 单 op 的最小快照（脱离 ModelHistory 生命周期）。"""
+
+    __slots__ = ("label", "step", "func", "shape", "mods",
+                 "parents", "children", "is_input", "is_output")
+
+    def __init__(self, label: str, step: int, func: str,
+                 shape: Optional[Tuple[int, ...]],
+                 mods: List[Tuple[str, int]],
+                 parents: List[str], children: List[str],
+                 is_input: bool, is_output: bool):
+        self.label = label
+        self.step = step
+        self.func = func
+        self.shape = shape
+        self.mods = mods
+        self.parents = parents
+        self.children = children
+        self.is_input = is_input
+        self.is_output = is_output
 
 
-def _make_prov_mode(prov: Provenance, merge_op: MergeOps):
-    """构造一个累积张量血缘的 TorchFunctionMode（torch 不支持时返回 None）。
-
-    每个流经模块/算子之间的张量在产生时都会被写入血缘（functional 输出在此累积，
-    叶子输出在 forward hook 覆盖），因此 ``id()`` 复用不会留下被读取到的陈旧项，
-    无需钉住全部张量（钉住会在大体积 3D 前向时撑爆内存）。
-    """
-    try:
-        from torch.overrides import TorchFunctionMode
-    except Exception:  # pragma: no cover - 老版本 torch
-        return None
-
-    class _ProvMode(TorchFunctionMode):
-        def __torch_function__(self, func, types, args=(), kwargs=None):
-            kwargs = kwargs or {}
-            ins = _iter_tensors(args) + _iter_tensors(kwargs)
-            out = func(*args, **kwargs)
-            try:
-                srcs: "frozenset[str]" = frozenset()
-                for t in ins:
-                    s = prov.get(id(t))
-                    if s:
-                        srcs |= s
-                in_ids = {id(t) for t in ins}
-                # 是否为真正的多源融合：该算子本身接收 ≥ 2 个带血缘的输入。
-                merge_sym = (_op_symbol(func)
-                             if sum(1 for t in ins if prov.get(id(t))) >= 2
-                             else None)
-                for o in _iter_tensors(out):
-                    if id(o) in in_ids:
-                        # in-place / 透传：在该（存活）张量已有血缘上累加。
-                        prov[id(o)] = prov.get(id(o), frozenset()) | srcs
-                    else:
-                        # 新张量：直接覆盖，杜绝其 id 命中已释放张量的陈旧血缘
-                        # （陈旧读是 id 追踪下不确定性的根源）。
-                        prov[id(o)] = srcs
-                    if merge_sym is not None:
-                        merge_op[id(o)] = merge_sym
-                    else:
-                        merge_op.pop(id(o), None)  # 新张量复用旧 id 时清陈旧标记
-            except Exception:  # pragma: no cover - 血缘累积尽力而为
-                pass
-            return out
-
-    return _ProvMode()
-
-
-def _trace_modules(
-    model: nn.Module, in_shape: Tuple[int, ...],
-) -> Tuple[Dict[str, _ModuleRec], bool]:
-    """注册全模块 hook 跑一次 dummy 前向，回填张量 id / 形状 / 输入血缘。
-
-    返回 ``(recs, traced)``；``traced=False`` 表示前向失败。每个 rec 的 ``in_prov``
-    在 pre_hook 时刻已解析好上游血缘，故无需把 ``prov`` 透出到 build 阶段。
-    """
-    recs: Dict[str, _ModuleRec] = {
-        name: _ModuleRec(name, m)
-        for name, m in model.named_modules() if name
-    }
-    leaf_names: Set[str] = {
-        name for name, m in model.named_modules()
-        if name and not list(m.children())
-    }
-    # 残差 block 容器：其输出 = 主路 + shortcut(输入)，会把"该 block 的输入血缘"
-    # 经 identity 捷径透传到输出，污染同级/下游连边。这里在 block 出口把血缘**重封**
-    # 为该 block 自身，使其对外只表现为单一产出单元（块内残差另由结构化残差边表达）。
-    residual_types = _residual_block_types()
-    reseal_names: Set[str] = {
-        name for name, m in model.named_modules()
-        if name and list(m.children()) and _has_residual(m, residual_types)
-    }
-    prov: Provenance = {}
-    merge_op: MergeOps = {}
-    # 叶子输出张量 id → (产出叶子名, 该张量弱引用)。weakref 用于在 pre_hook 查询时
-    # 辨别"id 是否被复用"：若弱引用已失效或不指向当前输入张量，则该 id 实为陈旧项。
-    live_out: Dict[int, Tuple[str, "weakref.ref"]] = {}
-
-    counter = {"i": 0}
-    handles: List[torch.utils.hooks.RemovableHandle] = []
-
-    def _src_of(t: torch.Tensor) -> Optional[str]:
-        entry = live_out.get(id(t))
-        if entry is None:
-            return None
-        name, ref = entry
-        return name if ref() is t else None  # 弱引用校验：防 id 复用误连
-
-    def _mk_pre_hook(rec: _ModuleRec):
-        def pre_hook(_mod, args, kwargs=None):
-            if rec.order < 0:  # 仅记首次调用
-                tensors = _iter_tensors(args) + _iter_tensors(kwargs or {})
-                rec.in_ids = tuple(id(t) for t in tensors)
-                # 此刻输入张量存活、id 唯一 → 立即快照血缘与直接产出叶子。
-                rec.in_prov = tuple(prov.get(id(t), frozenset()) for t in tensors)
-                rec.in_src = tuple(_src_of(t) for t in tensors)
-                rec.in_op = tuple(merge_op.get(id(t)) for t in tensors)
-                if tensors:
-                    rec.in_shape = tuple(tensors[0].shape)
-        return pre_hook
-
-    def _mk_hook(rec: _ModuleRec):
-        is_leaf = rec.name in leaf_names
-        is_reseal = rec.name in reseal_names
-
-        def hook(_mod, _inp, out):
-            tensors = _iter_tensors(out)
-            if rec.order < 0:
-                rec.order = counter["i"]
-                counter["i"] += 1
-                rec.out_ids = tuple(id(t) for t in tensors)
-                if tensors:
-                    rec.out_shape = tuple(tensors[0].shape)
-            if is_leaf:  # 叶子输出血缘归该叶子自身
-                # 透传叶子（Identity / inplace 激活等）输出张量与输入同一对象：
-                # 血缘不得抢占上游（否则冒名顶替真正的产出者），但**直接产出者**仍按
-                # "最近写者"记录（含透传），以复刻 block 内 inplace 链的逐叶子连边。
-                in_ids = {id(t) for t in _iter_tensors(_inp)}
-                src = frozenset({rec.name})
-                for t in tensors:
-                    if id(t) not in in_ids:
-                        prov[id(t)] = src
-                    try:
-                        live_out[id(t)] = (rec.name, weakref.ref(t))
-                    except TypeError:  # pragma: no cover - 个别张量不可弱引用
-                        pass
-            elif is_reseal:  # 残差 block 出口：把输出血缘重封为该 block 自身
-                src = frozenset({rec.name})
-                for t in tensors:
-                    prov[id(t)] = src
-        return hook
-
-    for rec in recs.values():
-        if _PRE_HOOK_SUPPORTS_KWARGS:
-            pre_handle = rec.module.register_forward_pre_hook(
-                _mk_pre_hook(rec), with_kwargs=True)
+def _parse_mods(mods) -> List[Tuple[str, int]]:
+    """torchlens ``Layer.modules``（``["encoder:1", "encoder.stages.0:2", …]``，
+    外层→内层）→ ``[(模块路径, 第几次调用), …]``。"""
+    out: List[Tuple[str, int]] = []
+    for m in mods or []:
+        s = str(m)
+        path, _, call = s.rpartition(":")
+        if path and call.isdigit():
+            out.append((path, int(call)))
         else:
-            pre_handle = rec.module.register_forward_pre_hook(_mk_pre_hook(rec))
-        handles.append(pre_handle)
-        handles.append(rec.module.register_forward_hook(_mk_hook(rec)))
+            out.append((s, 1))
+    return out
 
-    traced = False
+
+def _tl_trace(model: nn.Module, in_shape: Tuple[int, ...]) -> List[_Op]:
+    """torchlens 跑一次 dummy 前向，抽取 op 快照列表（执行序）。
+
+    先 ``train()``（激活 aux / deep-supervision / topo 等仅训练期输出的头），
+    失败再 ``eval()``；两者都失败抛出最后一次异常，由上层降级为纯结构图。
+    ``save=None`` 只留元数据、不驻留中间激活，避免 3D 大前向撑爆内存。
+    """
+    import torchlens as tl
+
+    dummy = torch.zeros(*in_shape, dtype=torch.float32)
     prev_training = model.training
+    last_err: Optional[Exception] = None
     try:
-        dummy = torch.zeros(*in_shape, dtype=torch.float32)
-        for mode in (True, False):  # 先 train()（激活 aux/ds/topo），失败再 eval()
+        for mode in (True, False):
+            model.train(mode)
             try:
-                prov.clear()
-                merge_op.clear()
-                prov[id(dummy)] = frozenset({"input"})
-                model.train(mode)
-                prov_mode = _make_prov_mode(prov, merge_op)
                 with torch.no_grad():
-                    if prov_mode is not None:
-                        with prov_mode:
-                            model(dummy)
-                    else:
-                        model(dummy)
-                traced = True
+                    hist = tl.trace(model, dummy, save=None)
                 break
-            except Exception as e:  # 换模式重试
-                logger.debug("model_flow: forward(train=%s) 失败: %s", mode, e)
-                counter["i"] = 0
-                live_out.clear()
-                for r in recs.values():  # 清空上次半成品记录
-                    r.order = -1
-                    r.in_ids = r.out_ids = ()
-                    r.in_shape = r.out_shape = None
-                    r.in_prov = ()
-                    r.in_src = ()
-                    r.in_op = ()
+            except Exception as e:
+                logger.debug("model_flow: torchlens(train=%s) 失败: %s", mode, e)
+                last_err = e
+        else:
+            raise last_err if last_err else RuntimeError("torchlens trace 失败")
     finally:
-        for h in handles:
-            h.remove()
         model.train(prev_training)
-    return recs, traced
+
+    def _canon(lbl: str) -> str:
+        # op 引用统一带 ":pass" 后缀（单 pass 引用常省略 ":1"）。
+        return lbl if ":" in lbl else f"{lbl}:1"
+
+    # 逐 **op**（执行实例）遍历而非逐 layer：同一 functional 层被多次执行
+    # （如 SelfAttentionBlock 的两次 `x+…` 残差加法）时 layer 级视图会把
+    # 多个 pass 合并成一个带自环的节点，丢失第二次加法。
+    ops: List[_Op] = []
+    for step, op in enumerate(hist):
+        if getattr(op, "is_buffer", False):  # BN running-stats 等与数据流无关
+            continue
+        shape = tuple(op.shape) if op.shape else None
+        ops.append(_Op(
+            label=_canon(str(op.label)), step=step,
+            func=str(op.func_name or ""),
+            shape=shape, mods=_parse_mods(op.modules),
+            parents=[_canon(str(p)) for p in (op.parents or [])],
+            children=[_canon(str(c)) for c in (op.children or [])],
+            is_input=bool(op.is_input), is_output=bool(op.is_output)))
+    return ops
+
+
+def _prune_to_dataflow(ops: List[_Op]) -> Dict[str, _Op]:
+    """只保留位于「输入→输出」通路上的 op（剔除 buffer 更新链等旁支）。"""
+    by_label = {op.label: op for op in ops}
+    labels = set(by_label)
+
+    def _reach(seeds: List[str], nbrs) -> Set[str]:
+        seen: Set[str] = set()
+        stack = [s for s in seeds if s in labels]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(n for n in nbrs(by_label[cur]) if n in labels)
+        return seen
+
+    fwd = _reach([o.label for o in ops if o.is_input],
+                 lambda o: o.children)
+    bwd = _reach([o.label for o in ops if o.is_output],
+                 lambda o: o.parents)
+    keep = fwd & bwd
+    return {lbl: op for lbl, op in by_label.items() if lbl in keep}
+
+
+# ---------------------------------------------------------------------------
+# 适配层：op 级 DAG → VisGraph
+# ---------------------------------------------------------------------------
+def _inst_id(path: str, call: int) -> str:
+    """模块实例（路径 + 第几次调用）→ 图节点 id。首个调用不带后缀。"""
+    return path if call <= 1 else f"{path}@{call}"
+
+
+class _Adapter:
+    """把 torchlens op 快照收缩、分组并发射为 ``VisGraph``。"""
+
+    def __init__(self, g: VisGraph, model: nn.Module, ops: Dict[str, _Op]):
+        self.g = g
+        self.ops = ops
+        self.order = sorted(ops.values(), key=lambda o: o.step)
+        self.modules: Dict[str, nn.Module] = {
+            name: m for name, m in model.named_modules() if name}
+        self.leaf_paths: Set[str] = {
+            name for name, m in self.modules.items() if not list(m.children())}
+
+        # op → 所属叶子实例 / 容器实例链。
+        self.op_owner: Dict[str, Optional[str]] = {}        # 叶子实例 id
+        self.op_containers: Dict[str, List[str]] = {}       # 容器实例 id 链（外→内）
+        for op in self.order:
+            chain: List[str] = []
+            owner: Optional[str] = None
+            for path, call in op.mods:
+                iid = _inst_id(path, call)
+                if path in self.leaf_paths and (path, call) == op.mods[-1]:
+                    owner = iid
+                else:
+                    chain.append(iid)
+            self.op_owner[op.label] = owner
+            self.op_containers[op.label] = chain
+
+        # 收缩：op → 代表节点集合（"input" / leaf 实例 / merge 节点 id）。
+        self.op_reps: Dict[str, Set[str]] = {}
+        # 材料化节点集合与其父容器实例链。
+        self.node_chain: Dict[str, List[str]] = {}
+        # 材料化 DAG 边（收缩后，去重保序）。
+        self.cedges: List[Tuple[str, str]] = []
+        self._cedge_set: Set[Tuple[str, str]] = set()
+        # merge 节点元数据：id → (符号, 输出形状, 源节点列表)。
+        self.merges: Dict[str, Tuple[str, Optional[Tuple[int, ...]], List[str]]] = {}
+        # 叶子实例元数据。
+        self.leaf_ops: Dict[str, List[_Op]] = {}
+
+    # -- 收缩 op 级 DAG ---------------------------------------------------
+    def contract(self) -> None:
+        for op in self.order:
+            up: Set[str] = set()
+            for p in op.parents:
+                up |= self.op_reps.get(p, set())
+            if op.is_input:
+                self.op_reps[op.label] = {"input"}
+                self.node_chain.setdefault("input", [])
+                continue
+            owner = self.op_owner[op.label]
+            if owner is not None:
+                nid = f"leaf::{owner}"
+                if nid not in self.leaf_ops:
+                    self.leaf_ops[nid] = []
+                    self.node_chain[nid] = self.op_containers[op.label]
+                self.leaf_ops[nid].append(op)
+                for src in up:
+                    if src != nid:
+                        self._add_cedge(src, nid)
+                self.op_reps[op.label] = {nid}
+                continue
+            # functional op：≥2 个不同上游 → 显式融合节点；否则为导线透传。
+            if len(up) >= 2:
+                sym = _MERGE_OP_SYMBOLS.get(op.func, "merge")
+                mid = f"merge::{op.label}"
+                self.merges[mid] = (sym, op.shape, sorted(up))
+                self.node_chain[mid] = self.op_containers[op.label]
+                for src in up:
+                    self._add_cedge(src, mid)
+                self.op_reps[op.label] = {mid}
+            else:
+                self.op_reps[op.label] = up
+
+    def _add_cedge(self, src: str, dst: str) -> None:
+        if src != dst and (src, dst) not in self._cedge_set:
+            self._cedge_set.add((src, dst))
+            self.cedges.append((src, dst))
+
+    # -- 残差判定：add 类融合中，可达另一路上游的那一路是捷径 ---------------
+    def residual_edges(self) -> Set[Tuple[str, str]]:
+        succ: Dict[str, List[str]] = {}
+        for s, d in self.cedges:
+            succ.setdefault(s, []).append(d)
+
+        memo: Dict[Tuple[str, str], bool] = {}
+
+        def reaches(a: str, b: str) -> bool:
+            key = (a, b)
+            if key in memo:
+                return memo[key]
+            memo[key] = False  # 防环（理论上 DAG 无环，防御式）
+            seen: Set[str] = set()
+            stack = [a]
+            found = False
+            while stack:
+                cur = stack.pop()
+                if cur == b:
+                    found = True
+                    break
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(succ.get(cur, ()))
+            memo[key] = found
+            return found
+
+        pred: Dict[str, List[str]] = {}
+        for s, d in self.cedges:
+            pred.setdefault(d, []).append(s)
+
+        def back_dists(a: str) -> Dict[str, int]:
+            """反向 BFS：a 的每个祖先 → 最短跳数（含 a 自身 0）。"""
+            dist = {a: 0}
+            frontier = [a]
+            while frontier:
+                nxt: List[str] = []
+                for cur in frontier:
+                    for p in pred.get(cur, ()):
+                        if p not in dist:
+                            dist[p] = dist[cur] + 1
+                            nxt.append(p)
+                frontier = nxt
+            return dist
+
+        out: Set[Tuple[str, str]] = set()
+        for mid, (sym, _sh, srcs) in self.merges.items():
+            if sym not in _ADDITIVE_SYMBOLS or len(srcs) < 2:
+                continue
+            # 规则 1：某一路上游 a 可沿 DAG 到达另一路 b ⇒ a 是恒等捷径。
+            marked = False
+            for a in srcs:
+                if any(a != b and reaches(a, b) for b in srcs):
+                    out.add((a, mid))
+                    marked = True
+            if marked:
+                continue
+            # 规则 2（投影捷径 ``out = f(x) + shortcut(x)``）：两路从公共分叉点
+            # 出发，显著更短的一路（≤ 另一路一半深度）视为捷径。等长分支
+            # （如 MultiRF 的多感受野加和）不标残差，保持普通融合。
+            if len(srcs) == 2:
+                da, db = back_dists(srcs[0]), back_dists(srcs[1])
+                common = set(da) & set(db)
+                if common:
+                    fork = min(common, key=lambda c: da[c] + db[c])
+                    la, lb = da[fork], db[fork]
+                    if la * 2 <= lb and la < lb:
+                        out.add((srcs[0], mid))
+                    elif lb * 2 <= la and lb < la:
+                        out.add((srcs[1], mid))
+        return out
+
+    # -- 容器树整理 --------------------------------------------------------
+    def build_containers(self) -> Tuple[Dict[str, Optional[str]], List[str]]:
+        """材料化节点的容器归属 → 实际需要的容器集合与父子关系。
+
+        单子容器**向上合并**：若容器 A 的成员只有唯一的子容器 B（无其它叶/merge），
+        B 的成员直接归入 A（B 不再单独成框），避免包裹层（如 Sequential(stage)）
+        产生的空嵌套。返回 ``(节点/容器 → 父容器, 容器发射顺序)``。
+        """
+        members: Dict[Optional[str], List[str]] = {}   # 容器 → 直接成员（节点+子容器）
+        parent: Dict[str, Optional[str]] = {}
+        cont_order: List[str] = []
+        seen_cont: Set[str] = set()
+        for nid, chain in self.node_chain.items():
+            for i, cid in enumerate(chain):
+                if cid not in seen_cont:
+                    seen_cont.add(cid)
+                    cont_order.append(cid)
+                    parent[cid] = chain[i - 1] if i else None
+                    members.setdefault(chain[i - 1] if i else None, []).append(cid)
+            p = chain[-1] if chain else None
+            parent[nid] = p
+            members.setdefault(p, []).append(nid)
+
+        # 迭代合并"只有唯一子容器"的容器（把子并入父，保住外层语义框）。
+        changed = True
+        while changed:
+            changed = False
+            for cid in list(seen_cont):
+                kids = members.get(cid, [])
+                if len(kids) != 1 or kids[0] not in seen_cont:
+                    continue
+                child = kids[0]
+                grandkids = members.pop(child, [])
+                for gk in grandkids:
+                    parent[gk] = cid
+                members[cid] = grandkids
+                seen_cont.discard(child)
+                parent.pop(child, None)
+                changed = True
+        order = [c for c in cont_order if c in seen_cont]
+        return parent, order
+
+    # -- 形状 ---------------------------------------------------------------
+    def leaf_io(self, nid: str) -> Tuple[Optional[Tuple[int, ...]],
+                                         Optional[Tuple[int, ...]]]:
+        group = self.leaf_ops.get(nid, [])
+        gset = {o.label for o in group}
+        in_sh = next(
+            (self.ops[p].shape for o in group for p in o.parents
+             if p in self.ops and p not in gset and self.ops[p].shape),
+            None)
+        out_sh = next(
+            (o.shape for o in reversed(group)
+             if o.shape and (o.is_output
+                             or any(c not in gset for c in o.children))),
+            None)
+        if out_sh is None:
+            out_sh = next((o.shape for o in reversed(group) if o.shape), None)
+        return in_sh, out_sh
+
+    def container_io(self, cid: str, node_parent: Dict[str, Optional[str]],
+                     ) -> Tuple[Optional[Tuple[int, ...]],
+                                Optional[Tuple[int, ...]], int]:
+        """容器 in/out 形状与内部 op 数：取容器内首个「有外部输入」op 的入形状、
+        末个「有外部输出」op 的出形状（直接读容器实例覆盖的全部 op）。"""
+        inside = [op for op in self.order
+                  if cid in self.op_containers[op.label]]
+        iset = {o.label for o in inside}
+        in_sh = next(
+            (self.ops[p].shape for o in inside for p in o.parents
+             if p in self.ops and p not in iset and self.ops[p].shape),
+            None)
+        out_sh = next(
+            (o.shape for o in reversed(inside)
+             if o.shape and (o.is_output
+                             or any(c not in iset for c in o.children))),
+            None)
+        return in_sh, out_sh, len(inside)
 
 
 # ---------------------------------------------------------------------------
@@ -604,119 +534,8 @@ def _loss_node_detail(cfg: Config) -> Dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
-# DAG 重建：分组 → 节点 → 连边 → 层级
+# 主入口
 # ---------------------------------------------------------------------------
-class _ModelGraphBuilder:
-    """把 ``_ModuleRec`` 集合重建为 ``VisGraph`` 的 DAG。"""
-
-    def __init__(self, g: VisGraph, recs: Dict[str, _ModuleRec],
-                 traced: bool):
-        self.g = g
-        self.recs = recs
-        self.traced = traced
-        self.residual_types = _residual_block_types()
-
-        # 叶子（被执行过；未追踪时取全部声明叶子）。
-        self.leaves: Dict[str, _ModuleRec] = {
-            name: rec for name, rec in recs.items()
-            if not list(rec.module.children())
-            and (rec.order >= 0 or not traced)
-        }
-        self.leaf_set: Set[str] = set(self.leaves)
-
-        # 分组结构。
-        self.top_leaves: Dict[str, List[_ModuleRec]] = {}
-        self.top_order: List[str] = []
-        for name, rec in self.leaves.items():
-            tk = _top_key(name)
-            if tk not in self.top_leaves:
-                self.top_leaves[tk] = []
-                self.top_order.append(tk)
-            self.top_leaves[tk].append(rec)
-
-        self.top_set: Set[str] = set(self.top_leaves)
-        self._edges: Set[Tuple[str, str]] = set()
-        # 叶子模块名 → 已发射的叶子节点 id（供同 block 内叶子连边反查）。
-        self._leaf_node_id: Dict[str, str] = {}
-        # (parent, tensor id, 输入序号) → 已发射的 merge 节点 id（同一融合张量被
-        # 多下游消费时复用同一节点，避免重复建框）。
-        self._merge_nodes: Dict[Tuple[str, int, int], str] = {}
-
-    # -- 排序键 --------------------------------------------------------
-    def _order_of(self, recs: Sequence[_ModuleRec]) -> Tuple[int, int]:
-        orders = [r.order for r in recs if r.order >= 0]
-        if orders:
-            return (0, min(orders))
-        return (1, 1 << 30)
-
-    def _top_sort_key(self, key: str):
-        oo = self._order_of(self.top_leaves[key])
-        return (oo[0], oo[1], self.top_order.index(key))
-
-    # -- 上游反查（基于 pre_hook 快照的输入血缘集合）----------------------
-    def _producers_at_top(
-        self, prov_sets: Sequence["frozenset[str]"], exclude: str,
-    ) -> List[str]:
-        """输入血缘集合 → 去重的上游顶层容器（或 'input'），按多源展开。"""
-        srcs: List[str] = []
-        seen: Set[str] = set()
-        for s in prov_sets:
-            for leaf in s:
-                src = "input" if leaf == "input" else _top_key(leaf)
-                if not src or src == exclude or src in seen:
-                    continue
-                if src == "input" or src in self.top_set:
-                    seen.add(src)
-                    srcs.append(src)
-        return srcs
-
-    def _producers_in_top(
-        self, prov_sets: Sequence["frozenset[str]"], top: str, exclude: str,
-    ) -> List[str]:
-        """容器内：输入血缘集合 → 同容器内的上游 block 键（外部来源忽略）。"""
-        srcs: List[str] = []
-        seen: Set[str] = set()
-        for s in prov_sets:
-            for leaf in s:
-                if leaf == "input" or _top_key(leaf) != top:
-                    continue
-                bk = _block_key(leaf, top) or leaf
-                if bk != exclude and bk not in seen:
-                    seen.add(bk)
-                    srcs.append(bk)
-        return srcs
-
-    def _add_edge(self, src: str, dst: str, label: str = "",
-                  kind: str = "forward") -> None:
-        if src == dst or (src, dst) in self._edges:
-            return
-        self._edges.add((src, dst))
-        self.g.add_edge(src, dst, label, kind=kind)
-
-    def _emit_merge(self, parent: str, tid: int, idx: int, op: str,
-                    out_shape: Optional[Tuple[int, ...]] = None
-                    ) -> Tuple[str, bool]:
-        """在融合点发射（或复用）一个显式 merge 算子节点；返回 ``(节点 id, 是否新建)``。
-
-        同一 ``(parent, tid, idx)`` 复用同一节点，以免被多个下游消费时重复建框。
-        节点 ``kind="merge"``，标题为融合符号（``cat`` / ``+`` / ``×`` …）。
-        """
-        mkey = (parent, tid, idx)
-        mid = self._merge_nodes.get(mkey)
-        if mid is not None:
-            return mid, False
-        mid = f"merge::{parent}::{tid}:{idx}"
-        # 标题已是融合符号，故 key_info 只补出张量形状，避免框内重复显示算子名。
-        ki: Dict[str, object] = {}
-        if out_shape:
-            ki["out"] = shape_str(out_shape)
-        detail = {"op": op, "kind": "merge (functional fusion)"}
-        self.g.add_node(mid, op, kind="merge", key_info=ki, detail=detail,
-                        parent_id=parent)
-        self._merge_nodes[mkey] = mid
-        return mid, True
-
-
 def build_model_flow(
     cfg: Config,
     model: nn.Module,
@@ -730,22 +549,18 @@ def build_model_flow(
 
     g = VisGraph(title="模型流 Model Flow")
 
-    recs: Dict[str, _ModuleRec] = {}
-    traced = False
+    ops: Dict[str, _Op] = {}
     if trace_shapes:
         try:
-            recs, traced = _trace_modules(model, trace_shape)
+            ops = _prune_to_dataflow(_tl_trace(model, trace_shape))
         except Exception as e:  # 追踪整体失败 → 纯结构
-            logger.warning("model_flow: 数据流追踪失败，退化为纯结构图: %s", e)
-    if not recs:
-        recs = {name: _ModuleRec(name, m)
-                for name, m in model.named_modules() if name}
+            logger.warning("model_flow: torchlens 追踪失败，退化为纯结构图: %s", e)
 
     g.meta = {
         "arch": str(cfg.model.arch),
         "input": shape_str(in_shape),
         "trace_batch": "1",
-        "shapes": "traced" if traced else "static (前向未执行/失败)",
+        "shapes": "traced" if ops else "static (前向未执行/失败)",
         "in_channels": str(topo.in_channels),
         "out_classes": str(topo.out_classes),
         "spatial_dims": f"{topo.spatial_dims}D",
@@ -758,453 +573,219 @@ def build_model_flow(
                 "spatial_dims": f"{topo.spatial_dims}D",
                 "n_views": str(topo.n_views)})
 
-    builder = _ModelGraphBuilder(g, recs, traced)
-    _emit(builder, cfg)
+    if ops:
+        _emit_traced(g, cfg, model, ops)
+    else:
+        _emit_structural(g, cfg, model)
     return g
 
 
-# ---------------------------------------------------------------------------
-# 节点与连边发射
-# ---------------------------------------------------------------------------
-def _emit(b: _ModelGraphBuilder, cfg: Config) -> None:
-    g = b.g
-    backbone = sorted(
-        (k for k in b.top_leaves if not _is_head(k)), key=b._top_sort_key)
-    heads = sorted(
-        (k for k in b.top_leaves if _is_head(k)), key=b._top_sort_key)
+def _is_head_container(cid: str) -> bool:
+    """顶层容器是否为输出头（框着色用；不参与分组/连边判定）。"""
+    return "head" in cid.split(".")[0].lower()
 
-    # 1) 发射各顶层容器（含内部 block / 叶子）。
-    for key in backbone + heads:
-        _emit_top(b, key)
 
-    # 2) 顶层连边：按真实张量流反查上游。
-    for key in backbone + heads:
-        _emit_top_inbound_edges(b, key)
+def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
+                 ops: Dict[str, _Op]) -> None:
+    a = _Adapter(g, model, ops)
+    a.contract()
+    residual = a.residual_edges()
+    parent, cont_order = a.build_containers()
 
-    # 2.5) 兜底：保证主干连通（追踪失败或反查缺失时）。
-    _ensure_backbone_chain(b, backbone)
+    node_first_step: Dict[str, int] = {"input": -1}
+    for nid, group in a.leaf_ops.items():
+        node_first_step[nid] = min(o.step for o in group)
+    for mid in a.merges:
+        node_first_step[mid] = a.ops[mid[len("merge::"):]].step \
+            if mid[len("merge::"):] in a.ops else 1 << 30
 
-    # 3) 损失节点 + 各 head → loss。
-    g.add_node(
-        "loss", f"Loss: {cfg.loss.name}", kind="loss",
-        key_info={"name": cfg.loss.name},
-        detail=_loss_node_detail(cfg))
-    if heads:
-        for key in heads:
-            b._add_edge(key, "loss", _head_edge_label(key))
-    else:
-        last = backbone[-1] if backbone else "input"
-        b._add_edge(last, "loss")
+    # 1) 容器框（按前向首次进入顺序）。
+    def _cont_step(cid: str) -> int:
+        return min((op.step for op in a.order
+                    if cid in a.op_containers[op.label]), default=1 << 30)
 
-    # 4) 标注跳连（src/dst 跨级且为 down 向）+ 计算层级 rank。
-    _assign_ranks_and_skip(b, backbone, heads)
-    # 5) 计算横向列位（col/colspan），供 renderer 做列对齐网格布局。rank 已由上一步
-    #    （含跳连/头分层等模型流专属逻辑）算好，这里只补通用列位。
+    for cid in sorted(cont_order, key=_cont_step):
+        in_sh, out_sh, n_ops = a.container_io(cid, parent)
+        mod = a.modules.get(cid.split("@")[0])
+        ki: Dict[str, object] = {}
+        if mod is not None:
+            ki["type"] = type(mod).__name__
+        ki["ops"] = str(n_ops)
+        if in_sh:
+            ki["in"] = shape_str(in_sh)
+        if out_sh:
+            ki["out"] = shape_str(out_sh)
+        pid = parent.get(cid)
+        label = cid[len(pid) + 1:] if pid and cid.startswith(pid + ".") else cid
+        kind = "head" if pid is None and _is_head_container(cid) else "stage"
+        g.add_node(cid, label, kind=kind, key_info=ki,
+                   parent_id=pid, collapsed=True)
+
+    # 2) 叶子节点。
+    for nid, group in sorted(a.leaf_ops.items(),
+                             key=lambda kv: node_first_step[kv[0]]):
+        inst = nid[len("leaf::"):]
+        path, _, call = inst.partition("@")
+        mod = a.modules.get(path)
+        tname = type(mod).__name__ if mod is not None else path.split(".")[-1]
+        in_sh, out_sh = a.leaf_io(nid)
+        ki = {"type": tname}
+        if out_sh:
+            ki["out"] = shape_str(out_sh)
+        detail = _leaf_params(mod) if mod is not None else {}
+        detail["module"] = path
+        if call:
+            detail["call"] = f"第 {call} 次调用（权重共享/复用）"
+        if in_sh:
+            detail["in_shape"] = shape_str(in_sh)
+        if out_sh:
+            detail["out_shape"] = shape_str(out_sh)
+        label = tname if not call else f"{tname} ×{call}"
+        g.add_node(nid, label,
+                   kind=_leaf_kind(mod) if mod is not None else "op",
+                   key_info=ki, detail=detail, parent_id=parent.get(nid))
+
+    # 3) 融合节点。
+    for mid, (sym, out_sh, _srcs) in sorted(
+            a.merges.items(), key=lambda kv: node_first_step[kv[0]]):
+        ki = {}
+        if out_sh:
+            ki["out"] = shape_str(out_sh)
+        g.add_node(mid, sym, kind="merge", key_info=ki,
+                   detail={"op": sym, "kind": "merge (functional fusion)"},
+                   parent_id=parent.get(mid))
+
+    # 4) 连边：直接在**最深的材料化端点**（叶子/merge/input）级别发射。
+    # 渲染层的 visibleAnchor 会按折叠状态把端点动态上提到可见的容器框，
+    # 因此无需（也不应）在 builder 预先上提——预上提会把多条跳连去重成一条。
+    for src, dst in a.cedges:
+        kind = "residual" if (src, dst) in residual else "forward"
+        g.add_edge(src, dst, "+" if kind == "residual" else "", kind=kind)
+
+    # 5) 损失节点 + 顶层输出容器 → loss。
+    g.add_node("loss", f"Loss: {cfg.loss.name}", kind="loss",
+               key_info={"name": cfg.loss.name}, detail=_loss_node_detail(cfg))
+    def _top_of(nid: str) -> str:
+        cur = nid
+        while parent.get(cur) is not None:
+            cur = parent[cur]
+        return cur
+
+    out_tops: List[str] = []
+    for op in a.order:
+        if not op.is_output:
+            continue
+        for r in a.op_reps.get(op.label) or set():
+            top = _top_of(r)
+            if top not in out_tops:
+                out_tops.append(top)
+    for top in out_tops:
+        g.add_edge(top, "loss", top.split(".")[0] if _is_head_container(top)
+                   else "")
+
+    # 6) 分层 rank + 跳连标注 + 列位。
+    _assign_ranks_and_skip(g)
     assign_grid_layout(g, assign_ranks=False)
 
 
-def _called_direct_children(
-    b: _ModelGraphBuilder, key: str,
-) -> List[_ModuleRec]:
-    """``key`` 的**直接子模块**中真正被前向调用过（有 order/形状）的那些，按执行序排序。
-    ``nn.ModuleList`` 这类容器自身不被调用（无形状），但其子 block 会被逐个调用并记录到
-    经过内部 functional reshape 之后的真实 in/out——比最深叶子更能代表容器的对外形状。"""
-    pre = key + "."
-    kids: List[_ModuleRec] = []
-    for nm, r in b.recs.items():
-        if nm.startswith(pre) and "." not in nm[len(pre):] and r.order >= 0:
-            kids.append(r)
-    kids.sort(key=lambda r: r.order)
-    return kids
-
-
-def _container_io(
-    b: _ModelGraphBuilder, key: str, members: Sequence[_ModuleRec],
-) -> Tuple[Optional[Tuple[int, ...]], Optional[Tuple[int, ...]]]:
-    """容器/block 的 in/out 形状，按可信度逐级回退：
-    ① **容器模块自身**被直接调用时记录的真实 in/out（如上采样容器 ``_Upsample`` 内含
-       ``F.interpolate`` 这类 functional 算子，只有读容器自身才看得出分辨率变化）；
-    ② 容器自身未被直接调用（如 ``nn.ModuleList`` 的 levels）时，取其**直接子模块**记录的
-       in/out——子 block 的形状已包含其内部 functional reshape 的还原（如注意力块内把
-       ``(B,C,H,W)`` 摊平成 ``(B,C,H·W)`` 做 ``Conv1d`` 再 reshape 回去，最深叶子 ``proj_out``
-       只看到摊平后的 ``(B,C,H·W)``，而子 block 自身的 out 已是 reshape 回来的 ``(B,C,H,W)``）；
-    ③ 最后才退化到最深成员叶子。"""
-    crec = b.recs.get(key)
-    ins = [r.in_shape for r in members if r.in_shape]
-    outs = [r.out_shape for r in members if r.out_shape]
-    in_sh = crec.in_shape if crec and crec.in_shape else None
-    out_sh = crec.out_shape if crec and crec.out_shape else None
-    if in_sh is None or out_sh is None:
-        kids = _called_direct_children(b, key)
-        if in_sh is None:
-            kin = next((r.in_shape for r in kids if r.in_shape), None)
-            in_sh = kin if kin is not None else (ins[0] if ins else None)
-        if out_sh is None:
-            kout = next(
-                (r.out_shape for r in reversed(kids) if r.out_shape), None)
-            out_sh = kout if kout is not None else (outs[-1] if outs else None)
-    return in_sh, out_sh
-
-
-def _emit_top(b: _ModelGraphBuilder, key: str) -> None:
-    """发射一个顶层容器，及其内部 block / 叶子节点与容器内连边。"""
-    g = b.g
-    recs = sorted(b.top_leaves[key],
-                  key=lambda r: r.order if r.order >= 0 else 1 << 30)
-    kind = "head" if _is_head(key) else "stage"
-
-    in_sh, out_sh = _container_io(b, key, recs)
-    s_key: Dict[str, object] = {"ops": str(len(recs))}
-    if in_sh:
-        s_key["in"] = shape_str(in_sh)
-    if out_sh:
-        s_key["out"] = shape_str(out_sh)
-    g.add_node(key, _top_label(key), kind=kind, key_info=s_key, collapsed=True)
-
-    # 容器内按 block 分组。
-    block_recs: Dict[Optional[str], List[_ModuleRec]] = {}
-    block_order: List[Optional[str]] = []
-    for rec in recs:
-        bk = _block_key(rec.name, key)
-        if bk not in block_recs:
-            block_recs[bk] = []
-            block_order.append(bk)
-        block_recs[bk].append(rec)
-
-    # 发射 block 框 + 叶子。
-    for bk in block_order:
-        members = block_recs[bk]
-        if bk is None:
-            # 未成 block 的散叶直接挂顶层容器；它们之间的真实张量流(如 Downsample
-            # 的 op→norm)同样要连边，否则同框叶子会无边堆在一起。
-            leaf_ids = [_emit_leaf(b, rec, parent=key) for rec in members]
-            top_rec = b.recs.get(key)
-            external = set(top_rec.in_ids) if top_rec else set()
-            _emit_leaf_flow(b, members, leaf_ids, external, parent=key)
-        else:
-            _emit_block(b, bk, key, members)
-
-    # 容器内 block 间连边：纯真实张量流（含穿过 functional 算子的血缘）。
-    _emit_intra_edges(b, key, block_recs, block_order)
-
-
-def _emit_leaf_flow(b: _ModelGraphBuilder, members: List[_ModuleRec],
-                    leaf_ids: List[str], external: Set[int],
-                    parent: str) -> None:
-    """在一组**同级叶子**间按真实张量流连边：逐**输入张量**求其"直接上游叶子"。
-
-    既服务于 block 框内的叶子(``_emit_block``)，也服务于顶层容器里未成 block 的散叶
-    (``_emit_top`` 的 ``bk is None`` 组，如 ``Downsample`` 的 ``op→norm``)。
-
-      · 该张量由某叶子直接产出(``in_src`` 非空，经 weakref 校验防 id 复用)→ 用它，
-        从而保住顺序链与透传链；
-      · 该张量由 functional 算子(torch.cat/+/split…)产生(``in_src`` 为 None)→ 退到
-        血缘 ``in_prov``，取落在**本组内**的叶子集合，从而恢复并联分支的扇入
-        (MultiRF 三支→fuse)与残差扇入(主路尾 + shortcut→输出)。
-    外部输入(``external``)是本框的并联入口，不在组内连边；其上游由顶层入边处理。
-    """
-    name_to_cid = {rec.name: cid for rec, cid in zip(members, leaf_ids)}
-    member_names = set(name_to_cid)
-
-    def _is_shortcut(name: str) -> bool:
-        return any(f".{a}" in name for a in _SHORTCUT_ATTRS)
-
-    def _infer_op(srcs: List[str]) -> str:
-        # 血缘未捕到算子符号时的回退：含捷径源 → 残差加，否则视为拼接。
-        return "+" if any(_is_shortcut(s) for s in srcs) else "cat"
-
-    def _block_prefix(name: str) -> str:
-        # 捷径叶子所属残差子块的路径前缀（截到 shortcut 段之前），用于把悬空 shortcut
-        # 连回**本子块**的输出叶，避免在多子块拍平成一个框时跨子块误连。
-        for a in _SHORTCUT_ATTRS:
-            idx = name.find(f".{a}")
-            if idx >= 0:
-                return name[:idx]
-        return name
-
-    if b.traced:
-        name_rec = {rec.name: rec for rec in members}
-        # 张量 id → 本 block 内**最后**产出它的叶子名（按前向序覆盖）。透传叶子(Identity、
-        # 无参 attn、inplace 激活)的输出张量与其输入同对象，故会"接管"该 id。
-        last_emit: Dict[int, str] = {}
-        for rec in sorted(members, key=lambda r: r.order):
-            for oid in rec.out_ids:
-                last_emit[oid] = rec.name
-
-        def _supersede(src: str, consumer: _ModuleRec) -> str:
-            # functional 合流(如 `主路 + shortcut`)的扇入，其血缘只记到最早产出者；但真正
-            # 喂入合流的是该张量**最后**的产出叶子(透传链尾，如 norm2→attn 的 attn)。把血缘
-            # 来源上提到该尾叶，既得到正确的 norm2→attn→act2 链，又免去冗余的 norm2→act2。
-            rec_src = name_rec.get(src)
-            if rec_src is None or not rec_src.out_ids:
-                return src
-            cand = last_emit.get(rec_src.out_ids[0])
-            cand_rec = name_rec.get(cand) if cand else None
-            if (cand_rec is not None and cand != src
-                    and cand in member_names and cand_rec.order < consumer.order):
-                return cand
-            return src
-
-        has_out: Set[str] = set()  # 已连出（有下游）的叶子，供残差兜底判定悬空 shortcut
-        for rec, cid in zip(members, leaf_ids):
-            prov = rec.in_prov if len(rec.in_prov) == len(rec.in_ids) else ()
-            in_op = rec.in_op if len(rec.in_op) == len(rec.in_ids) else ()
-            for idx, (tid, prod) in enumerate(zip(rec.in_ids, rec.in_src)):
-                if tid in external:          # 外部输入：并联入口，不连块内边
-                    continue
-                functional = False
-                if prod is not None and prod != rec.name:
-                    sources: Iterable[str] = (prod,)
-                elif idx < len(prov):        # functional 产出 → 退到血缘
-                    sources = [_supersede(s, rec) for s in prov[idx]]
-                    functional = True
-                else:
-                    sources = ()
-                # 去重 + 过滤到本组内、非自身的上游叶子。
-                valid: List[str] = []
-                for src in sources:
-                    if src in member_names and src != rec.name and src not in valid:
-                        valid.append(src)
-                if not valid:
-                    continue
-                if functional and len(valid) >= 2:
-                    # 多源融合点 → 插入显式 merge 节点：各上游叶→[op]→本叶。
-                    op = (in_op[idx] if idx < len(in_op) else None) or _infer_op(valid)
-                    out_sh = rec.in_shape if idx == 0 else None
-                    mid, created = b._emit_merge(parent, tid, idx, op, out_sh)
-                    if created:
-                        for src in valid:
-                            # shortcut 支汇入以残差线型凸显跳连；merge 节点本身已示算子
-                            # 符号，故入 merge 的边不再重复标 "+"。
-                            res = _is_shortcut(src) and not _is_shortcut(rec.name)
-                            b._add_edge(name_to_cid[src], mid, "",
-                                        kind="residual" if res else "forward")
-                    for src in valid:
-                        has_out.add(src)
-                    b._add_edge(mid, cid, kind="forward")
-                else:
-                    for src in valid:
-                        # 由 shortcut 子树**汇入主路**的边标注为残差(+)；shortcut 内部
-                        # 链(conv→norm)与主路前向流仍为普通前向边。
-                        residual_edge = _is_shortcut(src) and not _is_shortcut(rec.name)
-                        label = "+" if residual_edge else ""
-                        kind = "residual" if residual_edge else "forward"
-                        b._add_edge(name_to_cid[src], cid, label, kind=kind)
-                        has_out.add(src)
-        # 残差兜底：`out = 主路 + shortcut(x)` 的相加是 functional 算子，透传(Identity)
-        # 捷径叶子的输出张量与其输入(块外)同对象、血缘指向块外，prov 无法还原其汇入主路
-        # 的边，留下悬空 shortcut 叶子(无下游)。主路上的透传叶子(无参 attn 等)已由
-        # ``_supersede`` 上提到合流尾叶正确连边，故这里只需兜底**悬空的 shortcut 叶子**：
-        # 把它们补连到汇点——其后最近的悬空主路叶子(相加结果承接叶 act2/主路末层)。
-        # 以"存在悬空 shortcut 叶子"为触发条件(而非容器是否被判残差)，从而也能覆盖把多个
-        # 残差子块拍平成一个框的情形(如 selfattn stage)。仅连 shortcut 叶子，不动其余。
-        ordered = sorted(members, key=lambda r: r.order)
-        for rec in members:
-            if rec.name in has_out or not _is_shortcut(rec.name):
-                continue
-            # 汇点 = 与该 shortcut 同子块前缀、序最大的非 shortcut 叶(本子块输出叶 act2)；
-            # 退而求其次取全组最后一个非 shortcut 叶。
-            pref = _block_prefix(rec.name)
-            sink = next((r.name for r in reversed(ordered)
-                         if not _is_shortcut(r.name) and r.name.startswith(pref)),
-                        None)
-            sink = sink or next((r.name for r in reversed(ordered)
-                                 if not _is_shortcut(r.name)), None)
-            if sink is None or sink == rec.name:
-                continue
-            # 与"块内有模块捷径"（conv+norm shortcut，主循环 functional≥2 已建 + 框）
-            # 保持一致：Identity 等**无模块**捷径的残差也插入显式 '+' 融合框——主路前
-            # 向汇入、捷径以残差线汇入——而非画一条裸虚线，使各 block 残差呈现统一。
-            # 做法：把已发射的主路前向入边改接到 + 框上游，再 + 框→汇点。
-            sink_cid = name_to_cid[sink]
-            sink_rec = name_rec.get(sink)
-            tid = (sink_rec.in_ids[0] if sink_rec and sink_rec.in_ids
-                   else hash(sink_cid))
-            reuse = (parent, tid, 0) in b._merge_nodes
-            main_edges = [e for e in b.g.edges
-                          if e.dst == sink_cid and e.kind == "forward"]
-            if reuse or main_edges:
-                mid, created = b._emit_merge(
-                    parent, tid, 0, "+",
-                    sink_rec.in_shape if sink_rec else None)
-                if created:
-                    for e in main_edges:        # 主路前向：汇点 → + 框
-                        e.dst = mid
-                    b._add_edge(mid, sink_cid, kind="forward")
-                b._add_edge(name_to_cid[rec.name], mid, "", kind="residual")
-            else:
-                # 无主路前向入边（极少见）→ 退回直接残差线，避免建只有单输入的空框。
-                b._add_edge(name_to_cid[rec.name], sink_cid, "+", kind="residual")
-            has_out.add(rec.name)
-    else:
-        # 追踪失败的纯结构降级：按声明序把叶子连成一条线性链，至少给出可读骨架。
-        for prev, cur in zip(leaf_ids, leaf_ids[1:]):
-            b._add_edge(prev, cur)
-
-
-def _emit_block(b: _ModelGraphBuilder, block_key: str, top: str,
-                members: List[_ModuleRec]) -> None:
-    g = b.g
-    members = sorted(members, key=lambda r: r.order if r.order >= 0 else 1 << 30)
-    mod = b.recs[block_key].module if block_key in b.recs else members[0].module
-    ki: Dict[str, object] = {"type": type(mod).__name__}
-    in_sh, out_sh = _container_io(b, block_key, members)
-    if in_sh:
-        ki["in"] = shape_str(in_sh)
-    if out_sh:
-        ki["out"] = shape_str(out_sh)
-    residual = _has_residual(mod, b.residual_types)
-    if residual:
-        ki["skip"] = "residual (+)"
-    g.add_node(block_key, _block_label(block_key, top),
-               kind="stage", key_info=ki, parent_id=top, collapsed=True)
-
-    leaf_ids = [_emit_leaf(b, rec, parent=block_key) for rec in members]
-    # block 外部输入是本框的并联入口，不在块内连边；其上游由顶层入边处理。
-    block_rec = b.recs.get(block_key)
-    external: Set[int] = set(block_rec.in_ids) if block_rec else set()
-    _emit_leaf_flow(b, members, leaf_ids, external, parent=block_key)
-
-
-def _emit_leaf(b: _ModelGraphBuilder, rec: _ModuleRec, parent: str) -> str:
-    g = b.g
-    cid = f"leaf::{rec.name}"
-    ki: Dict[str, object] = {"type": type(rec.module).__name__}
-    if rec.out_shape:
-        ki["out"] = shape_str(rec.out_shape)
-    detail = _leaf_params(rec.module)
-    detail["module"] = rec.name
-    if rec.in_shape:
-        detail["in_shape"] = shape_str(rec.in_shape)
-    if rec.out_shape:
-        detail["out_shape"] = shape_str(rec.out_shape)
-    g.add_node(cid, type(rec.module).__name__, kind=_leaf_kind(rec.module),
-               key_info=ki, detail=detail, parent_id=parent)
-    b._leaf_node_id[rec.name] = cid
-    return cid
-
-
-def _emit_top_inbound_edges(b: _ModelGraphBuilder, key: str) -> None:
-    """顶层容器的入边：反查"喂给本容器内任一叶子的外部张量"的上游容器。
-
-    既用容器模块自身输入（被直接调用的容器），也并入**所有成员叶子的输入**——
-    对 ``ModuleList`` 这类从不被调用、自身无输入记录的容器（ADM/EDM2 的 levels、
-    UNet3+ 的 branches/fusions），后者是唯一能反查出真实入边（含 encoder→decoder
-    跳连）的来源；容器内部来源由 ``_producers_at_top`` 的 exclude 自动滤除。
-    """
-    prov_sets: List["frozenset[str]"] = []
-    rec = b.recs.get(key)
-    if rec:
-        prov_sets.extend(rec.in_prov)
-    for r in b.top_leaves.get(key, []):
-        prov_sets.extend(r.in_prov)
-    for src in b._producers_at_top(prov_sets, exclude=key):
-        b._add_edge(src, key)
-
-
-def _emit_intra_edges(
-    b: _ModelGraphBuilder, top: str,
-    block_recs: Dict[Optional[str], List[_ModuleRec]],
-    block_order: List[Optional[str]],
-) -> None:
-    """容器内单元（block 框 + 未成 block 的散叶）间连边：纯真实张量流。
-
-    每个单元用其模块输入的血缘 ``in_prov`` 反查同容器内上游单元。血缘由
-    ``TorchFunctionMode`` 钩子穿过 ``torch.cat/+/split`` 等 functional 算子累积，
-    因此 MultiStem 的三路 sub-stem→proj、DecoderLevel 的 upsample→首块等
-    经 cat 融合的边都能被通用地还原，无需按容器类型写死补边。
-
-    散叶单元（如 head 容器里 ``conv`` block 之后的 ``classifier``）同样作为收/发端
-    参与，否则它与同容器的 block 框因无连边而默认同 rank，并排堆在一起。散叶**彼此
-    之间**的边由 ``_emit_leaf_flow`` 负责，这里只补 block 边界两侧的跨单元边。
-    """
-    # 收集本容器内所有"单元"：block 框（节点 id 即 block 键）+ 散叶（节点 id 带
-    # ``leaf::`` 前缀，反查键为叶名）。``_producers_in_top`` 返回的是反查键，需经
-    # ``key_to_node`` 译成真实节点 id 再连边。
-    units: List[Tuple[str, str, Optional[_ModuleRec]]] = []
-    loose_keys: Set[str] = set()
-    for bk in block_order:
-        if bk is None:
-            for r in block_recs[None]:
-                units.append((r.name, f"leaf::{r.name}", r))
-                loose_keys.add(r.name)
-        else:
-            units.append((bk, bk, b.recs.get(bk)))
-    key_to_node = {uk: nid for uk, nid, _ in units}
-
-    for unit_key, node_id, rec in units:
-        if rec is None or not rec.in_prov:
-            continue
-        in_op = rec.in_op if len(rec.in_op) == len(rec.in_prov) else ()
-        # 逐**输入张量**反查同容器上游单元：单上游直连；同一输入被多单元
-        # 经 cat/+ 融合（如 MultiStem 三路 sub-stem→proj）则经显式 merge 节点汇入。
-        for idx, pset in enumerate(rec.in_prov):
-            keys = b._producers_in_top([pset], top, exclude=unit_key)
-            # 散叶↔散叶的边归 _emit_leaf_flow；这里只连至少一端为 block 框的跨单元边，
-            # 且来源须是本容器内已知单元（外部来源由顶层入边处理）。
-            keys = [k for k in keys
-                    if k in key_to_node
-                    and not (unit_key in loose_keys and k in loose_keys)]
-            if not keys:
-                continue
-            srcs = [key_to_node[k] for k in keys]
-            if len(srcs) >= 2:
-                op = (in_op[idx] if idx < len(in_op) else None) or "cat"
-                tid = rec.in_ids[idx] if idx < len(rec.in_ids) else -1 - idx
-                out_sh = rec.in_shape if idx == 0 else None
-                mid, created = b._emit_merge(top, tid, idx, op, out_sh)
-                if created:
-                    for src in srcs:
-                        b._add_edge(src, mid)
-                b._add_edge(mid, node_id)
-            else:
-                b._add_edge(srcs[0], node_id)
-
-
-def _ensure_backbone_chain(b: _ModelGraphBuilder, backbone: List[str]) -> None:
-    """兜底：任何无入边的非首 backbone 容器，按执行序从前一个连上；
-    首容器若无入边则从 input 连上。保证图连通（追踪失败时尤为重要）。"""
-    incoming = {dst for _, dst in b._edges}
+# ---------------------------------------------------------------------------
+# 纯结构降级（torchlens 不可用 / 前向失败）
+# ---------------------------------------------------------------------------
+def _emit_structural(g: VisGraph, cfg: Config, model: nn.Module) -> None:
+    """按 ``named_modules`` 声明序：顶层子模块各成一框、叶子线性链。"""
     prev = "input"
-    for key in backbone:
-        if key not in incoming:
-            b._add_edge(prev, key)
-        prev = key
+    for top_name, top in model.named_children():
+        kind = "head" if _is_head_container(top_name) else "stage"
+        leaves = [(n, m) for n, m in top.named_modules() if not list(m.children())]
+        g.add_node(top_name, top_name, kind=kind,
+                   key_info={"type": type(top).__name__,
+                             "ops": str(len(leaves))},
+                   collapsed=True)
+        g.add_edge(prev, top_name)
+        prev_leaf: Optional[str] = None
+        for name, m in leaves:
+            nid = f"leaf::{top_name}.{name}" if name else f"leaf::{top_name}"
+            detail = _leaf_params(m)
+            detail["module"] = f"{top_name}.{name}" if name else top_name
+            g.add_node(nid, type(m).__name__, kind=_leaf_kind(m),
+                       key_info={"type": type(m).__name__},
+                       detail=detail, parent_id=top_name)
+            if prev_leaf:
+                g.add_edge(prev_leaf, nid)
+            prev_leaf = nid
+        prev = top_name
+    g.add_node("loss", f"Loss: {cfg.loss.name}", kind="loss",
+               key_info={"name": cfg.loss.name}, detail=_loss_node_detail(cfg))
+    g.add_edge(prev, "loss")
+    _assign_ranks_and_skip(g)
+    assign_grid_layout(g, assign_ranks=False)
 
 
 # ---------------------------------------------------------------------------
-# 层级 rank 计算 + 跳连标注
+# 层级 rank 计算 + 跳连标注（通用：只依赖图结构）
 # ---------------------------------------------------------------------------
-def _assign_ranks_and_skip(
-    b: _ModelGraphBuilder, backbone: List[str], heads: List[str],
-) -> None:
-    """对每个父容器内的兄弟节点做最长路径分层（rank），并把"跨级 down 边"标为 skip。"""
-    g = b.g
+def _assign_ranks_and_skip(g: VisGraph) -> None:
+    """对每个父容器内的兄弟节点做最长路径分层（rank），并把"跨级边"标为 skip。
+
+    边可能发射在叶子级别（跨容器）：先把每条边投影为「两端在最近公共容器下的
+    兄弟对」，投影边参与该层级的分层；原始边按其投影的 rank 跨度标注 skip。
+    """
+    parent_of = {n.id: n.parent_id for n in g.nodes}
     by_parent: Dict[Optional[str], List[str]] = {}
     for n in g.nodes:
         by_parent.setdefault(n.parent_id, []).append(n.id)
 
-    # 各父容器内：用 forward 边做最长路径分层。
+    anc_cache: Dict[str, List[str]] = {}
+
+    def _anc(nid: str) -> List[str]:  # 自身在首位的祖先链
+        if nid not in anc_cache:
+            chain = [nid]
+            cur = parent_of.get(nid)
+            while cur is not None:
+                chain.append(cur)
+                cur = parent_of.get(cur)
+            anc_cache[nid] = chain
+        return anc_cache[nid]
+
+    def _project(src: str, dst: str) -> Optional[Tuple[str, str]]:
+        """边 → 最近公共容器下的兄弟对；同一节点内部则 None。"""
+        if src not in parent_of or dst not in parent_of:
+            return None
+        sc, dc = _anc(src), _anc(dst)
+        sset = set(sc)
+        lca = next((c for c in dc[1:] if c in sset), None)
+        s2 = next((c for c in sc if parent_of.get(c) == lca), sc[-1])
+        d2 = next((c for c in dc if parent_of.get(c) == lca), dc[-1])
+        return None if s2 == d2 else (s2, d2)
+
+    proj: Dict[int, Tuple[str, str]] = {}
+    for i, e in enumerate(g.edges):
+        pr = _project(e.src, e.dst)
+        if pr is not None:
+            proj[i] = pr
+
     node_rank: Dict[str, int] = {}
     for ids in by_parent.values():
         idset = set(ids)
         succ: Dict[str, List[str]] = {i: [] for i in ids}
         indeg: Dict[str, int] = {i: 0 for i in ids}
-        for e in g.edges:
-            if e.kind == "residual":
+        seen_pairs: Set[Tuple[str, str]] = set()
+        for i, e in enumerate(g.edges):
+            if e.kind == "residual" or i not in proj:
                 continue
-            if e.src in idset and e.dst in idset:
-                succ[e.src].append(e.dst)
-                indeg[e.dst] += 1
+            s2, d2 = proj[i]
+            if s2 in idset and d2 in idset and (s2, d2) not in seen_pairs:
+                seen_pairs.add((s2, d2))
+                succ[s2].append(d2)
+                indeg[d2] += 1
         # Kahn 最长路径；图中存在环（如 hierarchical 融合的反馈边）时，
-        # 朴素 Kahn 会让环内节点永远到不了 indeg 0、全卡在 rank 0（横向铺开、
-        # forward 边横穿同排框）。这里在队列耗尽但仍有未处理节点时贪心断环：
-        # 选环内「已被环外前驱定到最高 rank」的入口节点强制入队（其回边自然
-        # 退化为反向边/skip），从而恢复纵向分层。结果对节点序确定、幂等。
+        # 朴素 Kahn 会让环内节点永远到不了 indeg 0、全卡在 rank 0。队列耗尽但仍有
+        # 未处理节点时贪心断环：选「已被环外前驱定到最高 rank」的入口节点强制入队
+        # （其回边自然退化为反向边/skip）。结果对节点序确定、幂等。
         rank = {i: 0 for i in ids}
         indeg2 = dict(indeg)
         queue = [i for i in ids if indeg2[i] == 0]
-        done: set = set()
+        done: Set[str] = set()
         remaining = set(ids)
         order = {i: k for k, i in enumerate(ids)}
         while remaining:
@@ -1226,39 +807,59 @@ def _assign_ranks_and_skip(
                 queue.append(nxt)
         node_rank.update(rank)
 
-    # 顶层 head 分层：
-    #   * 主输出头（seg_head / aux_heads）从最后一个 decoder level 分叉，拍到同一末行；
-    #   * deep-supervision 头（ds_heads.*）保留最长路径自然层级，从而与其分叉来源
-    #     decoder level 的下一层**并列一行**（dec_k 同时发出 →dec_{k+1} 与 →ds_k），
-    #     避免硬拍到底排后再拉长线自上而下穿过解码器框。loss 殿后。
-    if heads:
-        final_heads = [h for h in heads if not h.startswith("ds_heads.")]
-        if final_heads:
-            fr = max((node_rank.get(h, 0) for h in final_heads), default=0)
-            for h in final_heads:
-                node_rank[h] = fr
-        if "loss" in node_rank:
-            node_rank["loss"] = max(
-                (node_rank.get(h, 0) for h in heads), default=0) + 1
-    # 应用 rank。
-    rankmap = {n.id: node_rank.get(n.id, 0) for n in g.nodes}
+    # 顶层输出头拍到同一末行、loss 殿后（按 kind 判定，不依赖命名）。
+    tops = by_parent.get(None, [])
+    kind_of = {n.id: n.kind for n in g.nodes}
+    head_ids = [i for i in tops if kind_of.get(i) == "head"]
+    if head_ids:
+        fr = max(node_rank.get(h, 0) for h in head_ids)
+        for h in head_ids:
+            node_rank[h] = fr
+    if "loss" in node_rank:
+        upstream = [node_rank.get(e.src, 0) for e in g.edges if e.dst == "loss"]
+        node_rank["loss"] = (max(upstream) if upstream else
+                             max(node_rank.values(), default=0)) + 1
+
     for n in g.nodes:
-        n.rank = rankmap[n.id]
+        n.rank = node_rank.get(n.id, 0)
 
-    # 跨级边（|dst.rank - src.rank| > 1）标为 skip（同一父容器内）。
-    # 含**上行反馈边**（如 hierarchical 融合 aux_fuse→stages.*，dst.rank<src.rank）：
-    # 二者都会跨越中间若干行、若直连必横穿沿途框，统一交由外缘竖轨正交路由绕开。
-    parent_of = {n.id: n.parent_id for n in g.nodes}
+    # skip 标注（前向边，按投影判定）：
+    #  a) 投影后 rank 跨度 > 1（含上行反馈边：同样要跨行绕线）；
+    #  b) 旁路边——两端点之间除这条直连外还存在更长的 DAG 路径
+    #     （UNet 的 encoder→decoder 跳连即典型：主干也能从 src 走到 dst）。
+    rankmap = {n.id: n.rank for n in g.nodes}
+    succ_all: Dict[str, Set[str]] = {}
     for e in g.edges:
-        if e.kind != "forward":
+        succ_all.setdefault(e.src, set()).add(e.dst)
+
+    bypass_memo: Dict[Tuple[str, str], bool] = {}
+
+    def _has_alt_path(u: str, v: str) -> bool:
+        key = (u, v)
+        if key in bypass_memo:
+            return bypass_memo[key]
+        seen: Set[str] = {u}
+        stack = [nx for nx in succ_all.get(u, ()) if nx != v]  # 不走直连
+        found = False
+        while stack:
+            cur = stack.pop()
+            if cur == v:
+                found = True
+                break
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(succ_all.get(cur, ()))
+        bypass_memo[key] = found
+        return found
+
+    for i, e in enumerate(g.edges):
+        if e.kind != "forward" or i not in proj:
             continue
-        if parent_of.get(e.src) != parent_of.get(e.dst):
-            continue
-        if abs(rankmap.get(e.dst, 0) - rankmap.get(e.src, 0)) > 1:
+        s2, d2 = proj[i]
+        if (abs(rankmap.get(d2, 0) - rankmap.get(s2, 0)) > 1
+                or _has_alt_path(e.src, e.dst)):
             e.kind = "skip"
-
-
-# -- 小工具 ----------------------------------------------------------------
 
 
 __all__ = ["build_model_flow"]

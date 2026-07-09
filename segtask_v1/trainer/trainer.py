@@ -51,6 +51,8 @@ from .breakdown import collect_multi_res_breakdown, format_breakdown
 from .checkpoint import (
     AsyncCheckpointSaver,
     extract_model_state_dict,
+    relocate_optimizer_state,
+    restore_rng_state,
     state_to_cpu,
     strip_common_prefixes,
     unwrap_compile,
@@ -1229,6 +1231,7 @@ class Trainer:
         unwrap_compile(self.model).load_state_dict(model_sd)
 
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        relocate_optimizer_state(self.optimizer)
         if "scheduler_state_dict" in ckpt:
             self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         if "scaler_state_dict" in ckpt:
@@ -1250,14 +1253,7 @@ class Trainer:
         rng = ckpt.get("rng_state")
         if rng:
             try:
-                if rng.get("torch_cpu") is not None:
-                    torch.set_rng_state(rng["torch_cpu"])
-                if rng.get("torch_cuda") is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state_all(rng["torch_cuda"])
-                if rng.get("numpy") is not None:
-                    np.random.set_state(rng["numpy"])
-                if rng.get("python") is not None:
-                    random.setstate(rng["python"])
+                restore_rng_state(rng)
                 logger.info("Restored RNG state from checkpoint.")
             except Exception as e:  # pragma: no cover
                 logger.warning("Failed to restore RNG state: %s", e)
