@@ -911,138 +911,73 @@ TTA / 更快采样器 / 感知指标 / 批处理推理
 3 
 
 
-4 模型流可视化乱套了：
-感觉模型流可视化仍然设计的不够通用，不够好，我增加了一些模块，例如自注意力等等，完整参数见seg2_5d.yaml和seg3d.yaml（这两个配置里面的参数几乎可以囊括所有可能情况），模型流可视化便乱套了。
+4 模型流可视化需要有层次化，结构化，美化，可以清晰看到计算流的走向，可以清晰理解模型架构，可以清晰的溯源。总之：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判、讨厌"自动布局默认输出"式的无设计感结果。以下是一些例子：  
 
-一、现状理解（现有实现怎么工作）
-模型流可视化是一套自研的三段式管线（零第三方依赖，输出单文件 HTML）：
+- 聚焦模式到stem, stage这个层级为止：
+点击模块A，进入聚焦模式，模块群B和A有联系，模块群C和A没有联系，所以模块群C谈出，模块群B突显。我希望到stem，stage这个级别的模块能进入聚焦，再进一步的子模块例如stem，stage里面的子模块则不进入聚焦。  
 
-采集（model_flow.py _trace_modules）：给所有模块注册 forward-pre/forward hook，跑一次 dummy 前向；用 id(tensor) + 一个 TorchFunctionMode（_make_prov_mode）追踪张量"血缘"（provenance），试图穿过 cat/+/interpolate 等 functional 算子。
-重建（_ModelGraphBuilder + _emit_*）：把叶子按硬编码命名规则聚合成容器框，再靠血缘反查连边、识别残差/融合。
-布局渲染（graph.py assign_grid_layout + render.py 的 JS）：CSS Grid 摆 (rank,col,colspan)，再用一大段手写 SVG 逻辑做正交折线、外缘车道、跳连分侧、聚焦布线等。
-二、根因分析：为什么"每次改模块就乱套"
-问题不是某个 bug，而是架构层面的耦合。当前实现把"分组、连边、残差、布局"四件事都建立在对具体模块命名/结构的硬编码假设上，任何新模块只要不符合这些假设，就至少打破其中一环：
+- 连线走线需要清晰、不重叠、不交叉、美观、可以溯源：
+需要清晰的看到不同模块的关系，并能溯源输入输出等等
 
-根因 1：分组靠"名字白名单"，不靠模块树本身。 _top_key / _block_key 依赖写死的段名集合：
+- 位置清晰，层次清晰，严格遵守各自的位置关系：
+例如输入后可能同时结果多个stem，那么这几个stem就是位置并列的；例如如果有deep supervision，且在dec level 0后有ds head 2, dec level 1后有ds head 1等等，那么ds head 2位置就应该和dec level 1并列，因为它们就是dec level 0的下一个计算。
 
+- 其它的我暂时没有想到，请你根据我的喜好推荐，注意，原则是：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判。
 
-model_flow.py
-Lines 118-121
-_INDEXED_SEGS = {
-    "stages", "downsamples", "levels", "upsamples", "level_blocks",
-    "level_entries", "blocks", "gates", "branches", "fusions",
-}
-你加 selfattn 时，factory 把 stage 包成 nn.Sequential(ResNetStage, SelfAttentionBlock)（factory.py:126），于是模块路径变成 encoder.stages.4.1.norm 这种；再加任何新容器名（新 backbone、新头、新融合），只要不在这个白名单里，分组就归错框。新增模块 = 必须回来改白名单，这正是"改一次乱一次"的直接来源。
+审查：
+总体结论
+这套实现的方向和大部分设计是正确且高质量的，与 TODO 4 的五条原则逐条对得上：
 
-根因 2：残差/捷径靠"类型清单 + 属性名"猜。
+TODO 4 原则	实现情况
+方案通用无架构特判
+✅ 分组=模块树、连边=op 级 DAG 收缩、残差=可达性/深度规则（model_flow.py:6-13），无命名白名单
+拒绝自动布局默认输出
+✅ 已删除 elk.bundled.js，改为自研确定性结构化布局（render.py:244-251）
+位置即计算次序
+✅ ASAP 分层（render.py:491-493）+ res 缩进呈 U 型（render.py:670）；ds/aux 头"挂靠"到源的下一层带（render.py:606-634），正是你举的"ds head 2 与 dec level 1 并列"例子
+聚焦止步 stem/stage
+✅ canFocus（render.py:340-344）= 顶层 + 顶层容器直接子级，更深层仅双击详情
+走线可溯源不交叉
+✅ 左右车道分离 + 区间打包（render.py:536-549）、fold-y 成对约束拓扑排序防交叉（render.py:944-975）、避框绕行、扇入扇出按对侧 x 排序、hover 单边上浮 + tooltip
+测试覆盖也扎实（unet/unetpp/unet3p 跳连数闭式公式断言、merge 健康性、形状与 topology 一致）。torchlens 用法（tl.trace(model, dummy, save=None)、逐 op 遍历、is_buffer 过滤）与 3.x 官方 API 一致 ✅。
 
+但审查发现 1 条会污染真实训练模型的 P1 副作用问题、若干语义/设计层面的 P2 问题，以及与你偏好高度契合的增强空间。
 
-model_flow.py
-Lines 244-281
-def _residual_block_types() -> Tuple[type, ...]:
-    ...  # 手工列举 ResNetBlock / ConvNeXtBlock / _ResBlockNoEmb / _EDM2Block
-_SHORTCUT_ATTRS = ("shortcut", "skip_connection", "conv_skip")
-SelfAttentionBlock 的残差是 x = x + h（blocks.py:991），它既不在类型清单里、也没有名叫 shortcut 的子模块 → _has_residual 判 False → 不 reseal、不标残差。于是它的 + 把"块输入血缘"和"注意力支血缘"混在一起，连边错乱。每种新残差写法都要回来登记。
+一、正确性问题
+P1：追踪前向会原地污染真实训练模型的状态
+_tl_trace（model_flow.py:156-181）优先在 model.train(True) 下跑 dummy 前向（为了激活 aux/DS 头），且 train.py:101 传入的是即将参与训练的那个真模型。torch.no_grad() 只挡梯度，挡不住两类原地副作用：
 
-根因 3：数据流靠 id(tensor) + functional 血缘，脆弱且随实现细节漂移。 SelfAttentionBlock 内部是 rearrange(flatten) → Conv1d → sdpa/permute/einsum → unflatten → +（blocks.py:984-999）。这些 reshape/permute/chunk 全是 functional，血缘要靠 _ProvMode 把 id 关系一路缝合，还要处理 id 复用、透传张量、inplace、weakref 校验（_supersede、reseal、"悬空 shortcut 兜底"等一大堆特判，见 _emit_leaf_flow 近 150 行）。Conv1d 作用在 (B,C,HW) 上，导致框里显示的形状维度都和 3D 语义对不上（_container_io 又要启发式回退）。追踪正确性依赖模块内部怎么写，换个等价写法就可能变样。
+BatchNorm running stats：train 模式下前向会用全零 dummy 更新 running_mean/var。默认 instance/group norm 时无碍，但配 BN 时首个 epoch 的统计被污染；
+EDM2 的训练期权重原地归一化：edm2_unet.py 的 _MPConv 在 train 前向中 copy_ 归一化权重（你的 TODO 2 审查已记录此机制）——追踪一次就真实改写了权重张量。
+修复方向：在 deepcopy(model).cpu() 上追踪，或追踪前快照 state_dict()（含 buffers）、追踪后恢复。成本极低、收益确定。
 
-根因 4：布局是"为已知架构手工调"的，不是通用图布局。 render.py 里注释明确写着这些逻辑是针对 unetpp/unet3p 密集解码器、deep-supervision 头→loss、hierarchical 反馈边 等具体结构调出来的（外缘车道两色划分、Rloss 束、聚焦星形布线…）。新拓扑一旦产生新的边型分布，这套手工规则就没覆盖到 → 连线交叉/穿框/溢出。
+P2：乘法门控被误标为"残差"，且边标签错写 +
+_ADDITIVE_SYMBOLS = {"+", "−", "×", "lerp"}（model_flow.py:114），残差规则 1 是"某一路上游可达另一路"（model_flow.py:365-369）。对 attention gate（out = x * psi，psi 由 x、g 算出）和 SE 类结构，x 必然可达 psi 分支 → x→× 这条边被判为 residual。语义上这是门控不是残差捷径；
+更直接的错误：model_flow.py:696 对所有 residual 边统一 label="+"——即使融合点是 ×，边上也标 +。
+建议：残差判定收窄到 {+, lerp}；× 融合引入独立语义（如 gate kind 或至少不标 residual、label 用真实符号）。需同步补一条 attention-gate 配置的测试（现有测试恰好没覆盖 skip_attention=True）。
 
-一句话根因："分组"和"连边"是两条各自依赖硬编码假设的管线，且都以模块命名/类型为锚点；布局又针对已知架构手工特化。三者任何一处遇到未登记的新模块都会失配，表现为"乱套"。
+P2：rank/列位存在"双真相源"，IR 契约已过时
+builder 侧算了 rank（_assign_ranks_and_skip）和 col/colspan（graph.py:155-230），但当前 renderer 完全不读它们——JS 自己重算 layerRanks（render.py:452-494）与绝对坐标。全仓 grep 确认 col/colspan 只被 visualization 内部与测试消费；
+graph.py:44-50 的 VisNode 注释仍写"renderer 据此摆进 CSS Grid"，是上一代渲染器的残留文档；
+两套分层规则已经在漂移：builder 把所有顶层 head 拍平到同一末行（model_flow.py:846-850），而 JS 的 attach 逻辑按 TODO 4 要求把 ds head 对齐到源的下一层——恰好因 renderer 不读 builder rank 才没冲突。但 builder rank 仍影响 skip 边分类（model_flow.py:889-895），而 JS 车道决策又基于 JS 自己的 rank + skip kind 双重判据（render.py:771-778），规则继续演化时容易产生难排查的不一致。
+建议：明确单一真相源——要么 skip 分类也移到 renderer（builder 只发裸 DAG + kind=residual），要么 renderer 消费 IR rank；同时修正 graph.py 过时注释、清理或降级 assign_grid_layout 的契约与对应测试。
 
-三、业界通用做法调研
-方案	机制	能否处理本项目（动态返回 dict/list、if training、reshape 残差）	依赖
-torch.fx symbolic_trace
-符号追踪成静态 IR
-❌ 官方明确：不支持 data-dependent 动态控制流；本模型 if self.training/返回结构随分支变化会 trace 失败或失真
-内置
-torch.export
-更强的图捕获
-⚠️ 比 fx 强但更严格，动态返回结构仍需改造模型
-内置
-torchview (draw_graph)
-__torch_function__ eager 追踪 一次前向，输出 graphviz
-✅ 支持 Skip/Sequential/嵌套/nested，depth 参数按模块树折叠；expand_nested、rolling
-+torchview +graphviz
-torchlens
-eager Python 函数包裹，捕获真实运行
-✅ 任意架构含动态/递归/融合注意力，一行出图
-+torchlens +graphviz
-Netron (ONNX 导出)
-导出 ONNX 后看图
-⚠️ 需能 export ONNX；算子层级、非交互定制弱
-onnx + 外部查看器
-关键结论：
-
-静态符号方案（fx/export）在本模型上不可行（动态控制流 + 动态返回结构）。
-业界成熟可视化（torchview / torchlens）与你现有采集思路同源（都是 eager 追踪），区别在于它们用模块树做分组、用 graphviz 做分层布局，因此对新模块天然鲁棒——这恰好对应你缺的两点。
-因此正确方向不是"再打一个补丁修 selfattn"，而是把分组从命名白名单改为模块树、把布局从手工特化改为通用分层算法。
-四、通用设计方案（核心思想）
-用三条"结构驱动、去硬编码"的原则替换四类特判：
-
-分组 = nn.Module 树本身：容器框 = 模块树节点；折叠深度 = 通用 depth 参数（类似 torchview）。删除 _INDEXED_SEGS/_top_key/_block_key 的名字白名单。新模块因为本就是树里的节点，自动获得正确的框，无需登记。
-连边 = op 级 DAG + "按当前可见深度上提(lift)"：底层只维护一张"张量→产出op"的真值 DAG；显示时把叶子边统一上提到"当前可见的祖先框"。这是一个统一操作，取代所有 per-container 补边/reseal/supersede/悬空兜底。
-残差/融合 = 从 DAG 结构判定：融合 = 任何有 ≥2 张量输入的 op（cat/add/mul）；残差 = 某 add 的一个输入是另一个输入的祖先。不再靠类型清单/属性名。
-布局二选一（见下方决策）：要么引入一个通用分层布局（Sugiyama/graphviz），要么保留自研 HTML 但把布局改成"对任意 DAG 通用"的分层，删掉架构特化路由。
-
-五、可执行计划（分步、可独立验收）
-每步都可单独交付、单独验证；先做"采集/分组"内核，再做布局，最后清理。
-
-步骤 0（对齐，仅确认不写码）：定下两个决策点（见文末问题）：是否允许引入依赖；布局走"引入 graphviz/JS 分层库"还是"自研通用分层"。
-步骤 1｜统一的结构化 IR 内核：新增一个"追踪→op级 DAG"的模块，产出 {节点(叶子/op), 边(张量流), 模块树父子} 三张表。复用现有 hook + TorchFunctionMode 采集，但只产出真值 op-DAG，不做任何命名判断。验收：对 seg2_5d.yaml/seg3d.yaml 各跑一次，导出的 DAG 节点数=被执行叶子+融合op数，边无悬空、无自环（单测断言）。
-步骤 2｜树驱动分组 + 边上提：用模块树做容器层级，实现"边 lift 到可见深度"的通用算法，替换 _top_key/_block_key/_emit_intra_edges/_emit_leaf_flow。验收：unet（含 selfattn+multirf）、unetpp、unet3p、一个扩散 backbone 四种配置下，每个 stage 框的 in/out 形状正确、encoder↔decoder 跳连数量与代码一致（单测按拓扑断言）。
-步骤 3｜结构化残差/融合判定：用"祖先关系"判残差、用"≥2 输入"判融合，删除 _residual_block_types/_SHORTCUT_ATTRS。验收：SelfAttentionBlock、ResNetBlock、ConvNeXtBlock 的残差都被标出且只标一条，无"悬空 shortcut"。
-步骤 4｜通用布局替换：按步骤 0 的决策，把 render.py 的手工车道/rank 特化换成对任意 DAG 通用的分层布局。验收：四种配置渲染无连线穿框、无右侧溢出被裁；同一配置两次渲染布局稳定（幂等）。
-步骤 5｜清理与回归：移除死代码与特判，补 README 说明新架构；跑通全量可视化回归。验收：git grep 不再有架构名白名单；已有 inspect.getsource 类测试更新通过。
-范围边界：只重构 segtask_v1/visualization/（model_flow 为主，必要时 graph/render），不改模型代码（models/）。data_flow / predict_flow 复用同一 IR 与渲染层，但本任务只保证 model_flow 达标，另两个作为兼容性验证。
-
-主要风险：① 若选"自研通用分层"，Sugiyama 类算法有一定实现量（可控，约 1 步）；② 引入 graphviz 是系统级依赖（需你许可）；③ eager 追踪对"动态返回结构"已被现有代码验证可行，风险低。
-
-依赖放开后的关键变化
-之前四个根因里，根因 3（id 血缘追踪脆弱）和根因 4（布局手工特化） 现在都能直接交给成熟库解决，而不是自己再造轮子：
-
-追踪/建图引擎：用 eager 追踪类库（torchlens 或 torchview），它们和你现有采集同源（都是 __torch_function__/函数包裹跑一次真实前向），因此照样支持你模型的动态返回（dict/list）与 if self.training，但把"op 级真值 DAG + 模块树层级 + 形状/元数据"做成了经过 1 万+架构验证的稳定能力。新增自注意力、multirf、乃至新 backbone，都不需要回来改可视化。
-布局引擎：用 graphviz（dot 分层布局）算坐标——通用、对任意 DAG 成立，彻底取代 render.py 里那套为 unetpp/unet3p/深监督手工调的车道路由。
-两者选型对比（本项目视角）：
-
-库	定位	优点	代价
-torchlens
-追踪引擎（程序化 API 最强）
-文档化的 per-op 图 + 父子层级 + 元数据，明确支持动态/递归/融合注意力；最适合"喂给我们自己的渲染器"
-需 graphviz 画图；引擎较重
-torchview
-可视化（graphviz 直出）
-depth/expand_nested 按模块树折叠、形状、Sequential/skip 都支持，出图快
-稳定公开产物是 graphviz Digraph，程序化取节点图偏内部
-graphviz
-布局引擎
-通用分层布局、可导出坐标(json/plain)供自绘
-系统级依赖（需装 graphviz 二进制）
-推荐架构（最高质量、保留交互）
-引擎 + 布局用成熟库，渲染仍用你现有的交互式单文件 HTML，三个 tab（Data/Model/Predict）保持一致体验：
-
-torchlens（或 torchview） 跑一次前向 → 产出 op 级 DAG + 模块树层级 + 形状 → 映射到你现有的 VisGraph IR（graph.py）。→ 消除根因 1/2/3（分组改由模块树、连边/残差由真值 DAG 结构判定，删掉所有命名白名单与类型清单）。
-graphviz dot 对该 DAG 算节点坐标（分层）→ 你的渲染器按坐标画 SVG。→ 消除根因 4（删架构特化路由）。
-保留 你的 HTML 渲染层：折叠框、单击聚焦、详情抽屉、按 kind 配色、Data/Predict 两个自研概念流（它们不是 nn.Module，无法被上述库追踪，继续用现渲染器）。
-这样：模型流的"追踪+布局"交给成熟库（不再乱套），交互与三流一致性由你现有渲染层保留。
-
-更新后的执行计划（分步、可独立验收）
-步骤 1｜选型 spike：在 seg2_5d.yaml / seg3d.yaml 两个"几乎囊括所有情况"的配置上，分别用 torchlens 与 torchview 各跑一次，评估：能否拿到 op 级图+模块层级+形状、对 selfattn/multirf/dict 返回是否正确、程序化取图是否稳定。产出：定选型 + 版本（遵守"以最新官方文档为准"，届时按当时文档 API 写）。验收：两配置都能生成非空、结构正确的图对象。
-步骤 2｜引擎图 → VisGraph 映射：写适配层把库的图映射到现有 VisGraph（节点 kind/形状/detail、模块树 parent_id、边 forward/residual/skip）。删除 model_flow.py 里的命名白名单/类型清单/血缘特判。验收：四类配置（unet+selfattn+multirf / unetpp / unet3p / 一个扩散 backbone）跳连数、stage in/out 形状与代码一致（单测断言）。
-步骤 3｜graphviz 布局接入：用 dot 算坐标，渲染器按坐标绘边，替换手工车道/rank 路由。验收：四类配置无穿框、无溢出被裁；两次渲染稳定幂等。
-步骤 4｜清理与回归：移除死代码，更新依赖声明（requirements）与 README，跑通全量可视化回归；更新受影响的既有测试。验收：git grep 无架构名白名单；三 tab 均正常。
-范围：只动 segtask_v1/visualization/ + 依赖声明；不改 models/。新增依赖会在引入前在提交说明里写明用途与必要性。
-
-（推荐）用 torchlens/torchview 作追踪引擎 + graphviz 算布局，但保留你现有的交互式单文件 HTML 渲染层（三 tab/聚焦/详情抽屉不变）
-方向已确认：成熟库作追踪引擎 + graphviz 算布局，保留你现有交互式 HTML 渲染层。规划到此完成，方案完全锁定。
-
-最终锁定方案
-依赖：允许引入高质量第三方库（追踪引擎 torchlens/torchview 二选一 + graphviz），引入前在提交说明写明用途与必要性。
-架构：库负责"模型追踪→op级DAG+模块树+形状"与"分层布局坐标"；你现有渲染层负责交互（三 tab、折叠、单击聚焦、详情抽屉），Data/Predict 两流不动。
-彻底删除乱套根源：命名白名单（_INDEXED_SEGS/_top_key/_block_key）、残差类型清单（_residual_block_types/_SHORTCUT_ATTRS）、自研 id 血缘特判、架构特化布局路由。
-范围：只改 segtask_v1/visualization/ + 依赖声明；不动 models/。
-执行步骤（每轮专注一步、做透）
-选型 spike：seg2_5d/seg3d 上对比 torchlens vs torchview，定引擎 + 版本
-引擎图 → VisGraph 映射，删命名/类型/血缘特判
-graphviz 布局接入，替换手工路由
-清理 + 依赖声明 + README + 回归
+P2/P3 级次要项
+生产路径全尺寸 CPU dummy 前向的成本：tests 里把 patch 缩到 1/8（test_model_flow.py:36-42），但 generate_visualization 生产路径不缩。大 patch（如 128³×宽通道）3D 模型在训练启动时可能耗时数十秒/占数 GB RAM。可加 vis.trace_downscale 选项（注意展示形状会随之变小，需在 meta 里标注"追踪用缩小 patch"）。
+cat(x, x) 同源多输入被去重成一条边（model_flow.py:310-313、render.py:415-421），merge 入度语义丢失。边缘场景，可在 edge 上带 multiplicity 标注解决。
+_res_level 只看末维 W（model_flow.py:593-602）：z-only 下采样的各向异性 stage 不会产生缩进。当前架构 H/W 总在下采样，实际影响小，记录即可。
+functional 上/下采样是"导线"不可见（model_flow.py:299-308 设计取舍）：F.interpolate 消失于连边中，nn.Upsample 才成节点。对"位置即计算次序"有轻微损失；可考虑把改变空间尺寸的 functional op 例外地材料化为小节点（仍是通用规则：按形状变化判定，非按名字特判）。
+二、值得肯定的设计（不动）
+IR（graph.py）/builder/renderer 三层职责分离，单文件离线 HTML 零外部依赖；
+逐 op 实例而非 layer 遍历（model_flow.py:187-190），正确处理权重共享模块的多次调用（@call 后缀 + "×2" 标注）；
+_prune_to_dataflow 只保留输入→输出通路，剔除 buffer 旁支；
+单子容器向上合并（build_containers）消灭 nn.Sequential 空嵌套框；
+连边发射在最深材料化端点、渲染期按折叠态动态上卷（model_flow.py:691-693 注释解释了为什么不能预上提）——这是折叠语义正确的关键决策；
+布局的工程细节密度很高：量测缓存 + 字体加载后失效重排、fold 中线防交叉的成对约束拓扑排序、直连穿框改道、贪心断环的幂等处理。
+三、可借鉴的业界做法（增强建议）
+血缘锥聚焦（强烈推荐，直指你"可清晰溯源"的诉求）：当前聚焦只亮直接邻居（render.py:1252-1262）。TensorBoard Graph 的 "trace inputs" 是亮完整上游/下游可达锥。建议聚焦支持两档：单击=直接邻居（现状），再次强化操作（如 Shift+单击或抽屉按钮）=全上下游血缘，沿途边全部上浮。纯图可达性计算，通用无特判。
+缩放/平移 + fit-to-view：大模型画布上万像素，目前只有浏览器滚动 + 锚点导航。Netron/TensorBoard 均有 wheel 缩放 + 拖拽平移；一个 CSS transform 缩放层即可，可选 minimap。
+顶层 stage 间前向边标注张量形状：形状目前在节点 key_info 里，边上标 (B,C,D,H,W) 后"走线溯源"的信息密度更高（数据已在 container_io，只差发射到 edge label）。
+分辨率级背景色带：res 缩进已呈 U 型，可加浅色纵向色带 + 1×/2×/4× 标尺，把"缩进=下采样级"从隐式变显式（对应 nnU-Net 论文图的分辨率行）。
+展开/折叠全部按钮 + 状态持久化（URL hash）：多次核对同一处结构时省去重复点击。
+rank 分配备选：目前是最长路径分层；Graphviz 的 network-simplex 分层更紧凑。当前 ASAP 语义（"就绪即排"= 位置即计算次序）其实更贴合你的原则，不建议换，仅作为已调研的备选记录。

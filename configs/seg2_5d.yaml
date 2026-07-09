@@ -184,7 +184,7 @@ model:
   multirf_branch_norm_act: true              # 各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除
 
   # ---- 自注意力（仅 backbone='resnet' 且 arch='unet'）：选定 stage 末尾追加自注意力残差块，全局 token 交互 ----
-  selfattn_enabled       : false       # 按下方 stages 列表在指定层追加自注意力块
+  selfattn_enabled       : true       # 按下方 stages 列表在指定层追加自注意力块
   selfattn_type          : "softmax"   # 全局默认注意力类型（逐层写 1 时沿用）；'softmax'=标准 O(N²)（放最深层） | 'linear'=O(N)（次深层） | 'window'=窗口内局部 | 'grid'=跨窗格稀疏
   selfattn_num_heads     : 4           # 头数；仅 selfattn_head_dim=-1 时使用
   selfattn_head_dim      : -1          # 每头维度；-1=自动（用 num_heads）；否则 heads = channels // head_dim
@@ -194,8 +194,8 @@ model:
   selfattn_ffn_ratio     : 4.0         # 仅 selfattn_ffn=true；FFN 扩张比
   selfattn_window_size   : 7           # 仅 type='window'；窗口边长
   selfattn_grid_size     : 7           # 仅 type='grid'；网格数
-  selfattn_encoder_stages: []          # 编码器逐 stage 开关；0/'none'=关 | 1=用全局 type | 'softmax'/'linear'/'window'/'grid'=逐层指定；非空长度须 = len(encoder_channels)
-  selfattn_decoder_stages: []          # 解码器逐 level 开关（取值同上）；非空长度须 = len(encoder_channels)-1；仅 decoder_type='unet'
+  selfattn_encoder_stages: [0, 0, linear, linear, softmax]          # 编码器逐 stage 开关；0/'none'=关 | 1=用全局 type | 'softmax'/'linear'/'window'/'grid'=逐层指定；非空长度须 = len(encoder_channels)
+  selfattn_decoder_stages: [softmax, linear, 0, 0]          # 解码器逐 level 开关（取值同上）；非空长度须 = len(encoder_channels)-1；仅 decoder_type='unet'
 
   # 仅 2.5D 且 arch 改为 "adm" / "edm2" 才生效。
   # adm_attention_levels          : []     # 带多头自注意力的级索引（0=顶层）；空=默认最深两级

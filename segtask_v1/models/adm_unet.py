@@ -736,7 +736,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         linear_attention_levels=lin_attn_levels,
         linear_attention_num_heads=lin_num_heads,
         linear_attention_head_dim=lin_head_dim,
-        out_channels=out_classes,
+        num_fg_classes=out_classes,
         deep_supervision=bool(mc.deep_supervision),
         aux_seg_supervision=aux_seg,
         aux_head_mode=str(mc.aux_head_mode),

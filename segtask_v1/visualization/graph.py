@@ -45,6 +45,9 @@ class VisNode:
       不同 rank 自上而下排列。renderer 据此把并联结构排成一行。
     * ``col`` / ``colspan`` —— 同一父容器内的横向列位（0 起）与跨列宽：renderer 据 ``(rank, col,
       colspan)`` 把节点摆进 CSS Grid，使各路径独占列、笔直对齐，融合点（cat/+）居中覆盖其上游列。
+    * ``res`` —— 分辨率级（0 起）：输出空间尺寸相对模型输入缩小 2^res 倍。由追踪
+      形状计算，renderer 据此把主干按分辨率级右缩进，呈现 encoder↓/decoder↑ 的
+      U 型结构；分辨率不变的流程（数据流等）恒为 0，布局自动退化为直列。
     """
 
     id: str
@@ -57,6 +60,7 @@ class VisNode:
     rank: int = 0
     col: int = 0
     colspan: int = 1
+    res: int = 0
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -110,6 +114,7 @@ class VisGraph:
         rank: int = 0,
         col: int = 0,
         colspan: int = 1,
+        res: int = 0,
     ) -> VisNode:
         """新增节点并返回（键值统一转字符串，避免 JSON 序列化歧义）。"""
         node = VisNode(
@@ -123,6 +128,7 @@ class VisGraph:
             rank=int(rank),
             col=int(col),
             colspan=int(colspan),
+            res=int(res),
         )
         self.nodes.append(node)
         return node

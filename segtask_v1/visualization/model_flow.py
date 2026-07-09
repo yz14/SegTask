@@ -19,6 +19,7 @@ torchlens 不可用或前向失败时，退化为**纯结构图**（按 ``named_
 from __future__ import annotations
 
 import logging
+import math
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
@@ -88,6 +89,15 @@ def _leaf_params(m: nn.Module) -> Dict[str, object]:
     if n_param:
         p["params"] = n_param
     return p
+
+
+def _fmt_params(n: int) -> str:
+    """参数量人读化：1234 → '1.2K'，3456789 → '3.46M'。"""
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1e3:.1f}K"
+    return str(n)
 
 
 # torch 函数名 → 融合点展示符号。未登记的多源算子回退到通用 "merge"。
@@ -574,10 +584,22 @@ def build_model_flow(
                 "n_views": str(topo.n_views)})
 
     if ops:
-        _emit_traced(g, cfg, model, ops)
+        _emit_traced(g, cfg, model, ops, in_shape)
     else:
         _emit_structural(g, cfg, model)
     return g
+
+
+def _res_level(out_sh: Optional[Tuple[int, ...]], in_w: int) -> int:
+    """分辨率级：输出末维（W）相对模型输入缩小 2^level 倍（四舍五入取整）。
+
+    只看空间末维，对通道数/维度数不敏感；形状未知或非正时回退 0（不缩进）。"""
+    if not out_sh or in_w <= 0:
+        return 0
+    w = out_sh[-1]
+    if not isinstance(w, int) or w <= 0 or w > in_w:
+        return 0
+    return max(0, int(round(math.log2(in_w / w))))
 
 
 def _is_head_container(cid: str) -> bool:
@@ -586,7 +608,8 @@ def _is_head_container(cid: str) -> bool:
 
 
 def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
-                 ops: Dict[str, _Op]) -> None:
+                 ops: Dict[str, _Op], in_shape: Tuple[int, ...]) -> None:
+    in_w = int(in_shape[-1]) if in_shape else 0
     a = _Adapter(g, model, ops)
     a.contract()
     residual = a.residual_edges()
@@ -610,6 +633,9 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
         ki: Dict[str, object] = {}
         if mod is not None:
             ki["type"] = type(mod).__name__
+            n_p = sum(prm.numel() for prm in mod.parameters())
+            if n_p:
+                ki["params"] = _fmt_params(n_p)
         ki["ops"] = str(n_ops)
         if in_sh:
             ki["in"] = shape_str(in_sh)
@@ -619,7 +645,8 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
         label = cid[len(pid) + 1:] if pid and cid.startswith(pid + ".") else cid
         kind = "head" if pid is None and _is_head_container(cid) else "stage"
         g.add_node(cid, label, kind=kind, key_info=ki,
-                   parent_id=pid, collapsed=True)
+                   parent_id=pid, collapsed=True,
+                   res=_res_level(out_sh, in_w))
 
     # 2) 叶子节点。
     for nid, group in sorted(a.leaf_ops.items(),
@@ -630,6 +657,10 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
         tname = type(mod).__name__ if mod is not None else path.split(".")[-1]
         in_sh, out_sh = a.leaf_io(nid)
         ki = {"type": tname}
+        if mod is not None:
+            n_p = sum(prm.numel() for prm in mod.parameters())
+            if n_p:
+                ki["params"] = _fmt_params(n_p)
         if out_sh:
             ki["out"] = shape_str(out_sh)
         detail = _leaf_params(mod) if mod is not None else {}
@@ -643,7 +674,8 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
         label = tname if not call else f"{tname} ×{call}"
         g.add_node(nid, label,
                    kind=_leaf_kind(mod) if mod is not None else "op",
-                   key_info=ki, detail=detail, parent_id=parent.get(nid))
+                   key_info=ki, detail=detail, parent_id=parent.get(nid),
+                   res=_res_level(out_sh, in_w))
 
     # 3) 融合节点。
     for mid, (sym, out_sh, _srcs) in sorted(
@@ -653,7 +685,8 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
             ki["out"] = shape_str(out_sh)
         g.add_node(mid, sym, kind="merge", key_info=ki,
                    detail={"op": sym, "kind": "merge (functional fusion)"},
-                   parent_id=parent.get(mid))
+                   parent_id=parent.get(mid),
+                   res=_res_level(out_sh, in_w))
 
     # 4) 连边：直接在**最深的材料化端点**（叶子/merge/input）级别发射。
     # 渲染层的 visibleAnchor 会按折叠状态把端点动态上提到可见的容器框，

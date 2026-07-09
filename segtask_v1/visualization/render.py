@@ -1,38 +1,24 @@
-"""IR → 自包含 HTML 渲染器（ELK.js 浏览器内实时布局）。
+"""IR → 自包含 HTML 渲染器（结构化确定性布局）。
 
 把若干 ``VisGraph`` 序列化为内嵌 JSON，配一段原生 HTML/CSS/JS：
 * 顶部标签页切换 Data / Model / Predict；
-* 布局由内嵌的 **ELK.js**（Eclipse Layout Kernel，分层 Sugiyama 算法，EPL-2.0）
-  在浏览器内实时计算：嵌套容器、正交布线、跨层级跳连/残差均由通用算法处理，
-  折叠/展开任意容器即重新布局——不再有任何手工车道路由与架构特判；
-* 双击任意框 → 右侧详情抽屉展示完整参数；单击顶层框 → 聚焦高亮其直接连接。
+* 布局由一套**只依赖图结构与追踪形状**的确定性版面规则在浏览器内计算：
+  每个容器内最长路径分层；主干脊柱中轴对齐并按分辨率级（``res``）右缩进呈
+  U 型；并联分支/输出头排脊柱右侧、超宽自动换行；跳连/反馈边走容器左侧车道、
+  残差走右侧车道（区间打包分道）。无任何架构名/模块名特判，对任意新模块通用；
+  折叠/展开任意容器即按可见锚点重新计算，结果幂等；
+* 双击任意框 → 右侧详情抽屉展示完整参数；单击顶层框或其直接子模块（stem/stage 级）→ 聚焦高亮其直接连接。
 
-ELK.js 打包源码（segtask_v1/visualization/static/elk.bundled.js）随包分发并
-内联进生成的 HTML，故输出仍是**单文件、离线可打开、零运行环境依赖**。
+输出是**单文件、离线可打开、零运行环境依赖**（无任何外部 JS 库）。
 """
 
 from __future__ import annotations
 
 import html
 import json
-import os
 from typing import Dict, List
 
 from .graph import VisGraph
-
-_ELK_PATH = os.path.join(os.path.dirname(__file__), "static", "elk.bundled.js")
-
-
-def _elk_source() -> str:
-    """读取随包分发的 ELK.js 打包源码（内联进 HTML）。"""
-    try:
-        with open(_ELK_PATH, "r", encoding="utf-8") as f:
-            return f.read()
-    except OSError as e:  # pragma: no cover - 包损坏才会触发
-        raise RuntimeError(
-            f"缺少 ELK.js 布局引擎资源：{_ELK_PATH}；"
-            "请确认 segtask_v1/visualization/static/elk.bundled.js 随包完整分发。"
-        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -94,14 +80,14 @@ header h1 { margin: 0 0 6px; font-size: 16px; font-weight: 680;
 .canvas-wrap { padding: 18px 20px 60px; }
 .flow { display: none; }
 .flow.active { display: block; }
-/* 画布：ELK 输出绝对坐标，所有框/容器绝对定位其上；连线 SVG 覆盖整画布。
-   连线由 ELK 正交路由绕开框体，故 SVG 层可安全置于框之上（z 20/30），
+/* 画布：布局输出绝对坐标，所有框/容器绝对定位其上；连线 SVG 覆盖整画布。
+   连线沿容器侧缘车道正交路由、绕开框体，故 SVG 层可安全置于框之上（z 20/30），
    聚焦上浮线与残差线始终可见、不再被容器背景遮挡。 */
 .canvas { position: relative; }
 svg.edges { position: absolute; left: 0; top: 0; pointer-events: none;
   z-index: 20; overflow: visible; }
 svg.edges-top { z-index: 30; }
-/* 隐藏量测箱：先把叶卡/容器标题渲染进来量出天然尺寸，再喂给 ELK 定坐标。 */
+/* 隐藏量测箱：先把叶卡/容器标题渲染进来量出天然尺寸，再喂给布局定坐标。 */
 .meas { position: fixed; left: -2200px; top: 0; width: 1600px; height: 0;
   overflow: hidden; visibility: hidden; }
 
@@ -150,11 +136,17 @@ svg.edges-top { z-index: 30; }
 .stage > .stage-head {
   display: flex; align-items: center; gap: 8px; padding: 8px 12px;
   cursor: pointer; font-weight: 700; color: var(--c-stage); user-select: none;
-  white-space: nowrap;
+  white-space: normal; flex-wrap: wrap; max-width: 100%; row-gap: 1px;
+  overflow-wrap: anywhere;
 }
 .stage > .stage-head .caret { transition: transform .15s; font-size: 11px;
   cursor: pointer; }
 .stage > .stage-head.collapsed .caret { transform: rotate(-90deg); }
+/* 折叠态：卡片压窄、元信息换行，便于同层并列分支横排 */
+.stage > .stage-head.collapsed { flex-wrap: wrap; white-space: normal;
+  max-width: 300px; row-gap: 1px; }
+.stage > .stage-head.collapsed .s-kv { flex-basis: 100%; margin-left: 0;
+  white-space: normal; word-break: break-word; }
 .stage > .stage-head .s-kv { color: var(--muted); font-weight: 500;
   font-size: 10.5px; margin-left: auto; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
@@ -216,6 +208,25 @@ svg.edges-top { z-index: 30; }
 .drawer-body td { padding: 3px 6px; vertical-align: top;
   border-bottom: 1px solid #eef0f3; }
 .drawer-body td.k { color: var(--muted); white-space: nowrap; width: 42%; }
+.main { display: flex; align-items: flex-start; }
+.main > .canvas-wrap { flex: 1 1 auto; min-width: 0; }
+.nav { position: sticky; top: 12px; left: 12px; z-index: 40;
+  flex: 0 0 auto; margin: 18px 0 18px 12px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(15,23,42,.10); font-size: 12px;
+  max-width: 200px; overflow: hidden; }
+.nav-head { padding: 6px 10px; font-weight: 700; color: var(--c-stage);
+  cursor: pointer; user-select: none; border-bottom: 1px solid var(--line); }
+.nav.closed .nav-body { display: none; }
+.nav.closed .nav-head { border-bottom: none; }
+.nav-body { max-height: calc(100vh - 90px); overflow: auto; padding: 4px 0; }
+.nav-item { padding: 3px 12px; cursor: pointer; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; color: var(--fg); }
+.nav-item:hover { background: rgba(37,99,235,.08); color: var(--accent); }
+.nav-item.lv1 { padding-left: 26px; }
+@keyframes navflash { 0% { box-shadow: 0 0 0 3px rgba(37,99,235,.85); }
+  100% { box-shadow: 0 0 0 3px rgba(37,99,235,0); } }
+.nav-flash { animation: navflash 1.2s ease-out 2; }
 .drawer-body td.v { color: var(--ink); word-break: break-word;
   font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .legend { display: flex; flex-wrap: wrap; gap: 10px; padding: 6px 20px 0;
@@ -228,38 +239,28 @@ svg.edges-top { z-index: 30; }
 """
 
 # ---------------------------------------------------------------------------
-# JS —— ELK.js 浏览器内布局 + 绝对定位 DOM + SVG 正交连线 + 折叠 + 聚焦 + 抽屉。
+# JS —— 结构化确定性布局 + 绝对定位 DOM + SVG 正交连线 + 折叠 + 聚焦 + 抽屉。
 #
-# 与旧实现的本质区别：不再有 CSS Grid 车道/侧缘同心弧/贪心两色划分等任何手工
-# 路由——节点坐标与每条边的正交折点全部由 ELK 分层算法给出（嵌套容器经
-# INCLUDE_CHILDREN 一体布局、edgeCoords=ROOT 使折点直接落在画布坐标系）。
-# 折叠/展开任意容器 = 图变化 = 重新调 ELK 布局，对任意 decoder_type /
-# 任意架构通用，无一处特判。
+# 版面规则（只依赖图结构与追踪形状，无任何架构名/模块名特判）：
+# 1. 每个容器内对兄弟做最长路径分层（rank）；主干脊柱 = 入口→主输出的最长
+#    路径，脊柱节点中轴对齐，并按分辨率级（node.res，来自追踪形状）右缩进，
+#    encoder↓/decoder↑ 自然呈 U 型；分辨率不变的流程退化为笔直单列；
+# 2. 非脊柱兄弟（并联分支/输出头）排在脊柱右侧，同 rank 超宽自动换行；
+# 3. 跳连/反馈边走最近公共容器的左侧车道、残差走右侧车道（短跨度贴内侧的
+#    区间打包分道）；前向邻级边垂直直连。折叠/展开 = 按可见锚点重算，幂等。
 # ---------------------------------------------------------------------------
 _JS = r"""
 const DATA = __DATA__;
-const elk = new ELK();
 // 连边线型/配色：forward 主流（实线灰）、skip 跳连（实线蓝）、
-// residual 残差（琥珀虚线）。几何全部来自 ELK 正交路由。
+// residual 残差（琥珀虚线）。
 const EDGE_STYLE = {
   forward:  { color: "#94a3b8", width: "1.6", dash: null,  marker: "arrow" },
   skip:     { color: "#2563eb", width: "1.8", dash: null,  marker: "arrow-skip" },
   residual: { color: "#d97706", width: "1.8", dash: "3 3", marker: "arrow-res" },
 };
-const LAYOUT_OPTS = {
-  "elk.algorithm": "layered",
-  "elk.direction": "DOWN",
-  "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-  "elk.edgeRouting": "ORTHOGONAL",
-  "org.eclipse.elk.json.edgeCoords": "ROOT",
-  "elk.layered.spacing.nodeNodeBetweenLayers": "32",
-  "elk.spacing.nodeNode": "26",
-  "elk.spacing.edgeNode": "14",
-  "elk.spacing.edgeEdge": "10",
-  "elk.layered.spacing.edgeNodeBetweenLayers": "14",
-  "elk.layered.spacing.edgeEdgeBetweenLayers": "10",
-  "elk.padding": "[top=8,left=8,bottom=8,right=8]",
-};
+// 布局常量：行间距/列间距/车道宽/分辨率缩进/单行最大内容宽/容器内边距。
+const LC = { GAPY: 40, GAPX: 26, LANE_W: 11, LANE_PAD: 8, INDENT: 26,
+             MAXROW: 1500, PAD: 12, HEAD_GAP: 6 };
 const STATE = {};       // flowKey -> 每视图状态（折叠集合/聚焦/布局缓存）
 let measBox = null;     // 隐藏量测箱
 
@@ -302,11 +303,11 @@ function leafCard(node, st) {
     });
     card.appendChild(kv);
   }
-  const topLevel = !node.parent_id;
+  const foc = st ? canFocus(node, st) : !node.parent_id;
   card.appendChild(el("div", "hint",
-    topLevel ? "\u5355\u51FB\u9AD8\u4EAE \u00B7 \u53CC\u51FB\u8BE6\u60C5"
-             : "\u53CC\u51FB\u8BE6\u60C5"));
-  if (st) attachNodeHandlers(card, node, st, topLevel);
+    foc ? "\u5355\u51FB\u9AD8\u4EAE \u00B7 \u53CC\u51FB\u8BE6\u60C5"
+        : "\u53CC\u51FB\u8BE6\u60C5"));
+  if (st) attachNodeHandlers(card, node, st, foc);
   return card;
 }
 
@@ -322,21 +323,29 @@ function stageBox(node, st, collapsed) {
   if (sk) head.appendChild(el("span", "s-kv", sk));
   box.appendChild(head);
   if (st) {
-    // 折叠/展开仅由标题左侧三角触发；标题其余区域单击=聚焦（仅顶层）、双击=详情。
+    // 折叠/展开仅由标题左侧三角触发；标题其余区域单击=聚焦（顶层及 stem/stage 级）、双击=详情。
     caret.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (st.collapsed.has(node.id)) st.collapsed.delete(node.id);
       else st.collapsed.add(node.id);
       relayout(st);
     });
-    attachNodeHandlers(head, node, st, !node.parent_id);
+    attachNodeHandlers(head, node, st, canFocus(node, st));
   }
   return box;
 }
 
+// 可聚焦层级：顶层模块 + 顶层容器的直接子模块（stem/stage 级）；
+// 更深的子模块不参与聚焦，仅双击看详情。
+function canFocus(node, st) {
+  if (!node.parent_id) return true;
+  const p = st.ix.byId[node.parent_id];
+  return !!p && !p.parent_id;
+}
+
 let _clickTimer = null;
-function attachNodeHandlers(elm, node, st, topLevel) {
-  if (topLevel) {
+function attachNodeHandlers(elm, node, st, focusable) {
+  if (focusable) {
     elm.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (_clickTimer) return;           // 双击进行中：交由 dblclick 处理
@@ -352,7 +361,7 @@ function attachNodeHandlers(elm, node, st, topLevel) {
       openDrawer(node);
     });
   } else {
-    // 框内子模块不参与聚焦：单击不做任何事，仅双击看详情。
+    // 更深层子模块不参与聚焦：单击不做任何事，仅双击看详情。
     elm.addEventListener("click", (ev) => ev.stopPropagation());
     elm.addEventListener("dblclick", (ev) => {
       ev.stopPropagation(); openDrawer(node);
@@ -360,9 +369,9 @@ function attachNodeHandlers(elm, node, st, topLevel) {
   }
 }
 
-// ---------------- 尺寸量测（喂给 ELK） ----------------
+// ---------------- 尺寸量测（喂给布局） ----------------
 // 叶卡按内容自适应（min/max-width 由 CSS 约束）；容器只量标题条（展开时
-// 作为 ELK padding-top 与最小宽，折叠时即整框尺寸）。结果按 node.id 缓存，
+// 作为顶部内边距与最小宽，折叠时即整框尺寸）。结果按 node.id 缓存，
 // 字体加载完成后统一失效重量。
 function measure(node, variant, st) {
   const ck = variant + "|" + node.id;
@@ -375,25 +384,6 @@ function measure(node, variant, st) {
   measBox.removeChild(e);
   st.measCache[ck] = m;
   return m;
-}
-
-// ---------------- IR → ELK 图 ----------------
-function toElk(n, st) {
-  const kids = st.ix.kids[n.id] || [];
-  if (kids.length && !st.collapsed.has(n.id)) {
-    const hm = measure(n, "head", st);
-    return {
-      id: n.id,
-      layoutOptions: {
-        "elk.padding": "[top=" + (hm.h + 6) + ",left=12,bottom=12,right=12]",
-        "elk.nodeSize.constraints": "MINIMUM_SIZE",
-        "elk.nodeSize.minimum": "(" + (hm.w + 4) + "," + (hm.h + 30) + ")",
-      },
-      children: kids.map(k => toElk(k, st)),
-    };
-  }
-  const m = measure(n, kids.length ? "head" : "leaf", st);
-  return { id: n.id, width: m.w, height: m.h };
 }
 
 // 折叠上卷：节点若藏在折叠容器内，其连边端点改挂到最外层折叠祖先。
@@ -432,9 +422,597 @@ function visEdges(st) {
   return out;
 }
 
+// ---------------- 结构化布局内核 ----------------
+// 祖先链（自身在首位、最外层在末位）与最近公共容器（null = 画布根）。
+function ancChainOf(st, id) {
+  const out = [id];
+  let cur = (st.ix.byId[id] || {}).parent_id;
+  while (cur) { out.push(cur); cur = (st.ix.byId[cur] || {}).parent_id; }
+  return out;
+}
+function lcaOf(st, a, b) {
+  const pa = new Set(ancChainOf(st, a).slice(1));
+  const cb = ancChainOf(st, b);
+  for (let i = 1; i < cb.length; i++) if (pa.has(cb[i])) return cb[i];
+  return null;
+}
+// 节点 id → 其在容器 container 直属子级中的代表（祖先或自身）。
+function projTo(st, container, id) {
+  let cur = id;
+  while (cur != null) {
+    const p = (st.ix.byId[cur] || {}).parent_id || null;
+    if (p === container) return cur;
+    cur = p;
+  }
+  return null;
+}
+
+// Kahn 最长路径分层（非 residual 边）；有环（反馈边）时贪心断环：
+// 选已被环外前驱定到最高 rank 的入口强制入队。结果对节点序确定、幂等。
+function layerRanks(ids, edges) {
+  const idset = new Set(ids);
+  const succ = {}, indeg = {}, seen = new Set();
+  ids.forEach(i => { succ[i] = []; indeg[i] = 0; });
+  edges.forEach(e => {
+    if (e.kind === "residual" || e.s === e.t) return;
+    const key = e.s + ">" + e.t;
+    if (!idset.has(e.s) || !idset.has(e.t) || seen.has(key)) return;
+    seen.add(key);
+    succ[e.s].push(e.t);
+    indeg[e.t]++;
+  });
+  const rank = {}, order = {};
+  ids.forEach((i, k) => { rank[i] = 0; order[i] = k; });
+  const indeg2 = Object.assign({}, indeg);
+  let queue = ids.filter(i => indeg2[i] === 0);
+  const done = new Set();
+  const remaining = new Set(ids);
+  while (remaining.size) {
+    while (queue.length) {
+      const cur = queue.pop();
+      if (done.has(cur)) continue;
+      done.add(cur);
+      remaining.delete(cur);
+      succ[cur].forEach(nx => {
+        if (rank[cur] + 1 > rank[nx]) rank[nx] = rank[cur] + 1;
+        if (--indeg2[nx] <= 0 && !done.has(nx)) queue.push(nx);
+      });
+    }
+    if (remaining.size) {
+      let best = null;
+      remaining.forEach(i => {
+        if (best === null || rank[i] > rank[best] ||
+            (rank[i] === rank[best] && order[i] < order[best])) best = i;
+      });
+      indeg2[best] = 0;
+      queue.push(best);
+    }
+  }
+  // 纯 ASAP（就绪即排）：节点排在其全部数据源的下一层。同源后继严格同层
+  // 并列（多 stem、MultiRF 分支、ds head 与下一级 dec 等），位置即计算次序。
+  return rank;
+}
+
+// 主干脊柱：入口→主输出（优先 loss/output 类汇点）的最长路径节点集合。
+function pickSpine(st, ids, edges, rank) {
+  const pred = {}, seen = new Set();
+  ids.forEach(i => { pred[i] = []; });
+  edges.forEach(e => {
+    if (e.kind === "residual" || e.s === e.t) return;
+    if ((rank[e.t] || 0) <= (rank[e.s] || 0)) return;   // 忽略反馈/同层
+    const key = e.s + ">" + e.t;
+    if (seen.has(key)) return;
+    seen.add(key);
+    pred[e.t].push(e.s);
+  });
+  const order = {};
+  ids.forEach((i, k) => { order[i] = k; });
+  const byRank = ids.slice().sort((a, b) => (rank[a] - rank[b]) || (order[a] - order[b]));
+  const len = {}, back = {};
+  byRank.forEach(i => {
+    len[i] = 1; back[i] = null;
+    pred[i].forEach(p => {
+      if (len[p] + 1 > len[i]) { len[i] = len[p] + 1; back[i] = p; }
+    });
+  });
+  const kindPri = (i) => {
+    const k = (st.ix.byId[i] || {}).kind;
+    return k === "loss" ? 2 : (k === "output" ? 1 : 0);
+  };
+  let sink = null;
+  ids.forEach(i => {
+    if (sink === null) { sink = i; return; }
+    const c = kindPri(i) - kindPri(sink);
+    if (c > 0 || (c === 0 && (len[i] > len[sink] ||
+        (len[i] === len[sink] && rank[i] > rank[sink])))) sink = i;
+  });
+  const spine = new Set();
+  let cur = sink;
+  while (cur != null && !spine.has(cur)) { spine.add(cur); cur = back[cur]; }
+  return spine;
+}
+
+// 侧缘车道分配：区间打包（短跨度排前 → 贴内侧车道），返回每条边的道号与总道数。
+function allocLanes(items) {
+  const lanes = [], asg = {};
+  items.slice().sort((a, b) => ((a.y1 - a.y0) - (b.y1 - b.y0)) || (a.y0 - b.y0))
+    .forEach(it => {
+      let l = 0;
+      for (;; l++) {
+        lanes[l] = lanes[l] || [];
+        if (lanes[l].every(iv => it.y1 + 6 <= iv.y0 || it.y0 >= iv.y1 + 6)) break;
+      }
+      lanes[l].push({ y0: it.y0, y1: it.y1 });
+      asg[it.key] = l;
+    });
+  return { asg, count: lanes.length };
+}
+
+// 计算整图布局：返回
+//   geo   —— 可见节点 id → {x,y,w,h,depth,isBox} 画布绝对坐标；
+//   routes—— 可见边 → 正交折点序列（画布绝对坐标）；
+//   W/H   —— 画布尺寸。
+function computeLayout(st, veds) {
+  // 1) 每条可见边投影到最近公共容器下的兄弟对，按容器分桶。
+  const sib = {};    // 容器 key（"$root" 或容器 id）→ [{s,t,kind,i}]
+  const edgeCont = [];  // 边 i → {c, s, t}
+  veds.forEach((e, i) => {
+    const c = lcaOf(st, e.vs, e.vt);
+    const s = projTo(st, c, e.vs), t = projTo(st, c, e.vt);
+    edgeCont[i] = { c, s, t };
+    if (s && t && s !== t) {
+      const key = c == null ? "$root" : c;
+      (sib[key] = sib[key] || []).push({ s, t, kind: e.kind, i });
+    }
+  });
+
+  const geo = {};      // id → {x,y,w,h}（先相对父内容原点，走树后转绝对）
+  const cinfo = {};    // 容器 key → {laneAsg, laneL, laneR, headH}
+  const lineIdx = {};  // 节点 → 所在换行序（同 rank 第 0 行才允许垂直直连入边）
+
+  // 2) 自底向上递归布局每个容器（相对坐标），并做本容器的车道分配。
+  function layoutBox(id) {
+    const nd = id == null ? null : st.ix.byId[id];
+    const kidNodes = id == null
+      ? (st.g.nodes || []).filter(n => !n.parent_id)
+      : (st.ix.kids[id] || []);
+    const expanded = kidNodes.length && (id == null || !st.collapsed.has(id));
+    if (!expanded) {
+      const m = measure(nd, kidNodes.length ? "head" : "leaf", st);
+      return { w: m.w, h: m.h };
+    }
+    const ids = kidNodes.map(n => n.id);
+    const size = {};
+    ids.forEach(k => { size[k] = layoutBox(k); });
+    const key = id == null ? "$root" : id;
+    const edges = sib[key] || [];
+    const rank = layerRanks(ids, edges);
+    const spine = pickSpine(st, ids, edges, rank);
+    const res = {};
+    ids.forEach(i => { res[i] = (st.ix.byId[i] || {}).res || 0; });
+    let resMin = Infinity;
+    spine.forEach(i => { if (res[i] < resMin) resMin = res[i]; });
+    if (!isFinite(resMin)) resMin = 0;
+
+    // 分支 barycenter 定位用的前驱表（仅下行边）。
+    const preds = {};
+    ids.forEach(i => { preds[i] = []; });
+    edges.forEach(e => {
+      if (e.kind !== "residual" && rank[e.t] > rank[e.s]) preds[e.t].push(e.s);
+    });
+
+    // 「就近挂靠」：唯一数据源投影为**展开容器**的非脊柱节点（如 ds/aux 头），
+    // 纵向对齐到容器内其真实源的下一层子行（二者同为该源的下一个计算），
+    // 横向排在容器右缘外侧，位置即计算次序。容器折叠时自然退化为普通行内并列。
+    const attach = {};
+    edges.forEach(e => {
+      if (e.kind === "residual" || rank[e.t] <= rank[e.s]) return;
+      const n = e.t;
+      if (spine.has(n)) return;
+      if (attach[n] === undefined) attach[n] = { p: e.s, srcs: [] };
+      else if (attach[n] && attach[n].p !== e.s) attach[n] = null;   // 多源不挂靠
+      if (attach[n]) attach[n].srcs.push(veds[e.i].vs);
+    });
+    Object.keys(attach).forEach(n => {
+      const a = attach[n];
+      const del = () => { delete attach[n]; };
+      if (!a) { del(); return; }
+      const p = a.p, pc = cinfo[p];
+      const pKids = st.ix.kids[p] || [];
+      if (!pc || !pc.kidRank || !pKids.length || st.collapsed.has(p)) { del(); return; }
+      const reps = a.srcs.map(sid => projTo(st, p, sid)).filter(x => x != null);
+      if (!reps.length) { del(); return; }
+      const nr = Math.max.apply(null, reps.map(rp => pc.kidRank[rp] || 0)) + 1;
+      const band = pKids.map(k => k.id)
+        .filter(k => pc.kidRank[k] === nr && geo[k]);
+      if (!band.length) { del(); return; }   // 源已是容器内末层 → 留在普通行流
+      let by0 = Infinity, by1 = -Infinity;
+      band.forEach(k => {
+        by0 = Math.min(by0, geo[k].y);
+        by1 = Math.max(by1, geo[k].y + geo[k].h);
+      });
+      attach[n] = { p, y0: by0, y1: by1 };
+    });
+
+    const declOrder = {};
+    ids.forEach((i, k) => { declOrder[i] = k; });
+    const cx = {}, top = {}, rankLineCnt = {};
+    let y = 0;
+    const ranksSorted = [...new Set(ids.map(i => rank[i]))].sort((a, b) => a - b);
+    ranksSorted.forEach(r => {
+      const row = ids.filter(i => rank[i] === r);
+      const sp = row.filter(i => spine.has(i));
+      const rest = row.filter(i => !spine.has(i) && !attach[i]).sort((a, b) => {
+        const bc = (n) => preds[n].length
+          ? preds[n].reduce((s, p) => s + (cx[p] || 0), 0) / preds[n].length
+          : Infinity;
+        return (bc(a) - bc(b)) || (declOrder[a] - declOrder[b]);
+      });
+      // 换行：首行含脊柱节点，其余从脊柱右侧起排，超过 MAXROW 换行。
+      const lines = [];
+      let line = [], lineW = 0;
+      if (sp.length) { line.push(sp[0]); lineW = size[sp[0]].w; }
+      rest.forEach(i => {
+        const w = size[i].w;
+        if (line.length && lineW + LC.GAPX + w > LC.MAXROW) {
+          lines.push(line); line = []; lineW = 0;
+        }
+        line.push(i);
+        lineW += (line.length > 1 ? LC.GAPX : 0) + w;
+      });
+      if (line.length) lines.push(line);
+      rankLineCnt[r] = lines.length;
+      lines.forEach((ln, li) => {
+        const lh = Math.max.apply(null, ln.map(i => size[i].h));
+        ln.forEach(i => { lineIdx[i] = li; });
+        if (li === 0 && sp.length) {
+          const s0 = sp[0];
+          cx[s0] = (res[s0] - resMin) * LC.INDENT;   // 分辨率缩进（中轴系）
+          top[s0] = y + (lh - size[s0].h) / 2;
+          let x = cx[s0] + size[s0].w / 2 + LC.GAPX;
+          ln.forEach(i => {
+            if (i === s0) return;
+            cx[i] = x + size[i].w / 2;
+            top[i] = y + (lh - size[i].h) / 2;
+            x += size[i].w + LC.GAPX;
+          });
+        } else {
+          // 无脊柱行（并联分支/换行续排）：按前驱 barycenter 居中。
+          const totW = ln.reduce((s, i) => s + size[i].w, 0)
+            + LC.GAPX * (ln.length - 1);
+          let bx = 0, bn = 0;
+          ln.forEach(i => preds[i].forEach(p => {
+            if (cx[p] != null) { bx += cx[p]; bn++; }
+          }));
+          let x = (bn ? bx / bn : 0) - totW / 2;
+          ln.forEach(i => {
+            cx[i] = x + size[i].w / 2;
+            top[i] = y + (lh - size[i].h) / 2;
+            x += size[i].w + LC.GAPX;
+          });
+        }
+        y += lh + LC.GAPY;
+      });
+    });
+    // 挂靠节点定位：纵向对齐源的下一层带，横向从容器右缘外依次排开。
+    const bandX = {};
+    Object.keys(attach).forEach(n => {
+      const a = attach[n];
+      const bk = a.p + "|" + a.y0;
+      if (bandX[bk] === undefined)
+        bandX[bk] = cx[a.p] + size[a.p].w / 2 + LC.GAPX;
+      top[n] = top[a.p] + (a.y0 + a.y1) / 2 - size[n].h / 2;
+      cx[n] = bandX[bk] + size[n].w / 2;
+      bandX[bk] += size[n].w + LC.GAPX;
+    });
+    let contentH = Math.max(0, y - LC.GAPY);
+    Object.keys(attach).forEach(n => {
+      contentH = Math.max(contentH, top[n] + size[n].h);
+    });
+
+    // 直连折线（源底→中线→目标顶）若穿过兄弟盒（如挂靠列内纵向穿框），
+    // 也改走侧缘车道。用本容器兄弟级几何近似校验三段折线。
+    const segHitsBox = (vert, coord, lo, hi, e) => {
+      if (hi < lo) { const t = lo; lo = hi; hi = t; }
+      return ids.some(b => {
+        if (b === e.s || b === e.t) return false;
+        const bx0 = cx[b] - size[b].w / 2, bx1 = cx[b] + size[b].w / 2;
+        const by0 = top[b], by1 = top[b] + size[b].h;
+        return vert
+          ? (bx0 < coord && coord < bx1 && by0 < hi && lo < by1)
+          : (by0 < coord && coord < by1 && bx0 < hi && lo < bx1);
+      });
+    };
+    const directBlocked = (e) => {
+      const y0 = top[e.s] + size[e.s].h, y1 = top[e.t];
+      if (y1 < y0 + 4) return false;             // 走水平直连分支，另行处理
+      const my = (y0 + y1) / 2;
+      return segHitsBox(true, cx[e.s], y0, my, e)
+          || segHitsBox(false, my, cx[e.s], cx[e.t], e)
+          || segHitsBox(true, cx[e.t], my, y1, e);
+    };
+
+    // 3) 本容器侧缘车道：skip/反馈走左，residual 走右（用兄弟盒纵区间打包）。
+    const leftIv = [], rightIv = [];
+    edges.forEach(e => {
+      if (!needSide(e, rank, rankLineCnt) && !directBlocked(e)) return;
+      const y0 = Math.min(top[e.s] + size[e.s].h / 2, top[e.t] + size[e.t].h / 2);
+      const y1 = Math.max(top[e.s] + size[e.s].h / 2, top[e.t] + size[e.t].h / 2);
+      (e.kind === "residual" ? rightIv : leftIv).push({ key: e.i, y0, y1 });
+    });
+    const L = allocLanes(leftIv), R = allocLanes(rightIv);
+    const laneAsg = Object.assign({}, L.asg, R.asg);
+
+    // 4) 平移到容器内容区（预留左右车道 gutter），并记录相对几何。
+    let minX = Infinity, maxX = -Infinity;
+    ids.forEach(i => {
+      minX = Math.min(minX, cx[i] - size[i].w / 2);
+      maxX = Math.max(maxX, cx[i] + size[i].w / 2);
+    });
+    if (!isFinite(minX)) { minX = 0; maxX = 0; }
+    const gutL = L.count * LC.LANE_W + (L.count ? LC.LANE_PAD : 0);
+    const gutR = R.count * LC.LANE_W + (R.count ? LC.LANE_PAD : 0);
+    const headM = id == null ? { w: 0, h: 0 } : measure(nd, "head", st);
+    const padTop = id == null ? 0 : headM.h + LC.HEAD_GAP;
+    const pad = id == null ? 4 : LC.PAD;
+    const dx = pad + gutL - minX, dy = padTop + (id == null ? 0 : 0);
+    ids.forEach(i => {
+      geo[i] = { x: cx[i] - size[i].w / 2 + dx, y: top[i] + dy,
+                 w: size[i].w, h: size[i].h };
+    });
+    const w = Math.max(pad * 2 + gutL + (maxX - minX) + gutR,
+                       id == null ? 0 : headM.w + 4);
+    const h = padTop + contentH + pad;
+    cinfo[key] = { laneAsg, laneL: L.count, laneR: R.count,
+                   pad, gutL, gutR, w, h, ids: ids.slice(), kidRank: rank };
+    return { w, h };
+  }
+
+  function needSide(e, rank, rankLineCnt) {
+    if (e.kind === "residual") return true;
+    if (e.kind === "skip") return true;
+    if ((rank[e.t] || 0) <= (rank[e.s] || 0)) return true;   // 反馈/同层
+    return (rank[e.t] || 0) - (rank[e.s] || 0) > 1
+        || (lineIdx[e.t] || 0) > 0 || (lineIdx[e.s] || 0) > 0
+        || (rankLineCnt[rank[e.s]] || 1) > 1;   // 源层换行过 → 直连会穿行
+  }
+
+  const rootSize = layoutBox(null);
+
+  // 5) 相对坐标 → 画布绝对坐标（父容器逐级累加）。
+  const abs = {};
+  function walkAbs(id, ox, oy, depth) {
+    const kidNodes = id == null
+      ? (st.g.nodes || []).filter(n => !n.parent_id)
+      : (st.ix.kids[id] || []);
+    const expanded = kidNodes.length && (id == null || !st.collapsed.has(id));
+    if (!expanded) return;
+    kidNodes.forEach(n => {
+      const g = geo[n.id];
+      if (!g) return;
+      abs[n.id] = { x: ox + g.x, y: oy + g.y, w: g.w, h: g.h, depth,
+                    isBox: (st.ix.kids[n.id] || []).length > 0 };
+      walkAbs(n.id, ox + g.x, oy + g.y, depth + 1);
+    });
+  }
+  walkAbs(null, 0, 0, 0);
+
+  // 6) 连边路由（画布绝对坐标）。侧缘边端点取**实际可见盒**（可深入展开容器），
+  // 车道取最近公共容器的 gutter；同盒多进/多出按序错开落点，避免线头重叠。
+  const inCnt = {}, outCnt = {}, inSeen = {}, outSeen = {};
+  const inGrp = {}, outGrp = {};   // 直连边扇出/扇入分组（用于按对侧 x 排序落点）
+  veds.forEach((e, i) => {
+    const pc = edgeCont[i];
+    if (!pc.s || !pc.t || pc.s === pc.t) return;
+    const key = pc.c == null ? "$root" : pc.c;
+    const side = (cinfo[key] && cinfo[key].laneAsg[i] != null);
+    const bt = abs[e.vt], bs = abs[e.vs];
+    if (!bt || !bs) return;
+    const dir = e.kind === "residual" ? "R" : "L";
+    const kIn = e.vt + "|" + (side ? dir : "T");
+    const kOut = e.vs + "|" + (side ? dir : "B");
+    inCnt[kIn] = (inCnt[kIn] || 0) + 1;
+    outCnt[kOut] = (outCnt[kOut] || 0) + 1;
+    if (!side) {
+      (outGrp[kOut] = outGrp[kOut] || []).push(i);
+      (inGrp[kIn] = inGrp[kIn] || []).push(i);
+    }
+  });
+  const stagger = (idx, n, span) => {
+    if (n <= 1) return 0;
+    const step = Math.min(10, span / (n + 1));
+    return (idx - (n - 1) / 2) * step;
+  };
+  // 扇出落点按目标 x 排序、扇入落点按源 x 排序：出/入顺序与走向一致，
+  // 从根上消除同源/同宿边在端点附近的相互交叉。
+  const outIdx = {}, inIdx = {};
+  Object.keys(outGrp).forEach(k => {
+    outGrp[k].slice().sort((a, b) =>
+      (abs[veds[a].vt].x + abs[veds[a].vt].w / 2)
+      - (abs[veds[b].vt].x + abs[veds[b].vt].w / 2))
+      .forEach((ei, j) => { outIdx[ei] = j; });
+  });
+  Object.keys(inGrp).forEach(k => {
+    inGrp[k].slice().sort((a, b) =>
+      (abs[veds[a].vs].x + abs[veds[a].vs].w / 2)
+      - (abs[veds[b].vs].x + abs[veds[b].vs].w / 2))
+      .forEach((ei, j) => { inIdx[ei] = j; });
+  });
+
+  // 水平段是否穿过同容器兄弟盒（穿框则改从上/下缘进出）。
+  const blockedH = (ci, x0, x1, yy, skip) => {
+    if (x1 < x0) { const t = x0; x0 = x1; x1 = t; }
+    return (ci.ids || []).some(id => {
+      if (skip.indexOf(id) >= 0) return false;
+      const g = abs[id];
+      return g && g.y < yy && yy < g.y + g.h && g.x < x1 && x0 < g.x + g.w;
+    });
+  };
+
+  const routes = [];
+  const folds = [];   // 层间折弯的直连边：先收集，再按互不交叉的次序统一分配中线 y
+  veds.forEach((e, i) => {
+    const pc = edgeCont[i];
+    if (!pc.s || !pc.t || pc.s === pc.t) return;
+    const key = pc.c == null ? "$root" : pc.c;
+    const ci = cinfo[key];
+    const A = abs[e.vs], B = abs[e.vt];
+    if (!A || !B || !ci) return;
+    const lane = ci.laneAsg[i];
+    let pts;
+    if (lane == null) {
+      // 垂直直连：A 底 → B 顶，necessary 时在层间水平折弯。
+      const kOut = e.vs + "|B", kIn = e.vt + "|T";
+      const ax = A.x + A.w / 2 + stagger(outIdx[i] || 0, outCnt[kOut], A.w * 0.6);
+      const bx = B.x + B.w / 2 + stagger(inIdx[i] || 0, inCnt[kIn], B.w * 0.6);
+      const y0 = A.y + A.h, y1 = B.y;
+      if (y1 < y0 + 4) {
+        // 目标不在源下方（挂靠节点与源同带等）：改走水平直连（侧缘出入）。
+        const toRight = B.x + B.w / 2 >= A.x + A.w / 2;
+        const hx0 = toRight ? A.x + A.w : A.x;
+        const hx1 = toRight ? B.x : B.x + B.w;
+        const hy0 = A.y + A.h / 2, hy1 = B.y + B.h / 2;
+        if (Math.abs(hy0 - hy1) < 1) pts = [[hx0, hy0], [hx1, hy1]];
+        else {
+          const mx = (hx0 + hx1) / 2;
+          pts = [[hx0, hy0], [mx, hy0], [mx, hy1], [hx1, hy1]];
+        }
+      } else if (Math.abs(ax - bx) < 1) pts = [[ax, y0], [ax, y1]];
+      else {
+        // 折弯边：先占位，稍后按互不交叉次序统一分配中线 y。
+        const r = { meta: e, pts: null };
+        folds.push({ key, ax, bx, y0, y1, route: r, ord: i });
+        routes.push(r);
+        return;
+      }
+    } else {
+      // 侧缘车道：左（skip/反馈）或右（residual）。
+      const contAbs = pc.c == null ? { x: 0, w: rootSize.w }
+                                   : abs[pc.c] || { x: 0, w: rootSize.w };
+      const right = e.kind === "residual";
+      const laneX = right
+        ? contAbs.x + contAbs.w - ci.pad - (lane + 0.5) * LC.LANE_W
+        : contAbs.x + ci.pad + ci.gutL - (lane + 0.5) * LC.LANE_W;
+      const dir = right ? "R" : "L";
+      const kOut = e.vs + "|" + dir, kIn = e.vt + "|" + dir;
+      outSeen[kOut] = (outSeen[kOut] || 0) + 1;
+      inSeen[kIn] = (inSeen[kIn] || 0) + 1;
+      // 附加 lane 序微偏移：不同车道的边引出/引入水平段不共线，便于溯源。
+      const lOff = ((lane % 3) - 1) * 5;
+      const ay = A.y + A.h / 2 + lOff
+        + stagger(outSeen[kOut] - 1, outCnt[kOut], A.h - 12);
+      const by = B.y + B.h / 2 + lOff
+        + stagger(inSeen[kIn] - 1, inCnt[kIn], B.h - 12);
+      const ax = right ? A.x + A.w : A.x;
+      const bx = right ? B.x + B.w : B.x;
+      const skip = [e.vs, e.vt];
+      pts = [];
+      if (blockedH(ci, ax, laneX, ay, skip)) {
+        // 源侧穿框：改从源底缘出，经行间空隙拐入车道。
+        const ax2 = A.x + A.w / 2, gy = A.y + A.h + LC.GAPY / 2;
+        pts.push([ax2, A.y + A.h], [ax2, gy], [laneX, gy]);
+      } else {
+        pts.push([ax, ay], [laneX, ay]);
+      }
+      if (blockedH(ci, laneX, bx, by, skip)) {
+        // 目标侧穿框：改经行间空隙从目标顶缘进。
+        const bx2 = B.x + B.w / 2, gy = B.y - LC.GAPY / 2;
+        pts.push([laneX, gy], [bx2, gy], [bx2, B.y]);
+      } else {
+        pts.push([laneX, by], [bx, by]);
+      }
+    }
+    routes.push({ meta: e, pts });
+  });
+
+  // 折弯边中线 y 分配：同容器内 [y0,y1] 纵向重叠的折弯边聚成一簇，
+  // 依「水平段不得跨过他边竖直段」的成对约束拓扑排序，再在空隙带内
+  // 均匀取 y——扇出/扇入/混合场景下折线互不交叉且不共线。
+  const grpMap = {};
+  folds.forEach(f => { (grpMap[f.key] = grpMap[f.key] || []).push(f); });
+  Object.keys(grpMap).forEach(k => {
+    const fs = grpMap[k].slice().sort((a, b) => a.y0 - b.y0 || a.ord - b.ord);
+    let cluster = [], cMax = -Infinity;
+    const flush = () => { if (cluster.length) assignFoldY(cluster); cluster = []; };
+    fs.forEach(f => {
+      if (cluster.length && f.y0 >= cMax) { flush(); cMax = -Infinity; }
+      cluster.push(f);
+      cMax = Math.max(cMax, f.y1);
+    });
+    flush();
+  });
+  function assignFoldY(fs) {
+    const n = fs.length;
+    const lo = (f) => Math.min(f.ax, f.bx), hi = (f) => Math.max(f.ax, f.bx);
+    const after = fs.map(() => []), deg = fs.map(() => 0);
+    for (let a = 0; a < n; a++) for (let b = 0; b < n; b++) {
+      if (a === b) continue;
+      const e = fs[a], f = fs[b];
+      // e 的水平段跨过 f 的上竖段（f.ax）→ f 须在 e 之上；跨过 f 的下竖段
+      // （f.bx）→ e 须在 f 之上。
+      if (lo(e) < f.ax && f.ax < hi(e)) { after[b].push(a); deg[a]++; }
+      if (lo(e) < f.bx && f.bx < hi(e)) { after[a].push(b); deg[b]++; }
+    }
+    const order = [], q = [];
+    for (let x = 0; x < n; x++) if (!deg[x]) q.push(x);
+    q.sort((a, b) => fs[a].ord - fs[b].ord);
+    while (q.length) {
+      const u = q.shift();
+      order.push(u);
+      after[u].forEach(v => { if (--deg[v] === 0) q.push(v); });
+      q.sort((a, b) => fs[a].ord - fs[b].ord);
+    }
+    for (let x = 0; x < n; x++)          // 约束成环时兜底保序
+      if (order.indexOf(x) < 0) order.push(x);
+    let gLo = Infinity, gHi = -Infinity;
+    fs.forEach(f => { gLo = Math.min(gLo, f.y0); gHi = Math.max(gHi, f.y1); });
+    order.forEach((u, rk) => {
+      const f = fs[u];
+      const t = gLo + (rk + 1) / (n + 1) * (gHi - gLo);
+      const my = Math.max(f.y0 + 5, Math.min(f.y1 - 5, t));
+      f.route.pts = [[f.ax, f.y0], [f.ax, my], [f.bx, my], [f.bx, f.y1]];
+    });
+  }
+
+  // 兜底避框：跨容器边的竖直段可能纵穿无关实心盒（叶子/折叠容器；展开
+  // 容器只是虚线外框，穿过无妨）。逐段检测，穿框处沿盒近侧缘绕行。
+  const hasKids = {};
+  Object.keys(abs).forEach(id => {
+    const p = (st.ix.byId[id] || {}).parent_id;
+    if (p) hasKids[p] = true;
+  });
+  const solid = Object.keys(abs).filter(id => !hasKids[id]);
+  routes.forEach(r => {
+    if (!r.pts) return;
+    const out = [r.pts[0]];
+    for (let s = 1; s < r.pts.length; s++) {
+      const [x0, y0] = out[out.length - 1], [x1, y1] = r.pts[s];
+      if (Math.abs(x1 - x0) < 0.5 && Math.abs(y1 - y0) > 1) {
+        const lo = Math.min(y0, y1), hi = Math.max(y0, y1);
+        const hit = solid
+          .filter(id => id !== r.meta.vs && id !== r.meta.vt)
+          .map(id => abs[id])
+          .filter(g => g.x + 1 < x0 && x0 < g.x + g.w - 1
+                    && g.y + 1 < hi && lo < g.y + g.h - 1)
+          .sort((a, b) => (y1 > y0 ? a.y - b.y : b.y - a.y));
+        hit.forEach(g => {
+          const side = (x0 - g.x < g.x + g.w - x0) ? g.x - 7 : g.x + g.w + 7;
+          const ya = y1 > y0 ? g.y - 6 : g.y + g.h + 6;
+          const yb = y1 > y0 ? g.y + g.h + 6 : g.y - 6;
+          out.push([x0, ya], [side, ya], [side, yb], [x0, yb]);
+        });
+      }
+      out.push([x1, y1]);
+    }
+    r.pts = out;
+  });
+
+  return { geo: abs, routes, W: Math.ceil(rootSize.w) + 8,
+           H: Math.ceil(rootSize.h) + 8 };
+}
+
 // ---------------- 布局 + 绘制 ----------------
-async function relayout(st) {
-  const my = ++st.seq;                 // 丢弃过期的异步布局结果
+function relayout(st) {
   const tops = (st.g.nodes || []).filter(n => !n.parent_id);
   const canvas = st.flowEl.querySelector(".canvas");
   if (!tops.length) {
@@ -444,23 +1022,8 @@ async function relayout(st) {
     return;
   }
   const eds = visEdges(st);
-  const root = {
-    id: "$root",
-    layoutOptions: LAYOUT_OPTS,
-    children: tops.map(n => toElk(n, st)),
-    edges: eds.map(e => ({ id: e.id, sources: [e.vs], targets: [e.vt] })),
-  };
-  let res;
-  try {
-    res = await elk.layout(root);
-  } catch (err) {
-    console.error("ELK layout failed:", err);
-    canvas.innerHTML = "";
-    canvas.appendChild(el("div", "empty", "布局失败：" + err));
-    return;
-  }
-  if (my !== st.seq) return;
-  paint(st, res, eds);
+  const lay = computeLayout(st, eds);
+  paint(st, lay);
   st.laidOut = true;
 }
 
@@ -516,7 +1079,7 @@ function midOf(pts) {
   return pts[pts.length - 1];
 }
 
-function paint(st, root, eds) {
+function paint(st, lay) {
   const canvas = st.flowEl.querySelector(".canvas");
   canvas.innerHTML = "";
   const svg = svgNS("svg");
@@ -527,30 +1090,24 @@ function paint(st, root, eds) {
   svgTop.innerHTML = svgDefs();
   canvas.appendChild(svg);
 
-  // 节点绝对定位：ELK 子坐标相对父容器，累加得画布绝对坐标。容器 z 按深度
-  // 递增（外层最低），叶卡恒在容器之上（z10），连线层再往上（z20/30）。
+  // 节点绝对定位（布局已给画布绝对坐标）。容器 z 按深度递增（外层最低），
+  // 叶卡恒在容器之上（z10），连线层再往上（z20/30）。
   const nodeEls = {};
-  const walk = (n, ox, oy, depth) => {
-    (n.children || []).forEach(c => {
-      const x = ox + (c.x || 0), y = oy + (c.y || 0);
-      const nd = st.ix.byId[c.id];
-      const kids = st.ix.kids[c.id] || [];
-      const isBox = kids.length > 0;
-      const e = isBox ? stageBox(nd, st, st.collapsed.has(c.id))
-                      : leafCard(nd, st);
-      e.style.left = x + "px";
-      e.style.top = y + "px";
-      e.style.width = c.width + "px";
-      e.style.height = c.height + "px";
-      e.style.zIndex = isBox ? String(1 + depth) : "10";
-      canvas.appendChild(e);
-      nodeEls[c.id] = e;
-      walk(c, x, y, depth + 1);
-    });
-  };
-  walk(root, 0, 0, 0);
+  Object.entries(lay.geo).forEach(([id, gm]) => {
+    const nd = st.ix.byId[id];
+    const isBox = gm.isBox;
+    const e = isBox ? stageBox(nd, st, st.collapsed.has(id))
+                    : leafCard(nd, st);
+    e.style.left = gm.x + "px";
+    e.style.top = gm.y + "px";
+    e.style.width = gm.w + "px";
+    e.style.height = gm.h + "px";
+    e.style.zIndex = isBox ? String(1 + gm.depth) : "10";
+    canvas.appendChild(e);
+    nodeEls[id] = e;
+  });
   canvas.appendChild(svgTop);
-  const W = Math.ceil(root.width || 0), H = Math.ceil(root.height || 0);
+  const W = lay.W, H = lay.H;
   canvas.style.width = W + "px";
   canvas.style.height = H + "px";
   [svg, svgTop].forEach(s => {
@@ -558,19 +1115,9 @@ function paint(st, root, eds) {
     s.style.width = W + "px"; s.style.height = H + "px";
   });
 
-  // 连线：直接采用 ELK 的正交 sections（edgeCoords=ROOT，画布坐标系）。
-  const byEid = {};
-  eds.forEach(e => { byEid[e.id] = e; });
+  // 连线：结构化布局已给出每条边的正交折点（画布坐标系）。
   const edgeEls = [];
-  (root.edges || []).forEach(le => {
-    const meta = byEid[le.id];
-    if (!meta || !le.sections || !le.sections.length) return;
-    const pts = [];
-    le.sections.forEach(s => {
-      pts.push([s.startPoint.x, s.startPoint.y]);
-      (s.bendPoints || []).forEach(p => pts.push([p.x, p.y]));
-      pts.push([s.endPoint.x, s.endPoint.y]);
-    });
+  lay.routes.forEach(({ meta, pts }) => {
     const style = EDGE_STYLE[meta.kind] || EDGE_STYLE.forward;
     const path = svgNS("path");
     path.setAttribute("d", ortho(pts, 7));
@@ -593,14 +1140,100 @@ function paint(st, root, eds) {
       txt.textContent = meta.label;
       home.appendChild(txt);
     }
-    edgeEls.push({ meta, path, txt, home });
+    // 透明宽命中层：hover 高亮单条边 + tooltip 显示端点，便于溯源。
+    const hit = svgNS("path");
+    hit.setAttribute("d", path.getAttribute("d"));
+    hit.setAttribute("fill", "none");
+    hit.setAttribute("stroke", "rgba(0,0,0,0)");
+    hit.setAttribute("stroke-width", "11");
+    hit.style.pointerEvents = "stroke";
+    const nameOf = (id) => (st.ix.byId[id] || {}).label || id;
+    const tip = svgNS("title");
+    tip.textContent = nameOf(meta.vs) + " \u2192 " + nameOf(meta.vt)
+      + (meta.kind !== "forward" ? "  [" + meta.kind + "]" : "");
+    hit.appendChild(tip);
+    svgTop.appendChild(hit);
+    const it = { meta, path, txt, home, hit, baseW: String(style.width) };
+    hit.addEventListener("mouseenter", () => hoverEdge(st, it, true));
+    hit.addEventListener("mouseleave", () => hoverEdge(st, it, false));
+    edgeEls.push(it);
   });
   st.rc = { nodeEls, edgeEls, svg, svgTop, canvas };
   applyFocus(st);
+  if (st === activeState()) refreshNav(st);
+}
+
+// —— 锚点导航：按计算次序（y 坐标）列出顶层节点与已展开容器的直接子模块，
+// 点击平滑滚动到目标并闪烁提示。纯数据驱动，与聚焦可达层级一致。 ——
+function refreshNav(st) {
+  const nav = document.getElementById("nav");
+  const body = nav.querySelector(".nav-body");
+  body.innerHTML = "";
+  const rc = st.rc;
+  if (!rc) { nav.style.display = "none"; return; }
+  const geo = {};
+  Object.keys(rc.nodeEls).forEach(id => {
+    const e = rc.nodeEls[id];
+    geo[id] = { y: parseFloat(e.style.top), x: parseFloat(e.style.left) };
+  });
+  const items = [];
+  Object.keys(geo).forEach(id => {
+    const nd = st.ix.byId[id] || {};
+    if (nd.kind === "merge") return;
+    if (!nd.parent_id) items.push({ id, lv: 0 });
+    else if (!(st.ix.byId[nd.parent_id] || {}).parent_id
+             && geo[nd.parent_id]) items.push({ id, lv: 1 });
+  });
+  items.sort((a, b) => geo[a.id].y - geo[b.id].y || geo[a.id].x - geo[b.id].x
+                     || (a.lv - b.lv));
+  if (items.length < 4) { nav.style.display = "none"; return; }
+  nav.style.display = "";
+  items.forEach(({ id, lv }) => {
+    const nd = st.ix.byId[id] || {};
+    const it = el("div", "nav-item" + (lv ? " lv1" : ""), nd.label || id);
+    it.title = nd.label || id;
+    it.addEventListener("click", () => {
+      const tgt = (st.rc || {}).nodeEls && st.rc.nodeEls[id];
+      if (!tgt) return;
+      tgt.scrollIntoView({ behavior: "smooth", block: "center",
+                           inline: "center" });
+      tgt.classList.remove("nav-flash");
+      void tgt.offsetWidth;
+      tgt.classList.add("nav-flash");
+    });
+    body.appendChild(it);
+  });
+}
+
+// —— 悬停溯源：单条边加粗上浮、其余边淡出；离开后恢复聚焦态 ——
+function hoverEdge(st, it, on) {
+  const rc = st.rc;
+  if (!rc) return;
+  if (!on) {
+    rc.edgeEls.forEach(e => {
+      e.path.setAttribute("stroke-width", e.baseW);
+      e.path.style.opacity = "";
+      if (e.txt) e.txt.style.opacity = "";
+      if (e.path.parentNode !== e.home) e.home.appendChild(e.path);
+      if (e.txt && e.txt.parentNode !== e.home) e.home.appendChild(e.txt);
+    });
+    applyFocus(st);
+    return;
+  }
+  rc.edgeEls.forEach(e => {
+    const h = e === it;
+    e.path.style.opacity = h ? "1" : "0.10";
+    if (e.txt) e.txt.style.opacity = h ? "1" : "0.10";
+    if (h) {
+      e.path.setAttribute("stroke-width", String(parseFloat(e.baseW) + 1.4));
+      rc.svgTop.appendChild(e.path);
+      if (e.txt) rc.svgTop.appendChild(e.txt);
+    }
+  });
 }
 
 // —— 聚焦高亮：单击顶层模块后，仅其本身+直接邻居+相连边醒目，其余淡出 ——
-// 通用、数据驱动（基于折叠上卷后的可见邻接）：相连边几何不变（仍是 ELK 路由），
+// 通用、数据驱动（基于折叠上卷后的可见邻接）：相连边几何不变（仍是车道路由），
 // 只上浮到顶层 SVG 并保持满不透明；无关边淡出；相关框及其后代/祖先保持明亮。
 function applyFocus(st) {
   const rc = st.rc;
@@ -711,7 +1344,7 @@ function init() {
     const g = DATA.flows[k];
     const ix = indexGraph(g);
     const st = { key: k, g, ix, collapsed: new Set(), focus: null,
-                 laidOut: false, rc: null, measCache: {}, seq: 0 };
+                 laidOut: false, rc: null, measCache: {} };
     (g.nodes || []).forEach(n => {
       if (n.collapsed && (ix.kids[n.id] || []).length) st.collapsed.add(n.id);
     });
@@ -751,6 +1384,7 @@ function activate(k) {
   renderMeta(k);
   const st = STATE[k];
   if (!st.laidOut) relayout(st);
+  else refreshNav(st);
 }
 function renderMeta(k) {
   const m = (DATA.flows[k] && DATA.flows[k].meta) || {};
@@ -843,7 +1477,13 @@ def render_html(
 </header>
 {_legend_html()}
 <div class="tabs" id="tabs"></div>
+<div class="main">
+<div class="nav" id="nav" style="display:none">
+  <div class="nav-head" onclick="this.parentNode.classList.toggle('closed')">结构导航</div>
+  <div class="nav-body"></div>
+</div>
 <div class="canvas-wrap" id="canvas-wrap"></div>
+</div>
 <div class="drawer" id="drawer">
   <div class="drawer-head">
     <h2 id="drawer-title">Details</h2>
@@ -851,8 +1491,6 @@ def render_html(
   </div>
   <div class="drawer-body" id="drawer-body"></div>
 </div>
-<script>/* ELK.js (Eclipse Layout Kernel, EPL-2.0) — 内联打包，供浏览器内实时布局 */
-{_elk_source()}</script>
 <script>{js}</script>
 </body>
 </html>

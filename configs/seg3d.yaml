@@ -179,7 +179,7 @@ model:
   multirf_axes           : "hw"              # 膨胀作用轴；'hw'=仅 H/W、z 恒 dilation=1（各向异性数据推荐） | 'all'=D/H/W 全膨胀
   multirf_encoder_stages : [0, 0, 1, 1, 1]   # 编码器逐 stage 0/1 开关；长度须 = len(encoder_channels)；空=该侧全关
   multirf_decoder_stages : [0, 0, 0, 0]      # 解码器逐 level 0/1 开关；长度须 = len(encoder_channels)-1；空=全关；仅 decoder_type='unet'
-  multirf_branch_norm_act: true              # 各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除
+  multirf_branch_norm_act: false             # 各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除（本配置 128/3=42 不满足，故关闭）
 
   # ---- 自注意力（仅 backbone='resnet' 且 arch='unet'）：选定 stage 末尾追加自注意力残差块，全局 token 交互 ----
   selfattn_enabled       : false       # 按下方 stages 列表在指定层追加自注意力块
