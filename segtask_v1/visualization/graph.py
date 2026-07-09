@@ -41,10 +41,9 @@ class VisNode:
     * ``detail``    —— 双击详情抽屉里的完整参数（有序 dict）。
     * ``parent_id`` —— 所属容器节点 id（如 stage）；顶层节点为 ``None``。
     * ``collapsed`` —— 容器默认是否折叠（仅对有子节点的容器有意义）。
-    * ``rank``      —— 同一父容器内的纵向层级（0 起）；同 rank 的兄弟节点横向并排（并联分支），
-      不同 rank 自上而下排列。renderer 据此把并联结构排成一行。
-    * ``col`` / ``colspan`` —— 同一父容器内的横向列位（0 起）与跨列宽：renderer 据 ``(rank, col,
-      colspan)`` 把节点摆进 CSS Grid，使各路径独占列、笔直对齐，融合点（cat/+）居中覆盖其上游列。
+    * ``rank``      —— 同一父容器内的纵向层级（0 起），builder 内部量：仅供
+      builder 自身（skip 跨度判定）与测试/调试使用。renderer 自行对可见子图做
+      确定性分层布局（折叠/展开后可见拓扑会变），**不消费此字段**。
     * ``res`` —— 分辨率级（0 起）：输出空间尺寸相对模型输入缩小 2^res 倍。由追踪
       形状计算，renderer 据此把主干按分辨率级右缩进，呈现 encoder↓/decoder↑ 的
       U 型结构；分辨率不变的流程（数据流等）恒为 0，布局自动退化为直列。
@@ -58,8 +57,6 @@ class VisNode:
     parent_id: Optional[str] = None
     collapsed: bool = True
     rank: int = 0
-    col: int = 0
-    colspan: int = 1
     res: int = 0
 
     def to_dict(self) -> Dict[str, object]:
@@ -112,8 +109,6 @@ class VisGraph:
         parent_id: Optional[str] = None,
         collapsed: bool = True,
         rank: int = 0,
-        col: int = 0,
-        colspan: int = 1,
         res: int = 0,
     ) -> VisNode:
         """新增节点并返回（键值统一转字符串，避免 JSON 序列化歧义）。"""
@@ -126,8 +121,6 @@ class VisGraph:
             parent_id=parent_id,
             collapsed=collapsed,
             rank=int(rank),
-            col=int(col),
-            colspan=int(colspan),
             res=int(res),
         )
         self.nodes.append(node)
@@ -150,84 +143,6 @@ class VisGraph:
             "nodes": [n.to_dict() for n in self.nodes],
             "edges": [e.to_dict() for e in self.edges],
         }
-
-
-def assign_grid_layout(g: "VisGraph", *, assign_ranks: bool = False) -> None:
-    """为图中每个父容器内的兄弟节点计算 ``(rank, col, colspan)``，供 renderer 摆进
-    CSS Grid。纯靠图结构（forward 边血缘），与具体网络/流程无关，可被任一 builder 复用。
-
-    * ``assign_ranks=True``：先按 forward 边做**最长路径分层**写入 ``rank``（线性流程
-      因此自上而下逐级排开，不再因缺省 rank 全堆在同一格）；``residual`` 边不计入层级。
-      模型流自带更复杂的 rank/skip 计算，故以 ``False`` 调用、只补列位。
-    * 列位：逐 rank 自上而下，按已定稿的 forward 父定列——无父则占新列；有父则
-      ``col=min(父.col)``、``colspan`` 覆盖父列区间（单父继承使主链笔直，多父跨列居中）；
-      同 rank 内按 ``(col, 插入序)`` 从左到右去重叠（右移）。
-    """
-    by_parent: Dict[Optional[str], List[VisNode]] = {}
-    for n in g.nodes:
-        by_parent.setdefault(n.parent_id, []).append(n)
-
-    if assign_ranks:
-        node_rank: Dict[str, int] = {}
-        for kids in by_parent.values():
-            ids = [n.id for n in kids]
-            idset = set(ids)
-            succ: Dict[str, List[str]] = {i: [] for i in ids}
-            indeg: Dict[str, int] = {i: 0 for i in ids}
-            for e in g.edges:
-                if e.kind == "residual":
-                    continue
-                if e.src in idset and e.dst in idset:
-                    succ[e.src].append(e.dst)
-                    indeg[e.dst] += 1
-            rank = {i: 0 for i in ids}
-            queue = [i for i in ids if indeg[i] == 0]
-            while queue:
-                cur = queue.pop()
-                for nx in succ[cur]:
-                    if rank[cur] + 1 > rank[nx]:
-                        rank[nx] = rank[cur] + 1
-                    indeg[nx] -= 1
-                    if indeg[nx] == 0:
-                        queue.append(nx)
-            node_rank.update(rank)
-        for n in g.nodes:
-            n.rank = node_rank.get(n.id, 0)
-
-    fwd_parents: Dict[str, List[str]] = {}
-    for e in g.edges:
-        if e.kind == "forward":
-            fwd_parents.setdefault(e.dst, []).append(e.src)
-
-    for kids in by_parent.values():
-        idset = {n.id for n in kids}
-        order_idx = {n.id: i for i, n in enumerate(kids)}
-        by_rank: Dict[int, List[str]] = {}
-        for n in kids:
-            by_rank.setdefault(n.rank, []).append(n.id)
-        col: Dict[str, int] = {}
-        span: Dict[str, int] = {}
-        for r in sorted(by_rank):
-            row = by_rank[r]
-            for nid in row:
-                ps = [p for p in fwd_parents.get(nid, ())
-                      if p in idset and p in col and p != nid]
-                if not ps:
-                    col[nid] = 0
-                    span[nid] = 1
-                else:
-                    lo = min(col[p] for p in ps)
-                    hi = max(col[p] + span[p] for p in ps)
-                    col[nid] = lo
-                    span[nid] = hi - lo
-            cursor: Optional[int] = None
-            for nid in sorted(row, key=lambda x: (col[x], order_idx[x])):
-                if cursor is not None and col[nid] < cursor:
-                    col[nid] = cursor
-                cursor = col[nid] + span[nid]
-        for n in kids:
-            n.col = col[n.id]
-            n.colspan = span[n.id]
 
 
 def shape_str(shape) -> str:
@@ -257,4 +172,4 @@ def _fmt_value(v: object) -> str:
 
 
 __all__ = ["VisNode", "VisEdge", "VisGraph", "NODE_KINDS", "EDGE_KINDS",
-           "shape_str", "assign_grid_layout"]
+           "shape_str"]

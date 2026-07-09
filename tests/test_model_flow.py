@@ -312,37 +312,98 @@ def test_no_disconnected_subtrees(cfg_name):
 
 
 # ---------------------------------------------------------------------------
-# 同 rank 列区间互不重叠（网格布局不变量，任意配置通用）。
+# 追踪零副作用：build_model_flow 不得改动真实模型的参数/缓冲区，也不得推进
+# 全局 RNG（train 模式前向的 BN 统计更新 / EDM2 weight-norm / dropout 均须被
+# deepcopy + fork_rng 隔离）。
 # ---------------------------------------------------------------------------
-def test_grid_no_column_overlap():
+def test_trace_has_no_side_effects_on_model_and_rng():
+    cfg = _load("seg2_5d.yaml")
+    model = build_model(cfg)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    torch.manual_seed(1234)
+    rng_before = torch.random.get_rng_state()
+
+    build_model_flow(cfg, model, trace_shapes=True)
+
+    after = model.state_dict()
+    dirty = [k for k in before
+             if not torch.equal(before[k], after[k])]
+    assert not dirty, f"追踪污染了真实模型状态: {dirty[:5]}"
+    assert torch.equal(rng_before, torch.random.get_rng_state()), \
+        "追踪不应消耗全局随机数（破坏训练可复现性）"
+    assert model.training == build_model(cfg).training, \
+        "追踪不应改变模型 train/eval 标志"
+
+
+# ---------------------------------------------------------------------------
+# 门控乘法（AttentionGate 的 x·ψ）不是残差：× 融合点保留，但不得标 residual；
+# residual 边标签应取真实融合符号而非硬编码 "+"。
+# ---------------------------------------------------------------------------
+def test_attention_gate_mul_not_residual():
+    g = _build("seg2_5d.yaml", skip_attention=True)
+    by_id = _by_id(g)
+    muls = [n for n in g.nodes if n.kind == "merge" and n.label == "×"]
+    assert muls, "skip_attention=True 应产生 × 门控融合点"
+    for m in muls:
+        bad = [e for e in g.edges if e.dst == m.id and e.kind == "residual"]
+        assert not bad, f"门控乘法 {m.id} 的入边不应标 residual: {bad}"
+    # 真残差（ResNetBlock 的 +）仍应存在，且标签与融合符号一致。
+    resid = [e for e in g.edges if e.kind == "residual"]
+    assert resid, "去掉 × 后真实加性残差仍应识别"
+    for e in resid:
+        if e.dst in by_id and by_id[e.dst].kind == "merge":
+            assert e.label == by_id[e.dst].label, \
+                f"residual 边标签应取融合点符号: {e.src}→{e.dst}"
+
+
+# ---------------------------------------------------------------------------
+# 输出头结构化判定：head 容器 = 产出模型输出的顶层容器（不依赖 "head" 命名）。
+# ---------------------------------------------------------------------------
+def test_head_kind_is_structural():
     g = _build("seg2_5d.yaml")
-    by_parent = {}
-    for n in g.nodes:
-        by_parent.setdefault(n.parent_id, []).append(n)
-    for kids in by_parent.values():
-        by_rank = {}
-        for n in kids:
-            by_rank.setdefault(n.rank, []).append(n)
-        for nodes in by_rank.values():
-            iv = sorted((n.col, n.col + n.colspan, n.id) for n in nodes)
-            for a, b in zip(iv, iv[1:]):
-                assert a[1] <= b[0], f"同 rank 列重叠: {a[2]} 与 {b[2]}"
+    heads = [n for n in g.nodes if n.kind == "head"]
+    assert heads, "seg2_5d 应有输出头容器"
+    head_ids = {n.id for n in heads}
+    # 每个 head 容器都应有指向 loss 的边（产出模型输出的结构性证据）。
+    loss_srcs = {e.src for e in g.edges if e.dst == "loss"}
+    assert head_ids <= loss_srcs, \
+        f"head 容器应直接产出模型输出并连 loss: {head_ids - loss_srcs}"
+    # 非输出容器（encoder 等）不得被标为 head。
+    assert all(n.parent_id is None for n in heads)
+    assert "encoder" not in head_ids
 
 
 # ---------------------------------------------------------------------------
-# 数据流 / 预测流：线性链各节点应分到唯一 (rank, col)，不再全堆同一格。
+# IR 去几何化：VisNode 不再携带 col/colspan（坐标由 renderer 对可见子图自算）。
+# ---------------------------------------------------------------------------
+def test_ir_carries_no_grid_geometry():
+    g = _build("seg2_5d.yaml")
+    for n in g.nodes:
+        d = n.to_dict()
+        assert "col" not in d and "colspan" not in d, \
+            "IR 不应携带网格几何字段（双真相源）"
+
+
+# ---------------------------------------------------------------------------
+# 数据流 / 预测流：应为单条连通链（无岐路、无孤立节点），具体坐标由 renderer 自算。
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("cfg_name", ["seg2_5d.yaml", "lungves_multirf.yaml",
                                       "seg3d.yaml"])
-def test_linear_flows_no_stacking(cfg_name):
+def test_linear_flows_single_chain(cfg_name):
     cfg = _load(cfg_name)
     for builder in (build_data_flow, build_predict_flow):
         g = builder(cfg)
-        cells = [(n.rank, n.col) for n in g.nodes]
-        assert len(cells) == len(set(cells)), \
-            f"{cfg_name} {builder.__name__}: 节点堆在同一 (rank,col) 格"
-        assert max(r for r, _ in cells) == len(g.nodes) - 1, \
-            f"{cfg_name} {builder.__name__}: 应自上而下逐级排开"
+        ids = [n.id for n in g.nodes]
+        assert len(g.edges) == len(ids) - 1, \
+            f"{cfg_name} {builder.__name__}: 线性流应有 n-1 条边"
+        outs = {e.src for e in g.edges}
+        ins = {e.dst for e in g.edges}
+        assert len(outs) == len(g.edges) and len(ins) == len(g.edges), \
+            f"{cfg_name} {builder.__name__}: 线性流不应有岐路/汇流"
+        heads = [i for i in ids if i not in ins]
+        tails = [i for i in ids if i not in outs]
+        assert len(heads) == 1 and len(tails) == 1, \
+            f"{cfg_name} {builder.__name__}: 应有唯一起点与终点（无孤立节点）"
 
 
 @pytest.mark.parametrize(

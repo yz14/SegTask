@@ -981,3 +981,119 @@ _prune_to_dataflow 只保留输入→输出通路，剔除 buffer 旁支；
 分辨率级背景色带：res 缩进已呈 U 型，可加浅色纵向色带 + 1×/2×/4× 标尺，把"缩进=下采样级"从隐式变显式（对应 nnU-Net 论文图的分辨率行）。
 展开/折叠全部按钮 + 状态持久化（URL hash）：多次核对同一处结构时省去重复点击。
 rank 分配备选：目前是最长路径分层；Graphviz 的 network-simplex 分层更紧凑。当前 ASAP 语义（"就绪即排"= 位置即计算次序）其实更贴合你的原则，不建议换，仅作为已调研的备选记录。
+
+
+# TODO 4（模型流可视化）调研分析报告
+
+> 本轮为调研规划轮，只输出结论与计划，未改任何代码。所有结论均经代码逐行核验，附文件:行号证据。
+> 涉及文件：`segtask_v1/visualization/{model_flow.py, graph.py, render.py, __init__.py}`、`segtask_v1/train.py`、`tests/test_model_flow.py`、`segtask_v1/models/{edm2_unet.py, blocks.py}`。
+
+---
+
+## 一、TODO.md「审查」结论逐条核验
+
+### 1. P1 —— `_tl_trace` 前向污染真实训练模型状态：**成立，且比审查描述更具体**
+
+证据链：
+- `train.py:95-101`：`model = build_model(cfg)` 后直接把**同一个将被训练的 model** 传给 `generate_visualization(cfg, model)`，无 deepcopy。
+- `model_flow.py:169-173`：`_tl_trace` 先 `model.train(True)` 再前向。`torch.no_grad()` 只阻断 autograd，**不阻断**：
+  1. **BN running stats**：train 模式下所有 BatchNorm 的 `running_mean/var` 被全零 dummy 输入更新一次（`momentum=0.1` 默认下即被拉向 0 的统计），`num_batches_tracked` +1。虽然一次前向影响有限，但这是对"尚未开始训练"的模型的确定性污染。
+  2. **EDM2 `_MPConv` 强制 weight-norm**：`edm2_unet.py:78-80`，train 模式前向会 `self.weight.copy_(_normalize(w))` **就地改写参数**。对 EDM2 这是设计上幂等的（后续训练本来也会做），但发生时点提前到了训练前，且是被"可视化"这一只读功能触发——违反"生成过程……不读盘、不依赖 GPU"的只读承诺（`__init__.py:5`）。
+- `model_flow.py:181` 只恢复了 `training` 标志，**未恢复 buffers/参数**。
+
+结论：审查判定正确。任何"有训练期副作用的 forward"（BN、EDM2 norm、dropout 的 RNG 消耗——后者还会**改变全局随机数序列**，影响可复现性）都会泄漏到真实训练。修复方向：对 `copy.deepcopy(model)`（CPU 上代价可接受）做追踪，或退而求其次备份/恢复全部 `named_buffers` + 受影响参数（deepcopy 更通用、无特判，推荐）。
+
+### 2. P2 —— 乘法门控被误判为 residual：**成立，且边标签还有伴生 bug**
+
+证据链：
+- `model_flow.py:110`：`_ADDITIVE_SYMBOLS = {"+", "−", "×", "lerp"}`，`×` 被纳入"加性"融合参与残差判定。
+- `blocks.py:1002-1035` `AttentionGate3D.forward`：`return x * self.psi(self.relu(self.W_x(x) + self.W_g(g)))`。`x` 同时是乘法的一路输入、又经 `W_x` 可达 `psi` 一路 ⇒ 触发规则 1（`model_flow.py:365-370` "a 可达 b ⇒ a 是恒等捷径"），`x → ×` 被标 residual。
+- 伴生 bug：`model_flow.py:696` 对所有 residual 边硬编码标签 `"+"`——门控乘法的捷径边会被画成橙色虚线并标注 `+`，**语义双重错误**（既不是残差、更不是加法）。
+- 语义上：residual 的判定依据（"可达另一路"或"显著更短"）只对**加法**成立——`y = f(x) + x` 中 x 是恒等捷径；`y = x·g(x)` 中 x 是被门控的主信号，g 才是调制路。SE block、attention gate、GLU 均属此类。
+
+结论：审查判定正确。修复方向：把 `×`（及 `lerp`？lerp(a,b,w) 语义近似加权和，可保留）移出 `_ADDITIVE_SYMBOLS`，为乘法门控引入独立 `gate` 边类/或保持普通 forward + merge 符号 `×`；同时把 `:696` 的标签改为随 merge 符号而非硬编码 `+`。
+
+### 3. P2 —— rank/col 双真相源：**成立（builder 计算的 rank/col/colspan 仅测试消费，渲染器完全无视）**
+
+证据链：
+- builder 侧：`model_flow.py:720-721` 调 `_assign_ranks_and_skip(g)`（Kahn 最长路径，`:760-895`）+ `assign_grid_layout(g)`（`graph.py:155-231` 列分配），把 rank/col/colspan 写进 VisNode，且 `graph.py:44-50` 的文档声称"renderer 据此把节点摆进 CSS Grid"。
+- renderer 侧：全 `render.py` 只读了 `node.res`（`:592`），**从未读取** `rank/col/colspan`；JS 在 `layerRanks`（`:452-494`）里用几乎相同的 Kahn 最长路径**重算**分层，列位则由脊柱 + barycenter（`:637-696`）另行决定。
+- 后果：① `graph.py` 文档撒谎（维护误导）；② 两套算法的断环/并列细节可能分歧，builder 侧的 skip 标注（依据投影 rank 跨度，`:889-895`）与 renderer 实际布局可能不一致；③ builder 的 `assign_grid_layout` 及其复杂度纯属死重（唯一消费者是 `test_model_flow.py:315-344` 两个测试）。
+
+结论：审查判定正确。修复方向二选一：(a) 删除 builder 侧 rank/col 计算，skip 判定改用纯结构规则（`_has_alt_path` 已不依赖 rank，只有 `跨度>1` 一条依赖），测试改测 IR 结构不测格位；(b) renderer 改为消费 IR 的 rank。推荐 (a)——renderer 的布局远比网格模型精细（换行/挂靠/车道），回不去 CSS Grid 语义；单真相源应设在真正做布局的一侧，IR 只承载**结构**（DAG、层级、res），不承载**几何**。注意 `n.rank` 仍被 `_assign_ranks_and_skip` 内部（skip 跨度判定、head/loss 拍平）使用，需一并梳理保留最小集。
+
+### 4. P2/P3 次要项：**全部成立**
+
+| 项 | 核验 | 备注 |
+|---|---|---|
+| CPU dummy 全尺寸前向代价 | 成立。`model_flow.py:558` 只把 batch 固定为 1，空间尺寸取全量 patch（3D 大 patch 上 CPU 前向可达分钟级）。对照 `test_model_flow.py:36-42` 测试自己都把 3D patch 缩到 1/8 | 可选 P3：`trace_shapes` 之外提供缩尺追踪（注意 res 缩进以输入 W 为基准，等比缩小不影响 `_res_level`；但对含绝对位置编码/固定尺寸假设的模型需回退全尺寸） |
+| `cat(x,x)` 去重 | 成立。`contract()` 中 `up` 是 set（`:279-281`），同源两路收缩为 1 ⇒ `len(up)>=2` 不满足（`:299`），merge 节点消失、退化为透传；即便成 merge，`_add_cedge` 去重（`:310-313`）也只画一条边，通道翻倍不可见 | 影响小（cat(x,x) 少见），P3 |
+| `_res_level` 只看末维 W | 成立（`:593-602`）。各向异性下采样（如 3D 里 D 减半 W 不变）缩进不动；W 上采样超过输入（超分/padding）回退 0 | P3。可改为对全部空间维取平均 log2 |
+| functional op 不可见 | 成立。单上游 functional op 一律透传（`:307-308`）——模块外的 `F.interpolate`/`sigmoid`/切片等在图上蒸发，只有 ≥2 上游的融合才材料化 | 这是有意的抽象取舍（叶子=nn.Module）；但 `interpolate` 这类**改变形状**的 op 消失会让相邻节点 in/out 形状"对不上"，可考虑 P3：形状变化的单上游 op 也材料化为小 op 节点 |
+
+---
+
+## 二、对照五条原则的独立分析
+
+### 原则 1：层次化 —— 达成度高
+- 容器树来自真实 module 层级 + 单子容器上卷（`model_flow.py:389-428`），折叠默认收起（`:648`）。
+- 聚焦限定 stem/stage 级：`render.py:340-344` `canFocus` = 顶层 + 顶层直接子模块，符合"聚焦不深入子模块"的要求；更深层双击看详情抽屉（`:1307`）。
+- 锚点导航（`:1168-1206`）与聚焦层级一致，纯数据驱动。
+- **弱点**：`_is_head_container`（`model_flow.py:605-607`）用**名字包含 "head"** 判定输出头——这是全链路里唯一一处命名特判，违反原则 5（见下）。
+
+### 原则 2：结构化 —— 达成度高
+- builder（语义/结构）与 renderer（几何）分层清晰，IR 语言无关。
+- 但 **rank/col 双真相源**（上文 §3）正是结构化的裂缝：IR 里混入了没人消费的几何字段，且文档与实现背离。
+
+### 原则 3：位置即计算次序 —— 基本达成
+- 纵向：ASAP 最长路径分层，同层并列（`render.py:452-494`）；容器/叶子发射序按首次执行 step（`model_flow.py:626-630, 652`）。
+- 横向：脊柱按 res 缩进呈 U 型（`:670`），旁支 barycenter 就近（`:645-649`），挂靠节点对齐"源的下一计算行"（`:606-635`）——注释明确以"位置即计算次序"为设计目标。
+- **风险点**：ASAP 分层会把浅层旁支（如 deep-supervision 头）提到其最早可行层而非实际执行层；与"次序"有细微偏差，但对可读性通常是改善，不算违反。
+
+### 原则 4：走线可溯源、不交叉 —— 机制完备，正确性靠近似
+- 车道左 skip/右 residual（`:735-744`）、区间打包（`:536-549`）、折弯边成簇拓扑排序分配中线 y（`:944-975`）、扇入扇出按对侧 x 排序（`:826-840`）、穿框绕行兜底（`:977-1008`）、hover 单边溯源 + tooltip（`:1143-1158`）。设计密度很高。
+- **residual 误判会直接放大到走线层**：门控乘法边被丢进右车道 + 橙色 + `+` 标签（§2），是"可溯源"原则下最扎眼的语义错误。
+- 折弯 y 分配的约束成环兜底"保序"（`:965-966`）意味着极端扇形下仍可能交叉，属已知近似，可接受。
+
+### 原则 5：通用无特判 —— 仅一处违背
+- 残差/skip/分层/车道全部基于 DAG 结构与形状，无架构名特判，符合要求。
+- **唯一命名特判**：`_is_head_container` 的 `"head" in name`（`model_flow.py:605`，用于框着色 + head 拍平同行 `:846-850` + 顶层→loss 连边标签 `:716`）。改名为 `decoder_out` 的头会失去待遇；反之叫 `overhead` 的容器会被误判。结构化替代：`kind=="head"` 可由「顶层容器且其输出是 `is_output` op 的 rep」推出（`:707-714` 已经在算 out_tops），不需要看名字。建议纳入本次修复（P2 末尾顺手项）。
+
+### 额外发现（审查未列）
+1. **residual 边标签硬编码 `"+"`**（`model_flow.py:696`）——即使修好 ×，`lerp` 残差也会标 `+`。应传 merge 符号。
+2. **`_tl_trace` 消耗全局 RNG**：dropout 等在 train 模式前向会推进默认 RNG，`generate_visualization` 在 `seed_everything` 之后、训练之前被调用的话会改变训练随机序列（需确认 seed 时点；与 P1 同根，deepcopy + fork_rng 一并解决）。
+3. **规则 2 深度阈值（≤1/2 且更短）是启发式**：投影捷径 `conv1x1` 深度 1 vs 主路深度 2 时 `1*2<=2` 成立可标注，但主路仅 2 层的浅 block 里 1 vs 2 也会误标。当前无反例架构，保持观察即可（P3，不建议现在动）。
+
+---
+
+## 三、优先级建议与分步计划（每步可独立执行）
+
+### Step 1（P1）：追踪隔离——消除对训练模型的状态污染
+- **做法**：`_tl_trace` 内对 `copy.deepcopy(model)` 追踪（模型此时在 CPU，deepcopy 代价 = 一份参数内存）；用 `torch.random.fork_rng()` 包裹前向隔离 RNG。deepcopy 失败（不可深拷模块）时告警回退现行为。
+- **产出**：`model_flow.py` 改动 ~10 行；新增回归测试：追踪前后 `named_buffers`/`parameters`/RNG state 逐一 allclose。
+- **验收**：现有 `test_model_flow.py` 全绿 + 新测试通过。
+- **依赖**：无。
+
+### Step 2（P2）：融合语义修正——× 不是残差
+- **做法**：`_ADDITIVE_SYMBOLS` 移除 `×`；residual 边标签改用对应 merge 符号（`:696`）；merge 节点符号本身已正确显示 `×`，门控退化为普通 forward + × 融合点。
+- **产出**：`model_flow.py` 2 处小改；新增测试：含 AttentionGate 的配置下无 `x→×` residual 边、图例语义正确。
+- **验收**：`test_edm2_residuals...`、`test_resnet_block_residual` 等既有残差测试不回归。
+- **依赖**：无（与 Step 1 正交）。
+
+### Step 3（P2）：单真相源——IR 去几何化
+- **做法**：删 `assign_grid_layout` 调用与 VisNode 的 col/colspan（rank 保留为 `_assign_ranks_and_skip` 的内部量或降为 debug 字段）；修正 `graph.py:44-50` 文档；`test_grid_no_column_overlap`/`test_linear_flows_no_stacking` 改为断言结构不变量（连通性、skip 数、rank 单调）或随字段删除。
+- **产出**：`graph.py`/`model_flow.py`/测试联动改动。
+- **验收**：渲染输出 HTML 与改动前逐字节一致（renderer 本就不读这些字段，可做黄金对比）。
+- **依赖**：无，但建议排在 1、2 之后（改动面稍大）。
+
+### Step 4（P2 顺手项）：head 判定去命名特判
+- **做法**：用「顶层容器的 rep 集与 out_tops 相交」判 head，替换 `_is_head_container` 的名字匹配（结构降级路径 `_emit_structural` 无 trace 信息，可保留名字启发式并注释说明）。
+- **验收**：现有 head 相关渲染（着色、同行拍平、loss 边标签）在标准配置下不变。
+- **依赖**：无。
+
+### Step 5（P3，可选，建议缓做）：次要项
+- 缩尺追踪降 CPU 成本（默认关、配置开）；`_res_level` 改多维平均；形状变化的单上游 functional op 材料化；`cat(x,x)` 重复度标注。每项独立小 PR，均需先确认有真实场景收益再动，避免范围膨胀。
+
+---
+
+**总结**：审查 5 项结论全部核验成立；独立分析补充 3 个新发现（residual 标签硬编码、RNG 泄漏、head 命名特判——最后一项是五原则中"通用无特判"的唯一违背点）。建议按 Step 1→2→(3,4)→5 顺序执行，1/2/4 改动小风险低，3 有测试联动，5 全部缓做。等你确认后再动手。

@@ -243,11 +243,15 @@ svg.edges-top { z-index: 30; }
 #
 # 版面规则（只依赖图结构与追踪形状，无任何架构名/模块名特判）：
 # 1. 每个容器内对兄弟做最长路径分层（rank）；主干脊柱 = 入口→主输出的最长
-#    路径，脊柱节点中轴对齐，并按分辨率级（node.res，来自追踪形状）右缩进，
-#    encoder↓/decoder↑ 自然呈 U 型；分辨率不变的流程退化为笔直单列；
-# 2. 非脊柱兄弟（并联分支/输出头）排在脊柱右侧，同 rank 超宽自动换行；
+#    路径。横坐标语义全层级统一：**单一主轴** —— 每个容器的脊柱节点严格共
+#    一条竖线，展开容器用其内部主轴锚点对位到父级同一竖线，任意嵌套深度下
+#    主线均为笔直单列（分辨率信息由卡片形状承载，不参与横坐标）；
+# 2. 非脊柱兄弟（并联分支/输出头）排在脊柱右侧，同 rank 超宽自动换行（续排行
+#    与首行左缘对齐）；无脊柱行首节点锚到主轴，barycenter 只决定行内排序；
+#    同容器同类叶卡宽度取最大统一，消除中心对齐锯齿感；
 # 3. 跳连/反馈边走最近公共容器的左侧车道、残差走右侧车道（短跨度贴内侧的
-#    区间打包分道）；前向邻级边垂直直连。折叠/展开 = 按可见锚点重算，幂等。
+#    区间打包分道，引出/引入段按道序错开）；反馈（上行）边用独立线型区分方向
+#    语义；前向邻级边垂直直连。折叠/展开 = 按可见锚点重算，幂等。
 # ---------------------------------------------------------------------------
 _JS = r"""
 const DATA = __DATA__;
@@ -257,6 +261,8 @@ const EDGE_STYLE = {
   forward:  { color: "#94a3b8", width: "1.6", dash: null,  marker: "arrow" },
   skip:     { color: "#2563eb", width: "1.8", dash: null,  marker: "arrow-skip" },
   residual: { color: "#d97706", width: "1.8", dash: "3 3", marker: "arrow-res" },
+  // 反馈/上行边（rank 不前进的 forward）：独立线型区分方向语义。
+  feedback: { color: "#7c3aed", width: "1.8", dash: "7 4", marker: "arrow-fb" },
 };
 // 布局常量：行间距/列间距/车道宽/分辨率缩进/单行最大内容宽/容器内边距。
 const LC = { GAPY: 40, GAPX: 26, LANE_W: 11, LANE_PAD: 8, INDENT: 26,
@@ -579,20 +585,31 @@ function computeLayout(st, veds) {
     const expanded = kidNodes.length && (id == null || !st.collapsed.has(id));
     if (!expanded) {
       const m = measure(nd, kidNodes.length ? "head" : "leaf", st);
-      return { w: m.w, h: m.h };
+      return { w: m.w, h: m.h, ax: m.w / 2 };
     }
     const ids = kidNodes.map(n => n.id);
     const size = {};
     ids.forEach(k => { size[k] = layoutBox(k); });
+    // 同容器同类叶卡宽度取最大统一（仅叶卡；容器框保持自适应），
+    // 主轴对齐之外左右边缘也对齐，消除中心对齐的锯齿感。
+    const kindMaxW = {};
+    kidNodes.forEach(n => {
+      if ((st.ix.kids[n.id] || []).length) return;
+      kindMaxW[n.kind] = Math.max(kindMaxW[n.kind] || 0, size[n.id].w);
+    });
+    kidNodes.forEach(n => {
+      if ((st.ix.kids[n.id] || []).length) return;
+      const w = kindMaxW[n.kind];
+      if (w > size[n.id].w) { size[n.id].w = w; size[n.id].ax = w / 2; }
+    });
     const key = id == null ? "$root" : id;
     const edges = sib[key] || [];
     const rank = layerRanks(ids, edges);
     const spine = pickSpine(st, ids, edges, rank);
-    const res = {};
-    ids.forEach(i => { res[i] = (st.ix.byId[i] || {}).res || 0; });
-    let resMin = Infinity;
-    spine.forEach(i => { if (res[i] < resMin) resMin = res[i]; });
-    if (!isFinite(resMin)) resMin = 0;
+    // 单一主轴：所有脊柱节点的主轴目标 x = 0（容器内统一竖线）；置盒时用
+    // 子盒自报的主轴锚点 ax 对位，嵌套层级间主线共轴、笔直单列。
+    const laneX = () => 0;
+    const leftOf = (i) => laneX(i) - size[i].ax;   // 锚到主轴的左缘 x
 
     // 分支 barycenter 定位用的前驱表（仅下行边）。
     const preds = {};
@@ -638,10 +655,13 @@ function computeLayout(st, veds) {
     ids.forEach((i, k) => { declOrder[i] = k; });
     const cx = {}, top = {}, rankLineCnt = {};
     let y = 0;
+    let entryAxis = null;   // 本容器主轴锚点（脊柱入口节点的泳道 x）
     const ranksSorted = [...new Set(ids.map(i => rank[i]))].sort((a, b) => a - b);
     ranksSorted.forEach(r => {
       const row = ids.filter(i => rank[i] === r);
       const sp = row.filter(i => spine.has(i));
+      // barycenter 只决定行内左右排序，不再参与坐标定位（避免均值把上游
+      // 偏移逐 rank 累积放大）。
       const rest = row.filter(i => !spine.has(i) && !attach[i]).sort((a, b) => {
         const bc = (n) => preds[n].length
           ? preds[n].reduce((s, p) => s + (cx[p] || 0), 0) / preds[n].length
@@ -662,14 +682,20 @@ function computeLayout(st, veds) {
       });
       if (line.length) lines.push(line);
       rankLineCnt[r] = lines.length;
+      let restStart = null;   // 首行侧列起点；续排行与之左缘对齐
       lines.forEach((ln, li) => {
         const lh = Math.max.apply(null, ln.map(i => size[i].h));
         ln.forEach(i => { lineIdx[i] = li; });
+        let x;
         if (li === 0 && sp.length) {
+          // 脊柱节点：锚到容器主轴；侧列从其右缘起排。
           const s0 = sp[0];
-          cx[s0] = (res[s0] - resMin) * LC.INDENT;   // 分辨率缩进（中轴系）
+          const lx = leftOf(s0);
+          cx[s0] = lx + size[s0].w / 2;
           top[s0] = y + (lh - size[s0].h) / 2;
-          let x = cx[s0] + size[s0].w / 2 + LC.GAPX;
+          if (entryAxis === null) entryAxis = laneX(s0);
+          x = lx + size[s0].w + LC.GAPX;
+          restStart = x;
           ln.forEach(i => {
             if (i === s0) return;
             cx[i] = x + size[i].w / 2;
@@ -677,14 +703,9 @@ function computeLayout(st, veds) {
             x += size[i].w + LC.GAPX;
           });
         } else {
-          // 无脊柱行（并联分支/换行续排）：按前驱 barycenter 居中。
-          const totW = ln.reduce((s, i) => s + size[i].w, 0)
-            + LC.GAPX * (ln.length - 1);
-          let bx = 0, bn = 0;
-          ln.forEach(i => preds[i].forEach(p => {
-            if (cx[p] != null) { bx += cx[p]; bn++; }
-          }));
-          let x = (bn ? bx / bn : 0) - totW / 2;
+          // 无脊柱行：首节点锚到容器主轴（与全层级同一坐标语义）；
+          // 换行续排行与首行侧列左缘对齐。
+          x = (li > 0 && restStart != null) ? restStart : leftOf(ln[0]);
           ln.forEach(i => {
             cx[i] = x + size[i].w / 2;
             top[i] = y + (lh - size[i].h) / 2;
@@ -735,6 +756,9 @@ function computeLayout(st, veds) {
     // 3) 本容器侧缘车道：skip/反馈走左，residual 走右（用兄弟盒纵区间打包）。
     const leftIv = [], rightIv = [];
     edges.forEach(e => {
+      // 反馈（上行）边打标：绘制时用独立线型区分方向语义。
+      if (e.kind !== "residual" && (rank[e.t] || 0) <= (rank[e.s] || 0))
+        veds[e.i].fb = true;
       if (!needSide(e, rank, rankLineCnt) && !directBlocked(e)) return;
       const y0 = Math.min(top[e.s] + size[e.s].h / 2, top[e.t] + size[e.t].h / 2);
       const y1 = Math.max(top[e.s] + size[e.s].h / 2, top[e.t] + size[e.t].h / 2);
@@ -765,7 +789,10 @@ function computeLayout(st, veds) {
     const h = padTop + contentH + pad;
     cinfo[key] = { laneAsg, laneL: L.count, laneR: R.count,
                    pad, gutL, gutR, w, h, ids: ids.slice(), kidRank: rank };
-    return { w, h };
+    // 主轴锚点：内部主轴 x（含平移），供父级对位到同一竖线，
+    // 保证嵌套层级间主线连续笔直；无脊柱时退化为几何中轴。
+    const ax = entryAxis != null ? entryAxis + dx : w / 2;
+    return { w, h, ax };
   }
 
   function needSide(e, rank, rankLineCnt) {
@@ -897,8 +924,11 @@ function computeLayout(st, veds) {
       const kOut = e.vs + "|" + dir, kIn = e.vt + "|" + dir;
       outSeen[kOut] = (outSeen[kOut] || 0) + 1;
       inSeen[kIn] = (inSeen[kIn] || 0) + 1;
-      // 附加 lane 序微偏移：不同车道的边引出/引入水平段不共线，便于溯源。
-      const lOff = ((lane % 3) - 1) * 5;
+      // 附加 lane 序微偏移：按道序完全错开（限幅 ±12px），不同车道的边
+      // 引出/引入水平段互不共线，便于溯源。
+      const cnt = right ? ci.laneR : ci.laneL;
+      const lOff = cnt > 1
+        ? (lane / (cnt - 1) - 0.5) * Math.min(24, 4 * (cnt - 1)) : 0;
       const ay = A.y + A.h / 2 + lOff
         + stagger(outSeen[kOut] - 1, outCnt[kOut], A.h - 12);
       const by = B.y + B.h / 2 + lOff
@@ -1037,6 +1067,7 @@ function svgDefs() {
     marker("arrow", EDGE_STYLE.forward.color) +
     marker("arrow-skip", EDGE_STYLE.skip.color) +
     marker("arrow-res", EDGE_STYLE.residual.color) +
+    marker("arrow-fb", EDGE_STYLE.feedback.color) +
     '</defs>';
 }
 
@@ -1118,7 +1149,8 @@ function paint(st, lay) {
   // 连线：结构化布局已给出每条边的正交折点（画布坐标系）。
   const edgeEls = [];
   lay.routes.forEach(({ meta, pts }) => {
-    const style = EDGE_STYLE[meta.kind] || EDGE_STYLE.forward;
+    const style = meta.fb ? EDGE_STYLE.feedback
+                          : (EDGE_STYLE[meta.kind] || EDGE_STYLE.forward);
     const path = svgNS("path");
     path.setAttribute("d", ortho(pts, 7));
     path.setAttribute("fill", "none");
@@ -1137,6 +1169,10 @@ function paint(st, lay) {
       txt.setAttribute("fill", style.color);
       txt.setAttribute("font-size", "10.5");
       txt.setAttribute("font-weight", meta.kind !== "forward" ? "700" : "400");
+      // 白底 halo：标签压在其它连线上时仍可读。
+      txt.setAttribute("stroke", "#ffffff");
+      txt.setAttribute("stroke-width", "3");
+      txt.setAttribute("paint-order", "stroke");
       txt.textContent = meta.label;
       home.appendChild(txt);
     }
@@ -1426,6 +1462,7 @@ def _legend_html() -> str:
         ("#94a3b8", "solid", "前向 forward"),
         ("#2563eb", "solid", "跳连 skip"),
         ("#d97706", "dashed", "残差 residual"),
+        ("#7c3aed", "dashed", "反馈 feedback"),
     ]
     spans.append('<span style="width:1px;height:14px;background:var(--line)">'
                  '</span>')

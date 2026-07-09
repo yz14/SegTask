@@ -28,7 +28,7 @@ import torch.nn as nn
 from ..config import Config
 from ..models.topology import ModelTopology, build_topology
 from .data_flow import _model_input_shape
-from .graph import VisGraph, assign_grid_layout, shape_str
+from .graph import VisGraph, shape_str
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,10 @@ _MERGE_OP_SYMBOLS: Dict[str, str] = {
     # lerp(a, b, w) = a + w·(b−a)：幅度保持网络（如 EDM2）用作加性融合。
     "lerp": "lerp", "lerp_": "lerp",
 }
-_ADDITIVE_SYMBOLS = {"+", "−", "×", "lerp"}
+# 参与残差捷径判定的加性融合符号。乘法（×）是门控/调制（attention gate、SE、
+# GLU 等：`y = x·g(x)` 中 x 是被门控的主信号而非恒等捷径），不属残差语义，
+# 保持普通 forward + × 融合点展示。
+_ADDITIVE_SYMBOLS = {"+", "−", "lerp"}
 
 
 # ---------------------------------------------------------------------------
@@ -160,25 +163,39 @@ def _tl_trace(model: nn.Module, in_shape: Tuple[int, ...]) -> List[_Op]:
     失败再 ``eval()``；两者都失败抛出最后一次异常，由上层降级为纯结构图。
     ``save=None`` 只留元数据、不驻留中间激活，避免 3D 大前向撑爆内存。
     """
+    import copy
+
     import torchlens as tl
 
     dummy = torch.zeros(*in_shape, dtype=torch.float32)
-    prev_training = model.training
+    # train 模式前向自带副作用（BN running stats 更新、EDM2 强制 weight-norm 的
+    # 就地 copy_、dropout 消耗全局随机数），`no_grad` 拦不住。追踪一份 deepcopy
+    # 副本并隔离 RNG，保证可视化对待训练模型与随机数序列零副作用。
+    try:
+        target = copy.deepcopy(model)
+    except Exception as e:
+        logger.warning(
+            "model_flow: 模型 deepcopy 失败（%s），退回原模型追踪（train 模式副作用"
+            "可能泄漏到训练模型）。", e)
+        target = model
+    prev_training = target.training
     last_err: Optional[Exception] = None
     try:
-        for mode in (True, False):
-            model.train(mode)
-            try:
-                with torch.no_grad():
-                    hist = tl.trace(model, dummy, save=None)
-                break
-            except Exception as e:
-                logger.debug("model_flow: torchlens(train=%s) 失败: %s", mode, e)
-                last_err = e
-        else:
-            raise last_err if last_err else RuntimeError("torchlens trace 失败")
+        with torch.random.fork_rng(devices=[]):
+            for mode in (True, False):
+                target.train(mode)
+                try:
+                    with torch.no_grad():
+                        hist = tl.trace(target, dummy, save=None)
+                    break
+                except Exception as e:
+                    logger.debug(
+                        "model_flow: torchlens(train=%s) 失败: %s", mode, e)
+                    last_err = e
+            else:
+                raise last_err if last_err else RuntimeError("torchlens trace 失败")
     finally:
-        model.train(prev_training)
+        target.train(prev_training)
 
     def _canon(lbl: str) -> str:
         # op 引用统一带 ":pass" 后缀（单 pass 引用常省略 ":1"）。
@@ -602,8 +619,10 @@ def _res_level(out_sh: Optional[Tuple[int, ...]], in_w: int) -> int:
     return max(0, int(round(math.log2(in_w / w))))
 
 
-def _is_head_container(cid: str) -> bool:
-    """顶层容器是否为输出头（框着色用；不参与分组/连边判定）。"""
+def _is_head_container_by_name(cid: str) -> bool:
+    """命名启发式判定输出头，**仅供纯结构降级路径**（无追踪信息时无法知道
+    哪个子模块产出模型输出）。追踪路径用结构判定：产出模型输出的顶层容器
+    即输出头（见 ``_emit_traced``）。框着色用；不参与分组/连边判定。"""
     return "head" in cid.split(".")[0].lower()
 
 
@@ -614,6 +633,24 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
     a.contract()
     residual = a.residual_edges()
     parent, cont_order = a.build_containers()
+
+    # 输出头的结构化判定：产出模型输出（op.is_output）的顶层容器即输出头，
+    # 不依赖 "head" 命名。
+    def _top_of(nid: str) -> str:
+        cur = nid
+        while parent.get(cur) is not None:
+            cur = parent[cur]
+        return cur
+
+    out_tops: List[str] = []
+    for op in a.order:
+        if not op.is_output:
+            continue
+        for r in a.op_reps.get(op.label) or set():
+            top = _top_of(r)
+            if top not in out_tops:
+                out_tops.append(top)
+    head_tops = set(out_tops) & set(cont_order)
 
     node_first_step: Dict[str, int] = {"input": -1}
     for nid, group in a.leaf_ops.items():
@@ -643,10 +680,13 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
             ki["out"] = shape_str(out_sh)
         pid = parent.get(cid)
         label = cid[len(pid) + 1:] if pid and cid.startswith(pid + ".") else cid
-        kind = "head" if pid is None and _is_head_container(cid) else "stage"
+        kind = "head" if pid is None and cid in head_tops else "stage"
+        # 容器 res 取**入口**形状：折叠框对位到其进入时的分辨率泳道，
+        # 折叠/展开切换时框的横向位置连续（出口形状会把 encoder 折叠框
+        # 对到瓶颈泳道、decoder 对到全分辨率泳道，产生跳变）。
         g.add_node(cid, label, kind=kind, key_info=ki,
                    parent_id=pid, collapsed=True,
-                   res=_res_level(out_sh, in_w))
+                   res=_res_level(in_sh or out_sh, in_w))
 
     # 2) 叶子节点。
     for nid, group in sorted(a.leaf_ops.items(),
@@ -693,32 +733,17 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
     # 因此无需（也不应）在 builder 预先上提——预上提会把多条跳连去重成一条。
     for src, dst in a.cedges:
         kind = "residual" if (src, dst) in residual else "forward"
-        g.add_edge(src, dst, "+" if kind == "residual" else "", kind=kind)
+        label = a.merges[dst][0] if kind == "residual" and dst in a.merges else ""
+        g.add_edge(src, dst, label, kind=kind)
 
     # 5) 损失节点 + 顶层输出容器 → loss。
     g.add_node("loss", f"Loss: {cfg.loss.name}", kind="loss",
                key_info={"name": cfg.loss.name}, detail=_loss_node_detail(cfg))
-    def _top_of(nid: str) -> str:
-        cur = nid
-        while parent.get(cur) is not None:
-            cur = parent[cur]
-        return cur
-
-    out_tops: List[str] = []
-    for op in a.order:
-        if not op.is_output:
-            continue
-        for r in a.op_reps.get(op.label) or set():
-            top = _top_of(r)
-            if top not in out_tops:
-                out_tops.append(top)
     for top in out_tops:
-        g.add_edge(top, "loss", top.split(".")[0] if _is_head_container(top)
-                   else "")
+        g.add_edge(top, "loss", top.split(".")[0] if top in head_tops else "")
 
-    # 6) 分层 rank + 跳连标注 + 列位。
+    # 6) 分层 rank（builder 内部量）+ 跳连标注。
     _assign_ranks_and_skip(g)
-    assign_grid_layout(g, assign_ranks=False)
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +753,7 @@ def _emit_structural(g: VisGraph, cfg: Config, model: nn.Module) -> None:
     """按 ``named_modules`` 声明序：顶层子模块各成一框、叶子线性链。"""
     prev = "input"
     for top_name, top in model.named_children():
-        kind = "head" if _is_head_container(top_name) else "stage"
+        kind = "head" if _is_head_container_by_name(top_name) else "stage"
         leaves = [(n, m) for n, m in top.named_modules() if not list(m.children())]
         g.add_node(top_name, top_name, kind=kind,
                    key_info={"type": type(top).__name__,
@@ -751,7 +776,6 @@ def _emit_structural(g: VisGraph, cfg: Config, model: nn.Module) -> None:
                key_info={"name": cfg.loss.name}, detail=_loss_node_detail(cfg))
     g.add_edge(prev, "loss")
     _assign_ranks_and_skip(g)
-    assign_grid_layout(g, assign_ranks=False)
 
 
 # ---------------------------------------------------------------------------
