@@ -37,7 +37,20 @@ data:
 
 
 augment:
-  enabled: false
+  # 重建类 SSL 的 trainer 级通用增强（复用 segtask GPUAugmentor，在
+  # corruption/mask 之前应用；增强后的图即新的自洽重建样本）。默认仅开
+  # 保守空间增强（翻转 + 小角仿射），强度扰动交由方法自身 corruption。
+  enabled: true
+  random_flip_prob    : 0.2
+  random_affine_prob  : 0.3
+  random_translate_range: [0.0, 0.0]  # SSL 无 oversample 裁剪余量，禁平移防边缘复制伪影
+  elastic_deform_prob : 0.0
+  grid_dropout_prob   : 0.0
+  random_brightness_prob: 0.0
+  random_contrast_prob  : 0.0
+  random_gamma_prob     : 0.0
+  gaussian_noise_prob   : 0.0
+  gaussian_blur_prob    : 0.0
 
 
 model:

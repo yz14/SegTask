@@ -121,8 +121,12 @@ def _build_loader(cfg, ssl, paths: Sequence[str], task: str, batch_size: int,
         intensity_max=dc.intensity_max,
         normalize=dc.normalize,
         samples_per_volume=int(samples_per_volume),
+        global_mean=dc.global_mean,
+        global_std=dc.global_std,
         spatial_dims=int(cfg.model.spatial_dims),
         cls_label_key=str(ssl.cls_label_key) if task == "cls" else "",
+        cache_enabled=dc.cache_mode == "memory",
+        cache_max_volumes=dc.cache_max_volumes,
     )
     return DataLoader(ds, batch_size=max(int(batch_size), 1), shuffle=bool(shuffle),
                       num_workers=0, drop_last=False)

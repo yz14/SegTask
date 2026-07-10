@@ -112,7 +112,9 @@ ssl:
 
   # MoCo 专属 tunable
   moco_proj_dim       : 128             # query/key projector 输出维度
-  moco_queue_size     : 32              # 队列长度
+  moco_queue_size     : 4096            # 负样本队列长度（InfoNCE 分母；显存开销
+                                        # 仅 proj_dim×队列长 fp32，4096×128≈2MB。
+                                        # 过小则负样本稀疏、对比信号弱）
   moco_temperature    : 0.2             # InfoNCE 温度
   moco_momentum_base  : 0.996           # EMA 动量起点
   moco_momentum_final : 1.0             # EMA 动量终点

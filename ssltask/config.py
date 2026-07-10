@@ -136,7 +136,7 @@ class SSLConfig:
 
     # --- method='moco'：MoCo-3D（query/key + EMA queue）---
     moco_proj_dim: int = 128
-    moco_queue_size: int = 32
+    moco_queue_size: int = 4096
     moco_temperature: float = 0.2
     moco_momentum_base: float = 0.996
     moco_momentum_final: float = 1.0

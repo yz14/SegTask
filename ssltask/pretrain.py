@@ -12,11 +12,18 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+from datetime import timedelta
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from segtask_v1.logging_utils import setup_logging as _setup_logging
+from segtask_v1.train import (
+    _find_free_port, _install_parent_death_signal, _install_term_handlers,
+    _maybe_enable_expandable_segments)
 from segtask_v1.utils import seed_everything
 
 from .config import apply_overrides, load_config, save_config, validate_ssl
@@ -27,6 +34,65 @@ from .trainer import SSLTrainer
 
 def setup_logging(output_dir: str, level: str = "INFO") -> None:
     _setup_logging(output_dir=output_dir, level=level, log_filename="pretrain.log")
+
+
+def _build_and_fit(cfg, ssl, device: torch.device):
+    logger = logging.getLogger(__name__)
+    train_loader = build_ssl_dataloader(cfg)
+    method = build_method(cfg, ssl, device)
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        save_config(cfg, ssl,
+                    Path(cfg.train.output_dir) / "resolved_ssl_config.yaml")
+
+    trainer = SSLTrainer(method, cfg, ssl, train_loader, device)
+    metrics = trainer.fit()
+    logger.info("SSL pretrain metrics: %s", metrics)
+    return metrics
+
+
+def _pretrain_worker(local_rank: int, gpus: list, cfg, ssl,
+                     log_level: str, master_port: int) -> None:
+    """每个 DDP 进程的入口（由 mp.spawn 调用，与 segtask train.py 同模式）。"""
+    physical_gpu = int(gpus[local_rank])
+    world_size = len(gpus)
+
+    _install_parent_death_signal()
+    _install_term_handlers()
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = str(master_port)
+
+    torch.cuda.set_device(physical_gpu)
+    dist.init_process_group(
+        backend="nccl", world_size=world_size, rank=local_rank,
+        timeout=timedelta(minutes=int(cfg.train.ddp_timeout_minutes)))
+    device = torch.device(f"cuda:{physical_gpu}")
+
+    if local_rank == 0:
+        setup_logging(cfg.train.output_dir, log_level)
+        logging.getLogger(__name__).info(
+            "SSL DDP launched: world_size=%d on physical GPUs %s "
+            "(MASTER_PORT=%s).", world_size, gpus, master_port)
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
+    # 逐 rank 偏移种子：解耦各 rank 的采样流（数据切分由 DistributedSampler
+    # 保证，模型初值由 SSLTrainer 构造时从 rank0 广播）。
+    seed_everything(cfg.train.seed + local_rank, cfg.train.deterministic)
+
+    completed = False
+    try:
+        _build_and_fit(cfg, ssl, device)
+        completed = True
+    finally:
+        if dist.is_initialized():
+            if completed:
+                try:
+                    dist.barrier()
+                except Exception:
+                    pass
+            dist.destroy_process_group()
 
 
 def main():
@@ -43,24 +109,36 @@ def main():
         cfg.validate()
         validate_ssl(ssl, cfg)
 
+    _maybe_enable_expandable_segments(cfg)
+
+    gpus = [int(g) for g in cfg.train.gpus]
+    cuda_ok = torch.cuda.is_available()
+    if cuda_ok and len(gpus) >= 2:
+        # 多卡 DDP：每卡 spawn 一个进程（与 segtask train.py 同模式）。
+        master_port = int(cfg.train.ddp_master_port) or _find_free_port()
+        mp.spawn(
+            _pretrain_worker,
+            args=(gpus, cfg, ssl, args.log_level, master_port),
+            nprocs=len(gpus),
+            join=True)
+        return None
+
+    # ---- 单进程路径（CPU / 单卡），行为与历史一致 ----
     setup_logging(cfg.train.output_dir, args.log_level)
     logger = logging.getLogger(__name__)
     logger.info("SSL config loaded from: %s (method=%s)", args.config, ssl.method)
 
     seed_everything(cfg.train.seed, cfg.train.deterministic)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if cuda_ok:
+        gpu_index = gpus[0] if gpus else 0
+        torch.cuda.set_device(gpu_index)
+        device = torch.device(f"cuda:{gpu_index}")
+    else:
+        device = torch.device("cpu")
     logger.info("Device: %s", device)
 
-    train_loader = build_ssl_dataloader(cfg)
-    method = build_method(cfg, ssl, device)
-
-    save_config(cfg, ssl, Path(cfg.train.output_dir) / "resolved_ssl_config.yaml")
-
-    trainer = SSLTrainer(method, cfg, ssl, train_loader, device)
-    metrics = trainer.fit()
-    logger.info("SSL pretrain metrics: %s", metrics)
-    return metrics
+    return _build_and_fit(cfg, ssl, device)
 
 
 if __name__ == "__main__":

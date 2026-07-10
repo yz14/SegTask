@@ -18,6 +18,7 @@ from .base import RECON_LOSS_FNS, SSLMethod
 
 class GenesisMethod(SSLMethod):
     name = "genesis"
+    trainer_augment = True   # 重建类：输入=目标同源，接受 trainer 级通用增强
 
     def __init__(self, cfg, ssl, device: torch.device):
         super().__init__(cfg, ssl, device)

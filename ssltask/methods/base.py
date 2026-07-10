@@ -39,6 +39,12 @@ class SSLMethod(ABC):
     #: 注册键（与 ``SSLConfig.method`` / ``ssltask.config.METHODS`` 对齐）。
     name: str = ""
 
+    #: 是否接受 trainer 级通用增强（segtask ``GPUAugmentor``，由 ``cfg.augment``
+    #: 控制）。重建类方法（破坏/掩码→重建，输入与目标同源）置 True——增强后的
+    #: 图即新的自洽样本；视图类方法（dino/byol/moco/jepa）自带多视图增广管道，
+    #: 置 False 以免与其视图变换叠加改变方法语义。
+    trainer_augment: bool = False
+
     def __init__(self, cfg, ssl, device: torch.device):
         self.cfg = cfg
         self.ssl = ssl
@@ -71,6 +77,10 @@ class SSLMethod(ABC):
 
     def on_after_step(self, global_step: int) -> None:
         """每个优化步边界后调用（EMA 教师更新 / 温度·动量调度）。默认 no-op。"""
+
+    def on_resume(self, global_step: int) -> None:
+        """resume 加载后由 ``SSLTrainer`` 调用一次，恢复步进度（温度/动量调度的
+        当前步）。仅恢复计数，不应产生 EMA 更新等副作用。默认 no-op。"""
 
     # ---- 便捷透传 ----------------------------------------------------------
     def train(self) -> None:

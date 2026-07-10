@@ -19,9 +19,13 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+
+from segtask_v1.trainer.dist_utils import (
+    get_rank, get_world_size, is_dist_avail_and_initialized)
 
 from segtask_v1.data.dataset import (
+    VolumeCache,
     _extract_cubic_patch,
     _open_npz,
     preprocess_image,
@@ -77,7 +81,9 @@ class ImageOnlyPatchDataset(Dataset):
         samples_per_volume: int = 1,
         global_mean      : float = 0.0,
         global_std       : float = 1.0,
-        spatial_dims     : int = 3):
+        spatial_dims     : int = 3,
+        cache_enabled    : bool = False,
+        cache_max_volumes: int = 0):
         self.paths = list(npz_paths)
         if not self.paths:
             raise ValueError("ImageOnlyPatchDataset got empty npz_paths.")
@@ -98,6 +104,9 @@ class ImageOnlyPatchDataset(Dataset):
         self.global_mean = float(global_mean)
         self.global_std = float(global_std)
         self.spv = max(int(samples_per_volume), 1)
+        # 逐 worker LRU 缓存（复用 segtask VolumeCache：pickle 到 worker 时清空），
+        # 避免 samples_per_volume>1 时每个 patch 都重新解压全卷。
+        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         logger.info(
             "ImageOnlyPatchDataset: %d volumes x %d samples = %d, patch=%s, "
             "spatial_dims=%d (%s)",
@@ -108,15 +117,20 @@ class ImageOnlyPatchDataset(Dataset):
         return len(self.paths) * self.spv
 
     def _load_volume(self, path: str) -> np.ndarray:
+        cached = self._img_cache.get(path)
+        if cached is not None:
+            return cached
         with _open_npz(path) as f:
             if "image" not in f.files:
                 raise KeyError(
                     f"npz {path!r} has no 'image' key (keys={list(f.files)}).")
             img_int16 = f["image"]
-            return preprocess_image(
+            img = preprocess_image(
                 img_int16, self.intensity_min, self.intensity_max,
                 self.normalize, self.global_mean, self.global_std,
                 inplace=False)
+        self._img_cache.put(path, img)
+        return img
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path = self.paths[idx % len(self.paths)]
@@ -159,7 +173,9 @@ class LabeledPatchDataset(Dataset):
         global_mean       : float = 0.0,
         global_std        : float = 1.0,
         spatial_dims      : int = 3,
-        cls_label_key     : str = ""):
+        cls_label_key     : str = "",
+        cache_enabled     : bool = False,
+        cache_max_volumes : int = 0):
         self.paths = list(npz_paths)
         if not self.paths:
             raise ValueError("LabeledPatchDataset got empty npz_paths.")
@@ -181,6 +197,9 @@ class LabeledPatchDataset(Dataset):
         self.global_std = float(global_std)
         self.spv = max(int(samples_per_volume), 1)
         self.cls_label_key = str(cls_label_key)
+        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
+        self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
+        self._cls_cache: Dict[str, Optional[np.ndarray]] = {}
         logger.info(
             "LabeledPatchDataset (probe): %d volumes x %d samples = %d, patch=%s, "
             "spatial_dims=%d (%s)",
@@ -191,6 +210,10 @@ class LabeledPatchDataset(Dataset):
         return len(self.paths) * self.spv
 
     def _load(self, path: str):
+        img = self._img_cache.get(path)
+        lbl = self._lbl_cache.get(path)
+        if img is not None and lbl is not None and path in self._cls_cache:
+            return img, lbl, self._cls_cache[path]
         with _open_npz(path) as f:
             if "image" not in f.files or "label" not in f.files:
                 raise KeyError(
@@ -212,6 +235,10 @@ class LabeledPatchDataset(Dataset):
             raise ValueError(
                 f"image/label shape mismatch in {path!r}: "
                 f"{img.shape} vs {lbl.shape}.")
+        self._img_cache.put(path, img)
+        self._lbl_cache.put(path, lbl)
+        if self._img_cache.get(path) is not None:
+            self._cls_cache[path] = cls_label
         return img, lbl, cls_label
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -262,16 +289,29 @@ def build_ssl_dataloader(cfg) -> DataLoader:
         intensity_max     = dc.intensity_max,
         normalize         = dc.normalize,
         samples_per_volume= dc.samples_per_volume,
-        spatial_dims      = spatial_dims)
+        global_mean       = dc.global_mean,
+        global_std        = dc.global_std,
+        spatial_dims      = spatial_dims,
+        cache_enabled     = dc.cache_mode == "memory",
+        cache_max_volumes = dc.cache_max_volumes)
     num_workers = int(dc.num_workers)
     kwargs: Dict[str, object] = {}
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(dc.persistent_workers)
         kwargs["prefetch_factor"] = int(dc.prefetch_factor)
+    # DDP：各 rank 分片采样（trainer 每 epoch ``set_epoch`` 重洗）。
+    sampler = None
+    shuffle = True
+    if is_dist_avail_and_initialized() and get_world_size() > 1:
+        sampler = DistributedSampler(
+            ds, num_replicas=get_world_size(), rank=get_rank(),
+            shuffle=True, drop_last=True)
+        shuffle = False
     return DataLoader(
         ds,
         batch_size      = int(dc.batch_size),
-        shuffle         = True,
+        shuffle         = shuffle,
+        sampler         = sampler,
         num_workers     = num_workers,
         pin_memory      = bool(dc.pin_memory),
         drop_last       = True,

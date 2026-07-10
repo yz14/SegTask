@@ -149,6 +149,9 @@ class DINOMethod(SSLMethod):
             alpha=1.0 - self.center_momentum)
 
     # ---- EMA teacher update ----------------------------------------------
+    def on_resume(self, global_step: int) -> None:
+        self._step = int(global_step)
+
     def on_after_step(self, global_step: int) -> None:
         self._step = int(global_step)
         m = self._momentum()

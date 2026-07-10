@@ -53,8 +53,12 @@ def build_cls_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
             intensity_max=dc.intensity_max,
             normalize=dc.normalize,
             samples_per_volume=spv,
+            global_mean=dc.global_mean,
+            global_std=dc.global_std,
             spatial_dims=spatial_dims,
             cls_label_key=ssl.cls_label_key,
+            cache_enabled=dc.cache_mode == "memory",
+            cache_max_volumes=dc.cache_max_volumes,
         )
 
     train_ds = _mk(train_paths, int(ssl.probe_samples_per_volume))

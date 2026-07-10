@@ -149,6 +149,9 @@ class MoCoMethod(SSLMethod):
         self._dequeue_and_enqueue(torch.cat([k1, k2], dim=0))
         return loss, {"moco_loss": float(loss.detach()), "queue_ptr": float(self.module.queue_ptr.item())}
 
+    def on_resume(self, global_step: int) -> None:
+        self._step = int(global_step)
+
     def on_after_step(self, global_step: int) -> None:
         self._step = int(global_step)
         m = self._momentum()
