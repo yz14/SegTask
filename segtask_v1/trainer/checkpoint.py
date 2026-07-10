@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from pathlib import Path
 from queue import Queue
 from typing import Callable, Iterable, Optional
 
@@ -17,6 +19,27 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+
+def atomic_torch_save(state, path) -> None:
+    """原子写 checkpoint：同目录临时文件 + ``os.replace``。
+
+    写盘中途崩溃/磁盘满时目标路径要么保留旧文件要么不存在，
+    不会出现半写的 ``best_model.pth`` 覆盖掉可用旧 best。失败时清理
+    临时文件后重抛。"""
+    p = Path(path)
+    tmp = p.with_name(p.name + ".tmp")
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError:
+            logger.warning("Failed to remove temp checkpoint %s", tmp)
+        raise
+
 
 # ``_build_state_dict`` 写入的 RNG 快照键集合；``state_to_cpu`` 据此识别并走
 # bytes 打包路径，避免 ``.clone()`` 把 ``ByteTensor`` 降级为普通 ``uint8 Tensor``。
@@ -167,7 +190,7 @@ class AsyncCheckpointSaver:
                     return
                 state, path, on_done = item
                 try:
-                    torch.save(state, path)
+                    atomic_torch_save(state, path)
                     if on_done is not None:
                         on_done()
                 except BaseException as exc:  # noqa: BLE001 — 记录后转交 wait()

@@ -479,8 +479,9 @@ def test_trainer_skips_poisoned_nonfinite_grads_on_no_scaler_path():
     after = trainer.model.state_dict()
     for k, v in before.items():
         assert torch.equal(after[k], v), k
-    assert trainer.scheduler.current_step == 1
-    # 跳过的优化步不推 EMA（权重未变，num_updates 不应白增）。
+    # 跳过的优化步不推 scheduler/EMA（权重未变，LR schedule 不消耗，
+    # num_updates 不应白增）。
+    assert trainer.scheduler.current_step == 0
     assert trainer.ema.num_updates == 0
 
 
@@ -568,8 +569,8 @@ def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
         assert torch.equal(after[k], v), k
     assert spy.step_calls == 1
     assert spy.step_execs == 0
-    assert trainer.scheduler.current_step == 1
-    # scale 回退被识别为跳步，EMA 不推进。
+    # scale 回退被识别为跳步，scheduler/EMA 均不推进。
+    assert trainer.scheduler.current_step == 0
     assert trainer.ema.num_updates == 0
 
 

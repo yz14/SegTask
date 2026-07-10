@@ -111,14 +111,16 @@ def prob_to_label(
     max_class = prob_volume.argmax(axis=0)        # (D, H, W)
     label_map = fg_values[max_class]
     thr = np.asarray(threshold, dtype=np.float32)
+    # 与验证侧（utils.dice_batch_stats 等的 ``prob > threshold``）同一契约：
+    # 严格大于阈值才取前景，``prob == threshold`` 判背景。
     if thr.ndim == 0:
-        below = max_prob < float(thr)
+        below = max_prob <= float(thr)
     else:
         if thr.shape != (num_fg,):
             raise ValueError(
                 f"prob_to_label: per-class threshold length {thr.shape[0]} "
                 f"!= num_fg {num_fg}.")
-        below = max_prob < thr[max_class]
+        below = max_prob <= thr[max_class]
     label_map[below] = bg_val
     if n_nan > 0:
         label_map[nan_mask] = bg_val

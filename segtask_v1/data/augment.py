@@ -303,10 +303,10 @@ def _grid_dropout(
     hh = min(H, max(1, int(H * frac)))
     hw = min(W, max(1, int(W * frac)))
 
-    # 逐样本 hole 左上角。
-    d0 = torch.randint(0, max(D - hd, 1), (B, num_holes), device=device)
-    h0 = torch.randint(0, max(H - hh, 1), (B, num_holes), device=device)
-    w0 = torch.randint(0, max(W - hw, 1), (B, num_holes), device=device)
+    # 逐样本 hole 左上角；合法起点为 0..axis-hole（randint 上界不含，故 +1）。
+    d0 = torch.randint(0, D - hd + 1, (B, num_holes), device=device)
+    h0 = torch.randint(0, H - hh + 1, (B, num_holes), device=device)
+    w0 = torch.randint(0, W - hw + 1, (B, num_holes), device=device)
 
     hole_mask = torch.ones(B, 1, D, H, W, device=device, dtype=image.dtype)
     d_off = torch.arange(hd, device=device)

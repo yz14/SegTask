@@ -608,7 +608,9 @@ class SoftCLDiceLoss(nn.Module):
             sp.sum(dim=-1) + self.smooth)
         tsens = ((st * p).sum(dim=-1) + self.smooth) / (
             st.sum(dim=-1) + self.smooth)
-        cldice = 2.0 * tprec * tsens / (tprec + tsens + self.smooth)
+        # 调和均值分母不加 smooth（官方 clDice 定义），否则完美预测损失不为 0；
+        # smooth>0 时 tprec/tsens 严格 >0，clamp 仅作 smooth=0 时的除零兜底。
+        cldice = 2.0 * tprec * tsens / (tprec + tsens).clamp(min=1e-8)
         per_class_loss = 1.0 - cldice  # (B, C)
         return _weighted_mean_over_classes(
             per_class_loss, self.class_weights).mean()

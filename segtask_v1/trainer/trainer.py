@@ -50,6 +50,7 @@ from .amp import (
 from .breakdown import collect_multi_res_breakdown, format_breakdown
 from .checkpoint import (
     AsyncCheckpointSaver,
+    atomic_torch_save,
     extract_model_state_dict,
     relocate_optimizer_state,
     restore_rng_state,
@@ -877,7 +878,8 @@ class Trainer:
                 # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步（基于
                 # all-reduce 后一致的梯度，各 rank 天然同步）；bf16/fp32 在
                 # loss 或梯度非有限时丢弃本 accum 组梯度，避免 NaN 永久污染
-                # 权重与 EMA（scheduler 照常推进，EMA 不推进）。loss 非有限
+                # 权重与 EMA（scheduler/EMA 均只在 optimizer 真正更新后推进，
+                # LR schedule 按“参数更新次数”而非“尝试步数”前进）。loss 非有限
                 # 是各 rank 本地信息，跳步决策需 all-reduce(any) 统一，维持
                 # DDP 各副本施加相同更新的不变量。
                 skip_optim_step = False
@@ -900,9 +902,8 @@ class Trainer:
                         else "non-finite on a peer rank",
                         self._amp_dtype_name)
                     self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    # 不推 EMA：权重未变，update 只会白增 num_updates（推进
-                    # warmup decay）并在 CPU offload 时多一次 D2H 同步。
+                    # 不推 scheduler/EMA：权重未变，推进只会消耗 LR schedule /
+                    # 白增 num_updates（跳步决策已 all-reduce，各 rank 一致）。
                     if self._health_monitor:
                         opt_steps += 1
                     continue
@@ -923,14 +924,17 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 # GradScaler 跳步（梯度含 inf/NaN）时会把 scale 回退减半；
-                # 据此识别未生效的优化步，不推 EMA。
+                # 据此识别未生效的优化步，不推 scheduler/EMA。
                 scaler_skipped = (
                     scale_before is not None
                     and self.scaler.get_scale() < scale_before)
                 self.optimizer.zero_grad(set_to_none=True)
-                self.scheduler.step()
-                if self.ema is not None and not scaler_skipped:
-                    self.ema.update(unwrap_compile(self.model))
+                # scheduler/EMA 仅在 optimizer 真正更新后推进（GradScaler 跳步
+                # 基于 all-reduce 后一致的梯度，各 rank 判定天然同步）。
+                if not scaler_skipped:
+                    self.scheduler.step()
+                    if self.ema is not None:
+                        self.ema.update(unwrap_compile(self.model))
 
                 if pre_step_snapshot is not None:
                     try:
@@ -1072,7 +1076,7 @@ class Trainer:
                 self.swa.n_averaged, self._swa_start_epoch + 1, metric_str)
             if self._is_main:
                 path = self.output_dir / "swa_model.pth"
-                torch.save({
+                atomic_torch_save({
                     "model_state_dict": bare.state_dict(),
                     "swa_n_averaged": self.swa.n_averaged,
                     "swa_val_metrics": metrics,
@@ -1186,7 +1190,7 @@ class Trainer:
                     on_done=lambda p=path: logger.info(
                         "Best model saved: %s", p))
             else:
-                torch.save(state, path)
+                atomic_torch_save(state, path)
                 logger.info("Best model saved: %s", path)
         else:
             path = self.output_dir / f"checkpoint_epoch_{epoch + 1}.pth"
@@ -1197,7 +1201,7 @@ class Trainer:
                     self._prune_old_checkpoints()
                 self._ckpt_saver.submit(state_to_cpu(state), path, _on_done)
             else:
-                torch.save(state, path)
+                atomic_torch_save(state, path)
                 logger.debug("Checkpoint saved: %s", path)
                 self._prune_old_checkpoints()
 
