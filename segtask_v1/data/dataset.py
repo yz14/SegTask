@@ -354,6 +354,21 @@ def load_npz_label_counts(path: str) -> Optional[Dict[int, int]]:
     return {int(v): int(c) for v, c in counts.items()}
 
 
+def load_npz_z_spacing(path: str) -> Optional[float]:
+    """返 npz 卷落盘坐标系的物理 z spacing (mm)：spacing 归一化过取
+    target_spacing[0]，否则取 orig_spacing[0]（make_data≥1.4 记录）；
+    旧 npz 无 spacing 字段返 None。供整卷验证把 z spacing 传给 Predictor
+    （z-interleave 因子选择与部署一致）。"""
+    with _open_npz(path) as f:
+        meta = f["meta"].item()
+    sp = (meta.get("target_spacing") if meta.get("spacing_normalized")
+          else meta.get("orig_spacing"))
+    if not sp:
+        return None
+    z = float(sp[0])
+    return z if (np.isfinite(z) and z > 0.0) else None
+
+
 def load_npz_label_for_split(path: str) -> np.ndarray:
     """owned int16 label copy，供 loader.py 预扫描使用。强制 copy 以免父进程持有 mmap 句柄。"""
     with _open_npz(path) as f:

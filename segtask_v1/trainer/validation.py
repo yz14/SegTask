@@ -64,6 +64,8 @@ class MetricAccumulator:
         surface_dice_tolerance: int,
         surface_dice_weight: float,
         threshold: Union[float, Sequence[float]] = 0.5,
+        surface_dice_tolerance_mm: float = 0.0,
+        spacing: Optional[Sequence[float]] = None,
     ):
         crit = str(criterion).lower().strip()
         self._crit = crit
@@ -76,6 +78,12 @@ class MetricAccumulator:
         self.compute_sd = crit in ("dice+surface_dice", "balanced")
         self.sd_tol = int(surface_dice_tolerance)
         self.sd_w = float(surface_dice_weight)
+        # 物理空间 (mm) 各向异性欧氏 NSD：tolerance_mm>0 且 spacing 非空时启用，
+        # 否则沿用 voxel-Chebyshev@sd_tol。spacing 为每轴 mm（numpy 轴序）。
+        self.sd_tol_mm = float(surface_dice_tolerance_mm)
+        self.sd_spacing = (
+            [float(s) for s in spacing] if spacing is not None else None)
+        self.sd_physical = self.sd_tol_mm > 0.0 and self.sd_spacing is not None
 
         self.loss_meter = AverageMeter()
         self._inter = None
@@ -140,7 +148,9 @@ class MetricAccumulator:
         if self.compute_sd:
             sd_stats = surface_dice_batch_stats(
                 pred_f, target, tolerance=self.sd_tol,
-                threshold=thr, pred_is_binary=pred_is_binary)
+                threshold=thr, pred_is_binary=pred_is_binary,
+                tolerance_mm=self.sd_tol_mm if self.sd_physical else 0.0,
+                spacing=self.sd_spacing if self.sd_physical else None)
             if self._sd_num is None:
                 self._sd_num = sd_stats["sd_num"].clone()
                 self._sd_denom = sd_stats["sd_denom"].clone()
@@ -264,8 +274,10 @@ class MetricAccumulator:
             metrics["mean_combined"] = (
                 (1.0 - self.sd_w) * metrics["mean_dice"]
                 + self.sd_w * metrics["mean_surface_dice"])
+            sd_tag = (f"{self.sd_tol_mm:g}mm" if self.sd_physical
+                      else f"{self.sd_tol}px")
             sd_msg = (
-                f", pooled_mean_surface_dice@{self.sd_tol}px="
+                f", pooled_mean_surface_dice@{sd_tag}="
                 f"{metrics['mean_surface_dice']:.4f}, "
                 f"per_class_sd={[f'{d:.4f}' for d in sd_per_class.tolist()]}, "
                 f"combined(w={self.sd_w:.2f})={metrics['mean_combined']:.4f}")
@@ -315,13 +327,43 @@ class ValEvaluator(ABC):
     def __init__(self, trainer: "Trainer"):
         self.trainer = trainer
 
+    def _resolve_sd_spacing(self) -> Optional[list]:
+        """物理 NSD 所需的每轴 mm spacing：仅当 surface_dice_tolerance_mm>0 时解析。
+        取 data.target_spacing（未显式配置则从 npz_dir/_manifest.json 回读）；
+        无法解析（如未开启 spacing_normalization）时返回 None 并告警一次，
+        由 MetricAccumulator 回退 voxel-Chebyshev 容差。"""
+        tc = self.trainer.cfg.train
+        if float(tc.surface_dice_tolerance_mm) <= 0.0:
+            return None
+        dc = self.trainer.cfg.data
+        ts = dc.target_spacing
+        if ts is None:
+            from ..predictor.predictor import _manifest_target_spacing
+            ts = _manifest_target_spacing(dc.npz_dir)
+        if ts is None:
+            if not getattr(self, "_sd_spacing_warned", False):
+                logger.warning(
+                    "train.surface_dice_tolerance_mm=%.3f requires a resolved "
+                    "voxel spacing, but data.target_spacing is unset and no "
+                    "%s/_manifest.json target_spacing is available (enable "
+                    "data.spacing_normalization when baking, or set "
+                    "data.target_spacing). Falling back to voxel-Chebyshev "
+                    "surface_dice_tolerance=%d.",
+                    float(tc.surface_dice_tolerance_mm), dc.npz_dir,
+                    int(tc.surface_dice_tolerance))
+                self._sd_spacing_warned = True
+            return None
+        return [float(s) for s in ts]
+
     def _new_accumulator(self) -> MetricAccumulator:
         tc = self.trainer.cfg.train
         return MetricAccumulator(
             criterion=str(tc.save_best_criterion),
             surface_dice_tolerance=int(tc.surface_dice_tolerance),
             surface_dice_weight=float(tc.surface_dice_weight),
-            threshold=self.trainer.cfg.predict.threshold)
+            threshold=self.trainer.cfg.predict.threshold,
+            surface_dice_tolerance_mm=float(tc.surface_dice_tolerance_mm),
+            spacing=self._resolve_sd_spacing())
 
     @abstractmethod
     def evaluate(self, epoch: int) -> Dict[str, float]:
@@ -415,7 +457,8 @@ class VolumeValEvaluator(ValEvaluator):
     @torch.no_grad()
     def evaluate(self, epoch: int) -> Dict[str, float]:
         from ..data.dataset import (
-            load_npz_image, load_npz_label, preprocess_label)
+            load_npz_image, load_npz_label, load_npz_z_spacing,
+            preprocess_label)
 
         t = self.trainer
         dc = t.cfg.data
@@ -438,8 +481,13 @@ class VolumeValEvaluator(ValEvaluator):
                 path, dc.intensity_min, dc.intensity_max, dc.normalize,
                 dc.global_mean, dc.global_std)
             label = load_npz_label(path)
+            # 物理 z spacing（npz meta，make_data≥1.4/1.6）：使 2.5D z-interleave
+            # 因子选择与部署路径一致；旧 npz 无记录时为 None（回退标准滑窗）。
+            z_spacing = (load_npz_z_spacing(path)
+                         if predictor.z_interleave_enabled else None)
             # (num_fg, D, H, W) 概率体（已 sigmoid，跨窗 blended）。
-            prob = predictor.predict_preprocessed_array(vol)
+            prob = predictor.predict_preprocessed_array(
+                vol, z_spacing=z_spacing)
             target_np = preprocess_label(label, label_values)
 
             prob_t = torch.from_numpy(prob).to(t.device)
@@ -463,7 +511,14 @@ class VolumeValEvaluator(ValEvaluator):
             # 总体素数按整卷回传，使 TN/MCC 口径不变。
             voxels_override = None
             if bool(t.cfg.train.val_metric_bbox_crop):
-                margin = (acc.sd_tol + 1) if acc.compute_sd else 1
+                if acc.compute_sd and acc.sd_physical:
+                    # mm 容差 → 各轴最保守（最小 spacing）的 voxel 半径。
+                    margin = int(math.ceil(
+                        acc.sd_tol_mm / min(acc.sd_spacing))) + 1
+                elif acc.compute_sd:
+                    margin = acc.sd_tol + 1
+                else:
+                    margin = 1
                 fg = (pred_bin > 0.5).any(dim=0) | (target_t > 0.5).any(dim=0)
                 sl = self._union_bbox_slices(fg, margin)
                 if sl is not None:

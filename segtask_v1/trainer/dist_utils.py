@@ -21,6 +21,7 @@ __all__ = [
     "barrier",
     "all_reduce_sum_",
     "all_reduce_flag_any",
+    "all_reduce_bn_running_stats_",
     "shard_for_rank",
 ]
 
@@ -80,6 +81,35 @@ def all_reduce_flag_any(flag: bool, device: torch.device) -> bool:
     t = torch.tensor(1.0 if flag else 0.0, device=device)
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return bool(t.item() > 0)
+
+
+@torch.no_grad()
+def all_reduce_bn_running_stats_(bn_modules: List) -> None:
+    """跨 rank 聚合 BatchNorm running stats（就地）；非分布式时 no-op。
+
+    面向 ``estimate_bn_stats`` 的累积平均语义（momentum=None：running_mean/var
+    为各 batch 统计的等权均值）：以各 rank 的 ``num_batches_tracked`` 为权重做
+    加权平均，与单进程在所有 rank 的 batch 全集上累积**严格相等**（等 batch
+    大小下）。``num_batches_tracked`` 归并为全局总和。各 rank 数据 shard 不同
+    时，未聚合的 stats 只代表本 rank shard —— 这正是本函数要修复的偏差。
+    """
+    if not (is_dist_avail_and_initialized() and get_world_size() > 1):
+        return
+    for m in bn_modules:
+        n = m.num_batches_tracked
+        n_f = n.to(torch.float64)
+        mean_w = m.running_mean.to(torch.float64) * n_f
+        var_w = m.running_var.to(torch.float64) * n_f
+        n_total = n_f.clone()
+        all_reduce_sum_(mean_w)
+        all_reduce_sum_(var_w)
+        all_reduce_sum_(n_total)
+        if float(n_total.item()) > 0:
+            m.running_mean.copy_(
+                (mean_w / n_total).to(m.running_mean.dtype))
+            m.running_var.copy_(
+                (var_w / n_total).to(m.running_var.dtype))
+        all_reduce_sum_(n)
 
 
 def shard_for_rank(items: List) -> List:

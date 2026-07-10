@@ -39,7 +39,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.5"
+_TOOL_VERSION = "make_data/1.6"
 
 # 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -215,11 +215,12 @@ def prepare_one(
 
     # 4.5 物理 spacing 归一化（可选）：把 bbox-裁剪后的体积重采样到 target_spacing。
     #     在 fg 索引/shape 记录之前做，保证下游全部落在归一化坐标系。
-    orig_spacing: Optional[List[float]] = None
+    #     orig_spacing 无论归一化与否都记录（make_data≥1.6），使未归一化 npz 也
+    #     携带物理 z spacing（整卷验证的 z-interleave 因子选择与部署一致）。
+    src = read_nifti_spacing(image_path)  # (sz, sy, sx) mm
+    orig_spacing: Optional[List[float]] = [float(s) for s in src]
     spacing_normalized = False
     if spacing_normalization and target_spacing is not None:
-        src = read_nifti_spacing(image_path)  # (sz, sy, sx) mm
-        orig_spacing = [float(s) for s in src]
         tgt = tuple(float(s) for s in target_spacing)
         image = resample_to_spacing(image, src, tgt, is_label=False)
         label = resample_to_spacing(label, src, tgt, is_label=True)

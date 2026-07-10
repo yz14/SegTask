@@ -907,10 +907,35 @@ num_fg = 1 / 3
    1e-3、origin 1e-2 mm），不一致 fail-fast（与 shape 校验同级），
    杜绝"shape 相同但物理坐标系不同"的静默错配。
 
-### 16.4 后续批次（未实施）
+### 16.4 第三批修复（已实施并通过测试，2026-07-10）
 
-- 第三批：spacing-aware Surface Dice、SWA/AdaBN BN buffer 跨 rank 聚合、
-  high-val z-interleave 一致性。
+配套回归测试 `tests/test_review_batch3_fixes.py`（17 项全过，含 gloo 双进程
+BN 聚合数值一致性）；全仓测试基线无新增失败（失败集合与改动前逐条 diff 一致）：
+
+1. **P1-04**：spacing-aware Surface Dice。`utils.py` 新增
+   `_nsd_stats_spacing_aware`（scipy EDT，各向异性欧氏 mm 距离，语义同 MONAI
+   distance-based symmetric NSD），`surface_dice_batch_stats` 增
+   `tolerance_mm`/`spacing` 参数：`tolerance_mm>0` 且 spacing 非空时走物理
+   空间版，否则保持 voxel-Chebyshev（向后兼容，数值不变）。`config.py` 新增
+   `train.surface_dice_tolerance_mm`（默认 0=沿用像素容差，validate 校验
+   >=0）。`validation.py` MetricAccumulator 增 `surface_dice_tolerance_mm`/
+   `spacing`；ValEvaluator 从 `data.target_spacing`（缺省回读
+   `_manifest.json`）解析 spacing，解析不到告警并回退 voxel 版；日志标注
+   `@τmm` vs `@τpx`；`val_metric_bbox_crop` 边距按 mm 容差 /min(spacing)
+   向上取整。
+2. **P2-07**：SWA BN 跨 rank 聚合。`dist_utils.py` 新增
+   `all_reduce_bn_running_stats_`（以 num_batches_tracked 加权平均
+   running_mean/var、求和 num_batches_tracked，与单进程在全部 rank batch
+   上累积平均严格相等；非分布式 no-op）；`trainer.py`
+   `_swa_recalibrate_bn` 在 `estimate_bn_stats` 后调用，rank0 落盘的
+   swa_model.pth BN stats 代表全训练集而非 rank0 shard。
+3. **P2-10**：high-val z-interleave 一致性。`make_data.py` 步骤 4.5 无论是否
+   spacing 归一化都记录 `orig_spacing`（`_TOOL_VERSION` 1.5→1.6）；
+   `dataset.py` 新增 `load_npz_z_spacing`（spacing_normalized 取
+   target_spacing[0]，否则 orig_spacing[0]，旧 npz 返 None）；
+   `validation.py` VolumeValEvaluator 把 npz meta 的 z spacing 传给
+   `predict_preprocessed_array`，2.5D z-interleave 因子选择与部署路径一致
+   （旧 npz 无记录时回退标准滑窗，行为不变）。
 
 
 

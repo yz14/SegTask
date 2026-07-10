@@ -456,6 +456,74 @@ def _binary_dilate_pool(mask: torch.Tensor, ndim: int, tol: int) -> torch.Tensor
     return out
 
 
+def _nsd_stats_spacing_aware(
+    pred_bin: torch.Tensor,
+    target_f: torch.Tensor,
+    tolerance_mm: float,
+    spacing: "Union[float, tuple, list]",
+) -> Dict[str, torch.Tensor]:
+    """物理空间 (mm) 双向 Normalized Surface Dice 的可池化统计量。
+
+    与 voxel-Chebyshev 版返回同义的 (sd_num, sd_denom, n_with_gt)，但"匹配"
+    由各向异性 **欧氏** 表面距离判定：以 ``spacing``（每轴 mm，长度=ndim）为
+    采样距离做 EDT，gt/pred 表面体素到对侧表面的最近欧氏距离 <= ``tolerance_mm``
+    记为匹配。定义同 MONAI Surface Dice（distance-based, symmetric）：
+    NSD[c] = Σ(|{b∈B_p: d(b,B_t)<=τ}| + |{b∈B_t: d(b,B_p)<=τ}|) / Σ(|B_p|+|B_t|)。
+    分子分母跨样本/类求和后闭式导出，与单进程全集累加严格相等（可 all-reduce）。"""
+    from scipy.ndimage import binary_erosion, distance_transform_edt
+
+    device = pred_bin.device
+    B, C = pred_bin.shape[:2]
+    ndim = pred_bin.ndim - 2
+    sp = ([float(spacing)] * ndim if isinstance(spacing, (int, float))
+          else [float(s) for s in spacing])
+    if len(sp) != ndim:
+        raise ValueError(
+            f"spacing length {len(sp)} != spatial rank {ndim}")
+    tol = float(tolerance_mm)
+    struct = np.ones((3,) * ndim, dtype=bool)   # 全连通（同 GPU Chebyshev 腐蚀）
+
+    pred_np = (pred_bin.detach().cpu().numpy() > 0.5)
+    tgt_np = (target_f.detach().cpu().numpy() > 0.5)
+
+    sd_num = np.zeros(C, dtype=np.float64)
+    sd_denom = np.zeros(C, dtype=np.float64)
+    n_with_gt = np.zeros(C, dtype=np.float64)
+
+    def _boundary(mask: np.ndarray) -> np.ndarray:
+        if not mask.any():
+            return np.zeros_like(mask)
+        # border_value=0：卷体外按背景，边缘前景计入表面（同 GPU 版 zero-pad）。
+        eroded = binary_erosion(mask, structure=struct, border_value=0)
+        return mask & (~eroded)
+
+    for b in range(B):
+        for c in range(C):
+            pm = pred_np[b, c]
+            gm = tgt_np[b, c]
+            if gm.any():
+                n_with_gt[c] += 1.0
+            pb = _boundary(pm)
+            tb = _boundary(gm)
+            n_pb = int(pb.sum())
+            n_tb = int(tb.sum())
+            sd_denom[c] += n_pb + n_tb
+            if n_pb == 0 or n_tb == 0:
+                continue   # 一侧无表面 → 无匹配（分母仍计，惩罚缺失）。
+            # EDT(~boundary) 在每个体素给出到最近 boundary 体素的欧氏 mm 距离。
+            dt_to_pred = distance_transform_edt(~pb, sampling=sp)
+            dt_to_gt = distance_transform_edt(~tb, sampling=sp)
+            sd_num[c] += float((dt_to_pred[tb] <= tol).sum())
+            sd_num[c] += float((dt_to_gt[pb] <= tol).sum())
+
+    return {
+        "sd_num": torch.as_tensor(sd_num, dtype=torch.float32, device=device),
+        "sd_denom": torch.as_tensor(
+            sd_denom, dtype=torch.float32, device=device),
+        "n_with_gt": torch.as_tensor(
+            n_with_gt, dtype=torch.float32, device=device)}
+
+
 @torch.no_grad()
 def surface_dice_batch_stats(
     pred: torch.Tensor,
@@ -463,16 +531,25 @@ def surface_dice_batch_stats(
     tolerance: int = 1,
     threshold: Union[float, torch.Tensor] = 0.5,
     pred_is_binary: bool = False,
+    tolerance_mm: float = 0.0,
+    spacing: Optional[Union[float, tuple, list]] = None,
 ) -> Dict[str, torch.Tensor]:
-    """逐类汇总 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice@τ：
+    """逐类汇总 (sd_num, sd_denom, n_with_gt)，供 pooled surface-dice：
     SD[c] = Σ(|B_p ∩ Dil_τ(B_t)| + |B_t ∩ Dil_τ(B_p)|) / Σ(|B_p|+|B_t|)。
     支持 2D (B,C,H,W) 与 3D (B,C,D,H,W)；外侧体素按背景计入边界。
-    ``pred_is_binary`` 含义同 ``dice_batch_stats``。"""
+    ``pred_is_binary`` 含义同 ``dice_batch_stats``。
+
+    ``tolerance_mm>0`` 且 ``spacing`` 非空时切换到物理空间各向异性 **欧氏** NSD
+    （见 :func:`_nsd_stats_spacing_aware`）；否则用 voxel-Chebyshev@``tolerance``。"""
     pred_bin = (pred.float() if pred_is_binary
                 else (torch.sigmoid(pred) > threshold).float())
     target_f = target.float()
     ndim = pred_bin.ndim - 2
     assert ndim in (2, 3), f"surface_dice expects 2D/3D spatial, got rank {pred_bin.ndim}"
+
+    if tolerance_mm > 0.0 and spacing is not None:
+        return _nsd_stats_spacing_aware(
+            pred_bin, target_f, tolerance_mm, spacing)
 
     p_er = _binary_erosion_pool(pred_bin, ndim)
     t_er = _binary_erosion_pool(target_f, ndim)

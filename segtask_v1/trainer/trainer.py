@@ -59,6 +59,7 @@ from .checkpoint import (
     unwrap_compile,
 )
 from .dist_utils import (
+    all_reduce_bn_running_stats_,
     all_reduce_flag_any,
     barrier,
     get_rank,
@@ -1127,6 +1128,9 @@ class Trainer:
                     self.model(image)
 
         estimate_bn_stats(bn_modules, _run_forward)
+        # DDP：各 rank 只看到自己的 train shard，聚合后 running stats 才代表
+        # 全训练集（rank0 落盘的 swa_model.pth 否则只含 rank0 shard 的统计）。
+        all_reduce_bn_running_stats_(bn_modules)
 
     # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)

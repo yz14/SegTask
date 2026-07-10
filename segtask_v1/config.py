@@ -801,6 +801,10 @@ class TrainConfig:
     save_best_criterion: str = "dice"
     # Surface Dice 容差（像素，Chebyshev 邻域；0=严格表面 Dice）。
     surface_dice_tolerance: int = 1
+    # >0 时启用物理空间 (mm) 各向异性欧氏 NSD（同 MONAI Surface Dice），
+    # 覆盖上面的 voxel-Chebyshev 容差；需可解析的 spacing（data.spacing_normalization
+    # + target_spacing / manifest 回读），否则告警并回退 voxel 容差。0=沿用像素容差。
+    surface_dice_tolerance_mm: float = 0.0
     # 组合标准下 combined = (1-w)*dice + w*surface_dice。
     surface_dice_weight: float = 0.5
     # 任务化推荐预设：非空时由 sync() 覆盖上面三项 (criterion / tolerance / weight)。
@@ -2024,6 +2028,10 @@ class Config:
         _require(
             0.0 <= float(self.train.surface_dice_weight) <= 1.0,
             f"surface_dice_weight must be in [0,1]; got {self.train.surface_dice_weight}")
+        _require(
+            float(self.train.surface_dice_tolerance_mm) >= 0.0,
+            f"surface_dice_tolerance_mm must be >= 0; got "
+            f"{self.train.surface_dice_tolerance_mm}")
         if self.train.pretrain_upkern and self.model.backbone != "mednext":
             logger.warning(
                 "train.pretrain_upkern=True only affects backbone='mednext'; "
