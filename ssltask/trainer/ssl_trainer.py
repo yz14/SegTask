@@ -101,6 +101,18 @@ class SSLTrainer:
         self._scaler_active = self.use_amp and self.amp_dtype == torch.float16
         self.scaler = GradScaler("cuda", enabled=self._scaler_active)
 
+        # --- channels_last 内存格式（同母项目 TrainConfig.channels_last）-----
+        # 数值等价；Ampere+ 上 3D conv 可能提速。模型与 batch 同时转排布。
+        self._memory_format = None
+        if tc.channels_last:
+            self._memory_format = (
+                torch.channels_last_3d
+                if int(cfg.model.spatial_dims) == 3
+                else torch.channels_last)
+            model.to(memory_format=self._memory_format)
+            logger.info("channels_last memory format enabled (%s).",
+                        self._memory_format)
+
         # --- EMA (over the method's module; orthogonal to any method-internal teacher) ---
         # 绑裸模型（compile 包装前），shadow key 无 ``_orig_mod.`` 前缀。
         self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
@@ -132,6 +144,20 @@ class SSLTrainer:
         self._best_saved = False
         self._global_step = 0
         self.start_epoch = 0
+
+        # --- 训练监控面板（复用 segtask_v1.monitor；cfg.monitor 守卫，仅 rank0，
+        #     失败隔离不阻断训练）---------------------------------------
+        self._monitor = None
+        self._monitor_html = None
+        self._monitor_cfg = getattr(cfg, "monitor", None)
+        self._health_monitor = bool(
+            self._monitor_cfg is not None
+            and getattr(self._monitor_cfg, "health_monitor", False))
+        self._health_grad_norm_when_no_clip = bool(getattr(
+            self._monitor_cfg, "health_grad_norm_when_no_clip", True))
+        if (self._monitor_cfg is not None and self._monitor_cfg.enabled
+                and self._is_main):
+            self._init_monitor(resume_active=bool(tc.resume))
 
         # 告知方法总优化步数（= boundary 数：每 grad_accum 个 micro-step 一次）。
         # 供自蒸馏等方法预计算 EMA 动量 / teacher 温度的 cosine 调度（默认 no-op）。
@@ -180,6 +206,127 @@ class SSLTrainer:
                     self.method.module, mode=tc.compile_mode)
 
     # ------------------------------------------------------------------
+    def _init_monitor(self, resume_active: bool) -> None:
+        """实例化 ``MetricsLogger``（SSL 口径：无验证集，val 位置留空；选模
+        指标为 train loss / probe dice）。失败仅告警、不影响训练。"""
+        mc = self._monitor_cfg
+        tc = self.cfg.train
+        try:
+            from segtask_v1.monitor import MetricsLogger
+
+            root = Path(mc.output_dir) if mc.output_dir else self.output_dir
+            mon_dir = root / "monitor"
+            self._monitor_html = root / (mc.filename or "training_monitor.html")
+            run_name = mc.run_name or self.output_dir.name or "ssl_run"
+            select_by = ("probe_dice"
+                         if bool(getattr(self.ssl, "probe_enabled", False))
+                         and bool(self.ssl.probe_select_best) else "loss")
+            self._monitor = MetricsLogger(
+                mon_dir,
+                run_name=run_name,
+                save_best_metric=select_by,
+                save_best_mode="max" if select_by == "probe_dice" else "min",
+                num_classes=0,
+                total_epochs=tc.epochs,
+                config_meta={
+                    "ssl_method": self.ssl.method,
+                    "recon_loss": self.ssl.recon_loss,
+                    "batch_size": self.cfg.data.batch_size,
+                },
+                resume=resume_active,
+            )
+            logger.info("SSL training monitor enabled → metrics: %s | "
+                        "dashboard: %s", mon_dir, self._monitor_html)
+        except Exception as e:  # 隔离：监测初始化失败绝不阻断训练
+            self._monitor = None
+            logger.warning("SSL training monitor disabled (init failed): %s", e)
+
+    def _monitor_log_epoch(self, epoch: int, train_metrics: Dict[str, float],
+                           *, lr: float, gpu_peak_mib, wall_time_s: float,
+                           is_best: bool, last_epoch: bool) -> None:
+        """落盘一个 epoch 并按 ``update_every`` 节奏重渲染 HTML（异常隔离）。"""
+        if self._monitor is None:
+            return
+        mc = self._monitor_cfg
+        try:
+            self._monitor.log_epoch(
+                epoch, train=train_metrics, val=None, lr=lr,
+                gpu_peak_mib=gpu_peak_mib, wall_time_s=wall_time_s,
+                is_best=is_best)
+        except Exception as e:
+            logger.warning("SSL monitor: log_epoch failed at epoch %d: %s",
+                           epoch + 1, e)
+            return
+        every = max(int(mc.update_every), 1)
+        if is_best or last_epoch or ((epoch + 1) % every == 0):
+            self._monitor_render(
+                auto_reload_seconds=int(mc.auto_reload_seconds))
+
+    def _monitor_render(self, *, auto_reload_seconds: int) -> None:
+        if self._monitor is None or self._monitor_html is None:
+            return
+        try:
+            from segtask_v1.monitor import MetricsHistory, write_dashboard
+
+            hist = MetricsHistory.from_dir(self._monitor.dir)
+            write_dashboard(hist, self._monitor_html,
+                            auto_reload_seconds=auto_reload_seconds)
+        except Exception as e:
+            logger.warning("SSL monitor: dashboard render failed: %s", e)
+
+    def _monitor_finalize(self, status: str) -> None:
+        if self._monitor is None:
+            return
+        try:
+            self._monitor.finalize(status)
+        except Exception as e:
+            logger.warning("SSL monitor: finalize failed: %s", e)
+        self._monitor_render(auto_reload_seconds=0)
+
+    # ------------------------------------------------------------------
+    # Model-health helpers（同母项目；仅 rank0 监测启用时调用）
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _global_grad_norm(self) -> "float | None":
+        """当前已 unscale 的全局梯度 L2 范数（末尾仅一次 .item() 同步）。"""
+        grads = [p.grad for p in self.method.parameters()
+                 if p.grad is not None]
+        if not grads:
+            return None
+        norms = torch._foreach_norm(grads, 2)
+        return float(torch.linalg.vector_norm(
+            torch.stack([n.float() for n in norms])).item())
+
+    @torch.no_grad()
+    def _global_weight_norm(self) -> "float | None":
+        """全部参数的全局 L2 范数（每 epoch 仅算一次）。"""
+        params = [p.detach() for p in self.method.parameters()]
+        if not params:
+            return None
+        norms = torch._foreach_norm(params, 2)
+        return float(torch.linalg.vector_norm(
+            torch.stack([n.float() for n in norms])).item())
+
+    def _collect_health_metrics(
+        self, out: Dict[str, float], *,
+        grad_norm_meter: AverageMeter, grad_norm_max: float,
+        nonfinite_steps: int, clipped_steps: int, opt_steps: int,
+        grad_clip_norm: float,
+    ) -> None:
+        """把本 epoch 聚合的健康指标并入 ``out``（仅写入有意义的键）。"""
+        if grad_norm_meter.count > 0:
+            out["grad_norm"] = grad_norm_meter.avg
+            out["grad_norm_max"] = grad_norm_max
+        out["nonfinite_steps"] = float(nonfinite_steps)
+        if grad_clip_norm > 0 and opt_steps > 0:
+            out["grad_clip_frac"] = clipped_steps / opt_steps
+        wn = self._global_weight_norm()
+        if wn is not None:
+            out["weight_norm"] = wn
+        if self._scaler_active:
+            out["amp_scale"] = float(self.scaler.get_scale())
+
+    # ------------------------------------------------------------------
     def _prepare(self, batch: Dict) -> Dict:
         """把 batch 内张量搬到 device 并转 fp32（非张量原样透传）。"""
         out: Dict = {}
@@ -188,6 +335,8 @@ class SSLTrainer:
                 out[k] = v.to(self.device, non_blocking=True).float()
             else:
                 out[k] = v
+        if self._memory_format is not None and "image" in out:
+            out["image"] = out["image"].to(memory_format=self._memory_format)
         return out
 
     def _export_state_dict(self) -> Dict:
@@ -306,7 +455,10 @@ class SSLTrainer:
 
         use_probe_select = self.probe is not None and bool(self.ssl.probe_select_best)
         for epoch in range(self.start_epoch, tc.epochs):
-            train_loss = self._train_epoch(epoch)
+            if (self._monitor is not None and self.device.type == "cuda"):
+                torch.cuda.reset_peak_memory_stats(self.device)
+            epoch_t0 = timer.elapsed()
+            train_loss, train_metrics = self._train_epoch(epoch)
             elapsed = timer.elapsed()
             logger.info("[SSL epoch %d/%d] loss=%.5f lr=%.2e (%.1fs)",
                         epoch + 1, tc.epochs, train_loss,
@@ -348,12 +500,27 @@ class SSLTrainer:
                 self._save(epoch, "last")
                 self._save_resume(epoch)
 
+            # --- 监控面板：逐 epoch 落盘 + 节奏化重渲染（异常隔离）---
+            if self._monitor is not None:
+                if probe_dice is not None:
+                    train_metrics["probe_dice"] = float(probe_dice)
+                gpu_peak = (
+                    torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
+                    if self.device.type == "cuda" else None)
+                is_best = (improved_probe if use_probe_select
+                           else improved_loss)
+                self._monitor_log_epoch(
+                    epoch, train_metrics, lr=self.scheduler.get_lr(),
+                    gpu_peak_mib=gpu_peak, wall_time_s=elapsed - epoch_t0,
+                    is_best=is_best, last_epoch=is_last)
+
         # 保底：若选模策略从未保存过 best（如探针全程失败），最后兜底存一次。
         if not self._best_saved:
             self._save(tc.epochs - 1, "best")
             logger.info("No best ckpt selected during training; saved final "
                         "state as ssl_best.pt (fallback).")
 
+        self._monitor_finalize("finished")
         logger.info("SSL pretrain done. best_loss=%.5f, best_probe=%.4f. Use "
                     "ssl_best.pt via train.pretrain for downstream.",
                     self.best_loss, self.best_probe)
@@ -388,12 +555,21 @@ class SSLTrainer:
         for g in grads:
             dist.all_reduce(g, op=dist.ReduceOp.SUM)
 
-    def _train_epoch(self, epoch: int) -> float:
+    def _train_epoch(self, epoch: int) -> "tuple[float, Dict[str, float]]":
+        """单 epoch 训练；返回 (平均 loss, 监控指标 dict（含方法 logs 与健康
+        指标，仅监控启用时采集）)。"""
         self.method.train()
         loss_meter = AverageMeter()
+        log_meters: Dict[str, AverageMeter] = {}
         tc = self.cfg.train
         accum = self.grad_accum_steps
         total_steps = len(self.train_loader)
+        health_on = self._monitor is not None and self._health_monitor
+        grad_norm_meter = AverageMeter()
+        grad_norm_max = 0.0
+        nonfinite_steps = 0
+        clipped_steps = 0
+        opt_steps = 0
 
         # DDP：每 epoch 重置 DistributedSampler 的洗牌种子。
         if self._train_sampler is not None:
@@ -424,6 +600,7 @@ class SSLTrainer:
             step_loss = loss.item() * effective_accum
             if not math.isfinite(step_loss):
                 group_has_nonfinite = True
+                nonfinite_steps += 1
 
             is_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_boundary:
@@ -448,21 +625,40 @@ class SSLTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()
                 else:
+                    grad_norm_val = None
                     if tc.grad_clip_norm > 0:
                         self.scaler.unscale_(self.optimizer)
-                        nn.utils.clip_grad_norm_(
+                        gn = nn.utils.clip_grad_norm_(
                             self.method.parameters(), tc.grad_clip_norm)
+                        grad_norm_val = float(gn)
+                    elif health_on and self._health_grad_norm_when_no_clip:
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm_val = self._global_grad_norm()
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()
                     if self.ema is not None:
                         self.ema.update(unwrap_compile(self.method.module))
+                    opt_steps += 1
+                    if health_on and grad_norm_val is not None and \
+                            math.isfinite(grad_norm_val):
+                        grad_norm_meter.update(grad_norm_val)
+                        grad_norm_max = max(grad_norm_max, grad_norm_val)
+                        if (tc.grad_clip_norm > 0
+                                and grad_norm_val > tc.grad_clip_norm):
+                            clipped_steps += 1
                 self._global_step += 1
                 self.method.on_after_step(self._global_step)
 
             if math.isfinite(step_loss):
                 loss_meter.update(step_loss, bs)
+                if self._monitor is not None:
+                    for k, v in logs.items():
+                        fv = float(v)
+                        if math.isfinite(fv):
+                            log_meters.setdefault(
+                                k, AverageMeter()).update(fv, bs)
             else:
                 logger.warning(
                     "Non-finite SSL loss at epoch %d step %d/%d; excluded "
@@ -472,7 +668,24 @@ class SSLTrainer:
                 logger.debug("  [%d/%d] loss=%.5f lr=%.2e",
                              step + 1, total_steps, step_loss,
                              self.scheduler.get_lr())
-        return loss_meter.avg
+
+        metrics: Dict[str, float] = {"loss": loss_meter.avg}
+        if self._monitor is not None:
+            for k, m in log_meters.items():
+                metrics[k] = m.avg
+            if health_on:
+                try:
+                    self._collect_health_metrics(
+                        metrics, grad_norm_meter=grad_norm_meter,
+                        grad_norm_max=grad_norm_max,
+                        nonfinite_steps=nonfinite_steps,
+                        clipped_steps=clipped_steps, opt_steps=opt_steps,
+                        grad_clip_norm=tc.grad_clip_norm)
+                except Exception:  # 监测失败绝不打断训练
+                    logger.warning(
+                        "SSL health metric collection failed; skipping.",
+                        exc_info=True)
+        return loss_meter.avg, metrics
 
 
 __all__ = ["SSLTrainer"]
