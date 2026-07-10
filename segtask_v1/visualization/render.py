@@ -3,9 +3,10 @@
 把若干 ``VisGraph`` 序列化为内嵌 JSON，配一段原生 HTML/CSS/JS：
 * 顶部标签页切换 Data / Model / Predict；
 * 布局由一套**只依赖图结构与追踪形状**的确定性版面规则在浏览器内计算：
-  每个容器内最长路径分层；主干脊柱中轴对齐并按分辨率级（``res``）右缩进呈
-  U 型；并联分支/输出头排脊柱右侧、超宽自动换行；跳连/反馈边走容器左侧车道、
-  残差走右侧车道（区间打包分道）。无任何架构名/模块名特判，对任意新模块通用；
+  每个容器内最长路径分层；主干脊柱严格共轴（单一主轴，分辨率级 ``res`` 以
+  卡片徽标呈现，不参与横坐标）；并联分支/输出头排脊柱右侧、超宽自动换行；
+  跳连/反馈边走容器左侧车道、残差走右侧车道（区间打包分道）。无任何架构名/
+  模块名特判，对任意新模块通用；
   折叠/展开任意容器即按可见锚点重新计算，结果幂等；
 * 双击任意框 → 右侧详情抽屉展示完整参数；单击顶层框或其直接子模块（stem/stage 级）→ 聚焦高亮其直接连接。
 
@@ -172,6 +173,15 @@ svg.edges-top { z-index: 30; }
 .k-merge .title { justify-content: center; gap: 6px; font-size: 13px;
   font-weight: 800; color: var(--c-merge); }
 .k-merge .badge { display: none; }
+/* 分辨率徽标：卡片/容器标题角标，只补信息不动布局。 */
+.res-tag { font-size: 9.5px; font-weight: 700; color: #0e7490;
+  border: 1px solid #67e8f9; background: #ecfeff; border-radius: 4px;
+  padding: 0 3px; line-height: 1.3; align-self: center;
+  font-variant-numeric: tabular-nums; white-space: nowrap; }
+#drc-badge { display: none; margin-left: 10px; font-size: 11.5px;
+  font-weight: 700; color: #b91c1c; background: #fef2f2;
+  border: 1px solid #fca5a5; border-radius: 6px; padding: 1px 7px;
+  cursor: pointer; vertical-align: middle; }
 .k-merge .kv { text-align: center; margin-top: 2px; }
 .k-head   { border-left-color: var(--c-head);   background: var(--c-head-bg); }
 .k-output { border-left-color: var(--c-output); background: var(--c-output-bg); }
@@ -245,7 +255,7 @@ svg.edges-top { z-index: 30; }
 # 1. 每个容器内对兄弟做最长路径分层（rank）；主干脊柱 = 入口→主输出的最长
 #    路径。横坐标语义全层级统一：**单一主轴** —— 每个容器的脊柱节点严格共
 #    一条竖线，展开容器用其内部主轴锚点对位到父级同一竖线，任意嵌套深度下
-#    主线均为笔直单列（分辨率信息由卡片形状承载，不参与横坐标）；
+#    主线均为笔直单列（分辨率信息以卡片角标徽标呈现，不参与横坐标）；
 # 2. 非脊柱兄弟（并联分支/输出头）排在脊柱右侧，同 rank 超宽自动换行（续排行
 #    与首行左缘对齐）；无脊柱行首节点锚到主轴，barycenter 只决定行内排序；
 #    同容器同类叶卡宽度取最大统一，消除中心对齐锯齿感；
@@ -264,8 +274,8 @@ const EDGE_STYLE = {
   // 反馈/上行边（rank 不前进的 forward）：独立线型区分方向语义。
   feedback: { color: "#7c3aed", width: "1.8", dash: "7 4", marker: "arrow-fb" },
 };
-// 布局常量：行间距/列间距/车道宽/分辨率缩进/单行最大内容宽/容器内边距。
-const LC = { GAPY: 40, GAPX: 26, LANE_W: 11, LANE_PAD: 8, INDENT: 26,
+// 布局常量：行间距/列间距/车道宽/单行最大内容宽/容器内边距。
+const LC = { GAPY: 40, GAPX: 26, LANE_W: 11, LANE_PAD: 8,
              MAXROW: 1500, PAD: 12, HEAD_GAP: 6 };
 const STATE = {};       // flowKey -> 每视图状态（折叠集合/聚焦/布局缓存）
 let measBox = null;     // 隐藏量测箱
@@ -279,6 +289,8 @@ function el(tag, cls, txt) {
 function svgNS(tag) {
   return document.createElementNS("http://www.w3.org/2000/svg", tag);
 }
+// 分辨率徽标文案：res 级 n → 空间尺寸为输入的 1/2^n（res=0 不显示）。
+function resTag(res) { return "1/" + Math.pow(2, res) + "\u00D7"; }
 
 // ---------------- IR 索引 ----------------
 function indexGraph(g) {
@@ -297,6 +309,7 @@ function leafCard(node, st) {
   const title = el("div", "title");
   title.appendChild(el("span", null, node.label));
   title.appendChild(el("span", "badge k-" + node.kind, node.kind));
+  if (node.res) title.appendChild(el("span", "res-tag", resTag(node.res)));
   card.appendChild(title);
   const keys = Object.keys(node.key_info || {});
   if (keys.length) {
@@ -324,6 +337,7 @@ function stageBox(node, st, collapsed) {
   const caret = el("span", "caret", "\u25BC");
   head.appendChild(caret);
   head.appendChild(el("span", null, node.label));
+  if (node.res) head.appendChild(el("span", "res-tag", resTag(node.res)));
   const sk = Object.entries(node.key_info || {})
     .map(([k, v]) => k + " " + v).join("  ·  ");
   if (sk) head.appendChild(el("span", "s-kv", sk));
@@ -592,13 +606,14 @@ function computeLayout(st, veds) {
     ids.forEach(k => { size[k] = layoutBox(k); });
     // 同容器同类叶卡宽度取最大统一（仅叶卡；容器框保持自适应），
     // 主轴对齐之外左右边缘也对齐，消除中心对齐的锯齿感。
+    // merge 胶囊保持紧凑药丸（fit-content 意图），不参与等宽统一。
     const kindMaxW = {};
     kidNodes.forEach(n => {
-      if ((st.ix.kids[n.id] || []).length) return;
+      if ((st.ix.kids[n.id] || []).length || n.kind === "merge") return;
       kindMaxW[n.kind] = Math.max(kindMaxW[n.kind] || 0, size[n.id].w);
     });
     kidNodes.forEach(n => {
-      if ((st.ix.kids[n.id] || []).length) return;
+      if ((st.ix.kids[n.id] || []).length || n.kind === "merge") return;
       const w = kindMaxW[n.kind];
       if (w > size[n.id].w) { size[n.id].w = w; size[n.id].ax = w / 2; }
     });
@@ -876,6 +891,22 @@ function computeLayout(st, veds) {
     });
   };
 
+  // 行间空隙的水平穿越段逐条错开：同一空隙内多条边不共线（递增分槽，
+  // 交替正负、无回绕；间距过密由 DRC R-COLIN 兜底告警）。
+  const slot = (n, step) =>
+    (n % 2 === 0 ? 1 : -1) * Math.floor(n / 2) * step;
+  const gapCnt = {};
+  const gapY = (base) => {
+    const n = gapCnt[Math.round(base)] = (gapCnt[Math.round(base)] || 0) + 1;
+    return base + slot(n, 4);
+  };
+  // 穿越段的竖直落线同理错开：同一竖列（卡中轴）上多条不共线。
+  const colCnt = {};
+  const gapX = (base) => {
+    const n = colCnt[Math.round(base)] = (colCnt[Math.round(base)] || 0) + 1;
+    return base + slot(n, 5);
+  };
+
   const routes = [];
   const folds = [];   // 层间折弯的直连边：先收集，再按互不交叉的次序统一分配中线 y
   veds.forEach((e, i) => {
@@ -889,9 +920,16 @@ function computeLayout(st, veds) {
     let pts;
     if (lane == null) {
       // 垂直直连：A 底 → B 顶，necessary 时在层间水平折弯。
+      // 同源扇出/同宿扇入按 net 干线布线（原理图语义）：一个输出引脚
+      // 只从底缘中心单点出线，同 net 各分支共用一条母线 y，分叉处由
+      // junction 圆点标注相连；单边时保持逐边分脚错开。
       const kOut = e.vs + "|B", kIn = e.vt + "|T";
-      const ax = A.x + A.w / 2 + stagger(outIdx[i] || 0, outCnt[kOut], A.w * 0.6);
-      const bx = B.x + B.w / 2 + stagger(inIdx[i] || 0, inCnt[kIn], B.w * 0.6);
+      const netO = outCnt[kOut] > 1 ? key + "|o|" + e.vs : null;
+      const netI = inCnt[kIn] > 1 ? key + "|i|" + e.vt : null;
+      const ax = netO ? A.x + A.w / 2
+        : A.x + A.w / 2 + stagger(outIdx[i] || 0, outCnt[kOut], A.w * 0.6);
+      const bx = netI ? B.x + B.w / 2
+        : B.x + B.w / 2 + stagger(inIdx[i] || 0, inCnt[kIn], B.w * 0.6);
       const y0 = A.y + A.h, y1 = B.y;
       if (y1 < y0 + 4) {
         // 目标不在源下方（挂靠节点与源同带等）：改走水平直连（侧缘出入）。
@@ -906,9 +944,10 @@ function computeLayout(st, veds) {
         }
       } else if (Math.abs(ax - bx) < 1) pts = [[ax, y0], [ax, y1]];
       else {
-        // 折弯边：先占位，稍后按互不交叉次序统一分配中线 y。
+        // 折弯边：先占位，稍后按互不交叉次序统一分配中线 y（同 net 共用）。
         const r = { meta: e, pts: null };
-        folds.push({ key, ax, bx, y0, y1, route: r, ord: i });
+        folds.push({ key, ax, bx, y0, y1, route: r, ord: i,
+                     net: netO || netI });
         routes.push(r);
         return;
       }
@@ -939,14 +978,14 @@ function computeLayout(st, veds) {
       pts = [];
       if (blockedH(ci, ax, laneX, ay, skip)) {
         // 源侧穿框：改从源底缘出，经行间空隙拐入车道。
-        const ax2 = A.x + A.w / 2, gy = A.y + A.h + LC.GAPY / 2;
+        const ax2 = gapX(A.x + A.w / 2), gy = gapY(A.y + A.h + LC.GAPY / 2);
         pts.push([ax2, A.y + A.h], [ax2, gy], [laneX, gy]);
       } else {
         pts.push([ax, ay], [laneX, ay]);
       }
       if (blockedH(ci, laneX, bx, by, skip)) {
         // 目标侧穿框：改经行间空隙从目标顶缘进。
-        const bx2 = B.x + B.w / 2, gy = B.y - LC.GAPY / 2;
+        const bx2 = gapX(B.x + B.w / 2), gy = gapY(B.y - LC.GAPY / 2);
         pts.push([laneX, gy], [bx2, gy], [bx2, B.y]);
       } else {
         pts.push([laneX, by], [bx, by]);
@@ -972,40 +1011,79 @@ function computeLayout(st, veds) {
     flush();
   });
   function assignFoldY(fs) {
-    const n = fs.length;
+    // 同 net（同源扇出/同宿汇入）的折弯边合并为一个单元：共用一条母线 y，
+    // 干线单点引出，分支处自然形成 T 型分叉（junction 圆点标注）。
+    const uMap = {}, units = [];
+    fs.forEach(f => {
+      const k = f.net || ("$" + f.ord);
+      if (!uMap[k]) { uMap[k] = { ms: [], ord: f.ord }; units.push(uMap[k]); }
+      uMap[k].ms.push(f);
+      uMap[k].ord = Math.min(uMap[k].ord, f.ord);
+    });
+    const n = units.length;
     const lo = (f) => Math.min(f.ax, f.bx), hi = (f) => Math.max(f.ax, f.bx);
-    const after = fs.map(() => []), deg = fs.map(() => 0);
+    const after = units.map(() => []), deg = units.map(() => 0);
     for (let a = 0; a < n; a++) for (let b = 0; b < n; b++) {
       if (a === b) continue;
-      const e = fs[a], f = fs[b];
-      // e 的水平段跨过 f 的上竖段（f.ax）→ f 须在 e 之上；跨过 f 的下竖段
-      // （f.bx）→ e 须在 f 之上。
-      if (lo(e) < f.ax && f.ax < hi(e)) { after[b].push(a); deg[a]++; }
-      if (lo(e) < f.bx && f.bx < hi(e)) { after[a].push(b); deg[b]++; }
+      // 单元 a 的水平段跨过单元 b 的上竖段（f.ax）→ b 须在 a 之上；
+      // 跨过 b 的下竖段（f.bx）→ a 须在 b 之上。
+      let bUp = false, aUp = false;
+      units[a].ms.forEach(e => units[b].ms.forEach(f => {
+        if (lo(e) < f.ax && f.ax < hi(e)) bUp = true;
+        if (lo(e) < f.bx && f.bx < hi(e)) aUp = true;
+      }));
+      if (bUp) { after[b].push(a); deg[a]++; }
+      if (aUp) { after[a].push(b); deg[b]++; }
     }
     const order = [], q = [];
     for (let x = 0; x < n; x++) if (!deg[x]) q.push(x);
-    q.sort((a, b) => fs[a].ord - fs[b].ord);
+    q.sort((a, b) => units[a].ord - units[b].ord);
     while (q.length) {
       const u = q.shift();
       order.push(u);
       after[u].forEach(v => { if (--deg[v] === 0) q.push(v); });
-      q.sort((a, b) => fs[a].ord - fs[b].ord);
+      q.sort((a, b) => units[a].ord - units[b].ord);
     }
     for (let x = 0; x < n; x++)          // 约束成环时兜底保序
       if (order.indexOf(x) < 0) order.push(x);
     let gLo = Infinity, gHi = -Infinity;
     fs.forEach(f => { gLo = Math.min(gLo, f.y0); gHi = Math.max(gHi, f.y1); });
-    order.forEach((u, rk) => {
-      const f = fs[u];
-      const t = gLo + (rk + 1) / (n + 1) * (gHi - gLo);
-      const my = Math.max(f.y0 + 5, Math.min(f.y1 - 5, t));
-      f.route.pts = [[f.ax, f.y0], [f.ax, my], [f.bx, my], [f.bx, f.y1]];
+    const used = [];   // 已占用母线：{y, x0, x1}，重叠时逐槽错开避免共线
+    order.forEach((ui, rk) => {
+      const u = units[ui];
+      let uy0 = -Infinity, uy1 = Infinity, ux0 = Infinity, ux1 = -Infinity;
+      u.ms.forEach(f => {
+        uy0 = Math.max(uy0, f.y0); uy1 = Math.min(uy1, f.y1);
+        ux0 = Math.min(ux0, lo(f)); ux1 = Math.max(ux1, hi(f));
+      });
+      // 母线 y 基准：扇出 net 贴源侧第一条空隙（干线短引出，长程走分支
+      // 竖列，不在主轴上拖长线）；扇入 net 对称贴宿侧；单边沿簇带均匀铺开。
+      const net = u.ms[0].net;
+      // net 母线经 gapY 分槽：与车道边经行间空隙的改道段共用同一分槽
+      // 计数器，两个分配器互不共线。
+      const base = net
+        ? gapY(net.indexOf("|o|") >= 0 ? uy0 + LC.GAPY / 2
+                                       : uy1 - LC.GAPY / 2)
+        : gLo + (rk + 1) / (n + 1) * (gHi - gLo);
+      const clamp = (t) => Math.max(uy0 + 5, Math.min(uy1 - 5, t));
+      let my = clamp(base);
+      const clash = (yy) => used.some(o =>
+        Math.abs(o.y - yy) < 4 && o.x0 < ux1 && ux0 < o.x1);
+      for (let s = 1; clash(my) && s < 24; s++) {
+        const cand = clamp(base + slot(s + 1, 4));
+        if (!clash(cand)) { my = cand; break; }
+        my = cand;
+      }
+      used.push({ y: my, x0: ux0, x1: ux1 });
+      u.ms.forEach(f => {
+        f.route.pts = [[f.ax, f.y0], [f.ax, my], [f.bx, my], [f.bx, f.y1]];
+      });
     });
   }
 
-  // 兜底避框：跨容器边的竖直段可能纵穿无关实心盒（叶子/折叠容器；展开
-  // 容器只是虚线外框，穿过无妨）。逐段检测，穿框处沿盒近侧缘绕行。
+  // 兜底避框：跨容器边的竖直段/水平段可能穿越无关实心盒（叶子/折叠容器；
+  // 展开容器只是虚线外框，穿过无妨）。逐段检测，穿框处沿盒近侧缘绕行。
+  // 直接基于实际绘制坐标（abs 深层锚点），与投影几何预检无盲区。
   const hasKids = {};
   Object.keys(abs).forEach(id => {
     const p = (st.ix.byId[id] || {}).parent_id;
@@ -1031,14 +1109,213 @@ function computeLayout(st, veds) {
           const yb = y1 > y0 ? g.y + g.h + 6 : g.y - 6;
           out.push([x0, ya], [side, ya], [side, yb], [x0, yb]);
         });
+      } else if (Math.abs(y1 - y0) < 0.5 && Math.abs(x1 - x0) > 1) {
+        // 水平段穿框：沿盒上/下近侧缘绕行（挂靠列同带多头等场景）。
+        const lo = Math.min(x0, x1), hi = Math.max(x0, x1);
+        const hit = solid
+          .filter(id => id !== r.meta.vs && id !== r.meta.vt)
+          .map(id => abs[id])
+          .filter(g => g.y + 1 < y0 && y0 < g.y + g.h - 1
+                    && g.x + 1 < hi && lo < g.x + g.w - 1)
+          .sort((a, b) => (x1 > x0 ? a.x - b.x : b.x - a.x));
+        hit.forEach(g => {
+          const edge = (y0 - g.y < g.y + g.h - y0) ? g.y - 6 : g.y + g.h + 6;
+          const xa = x1 > x0 ? g.x - 7 : g.x + g.w + 7;
+          const xb = x1 > x0 ? g.x + g.w + 7 : g.x - 7;
+          out.push([xa, y0], [xa, edge], [xb, edge], [xb, y0]);
+        });
       }
       out.push([x1, y1]);
     }
     r.pts = out;
   });
 
-  return { geo: abs, routes, W: Math.ceil(rootSize.w) + 8,
+  const marks = layoutMarks(routes);
+
+  return { geo: abs, routes, marks, W: Math.ceil(rootSize.w) + 8,
            H: Math.ceil(rootSize.h) + 8 };
+}
+
+// ---------------- EDA 制图标注（原理图规范） ----------------
+// junction —— 同 net（同源扇出/同宿汇入）走线的 T 型相触点画实心圆点＝相连；
+// hop —— 正交交叉处水平段画半圆跳线＝交叉不连接。纯几何规则，无特判。
+function layoutMarks(routes) {
+  const segsOf = (r) => {
+    const s = [];
+    for (let i = 1; i < r.pts.length; i++) {
+      const [x0, y0] = r.pts[i - 1], [x1, y1] = r.pts[i];
+      if (Math.abs(y1 - y0) < 0.5 && Math.abs(x1 - x0) >= 0.5)
+        s.push({ h: true, seg: i - 1, y: y0,
+                 x0: Math.min(x0, x1), x1: Math.max(x0, x1) });
+      else if (Math.abs(x1 - x0) < 0.5 && Math.abs(y1 - y0) >= 0.5)
+        s.push({ h: false, seg: i - 1, x: x0,
+                 y0: Math.min(y0, y1), y1: Math.max(y0, y1) });
+    }
+    return s;
+  };
+  const all = routes.filter(r => r.pts && r.pts.length > 1)
+    .map(r => ({ r, segs: segsOf(r) }));
+  const sameNet = (a, b) =>
+    a.r.meta.vs === b.r.meta.vs || a.r.meta.vt === b.r.meta.vt;
+  const onSeg = (s, x, y) => s.h
+    ? (Math.abs(y - s.y) < 0.8 && s.x0 - 0.5 <= x && x <= s.x1 + 0.5)
+    : (Math.abs(x - s.x) < 0.8 && s.y0 - 0.5 <= y && y <= s.y1 + 0.5);
+  const junctions = [], seen = {};
+  for (let a = 0; a < all.length; a++) for (let b = 0; b < all.length; b++) {
+    if (a === b || !sameNet(all[a], all[b])) continue;
+    // A 的端点/折点落在 B 的线段上 → T 型分叉（连接点）。
+    all[a].r.pts.forEach((p, pi) => {
+      const isEnd = pi === 0 || pi === all[a].r.pts.length - 1;
+      all[b].segs.forEach(s => {
+        if (!onSeg(s, p[0], p[1])) return;
+        // 排除两边共用的卡缘端子点（那是引脚，不是走线分叉）。
+        const bp = all[b].r.pts, b0 = bp[0], b1 = bp[bp.length - 1];
+        const near = (q) => Math.abs(p[0] - q[0]) < 0.8
+                         && Math.abs(p[1] - q[1]) < 0.8;
+        if (isEnd && (near(b0) || near(b1))) return;
+        const k = Math.round(p[0]) + "," + Math.round(p[1]);
+        if (seen[k]) return;
+        seen[k] = 1;
+        junctions.push({ x: p[0], y: p[1], kind: all[a].r.meta.kind,
+                         fb: all[a].r.meta.fb, r: all[a].r });
+      });
+    });
+  }
+  const isJ = (x, y) =>
+    junctions.some(j => Math.abs(j.x - x) < 3 && Math.abs(j.y - y) < 3);
+  // 交叉跳线：H×V 严格内部交叉，hop 记到水平段上（连接点除外）。
+  all.forEach(A => { A.r.hops = {}; });
+  for (let a = 0; a < all.length; a++) for (let b = 0; b < all.length; b++) {
+    if (a === b) continue;
+    all[a].segs.forEach(h => {
+      if (!h.h) return;
+      all[b].segs.forEach(v => {
+        if (v.h) return;
+        if (h.x0 + 2 < v.x && v.x < h.x1 - 2
+            && v.y0 + 2 < h.y && h.y < v.y1 - 2 && !isJ(v.x, h.y))
+          (all[a].r.hops[h.seg] = all[a].r.hops[h.seg] || []).push(v.x);
+      });
+    });
+  }
+  return junctions;
+}
+
+// ---------------- DRC 布局自检（借鉴 EDA design rule check） ----------------
+// 布完自动检查而非人审：R-OVL 实心卡片互相重叠；R-XNODE 线段穿越无关
+// 实心卡内部；R-COLIN 异 net 平行线段共线重叠。违规仅告警不阻断渲染；
+// 结果写入 #drc-report（data-* 为违规数）供无头浏览器回归测试抓取，
+// 并在顶栏展示红徽标（点击列违规详情），自检结果对看图人可见。
+// 成对检查为 O(S²)：超大图（线段数超阈）时默认跳过，加 ?drc=1 强制跑。
+const DRC_SEG_LIMIT = 4000;
+function layoutDRC(st, lay) {
+  const forced = /[?&]drc=1/.test(location.search);
+  let nSeg = 0;
+  lay.routes.forEach(r => { if (r.pts) nSeg += r.pts.length - 1; });
+  if (!forced && nSeg > DRC_SEG_LIMIT) {
+    console.warn("[DRC] " + st.key + " 跳过（线段数 " + nSeg
+                 + " 超阈 " + DRC_SEG_LIMIT + "，加 ?drc=1 强制跑）");
+    return;
+  }
+  const v = [];
+  const hasKid = {};
+  Object.keys(lay.geo).forEach(id => {
+    const p = (st.ix.byId[id] || {}).parent_id;
+    if (p) hasKid[p] = true;
+  });
+  const solid = Object.keys(lay.geo).filter(id => !hasKid[id])
+    .map(id => ({ id, g: lay.geo[id] }));
+  for (let i = 0; i < solid.length; i++)
+    for (let j = i + 1; j < solid.length; j++) {
+      const a = solid[i].g, b = solid[j].g;
+      if (a.x + 1 < b.x + b.w && b.x + 1 < a.x + a.w
+          && a.y + 1 < b.y + b.h && b.y + 1 < a.y + a.h)
+        v.push("R-OVL: " + solid[i].id + " × " + solid[j].id
+               + " @(" + Math.round(Math.max(a.x, b.x)) + ","
+               + Math.round(Math.max(a.y, b.y)) + ")");
+    }
+  const segs = [];
+  lay.routes.forEach((r, ri) => {
+    if (!r.pts) return;
+    for (let i = 1; i < r.pts.length; i++) {
+      const [x0, y0] = r.pts[i - 1], [x1, y1] = r.pts[i];
+      if (Math.abs(y1 - y0) < 0.5 && Math.abs(x1 - x0) >= 0.5)
+        segs.push({ ri, meta: r.meta, h: true, y: y0,
+                    x0: Math.min(x0, x1), x1: Math.max(x0, x1) });
+      else if (Math.abs(x1 - x0) < 0.5 && Math.abs(y1 - y0) >= 0.5)
+        segs.push({ ri, meta: r.meta, h: false, x: x0,
+                    y0: Math.min(y0, y1), y1: Math.max(y0, y1) });
+    }
+  });
+  segs.forEach(s => {
+    solid.forEach(({ id, g }) => {
+      if (id === s.meta.vs || id === s.meta.vt) return;
+      const hit = s.h
+        ? (g.y + 1.5 < s.y && s.y < g.y + g.h - 1.5
+           && s.x0 < g.x + g.w - 1.5 && g.x + 1.5 < s.x1)
+        : (g.x + 1.5 < s.x && s.x < g.x + g.w - 1.5
+           && s.y0 < g.y + g.h - 1.5 && g.y + 1.5 < s.y1);
+      if (hit) v.push("R-XNODE: " + s.meta.vs + "→" + s.meta.vt
+                      + " 穿越 " + id + " @(" + Math.round(s.h ? s.x0 : s.x)
+                      + "," + Math.round(s.h ? s.y : s.y0) + ")");
+    });
+  });
+  const sameNet = (a, b) => a.meta.vs === b.meta.vs || a.meta.vt === b.meta.vt;
+  for (let i = 0; i < segs.length; i++)
+    for (let j = i + 1; j < segs.length; j++) {
+      const a = segs[i], b = segs[j];
+      if (a.ri === b.ri || a.h !== b.h || sameNet(a, b)) continue;
+      const co = a.h
+        ? (Math.abs(a.y - b.y) < 0.8 && Math.min(a.x1, b.x1)
+           - Math.max(a.x0, b.x0) > 4)
+        : (Math.abs(a.x - b.x) < 0.8 && Math.min(a.y1, b.y1)
+           - Math.max(a.y0, b.y0) > 4);
+      if (co) v.push("R-COLIN: " + a.meta.vs + "→" + a.meta.vt + " ∥ "
+                     + b.meta.vs + "→" + b.meta.vt + " @"
+                     + (a.h ? "y=" + Math.round(a.y) + " x∈["
+                          + Math.round(Math.max(a.x0, b.x0)) + ","
+                          + Math.round(Math.min(a.x1, b.x1)) + "]"
+                        : "x=" + Math.round(a.x) + " y∈["
+                          + Math.round(Math.max(a.y0, b.y0)) + ","
+                          + Math.round(Math.min(a.y1, b.y1)) + "]"));
+    }
+  window.__DRC = window.__DRC || {};
+  window.__DRC[st.key] = v;
+  window.__LAY = window.__LAY || {};   // DEBUG：暴露布局供控制台排查违规
+  window.__LAY[st.key] = lay;
+  if (v.length) console.warn("[DRC] " + st.key, v);
+  let d = document.getElementById("drc-report");
+  if (!d) {
+    d = el("div");
+    d.id = "drc-report";
+    d.style.display = "none";
+    document.body.appendChild(d);
+  }
+  d.setAttribute("data-" + st.key, String(v.length));
+  d.textContent = JSON.stringify(window.__DRC);
+  drcBadge();
+}
+
+// 顶栏 DRC 徽标：汇总各视图违规数，非零时显示，点击列详情。
+function drcBadge() {
+  let b = document.getElementById("drc-badge");
+  if (!b) {
+    const h1 = document.querySelector("header h1");
+    if (!h1) return;
+    b = el("span");
+    b.id = "drc-badge";
+    b.addEventListener("click", () => {
+      const lines = [];
+      Object.entries(window.__DRC || {}).forEach(([k, vs]) =>
+        vs.forEach(s => lines.push("[" + k + "] " + s)));
+      alert(lines.length ? lines.join("\n") : "DRC 无违规");
+    });
+    h1.appendChild(b);
+  }
+  let total = 0;
+  Object.values(window.__DRC || {}).forEach(vs => { total += vs.length; });
+  b.textContent = "DRC: " + total;
+  b.title = "布局自检违规数（点击看详情）";
+  b.style.display = total ? "inline-block" : "none";
 }
 
 // ---------------- 布局 + 绘制 ----------------
@@ -1054,6 +1331,7 @@ function relayout(st) {
   const eds = visEdges(st);
   const lay = computeLayout(st, eds);
   paint(st, lay);
+  layoutDRC(st, lay);
   st.laidOut = true;
 }
 
@@ -1072,10 +1350,25 @@ function svgDefs() {
 }
 
 // 正交折线 + 圆角：给定折点序列，输出带圆角拐弯的 path。
-function ortho(pts, r) {
+// hops（可选）：{段序: [x...]}，在对应水平段的交叉点画半圆跳线。
+function ortho(pts, r, hops) {
   r = (r == null) ? 7 : r;
   if (pts.length < 2) return "";
+  const HR = 4;   // 跳线半径
   let d = "M " + pts[0][0] + " " + pts[0][1];
+  const lineTo = (si, x0, y0, x1, y1) => {
+    const hs = hops && hops[si];
+    if (hs && Math.abs(y1 - y0) < 0.5 && Math.abs(x1 - x0) > 2 * HR + 2) {
+      const dir = x1 > x0 ? 1 : -1;
+      hs.slice().sort((a, b) => dir * (a - b)).forEach(hx => {
+        if ((hx - x0) * dir <= HR + 1 || (x1 - hx) * dir <= HR + 1) return;
+        d += " L " + (hx - dir * HR) + " " + y0
+           + " A " + HR + " " + HR + " 0 0 " + (dir > 0 ? 1 : 0) + " "
+           + (hx + dir * HR) + " " + y0;   // 拱顶恒朝上
+      });
+    }
+    d += " L " + x1 + " " + y1;
+  };
   for (let i = 1; i < pts.length - 1; i++) {
     const p0 = pts[i - 1], p1 = pts[i], p2 = pts[i + 1];
     const d1 = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) || 1;
@@ -1083,12 +1376,13 @@ function ortho(pts, r) {
     const rr = Math.min(r, d1 / 2, d2 / 2);
     const u1x = (p1[0] - p0[0]) / d1, u1y = (p1[1] - p0[1]) / d1;
     const u2x = (p2[0] - p1[0]) / d2, u2y = (p2[1] - p1[1]) / d2;
-    d += " L " + (p1[0] - u1x * rr) + " " + (p1[1] - u1y * rr)
-       + " Q " + p1[0] + " " + p1[1] + " "
+    lineTo(i - 1, p0[0], p0[1], p1[0] - u1x * rr, p1[1] - u1y * rr);
+    d += " Q " + p1[0] + " " + p1[1] + " "
        + (p1[0] + u2x * rr) + " " + (p1[1] + u2y * rr);
   }
   const last = pts.length - 1;
-  d += " L " + pts[last][0] + " " + pts[last][1];
+  lineTo(last - 1, pts[last - 1][0], pts[last - 1][1],
+         pts[last][0], pts[last][1]);
   return d;
 }
 
@@ -1148,11 +1442,12 @@ function paint(st, lay) {
 
   // 连线：结构化布局已给出每条边的正交折点（画布坐标系）。
   const edgeEls = [];
-  lay.routes.forEach(({ meta, pts }) => {
+  lay.routes.forEach((rt) => {
+    const meta = rt.meta, pts = rt.pts;
     const style = meta.fb ? EDGE_STYLE.feedback
                           : (EDGE_STYLE[meta.kind] || EDGE_STYLE.forward);
     const path = svgNS("path");
-    path.setAttribute("d", ortho(pts, 7));
+    path.setAttribute("d", ortho(pts, 7, rt.hops));
     path.setAttribute("fill", "none");
     path.setAttribute("stroke", style.color);
     path.setAttribute("stroke-width", style.width);
@@ -1193,6 +1488,22 @@ function paint(st, lay) {
     hit.addEventListener("mouseenter", () => hoverEdge(st, it, true));
     hit.addEventListener("mouseleave", () => hoverEdge(st, it, false));
     edgeEls.push(it);
+  });
+  // 连接圆点（junction dot）：同 net 走线 T 型分叉处，实心圆＝相连。
+  // 圆点归属到所在边，悬停/聚焦淡出时随边同步（无孤儿亮点）。
+  const edgeByRoute = new Map();
+  lay.routes.forEach((rt, i) => edgeByRoute.set(rt, edgeEls[i]));
+  (lay.marks || []).forEach(j => {
+    const stl = j.fb ? EDGE_STYLE.feedback
+                     : (EDGE_STYLE[j.kind] || EDGE_STYLE.forward);
+    const c = svgNS("circle");
+    c.setAttribute("cx", j.x);
+    c.setAttribute("cy", j.y);
+    c.setAttribute("r", "2.6");
+    c.setAttribute("fill", stl.color);
+    svgTop.appendChild(c);
+    const owner = edgeByRoute.get(j.r);
+    if (owner) (owner.dots = owner.dots || []).push(c);
   });
   st.rc = { nodeEls, edgeEls, svg, svgTop, canvas };
   applyFocus(st);
@@ -1250,6 +1561,7 @@ function hoverEdge(st, it, on) {
       e.path.setAttribute("stroke-width", e.baseW);
       e.path.style.opacity = "";
       if (e.txt) e.txt.style.opacity = "";
+      (e.dots || []).forEach(d => { d.style.opacity = ""; });
       if (e.path.parentNode !== e.home) e.home.appendChild(e.path);
       if (e.txt && e.txt.parentNode !== e.home) e.home.appendChild(e.txt);
     });
@@ -1260,6 +1572,7 @@ function hoverEdge(st, it, on) {
     const h = e === it;
     e.path.style.opacity = h ? "1" : "0.10";
     if (e.txt) e.txt.style.opacity = h ? "1" : "0.10";
+    (e.dots || []).forEach(d => { d.style.opacity = h ? "1" : "0.10"; });
     if (h) {
       e.path.setAttribute("stroke-width", String(parseFloat(e.baseW) + 1.4));
       rc.svgTop.appendChild(e.path);
@@ -1281,6 +1594,7 @@ function applyFocus(st) {
   rc.edgeEls.forEach(it => {
     it.path.style.opacity = "";
     if (it.txt) it.txt.style.opacity = "";
+    (it.dots || []).forEach(d => { d.style.opacity = ""; });
     if (it.path.parentNode !== it.home) it.home.appendChild(it.path);
     if (it.txt && it.txt.parentNode !== it.home) it.home.appendChild(it.txt);
   });
@@ -1327,6 +1641,7 @@ function applyFocus(st) {
     if (!internal) {
       it.path.style.opacity = "0.08";
       if (it.txt) it.txt.style.opacity = "0.08";
+      (it.dots || []).forEach(d => { d.style.opacity = "0.08"; });
     }
   });
 }
@@ -1402,6 +1717,9 @@ function init() {
   });
   renderMeta(order[0]);
   relayout(STATE[order[0]]);   // 其余标签页首次激活时才布局（懒加载）
+  // ?drc=1：强制布局全部标签页并输出 DRC 结果（供无头浏览器回归测试抓取）。
+  if (location.search.indexOf("drc") >= 0)
+    order.forEach(k => { if (!STATE[k].laidOut) relayout(STATE[k]); });
   // 字体异步换字会改变卡片实测尺寸：加载完成后失效量测缓存并重排。
   if (document.fonts && document.fonts.ready) {
     document.fonts.ready.then(() => {

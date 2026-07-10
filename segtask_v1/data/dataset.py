@@ -928,6 +928,10 @@ def _extract_cubic_patch(
             patch,
             list(zip(pad_before, pad_after)),
             mode="edge")
+    else:
+        # 无 padding 时切片是缓存卷的视图；强制 copy 防下游 in-place 操作
+        # 污染 LRU 缓存（与 extract_z_patch_padded 末尾的 .copy() 同理）。
+        patch = patch.copy()
 
     return patch
 

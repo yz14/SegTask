@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from segtask_v1.models.blocks import _CONV, INTERP_SMOOTH, ConvNormAct
 from segtask_v1.models.factory import build_model
-from segtask_v1.models.unet import SegmentationHead
+from segtask_v1.models.unet import SegmentationHead, _resize_logits
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,10 @@ class SSLReconModel(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.out_channels = int(out_channels)
+        self.spatial_dims = int(spatial_dims)
+        # patchN stem：decoder 最高分辨率 = 输入/stem_stride，forward 插值上采补回
+        # 输入分辨率（与 segtask UNet 主头同策略）。
+        self.stem_stride = int(encoder.stem_stride)
         self.recon_head = SegmentationHead(
             decoder.out_channels[-1], self.out_channels,
             spatial_dims=spatial_dims)
@@ -49,6 +53,8 @@ class SSLReconModel(nn.Module):
         enc_features = self.encoder(x)
         dec_features = self.decoder(enc_features)
         out = self.recon_head(dec_features[-1])
+        if self.stem_stride > 1:
+            out = _resize_logits(out, x.shape[2:], self.spatial_dims)
         if out.shape[2:] != x.shape[2:]:
             raise RuntimeError(
                 f"SSL recon output size mismatch: got {tuple(out.shape[2:])}, "

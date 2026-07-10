@@ -434,6 +434,67 @@ def test_model_input_shape_matches_real_pipeline_feed_seg3d():
     assert shape[1] == topo.in_channels
 
 
+def _find_chrome():
+    """找可用的 Chrome/Chromium 真实二进制（``--version`` 校验，排除包装脚本）。"""
+    import os
+    import shutil
+    import subprocess
+    names = [os.environ.get("CHROME_BIN"), "google-chrome",
+             "google-chrome-stable", "chromium", "chromium-browser", "chrome"]
+    for name in names:
+        p = name and (name if os.path.sep in name else shutil.which(name))
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            r = subprocess.run([p, "--version"], capture_output=True,
+                               text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if "Chrom" in (r.stdout + r.stderr):
+            return p
+    return None
+
+
+def test_layout_drc_clean(tmp_path):
+    """TODO#4 EDA 借鉴 P1 验收：黄金样本渲染后 DRC 违规数为 0。
+
+    渲染器内置 layoutDRC（卡片重叠 / 线穿卡 / 异 net 共线三条规则），
+    结果写入 ``#drc-report`` 的 ``data-<flow>`` 属性；本测试用无头浏览器
+    加载 ``?drc=1``（强制布局全部标签页）后抓取断言。布局质量由此从
+    人工截图核验升级为可回归的硬指标。无浏览器环境自动跳过。
+    """
+    chrome = _find_chrome()
+    if chrome is None:
+        pytest.skip("未找到 Chrome/Chromium，跳过 DRC 无头渲染测试")
+    import re
+    import subprocess
+
+    from segtask_v1.visualization.render import render_html
+
+    cfg = _load("seg2_5d.yaml")
+    model = build_model(cfg)
+    graphs = {
+        "data": build_data_flow(cfg),
+        "model": build_model_flow(cfg, model, trace_shapes=True),
+        "predict": build_predict_flow(cfg),
+    }
+    out = tmp_path / "drc.html"
+    out.write_text(render_html(graphs, ["data", "model", "predict"]),
+                   encoding="utf-8")
+    dom = subprocess.run(
+        [chrome, "--headless=new", "--disable-gpu", "--no-sandbox",
+         "--virtual-time-budget=15000", "--dump-dom",
+         f"file://{out}?drc=1"],
+        capture_output=True, text=True, timeout=120).stdout
+    m = re.search(r'<div[^>]*id="drc-report"[^>]*>', dom)
+    assert m, "渲染页面缺少 #drc-report（布局 JS 可能报错未执行）"
+    for flow in ("data", "model", "predict"):
+        got = re.search(rf'data-{flow}="(\d+)"', m.group(0))
+        assert got, f"{flow}: DRC 未产出结果"
+        assert got.group(1) == "0", \
+            f"{flow}: DRC 违规 {got.group(1)} 项，详见页面 console/#drc-report"
+
+
 def test_model_input_spatial_cubic_keep_native_multi_res_matches_patch_size():
     cfg = load_config(str(_CONFIGS / "seg3d.yaml"))
     cfg.data.patch_mode = "cubic"

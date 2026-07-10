@@ -603,8 +603,11 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
 
-    assert cfg.data.patch_mode == "2_5d", (
-        "arch='edm2' is currently only wired for patch_mode='2_5d'.")
+    # 显式 raise（assert 在 python -O 下失效）。
+    if cfg.data.patch_mode != "2_5d":
+        raise ValueError(
+            "arch='edm2' is currently only wired for patch_mode='2_5d'; "
+            f"got {cfg.data.patch_mode!r}.")
     D = int(cfg.data.patch_size[0])
     out_classes = num_fg * D
     n_views = max(len(cfg.data.multi_res_scales), 1)
@@ -630,6 +633,16 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
     # 显式空列表 [] = 不加注意力（保持历史默认行为）；传 None 才会用默认。
     attn_levels = _resolve_attn_levels(
         n_levels, mc.edm2_attention_levels)
+
+    # EDM2 stem 固定为 MP conv3，头固定为 _MPSegHead；非默认配置被忽略时显式告警。
+    if mc.stem_mode != "conv3":
+        logger.warning(
+            "model.arch='edm2' ignores model.stem_mode=%r; the EDM2 stem is "
+            "fixed to an MP conv3 (stride=1).", mc.stem_mode)
+    if mc.aux_head_mode != "linear":
+        logger.warning(
+            "model.arch='edm2' ignores model.aux_head_mode=%r; aux heads are "
+            "fixed to _MPSegHead (MP 1×1 conv).", mc.aux_head_mode)
 
     if mc.stem_fusion_mode == "hierarchical":
         raise ValueError(

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -189,7 +189,8 @@ class SegProbe:
 
     def _train_step(self, batch: Dict[str, torch.Tensor], head: nn.Module,
                     optimizer: torch.optim.Optimizer,
-                    loss_fn: nn.Module) -> torch.Tensor:
+                    loss_fn: Callable[[torch.Tensor, torch.Tensor],
+                                      torch.Tensor]) -> torch.Tensor:
         img = batch["image"].to(self.device).float()
         target = self._binary_target(batch["label"].to(self.device).float())
         if self.finetune:
@@ -245,7 +246,7 @@ class SegProbe:
             else:
                 params = [{"params": head.parameters(), "lr": self.lr}]
             optimizer = torch.optim.Adam(params)
-            loss_fn = nn.BCEWithLogitsLoss()
+            loss_fn = self._probe_loss
 
             data_iter = iter(self.train_loader)
             for _ in range(self.iters):

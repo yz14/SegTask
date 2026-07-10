@@ -488,7 +488,8 @@ class ModelConfig:
     selfattn_decoder_stages: List = field(default_factory=list)
 
     # ---- ADM 专用（arch=="adm"） ----
-    # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空=默认最深两级。
+    # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空列表 [] = 不加注意力（默认）；
+    # 传 None 才会用"最深两级"默认（见 models.adm_unet._resolve_attention_levels）。
     adm_attention_levels: List[int] = field(default_factory=list)
 
     # 头数：仅在 adm_num_head_channels==-1 时使用。
@@ -1766,6 +1767,13 @@ class Config:
         # 深监督权重预校验：forward 返回 n_levels-1 个预测（main + DS 头），
         # 长度不符会在首个训练 step 才由 DeepSupervisionLoss 报错，这里提前警示。
         # （只警告不硬错：默认权重表按典型 5 级配置给出，小模型可能沿用默认。）
+        if self.model.deep_supervision:
+            _require(
+                bool(self.loss.deep_supervision_weights),
+                "model.deep_supervision=True requires non-empty "
+                "loss.deep_supervision_weights：否则 pipeline 不会包装 "
+                "DeepSupervisionLoss，而模型 forward 返回 list，首个训练 "
+                "step 才会报错。")
         if self.model.deep_supervision and self.loss.deep_supervision_weights:
             ds_w = self.loss.deep_supervision_weights
             expected = len(self.model.encoder_channels) - 1
@@ -1879,6 +1887,12 @@ class Config:
             n_views = len(self.data.multi_res_scales)
             lift = bool(self.model.lift_2_5d_to_3d)
             if lift:
+                # ADM/EDM2 硬编码为折叠-D 的 2D 布局，与 lift 的真 3D 布局互斥。
+                _require(
+                    self.model.arch not in ("adm", "edm2"),
+                    f"lift_2_5d_to_3d=True is not supported by model.arch="
+                    f"{self.model.arch!r} (ADM/EDM2 are wired for the folded-D "
+                    "2D layout only). Use arch='unet' or disable lift.")
                 # lift：D 保留为空间轴（真 3D UNet），与折叠-D 布局互斥。
                 _require(
                     self.model.spatial_dims == 3,

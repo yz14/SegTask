@@ -19,7 +19,7 @@ class UNetPPDecoder(nn.Module):
     """UNet++ 嵌套 decoder。对角线 X[i,n-1-i] 为输出（low-res→high-res）。
 
     参数：upsample_mode示例 'transpose' 可学 或 'trilinear' 无参；
-    skip_attention=True 时用 X[i,0] 对上采样分支作 gate (Oktay 2018)。
+    skip_attention=True 时用上采样的解码信号门控同深度 skip 节点 (Oktay 2018)。
     """
 
     def __init__(
@@ -107,8 +107,11 @@ class UNetPPDecoder(nn.Module):
                         mode=INTERP_SMOOTH[self.spatial_dims],
                         align_corners=False)
                 if self.skip_attention:
-                    up = self.gates[key](up, x[i][0])
-                fused = torch.cat(x[i][:j] + [up], dim=1)
+                    gate = self.gates[key]
+                    skips = [gate(s, up) for s in x[i][:j]]
+                else:
+                    skips = x[i][:j]
+                fused = torch.cat(skips + [up], dim=1)
                 x[i][j] = checkpoint_if(
                     self.grad_checkpointing, self.blocks[key], fused)
 

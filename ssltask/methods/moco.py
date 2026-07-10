@@ -80,6 +80,7 @@ class MoCoMethod(SSLMethod):
         hidden_dim = int(self.ssl.dino_hidden_dim)
         q_enc = build_model(self.cfg).encoder
         k_enc = build_model(self.cfg).encoder
+        k_enc.load_state_dict(q_enc.state_dict())   # key 初始 = query
         q_proj = DINOHead(
             in_dim=int(self.cfg.model.encoder_channels[-1]),
             out_dim=proj_dim,

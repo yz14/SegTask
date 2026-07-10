@@ -76,6 +76,7 @@ class BYOLMethod(SSLMethod):
         pred_hidden_dim = int(self.ssl.byol_pred_hidden_dim)
         enc_online = build_model(self.cfg).encoder
         enc_target = build_model(self.cfg).encoder
+        enc_target.load_state_dict(enc_online.state_dict())   # 目标初始 = 在线
         projector_online = DINOHead(
             in_dim=int(self.cfg.model.encoder_channels[-1]),
             out_dim=proj_dim,

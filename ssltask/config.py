@@ -418,6 +418,11 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             0.0 < float(ssl.byol_momentum_base) <= float(ssl.byol_momentum_final) <= 1.0,
             f"ssl.byol_momentum_base/final must satisfy 0<base<=final<=1; got "
             f"{ssl.byol_momentum_base}, {ssl.byol_momentum_final}.")
+        if bool(cfg.train.use_ema):
+            logger.warning(
+                "ssl.method='byol' with train.use_ema=True: the BYOL target "
+                "encoder is already an EMA of the online encoder; the "
+                "trainer-level EMA is redundant. Recommend train.use_ema=false.")
     if ssl.method == "moco":
         _require(
             int(ssl.dino_hidden_dim) >= 1,
@@ -447,6 +452,11 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             0.0 < float(ssl.moco_momentum_base) <= float(ssl.moco_momentum_final) <= 1.0,
             f"ssl.moco_momentum_base/final must satisfy 0<base<=final<=1; got "
             f"{ssl.moco_momentum_base}, {ssl.moco_momentum_final}.")
+        if bool(cfg.train.use_ema):
+            logger.warning(
+                "ssl.method='moco' with train.use_ema=True: the MoCo key "
+                "encoder is already an EMA of the query encoder; the "
+                "trainer-level EMA is redundant. Recommend train.use_ema=false.")
     if ssl.method == "sparkdino":
         _require(
             float(ssl.sparkdino_dino_weight) >= 0.0,

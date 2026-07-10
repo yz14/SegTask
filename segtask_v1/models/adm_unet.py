@@ -645,9 +645,11 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
 
-    # 仅 2.5D（其他模式需额外布线）。
-    assert cfg.data.patch_mode == "2_5d", (
-        "arch='adm' is currently only wired for patch_mode='2_5d'.")
+    # 仅 2.5D（其他模式需额外布线）。显式 raise（assert 在 python -O 下失效）。
+    if cfg.data.patch_mode != "2_5d":
+        raise ValueError(
+            "arch='adm' is currently only wired for patch_mode='2_5d'; "
+            f"got {cfg.data.patch_mode!r}.")
     D = int(cfg.data.patch_size[0])
     out_classes = num_fg * D
     n_views = max(len(cfg.data.multi_res_scales), 1)

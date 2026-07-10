@@ -200,6 +200,16 @@ class SSLTrainer:
             out["best_probe"] = self.best_probe
         return out
 
+    @staticmethod
+    def _effective_accum(step: int, total_steps: int, accum: int) -> int:
+        """尾批 micro-batch 数不满 ``accum`` 时，用真实尾长作分母，
+        以免最后一组 micro-batch 因被除以 ``accum`` 而权重偏小。"""
+        if accum <= 1:
+            return 1
+        remainder = total_steps % accum
+        partial_start = total_steps - remainder
+        return remainder if (remainder > 0 and step >= partial_start) else accum
+
     def _train_epoch(self, epoch: int) -> float:
         self.method.train()
         loss_meter = AverageMeter()
@@ -208,6 +218,7 @@ class SSLTrainer:
         total_steps = len(self.train_loader)
 
         self.optimizer.zero_grad(set_to_none=True)
+        group_has_nonfinite = False
         for step, batch in enumerate(self.train_loader):
             batch = self._prepare(batch)
             bs = batch["image"].shape[0] if "image" in batch else tc.batch_size
@@ -215,32 +226,52 @@ class SSLTrainer:
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):
                 loss, logs = self.method.compute_loss(batch)
-            if accum > 1:
-                loss = loss / accum
+            # 尾批 micro-batch 数不满 accum 时用真实尾长作分母，避免尾组梯度
+            # 因除以 accum 而权重偏小。
+            effective_accum = self._effective_accum(step, total_steps, accum)
+            if effective_accum > 1:
+                loss = loss / effective_accum
             self.scaler.scale(loss).backward()
+
+            step_loss = loss.item() * effective_accum
+            if not math.isfinite(step_loss):
+                group_has_nonfinite = True
 
             is_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             if is_boundary:
-                if tc.grad_clip_norm > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(
-                        self.method.parameters(), tc.grad_clip_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scheduler.step()
-                if self.ema is not None:
-                    self.ema.update(self.method.module)
+                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；bf16/fp32
+                # 无此保护，loss 非有限时丢弃本 accum 组梯度，避免 NaN 永久污染
+                # 权重与 EMA（scheduler 照常推进，EMA 不推进）。
+                skip_optim_step = group_has_nonfinite and not self._scaler_active
+                group_has_nonfinite = False
+                if skip_optim_step:
+                    logger.warning(
+                        "Skipping optimizer step at epoch %d step %d/%d: "
+                        "non-finite loss in this accumulation group "
+                        "(amp_dtype without GradScaler protection).",
+                        epoch + 1, step + 1, total_steps)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                else:
+                    if tc.grad_clip_norm > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        nn.utils.clip_grad_norm_(
+                            self.method.parameters(), tc.grad_clip_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.scheduler.step()
+                    if self.ema is not None:
+                        self.ema.update(self.method.module)
                 self._global_step += 1
                 self.method.on_after_step(self._global_step)
 
-            step_loss = loss.item() * (accum if accum > 1 else 1)
             if math.isfinite(step_loss):
                 loss_meter.update(step_loss, bs)
             else:
                 logger.warning(
-                    "Non-finite SSL loss at epoch %d step %d/%d; skipping.",
-                    epoch + 1, step + 1, total_steps)
+                    "Non-finite SSL loss at epoch %d step %d/%d; excluded "
+                    "from loss meter.", epoch + 1, step + 1, total_steps)
 
             if (step + 1) % tc.log_every == 0 or step == 0:
                 logger.debug("  [%d/%d] loss=%.5f lr=%.2e",

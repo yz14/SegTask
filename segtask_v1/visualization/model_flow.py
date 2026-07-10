@@ -681,9 +681,10 @@ def _emit_traced(g: VisGraph, cfg: Config, model: nn.Module,
         pid = parent.get(cid)
         label = cid[len(pid) + 1:] if pid and cid.startswith(pid + ".") else cid
         kind = "head" if pid is None and cid in head_tops else "stage"
-        # 容器 res 取**入口**形状：折叠框对位到其进入时的分辨率泳道，
-        # 折叠/展开切换时框的横向位置连续（出口形状会把 encoder 折叠框
-        # 对到瓶颈泳道、decoder 对到全分辨率泳道，产生跳变）。
+        # 容器 res 取**入口**形状：res 不参与布局横坐标（单一主轴），仅
+        # 作为卡片分辨率徽标呈现；取入口形状使折叠框的徽标与其进入时的
+        # 分辨率一致（出口形状会把 encoder 标到瓶颈级、decoder 标到全
+        # 分辨率级，语义跳变）。
         g.add_node(cid, label, kind=kind, key_info=ki,
                    parent_id=pid, collapsed=True,
                    res=_res_level(in_sh or out_sh, in_w))
