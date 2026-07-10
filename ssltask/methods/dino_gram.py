@@ -74,6 +74,30 @@ class DINOGramMethod(DINOMethod):
         x = F.normalize(x, dim=-1, p=2)               # 每位点向量 L2 归一化
         return x @ x.transpose(1, 2)                  # (B, N, N)
 
+    @staticmethod
+    def _gram_sq_dist(s_feat: torch.Tensor, t_feat: torch.Tensor) -> torch.Tensor:
+        """``mean((G_s - G_t)**2)``（即逐样本 Frobenius²/N² 的 batch 均值）。
+
+        N > C 时不物化 (B,N,N) Gram，而用恒等式
+        ``||XXᵀ - YYᵀ||²_F = ||XᵀX||²_F - 2||XᵀY||²_F + ||YᵀY||²_F``
+        在 (C,C) 空间计算（数值精确等价，显存 O(N²)→O(C²)），使浅层高分辨率
+        特征级（N 可达数万）也可安全作 Gram anchoring。
+        """
+        xs = F.normalize(s_feat.flatten(2).transpose(1, 2), dim=-1, p=2)  # (B,N,C)
+        xt = F.normalize(t_feat.flatten(2).transpose(1, 2), dim=-1, p=2)
+        _, n, c = xs.shape
+        if n <= c:                                     # 小 N：直接 N×N 更便宜
+            gs = xs @ xs.transpose(1, 2)
+            gt = xt @ xt.transpose(1, 2)
+            return (gs - gt).pow(2).mean()
+        ss = xs.transpose(1, 2) @ xs                   # (B, C, C)
+        st = xs.transpose(1, 2) @ xt
+        tt = xt.transpose(1, 2) @ xt
+        frob_sq = (ss.pow(2).sum(dim=(1, 2))
+                   - 2.0 * st.pow(2).sum(dim=(1, 2))
+                   + tt.pow(2).sum(dim=(1, 2)))        # (B,) 逐样本 ||G_s-G_t||²_F
+        return frob_sq.clamp_min(0.0).mean() / float(n * n)
+
     def _gram_loss(self, image: torch.Tensor) -> torch.Tensor:
         """学生 vs Gram 教师在 global 裁剪密集特征上的 Gram 矩阵 Frobenius² 距离。"""
         global_crops: List[torch.Tensor] = self.multicrop(image)["global"]
@@ -82,10 +106,7 @@ class DINOGramMethod(DINOMethod):
             s_feat = self.module.student.encoder(g)[self.gram_level].float()
             with torch.no_grad():
                 t_feat = self.module.gram_teacher.encoder(g)[self.gram_level].float()
-            gs = self._gram_matrix(s_feat)
-            gt = self._gram_matrix(t_feat).detach()
-            # mean over (B,N,N) == 每样本 Frobenius² / N²，再对 batch 取均值。
-            terms.append((gs - gt).pow(2).mean())
+            terms.append(self._gram_sq_dist(s_feat, t_feat.detach()))
         return torch.stack(terms).mean()
 
     # ---- loss -------------------------------------------------------------

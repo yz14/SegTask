@@ -37,7 +37,9 @@ class SparKMethod(SSLMethod):
         return build_ssl_spark_model(
             self.cfg,
             dim_div=int(self.ssl.spark_decoder_dim_div),
-            min_dim=int(self.ssl.spark_decoder_min_dim))
+            min_dim=int(self.ssl.spark_decoder_min_dim),
+            masked_norm=bool(self.ssl.spark_masked_norm),
+            decoder_mode=str(self.ssl.spark_decoder_mode))
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:

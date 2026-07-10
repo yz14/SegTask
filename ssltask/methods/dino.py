@@ -20,9 +20,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from segtask_v1.trainer.dist_utils import (
+    all_reduce_sum_, get_world_size, is_dist_avail_and_initialized)
+
 from ..data.multicrop import MultiCropGenerator
 from ..models.dino_modules import build_dino_net
 from .base import SSLMethod
+
+
+def _global_batch_mean(batch_center: torch.Tensor) -> torch.Tensor:
+    """把本 rank 的 batch 均值归约为全局均值（非分布式时原样返回）。
+
+    手动 DDP 只在初始化时广播一次 buffer，之后各 rank 独立更新；center 若只用
+    本地 batch 会逐步发散。各 rank 等长 batch（DistributedSampler drop_last
+    保证），故 all-reduce 均值即全局 batch 均值，center 在各副本间保持一致。
+    """
+    if not (is_dist_avail_and_initialized() and get_world_size() > 1):
+        return batch_center
+    batch_center = batch_center.contiguous()
+    all_reduce_sum_(batch_center)
+    return batch_center / float(get_world_size())
 
 
 class _DINOModule(nn.Module):
@@ -143,7 +160,8 @@ class DINOMethod(SSLMethod):
 
     @torch.no_grad()
     def _update_center(self, teacher_out: List[torch.Tensor]) -> None:
-        batch_center = torch.cat(teacher_out, dim=0).mean(dim=0, keepdim=True)
+        batch_center = _global_batch_mean(
+            torch.cat(teacher_out, dim=0).mean(dim=0, keepdim=True))
         self.module.center.mul_(self.center_momentum).add_(
             batch_center.to(self.module.center.dtype),
             alpha=1.0 - self.center_momentum)

@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #: 重建/回归损失。
 RECON_LOSSES = ("l1", "smooth_l1", "mse")
 #: 已实现的 SSL 方法注册键（须与 ``ssltask.methods`` 注册表保持同步；随 P2+ 扩展）。
-METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot", "sparkdino", "byol", "moco")
+METHODS = ("genesis", "prior", "simmim", "dino", "spark", "dino_gram", "jepa", "ibot", "sparkdino", "byol", "moco", "vicregl")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,15 @@ class SSLConfig:
     spark_decoder_min_dim: int = 16
     # 是否对重建目标做 per-unit 归一化（减单元均值除单元标准差，MAE 经验）。
     spark_norm_pix: bool = True
+    # 掩码前向时把 encoder 的 InstanceNorm 换为仅在可见位点上统计的 Masked 版本，
+    # 消除置零位点对归一化统计的污染（训练/下游稠密前向分布一致）；参数名/形状
+    # 不变，稠密前向（探针/下游/DINO 分支）走原生路径。False = 旧行为（有偏统计）。
+    spark_masked_norm: bool = True
+    # 解码器模式（仅 method='spark'）：
+    #   "light" — SparK 原方窄解码器（dim_div 控宽），用完即弃，下游仅迁移 encoder.*；
+    #   "seg"   — 重建经过下游真解码器（decoder.* 同名同形），SSL ckpt 同时
+    #             warm-start encoder.*+decoder.*，下游仅 seg_head.* 随机（分割友好）。
+    spark_decoder_mode: str = "light"
 
     # --- method='dino'：多裁剪 + EMA 教师自蒸馏（SSL.md 方案④）---
     # 投影头：原型数 out_dim、MLP 隐藏/瓶颈维、层数、是否 BN（小 batch 慎用）。
@@ -140,6 +149,24 @@ class SSLConfig:
     moco_temperature: float = 0.2
     moco_momentum_base: float = 0.996
     moco_momentum_final: float = 1.0
+
+    # --- method='vicregl'：VICRegL-3D（全局 VIC + 位置匹配稠密 VIC；孪生无 EMA）---
+    # 全局投影头：输出维 / 隐藏维；稠密投影头输出维（1×1 conv MLP，保分辨率）。
+    vicregl_proj_dim: int = 256
+    vicregl_hidden_dim: int = 1024
+    vicregl_dense_proj_dim: int = 64
+    # 稠密嵌入取自哪一级 encoder 特征（feats 索引，-1=瓶颈）。
+    vicregl_feature_level: int = -1
+    # VIC 三项权重（invariance/variance/covariance，原论文 25/25/1）。
+    vicregl_sim_coeff: float = 25.0
+    vicregl_var_coeff: float = 25.0
+    vicregl_cov_coeff: float = 1.0
+    # 全局/局部加权 α：L = α·L_global + (1-α)·L_local（原论文 0.75）。
+    vicregl_alpha: float = 0.75
+    # 每样本取多少对位置最近的位点匹配（top-γ）。
+    vicregl_num_matches: int = 20
+    # 两视图裁剪尺度区间（高重叠保证可匹配；翻转/强度增广复用 dino_*）。
+    vicregl_crop_scale: List[float] = field(default_factory=lambda: [0.6, 1.0])
 
     # --- method='jepa'：隐空间掩码预测（SSL.md 方案⑦）---
     # 目标块掩码：单元尺寸（体素）与覆盖比例（被遮单元占比，作为预测目标）。
@@ -200,6 +227,11 @@ class SSLConfig:
     probe_samples_per_volume: int = 4   # 探针每卷抽样数
     probe_seed: int = 0                 # 线性头重置 + 划分种子（保证跨 epoch 可比）
     probe_select_best: bool = True      # True: 以 probe_dice 选 best；False: 退回 train loss
+    # 探针头结构："linear" — 逐尺度 1×1 线性头（上采样求和，严格线性探针）；
+    # "unet" — 轻量 UNet 式自顶向下融合头（lateral 1×1 + 逐级上采样 3×3 融合），
+    # 读数更接近下游真实分割能力（仍冻结/微调 encoder，仅头容量不同）。
+    probe_head: str = "linear"
+    probe_head_width: int = 16          # "unet" 头的统一通道宽度
 
     # --- 在线分类探针（SSL.md §0.4；encoder + GAP + MLP 头；frozen/finetune）---
     cls_probe_iters: int = 100
@@ -262,6 +294,10 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.spark_decoder_min_dim) >= 1,
             f"ssl.spark_decoder_min_dim must be >= 1; got "
             f"{ssl.spark_decoder_min_dim}.")
+        _require(
+            str(ssl.spark_decoder_mode) in ("light", "seg"),
+            f"ssl.spark_decoder_mode must be 'light' or 'seg'; got "
+            f"{ssl.spark_decoder_mode!r}.")
     if ssl.method in ("dino", "dino_gram", "ibot", "sparkdino"):
         _require(
             int(ssl.dino_out_dim) >= 1,
@@ -457,6 +493,30 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
                 "ssl.method='moco' with train.use_ema=True: the MoCo key "
                 "encoder is already an EMA of the query encoder; the "
                 "trainer-level EMA is redundant. Recommend train.use_ema=false.")
+    if ssl.method == "vicregl":
+        for name in ("vicregl_proj_dim", "vicregl_hidden_dim",
+                     "vicregl_dense_proj_dim", "vicregl_num_matches"):
+            _require(
+                int(getattr(ssl, name)) >= 1,
+                f"ssl.{name} must be >= 1; got {getattr(ssl, name)}.")
+        for name in ("vicregl_sim_coeff", "vicregl_var_coeff",
+                     "vicregl_cov_coeff"):
+            _require(
+                float(getattr(ssl, name)) >= 0.0,
+                f"ssl.{name} must be >= 0; got {getattr(ssl, name)}.")
+        _require(
+            0.0 <= float(ssl.vicregl_alpha) <= 1.0,
+            f"ssl.vicregl_alpha must be in [0,1]; got {ssl.vicregl_alpha}.")
+        n_levels = len(cfg.model.encoder_channels)
+        _require(
+            -n_levels <= int(ssl.vicregl_feature_level) < n_levels,
+            f"ssl.vicregl_feature_level must index encoder_channels "
+            f"(len {n_levels}); got {ssl.vicregl_feature_level}.")
+        sc = [float(v) for v in ssl.vicregl_crop_scale]
+        _require(
+            len(sc) == 2 and 0.0 < sc[0] <= sc[1] <= 1.0,
+            f"ssl.vicregl_crop_scale must be [lo, hi] with 0 < lo <= hi <= 1; "
+            f"got {ssl.vicregl_crop_scale}.")
     if ssl.method == "sparkdino":
         _require(
             float(ssl.sparkdino_dino_weight) >= 0.0,
@@ -513,6 +573,12 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.probe_samples_per_volume) >= 1,
             f"ssl.probe_samples_per_volume must be >= 1; "
             f"got {ssl.probe_samples_per_volume}.")
+    _require(
+        str(ssl.probe_head) in ("linear", "unet"),
+        f"ssl.probe_head must be 'linear' or 'unet'; got {ssl.probe_head!r}.")
+    _require(
+        int(ssl.probe_head_width) >= 1,
+        f"ssl.probe_head_width must be >= 1; got {ssl.probe_head_width}.")
     _require(
         int(ssl.cls_probe_iters) >= 1,
         f"ssl.cls_probe_iters must be >= 1; got {ssl.cls_probe_iters}.")

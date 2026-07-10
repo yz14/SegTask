@@ -33,7 +33,7 @@
 本地测试环境为: **D:\miniconda\envs\torch27_env\python.exe**。  
 
 
-内容（需查看各自对应README.md理解设计）：  
+内容（**注意**：需查看各自对应README.md理解设计）：  
 segtask_v1是2.5D/3D分割项目（项目起源，目前最完善）。  
 ssltask是自监督学习项目（基于segtask_v1改造），主要是对分割，生成，分类，检测的backbone（部分/全部）进行预训练。  
 clstask是分类项目（基于segtask_v1改造）。  

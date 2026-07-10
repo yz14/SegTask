@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from ..data.masking import apply_mask_token, downsample_mask_to, make_unit_mask
 from ..models.ibot_modules import build_ibot_head, dense_head_forward
 from .base import SSLMethod  # noqa: F401  (保持与同级方法一致的导入面)
-from .dino import DINOMethod, _DINOModule
+from .dino import DINOMethod, _DINOModule, _global_batch_mean
 
 
 class _IBOTModule(_DINOModule):
@@ -129,7 +129,7 @@ class IBOTMethod(DINOMethod):
     @torch.no_grad()
     def _update_ibot_center(self, teacher_logits: List[torch.Tensor]) -> None:
         cat = torch.cat([t.reshape(-1, t.shape[-1]) for t in teacher_logits], dim=0)
-        batch_center = cat.mean(dim=0, keepdim=True)
+        batch_center = _global_batch_mean(cat.mean(dim=0, keepdim=True))
         self.module.ibot_center.mul_(self.center_momentum).add_(
             batch_center.to(self.module.ibot_center.dtype),
             alpha=1.0 - self.center_momentum)

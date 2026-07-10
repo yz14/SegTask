@@ -40,7 +40,11 @@ from ssltask.data.masking import (
     sample_unit_mask,
     upsample_mask_to,
 )
-from ssltask.data.multicrop import MultiCropGenerator
+from ssltask.data.multicrop import (
+    MultiCropGenerator,
+    PairedCropGenerator,
+    site_coords,
+)
 from ssltask.data.ssl_dataset import ImageOnlyPatchDataset, LabeledPatchDataset
 from ssltask.data.vesselness import frangi_vesselness
 from ssltask.eval.cls_probe import ClsProbe, macro_cls_metrics
@@ -59,11 +63,14 @@ from ssltask.models.ssl_models import (
     build_ssl_recon_model,
 )
 from ssltask.models.spark_modules import (
+    MaskedInstanceNorm3d,
     SSLSparkModel,
     SparkLightDecoder,
     build_ssl_spark_model,
+    enable_masked_instance_norm,
     spark_encode,
 )
+from ssltask.models.spark_modules import _MaskedInstanceNormMixin, _SparkVisHolder
 from ssltask.trainer import SSLTrainer
 
 try:
@@ -1477,6 +1484,66 @@ def test_spark_encode_gates_masked_positions_to_zero():
         assert float((f * masked).abs().max()) == 0.0
 
 
+# ---- masked InstanceNorm (visible-only statistics) --------------------------
+def test_spark_masked_norm_preserves_state_dict_and_converts_layers():
+    """Conversion keeps encoder.* keys/values identical (downstream handoff
+    unaffected) and actually swaps in Masked InstanceNorm layers."""
+    cfg = _cfg("cubic")
+    ref = build_ssl_spark_model(cfg, dim_div=4, min_dim=8,
+                                masked_norm=False).encoder
+    enc = build_ssl_spark_model(cfg, dim_div=4, min_dim=8,
+                                masked_norm=True).encoder
+    assert set(enc.state_dict()) == set(ref.state_dict())
+    assert any(isinstance(m_, _MaskedInstanceNormMixin) for m_ in enc.modules())
+    assert not any(isinstance(m_, _MaskedInstanceNormMixin)
+                   for m_ in ref.modules())
+    # idempotent: re-running converts nothing new but keeps a positive count.
+    n1 = enable_masked_instance_norm(enc)
+    n2 = enable_masked_instance_norm(enc)
+    assert n1 == n2 > 0
+
+
+def test_spark_masked_norm_dense_path_matches_native():
+    """holder empty (dense forward: probe/downstream/DINO branch) => output is
+    numerically the native InstanceNorm output."""
+    torch.manual_seed(0)
+    native = torch.nn.InstanceNorm3d(4, affine=True)
+    torch.nn.init.normal_(native.weight)
+    torch.nn.init.normal_(native.bias)
+    masked = MaskedInstanceNorm3d(4, affine=True)
+    masked.load_state_dict(native.state_dict())
+    masked._spark_holder = _SparkVisHolder()          # vis_full=None
+    x = torch.randn(2, 4, 8, 8, 8)
+    assert torch.allclose(masked(x), native(x), atol=1e-6)
+
+
+def test_spark_masked_norm_visible_stats_and_gating():
+    """With a mask installed, statistics come from visible positions only
+    (visible mean~0 / var~1 per sample-channel) and masked positions are gated
+    to zero — unlike the polluted native InstanceNorm on zeroed input."""
+    torch.manual_seed(0)
+    norm = MaskedInstanceNorm3d(4, affine=False)
+    holder = _SparkVisHolder()
+    norm._spark_holder = holder
+    mask = make_unit_mask(2, (8, 8, 8), 4, 0.5, torch.device("cpu"))
+    vis = 1.0 - mask                                  # (B,1,8,8,8), 1=visible
+    x = torch.randn(2, 4, 8, 8, 8) * 3.0 + 5.0
+    holder.vis_full = vis
+    y = norm(x * vis)                                 # spark zeroes masked input
+    holder.vis_full = None
+    assert float((y * mask).abs().max()) == 0.0       # gated output
+    b = vis.bool().expand_as(y)
+    for s in range(2):
+        for c in range(4):
+            v = y[s, c][b[s, c]]
+            assert abs(float(v.mean())) < 1e-4
+            assert abs(float(v.var(unbiased=False)) - 1.0) < 1e-3
+    # the native norm on the same zeroed input is visibly polluted:
+    z = torch.nn.InstanceNorm3d(4, affine=False)(x * vis)
+    vm = float((z * vis).sum() / (vis.sum() * 4))
+    assert abs(vm) > 0.05, "expected polluted mean shift on native norm"
+
+
 def test_spark_encode_rejects_hierarchical_stem():
     cfg = _cfg("cubic")
     encoder = build_ssl_spark_model(cfg, dim_div=4, min_dim=8).encoder
@@ -1524,6 +1591,49 @@ def test_spark_handoff_encoder_only():
     assert any(k.startswith("spark_decoder.") for k in result.unexpected_keys)
     assert any(k.startswith("decoder.") for k in result.missing_keys)
     assert any(k.startswith("seg_head.") for k in result.missing_keys)
+
+
+# ---- decoder_mode='seg': warm-start the real downstream decoder ------------
+def test_spark_validate_rejects_bad_decoder_mode():
+    cfg = _cfg("cubic")
+    ssl = _spark_ssl()
+    ssl.spark_decoder_mode = "bogus"
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, cfg)
+
+
+def test_spark_seg_decoder_loss_runs_and_backward():
+    cfg = _cfg("cubic")
+    ssl = _spark_ssl()
+    ssl.spark_decoder_mode = "seg"
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.train()
+    loss, logs = m.compute_loss(
+        {"image": torch.randn(2, cfg.model.in_channels, 16, 32, 32)})
+    assert torch.isfinite(loss) and loss.requires_grad
+    loss.backward()
+    # both the encoder and the transferable real decoder must receive grads.
+    assert any(p.grad is not None for p in m.module.encoder.parameters())
+    assert any(p.grad is not None for p in m.module.decoder.parameters())
+
+
+def test_spark_seg_decoder_handoff_warm_starts_decoder():
+    """decoder_mode='seg' transfers encoder.* AND decoder.*; only seg_head.*
+    stays missing; recon_head/mask_embed are the only unexpected keys."""
+    cfg = _cfg("cubic")
+    ssl = _spark_ssl()
+    ssl.spark_decoder_mode = "seg"
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    sd = strip_common_prefixes(m.export_backbone_state_dict())
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(sd, strict=False)
+    missing = list(result.missing_keys)
+    assert all(k.startswith("seg_head.") for k in missing), missing
+    assert any(k.startswith("seg_head.") for k in missing)
+    assert all(k.startswith(("recon_head.", "mask_embed."))
+               for k in result.unexpected_keys), list(result.unexpected_keys)
 
 
 # ---- one-epoch CPU trainer smoke -------------------------------------------
@@ -1877,6 +1987,31 @@ def test_dino_gram_matrix_is_normalized_gram():
     diag = torch.diagonal(g, dim1=-2, dim2=-1)
     assert torch.allclose(diag, torch.ones_like(diag), atol=1e-5)
     assert float(g.max()) <= 1.0 + 1e-4 and float(g.min()) >= -1.0 - 1e-4
+
+
+# ---- memory-safe gram distance (C×C identity path) -------------------------
+def test_dino_gram_sq_dist_matches_materialized_gram():
+    """_gram_sq_dist == mean((G_s-G_t)**2) for both the N<=C (materialized)
+    and N>C (C×C identity, no (B,N,N) allocation) branches."""
+    torch.manual_seed(0)
+    for shape in [(2, 3, 5, 5, 5),    # N=125 > C=3  -> identity path
+                  (2, 8, 2, 2)]:      # N=4  <= C=8  -> materialized path
+        s = torch.randn(*shape).double()
+        t = torch.randn(*shape).double()
+        ref = (DINOGramMethod._gram_matrix(s)
+               - DINOGramMethod._gram_matrix(t)).pow(2).mean()
+        out = DINOGramMethod._gram_sq_dist(s, t)
+        assert torch.allclose(out, ref, atol=1e-10), (shape, float(out), float(ref))
+
+
+def test_dino_gram_sq_dist_identity_path_backward():
+    """Gradients flow through the student side on the N>C identity path."""
+    torch.manual_seed(0)
+    s = torch.randn(2, 3, 4, 4, 4, requires_grad=True)   # N=64 > C=3
+    t = torch.randn(2, 3, 4, 4, 4)
+    out = DINOGramMethod._gram_sq_dist(s, t)
+    out.backward()
+    assert s.grad is not None and torch.isfinite(s.grad).all()
 
 
 # ---- periodic gram-teacher refresh ----------------------------------------
@@ -2308,3 +2443,189 @@ def test_sparkdino_trainer_smoke(tmp_path):
     assert ckpt.exists()
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# VICRegL — dense-correspondence SSL (global VIC + location-matched local VIC)
+# ---------------------------------------------------------------------------
+def _vicregl_ssl(**kw):
+    """Small VICRegL SSLConfig for fast CPU tests."""
+    ssl = SSLConfig(method="vicregl")
+    ssl.vicregl_proj_dim = 32
+    ssl.vicregl_hidden_dim = 32
+    ssl.vicregl_dense_proj_dim = 16
+    ssl.vicregl_num_matches = 8
+    for k, v in kw.items():
+        setattr(ssl, k, v)
+    return ssl
+
+
+# ---- config validation -----------------------------------------------------
+def test_ssl_validate_vicregl_ok():
+    validate_ssl(_vicregl_ssl(), _cfg())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("vicregl_proj_dim", 0),
+    ("vicregl_num_matches", 0),
+    ("vicregl_sim_coeff", -1.0),
+    ("vicregl_alpha", 1.5),
+    ("vicregl_feature_level", 99),
+    ("vicregl_crop_scale", [0.9, 0.5]),
+])
+def test_ssl_validate_vicregl_rejects(field, value):
+    ssl = _vicregl_ssl(**{field: value})
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+# ---- paired crops + coordinate bookkeeping ---------------------------------
+def test_paired_crop_shapes_and_meta():
+    gen = PairedCropGenerator(spatial_dims=3, out_size=(16, 32, 32),
+                              scale=(0.6, 1.0))
+    x = torch.rand(2, 1, 16, 32, 32)
+    (v1, v2), (m1, m2) = gen(x)
+    for v in (v1, v2):
+        assert v.shape == (2, 1, 16, 32, 32)
+    for m in (m1, m2):
+        assert m["origin"].shape == (2, 3)
+        assert m["size"].shape == (2, 3)
+        assert m["flip"].shape == (2, 3) and m["flip"].dtype == torch.bool
+        assert bool((m["origin"] >= 0).all())
+        hi = m["origin"] + m["size"]
+        assert bool((hi <= torch.tensor([16., 32., 32.])).all())
+
+
+def test_site_coords_known_box_and_flip():
+    # 1 sample, 2 axes, feature map 2x2, box origin (4, 8) size (8, 16)
+    meta = {
+        "origin": torch.tensor([[4.0, 8.0]]),
+        "size": torch.tensor([[8.0, 16.0]]),
+        "flip": torch.tensor([[False, True]]),
+    }
+    coords = site_coords((2, 2), meta)               # (1, 4, 2)
+    assert coords.shape == (1, 4, 2)
+    # axis 0 (no flip): centers at 4 + {0.25, 0.75}*8 = {6, 10}
+    # axis 1 (flipped): centers at 8 + {0.75, 0.25}*16 = {20, 12}
+    expected = torch.tensor([[[6., 20.], [6., 12.], [10., 20.], [10., 12.]]])
+    assert torch.allclose(coords, expected)
+
+
+def test_site_coords_identical_boxes_match_identity():
+    meta = {
+        "origin": torch.tensor([[0.0, 0.0, 0.0]]),
+        "size": torch.tensor([[16.0, 32.0, 32.0]]),
+        "flip": torch.zeros(1, 3, dtype=torch.bool),
+    }
+    c1 = site_coords((2, 4, 4), meta)
+    c2 = site_coords((2, 4, 4), meta)
+    nn_idx = torch.cdist(c1[0], c2[0]).argmin(dim=1)
+    assert torch.equal(nn_idx, torch.arange(c1.shape[1]))
+
+
+# ---- loss + backward --------------------------------------------------------
+def test_vicregl_loss_runs_and_backward():
+    cfg = _cfg()
+    ssl = _vicregl_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    x = torch.rand(2, cfg.model.in_channels, 16, 32, 32)
+    loss, logs = m.compute_loss({"image": x})
+    assert torch.isfinite(loss)
+    for k in ("vicregl_loss", "global_loss", "local_loss"):
+        assert k in logs
+    loss.backward()
+    grads = [p.grad for p in m.module.encoder.parameters()
+             if p.grad is not None]
+    assert grads and any(float(g.abs().sum()) > 0 for g in grads)
+
+
+def test_vicregl_alpha_one_is_pure_global():
+    cfg = _cfg()
+    m = build_method(cfg, _vicregl_ssl(vicregl_alpha=1.0), torch.device("cpu"))
+    x = torch.rand(2, cfg.model.in_channels, 16, 32, 32)
+    loss, logs = m.compute_loss({"image": x})
+    assert abs(float(loss.detach()) - logs["global_loss"]) < 1e-5
+
+
+# ---- handoff: encoder-only warm-start ---------------------------------------
+def test_vicregl_handoff_encoder_only():
+    cfg = _cfg()
+    m = build_method(cfg, _vicregl_ssl(), torch.device("cpu"))
+    sd = m.export_backbone_state_dict()
+    assert sd and all(k.startswith("encoder.") for k in sd)
+
+    seg_model = build_model(cfg)
+    result = seg_model.load_state_dict(strip_common_prefixes(sd), strict=False)
+    assert not result.unexpected_keys
+    assert all(not k.startswith("encoder.") for k in result.missing_keys)
+
+
+# ---- one-epoch CPU trainer smoke -------------------------------------------
+def test_vicregl_trainer_smoke(tmp_path):
+    cfg = _cfg("cubic")
+    cfg.train.epochs = 1
+    cfg.train.warmup_epochs = 0
+    cfg.train.use_ema = False
+    cfg.train.use_amp = False
+    cfg.train.grad_accum_steps = 1
+    cfg.train.output_dir = str(tmp_path)
+    cfg.sync()
+    cfg.validate()
+
+    ssl = _vicregl_ssl()
+    validate_ssl(ssl, cfg)
+
+    device = torch.device("cpu")
+    m = build_method(cfg, ssl, device)
+    ds = _ImgDataset(4, cfg.model.in_channels, (16, 32, 32))
+    loader = DataLoader(ds, batch_size=2)
+    trainer = SSLTrainer(m, cfg, ssl, loader, device)
+    out = trainer.fit()
+    assert "best_loss" in out
+
+    ckpt = tmp_path / "ssl_best.pt"
+    assert ckpt.exists()
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert any(k.startswith("encoder.") for k in blob["model_state_dict"])
+
+
+# ---------------------------------------------------------------------------
+# probe UNet head (ssl.probe_head='unet')
+# ---------------------------------------------------------------------------
+def test_probe_head_validate_rejects_bad():
+    ssl = SSLConfig()
+    ssl.probe_head = "resnet"
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_unet_probe_head_forward_shape():
+    from ssltask.eval.probe import _UNetProbeHead
+    head = _UNetProbeHead([8, 16, 32], out_channels=1, spatial_dims=3, width=8)
+    feats = [torch.rand(2, 8, 8, 16, 16), torch.rand(2, 16, 4, 8, 8),
+             torch.rand(2, 32, 2, 4, 4)]
+    out = head(feats, (16, 32, 32))
+    assert out.shape == (2, 1, 16, 32, 32)
+
+
+def test_seg_probe_unet_head_evaluate(tmp_path):
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
+    cfg = _cfg("cubic")
+    ssl = SSLConfig(method="genesis")
+    ssl.probe_enabled = True
+    ssl.probe_data_dir = str(tmp_path)
+    ssl.probe_iters = 2
+    ssl.probe_samples_per_volume = 2
+    ssl.probe_head = "unet"
+    ssl.probe_head_width = 8
+    validate_ssl(ssl, cfg)
+
+    from ssltask.eval.probe import _UNetProbeHead
+    probe = SegProbe(cfg, ssl, torch.device("cpu"))
+    assert isinstance(probe._build_head(), _UNetProbeHead)
+    sd = build_ssl_recon_model(cfg).state_dict()
+    out = probe.evaluate(sd)
+    assert set(out) == {"probe_dice", "probe_hd95"}
+    assert 0.0 <= out["probe_dice"] <= 1.0
+    assert out["probe_hd95"] >= 0.0

@@ -22,6 +22,7 @@ from .prior import PriorMethod
 from .simmim import SimMIMMethod
 from .spark import SparKMethod
 from .sparkdino import SparkDINOMethod
+from .vicregl import VICRegLMethod
 
 _REGISTRY: Dict[str, Type[SSLMethod]] = {
     GenesisMethod.name: GenesisMethod,
@@ -35,6 +36,7 @@ _REGISTRY: Dict[str, Type[SSLMethod]] = {
     JEPAMethod.name: JEPAMethod,
     IBOTMethod.name: IBOTMethod,
     SparkDINOMethod.name: SparkDINOMethod,
+    VICRegLMethod.name: VICRegLMethod,
 }
 
 

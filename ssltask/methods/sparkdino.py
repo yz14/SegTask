@@ -21,7 +21,8 @@ import torch
 import torch.nn as nn
 
 from ..data.masking import make_unit_mask, masked_recon_loss, per_unit_normalize
-from ..models.spark_modules import build_spark_decoder, spark_encode
+from ..models.spark_modules import (
+    build_spark_decoder, enable_masked_instance_norm, spark_encode)
 from .base import SSLMethod  # noqa: F401  (保持与同级方法一致的导入面)
 from .dino import DINOMethod, _DINOModule
 
@@ -49,6 +50,10 @@ class SparkDINOMethod(DINOMethod):
     # ---- modules ----------------------------------------------------------
     def build_modules(self) -> nn.Module:
         base = super().build_modules()                # _DINOModule(student, teacher)
+        if bool(self.ssl.spark_masked_norm):
+            # 仅学生 encoder：掩码前向时统计只看可见位点；DINO 分支/教师的
+            # 稠密前向不受影响（holder 为空时退化为原生 InstanceNorm）。
+            enable_masked_instance_norm(base.student.encoder)
         decoder = build_spark_decoder(               # 作用于学生 encoder（共享骨干）
             self.cfg, base.student.encoder,
             dim_div=int(self.ssl.spark_decoder_dim_div),

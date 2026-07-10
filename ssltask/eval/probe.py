@@ -103,6 +103,43 @@ class _MultiScaleLinearHead(nn.Module):
         return out
 
 
+class _UNetProbeHead(nn.Module):
+    """轻量 UNet 式探针头：自顶向下逐级上采样融合（lateral 1×1 + 3×3 融合）→ 1×1 logits。
+
+    相对 :class:`_MultiScaleLinearHead` 容量更大，读数更接近下游真实分割头的可达
+    能力；encoder 的冻结/微调语义不变，仅头结构不同（由 ``ssl.probe_head`` 选择）。
+    """
+
+    def __init__(self, enc_channels: List[int], out_channels: int,
+                 spatial_dims: int, width: int = 16):
+        super().__init__()
+        self.spatial_dims = int(spatial_dims)
+        self.mode = INTERP_SMOOTH[self.spatial_dims]
+        conv = _CONV[self.spatial_dims]
+        w = int(width)
+        self.lateral = nn.ModuleList(
+            [conv(int(c), w, kernel_size=1) for c in enc_channels])
+        self.fuse = nn.ModuleList(
+            [conv(w, w, kernel_size=3, padding=1)
+             for _ in enc_channels[:-1]])
+        self.out = conv(w, int(out_channels), kernel_size=1)
+
+    def forward(self, feats: List[torch.Tensor], target_spatial) -> torch.Tensor:
+        target_spatial = tuple(int(s) for s in target_spatial)
+        x = self.lateral[-1](feats[-1])
+        for lvl in range(len(feats) - 2, -1, -1):
+            skip = self.lateral[lvl](feats[lvl])
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(x, size=skip.shape[2:], mode=self.mode,
+                                  align_corners=False)
+            x = F.relu(self.fuse[lvl](x + skip), inplace=True)
+        o = self.out(x)
+        if o.shape[2:] != target_spatial:
+            o = F.interpolate(o, size=target_spatial, mode=self.mode,
+                              align_corners=False)
+        return o
+
+
 class SegProbe:
     """冻结/微调 encoder 的多尺度线性分割探针。``evaluate`` 输入 SSL 导出的 state_dict。"""
 
@@ -137,6 +174,10 @@ class SegProbe:
             p.requires_grad_(bool(trainable))
 
     def _build_head(self) -> nn.Module:
+        if str(self.ssl.probe_head) == "unet":
+            return _UNetProbeHead(
+                self.enc_channels, self.head_out, self.spatial_dims,
+                width=int(self.ssl.probe_head_width)).to(self.device)
         return _MultiScaleLinearHead(self.enc_channels, self.head_out,
                                      self.spatial_dims).to(self.device)
 

@@ -6,11 +6,14 @@ import math
 from typing import Dict, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
 from segtask_v1.models.factory import build_model
 from segtask_v1.trainer.checkpoint import unwrap_compile
+from segtask_v1.trainer.dist_utils import (
+    get_world_size, is_dist_avail_and_initialized)
 
 from ..data.multicrop import MultiCropGenerator
 from ..models.dino_modules import DINOHead
@@ -19,6 +22,20 @@ from .base import SSLMethod
 
 def _pool_feat(feats):
     return feats[-1].mean(dim=tuple(range(2, feats[-1].ndim)))
+
+
+def _concat_all_gather(t: torch.Tensor) -> torch.Tensor:
+    """跨 rank 收集张量并沿 batch 维拼接（非分布式时原样返回）。
+
+    各 rank 等长（DistributedSampler drop_last 保证）；key 来自 no_grad 分支，
+    无需梯度穿过 gather。所有 rank 得到同一拼接结果（按 rank 序），使隔离的
+    queue/queue_ptr buffer 在各副本间保持逐步一致，同时把负样本扩充到全局 batch。
+    """
+    if not (is_dist_avail_and_initialized() and get_world_size() > 1):
+        return t
+    out = [torch.empty_like(t) for _ in range(get_world_size())]
+    dist.all_gather(out, t.contiguous())
+    return torch.cat(out, dim=0)
 
 
 class _ProjectedEncoder(nn.Module):
@@ -113,6 +130,7 @@ class MoCoMethod(SSLMethod):
     def _dequeue_and_enqueue(self, keys: torch.Tensor) -> None:
         keys = F.normalize(keys.detach(), dim=-1)
         keys = keys.reshape(-1, keys.shape[-1])
+        keys = _concat_all_gather(keys)               # 全局 key：各 rank 同步入队
         k = keys.shape[0]
         queue = self.module.queue
         ptr = int(self.module.queue_ptr.item())
