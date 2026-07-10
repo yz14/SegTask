@@ -23,6 +23,7 @@ from .dataset import (
     load_nifti,
     load_nifti_cropped,
     load_region_weight_volume,
+    read_nifti_geometry,
     read_nifti_spacing,
     resample_to_spacing,
 )
@@ -38,7 +39,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.4"
+_TOOL_VERSION = "make_data/1.5"
 
 # 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -106,6 +107,38 @@ def _compute_fg_indices(
     return fg_slices, fg_coords, fg_coords_cls, fg_slices_cls_z, fg_slices_cls
 
 
+# 物理几何一致性容差：spacing/origin 为 mm（头存 float32，允许亚 mm 量化误差），
+# direction 为方向余弦。
+_GEOM_SPACING_ATOL   = 1e-3
+_GEOM_ORIGIN_ATOL    = 1e-2
+_GEOM_DIRECTION_ATOL = 1e-3
+
+
+def _check_physical_geometry(
+    pid: str,
+    image_path: str,
+    others: List[Tuple[str, Optional[str]]]) -> None:
+    """校验 label/bbox/rw 与 image 共物理坐标系（spacing/origin/direction，
+    只读头不解码像素）；不一致说明未严格共注册，voxel 索引对齐无意义，
+    直接 fail-fast（与 shape 校验同级）。"""
+    ref = read_nifti_geometry(image_path)
+    names = ("spacing", "origin", "direction")
+    atols = (_GEOM_SPACING_ATOL, _GEOM_ORIGIN_ATOL, _GEOM_DIRECTION_ATOL)
+    for role, path in others:
+        if not path:
+            continue
+        got = read_nifti_geometry(path)
+        for name, atol, a, b in zip(names, atols, ref, got):
+            if len(a) != len(b) or not np.allclose(a, b, rtol=0.0, atol=atol):
+                raise ValueError(
+                    f"pid={pid}: {role} volume is not in the same physical "
+                    f"space as the image ({name} mismatch: image={a} vs "
+                    f"{role}={b}, atol={atol}). Voxel-wise pairing would be "
+                    f"geometrically wrong; resample/co-register {role} onto "
+                    f"the image grid first (paths: image={image_path}, "
+                    f"{role}={path}).")
+
+
 def _bbox_from_mask_path(bbox_path: Optional[str]) -> Optional[BBox]:
     """读 mask→compute_bbox_from_volume；路径为空或 mask 空返 None。"""
     if not bbox_path:
@@ -137,6 +170,12 @@ def prepare_one(
 
     t0 = time.perf_counter()
     out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    # 0. 物理几何校验：label/bbox/rw 必须与 image 共 spacing/origin/direction
+    #    （shape 相等不蒴含共坐标系；只读头，成本可忽略）。
+    _check_physical_geometry(
+        pid, image_path,
+        [("label", label_path), ("bbox", bbox_path), ("rw", rw_path)])
 
     # 1. mask → bbox（无/空为 None）。
     bbox = _bbox_from_mask_path(bbox_path)
@@ -455,6 +494,11 @@ def prepare_dataset(
             "region_weight_dir": cfg.data.region_weight_dir,
         },
         "label_values": label_values,
+        # 推理复现契约：Predictor 在 cfg.data.target_spacing 未显式配置时从此处
+        # 回读（自动中位数不再只存在于日志里）。
+        "spacing_normalization": spacing_norm,
+        "target_spacing": ([float(s) for s in target_spacing]
+                           if target_spacing is not None else None),
         "n_total": counters["total"],
         "n_written": counters["written"],
         "n_skipped": counters["skipped"],

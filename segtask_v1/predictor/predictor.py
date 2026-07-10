@@ -8,6 +8,7 @@ ckpt 加载（兼容 torch.compile / EMA / best-model EMA-primary）。
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,6 +33,26 @@ logger = logging.getLogger(__name__)
 _AMP_DTYPES = {
     "float16": torch.float16, "fp16": torch.float16,
     "bfloat16": torch.bfloat16, "bf16": torch.bfloat16}
+
+
+def _manifest_target_spacing(npz_dir: str) -> Optional[List[float]]:
+    """从 make_data 写入的 ``npz_dir/_manifest.json`` 回读解析后的
+    target_spacing（(D,H,W) mm）；目录/文件/字段缺失或非法时返 None。"""
+    if not npz_dir:
+        return None
+    p = Path(npz_dir) / "_manifest.json"
+    if not p.is_file():
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            ts = json.load(f).get("target_spacing")
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to read %s: %s", p, exc)
+        return None
+    if (isinstance(ts, (list, tuple)) and len(ts) == 3
+            and all(isinstance(s, (int, float)) and s > 0 for s in ts)):
+        return [float(s) for s in ts]
+    return None
 
 
 class Predictor:
@@ -129,20 +150,28 @@ class Predictor:
                     len(self._adabn_bn_modules))
 
         # 物理 spacing 归一化（B1）：推理前把体积镜像重采样到 target_spacing，
-        # 概率图再回采到原分辨率。须与烘焙用的 target_spacing 一致（自动中位数时
-        # make_data 会把中位数写进日志，须显式填回 cfg.data.target_spacing 以复现）。
+        # 概率图再回采到原分辨率。须与烘焙用的 target_spacing 一致：显式配置优先，
+        # 否则回读 make_data 写入 npz_dir/_manifest.json 的解析值（自动中位数）。
         self.spacing_norm = bool(cfg.data.spacing_normalization)
         self.target_spacing: Optional[Tuple[float, float, float]] = None
         if self.spacing_norm:
-            if cfg.data.target_spacing is None:
+            ts = cfg.data.target_spacing
+            if ts is None:
+                ts = _manifest_target_spacing(cfg.data.npz_dir)
+                if ts is not None:
+                    logger.info(
+                        "data.target_spacing not set; using target_spacing=%s "
+                        "mm recorded by make_data in %s/_manifest.json.",
+                        ts, cfg.data.npz_dir)
+            if ts is None:
                 raise ValueError(
-                    "data.spacing_normalization=True requires an explicit "
+                    "data.spacing_normalization=True requires "
                     "data.target_spacing [sz, sy, sx] (mm) for inference so it "
-                    "matches the spacing used when baking npz. If make_data "
-                    "auto-computed the dataset median, copy that logged value "
-                    "into the config before predicting.")
-            self.target_spacing = tuple(
-                float(s) for s in cfg.data.target_spacing)
+                    "matches the spacing used when baking npz. Set it "
+                    "explicitly, or point data.npz_dir at the baked dataset "
+                    "whose _manifest.json records the resolved value "
+                    "(make_data >= 1.5).")
+            self.target_spacing = tuple(float(s) for s in ts)
             logger.info(
                 "Predictor spacing_normalization=True: resample inputs to "
                 "target_spacing=%s mm (D,H,W), resample probabilities back.",

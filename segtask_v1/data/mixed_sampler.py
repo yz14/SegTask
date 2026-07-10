@@ -7,7 +7,9 @@
   现有 dataset 子类无需改动。
 * :class:`MixedBatchSampler` —— 在 ``ConcatDataset`` 的全局索引空间上工作，保证
   每个 batch 同时含金标准与粗标，且按整数配额混合。粗标每个 epoch 顺序消费一遍，
-  金标准循环重采样（适合"金少粗多"）。
+  金标准循环重采样（适合"金少粗多"）。支持 DDP：传入 ``rank`` /
+  ``world_size`` 后，各 rank 共享同一全局 batch 序列（同 seed+epoch）并按
+  batch 不相交切分，各 rank 等长（尾部不整除部分丢弃）。
 
 二者均不依赖 trainer / specs，``DataLoader`` 通过 ``batch_sampler=`` 接入。
 """
@@ -92,14 +94,18 @@ class MixedBatchSampler(Sampler[List[int]]):
 
     * 粗标(secondary)整体随机重排，按 ``coarse_per_batch`` 顺序消费，整轮恰好覆盖一遍；
     * 金标准(primary)按 ``gold_per_batch`` 取，耗尽即重排续取（循环过采样）；
-    * epoch 长度 ``__len__ = n_secondary // coarse_per_batch``。
+    * epoch 长度 ``__len__ = n_secondary // coarse_per_batch // world_size``
+      （单卡即全局 batch 数）。
 
     Args:
         n_primary:        金标准展开样本数（= num_vols * samples_per_volume）。
         n_secondary:      粗标展开样本数。
         gold_per_batch:   每 batch 金标准数（>= 1）。
         coarse_per_batch: 每 batch 粗标数（>= 1）。
-        seed:             基础随机种子；每 epoch 自增以获得可复现且各异的顺序。
+        seed:             基础随机种子；配合 ``set_epoch``（或未调用时的逐
+                          ``__iter__`` 自增）获得可复现且逐 epoch 各异的顺序。
+        rank:             DDP 进程序号（单卡/非 DDP 为 0）。
+        world_size:       DDP 进程总数（单卡/非 DDP 为 1）。
     """
 
     def __init__(
@@ -108,7 +114,9 @@ class MixedBatchSampler(Sampler[List[int]]):
         n_secondary: int,
         gold_per_batch: int,
         coarse_per_batch: int,
-        seed: int = 0) -> None:
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1) -> None:
         super().__init__(data_source=None)
         if gold_per_batch < 1 or coarse_per_batch < 1:
             raise ValueError(
@@ -127,26 +135,50 @@ class MixedBatchSampler(Sampler[List[int]]):
         self.n_secondary      = int(n_secondary)
         self.gold_per_batch   = int(gold_per_batch)
         self.coarse_per_batch = int(coarse_per_batch)
+        if world_size < 1 or not (0 <= rank < world_size):
+            raise ValueError(
+                f"Invalid rank/world_size: rank={rank}, "
+                f"world_size={world_size}.")
         self._base_seed       = int(seed)
         self._epoch           = 0
+        self._epoch_explicit  = False
+        self.rank             = int(rank)
+        self.world_size       = int(world_size)
 
         # secondary 在 concat 中的全局索引偏移。
         self._sec_offset = self.n_primary
-        self._num_batches = self.n_secondary // self.coarse_per_batch
+        self._num_batches_global = self.n_secondary // self.coarse_per_batch
+        # DDP：按 batch 不相交切分，各 rank 等长（尾部不整除部分丢弃，类似
+        # DistributedSampler(drop_last=True)）。
+        self._num_batches = self._num_batches_global // self.world_size
+        if self._num_batches < 1:
+            raise ValueError(
+                f"Mixed-source epoch has {self._num_batches_global} global "
+                f"batch(es) but world_size={self.world_size}; every rank "
+                f"needs at least one batch. Add coarse data or reduce GPUs.")
 
         logger.info(
             "MixedBatchSampler: gold=%d, coarse=%d samples; per-batch "
             "gold=%d + coarse=%d (batch_size=%d); %d batches/epoch "
-            "(coarse-bound). Gold is cycled/oversampled ~%.2fx per epoch.",
+            "(coarse-bound%s). Gold is cycled/oversampled ~%.2fx per epoch.",
             self.n_primary, self.n_secondary,
             self.gold_per_batch, self.coarse_per_batch,
             self.gold_per_batch + self.coarse_per_batch,
             self._num_batches,
-            (self._num_batches * self.gold_per_batch)
+            (f"; rank {self.rank}/{self.world_size} of "
+             f"{self._num_batches_global} global"
+             if self.world_size > 1 else ""),
+            (self._num_batches_global * self.gold_per_batch)
             / max(self.n_primary, 1))
 
     def __len__(self) -> int:
         return self._num_batches
+
+    def set_epoch(self, epoch: int) -> None:
+        """显式设定 epoch（DistributedSampler 同款接口）。DDP 下各 rank 必须
+        每 epoch 调用以对齐全局排列；调用后 ``__iter__`` 不再自增。"""
+        self._epoch = int(epoch)
+        self._epoch_explicit = True
 
     def _gold_stream(self, rng: np.random.Generator) -> Iterator[int]:
         """无限金标准索引流：每耗尽一轮即重排续发。"""
@@ -156,14 +188,16 @@ class MixedBatchSampler(Sampler[List[int]]):
                 yield int(i)
 
     def __iter__(self) -> Iterator[List[int]]:
-        # 每 epoch 用独立但可复现的 RNG。
+        # 每 epoch 用独立但可复现的 RNG；DDP 下各 rank 同 seed+epoch，因而
+        # 全局 batch 序列一致，再按 rank 取不相交的 strided 切片。
         rng = np.random.default_rng(self._base_seed + self._epoch)
-        self._epoch += 1
+        if not self._epoch_explicit:
+            self._epoch += 1
 
         sec_perm   = rng.permutation(self.n_secondary)
         gold_iter  = self._gold_stream(rng)
 
-        for b in range(self._num_batches):
+        for b in range(self._num_batches_global):
             start = b * self.coarse_per_batch
             sec_chunk = sec_perm[start:start + self.coarse_per_batch]
             # secondary 全局索引 = 局部索引 + 偏移。
@@ -172,4 +206,10 @@ class MixedBatchSampler(Sampler[List[int]]):
                 batch.append(next(gold_iter))   # primary 全局索引 == 局部索引
             # 打散 batch 内顺序，避免来源位置固定带来的潜在偏置。
             rng.shuffle(batch)
+            # RNG 消费对所有 rank 保持一致（每个全局 batch 都生成），仅
+            # 产出属于本 rank 的切片；超出等长配额的尾部 batch 丢弃。
+            if b % self.world_size != self.rank:
+                continue
+            if b // self.world_size >= self._num_batches:
+                break
             yield batch

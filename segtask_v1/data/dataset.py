@@ -145,6 +145,20 @@ def read_nifti_spacing(path: str) -> "Tuple[float, float, float]":
     return (out[0], out[1], out[2])
 
 
+def read_nifti_geometry(
+    path: str,
+) -> "Tuple[Tuple[float, ...], Tuple[float, ...], Tuple[float, ...]]":
+    """仅读 NIfTI 头（不解码像素）返 (spacing, origin, direction)，均为 sitk
+    原生顺序（spacing/origin=(sx,sy,sz)，direction=9 元行主方向余弦）。
+    供 make_data 校验 image/label/bbox/rw 是否共物理坐标系。"""
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.ReadImageInformation()
+    return (tuple(float(s) for s in reader.GetSpacing()),
+            tuple(float(o) for o in reader.GetOrigin()),
+            tuple(float(d) for d in reader.GetDirection()))
+
+
 def resample_to_spacing(
     vol: np.ndarray,
     src_spacing: "Tuple[float, float, float]",

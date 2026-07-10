@@ -607,20 +607,16 @@ def build_dataloaders(
 
     ``data.npz_dir_secondary`` 非空时启用双批混合：第二批（粗标）仅用于训练，
     与第一批（金标准）经 ``ConcatDataset`` + ``MixedBatchSampler`` 在每个 train
-    batch 内按 ``data.mix_ratio`` 混合；验证集始终仅取金标准。
+    batch 内按 ``data.mix_ratio`` 混合；验证集始终仅取金标准。DDP 下
+    ``MixedBatchSampler`` 自身按 rank 对全局 batch 序列不相交切分（各 rank
+    同 seed+epoch，每 epoch 需在外层 ``set_epoch``）。
 
-    ``world_size > 1`` 时为多卡 DDP：训练集用 ``DistributedSampler`` 不相交切分到
-    各 rank（每 epoch 需在外层 ``set_epoch`` 以重新洗牌）。验证集用
+    ``world_size > 1`` 时为多卡 DDP：单源训练集用 ``DistributedSampler`` 不相交
+    切分到各 rank（每 epoch 需在外层 ``set_epoch`` 以重新洗牌）。验证集用
     ``ValBatchShardSampler`` 按 batch 块不相交切分（worker 只生产本 rank 的
     batch，无 padding / 无重复）；整卷(high)验证不走 val_loader 的 batch，仍按
     ``_npz_paths`` 在验证器内逐 rank 切。"""
     dc = cfg.data
-    if world_size > 1 and bool(dc.npz_dir_secondary):
-        raise ValueError(
-            "Multi-GPU DDP (train.gpus length >= 2) is not supported together "
-            "with two-source mixed training (data.npz_dir_secondary set), "
-            "because MixedBatchSampler is not rank-aware. Use a single GPU for "
-            "mixed-source runs, or disable npz_dir_secondary for DDP.")
 
     # DDP 下按 world_size 平摊每卡 DataLoader 的 num_workers（向下取整、至少 1）。
     # 每个 rank 是独立进程，各自 fork ``num_workers`` 个 worker 且各持一份逐 worker
@@ -745,12 +741,16 @@ def build_dataloaders(
         n_secondary_samples = len(tagged_secondary)
         gold_per_batch, coarse_per_batch = resolve_per_batch_counts(
             dc.mix_ratio, dc.batch_size)
+        # DDP：sampler 自身按 rank 切分全局 batch 序列（各 rank 同排列、
+        # 不相交、等长）；外层每 epoch 需 set_epoch 对齐重洗。
         sampler = MixedBatchSampler(
             n_primary        = n_primary_samples,
             n_secondary      = n_secondary_samples,
             gold_per_batch   = gold_per_batch,
             coarse_per_batch = coarse_per_batch,
-            seed             = dc.split_seed)
+            seed             = dc.split_seed,
+            rank             = rank,
+            world_size       = world_size)
         concat_ds = ConcatDataset([tagged_primary, tagged_secondary])
         train_loader = DataLoader(
             concat_ds,
@@ -761,9 +761,11 @@ def build_dataloaders(
         n_train_vols = len(train_idx) + len(secondary_paths)
         logger.info(
             "Mixed two-source training enabled: mix_ratio(gold:coarse)=%s -> "
-            "per-batch %d gold + %d coarse (batch_size=%d), %d batches/epoch.",
+            "per-batch %d gold + %d coarse (batch_size=%d), %d batches/epoch"
+            "%s.",
             dc.mix_ratio, gold_per_batch, coarse_per_batch,
-            dc.batch_size, len(sampler))
+            dc.batch_size, len(sampler),
+            f" per rank (world_size={world_size})" if world_size > 1 else "")
     elif world_size > 1:
         # DDP：训练样本经 DistributedSampler 不相交切分到各 rank（shuffle 由
         # sampler 负责，外层每 epoch set_epoch 重洗）。drop_last 保持各 rank 等长。

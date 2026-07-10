@@ -50,131 +50,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 在针对下游分割项目的预训练模块/方向上是否有更好的高质量内容可以借鉴、适配或新增。  
 
 进展：
-一、总体评价
-ssltask 的工程骨架是好的：
 
-SSLMethod 统一了模块构建、损失、步后更新和权重导出，训练器与算法基本解耦。
-SSL 与 segtask_v1 共用模型构造路径，encoder.* / decoder.* 同名迁移是正确且高价值的设计。
-masking、multi-crop、corruption、probe、resume、DDP 等基础设施覆盖较完整。
-12 种方法覆盖面很广，但当前主要问题不是“方法还不够多”，而是训练语义、算法忠实度、评测闭环和分割任务对齐还不够扎实。
-结论：适合作为研究平台继续建设，但在修复关键问题和完成严格下游验证前，不宜把现有 12 种实现视为等成熟、等可信的生产方案。
-
-二、已确认的关键问题
-P0：必须优先处理
-梯度累积时 LR 调度单位错误
-ssl_trainer.py:78-90 用 micro-batch 数构造 scheduler，但 :605-652 只在 accumulation boundary 调用 scheduler.step()。例如 grad_accum_steps=4 时，训练结束仅走完约 1/4 的预定 schedule，warmup 也被放大约 4 倍。该问题影响所有方法。
-VICRegL 在本地 batch=1 时会产生 NaN
-vicregl.py:30-33 使用默认无偏 torch.var；单样本全局嵌入方差无定义。即便 batch=2，统计也极不稳定；当前又没有跨 rank gather，因此不适合常见的小 batch 3D 训练。
-只检查 loss 非有限，不能阻止有限 loss + 非有限梯度污染 bf16/fp32 权重
-当前非 fp16 路径没有完整 gradient-finite 检查。fp16 虽由 GradScaler 跳过 optimizer，但代码仍可能推进方法内部教师/调度状态。
-P1：高优先级正确性或可信度问题
-跳过 optimizer 后仍推进方法内部 EMA 和 global step
-ssl_trainer.py:619-652 的显式跳步仍执行 _global_step += 1 和 method.on_after_step()，与代码注释中的“EMA 不推进”矛盾。DINO/JEPA/BYOL/MoCo 等教师都会在学生未更新时继续变化。
-方法副作用发生得过早，非有限步骤可能污染状态
-DINO/iBOT 在 compute_loss() 中先更新 center，MoCo 先写 queue；之后才由 trainer 判断本步是否有效。NaN logits/key 可永久污染 center/queue。应把这类更新改成“optimizer 成功后提交”。
-方法内 EMA 与 trainer EMA 默认叠加
-配置目前只告警、不阻止；而分割配置默认通常开启 EMA。DINO 导出的教师可能实际成为“教师的二次 EMA”，JEPA/BYOL/MoCo 同样语义不清。应按方法明确唯一的导出与 EMA 策略。
-手动 DDP 只同步梯度，不完整同步训练语义
-epoch loss、方法日志和 best-by-loss 使用 rank0 本地数据而非全局均值；若骨干/头使用带 running buffer 的归一化，各 rank buffer 也可能分叉。
-SparK 当前是门控稠密近似，不是真正稀疏卷积等价
-仅在 stem/stage 边界门控，stage 内普通卷积仍可能让遮挡位置产生中间激活并传播；masked InstanceNorm 只覆盖部分 norm 情况，GroupNorm/BatchNorm 没有相同保证。aux_fuse 等 stem 又在运行时才拒绝。建议将名称和能力边界说清，并用不变量测试验证。
-DINO+Gram 与官方 DINOv3 Gram anchoring 的 anchor 生命周期不同
-当前周期性用最新 EMA teacher 刷新 anchor；官方流程使用前一训练阶段的固定 Gram teacher checkpoint。周期刷新会让 anchor 跟随密集特征退化，削弱“锚定”本意。因此当前应定位为自定义 DINO+Gram 变体，而非未经验证地等同 DINOv3。
-VICRegL 局部匹配不完整
-当前只做全量 cdist 后的位置最近邻，没有距离阈值、重叠有效性过滤或论文中的特征匹配支路；无重叠裁剪也会被强制配对。浅层大特征图的 O(N²) cdist 还可能直接 OOM。
-best-by-SSL-loss 对非重建方法不可靠
-DINO、JEPA、BYOL、MoCo 的代理损失与下游分割质量不保证单调，甚至坍缩也可能给出较低损失。在线 probe 是正确方向，但当前默认闭环仍可能按本地训练 loss 选 best。
-当前 probe/离线评测不足以支撑方法优劣结论
-随机 patch probe 容易大量采到无前景区域；单卷时甚至 train=val；离线 finetune 只是 encoder + probe head，不是完整分割模型；缺少多随机种子、置信区间、完整体积推理和独立测试集。因此它适合健康监测，不宜替代真实下游结论。
-三、12 种方法判断
-方法	判断	对下游分割的主要意见
-Genesis	成熟基线，且可迁移 enc+dec	可能偏低级纹理/强度重建；应保留作强基线
-Prior/Frangi	血管任务有针对性	spacing、尺度、伪目标噪声和逐 patch 归一化风险较大；更适合作辅助目标，不宜单独主导
-SimMIM	实现简洁、适合作对照	单瓶颈轻头可能不足以形成多尺度密集特征
-SparK	最值得优先打磨	分层重建和 decoder_mode=seg 很契合分割，但须先解决稀疏语义、norm 和配置闭环
-DINO	核心蒸馏逻辑基本合理	随机非重叠医学 patch 被当作同语义正对，可能损害局部解剖；只迁移 encoder
-DINO+Gram	计算公式实现较用心	anchor 策略需重新对齐论文或明确为自定义变体
-JEPA	有价值的 CNN 隐空间实验	与 I-JEPA 差异较大：无显式目标块 query、多块策略和 token removal，需严查捷径/坍缩
-iBOT	密集目标方向适合分割	DINO 与 iBOT 独立重采样、重复前向；是简化混合，不等于完整 DINOv2
-SparK+DINO	全局+密集组合方向合理	固定损失权重、重复前向和梯度冲突尚未量化
-BYOL	可保留为非对比基线	DINOHead 替代典型 BYOL projector/predictor，且无 BN；需坍缩诊断
-MoCo	队列和 EMA 主体合理	同患者/相似解剖容易成为 false negatives，且目标偏全局分类而非密集分割
-VICRegL	理论上最对齐分割的判别式方法	但当前 batch 统计和局部匹配必须先修复，现状不宜直接用于结论
-四、针对下游分割的建议优先级
-主线优先选择经过修正的 SparK-3D/MAE 路线，而不是继续扩充方法数量。
-重点比较：轻 decoder 的 encoder-only 迁移，与真实分割 decoder 的 enc+dec warm-start。近期 3D 医学研究也表明，架构对齐、配置良好的 CNN MAE/SparK 在严格分割评测下很有竞争力，但该结论仍需在本项目 CT/血管数据上复验。
-把数据采样从纯均匀 patch 改成无标注解剖感知采样。
-可利用 body/lung mask、强梯度区、Frangi 高响应区或多尺度混合采样，避免大量空气背景；保留一定比例均匀样本防止偏置。
-做 spacing-aware、轴向可控的医学增强。
-当前逐轴独立 crop scale 会造成较强非等比形变，所有轴同概率翻转也可能产生不合理的头脚翻转。应支持 per-axis scale/flip、最小重叠率、物理尺度 mask unit，并保留病灶/细血管结构。
-优先学习多尺度密集特征与 decoder，而非只优化全局 embedding。
-推荐方向是：SparK 像素目标 + 多尺度 EMA latent target，或修正后的 VICRegL/iBOT；全局 DINO 项只作辅助，并监测各分支梯度比例。
-Frangi 作为软辅助先验。
-与像素/latent 重建联合，设置较小权重和置信度掩码；尺度应由 mm 转 voxel，并避免把支气管、裂隙和噪声伪响应硬灌入模型。
-下游微调必须单独研究迁移策略。
-比较 encoder-only/enc+dec、较低 encoder LR、逐级解冻、layer-wise LR decay；否则好的预训练权重可能在早期被随机 decoder 梯度快速破坏。
-五、建议实验短名单
-先不要对 12 种方法做昂贵全排列。第一轮只比较：
-
-from scratch 强基线；
-Genesis enc+dec；
-SparK light encoder-only；
-SparK seg-decoder enc+dec；
-修正后的 VICRegL；
-一个修正后的 dense latent hybrid（JEPA 或 iBOT，二选一）。
-所有方法统一骨干、预训练数据、优化步数/算力、下游训练 recipe，并在 1%、5%、10%、100% 标注量上至少跑 3 个种子，报告完整体积 Dice、HD95、precision/recall 和 mean±std。
-
-六、可拆分执行计划
-A1. 修正 optimizer-step 状态机
-目标：统一 micro-step、attempted-step、successful-step；scheduler/EMA/teacher 只按明确语义推进。
-产出：trainer 修改与 grad accumulation/nonfinite 单测。
-验收：accum=1/4/尾组时 LR 曲线完全符合预期；注入 NaN/Inf 后参数、教师、EMA、center、queue 均不被污染。
-依赖：无。
-A2. 修正 DDP 全局语义
-目标：全局归约 loss/log/health 指标，处理或禁止不同步 running buffers。
-产出：单卡/双卡一致性测试。
-验收：固定输入下单卡与双卡一步更新及 epoch 指标在容差内一致。
-依赖：可与 A1 并行。
-A3. 修正 VICRegL
-目标：跨 rank gather 全局嵌入；batch=1 安全；重叠/距离有效匹配；chunked KNN。
-产出：数值测试、无重叠测试、显存上界测试。
-验收：batch=1 有限；无重叠不产生伪正对；浅层特征不会因全量 cdist OOM。
-依赖：无；评测前必须完成。
-A4. 收紧配置与导出契约
-目标：内部 EMA 方法禁止或明确覆盖 trainer EMA；校验 mask divisibility、最少单元数、SparK stem/norm 支持；输出实际命中键报告。
-产出：配置硬错误/告警和 transfer contract 测试。
-验收：不支持组合在启动前失败；预期 encoder/decoder 键 100% 命中且无 shape mismatch。
-依赖：无。
-B1. 建立 SSL 方法测试矩阵
-目标：12 方法至少覆盖 build、forward/backward、successful/failed step、resume、export，含 2D/3D 和 accum/DDP 关键组合。
-产出：快速 smoke + 精确单元测试。
-验收：每种方法都能在小张量上完成两次更新和 resume 后一致继续。
-依赖：A1–A4 后锁定最终语义。
-B2. 重建可信评测闭环
-目标：patient-level 固定划分、前景感知 probe、多种子、完整体积分割测试、独立 test set。
-产出：统一 benchmark 配置和 CSV/JSON 报告。
-验收：所有方法共享同一 split/seed/算力；报告 mean±std 和 paired delta；probe 与真实下游排名相关性被量化。
-依赖：A1–A4；协议设计可提前并行。
-C1. 打磨 SparK 分割主线
-目标：验证/修正 masked convolution 与 normalization；比较 light decoder 和真实 decoder warm-start。
-产出：两个公平配置及消融结果。
-验收：无掩码时与普通 encoder 数值等价；遮挡位点不会通过 norm/卷积污染可见特征；下游提升经多种子确认。
-依赖：A1、A4、B2。
-C2. 引入解剖与物理空间感知
-目标：spacing-aware mask/crop、per-axis augmentation、最小视图重叠、背景/结构混合采样。
-产出：数据元数据扩展及采样消融。
-验收：采样覆盖率、前景代理比例和视图重叠率可记录；不再产生不合理轴向翻转/畸变。
-依赖：可独立实现；效果验收依赖 B2。
-C3. 选择一个 dense latent 混合方法
-目标：在修正 VICRegL、iBOT 或 JEPA 中只晋级一个；共享视图/encoder forward，加入多尺度目标和坍缩监测。
-产出：单一可维护实现，而非继续平行堆方法。
-验收：同等算力下稳定优于 SparK 或提供互补收益，否则保留为实验方法。
-依赖：A1–A3、B2、C1 基线。
-D1. 性能与成熟度治理
-目标：批量化 multi-crop、缓存/预计算 Frangi、确认 compile 实际覆盖范围；给方法标注 stable/experimental/reference。
-产出：吞吐/显存基准和明确能力矩阵。
-验收：优化前后数值一致；吞吐改善有基准数据；README 不再把简化实现等同原论文完整算法。
-依赖：正确性修复后执行
 
 
 
@@ -1008,11 +884,33 @@ num_fg = 1 / 3
 相关用例通过（test_round2_fixes 中 bug1/bug6/bug10b/bug11 等 4 项失败为陈旧测试
 与演进后代码不匹配，改动前即失败，与本批修复无关）。
 
-### 16.3 后续批次（未实施）
+### 16.3 第二批修复（已实施并通过测试，2026-07-10）
 
-- 第二批：DistributedMixedBatchSampler、manifest 持久化 target_spacing + Predictor 读取、
-  物理几何（origin/spacing/direction）校验。
-- 第三批：spacing-aware Surface Dice、SWA/AdaBN BN buffer 跨 rank 聚合、high-val z-interleave。
+配套回归测试 `tests/test_review_batch2_fixes.py`（14 项全过）；全仓测试基线
+无新增失败（陈旧失败集合与改动前一致）：
+
+1. **P1-01（功能增强）**：`mixed_sampler.py` MixedBatchSampler 增加
+   `rank`/`world_size` 与 `set_epoch`（DistributedSampler 同款接口）：各 rank
+   共享同一全局 batch 序列（同 seed+epoch），按 batch 取 strided 不相交切片、
+   等长（尾部不整除丢弃，类比 drop_last）。`loader.py` 移除 DDP+双源互斥
+   fail-fast，混合采样器直接接 rank/world_size；`trainer.py` 采样器识别改为
+   按 set_epoch 协议鸭子识别 sampler/batch_sampler 两处，每 epoch set_epoch
+   对齐重洗。
+2. **P1-07 / P2-04（部分）**：`make_data.py` manifest 增记
+   `spacing_normalization` 与解析后的 `target_spacing`（自动中位数不再只存在
+   于日志）；`predictor.py` 在 `data.target_spacing` 未显式配置时从
+   `npz_dir/_manifest.json` 回读（显式配置仍优先，均缺失才报错）。
+   `_TOOL_VERSION` 1.4→1.5。
+3. **P1-04/P1-05（几何部分）**：`dataset.py` 新增 `read_nifti_geometry`
+   （只读头返 spacing/origin/direction）；`make_data.prepare_one` 开头对
+   label/bbox/rw 与 image 做物理坐标系一致性校验（容差 spacing/direction
+   1e-3、origin 1e-2 mm），不一致 fail-fast（与 shape 校验同级），
+   杜绝"shape 相同但物理坐标系不同"的静默错配。
+
+### 16.4 后续批次（未实施）
+
+- 第三批：spacing-aware Surface Dice、SWA/AdaBN BN buffer 跨 rank 聚合、
+  high-val z-interleave 一致性。
 
 
 

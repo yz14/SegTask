@@ -254,10 +254,15 @@ class Trainer:
         else:
             self.fwd_model = self.model
 
-        # DDP 训练采样器（每 epoch set_epoch 重洗）；非 DDP 为 None。
-        _sampler = getattr(self.train_loader, "sampler", None)
-        self._train_sampler = (
-            _sampler if isinstance(_sampler, DistributedSampler) else None)
+        # 训练采样器（每 epoch set_epoch 重洗）：单源 DDP 为 DistributedSampler
+        # （loader.sampler），双源混合为 MixedBatchSampler（loader.batch_sampler，
+        # DDP 下各 rank 依赖 set_epoch 对齐全局排列）；均按 set_epoch 协议鸭子识别。
+        self._train_sampler = None
+        for _s in (getattr(self.train_loader, "sampler", None),
+                   getattr(self.train_loader, "batch_sampler", None)):
+            if _s is not None and callable(getattr(_s, "set_epoch", None)):
+                self._train_sampler = _s
+                break
 
         # --- 增强 ------------------------------------------------------
         _scales = cfg.data.multi_res_scales or [1.0]
