@@ -130,9 +130,9 @@ def _make_pipeline_inputs(cfg):
     if cfg.data.keep_native_multi_res:                 # cubic native：(1,1,eD,eH,eW)
         shape = (1, 1, round(D * max_scale),
                  round(H * max_scale), round(W * max_scale))
-    elif cfg.data.keep_native_view_depth:              # 2.5D native-d：(1,1,eD,H,W)
-        shape = (1, 1, round(D * max_scale), H, W)
-    else:                                              # 折叠多视图：(1,n_views,D,H,W)
+    elif cfg.data.patch_mode == "2_5d":                # 2.5D：单 max-FOV z-cube
+        shape = (1, 1, round(D * max_scale), H, W)     # 拆视图在 prepare_batch 内
+    else:                                              # 3D 折叠多视图：(1,n_views,D,H,W)
         shape = (1, n_views, D, H, W)
     img = torch.randn(*shape)
     lbl = torch.randint(0, 3, shape).float()

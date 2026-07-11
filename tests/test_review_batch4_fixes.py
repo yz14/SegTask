@@ -324,14 +324,14 @@ def _make_cfg(patch_mode, scales, native_d, native_mr, lift, aux, ds):
 
 
 def _dataset_batch(cfg, native_mr):
-    n_views = len(cfg.data.multi_res_scales)
     d = cfg.data.patch_size[0]
-    if native_mr or cfg.data.keep_native_view_depth:
-        # keep_native_*：dataset 发单个 max-FOV cube（z 轴乘 max_scale）。
+    if cfg.data.patch_mode == "2_5d" or native_mr:
+        # dataset 发单个 max-FOV cube（z 轴乘 max_scale）；逐视图拆分在
+        # pipeline.prepare_batch 内完成（folded 与 keep_native_* 皆然）。
         d = int(round(d * max(cfg.data.multi_res_scales)))
         c = 1
     else:
-        c = n_views
+        c = len(cfg.data.multi_res_scales)
     img = torch.randn(B, c, d, H, W)
     lbl = torch.randint(0, 3, (B, c, d, H, W)).float()
     return img, lbl

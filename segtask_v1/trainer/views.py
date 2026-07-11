@@ -171,6 +171,66 @@ def split_views_native_d(
 
 
 # ---------------------------------------------------------------------------
+# 2.5D lazy multi-resolution split (folded: per-view z-resize back to D)
+# ---------------------------------------------------------------------------
+def split_views_2_5d_folded(
+    image            : torch.Tensor,
+    label            : torch.Tensor,
+    wmap             : Optional[torch.Tensor],
+    per_view_depths  : List[int],
+    target_patch_size: Tuple[int, int, int]) -> Tuple[
+    torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """``(B,1,eD_max,H,W)`` 逐视图中心裁 ``D_k`` 切片后 D 轴 resize 回 ``D``，
+    stack 成 ``(B,n_views,D,H,W)``（folded 布局，供 ``squeeze_2_5d`` 折叠）。
+
+    与推理侧 ``build_z_window_cpu_multi_res`` / GPU builder 同一几何约定：
+    img/wmap 走 trilinear，label 走 nearest。
+    """
+    if image.ndim != 5 or image.shape[1] != 1:
+        raise ValueError(
+            "2.5D folded split expects (B, 1, eD_max, H, W); got "
+            f"image.shape={tuple(image.shape)}")
+    if label.shape[:2] != image.shape[:2] or label.shape[2:] != image.shape[2:]:
+        raise ValueError(
+            "image / label shape mismatch: "
+            f"image={tuple(image.shape)}, label={tuple(label.shape)}")
+
+    _, _, eD_max, H, W = image.shape
+    depths = per_view_depths
+    D      = depths[0]
+    if eD_max != int(target_patch_size[0]):
+        raise ValueError(
+            f"2.5D folded split expects depth axis == target_patch_size[0]"
+            f"={target_patch_size[0]}; got {eD_max}. The post-augment "
+            "center crop should already have removed the augment "
+            "oversample margin.")
+    if max(depths) > eD_max:
+        raise ValueError(
+            f"max(per_view_depths)={max(depths)} exceeds eD_max={eD_max}; "
+            "this indicates a multi_res_scales / patch_size mismatch.")
+
+    def _view(t: torch.Tensor, d_k: int, is_label: bool) -> torch.Tensor:
+        d0 = (eD_max - d_k) // 2
+        v  = t[:, :, d0:d0 + d_k]                    # (B, 1, d_k, H, W)
+        if d_k != D:
+            v = F.interpolate(
+                v, size=(D, H, W),
+                **({"mode": "nearest"} if is_label else
+                   {"mode": "trilinear", "align_corners": False}))
+        return v.squeeze(1)                          # (B, D, H, W)
+
+    img_views  = [_view(image, d_k, False) for d_k in depths]
+    lbl_views  = [_view(label, d_k, True) for d_k in depths]
+    image_out  = torch.stack(img_views, dim=1).contiguous()
+    label_out  = torch.stack(lbl_views, dim=1).contiguous()
+    wmap_out: Optional[torch.Tensor] = None
+    if wmap is not None:
+        wmap_out = torch.stack(
+            [_view(wmap, d_k, True) for d_k in depths], dim=1).contiguous()
+    return image_out, label_out, wmap_out
+
+
+# ---------------------------------------------------------------------------
 # 2.5D fold ops
 # ---------------------------------------------------------------------------
 def squeeze_2_5d(
@@ -216,5 +276,6 @@ __all__ = [
     "center_crop",
     "split_views_native_3d",
     "split_views_native_d",
+    "split_views_2_5d_folded",
     "squeeze_2_5d",
     "squeeze_2_5d_keep_views"]

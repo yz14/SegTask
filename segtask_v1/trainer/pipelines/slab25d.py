@@ -84,18 +84,32 @@ class Slab2_5DPipeline(ViewPipeline):
         self.aux_loss_fns    = None
         self.aux_weights     = []
         self.mr_native_sizes = []
-        self.per_view_depths = []
-        self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
+        self.per_view_depths = list(cfg.per_view_depths)
+        # 数据集发单 max-FOV z-cube；多 FOV 时增强后 target 深度 = eD_max。
+        max_scale = max(cfg.data.multi_res_scales)
+        self.target_patch_size = (
+            int(round(D * max_scale)),
+            int(cfg.data.patch_size[1]),
+            int(cfg.data.patch_size[2]))
         logger.info(
             "Loss: %s [2.5D, reduction=%s], num_slices=%d, fg_classes=%d",
             cfg.loss.name, cfg.loss.slice_loss_reduction,
             D, cfg.num_fg_classes)
 
+    def _split_views(self, image, label, wmap):
+        """(B,1,eD_max,H,W) → (B,n_views,D,H,W)；单分辨率时为无操作透传。"""
+        return views.split_views_2_5d_folded(
+            image, label, wmap,
+            per_view_depths   = self.per_view_depths,
+            target_patch_size = self.target_patch_size)
+
     def prepare_batch(self, image, label, wmap):
+        image, label, wmap = self._split_views(image, label, wmap)
         image, label, wmap = views.squeeze_2_5d(image, label, wmap)
         return image, SupervisionPack(label_main=label, wmap_main=wmap)
 
     def prepare_val_batch(self, image, label):
+        image, label, _ = self._split_views(image, label, None)
         image, label, _ = views.squeeze_2_5d(image, label, None)
         return image, label
 
@@ -152,15 +166,28 @@ class Slab2_5DAuxPipeline(ViewPipeline):
         self.aux_loss_fns = None
         self.aux_weights  = _resolve_aux_weights(cfg, n_aux)  # 确认aux监督权重
         self.mr_native_sizes = []
-        self.per_view_depths = []
-        self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
+        self.per_view_depths = list(cfg.per_view_depths)
+        # 数据集发单 max-FOV z-cube；增强后 target 深度 = eD_max。
+        max_scale = max(cfg.data.multi_res_scales)
+        self.target_patch_size = (
+            int(round(D * max_scale)),
+            int(cfg.data.patch_size[1]),
+            int(cfg.data.patch_size[2]))
         logger.info(
             "Aux seg supervision: ENABLED, n_aux_views=%d, weights=%s, "
             "fusion=%s",
             n_aux, self.aux_weights, cfg.model.stem_fusion_mode)
 
+    def _split_views(self, image, label, wmap):
+        """(B,1,eD_max,H,W) → (B,n_views,D,H,W) folded 布局。"""
+        return views.split_views_2_5d_folded(
+            image, label, wmap,
+            per_view_depths   = self.per_view_depths,
+            target_patch_size = self.target_patch_size)
+
     def prepare_batch(self, image, label, wmap):
-        # image 折叠；label/wmap 保 rank-5；主 label 取 view 0 用于 metrics。
+        # 拆视图后 image 折叠；label/wmap 保 rank-5；主 label 取 view 0 用于 metrics。
+        image, label, wmap = self._split_views(image, label, wmap)
         image, label_all, wmap_all = views.squeeze_2_5d_keep_views(
             image, label, wmap)
         return image, SupervisionPack(
@@ -171,6 +198,7 @@ class Slab2_5DAuxPipeline(ViewPipeline):
 
     def prepare_val_batch(self, image, label):
         # val 无 aux；折叠后仅 view-0 监督指标。
+        image, label, _ = self._split_views(image, label, None)
         image, label, _ = views.squeeze_2_5d(image, label, None)
         return image, label
 

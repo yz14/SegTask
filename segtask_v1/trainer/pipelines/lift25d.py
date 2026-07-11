@@ -14,6 +14,7 @@ import torch
 
 from ...config import Config
 from ...losses.losses import DeepSupervisionLoss, MultiResolutionLoss
+from .. import views
 from ..amp import compute_loss_fp32
 from .base import SupervisionPack, ViewPipeline
 from .slab25d import _accumulate_main, _resolve_aux_weights
@@ -51,19 +52,34 @@ class Lift2_5DPipeline(ViewPipeline):
         self.aux_loss_fns = None
         self.aux_weights = []
         self.mr_native_sizes = []
-        self.per_view_depths = []
-        self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
+        self.per_view_depths = list(cfg.per_view_depths)
+        # 数据集发单 max-FOV z-cube；增强后 target 深度 = eD_max。
+        D = int(cfg.data.patch_size[0])
+        max_scale = max(cfg.data.multi_res_scales)
+        self.target_patch_size = (
+            int(round(D * max_scale)),
+            int(cfg.data.patch_size[1]),
+            int(cfg.data.patch_size[2]))
         logger.info(
             "Loss: %s, scales=%d, fg_classes=%d [2.5D LIFTED to 3D]",
             cfg.loss.name, 1, cfg.num_fg_classes)
 
+    def _split_views(self, image, label, wmap):
+        """(B,1,eD_max,H,W) → (B,n_views,D,H,W)；单分辨率时为无操作透传。"""
+        return views.split_views_2_5d_folded(
+            image, label, wmap,
+            per_view_depths   = self.per_view_depths,
+            target_patch_size = self.target_patch_size)
+
     def prepare_batch(self, image, label, wmap):
-        # image 不变；仅以 view 0 作监督，保留 C_res=1 以合 num_res=1。
+        # 拆视图后 image 保 rank-5；仅以 view 0 作监督，保留 C_res=1 以合 num_res=1。
+        image, label, wmap = self._split_views(image, label, wmap)
         label = label[:, :1].contiguous()
         wmap = wmap[:, :1].contiguous() if wmap is not None else None
         return image, SupervisionPack(label_main=label, wmap_main=wmap)
 
     def prepare_val_batch(self, image, label):
+        image, label, _ = self._split_views(image, label, None)
         return image, label[:, :1].contiguous()
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
@@ -122,15 +138,28 @@ class Lift2_5DAuxPipeline(ViewPipeline):
         self.aux_loss_fns = None
         self.aux_weights = _resolve_aux_weights(cfg, n_aux)
         self.mr_native_sizes = []
-        self.per_view_depths = []
-        self.target_patch_size = tuple(int(x) for x in cfg.data.patch_size)
+        self.per_view_depths = list(cfg.per_view_depths)
+        # 数据集发单 max-FOV z-cube；增强后 target 深度 = eD_max。
+        max_scale = max(cfg.data.multi_res_scales)
+        self.target_patch_size = (
+            int(round(D * max_scale)),
+            int(cfg.data.patch_size[1]),
+            int(cfg.data.patch_size[2]))
         logger.info(
             "Aux seg supervision: ENABLED [LIFT], n_aux_views=%d, "
             "weights=%s, fusion=%s",
             n_aux, self.aux_weights, cfg.model.stem_fusion_mode)
 
+    def _split_views(self, image, label, wmap):
+        """(B,1,eD_max,H,W) → (B,n_views,D,H,W) folded 布局。"""
+        return views.split_views_2_5d_folded(
+            image, label, wmap,
+            per_view_depths   = self.per_view_depths,
+            target_patch_size = self.target_patch_size)
+
     def prepare_batch(self, image, label, wmap):
-        # image 保 rank-5；label/wmap 整存以便逐视图 [:, k:k+1] 取出（rank-5）
+        # 拆视图后 image 保 rank-5；label/wmap 整存以便逐视图 [:, k:k+1] 取出（rank-5）
+        image, label, wmap = self._split_views(image, label, wmap)
         return image, SupervisionPack(
             label_main=label[:, :1].contiguous(),
             wmap_main=wmap[:, :1].contiguous() if wmap is not None else None,
@@ -139,6 +168,7 @@ class Lift2_5DAuxPipeline(ViewPipeline):
         )
 
     def prepare_val_batch(self, image, label):
+        image, label, _ = self._split_views(image, label, None)
         return image, label[:, :1].contiguous()
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):

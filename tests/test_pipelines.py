@@ -166,8 +166,9 @@ class TestPrepareBatch:
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
-        img = torch.randn(B, 2, D, H, W)
-        lbl = torch.randint(0, 3, (B, 2, D, H, W)).float()
+        eD_max = int(round(D * 2.0))     # dataset emits single max-FOV cube
+        img = torch.randn(B, 1, eD_max, H, W)
+        lbl = torch.randint(0, 3, (B, 1, eD_max, H, W)).float()
         out_img, sup = p.prepare_batch(img, lbl, None)
         assert out_img.shape == (B, 2 * D, H, W)
         assert sup.label_main.shape == (B, D, H, W)
