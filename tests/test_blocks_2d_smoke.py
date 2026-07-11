@@ -289,12 +289,12 @@ def test_unet_factory_2d_unet():
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unet")
     model = build_model(cfg).eval()
     # 2D model expects (B, C_in, H, W); for 2.5D, C_in == D slices.
-    # Use generic in_channels=1 here (no multi-res), H=W=32.
     x = torch.randn(1, cfg.model.in_channels, 32, 32)
     y = model(x)
     assert y.ndim == 4, f"2D UNet output must be rank-4, got {y.ndim}"
     assert y.shape[0] == 1
-    assert y.shape[1] == cfg.num_fg_classes  # default num_res=1
+    # 2.5D head emits num_fg * D slice-channels.
+    assert y.shape[1] == cfg.num_fg_classes * cfg.data.patch_size[0]
     assert y.shape[2:] == (32, 32)
     _ok("UNet factory 2D end-to-end (unet decoder)")
 
@@ -303,9 +303,9 @@ def test_unet_factory_2d_unetpp():
     from segtask_v1.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unetpp")
     model = build_model(cfg).eval()
-    x = torch.randn(1, 1, 32, 32)
+    x = torch.randn(1, cfg.model.in_channels, 32, 32)
     y = model(x)
-    assert y.shape == (1, 2, 32, 32)
+    assert y.shape == (1, cfg.num_fg_classes * cfg.data.patch_size[0], 32, 32)
     _ok("UNet factory 2D end-to-end (unetpp decoder)")
 
 
@@ -313,9 +313,9 @@ def test_unet_factory_2d_unet3p():
     from segtask_v1.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unet3p")
     model = build_model(cfg).eval()
-    x = torch.randn(1, 1, 32, 32)
+    x = torch.randn(1, cfg.model.in_channels, 32, 32)
     y = model(x)
-    assert y.shape == (1, 2, 32, 32)
+    assert y.shape == (1, cfg.num_fg_classes * cfg.data.patch_size[0], 32, 32)
     _ok("UNet factory 2D end-to-end (unet3p decoder)")
 
 
@@ -330,14 +330,15 @@ def test_unet_factory_2d_convnext_with_attention():
     cfg.model.upsample_mode = "trilinear"  # bilinear in 2D path
     cfg.validate()
     model = build_model(cfg).train()  # DS only active in train mode
-    x = torch.randn(1, 1, 32, 32)
+    x = torch.randn(1, cfg.model.in_channels, 32, 32)
     out = model(x)
+    n_out = cfg.num_fg_classes * cfg.data.patch_size[0]
     assert isinstance(out, list), "deep_supervision should return a list"
-    assert out[0].shape == (1, 2, 32, 32), \
+    assert out[0].shape == (1, n_out, 32, 32), \
         f"main DS output shape mismatch: {out[0].shape}"
     for sub in out[1:]:
         assert sub.ndim == 4
-        assert sub.shape[0] == 1 and sub.shape[1] == 2
+        assert sub.shape[0] == 1 and sub.shape[1] == n_out
     _ok("UNet factory 2D ConvNeXt + ECA + skip-attn + DS")
 
 
@@ -348,9 +349,9 @@ def test_unet_factory_2d_patch_stem_resolution_restored():
     cfg.model.stem_mode = "patch2"
     cfg.validate()
     model = build_model(cfg).eval()
-    x = torch.randn(1, 1, 32, 32)
+    x = torch.randn(1, cfg.model.in_channels, 32, 32)
     y = model(x)
-    assert y.shape == (1, 2, 32, 32), (
+    assert y.shape == (1, cfg.num_fg_classes * cfg.data.patch_size[0], 32, 32), (
         f"patchN stem 2D should restore resolution; got {tuple(y.shape)}")
     _ok("UNet factory 2D patch-stem resolution restored")
 

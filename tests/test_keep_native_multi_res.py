@@ -100,8 +100,18 @@ class _SyntheticSegDataset3D(SegDataset3D):
         super().__init__(
             image_paths=["__synth__.nii.gz"],
             label_paths=["__synth__.nii.gz"],
+            npz_paths=["__synth__.npz"],
             **kw,
         )
+
+    def _build_index(self) -> None:
+        # Synthetic in-memory volume: no npz package to read.
+        self._vol_fg_slices = [np.zeros(0, dtype=np.int32)]
+        self._vol_fg_slices_by_cls = [None]
+        self._vol_all_slices = [int(self._fake_img_pre.shape[0])]
+
+    def _has_region_weight_file(self, vol_idx):
+        return False
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         # Mirror the production path: preprocess (intensity normalisation)
@@ -126,8 +136,18 @@ class _SyntheticSegDataset3DCubic(SegDataset3DCubic):
         super().__init__(
             image_paths=["__synth__.nii.gz"],
             label_paths=["__synth__.nii.gz"],
+            npz_paths=["__synth__.npz"],
             **kw,
         )
+
+    def _build_index(self) -> None:
+        # Synthetic in-memory volume: no npz package to read.
+        self._vol_shapes = [tuple(self._fake_img_pre.shape)]
+        self._vol_fg_coords = [np.zeros((0, 3), dtype=np.int32)]
+        self._vol_fg_coords_by_cls = [None]
+
+    def _has_region_weight_file(self, vol_idx):
+        return False
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         return preprocess_image(
@@ -171,15 +191,15 @@ def test_config_sync_z_axis_on_auto_upgrades_z_boundary():
 
 
 def test_config_sync_cubic_on_does_not_touch_z_boundary():
-    """Cubic mode does NOT use z_boundary_mode; sync must leave it alone."""
+    """'stretch' is deprecated; sync() always auto-upgrades to 'edge_pad'
+    (training-side extraction is edge-pad-only), cubic mode included."""
     cfg = _make_cfg(
         patch_mode="cubic", multi_res_scales=[1.0, 1.5, 2.0],
         keep_native_multi_res=True, z_boundary_mode="stretch",
     )
     cfg.validate()
-    assert cfg.data.z_boundary_mode == "stretch", (
-        "cubic ON path must NOT mutate z_boundary_mode (cubic doesn't "
-        "consume it)")
+    assert cfg.data.z_boundary_mode == "edge_pad", (
+        "'stretch' is deprecated; sync() must auto-upgrade to 'edge_pad'")
     assert cfg.model.in_channels == 3
 
 
@@ -189,8 +209,8 @@ def test_config_off_mode_unchanged():
         keep_native_multi_res=False, z_boundary_mode="stretch",
     )
     cfg.validate()
-    assert cfg.data.z_boundary_mode == "stretch", (
-        "OFF mode must NOT mutate z_boundary_mode")
+    assert cfg.data.z_boundary_mode == "edge_pad", (
+        "'stretch' is deprecated; sync() must auto-upgrade to 'edge_pad'")
     assert cfg.model.in_channels == 3
 
 
@@ -286,7 +306,6 @@ def test_z_axis_on_shape_and_view0_equivalence():
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
         z_boundary_mode="edge_pad",
-        keep_native_multi_res=True,
         **common,
     )
     out_on = ds_on[0]
@@ -296,25 +315,22 @@ def test_z_axis_on_shape_and_view0_equivalence():
     assert tuple(out_on["label"].shape) == (1, eD_max, H, W), (
         f"ON label shape {tuple(out_on['label'].shape)}")
 
-    # OFF (legacy) — same z-center, edge_pad. View-0 == centered D
-    # slices of the ON cube voxel-for-voxel.
-    ds_off = _FixedZ(
-        img_vol, lbl_vol,
-        multi_res_scales=multi_res_scales,
-        z_boundary_mode="edge_pad",
-        keep_native_multi_res=False,
-        **common,
-    )
-    out_off = ds_off[0]
-    assert tuple(out_off["image"].shape) == (3, D, H, W)
+    # View-0 reference: an independent edge_pad extraction of exactly D
+    # slices around the same z-center (the legacy OFF-path view-0). The
+    # centered D slices of the max-FOV cube must equal it voxel-for-voxel.
+    z = 40 // 2
+    img_pre = ds_on._load_image(0)  # already normalised
+    lbl_raw = ds_on._load_label(0)
+    off_view0_img = resize_3d(
+        extract_z_patch_padded(img_pre, z, D), D, H, W, is_label=False)
+    off_view0_lbl = resize_3d(
+        extract_z_patch_padded(lbl_raw, z, D), D, H, W, is_label=True)
 
     on_img = out_on["image"][0].numpy()
     on_lbl = out_on["label"][0].numpy()
     d0 = (eD_max - D) // 2
     on_view0_img = on_img[d0:d0 + D]
     on_view0_lbl = on_lbl[d0:d0 + D]
-    off_view0_img = out_off["image"][0].numpy()
-    off_view0_lbl = out_off["label"][0].numpy()
 
     if not np.allclose(on_view0_img, off_view0_img, atol=1e-5):
         diff = float(np.abs(on_view0_img - off_view0_img).max())
@@ -342,7 +358,6 @@ def test_z_axis_on_aux_view_geometric_ground_truth():
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
         z_boundary_mode="edge_pad",
-        keep_native_multi_res=True,
         **common,
     )
     out = ds_on[0]
@@ -390,7 +405,6 @@ def test_z_axis_on_weight_map_shape_and_geometry():
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
         z_boundary_mode="edge_pad",
-        keep_native_multi_res=True,
         region_weights=[1.0, 4.0, 2.0],
         **common,
     )
@@ -399,12 +413,14 @@ def test_z_axis_on_weight_map_shape_and_geometry():
     assert "weight_map" in out, "static region_weights should emit a weight_map"
     assert tuple(out["weight_map"].shape) == (1, eD_max, H, W), (
         f"weight_map shape {tuple(out['weight_map'].shape)}")
-    # Values must follow the label-driven mapping.
+    # Values follow the label-driven mapping: final weight = configured + 1
+    # (same semantics as the per-sample weight-file path).
     lbl_int = out["label"][0].numpy().round().astype(np.int32)
     wmap = out["weight_map"][0].numpy()
     expected = np.ones_like(wmap)
-    expected[lbl_int == 1] = 4.0
-    expected[lbl_int == 2] = 2.0
+    expected[lbl_int == 0] = 1.0 + 1.0
+    expected[lbl_int == 1] = 4.0 + 1.0
+    expected[lbl_int == 2] = 2.0 + 1.0
     assert np.allclose(wmap, expected), "weight_map values mismatch"
 
 
@@ -446,7 +462,6 @@ def test_cubic_on_shape_and_per_view_geometry():
     ds_on = _FixedCenter(
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
-        keep_native_multi_res=True,
         **common,
     )
     out = ds_on[0]
@@ -486,7 +501,8 @@ def test_cubic_on_shape_and_per_view_geometry():
 
 
 def test_cubic_off_path_unchanged():
-    """OFF-mode emission contract is bit-identical to legacy."""
+    """Dataset always emits the single max-FOV cube (per-view split lives
+    in the trainer); with scales [1.0, 1.5] the cube is round(p * 1.5)."""
     pD, pH, pW = 8, 16, 16
     multi_res_scales = [1.0, 1.5]
     Dv, Hv, Wv = 40, 32, 32
@@ -499,15 +515,15 @@ def test_cubic_off_path_unchanged():
         def _sample_center(self, vol_idx, D, H, W):
             return fixed_center
 
-    ds_off = _FixedCenter(
+    ds = _FixedCenter(
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
-        keep_native_multi_res=False,
         **common,
     )
-    out = ds_off[0]
-    assert tuple(out["image"].shape) == (2, pD, pH, pW)
-    assert tuple(out["label"].shape) == (2, pD, pH, pW)
+    out = ds[0]
+    eD, eH, eW = (int(round(p * 1.5)) for p in (pD, pH, pW))
+    assert tuple(out["image"].shape) == (1, eD, eH, eW)
+    assert tuple(out["label"].shape) == (1, eD, eH, eW)
 
 
 # ===========================================================================

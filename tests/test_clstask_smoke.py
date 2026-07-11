@@ -23,11 +23,24 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+
+# pytest fixtures：脚本模式（python tests/test_clstask_smoke.py）由 main()
+# 直接传参；pytest 收集时由以下 fixture 提供同名参数。
+@pytest.fixture(scope="module")
+def npz_dir(tmp_path_factory) -> str:
+    return _make_npz_dir(tmp_path_factory.mktemp("cls_npz"), n=12)
+
+
+@pytest.fixture
+def tmp(tmp_path) -> Path:
+    return tmp_path
 
 
 def _ok(name: str, msg: str = "") -> None:
@@ -226,7 +239,7 @@ def test_table_labels_and_mixup(npz_dir: str, tmp: Path):
     _ok("table_labels_mixup", "csv/json tables + soft-label mixup/cutmix OK")
 
 
-def test_train_and_transfer(config_path: str, npz_dir: str, out_dir: str,
+def _run_train_and_transfer(config_path: str, npz_dir: str, out_dir: str,
                             tag: str):
     from clstask.data.loader import build_cls_dataloaders
     from clstask.models.factory import build_classifier, load_pretrained_encoder
@@ -257,7 +270,7 @@ def test_train_and_transfer(config_path: str, npz_dir: str, out_dir: str,
     return cfg, cls, str(ckpt)
 
 
-def test_predict(config_path: str, npz_dir: str, out_dir: str, ckpt: str):
+def _run_predict(config_path: str, npz_dir: str, out_dir: str, ckpt: str):
     from clstask.config import apply_overrides, validate_cls
     from clstask.data.loader import discover_npz
     from clstask.models.factory import build_classifier
@@ -275,6 +288,20 @@ def test_predict(config_path: str, npz_dir: str, out_dir: str, ckpt: str):
     if cls.label_granularity == "slice":
         assert res["slice_probs"].shape[0] == k
     _ok("predict", f"volume_probs shape={res['volume_probs'].shape}")
+
+
+@pytest.mark.parametrize("tag,cfg_yaml", [
+    ("3d_cubic", "configs/cls3d_cubic.yaml"),
+    ("2_5d", "configs/cls2_5d.yaml"),
+])
+def test_train_transfer_predict(npz_dir: str, tmp_path: Path,
+                                tag: str, cfg_yaml: str):
+    torch.manual_seed(0)
+    np.random.seed(0)
+    out = str(tmp_path / f"out_{tag}")
+    cfg, cls, ckpt = _run_train_and_transfer(
+        str(_ROOT / cfg_yaml), npz_dir, out, tag)
+    _run_predict(str(_ROOT / cfg_yaml), npz_dir, out, ckpt)
 
 
 def main() -> int:
@@ -303,10 +330,10 @@ def main() -> int:
                               ("2_5d", "configs/cls2_5d.yaml")):
             print(f"\n[5:{tag}] train + SSL transfer")
             out = str(tmp / f"out_{tag}")
-            cfg, cls, ckpt = test_train_and_transfer(
+            cfg, cls, ckpt = _run_train_and_transfer(
                 str(root / cfg_yaml), npz_dir, out, tag)
             print(f"[6:{tag}] predict")
-            test_predict(str(root / cfg_yaml), npz_dir, out, ckpt)
+            _run_predict(str(root / cfg_yaml), npz_dir, out, ckpt)
 
     print("\n" + "=" * 68)
     print("ALL CLSTASK SMOKE TESTS PASSED")

@@ -43,7 +43,8 @@ from segtask_v1.config import (  # noqa: E402
     PredictConfig,
 )
 from segtask_v1.data.dataset import (  # noqa: E402
-    SegDataset3D, SegDataset3DCubic, preprocess_image,
+    SegDataset3D, SegDataset3DCubic, _extract_cubic_patch,
+    extract_z_patch_padded, preprocess_image, resize_3d,
 )
 from segtask_v1.trainer import views  # noqa: E402
 
@@ -131,7 +132,17 @@ class _SyntheticSegDataset3D(SegDataset3D):
         self._fake_lbl_raw = lbl
         super().__init__(
             image_paths=["__synth__.nii.gz"],
-            label_paths=["__synth__.nii.gz"], **kw)
+            label_paths=["__synth__.nii.gz"],
+            npz_paths=["__synth__.npz"], **kw)
+
+    def _build_index(self):
+        # Synthetic in-memory volume: no npz package to read.
+        self._vol_fg_slices = [np.zeros(0, dtype=np.int32)]
+        self._vol_fg_slices_by_cls = [None]
+        self._vol_all_slices = [int(self._fake_img_pre.shape[0])]
+
+    def _has_region_weight_file(self, vol_idx):
+        return False
 
     def _load_image(self, vol_idx):
         return preprocess_image(
@@ -148,7 +159,17 @@ class _SyntheticSegDataset3DCubic(SegDataset3DCubic):
         self._fake_lbl_raw = lbl
         super().__init__(
             image_paths=["__synth__.nii.gz"],
-            label_paths=["__synth__.nii.gz"], **kw)
+            label_paths=["__synth__.nii.gz"],
+            npz_paths=["__synth__.npz"], **kw)
+
+    def _build_index(self):
+        # Synthetic in-memory volume: no npz package to read.
+        self._vol_shapes = [tuple(self._fake_img_pre.shape)]
+        self._vol_fg_coords = [np.zeros((0, 3), dtype=np.int32)]
+        self._vol_fg_coords_by_cls = [None]
+
+    def _has_region_weight_file(self, vol_idx):
+        return False
 
     def _load_image(self, vol_idx):
         return preprocess_image(
@@ -338,25 +359,22 @@ def test_e2e_z_axis_view0_matches_off_path():
         def _sample_z(self, vol_idx, D_vol):
             return D_vol // 2
 
-    class _FixedZ_OFF(_SyntheticSegDataset3D):
-        def _sample_z(self, vol_idx, D_vol):
-            return D_vol // 2
-
     ds_on = _FixedZ_ON(
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
         z_boundary_mode="edge_pad",
-        keep_native_multi_res=True,
-        **common)
-    ds_off = _FixedZ_OFF(
-        img_vol, lbl_vol,
-        multi_res_scales=multi_res_scales,
-        z_boundary_mode="edge_pad",
-        keep_native_multi_res=False,
         **common)
 
     on = ds_on[0]
-    off = ds_off[0]
+    # Legacy OFF-path view-0 reference: independent edge_pad extraction of
+    # exactly pD slices around the same z-center (view 0 has no resize).
+    z = 40 // 2
+    img_pre = ds_on._load_image(0)
+    lbl_raw = ds_on._load_label(0)
+    off_img_v0 = resize_3d(
+        extract_z_patch_padded(img_pre, z, pD), pD, pH, pW, is_label=False)
+    off_lbl_v0 = resize_3d(
+        extract_z_patch_padded(lbl_raw, z, pD), pD, pH, pW, is_label=True)
     # Build a stub configured exactly like the trainer would build itself.
     cfg = _make_cfg(patch_mode="z_axis",
                      multi_res_scales=multi_res_scales,
@@ -370,15 +388,14 @@ def test_e2e_z_axis_view0_matches_off_path():
         img_in, lbl_in, None)
 
     img_v0_split = img_split[0, 0].numpy()    # (pD, pH, pW)
-    img_v0_off = off["image"][0].numpy()      # (pD, pH, pW)
-    if not np.allclose(img_v0_split, img_v0_off, atol=1e-5):
-        diff = float(np.abs(img_v0_split - img_v0_off).max())
+    if not np.allclose(img_v0_split, off_img_v0, atol=1e-5):
+        diff = float(np.abs(img_v0_split - off_img_v0).max())
         raise AssertionError(
             f"z_axis e2e view-0 image mismatch (max abs diff={diff:.6g}); "
-            "view 0 is no-resize, so ON-split must equal OFF dataset")
+            "view 0 is no-resize, so ON-split must equal the legacy "
+            "view-0 extraction")
     lbl_v0_split = lbl_split[0, 0].numpy()
-    lbl_v0_off = off["label"][0].numpy()
-    if not np.array_equal(lbl_v0_split, lbl_v0_off):
+    if not np.array_equal(lbl_v0_split, off_lbl_v0):
         raise AssertionError("z_axis e2e view-0 label mismatch")
 
 
@@ -396,23 +413,18 @@ def test_e2e_cubic_view0_matches_off_path():
         def _sample_center(self, vol_idx, D, H, W):
             return fixed_center
 
-    class _FC_OFF(_SyntheticSegDataset3DCubic):
-        def _sample_center(self, vol_idx, D, H, W):
-            return fixed_center
-
     ds_on = _FC_ON(
         img_vol, lbl_vol,
         multi_res_scales=multi_res_scales,
-        keep_native_multi_res=True,
-        **common)
-    ds_off = _FC_OFF(
-        img_vol, lbl_vol,
-        multi_res_scales=multi_res_scales,
-        keep_native_multi_res=False,
         **common)
 
     on = ds_on[0]
-    off = ds_off[0]
+    # Legacy OFF-path view-0 reference: independent cubic extraction of
+    # exactly (pD, pH, pW) around the same center (view 0 has no resize).
+    img_pre = ds_on._load_image(0)
+    lbl_raw = ds_on._load_label(0)
+    off_img_v0 = _extract_cubic_patch(img_pre, fixed_center, (pD, pH, pW))
+    off_lbl_v0 = _extract_cubic_patch(lbl_raw, fixed_center, (pD, pH, pW))
     cfg = _make_cfg(patch_mode="cubic",
                      multi_res_scales=multi_res_scales,
                      patch_size=(pD, pH, pW))
@@ -424,14 +436,12 @@ def test_e2e_cubic_view0_matches_off_path():
         img_in, lbl_in, None)
 
     img_v0_split = img_split[0, 0].numpy()
-    img_v0_off = off["image"][0].numpy()
-    if not np.allclose(img_v0_split, img_v0_off, atol=1e-5):
-        diff = float(np.abs(img_v0_split - img_v0_off).max())
+    if not np.allclose(img_v0_split, off_img_v0, atol=1e-5):
+        diff = float(np.abs(img_v0_split - off_img_v0).max())
         raise AssertionError(
             f"cubic e2e view-0 image mismatch (max abs diff={diff:.6g})")
     lbl_v0_split = lbl_split[0, 0].numpy()
-    lbl_v0_off = off["label"][0].numpy()
-    if not np.array_equal(lbl_v0_split, lbl_v0_off):
+    if not np.array_equal(lbl_v0_split, off_lbl_v0):
         raise AssertionError("cubic e2e view-0 label mismatch")
 
 

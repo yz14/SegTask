@@ -110,8 +110,18 @@ class _SyntheticSegDataset(SegDataset3D):
         super().__init__(
             image_paths=["__synth__.nii.gz"],
             label_paths=["__synth__.nii.gz"],
+            npz_paths=["__synth__.npz"],
             **kw,
         )
+
+    def _build_index(self) -> None:
+        # Synthetic in-memory volume: no npz package to read.
+        self._vol_fg_slices = [np.zeros(0, dtype=np.int32)]
+        self._vol_fg_slices_by_cls = [None]
+        self._vol_all_slices = [int(self._fake_img.shape[0])]
+
+    def _has_region_weight_file(self, vol_idx):
+        return False
 
     def _load_image(self, vol_idx: int) -> np.ndarray:
         return self._fake_img
@@ -163,7 +173,8 @@ def test_config_sync_on_mode():
 
 
 def test_config_sync_off_mode_unchanged():
-    """OFF mode: legacy in_channels = D * n_views; no z_boundary_mode override."""
+    """OFF mode: legacy in_channels = D * n_views; stretch is deprecated and
+    always auto-upgraded to edge_pad by sync() regardless of the flag."""
     cfg = _make_cfg(
         multi_res_scales=[1.0, 1.5, 2.0],
         keep_native_view_depth=False,
@@ -174,8 +185,8 @@ def test_config_sync_off_mode_unchanged():
     cfg.validate()
     assert cfg.model.in_channels == 8 * 3, (
         f"OFF mode in_channels should be D*n_views=24; got {cfg.model.in_channels}")
-    assert cfg.data.z_boundary_mode == "stretch", (
-        "OFF mode must NOT mutate z_boundary_mode")
+    assert cfg.data.z_boundary_mode == "edge_pad", (
+        "'stretch' is deprecated; sync() must auto-upgrade to 'edge_pad'")
 
 
 def test_config_validate_rejects_on_outside_2_5d():

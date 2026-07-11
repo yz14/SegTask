@@ -249,7 +249,7 @@ def test_factory_2_5d_multi_fov_multi_stem_proj():
     assert isinstance(encoder_mod.stem, MultiStemProj), (
         f"expected MultiStemProj, got {type(encoder_mod.stem).__name__}")
     assert len(encoder_mod.stem.stems) == n_views
-    assert encoder_mod.stem.in_ch_per_view == D
+    assert encoder_mod.stem.in_ch_per_view_list == [D] * n_views
 
     x = torch.randn(1, D * n_views, 32, 32)
     y = model_multi(x)
@@ -446,6 +446,8 @@ def test_end_to_end_2_5d_one_step():
         cfg = Config()
         cfg.data.image_dir = img_dir
         cfg.data.label_dir = lbl_dir
+        cfg.data.npz_dir = str(td / "npz")
+        cfg.data.npz_auto_build = True
         cfg.data.patch_mode = "2_5d"
         cfg.data.patch_size = [12, 32, 32]
         cfg.data.label_values = [0, 1, 2]
@@ -576,6 +578,8 @@ def test_end_to_end_2_5d_multi_fov_one_step():
         cfg = Config()
         cfg.data.image_dir = img_dir
         cfg.data.label_dir = lbl_dir
+        cfg.data.npz_dir = str(td / "npz")
+        cfg.data.npz_auto_build = True
         cfg.data.patch_mode = "2_5d"
         cfg.data.patch_size = [12, 32, 32]
         cfg.data.label_values = [0, 1, 2]
@@ -611,10 +615,12 @@ def test_end_to_end_2_5d_multi_fov_one_step():
         # ----- dataloader contract -------------------------------------
         train_loader, val_loader = build_dataloaders(cfg)
         sample = next(iter(train_loader))
-        # (B, C_res=n_views, eD, pH, pW)
-        assert sample["image"].shape[1] == 3, (
-            f"expected C_res=3 for 3-FOV config; got {sample['image'].shape}")
-        assert sample["image"].shape[2] == cfg.data.patch_size[0]
+        # dataset 发单份 max-FOV z-cube：(B, 1, round(D*max_scale), pH, pW)；
+        # 逐视图拆分由 trainer pipeline 完成。
+        eD_max = int(round(cfg.data.patch_size[0] * max(cfg.data.multi_res_scales)))
+        assert sample["image"].shape[1] == 1, (
+            f"expected single max-FOV cube (C=1); got {sample['image'].shape}")
+        assert sample["image"].shape[2] == eD_max
 
         # ----- trainer one-epoch dry run -------------------------------
         device = torch.device("cpu")
@@ -660,6 +666,8 @@ def test_end_to_end_2_5d_hierarchical_one_step():
         cfg = Config()
         cfg.data.image_dir = img_dir
         cfg.data.label_dir = lbl_dir
+        cfg.data.npz_dir = str(td / "npz")
+        cfg.data.npz_auto_build = True
         cfg.data.patch_mode = "2_5d"
         cfg.data.patch_size = [12, 32, 32]   # 32 % 4 == 0
         cfg.data.label_values = [0, 1, 2]
@@ -694,7 +702,10 @@ def test_end_to_end_2_5d_hierarchical_one_step():
 
         train_loader, val_loader = build_dataloaders(cfg)
         sample = next(iter(train_loader))
-        assert sample["image"].shape[1] == 3  # C_res=n_views
+        # 单份 max-FOV z-cube；逐视图拆分在 trainer 侧。
+        eD_max = int(round(cfg.data.patch_size[0] * max(cfg.data.multi_res_scales)))
+        assert sample["image"].shape[1] == 1
+        assert sample["image"].shape[2] == eD_max
 
         device = torch.device("cpu")
         model = build_model(cfg)

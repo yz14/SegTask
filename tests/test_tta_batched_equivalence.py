@@ -73,6 +73,7 @@ class _Stub:
                  batch_size=2, adabn_estimating=False):
         self.model = model
         self.model_dtype = torch.float32
+        self.channels_last = False
         self.num_fg = num_fg
         self.patch_D = patch_D
         self.batch_size = batch_size

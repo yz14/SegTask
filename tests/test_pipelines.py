@@ -102,7 +102,7 @@ class TestFactoryDispatch:
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         assert isinstance(p, Slab2_5DNativeDPipeline)
-        assert len(p.aux_inner_losses) == 1
+        assert len(p.aux_loss_fns) == 1
         assert p.per_view_depths == cfg.per_view_depths
 
     def test_lift_no_aux(self):
@@ -223,7 +223,7 @@ class TestComputeLossEquivalence:
             label_main=lbl_all[:, 0], label_all_views=lbl_all)
         l_p = p.compute_loss(pred, sup)
         l_main = compute_loss_fp32(p.criterion, pred_main, lbl_all[:, 0])
-        l_aux = compute_loss_fp32(p.aux_inner_loss, pred_aux, lbl_all[:, 1])
+        l_aux = compute_loss_fp32(p.aux_loss_fn, pred_aux, lbl_all[:, 1])
         l_h = l_main + p.aux_weights[0] * l_aux
         assert (l_p - l_h).abs().max() < TOL
 
@@ -244,7 +244,7 @@ class TestComputeLossEquivalence:
             label_main=lbl_all[:, :1], label_all_views=lbl_all)
         l_p = p.compute_loss(pred, sup)
         l_main = compute_loss_fp32(p.criterion, pred_main, lbl_all[:, :1])
-        l_aux = compute_loss_fp32(p.aux_inner_loss, pred_aux, lbl_all[:, 1:2])
+        l_aux = compute_loss_fp32(p.aux_loss_fn, pred_aux, lbl_all[:, 1:2])
         l_h = l_main + p.aux_weights[0] * l_aux
         assert (l_p - l_h).abs().max() < TOL
 
@@ -266,7 +266,7 @@ class TestComputeLossEquivalence:
             label_main=lbl_main, aux_labels=[lbl_aux], aux_wmaps=[None])
         l_p = p.compute_loss(pred, sup)
         l_main = compute_loss_fp32(p.criterion, pred_main, lbl_main)
-        l_aux = compute_loss_fp32(p.aux_inner_losses[0], pred_aux, lbl_aux)
+        l_aux = compute_loss_fp32(p.aux_loss_fns[0], pred_aux, lbl_aux)
         l_h = l_main + p.aux_weights[0] * l_aux
         assert (l_p - l_h).abs().max() < TOL
 

@@ -26,11 +26,19 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+
+# pytest fixture：脚本模式（python tests/test_dettask_smoke.py）由 main()
+# 直接传参；pytest 收集时由该 fixture 提供同名参数。
+@pytest.fixture(scope="module")
+def npz_dir(tmp_path_factory) -> str:
+    return _make_npz_dir(tmp_path_factory.mktemp("det_npz"), n=12)
 
 
 def _ok(name: str, msg: str = "") -> None:
@@ -315,8 +323,8 @@ def test_four_archs():
 # ---------------------------------------------------------------------------
 # [5] 训练 + SSL 迁移；[6] 整卷推理 + FROC
 # ---------------------------------------------------------------------------
-def test_train_transfer_predict(config_path: str, npz_dir: str, out_dir: str,
-                                tag: str):
+def _run_train_transfer_predict(config_path: str, npz_dir: str,
+                                out_dir: str, tag: str):
     from dettask.data.loader import build_det_dataloaders
     from dettask.models.factory import build_detector, \
         load_pretrained_backbone
@@ -357,6 +365,18 @@ def test_train_transfer_predict(config_path: str, npz_dir: str, out_dir: str,
         f"froc={fr['froc']:.3f}")
 
 
+@pytest.mark.parametrize("tag,cfg_yaml", [
+    ("2_5d", "configs/det2_5d.yaml"),
+    ("3d_cubic", "configs/det3d.yaml"),
+])
+def test_train_transfer_predict(npz_dir: str, tmp_path: Path,
+                                tag: str, cfg_yaml: str):
+    torch.manual_seed(0)
+    np.random.seed(0)
+    out = str(tmp_path / f"out_{tag}")
+    _run_train_transfer_predict(str(_ROOT / cfg_yaml), npz_dir, out, tag)
+
+
 def main() -> int:
     print("=" * 68)
     print("dettask smoke test (3D cubic + 2.5D folded)")
@@ -384,7 +404,7 @@ def main() -> int:
                               ("3d_cubic", "configs/det3d.yaml")):
             print(f"\n[5+6:{tag}] train + SSL transfer + volume predict/FROC")
             out = str(tmp / f"out_{tag}")
-            test_train_transfer_predict(str(root / cfg_yaml), npz_dir, out,
+            _run_train_transfer_predict(str(root / cfg_yaml), npz_dir, out,
                                         tag)
 
     print("\n" + "=" * 68)
