@@ -21,6 +21,20 @@ import pytest
 sys.path.insert(0, ".")
 
 
+def _write_seg_npz(path, img, lbl):
+    """写最小 make_data 风格 npz 包（训练 npz-only）：image/label +
+    fg_slices（z轴）/ fg_coords（cubic）。"""
+    fg = np.argwhere(lbl > 0).astype(np.int32)
+    fg_slices = np.unique(fg[:, 0]).astype(np.int32) if len(fg) else \
+        np.arange(img.shape[0], dtype=np.int32)
+    if len(fg) == 0:
+        fg = np.zeros((0, 3), dtype=np.int32)
+    np.savez(path, image=img.astype(np.float32),
+             label=lbl.astype(np.int16),
+             fg_slices=fg_slices, fg_coords=fg)
+    return str(path)
+
+
 # ---------------------------------------------------------------------------
 # Config tests
 # ---------------------------------------------------------------------------
@@ -28,9 +42,9 @@ class TestConfig:
     def test_load_config(self):
         from segtask_v1.config import load_config
         cfg = load_config("configs/seg3d.yaml")
-        assert cfg.data.patch_size == [64, 128, 128]
+        assert cfg.data.patch_size == [16, 128, 128]
         assert cfg.model.backbone == "resnet"
-        assert cfg.loss.name == "dice_bce"
+        assert cfg.loss.name == "dice_focal"
 
     def test_sync_label_values(self):
         from segtask_v1.config import Config
@@ -266,7 +280,7 @@ class TestAugmentation:
         aug = GPUAugmentor(AugConfig(enabled=True))
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.zeros(2, 2, 16, 32, 32)
-        img_out, lbl_out = aug(img, lbl)
+        img_out, lbl_out, _ = aug(img, lbl)
         assert img_out.shape == img.shape
         assert lbl_out.shape == lbl.shape
 
@@ -276,7 +290,7 @@ class TestAugmentation:
         aug = GPUAugmentor(AugConfig(enabled=False))
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.ones(2, 2, 16, 32, 32)
-        img_out, lbl_out = aug(img, lbl)
+        img_out, lbl_out, _ = aug(img, lbl)
         assert torch.equal(img_out, img)
         assert torch.equal(lbl_out, lbl)
 
@@ -420,9 +434,10 @@ class TestRegionWeights:
         vol = np.array([[[0, 1], [2, 0]]], dtype=np.float32)  # (1, 2, 2)
         wmap = compute_region_weight_map(vol, [0, 1, 2], [1.0, 3.0, 2.0])
         assert wmap.shape == (1, 1, 2, 2)
-        assert wmap[0, 0, 0, 0] == 1.0  # bg
-        assert wmap[0, 0, 0, 1] == 3.0  # label 1
-        assert wmap[0, 0, 1, 0] == 2.0  # label 2
+        # 最终权重 = 配置值 + 1（与逐样本权重文件路径同一语义，配 0 → 权重 1）
+        assert wmap[0, 0, 0, 0] == 2.0  # bg (1.0 + 1)
+        assert wmap[0, 0, 0, 1] == 4.0  # label 1 (3.0 + 1)
+        assert wmap[0, 0, 1, 0] == 3.0  # label 2 (2.0 + 1)
 
     def test_loss_with_weight_map(self):
         from segtask_v1.losses.losses import BinaryDiceLoss, BCELoss, CompoundLoss
@@ -485,25 +500,30 @@ class TestNewAugmentation:
         img = torch.arange(24).reshape(2, 1, 3, 2, 2).float()
         lbl = img.clone()
         # With prob=1.0, all samples should be flipped
-        img_f, lbl_f = _random_flip(img.clone(), lbl.clone(), prob=1.0, axes=[2])
+        img_f, lbl_f, _ = _random_flip(img.clone(), lbl.clone(), prob=1.0, axes=[2])
         assert img_f.shape == img.shape
         assert lbl_f.shape == lbl.shape
 
     def test_affine_shapes(self):
-        from segtask_v1.data.augment import _random_affine
+        # 旧 _random_affine / _elastic_deform 已融合为 _random_affine_elastic。
+        from segtask_v1.data.augment import _random_affine_elastic
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.zeros(2, 2, 16, 32, 32)
-        img_a, lbl_a = _random_affine(img, lbl, prob=1.0,
-                                       rotate_range=[-10.0, 10.0],
-                                       scale_range=[0.9, 1.1])
+        img_a, lbl_a, _ = _random_affine_elastic(
+            img, lbl, affine_prob=1.0,
+            rotate_range=[-10.0, 10.0], scale_range=[0.9, 1.1],
+            elastic_prob=0.0, sigma=5.0, alpha=0.0)
         assert img_a.shape == img.shape
         assert lbl_a.shape == lbl.shape
 
     def test_elastic_deform_shapes(self):
-        from segtask_v1.data.augment import _elastic_deform
+        from segtask_v1.data.augment import _random_affine_elastic
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.zeros(2, 2, 16, 32, 32)
-        img_e, lbl_e = _elastic_deform(img, lbl, prob=1.0, sigma=5.0, alpha=50.0)
+        img_e, lbl_e, _ = _random_affine_elastic(
+            img, lbl, affine_prob=0.0,
+            rotate_range=[0.0, 0.0], scale_range=[1.0, 1.0],
+            elastic_prob=1.0, sigma=5.0, alpha=50.0)
         assert img_e.shape == img.shape
         assert lbl_e.shape == lbl.shape
 
@@ -511,7 +531,7 @@ class TestNewAugmentation:
         from segtask_v1.data.augment import _grid_dropout
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.ones(2, 2, 16, 32, 32)
-        img_d, lbl_d = _grid_dropout(img.clone(), lbl.clone(), prob=1.0, ratio=0.3, num_holes=4)
+        img_d, lbl_d, _ = _grid_dropout(img.clone(), lbl.clone(), prob=1.0, ratio=0.3, num_holes=4)
         assert img_d.shape == img.shape
         # Label should NOT be masked
         assert torch.equal(lbl_d, lbl)
@@ -533,10 +553,12 @@ class TestNewAugmentation:
             grid_dropout_prob=0.2, simulate_lowres_prob=0.2)
         aug = GPUAugmentor(cfg)
         img = torch.randn(2, 1, 16, 32, 32)
-        lbl = torch.zeros(2, 3, 16, 32, 32)  # 3 channels (e.g., 2 fg + 1 weight_map)
-        img_a, lbl_a = aug(img, lbl)
+        lbl = torch.zeros(2, 3, 16, 32, 32)
+        wmap = torch.ones(2, 1, 16, 32, 32)
+        img_a, lbl_a, wmap_a = aug(img, lbl, weight_map=wmap)
         assert img_a.shape == img.shape
         assert lbl_a.shape == lbl.shape
+        assert wmap_a.shape == wmap.shape
 
 
 # ---------------------------------------------------------------------------
@@ -631,15 +653,11 @@ class TestCubicDataset:
         lbl = np.zeros((50, 40, 40), dtype=np.float32)
         lbl[20:30, 15:25, 15:25] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             ds = SegDataset3DCubic(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 16, 16),
                 multi_res_scales=[1.0],
                 samples_per_volume=2, cache_enabled=False)
@@ -673,16 +691,12 @@ class TestCubicDataset:
         lbl = np.zeros((60, 256, 256), dtype=np.float32)
         lbl[20:40, 100:150, 100:150] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             # oversample=1.25 → eD=20 from pD=16.
             ds = SegDataset3D(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 64, 64),
                 aug_oversample_ratio=1.25,
                 samples_per_volume=2, cache_enabled=False)
@@ -709,15 +723,11 @@ class TestCubicDataset:
         lbl = np.zeros((60, 128, 128), dtype=np.float32)
         lbl[20:40, 40:80, 40:80] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             ds = SegDataset3D(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 64, 64),
                 samples_per_volume=1, cache_enabled=False)
             sample = ds[0]
@@ -726,28 +736,27 @@ class TestCubicDataset:
             assert sample["label"].shape == (1, 16, 64, 64)
 
     def test_z_axis_multires_shape_three_scales(self):
-        """multi_res_scales=[1.0, 1.5, 2.0] → image/label (3, eD, pH, pW)."""
+        """multi_res_scales=[1.0, 1.5, 2.0] → dataset 发单 max-FOV cube
+        (1, round(eD*max_scale), pH, pW)，trainer 侧再中心裁拆视图。"""
         from segtask_v1.data.dataset import SegDataset3D
         img = np.random.rand(80, 128, 128).astype(np.float32)
         lbl = np.zeros((80, 128, 128), dtype=np.float32)
         lbl[30:50, 40:80, 40:80] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             ds = SegDataset3D(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 64, 64),
                 aug_oversample_ratio=1.0,
                 multi_res_scales=[1.0, 1.5, 2.0],
+                z_boundary_mode="edge_pad",
                 samples_per_volume=1, cache_enabled=False)
             sample = ds[0]
-            assert sample["image"].shape == (3, 16, 64, 64)
-            assert sample["label"].shape == (3, 16, 64, 64)
+            # eD_max = round(16 * 2.0) = 32；领头 1 = 压叠 C_res 轴。
+            assert sample["image"].shape == (1, 32, 64, 64)
+            assert sample["label"].shape == (1, 32, 64, 64)
 
     def test_z_axis_multires_edge_padded_preserves_exact_depth(self):
         """Scale > 1 extraction at volume boundary must return EXACTLY D_patch
@@ -779,40 +788,37 @@ class TestCubicDataset:
             np.testing.assert_array_equal(img_p2[-1 - i], img[-1])
 
     def test_z_axis_multires_scale1_matches_legacy(self):
-        """multi_res_scales=[1.0] must yield IDENTICAL image as the legacy
-        single-res path (confirms channel-0 bit-compatibility).
-        """
+        """多分辨率 max-FOV cube 的中心 eD 层必须与单分辨率抽取位对位一致
+        （scale-1 视图 = 中心裁，确认视图 0 与 legacy 单分辨率兼容）。"""
         from segtask_v1.data.dataset import SegDataset3D
         np.random.seed(0)
         img = np.random.rand(50, 64, 64).astype(np.float32)
         lbl = np.zeros((50, 64, 64), dtype=np.float32)
         lbl[15:35, 20:40, 20:40] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             kwargs = dict(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 32, 32),
+                z_boundary_mode="edge_pad",
                 foreground_oversample_ratio=0.0,  # deterministic z sample
                 samples_per_volume=1, cache_enabled=False, is_train=False)
 
-            # Seed RNG before each call so `_sample_z` picks the same z.
-            np.random.seed(123)
+            # is_train=False 走逐样本确定性 RNG，两个 dataset 采同一 z。
             ds_legacy = SegDataset3D(multi_res_scales=[1.0], **kwargs)
-            legacy = ds_legacy[0]["image"].numpy()
+            legacy = ds_legacy[0]["image"].numpy()  # (1, 16, 32, 32)
 
-            np.random.seed(123)
             ds_multi = SegDataset3D(
-                multi_res_scales=[1.0, 1.5], **kwargs)
-            multi = ds_multi[0]["image"].numpy()
+                multi_res_scales=[1.0, 2.0], **kwargs)
+            multi = ds_multi[0]["image"].numpy()    # (1, 32, 32, 32)
 
-            # Channel 0 of the multi-res output must match the legacy single-res.
-            np.testing.assert_allclose(multi[0], legacy[0], rtol=0, atol=0)
+            # max-FOV cube 的中心 16 层（scale-1 视图）必须位对位等于 legacy。
+            eD_max = multi.shape[1]
+            lo = eD_max // 2 - legacy.shape[1] // 2
+            np.testing.assert_allclose(
+                multi[0, lo:lo + legacy.shape[1]], legacy[0], rtol=0, atol=0)
 
     def test_predictor_build_z_window_input_single_res(self):
         """Single-res (`[1.0]`): (1, pD, pH, pW), legacy resize path."""
@@ -874,15 +880,11 @@ class TestCubicDataset:
         lbl = np.zeros((70, 90, 90), dtype=np.float32)
         lbl[20:50, 30:60, 30:60] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             ds = SegDataset3DWhole(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 32, 32),
                 aug_oversample_ratio=1.0,
                 samples_per_volume=3, cache_enabled=False)
@@ -898,15 +900,11 @@ class TestCubicDataset:
         img = np.random.rand(30, 40, 40).astype(np.float32)
         lbl = np.zeros((30, 40, 40), dtype=np.float32)
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             ds = SegDataset3DWhole(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 16, 16),
                 aug_oversample_ratio=1.5,
                 samples_per_volume=1, cache_enabled=False)
@@ -956,15 +954,11 @@ class TestCubicDataset:
         lbl = np.zeros((80, 60, 60), dtype=np.float32)
         lbl[30:50, 20:40, 20:40] = 1.0
 
-        import tempfile, os, nibabel as nib
+        import tempfile, os
         with tempfile.TemporaryDirectory() as td:
-            img_path = os.path.join(td, "test.nii.gz")
-            lbl_path = os.path.join(td, "test_lbl.nii.gz")
-            nib.save(nib.Nifti1Image(img.transpose(2, 1, 0), np.eye(4)), img_path)
-            nib.save(nib.Nifti1Image(lbl.transpose(2, 1, 0), np.eye(4)), lbl_path)
-
+            npz = _write_seg_npz(os.path.join(td, "test.npz"), img, lbl)
             ds = SegDataset3DCubic(
-                image_paths=[img_path], label_paths=[lbl_path],
+                image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
                 label_values=[0, 1], patch_size=(16, 16, 16),
                 aug_oversample_ratio=1.5,
                 multi_res_scales=[1.0],

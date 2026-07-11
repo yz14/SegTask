@@ -49,7 +49,7 @@ def _make_tiny_volumes(tmpdir: str, num_fg: int = 2, shape=(16, 32, 32)):
     lbl_dir = os.path.join(tmpdir, "lbl")
     os.makedirs(img_dir); os.makedirs(lbl_dir)
     rng = np.random.RandomState(0)
-    img_paths, lbl_paths = [], []
+    img_paths, lbl_paths, npz_paths = [], [], []
     for i in range(2):
         # Float image in HU-ish range
         img = rng.uniform(-500, 500, size=shape).astype(np.float32)
@@ -63,8 +63,16 @@ def _make_tiny_volumes(tmpdir: str, num_fg: int = 2, shape=(16, 32, 32)):
         lbl_p = os.path.join(lbl_dir, f"v{i}.nii.gz")
         _write_nifti(img, img_p)
         _write_nifti(lbl.astype(np.float32), lbl_p)
+        # 训练 npz-only：同步写最小 make_data 风格 npz 包。
+        fg = np.argwhere(lbl > 0).astype(np.int32)
+        fg_slices = (np.unique(fg[:, 0]).astype(np.int32) if len(fg)
+                     else np.arange(shape[0], dtype=np.int32))
+        npz_p = os.path.join(img_dir, f"v{i}.npz")
+        np.savez(npz_p, image=img, label=lbl, fg_slices=fg_slices,
+                 fg_coords=fg if len(fg) else np.zeros((0, 3), dtype=np.int32))
         img_paths.append(img_p); lbl_paths.append(lbl_p)
-    return img_paths, lbl_paths
+        npz_paths.append(npz_p)
+    return img_paths, lbl_paths, npz_paths
 
 
 def _build_tiny_unet(num_fg: int, deep_supervision: bool = False) -> UNet3D:
@@ -89,10 +97,11 @@ def test_bug1_z_axis_label_shape_and_multi_class():
     np.random.seed(0); torch.manual_seed(0)
     with tempfile.TemporaryDirectory() as tmp:
         label_values = [0, 1, 2]  # num_fg = 2
-        img_paths, lbl_paths = _make_tiny_volumes(tmp, num_fg=2)
+        img_paths, lbl_paths, npz_paths = _make_tiny_volumes(tmp, num_fg=2)
 
         ds = SegDataset3D(
             image_paths=img_paths, label_paths=lbl_paths,
+            npz_paths=npz_paths,
             label_values=label_values,
             patch_size=(8, 16, 16),
             samples_per_volume=2, is_train=True,
@@ -214,18 +223,20 @@ def test_bug3_extract_cubic_patch_pads_boundary():
 def test_integration_z_axis_multi_class_ds():
     with tempfile.TemporaryDirectory() as tmp:
         label_values = [0, 1, 2]
-        img_paths, lbl_paths = _make_tiny_volumes(tmp, num_fg=2)
+        img_paths, lbl_paths, npz_paths = _make_tiny_volumes(tmp, num_fg=2)
 
         ds = SegDataset3D(
             image_paths=img_paths, label_paths=lbl_paths,
+            npz_paths=npz_paths,
             label_values=label_values,
             patch_size=(8, 16, 16),
             samples_per_volume=2, is_train=True, cache_enabled=False)
         sample = ds[0]
 
         model = _build_tiny_unet(num_fg=2, deep_supervision=True).train()
-        image = sample["image"].unsqueeze(0)  # (1, 1, D, H, W)
-        label = sample["label"].unsqueeze(0)  # (1, 1, D, H, W)
+        image = sample["image"].unsqueeze(0)          # (1, 1, D, H, W)
+        # trainer 侧统一 .float()（npz label 是 int16，F.interpolate 不支持）。
+        label = sample["label"].unsqueeze(0).float()  # (1, 1, D, H, W)
 
         # Correct composition: DS(MR(base)). Match the trainer's order.
         from segtask_v1.losses.losses import DeepSupervisionLoss
@@ -598,20 +609,19 @@ def test_bug5_plateau_mode_from_config():
 def test_bug6_config_validate_rejects_illegal_combo():
     from segtask_v1.config import Config
 
+    # z_axis + multi-res 现已合法（多分辨率 z-FOV），sync 后 in_channels=视图数。
     cfg = Config()
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2
     cfg.data.patch_mode = "z_axis"
-    cfg.data.multi_res_scales = [1.0, 1.5]  # illegal for z_axis
-    raised = False
-    try:
-        cfg.validate()
-    except AssertionError as e:
-        raised = "multi_res_scales" in str(e) and "z_axis" in str(e)
-    assert raised, "BUG-6 regression: z_axis + multi-res should be rejected"
+    cfg.data.multi_res_scales = [1.0, 1.5]
+    cfg.sync()
+    cfg.validate()  # must not raise
+    assert cfg.model.in_channels == 2
 
     # Legal: z_axis + [1.0]
     cfg.data.multi_res_scales = [1.0]
+    cfg.sync()
     cfg.validate()
 
     # Legal: cubic + multi-res
@@ -718,7 +728,7 @@ def test_bug10b_grid_dropout_vectorized():
     x = torch.ones(4, 1, 8, 16, 16)
     lbl = torch.ones(4, 1, 8, 16, 16)
 
-    x_out, lbl_out = _grid_dropout(
+    x_out, lbl_out, _ = _grid_dropout(
         x.clone(), lbl.clone(), prob=1.0, ratio=0.3, num_holes=3)
     # Label untouched
     assert torch.equal(lbl_out, lbl), "grid_dropout must not modify label"
@@ -728,7 +738,7 @@ def test_bug10b_grid_dropout_vectorized():
     assert x_out.shape == x.shape
 
     # prob=0 identity
-    y, _ = _grid_dropout(x.clone(), lbl, prob=0.0, ratio=0.3, num_holes=3)
+    y, _, _ = _grid_dropout(x.clone(), lbl, prob=0.0, ratio=0.3, num_holes=3)
     assert torch.equal(y, x)
     print("[BUG-10b] PASS — _grid_dropout vectorized and correct.")
 

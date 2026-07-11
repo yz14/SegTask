@@ -46,12 +46,20 @@ def _ok(name: str, msg: str = "") -> None:
 # ---------------------------------------------------------------------------
 # 1. Config
 # ---------------------------------------------------------------------------
-def test_default_z_boundary_mode_is_stretch():
+def test_default_z_boundary_mode_is_edge_pad_and_stretch_auto_upgrades():
+    """默认已改为 edge_pad；stretch 已废弃，sync() 自动升级并告警。"""
     from segtask_v1.config import Config, DataConfig
-    assert DataConfig().z_boundary_mode == "stretch"
+    assert DataConfig().z_boundary_mode == "edge_pad"
     cfg = Config()
-    assert cfg.data.z_boundary_mode == "stretch"
-    _ok("Default DataConfig.z_boundary_mode == 'stretch'")
+    assert cfg.data.z_boundary_mode == "edge_pad"
+
+    cfg = Config()
+    cfg.data.label_values = [0, 1]
+    cfg.data.num_classes = 2
+    cfg.data.z_boundary_mode = "stretch"
+    cfg.sync()
+    assert cfg.data.z_boundary_mode == "edge_pad"
+    _ok("Default edge_pad; deprecated 'stretch' auto-upgrades on sync()")
 
 
 def test_validate_rejects_invalid_z_boundary_mode():
@@ -107,17 +115,32 @@ def _make_synthetic_volume_files(out_dir: Path, n_volumes: int = 1,
     return str(img_dir), str(lbl_dir)
 
 
+def _write_seg_npz(path: Path, img: np.ndarray, lbl: np.ndarray) -> str:
+    fg = np.argwhere(lbl > 0).astype(np.int32)
+    fg_slices = (np.unique(fg[:, 0]).astype(np.int32) if len(fg)
+                 else np.arange(img.shape[0], dtype=np.int32))
+    np.savez(path, image=img.astype(np.float32), label=lbl.astype(np.int16),
+             fg_slices=fg_slices,
+             fg_coords=fg if len(fg) else np.zeros((0, 3), dtype=np.int32))
+    return str(path)
+
+
 def test_segdataset_constructor_rejects_invalid():
     from segtask_v1.data.dataset import SegDataset3D
-    try:
-        SegDataset3D(
-            image_paths=[], label_paths=[],
-            label_values=[0, 1], patch_size=(8, 16, 16),
-            z_boundary_mode="bogus")
-    except ValueError as e:
-        assert "z_boundary_mode" in str(e)
-        _ok("SegDataset3D rejects invalid z_boundary_mode")
-        return
+    with tempfile.TemporaryDirectory() as td:
+        img = np.zeros((4, 8, 8), dtype=np.float32)
+        lbl = np.zeros((4, 8, 8), dtype=np.int16)
+        npz = _write_seg_npz(Path(td) / "v.npz", img, lbl)
+        try:
+            SegDataset3D(
+                image_paths=["dummy"], label_paths=["dummy"],
+                npz_paths=[npz],
+                label_values=[0, 1], patch_size=(8, 16, 16),
+                z_boundary_mode="bogus")
+        except ValueError as e:
+            assert "z_boundary_mode" in str(e)
+            _ok("SegDataset3D rejects invalid z_boundary_mode")
+            return
     raise AssertionError("SegDataset3D should have rejected 'bogus'")
 
 
@@ -125,43 +148,31 @@ def test_segdataset_constructor_rejects_invalid():
 # 3. Dataset __getitem__ dispatch
 # ---------------------------------------------------------------------------
 def test_dataset_dispatch_stretch_vs_edge_pad():
-    """Build a tiny dataset with D_vol=4, eD=12, and ``z_center`` forced
-    to slice 1 (near top boundary). The image is ``vol[z, :, :] = z*10``
-    so we can inspect the z-axis behaviour directly:
-
-      - stretch: clamp returns slices [0, 1, 2, 3] (4 slices) which
-        ``resize_3d`` stretches to 12. Trilinear interpolation produces
-        a smoothed ramp from 0 to 30; in particular, the FIRST output
-        slice is ≈ 0 (close to vol[0]) and the LAST is ≈ 30 (close to
-        vol[3]). Importantly, intermediate slices are NOT exact
-        replicas of any source slice — they are interpolated.
-
-      - edge_pad: ``extract_z_patch_padded`` returns 12 slices centred
-        on z=1: pad_before=5 (replicas of vol[0]=0), original slices
-        [0, 1, 2, 3] (values 0, 10, 20, 30), pad_after=3 (replicas of
-        vol[3]=30). After resize_3d (which is a no-op along z because
-        sizes match), the output[0..4] should all equal 0, output[5..8]
-        should be exactly 0, 10, 20, 30, and output[9..11] should all
-        equal 30.
-    """
+    """训练侧抽取恒走 edge-pad 几何（stretch 在训练路径已无分支）：
+    D_vol=4、eD=12、z_center=1 时，`extract_z_patch_padded(vol, 1, 12)`：
+      half=6; lo=-5; hi=7; src=[0,4); pad_before=5; pad_after=3
+      → [vol[0]]*5 + vol[0:4] + [vol[3]]*3
+      = [0,0,0,0,0, 0,10,20,30, 30,30,30] / 100（minmax 归一化后）。
+    传 'stretch' 与 'edge_pad' 必须给出逐位一致的输出。"""
     from segtask_v1.data.dataset import SegDataset3D
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        img_dir, lbl_dir = _make_synthetic_volume_files(
-            td, n_volumes=1, shape=(4, 8, 8))   # D_vol=4
+        img = np.zeros((4, 8, 8), dtype=np.float32)
+        for z in range(4):
+            img[z] = float(z) * 10.0
+        lbl = np.zeros((4, 8, 8), dtype=np.int16)
+        lbl[2, 2:6, 2:6] = 1
+        npz = _write_seg_npz(td / "v.npz", img, lbl)
 
         common = dict(
-            image_paths=sorted(Path(img_dir).glob("*.nii.gz")),
-            label_paths=sorted(Path(lbl_dir).glob("*.nii.gz")),
+            image_paths=["dummy"], label_paths=["dummy"], npz_paths=[npz],
             label_values=[0, 1], patch_size=(12, 8, 8),
             aug_oversample_ratio=1.0, multi_res_scales=[1.0],
             intensity_min=0.0, intensity_max=100.0,  # keep raw intensities
             normalize="minmax",
             foreground_oversample_ratio=0.0, samples_per_volume=1,
             is_train=False, cache_enabled=True)
-        common["image_paths"] = [str(p) for p in common["image_paths"]]
-        common["label_paths"] = [str(p) for p in common["label_paths"]]
 
         ds_stretch = SegDataset3D(**common, z_boundary_mode="stretch")
         ds_edge = SegDataset3D(**common, z_boundary_mode="edge_pad")
@@ -177,17 +188,6 @@ def test_dataset_dispatch_stretch_vs_edge_pad():
         assert out_stretch.shape == (1, 12, 8, 8)
         assert out_edge.shape == (1, 12, 8, 8)
 
-        # Reverse the minmax normalisation: norm = (raw - 0) / 100 = raw/100.
-        # So a slice with raw value V appears as V/100 in the output.
-        # Edge-pad expectations (raw values: 0, 10, 20, 30 in the 4 source
-        # slices). pad_before=(12-4)/2=4 → wait, let's recompute.
-        # In `extract_z_patch_padded(vol, z_center=1, D_patch=12)`:
-        #   half = 6; lo = 1 - 6 = -5; hi = -5 + 12 = 7.
-        #   src_lo = max(-5, 0) = 0; src_hi = min(7, 4) = 4.
-        #   pad_before = max(5, 0) = 5; pad_after = max(7-4, 0) = 3.
-        # So the layout is: [vol[0]]*5  +  vol[0:4]  +  [vol[3]]*3
-        #                = [0,0,0,0,0, 0,10,20,30, 30,30,30] / 100
-        #                = [0,0,0,0,0, 0.0, 0.1, 0.2, 0.3, 0.3, 0.3, 0.3]
         z_means_edge = out_edge[0, :, :, :].mean(dim=(1, 2)).numpy()
         expected = np.array(
             [0, 0, 0, 0, 0, 0, 0.1, 0.2, 0.3, 0.3, 0.3, 0.3],
@@ -195,33 +195,12 @@ def test_dataset_dispatch_stretch_vs_edge_pad():
         np.testing.assert_allclose(z_means_edge, expected, atol=1e-5,
                                    err_msg="edge_pad z-axis layout incorrect")
 
-        # Stretch: ALL 12 output z-slices come from interpolating 4 inputs
-        # along z. In particular the per-slice means cover the full input
-        # range monotonically, but no two adjacent slices can be exactly
-        # equal (unlike edge_pad's leading/trailing constant runs).
-        z_means_stretch = out_stretch[0, :, :, :].mean(dim=(1, 2)).numpy()
-        # First & last differ from edge_pad because trilinear stretches the
-        # 4 inputs across all 12 outputs:
-        #   - first slice should be near 0 (vol[0]/100 = 0)
-        #   - last slice should be near 0.3 (vol[3]/100 = 0.3)
-        assert abs(z_means_stretch[0]) < 0.05, (
-            f"stretch first slice should be near 0, got {z_means_stretch[0]}")
-        assert abs(z_means_stretch[-1] - 0.3) < 0.05, (
-            f"stretch last slice should be near 0.3, got {z_means_stretch[-1]}")
-        # Critical contrast: stretch has NO constant leading/trailing run
-        # (trilinear interpolation makes neighbouring slices distinct);
-        # edge_pad has 5 leading + 3 trailing constant slices.
-        leading_const = (z_means_edge[0:5] == z_means_edge[0]).all()
-        trailing_const = (z_means_edge[9:12] == z_means_edge[9]).all()
-        assert leading_const and trailing_const, (
-            "edge_pad should have constant runs at start/end")
-        # Stretch must NOT have such a long constant run (would mean depth
-        # was not actually stretched).
-        leading_const_s = (z_means_stretch[0:5] == z_means_stretch[0]).all()
-        assert not leading_const_s, (
-            "stretch should NOT produce 5 constant leading slices")
+        # 训练侧 stretch 与 edge_pad 输出必须逐位一致（无 stretch 分支）。
+        np.testing.assert_allclose(
+            out_stretch.numpy(), out_edge.numpy(), atol=0, rtol=0,
+            err_msg="training-side extraction must be edge-pad for both modes")
 
-        _ok("Dataset dispatch: stretch interpolates / edge_pad replicates")
+        _ok("Dataset extraction is edge-pad regardless of configured mode")
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +380,8 @@ def test_predict_volume_short_volume_both_modes():
             device = torch.device("cpu")
             model = build_model(cfg).to(device).eval()
             predictor = Predictor(model, cfg, device)
-            assert predictor.z_boundary_mode == mode
+            # sync() 自动把废弃的 'stretch' 升级为 'edge_pad'。
+            assert predictor.z_boundary_mode == "edge_pad"
             img_paths = sorted(Path(img_dir).glob("*.nii.gz"))
             result = predictor.predict_volume(str(img_paths[0]))
             assert result["label_map"].shape == (4, 32, 32), (

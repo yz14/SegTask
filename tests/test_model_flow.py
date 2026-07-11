@@ -205,8 +205,10 @@ def test_unet_skip_count_matches_topology():
     skips = _skip_edges(g)
     assert len(skips) == expected, \
         f"UNet 应有 {expected} 条跳连，实得 {len(skips)}"
-    # 全部由 encoder 侧发出、汇入 cat 融合点。
-    assert all(e.src.startswith("leaf::encoder.") for e in skips)
+    # 全部由 encoder 侧发出（stage 尾是 act 时为 leaf::encoder.*，
+    # 尾是残差 add 时 torchlens 记为 merge::add_* 节点）、汇入 cat 融合点。
+    assert all(e.src.startswith(("leaf::encoder.", "merge::add_"))
+               for e in skips)
     assert all(e.dst.startswith("merge::") for e in skips)
 
 
