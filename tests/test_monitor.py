@@ -21,7 +21,7 @@ from segtask_v1.monitor import charts
 
 def _val(epoch: int) -> dict:
     return {
-        "val_loss": 1.0 / (epoch + 1),
+        "val_base_loss": 1.0 / (epoch + 1),
         "mean_dice": 0.5 + 0.04 * epoch,
         "dice_class_0": 0.9,
         "dice_class_1": 0.4 + 0.05 * epoch,
@@ -225,11 +225,11 @@ def test_loss_components_merged_into_loss_panel(tmp_path):
     by_id = {p["id"]: p for p in payload["panels"]}
     loss = by_id["loss"]
     labels = [s["label"] for s in loss["series"]]
-    assert "train loss" in labels and "val loss" in labels
+    assert "train loss" in labels and "val base loss" in labels
     assert "L_main" in labels and "L_res_0" in labels  # 分量并入
     # 总损失（train/val）加粗高亮，分量不强调。
     emph = {s["label"] for s in loss["series"] if s.get("emphasis")}
-    assert emph == {"train loss", "val loss"}
+    assert emph == {"train loss", "val base loss"}
     assert all(not s.get("emphasis") for s in loss["series"]
                if s["label"] in ("L_main", "L_res_0"))
     # 每条线颜色互不相同。
@@ -244,7 +244,7 @@ def test_best_card_means_and_per_class_matrix(tmp_path):
                        save_best_mode="max", num_classes=2, total_epochs=2)
     for ep in range(2):
         lg.log_epoch(ep, train=_train(ep), val={
-            "val_loss": 1.0 / (ep + 1),
+            "val_base_loss": 1.0 / (ep + 1),
             "mean_dice": 0.5 + 0.1 * ep, "mean_iou": 0.4 + 0.1 * ep,
             "dice_class_0": 0.8 + 0.05 * ep, "dice_class_1": 0.6 + 0.05 * ep,
             "iou_class_0": 0.7, "iou_class_1": 0.5,
@@ -267,10 +267,10 @@ def test_best_card_means_and_per_class_matrix(tmp_path):
     c0 = mtx["rows"][0]["cells"]
     assert len(c0) == 3 and c0[0]["t"] is not None
 
-    # 逐类 key 被矩阵吸收，不再混入「其余」列表；val_loss 进入其余。
+    # 逐类 key 被矩阵吸收，不再混入「其余」列表；val_base_loss 进入其余。
     rest_keys = [k for k, _ in bc["rest"]]
     assert "dice_class_0" not in rest_keys
-    assert "val_loss" in rest_keys
+    assert "val_base_loss" in rest_keys
 
 
 def test_per_class_other_scale_separate(tmp_path):
@@ -528,7 +528,7 @@ def test_trainer_monitor_logs_and_renders_on_cadence(tmp_path):
     prev_html = None
     for epoch in range(5):
         is_best = (epoch == 3)
-        val = {"val_loss": 1.0 / (epoch + 1),
+        val = {"val_base_loss": 1.0 / (epoch + 1),
                "mean_dice": dice_curve[epoch],
                "dice_class_0": 0.9, "dice_class_1": dice_curve[epoch] - 0.1}
         t._monitor_log_epoch(
@@ -627,7 +627,7 @@ def _persist_run(tmp_path, name, *, scale=0.05, n=5):
     for e in range(n):
         lg.log_epoch(
             e, train={"loss": 2.0 / (e + 1)},
-            val={"val_loss": 1.0 / (e + 1), "mean_dice": 0.5 + scale * e,
+            val={"val_base_loss": 1.0 / (e + 1), "mean_dice": 0.5 + scale * e,
                  "dice_class_0": 0.9, "dice_class_1": 0.4 + scale * e},
             lr=1e-3, is_best=(e == n - 1))
     lg.finalize("completed")

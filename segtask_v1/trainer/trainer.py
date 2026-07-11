@@ -267,7 +267,11 @@ class Trainer:
 
         # --- 增强 ------------------------------------------------------
         _scales = cfg.data.multi_res_scales or [1.0]
-        self.augmentor = GPUAugmentor(cfg.augment, max_scale=max(_scales))
+        # label_fill：affine/elastic 越界区域的背景 label 值（label_values[0]，
+        # loader 构建后必已填充）。
+        _bg = float(cfg.data.label_values[0]) if cfg.data.label_values else 0.0
+        self.augmentor = GPUAugmentor(
+            cfg.augment, max_scale=max(_scales), label_fill=_bg)
 
         # --- Tracking --------------------------------------------------
         self.num_fg           = cfg.num_fg_classes

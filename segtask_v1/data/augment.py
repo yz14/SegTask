@@ -23,12 +23,15 @@ def _bernoulli_mask(n: int, prob: float) -> torch.Tensor:
 
 
 class GPUAugmentor:
-    """GPU 3D 增强管道。max_scale 为输入多分辨率最大 scale，用于缩小 elastic_deform_alpha，使最大物理通道位移 ≤ alpha 体素。"""
+    """GPU 3D 增强管道。max_scale 为输入多分辨率最大 scale，用于缩小 elastic_deform_alpha，使最大物理通道位移 ≤ alpha 体素。
+    label_fill 为背景 label 值（label_values[0]），供 affine/elastic 越界区域填充。"""
 
-    def __init__(self, cfg: AugConfig, max_scale: float = 1.0):
+    def __init__(self, cfg: AugConfig, max_scale: float = 1.0,
+                 label_fill: float = 0.0):
         self.cfg       = cfg
         self.enabled   = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
+        self.label_fill = float(label_fill)
         # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。仅 affine/elastic 动 wmap。
         wmode = cfg.wmap_interp_mode
         if wmode not in ("nearest", "bilinear"):
@@ -78,7 +81,8 @@ class GPUAugmentor:
             wmap_mode=self.wmap_interp_mode,
             translate_range=c.random_translate_range,
             rotate_range_per_axis=c.random_rotate_range_per_axis,
-            aspect_correct=c.random_affine_aspect_correct)
+            aspect_correct=c.random_affine_aspect_correct,
+            label_fill=self.label_fill)
         image, label, weight_map = _grid_dropout(
             image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
             c.grid_dropout_holes, weight_map=weight_map)
@@ -195,6 +199,7 @@ def _random_affine_elastic(
     translate_range: Optional[list] = None,
     rotate_range_per_axis: Optional[list] = None,
     aspect_correct: bool = False,
+    label_fill: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """仿射与弹性形变融合为单次 grid_sample。
 
@@ -208,7 +213,10 @@ def _random_affine_elastic(
     aspect_correct=True 时在 voxel-count 各向同性坐标里旋转（R←A⁻¹RA，
     A=diag(W,H,D)），不代替真实 spacing 校正；translate_range 为归一化
     坐标 [-1,1]。弹性：sigma 控平滑度（常 4–9），alpha 控位移幅度体素
-    （常 3–12，近似标称）。三路 grid_sample 均 padding_mode='border'。"""
+    （常 3–12，近似标称）。image 的 grid_sample 用 padding_mode='border'；
+    采样点落在体外（归一化坐标绝对值 > 1）的体素，label 填背景常数
+    ``label_fill``（= label_values[0]）、weight_map 填语义中性值 1，避免
+    border 复制把边缘前景/权重沿越界区域外推产生非真实监督。"""
     B, _, D, H, W = image.shape
     device = image.device
 
@@ -269,14 +277,21 @@ def _random_affine_elastic(
         grid[sel_e_dev] = grid[sel_e_dev] + torch.einsum(
             'n r c, n d h w c -> n d h w r', m, disp)
 
+    # 越界采样点：归一化坐标任一轴绝对值 > 1 即落在体外。
+    oob = (grid.abs() > 1.0).any(dim=-1)  # (n, D, H, W)
+
     image[idx] = F.grid_sample(
         image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
-    label[idx] = F.grid_sample(
+    lbl = F.grid_sample(
         label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
+    lbl[oob.unsqueeze(1).expand_as(lbl)] = label_fill
+    label[idx] = lbl
     if weight_map is not None:
-        weight_map[idx] = F.grid_sample(
+        wm = F.grid_sample(
             weight_map[idx], grid, mode=wmap_mode,
             padding_mode="border", align_corners=False)
+        wm[oob.unsqueeze(1).expand_as(wm)] = 1.0
+        weight_map[idx] = wm
 
     return image, label, weight_map
 

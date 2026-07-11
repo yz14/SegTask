@@ -83,9 +83,13 @@ def prob_to_label(
 ) -> np.ndarray:
     """概率体 ``(num_fg, D, H, W)`` → 整数 label map ``(D, H, W)``。
 
-    * 逐体素：``max fg 概率 > threshold`` 取对应 ``label_values[1:][argmax]``，否则 ``label_values[0]``
-    * ``threshold`` 可为标量（全类共享）或逐前景类序列（长度 = num_fg，与
-      ``label_values[1:]`` 一一对应）；逐类时每个体素按其 argmax 类的阈值判背景
+    * 标量 ``threshold``（全类共享）：逐体素 ``max fg 概率 > threshold`` 取对应
+      ``label_values[1:][argmax]``，否则 ``label_values[0]``
+    * 逐前景类序列（长度 = num_fg，与 ``label_values[1:]`` 一一对应）：
+      eligible-mask 语义——每类先过自身阈值（``prob_c > thr_c``），再在
+      合格类中取概率最高者；无合格类 → 背景。与验证侧逐类独立
+      ``prob > threshold`` 的门槛语义一致，避免先 argmax 再门控丢弃
+      本可接受的次高类
     * NaN 体素强制为背景并 ``logger.error``（典型成因：fp16 LayerNorm 溢出 → "全前景"假象）
     * 输出 dtype 选能装下所有 ``label_values`` 的最小有符号整型
     """
@@ -107,21 +111,26 @@ def prob_to_label(
         prob_volume = np.where(np.isnan(prob_volume),
                                np.float32(-np.inf), prob_volume)
 
-    max_prob = prob_volume.max(axis=0)            # (D, H, W)
-    max_class = prob_volume.argmax(axis=0)        # (D, H, W)
-    label_map = fg_values[max_class]
     thr = np.asarray(threshold, dtype=np.float32)
     # 与验证侧（utils.dice_batch_stats 等的 ``prob > threshold``）同一契约：
     # 严格大于阈值才取前景，``prob == threshold`` 判背景。
     if thr.ndim == 0:
-        below = max_prob <= float(thr)
+        max_prob = prob_volume.max(axis=0)            # (D, H, W)
+        max_class = prob_volume.argmax(axis=0)        # (D, H, W)
+        label_map = fg_values[max_class]
+        label_map[max_prob <= float(thr)] = bg_val
     else:
         if thr.shape != (num_fg,):
             raise ValueError(
                 f"prob_to_label: per-class threshold length {thr.shape[0]} "
                 f"!= num_fg {num_fg}.")
-        below = max_prob <= thr[max_class]
-    label_map[below] = bg_val
+        # eligible-mask：每类先过自身阈值，再在合格类中取概率最高者；
+        # 无合格类 → 背景（NaN 已替换为 -inf，必不合格）。
+        eligible = prob_volume > thr.reshape(-1, 1, 1, 1)  # (num_fg, D, H, W)
+        masked = np.where(eligible, prob_volume, np.float32(-np.inf))
+        max_class = masked.argmax(axis=0)             # (D, H, W)
+        label_map = fg_values[max_class]
+        label_map[~eligible.any(axis=0)] = bg_val
     if n_nan > 0:
         label_map[nan_mask] = bg_val
 

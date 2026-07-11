@@ -108,7 +108,8 @@ class MetricAccumulator:
 
         ``pred_logits`` 形如 ``(B, num_fg, ...)`` 的 *logits*（指标算子内部自行做
         sigmoid + 阈值，阈值来自 ``predict.threshold``，默认 0.5）；``target`` 同形二值标签。``loss_value`` 为该 batch 的
-        标量验证损失，``None`` 时不计入（high 模式无可逆 logits，故不产 val_loss）。
+        标量验证损失，``None`` 时不计入（high 模式无可逆 logits，故不产
+        val_base_loss）。
 
         ``voxels_override``：喂入的张量若已按 pred∪GT bbox 裁剪，传入裁剪前的
         总体素数（B × 整卷空间体素），使 TN/MCC 仍按整卷口径严格等价。
@@ -219,7 +220,7 @@ class MetricAccumulator:
         if self._inter is None:
             if log:
                 logger.warning("%s: accumulator received no samples.", log_prefix)
-            return {"val_loss": float("nan"), "mean_dice": 0.0}
+            return {"val_base_loss": float("nan"), "mean_dice": 0.0}
 
         derived = derive_overlap_metrics(
             self._inter, self._pred_sum, self._target_sum, self._voxels)
@@ -231,9 +232,11 @@ class MetricAccumulator:
         vs_per_class = derived_cpu["vol_sim"]
         mcc_per_class = derived_cpu["mcc"]
 
-        val_loss = (self.loss_meter.avg if self.loss_meter.count > 0
-                    else float("nan"))
-        metrics: Dict[str, float] = {"val_loss": val_loss}
+        # 命名为 val_base_loss：只含裸 base_loss（无 DS/aux/topo 加权），与训练
+        # 组合损失口径不同，避免被当作可与 train loss 直接对比的同量。
+        val_base_loss = (self.loss_meter.avg if self.loss_meter.count > 0
+                         else float("nan"))
+        metrics: Dict[str, float] = {"val_base_loss": val_base_loss}
         for c in range(len(dice_per_class)):
             metrics[f"dice_class_{c}"] = dice_per_class[c].item()
             metrics[f"iou_class_{c}"] = iou_per_class[c].item()
@@ -296,7 +299,7 @@ class MetricAccumulator:
         if log:
             loss_str = (
                 "N/A" if self.loss_meter.count == 0
-                else f"{metrics['val_loss']:.4f}")
+                else f"{metrics['val_base_loss']:.4f}")
             logger.info(
                 "  %s: loss=%s, pooled_mean_dice=%.4f, per_class=%s, "
                 "iou=%.4f, recall=%.4f, precision=%.4f, vol_sim=%.4f, "
@@ -394,8 +397,8 @@ class PatchValEvaluator(ValEvaluator):
                 pred = t.model(image)
                 pred = t.pipeline.extract_main_pred(pred)
                 pred_1x, target_1x = t.pipeline.split_for_metrics(pred, label)
-            # val_loss 用裸 base_loss（无 DS/aux/topo 加权），与训练组合损失
-            # 口径不同，两条曲线不可直接对比，仅作趋势监控。
+            # val_base_loss 用裸 base_loss（无 DS/aux/topo 加权），与训练组合
+            # 损失口径不同，两条曲线不可直接对比，仅作趋势监控。
             loss = compute_loss_fp32(t.base_loss, pred_1x, target_1x)
             loss_val = loss.item()
             if not math.isfinite(loss_val):
@@ -413,7 +416,7 @@ class VolumeValEvaluator(ValEvaluator):
 
     整卷数据直接取自 npz 缓存（与 ``Predictor`` 同款预处理、bbox 已裁），无需磁盘
     NIfTI / bbox 处理。整卷 blended 概率按推理阈值二值化后以 ``pred_is_binary``
-    直接喂入与 medium 完全相同的 ``MetricAccumulator``。不产 val_loss（见 ``MetricAccumulator``）。
+    直接喂入与 medium 完全相同的 ``MetricAccumulator``。不产 val_base_loss（见 ``MetricAccumulator``）。
     """
 
     log_prefix = "Val[full-3D]"
@@ -468,7 +471,7 @@ class VolumeValEvaluator(ValEvaluator):
                 "%s: val dataset exposes no `_npz_paths`; cannot run "
                 "full-volume validation. Falling back to empty metrics.",
                 self.log_prefix)
-            return {"val_loss": float("nan"), "mean_dice": 0.0}
+            return {"val_base_loss": float("nan"), "mean_dice": 0.0}
 
         predictor = self._get_predictor()
         predictor.model.eval()

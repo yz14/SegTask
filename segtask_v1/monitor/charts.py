@@ -187,8 +187,13 @@ def build_single_payload(
         s = _line_series("train loss", _color(0), _points(hist, "loss", "train"))
         s["emphasis"] = True
         loss_series.append(s)
-    if "val_loss" in val_keys:
-        s = _line_series("val loss", _color(1), _points(hist, "val_loss", "val"))
+    # 新历史产 val_base_loss（裸 base_loss，无 DS/aux/topo 加权）；旧历史仍是
+    # val_loss，取存在的那个键以兼容旧 run 的图表渲染。
+    vloss_key = ("val_base_loss" if "val_base_loss" in val_keys
+                 else ("val_loss" if "val_loss" in val_keys else None))
+    if vloss_key is not None:
+        s = _line_series("val base loss", _color(1),
+                         _points(hist, vloss_key, "val"))
         s["emphasis"] = True
         loss_series.append(s)
     comp = _loss_component_keys(hist)
@@ -407,11 +412,13 @@ def build_compare_payload(
 
     run_colors = [_color(i) for i in range(len(hs))]
 
-    # 对比的指标集合：val_loss + 概览均值指标（取任一 run 出现过的）。
+    # 对比的指标集合：验证损失 + 概览均值指标（取任一 run 出现过的）。
+    # val_base_loss 为新键，val_loss 兼容旧历史。
     val_union = set()
     for h in hs:
         val_union.update(h.metric_keys("val"))
-    compare_metrics = (["val_loss"] if "val_loss" in val_union else []) \
+    compare_metrics = [k for k in ("val_base_loss", "val_loss")
+                       if k in val_union] \
         + [m for m in _OVERVIEW_METRICS if m in val_union]
 
     panels: List[Dict[str, Any]] = []

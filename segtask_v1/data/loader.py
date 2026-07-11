@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -407,6 +408,56 @@ def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], Lis
     return indices[n_val:], indices[:n_val]
 
 
+def extract_group_ids(
+    paths: Sequence[str], group_id_regex: str) -> List[str]:
+    """从 npz 文件名 stem 提取 group id（首个捕获组，无捕获组取整个匹配）。
+
+    任一样本匹配失败即 fail-fast：静默回退会让患者级隔离契约无声失效。"""
+    pat = re.compile(group_id_regex)
+    gids: List[str] = []
+    for p in paths:
+        stem = Path(p).stem
+        m = pat.search(stem)
+        if m is None:
+            raise ValueError(
+                f"data.group_id_regex={group_id_regex!r} does not match "
+                f"npz stem {stem!r} ({p}). Fix the regex or the file "
+                f"naming; group-aware split requires every sample to "
+                f"resolve a group id.")
+        gids.append(m.group(1) if m.groups() else m.group(0))
+    return gids
+
+
+def grouped_train_val_split(
+    paths: Sequence[str], group_id_regex: str,
+    val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
+    """组级（患者级）随机划分：同 group id 的样本整体进 train 或 val。
+
+    按组数而非样本数应用 ``val_ratio``（至少 1 组进 train；仅 1 组时 val
+    为空并告警）；划分后断言 train/val 组集合互斥。"""
+    gids = extract_group_ids(paths, group_id_regex)
+    groups = sorted(set(gids))
+    rng = np.random.RandomState(seed)
+    perm = [groups[i] for i in rng.permutation(len(groups))]
+    n_g = len(groups)
+    n_val_g = min(max(1, int(n_g * val_ratio)), n_g - 1) if n_g > 1 else 0
+    if n_val_g == 0:
+        logger.warning(
+            "grouped_train_val_split: only %d group(s); validation set is "
+            "empty.", n_g)
+    val_groups = set(perm[:n_val_g])
+    train_idx = [i for i, g in enumerate(gids) if g not in val_groups]
+    val_idx = [i for i, g in enumerate(gids) if g in val_groups]
+    # 患者级隔离不变量：train/val 组集合必须互斥。
+    assert not ({gids[i] for i in train_idx} & {gids[i] for i in val_idx})
+    logger.info(
+        "Split (group-aware, regex=%r): %d train / %d val samples from "
+        "%d / %d groups (%d groups total).",
+        group_id_regex, len(train_idx), len(val_idx),
+        n_g - n_val_g, n_val_g, n_g)
+    return train_idx, val_idx
+
+
 def _volume_primary_class(
     label_path: str, label_values: List[int],
     label_loader_fn=None) -> int:
@@ -687,7 +738,16 @@ def build_dataloaders(
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
     # 主源 train/val 划分（粗标不参与划分，整批用于训练）。
-    if dc.stratified_split and dc.num_classes >= 2:
+    if dc.group_id_regex:
+        # 患者/组级划分优先：同组样本不得跨 train/val（防泄漏）。
+        if dc.stratified_split:
+            logger.warning(
+                "data.group_id_regex is set; group-aware split overrides "
+                "stratified_split (stratification within group constraints "
+                "is not supported).")
+        train_idx, val_idx = grouped_train_val_split(
+            primary_paths, dc.group_id_regex, dc.val_ratio, dc.split_seed)
+    elif dc.stratified_split and dc.num_classes >= 2:
         if per_sample_counts is None:
             # label_values 显式配置时未走探测；尝试从 npz meta 取计数，
             # 全部可用才使用（部分缺失则整体回退逐卷解码，保证划分口径一致）。

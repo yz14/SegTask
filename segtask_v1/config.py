@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field, fields, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -149,6 +150,12 @@ class DataConfig:
     split_seed: int = 42
     # 按首个前景类分层；样本太少时回退随机。
     stratified_split: bool = True
+    # 患者/组级划分：对 npz 文件名（去 .npz 后缀的 stem）做 re.search，取首个
+    # 捕获组（无捕获组则取整个匹配）作为 group id；同组样本整体进 train 或
+    # val，杜绝同一患者的多序列/多时点跨集泄漏。例如文件名 'P0123_T1.npz'
+    # 用 r'^(P\d+)' 归组为 'P0123'。启用时组级随机划分（stratified_split 被
+    # 覆盖并告警）；空字符串 = 关闭（默认，保持"一文件一样本"划分）。
+    group_id_regex: str = ""
 
     # ---- DataLoader ----
     batch_size        : int = 2
@@ -788,7 +795,7 @@ class TrainConfig:
     val_metric_bbox_crop: bool = False
 
     # 选模标准（互斥）：
-    #   * "loss"              → val_loss ↓
+    #   * "loss"              → val_base_loss ↓
     #   * "dice"              → mean_dice ↑
     #   * "dice+surface_dice" → mean_combined = (1−w)·dice + w·sd ↑
     #   * "iou"               → mean_iou ↑                （Jaccard，对边界更严格）
@@ -942,7 +949,7 @@ _SAVE_BEST_PRESETS: Dict[str, Dict[str, Any]] = {
 # ``Config.validate()`` 也以本表的键作为合法 criterion 白名单。单一真相源。
 # ---------------------------------------------------------------------------
 _CRITERION_TO_METRIC: Dict[str, Tuple[str, str]] = {
-    "loss":              ("val_loss",        "min"),
+    "loss":              ("val_base_loss",   "min"),
     "dice":              ("mean_dice",       "max"),
     "dice+surface_dice": ("mean_combined",   "max"),
     "iou":               ("mean_iou",        "max"),
@@ -1797,6 +1804,12 @@ class Config:
         _require(
             len(self.data.patch_size) == 3,
             "patch_size must be [D, H, W]")
+        if self.data.group_id_regex:
+            try:
+                re.compile(self.data.group_id_regex)
+            except re.error as e:
+                _require(False,
+                         f"data.group_id_regex is not a valid regex: {e}")
         _require(
             self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"),
             f"Invalid patch_mode: {self.data.patch_mode}")
@@ -2003,14 +2016,15 @@ class Config:
             str(self.train.val_metric_mode).lower().strip() in ("medium", "high"),
             f"Invalid val_metric_mode: {self.train.val_metric_mode!r}; "
             "expected 'medium' (patch-level) or 'high' (full-volume).")
-        # high 模式在整卷 blended 概率上算指标，无可逆 logits 故不产出 val_loss；
+        # high 模式在整卷 blended 概率上算指标，无可逆 logits 故不产出 val_base_loss；
         # 因此 'loss' criterion 与 high 互斥（否则永远选不出 best）。改用重叠类指标。
         if (str(self.train.val_metric_mode).lower().strip() == "high"
                 and _norm_crit(self.train.save_best_criterion) == "loss"):
             raise ConfigError(
                 "train.save_best_criterion='loss' is incompatible with "
                 "train.val_metric_mode='high' (full-volume inference produces "
-                "blended probabilities, not invertible logits, so no val_loss "
+                "blended probabilities, not invertible logits, so no "
+                "val_base_loss "
                 "is computed). Use an overlap-based criterion "
                 "(dice / iou / mcc / min_dice / dice+surface_dice / balanced) "
                 "or switch val_metric_mode to 'medium'.")

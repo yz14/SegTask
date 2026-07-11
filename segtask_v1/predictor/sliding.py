@@ -175,11 +175,7 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     (idx + 1) % max(1, 10 * p.batch_size) == 0 or is_last):
                 logger.info("  z-window %d/%d", idx + 1, n_windows)
 
-    if n_skipped and p.log_progress:
-        logger.info(
-            "  skip_empty_windows: skipped %d/%d pure-background z-windows "
-            "(window max <= %.4g).", n_skipped, n_windows,
-            p.skip_empty_threshold)
+    _log_skip_stats(p, n_skipped, n_windows, "z")
     return _finalize_accumulators(acc_pred, acc_weight)
 
 
@@ -433,12 +429,36 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
 
     _flush()
 
-    if n_skipped and p.log_progress:
-        logger.info(
-            "  skip_empty_windows: skipped %d/%d pure-background cubic "
-            "windows (window max <= %.4g).", n_skipped, total_windows,
-            p.skip_empty_threshold)
+    _log_skip_stats(p, n_skipped, total_windows, "cubic")
     return _finalize_accumulators(acc_pred, acc_weight)
+
+
+# skip_empty_windows 安全上限：单卷跳窗比例超过此值时无条件 warning（不受
+# log_progress 控制）——跳窗判据是归一化后低强度启发式而非“确无前景”的
+# 证明，大比例跳窗通常意味着阈值/归一化配置不匹配（如 z-score 下沿用
+# 默认阈值 0），可能静默丢弃真实前景。
+_SKIP_RATIO_WARN = 0.5
+
+
+def _log_skip_stats(p: "Predictor", n_skipped: int, n_total: int,
+                    kind: str) -> None:
+    """skip_empty_windows 跳窗统计：常规比例走 info（随 log_progress），
+    跳窗比例 > _SKIP_RATIO_WARN 时无条件 warning。"""
+    if not n_skipped:
+        return
+    ratio = n_skipped / max(1, n_total)
+    if ratio > _SKIP_RATIO_WARN:
+        logger.warning(
+            "skip_empty_windows: skipped %d/%d (%.0f%%) %s-windows (window "
+            "max <= %.4g). 跳窗判据是低强度启发式，如此高的跳窗比例通常"
+            "意味着 skip_empty_threshold 与归一化方式不匹配，可能正在丢弃"
+            "真实前景；请核实阈值或关闭 skip_empty_windows。",
+            n_skipped, n_total, 100.0 * ratio, kind, p.skip_empty_threshold)
+    elif p.log_progress:
+        logger.info(
+            "  skip_empty_windows: skipped %d/%d (%.0f%%) pure-background "
+            "%s-windows (window max <= %.4g).", n_skipped, n_total,
+            100.0 * ratio, kind, p.skip_empty_threshold)
 
 
 def _finalize_accumulators(acc_pred: torch.Tensor,
