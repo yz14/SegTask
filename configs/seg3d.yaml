@@ -52,6 +52,7 @@ data:
   val_ratio       : 0.2    # 验证集占比 (0~1)
   split_seed      : 42     # 训/验划分随机种子（固定则划分可复现）
   stratified_split: true   # 按首个前景类有无分层划分训/验（样本太少自动回退随机）
+  group_id_regex  : ""     # 患者/组级划分：对文件名 stem 取第 1 个捕获组为组 id，同组不跨训/验（启用时覆盖 stratified_split 并告警）；空=关闭（一文件一样本）
 
   batch_size        : 2      # 训练 batch 大小
   num_workers       : 4      # DataLoader 子进程数；0=主进程加载
@@ -196,6 +197,8 @@ model:
   selfattn_decoder_stages: []          # 解码器逐 level 开关（取值同上）；非空长度须 = len(encoder_channels)-1；仅 decoder_type='unet'
 
   # 注：adm_* / edm2_* 为 2D(2.5D) 专属 arch 字段，3D 模板下永不生效，故不列（见 configs/seg2_5d.yaml）。
+  # 同理不列的 2.5D 专属字段：data.keep_native_view_depth、model.lift_2_5d_to_3d / stem_fusion_mode /
+  # aux_seg_supervision / aux_head_mode、loss.slice_loss_reduction / aux_supervision_weights、predict.z_interleave_*。
 
 loss:
   name                    : "dice_focal"              # 损失函数；单项 'dice'|'bce'|'focal'|'tversky'|'gdl'|'focal_tversky'|'lovasz'|'cldice'，或下划线复合如 'dice_bce'/'dice_focal'
@@ -298,6 +301,7 @@ train:
   save_best_criterion          : "dice"             # 选模标准（看哪个指标）；'loss'=val_loss↓ | 'dice'=mean_dice↑ | 'iou'↑ | 'mcc'↑（类不平衡稳健） | 'min_dice'=最差类↑ | 'dice+surface_dice'↑ | 'balanced'=四指标调和均值↑
   surface_dice_tolerance       : 1                  # 仅 criterion∈{dice+surface_dice, balanced}；表面容差（体素，Chebyshev；0=严格表面）
   surface_dice_weight          : 0.5                # 仅 criterion='dice+surface_dice'；combined = (1-w)*dice + w*sd 的 w
+  surface_dice_tolerance_mm    : 0.0                # >0 时按物理 mm 解释容差覆盖上面的体素容差（需可解析 spacing，否则告警回退）；0=沿用体素容差
   save_best_preset             : ""                 # 任务预设，非空时一键覆盖上面三项；空=不启用；'lung'|'vessel'|'airway'|'bone_multi'|'lymph_node'|'lesion_small'|'oar_multi'|'heart_chamber'|'bone_lung_combined'
   early_stopping               : 15                 # 连续 N 次验证无提升即停；0=禁用（单位=验证次数，非 epoch）
 
