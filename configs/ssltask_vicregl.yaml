@@ -1,0 +1,130 @@
+# 自监督预训练（ssltask, VICRegL-3D：全局 VIC + 位置/特征匹配稠密 VIC；孪生无 EMA/无负样本）示例配置。
+# 运行：  python -m ssltask.pretrain --config configs/ssltask_vicregl.yaml
+# 产出：  outputs/ssltask_vicregl/ssl_best.pt
+# 衔接：  下游分割/分类训练加 --override train.pretrain=outputs/ssltask_vicregl/ssl_best.pt
+#         下游 _load_pretrain 非严格加载：encoder.* 命中；decoder.*/seg_head.* 随机
+#         （VICRegL 仅预训练 encoder；导出的是孪生 encoder。）。
+#
+# 重要：要让 encoder 权重 1:1 迁移，下游 config 的 `model:` 段（backbone/encoder_channels/
+#       blocks/stem/norm/down 等几何项）应与本文件一致。
+#
+# 为什么适合下游分割：全局 VIC 学判别性瓶颈表示；稠密局部项（overlap-aware 双向位置匹配
+#       + 双向特征匹配）显式对齐逐位点密集特征，使各尺度特征具备裁剪/翻转一致的稠密语义
+#       —— 正是密集预测（分割）所需。
+#
+# 数据：只读 image-only npz；SSL 走单视图（multi_res_scales=[1.0]）。成对视图（高重叠）
+#       在 CPU/GPU 上从单 patch 即时生成，并记录裁剪框坐标供位置匹配。
+
+data:
+  npz_dir: "F:/LUNA25/ssl_npz"
+  npz_suffix: ".npz"
+
+  label_values: [0, 1]                 # 仅用于 segtask Config 校验；SSL 不读 label
+  num_classes : 2
+
+  patch_size: [96, 112, 112]
+  patch_mode: "cubic"
+
+  multi_res_scales    : [1.0]          # SSL 单视图（必须长度 1）
+  aug_oversample_ratio: 1.0
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  batch_size     : 2
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  samples_per_volume: 8
+
+
+augment:
+  enabled: false                       # VICRegL 视图增广在方法内（成对裁剪 + 翻转 + 强度抖动）
+
+
+model:
+  backbone: "resnet"
+  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type: "basic"
+
+  norm_type  : "instance"
+  norm_groups: 8
+  activation : "leakyrelu"
+  dropout    : 0.0
+
+  attention_type: "none"
+  skip_attention: true
+
+  # 以下头在 SSL 阶段被丢弃（VICRegL 仅预训练 encoder）；列出以便与下游对齐。
+  deep_supervision   : false
+  aux_seg_supervision: false
+  aux_topo_head      : false
+
+  stem_mode      : "conv3"
+  decoder_type   : "unet"
+  downsample_mode: "conv"
+  upsample_mode  : "trilinear"
+  skip_mode      : "cat"
+
+
+# 优化器/调度器/AMP/output_dir/epochs/lr 由 SSL 复用 segtask train.*。
+train:
+  epochs: 300
+
+  optimizer   : "adamw"
+  lr          : 5.0e-4
+  weight_decay: 1.0e-6                  # VICReg 系列惯用极弱正则（正则由 VIC 项承担）
+
+  scheduler    : "cosine"
+  warmup_epochs: 10
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4
+  grad_clip_norm  : 3.0
+
+  use_amp  : false
+  amp_dtype: "auto"
+
+  compile_mode: "none"
+
+  use_ema  : false                      # VICRegL 孪生无 EMA 教师
+  ema_decay: 0.999
+
+  output_dir: "outputs/ssltask_vicregl"
+
+  log_every: 10
+
+  seed: 42
+  deterministic: false
+
+
+ssl:
+  method: "vicregl"
+
+  # 视图增广（复用 dino_* 翻转/强度抖动字段）
+  dino_flip_prob      : 0.5             # 成对视图逐轴翻转概率
+  dino_intensity_scale: 0.1             # 视图强度缩放扰动
+  dino_intensity_shift: 0.1             # 视图强度平移扰动
+
+  # VICRegL 专属 tunable
+  vicregl_proj_dim       : 256          # 全局投影头输出维
+  vicregl_hidden_dim     : 1024         # 全局投影头隐藏维
+  vicregl_dense_proj_dim : 64           # 稠密投影头输出维（1×1 conv MLP，保分辨率）
+  vicregl_feature_level  : -1           # 稠密嵌入取哪一级 encoder 特征（-1=瓶颈）
+
+  vicregl_sim_coeff : 25.0              # invariance 权重（原论文 25）
+  vicregl_var_coeff : 25.0              # variance 权重（原论文 25；已用总体方差，抗坍缩）
+  vicregl_cov_coeff : 1.0               # covariance 权重（原论文 1）
+  vicregl_alpha     : 0.75              # L = α·L_global + (1-α)·L_local（原论文 0.75）
+
+  vicregl_num_matches    : 20           # 每样本每方向的位置最近邻匹配对数（双向）
+  vicregl_feature_matches: 20           # 每样本每方向的特征空间最近邻匹配对数（0=关闭 feature-based）
+  vicregl_match_radius   : 1.0          # 位置匹配最大半径（目标视图位点间距为单位；避免不重叠框强配对；<=0 关闭）
+  vicregl_crop_scale     : [0.6, 1.0]   # 成对视图裁剪尺度区间（高重叠保证可匹配）
+
+  save_every: 10

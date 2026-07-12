@@ -11,7 +11,9 @@
 5. 损失 = 仅被遮特征位点的 L2：``L = mean‖predictor(ctx) − sg(target)‖²``（可叠加 VICReg
    方差/协方差正则抗坍缩）。
 
-防坍缩：目标侧 EMA（不接收梯度）+ 非对称预测器（必备），可选 VICReg（默认关闭）。
+防坍缩：目标侧 EMA（不接收梯度）+ 非对称预测器（必备），叠加 VICReg 方差/协方差
+正则（**默认开启**——本实现为 CNN 适配：密集 mask-token 上下文而非 ViT 丢 token、
+单尺度随机块掩码而非 I-JEPA 的多目标块采样，坍缩风险高于原版，故默认加正则）。
 隔离轴=**隐空间目标 vs 像素目标**（对照①/②）。下游交接与 ④ 同构：导出 **目标**
 encoder（EMA，更稳）为 ``encoder.*``；预测器/mask-token 经 strict=False 加载被丢弃。
 """
@@ -40,11 +42,18 @@ class _JEPAModule(nn.Module):
         self.target_encoder = target_encoder
         for p in self.target_encoder.parameters():
             p.requires_grad_(False)
+        self.target_encoder.eval()
         self.predictor = predictor
         # 可学习 mask token（每输入通道一个标量，跨被遮单元广播）。
         self.mask_token = nn.Parameter(
             torch.zeros(1, int(in_channels), *([1] * int(spatial_dims))))
         nn.init.normal_(self.mask_token, std=0.02)
+
+    def train(self, mode: bool = True):
+        """冻结的 EMA 目标编码器始终保持 eval 模式。"""
+        super().train(mode)
+        self.target_encoder.eval()
+        return self
 
 
 class JEPAMethod(SSLMethod):
@@ -125,7 +134,7 @@ class JEPAMethod(SSLMethod):
         if z.shape[0] < 2:
             zero = feat.new_zeros(())
             return zero, zero
-        std = torch.sqrt(z.var(dim=0) + 1e-4)
+        std = torch.sqrt(z.var(dim=0, unbiased=False) + 1e-4)
         var_loss = F.relu(1.0 - std).mean()
         zc = z - z.mean(dim=0, keepdim=True)
         cov = (zc.T @ zc) / (z.shape[0] - 1)                          # (C, C)
@@ -137,8 +146,10 @@ class JEPAMethod(SSLMethod):
     def on_resume(self, global_step: int) -> None:
         self._step = int(global_step)
 
-    def on_after_step(self, global_step: int) -> None:
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
         self._step = int(global_step)
+        if not stepped:                       # 跳步：不推进 EMA 目标编码器
+            return
         m = self._momentum()
         with torch.no_grad():
             for pc, pt in zip(self.module.context_encoder.parameters(),

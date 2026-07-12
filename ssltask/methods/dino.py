@@ -52,6 +52,14 @@ class _DINOModule(nn.Module):
         for p in self.teacher.parameters():
             p.requires_grad_(False)
         self.register_buffer("center", torch.zeros(1, int(out_dim)))
+        self.teacher.eval()
+
+    def train(self, mode: bool = True):
+        """冻结的 EMA 教师始终保持 eval 模式（BN running-stat / dropout 不受
+        训练模式影响；本仓默认 InstanceNorm 下行为不变，但语义上应如此）。"""
+        super().train(mode)
+        self.teacher.eval()
+        return self
 
 
 class DINOMethod(SSLMethod):
@@ -67,6 +75,7 @@ class DINOMethod(SSLMethod):
         self.momentum_base = float(ssl.dino_momentum_base)
         self.momentum_final = float(ssl.dino_momentum_final)
         self.warmup_temp_frac = float(ssl.dino_warmup_teacher_temp_frac)
+        self.freeze_last_layer_frac = float(ssl.dino_freeze_last_layer_frac)
 
         # 多裁剪输出尺寸：未显式给定则由 patch_size 推导（global=patch，local≈半）。
         patch = [int(s) for s in cfg.data.patch_size]                 # [D,H,W]
@@ -91,6 +100,16 @@ class DINOMethod(SSLMethod):
         self._step = 0
         self.total_steps = 1
         self.warmup_temp_steps = 1
+        self.freeze_last_layer_steps = 0
+
+        # center 更新延迟到优化步边界（on_after_step）施加：micro-batch 内只累积
+        # 教师输出均值；跳步时整组丢弃，避免半步状态漂移 / NaN 污染 center。
+        self._pending_center_sum: torch.Tensor | None = None
+        self._pending_center_n = 0
+
+        # 本次 compute_loss 的 global 裁剪缓存：供子类的密集分支（iBOT/Gram）复用
+        # 同一批视图，避免重复随机多裁剪（全局蒸馏与密集分支看不同视图 + 额外计算）。
+        self._cached_global_crops: List[torch.Tensor] | None = None
 
     # ---- modules ----------------------------------------------------------
     def build_modules(self) -> nn.Module:
@@ -110,6 +129,8 @@ class DINOMethod(SSLMethod):
         self.total_steps = max(int(total_steps), 1)
         self.warmup_temp_steps = max(
             int(self.warmup_temp_frac * self.total_steps), 1)
+        self.freeze_last_layer_steps = int(
+            self.freeze_last_layer_frac * self.total_steps)
 
     def _teacher_temp(self) -> float:
         """teacher 温度从 warmup 起点线性升到 final（前 warmup_temp_steps 步）。"""
@@ -153,25 +174,56 @@ class DINOMethod(SSLMethod):
                 n_pairs += 1
         loss = total / max(n_pairs, 1)
 
-        self._update_center(teacher_out)
+        self._accumulate_center(teacher_out)
+        self._cached_global_crops = global_crops
         return loss, {"dino_loss": float(loss.detach()),
                       "teacher_temp": teacher_temp,
                       "ema_momentum": self._momentum()}
 
     @torch.no_grad()
-    def _update_center(self, teacher_out: List[torch.Tensor]) -> None:
+    def _accumulate_center(self, teacher_out: List[torch.Tensor]) -> None:
+        """累积本 micro-batch 的全局教师均值；EMA 施加延迟到优化步边界。"""
         batch_center = _global_batch_mean(
             torch.cat(teacher_out, dim=0).mean(dim=0, keepdim=True))
+        if self._pending_center_sum is None:
+            self._pending_center_sum = batch_center.detach().clone()
+        else:
+            self._pending_center_sum += batch_center.detach()
+        self._pending_center_n += 1
+
+    @torch.no_grad()
+    def _apply_center_update(self) -> None:
+        if self._pending_center_n == 0 or self._pending_center_sum is None:
+            return
+        batch_center = self._pending_center_sum / float(self._pending_center_n)
         self.module.center.mul_(self.center_momentum).add_(
             batch_center.to(self.module.center.dtype),
             alpha=1.0 - self.center_momentum)
+
+    def _clear_pending_center(self) -> None:
+        self._pending_center_sum = None
+        self._pending_center_n = 0
+
+    # ---- last-layer freeze (DINO 稳定化) -----------------------------------
+    def on_before_optimizer_step(self) -> None:
+        """前 ``freeze_last_layer_steps`` 步取消学生投影头末层（原型层）梯度：
+        避免训练初期原型剧烈重排引发崩塌（DINO 官方 freeze_last_layer 技巧）。"""
+        if self._step >= self.freeze_last_layer_steps:
+            return
+        for p in self.module.student.head.last_layer.parameters():
+            p.grad = None
 
     # ---- EMA teacher update ----------------------------------------------
     def on_resume(self, global_step: int) -> None:
         self._step = int(global_step)
 
-    def on_after_step(self, global_step: int) -> None:
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
         self._step = int(global_step)
+        if not stepped:                       # 跳步：丢弃本组待施加状态
+            self._clear_pending_center()
+            return
+        self._apply_center_update()
+        self._clear_pending_center()
         m = self._momentum()
         with torch.no_grad():
             for ps, pt in zip(self.module.student.parameters(),

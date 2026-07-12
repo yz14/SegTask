@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -58,8 +58,15 @@ class _MoCoModule(nn.Module):
         self.key = key
         for p in self.key.parameters():
             p.requires_grad_(False)
+        self.key.eval()
         self.register_buffer("queue", F.normalize(torch.randn(int(proj_dim), int(queue_size)), dim=0))
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+    def train(self, mode: bool = True):
+        """冻结的 EMA key 编码器始终保持 eval 模式。"""
+        super().train(mode)
+        self.key.eval()
+        return self
 
 
 class MoCoMethod(SSLMethod):
@@ -76,6 +83,11 @@ class MoCoMethod(SSLMethod):
         self.dino_hidden_dim = int(ssl.dino_hidden_dim)
         self._step = 0
         self.total_steps = 1
+        # 待入队 key：延迟到优化步边界统一入队（跳步时丢弃）。
+        self._pending_keys: List[torch.Tensor] = []
+        # queue_ptr 的主机侧镜像：仅在入队时（已有 .item() 同步）更新，供每步日志
+        # 读取，避免 compute_loss 每个 micro-batch 都对 queue_ptr 做设备→主机同步。
+        self._last_ptr: float = 0.0
 
         patch = [int(s) for s in cfg.data.patch_size]
         model_spatial = patch if self.spatial_dims == 3 else patch[1:]
@@ -146,6 +158,7 @@ class MoCoMethod(SSLMethod):
             queue[:, :end % queue.shape[1]] = keys[first:].T
         ptr = (ptr + k) % queue.shape[1]
         self.module.queue_ptr[0] = ptr
+        self._last_ptr = float(ptr)
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -164,16 +177,25 @@ class MoCoMethod(SSLMethod):
         logits2 = torch.cat([l2_pos, l2_neg], dim=1) / self.temperature
         labels = torch.zeros(logits1.shape[0], dtype=torch.long, device=logits1.device)
         loss = 0.5 * (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels))
-        self._dequeue_and_enqueue(torch.cat([k1, k2], dim=0))
-        return loss, {"moco_loss": float(loss.detach()), "queue_ptr": float(self.module.queue_ptr.item())}
+        # 入队延迟到优化步边界（on_after_step）：跳步时整组 key 丢弃，队列与
+        # 权重更新保持同步；同 accum 组内各 micro-batch 也不会互吃对方的 key 作负样本。
+        self._pending_keys.append(torch.cat([k1, k2], dim=0).detach())
+        return loss, {"moco_loss": float(loss.detach()),
+                      "queue_ptr": self._last_ptr}
 
     def on_resume(self, global_step: int) -> None:
         self._step = int(global_step)
+        self._last_ptr = float(self.module.queue_ptr.item())   # 恢复日志镜像（一次同步）
 
-    def on_after_step(self, global_step: int) -> None:
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
         self._step = int(global_step)
-        m = self._momentum()
+        pending, self._pending_keys = self._pending_keys, []
+        if not stepped:                       # 跳步：丢弃本组 key，不推进 EMA
+            return
         with torch.no_grad():
+            if pending:
+                self._dequeue_and_enqueue(torch.cat(pending, dim=0))
+            m = self._momentum()
             for pq, pk in zip(self.module.query.parameters(), self.module.key.parameters()):
                 pk.mul_(m).add_(pq.detach(), alpha=1.0 - m)
             for bq, bk in zip(self.module.query.buffers(), self.module.key.buffers()):

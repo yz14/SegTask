@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -76,19 +77,30 @@ class SSLTrainer:
             _sampler if isinstance(_sampler, DistributedSampler) else None)
 
         # --- Optimizer + scheduler (复用 segtask train.*) ---
+        # 关键：scheduler / warmup 只在“梯度累积边界”(= 一次 optimizer.step)推进，
+        # 故其时钟必须用 **optimizer-step** 计数，而非 micro-batch 计数。否则
+        # grad_accum_steps=k 时整段 schedule 只会走完约 1/k，warmup 被拉长 ~k 倍。
+        # 每 epoch 的边界数 = ceil(len(loader)/accum)，与方法内 EMA/温度 schedule
+        # (configure_schedule) 保持同一时钟。
+        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
         self.optimizer = build_optimizer(model, cfg)
-        steps_per_epoch = len(train_loader)
-        warmup_steps = tc.warmup_epochs * steps_per_epoch
-        total_steps = tc.epochs * steps_per_epoch
+        micro_steps_per_epoch = len(train_loader)
+        opt_steps_per_epoch = max(
+            math.ceil(micro_steps_per_epoch / self.grad_accum_steps), 1)
+        warmup_steps = tc.warmup_epochs * opt_steps_per_epoch
+        total_steps = tc.epochs * opt_steps_per_epoch
         post_warmup = total_steps - warmup_steps
         if tc.scheduler == "one_cycle" and warmup_steps > 0:
             raise ValueError(
                 "OneCycleLR has built-in warmup; set train.warmup_epochs=0.")
         base_scheduler = build_scheduler(
-            self.optimizer, cfg, steps_per_epoch, post_warmup_steps=post_warmup)
+            self.optimizer, cfg, opt_steps_per_epoch,
+            post_warmup_steps=post_warmup)
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
+        self._opt_steps_per_epoch = opt_steps_per_epoch
+        self._total_opt_steps = total_steps
 
         # --- AMP ---
         amp_dtype_cfg = tc.amp_dtype
@@ -136,7 +148,6 @@ class SSLTrainer:
                     "augmentation only supports spatial_dims=3 (2.5D input "
                     "is depth-folded 4D); augmentation disabled.")
 
-        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.best_loss = math.inf
@@ -160,9 +171,9 @@ class SSLTrainer:
             self._init_monitor(resume_active=bool(tc.resume))
 
         # 告知方法总优化步数（= boundary 数：每 grad_accum 个 micro-step 一次）。
-        # 供自蒸馏等方法预计算 EMA 动量 / teacher 温度的 cosine 调度（默认 no-op）。
-        opt_steps_per_epoch = math.ceil(steps_per_epoch / self.grad_accum_steps)
-        self.method.configure_schedule(tc.epochs * max(opt_steps_per_epoch, 1))
+        # 与上方 scheduler/warmup 完全同一时钟（optimizer-step）。供自蒸馏等方法
+        # 预计算 EMA 动量 / teacher 温度的 cosine 调度（默认 no-op）。
+        self.method.configure_schedule(self._total_opt_steps)
 
         # --- Online seg probe (§0.5): drives best selection by representation
         #     quality instead of the SSL proxy loss. Optional, isolated.
@@ -350,18 +361,45 @@ class SSLTrainer:
                 self.ema.restore(bare)
         return self.method.export_backbone_state_dict()
 
+    @staticmethod
+    def _atomic_save(obj: Dict, path: Path) -> None:
+        """原子落盘：先写同目录临时文件 + fsync，再 ``os.replace`` 覆盖目标。
+        避免训练/断电中断留下截断的半份 ckpt（``torch.load`` 直接崩）。"""
+        tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+        with open(tmp, "wb") as f:
+            torch.save(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)                 # 同文件系统内原子替换
+
+    @staticmethod
+    def _state_fingerprint(state: Dict[str, torch.Tensor]) -> str:
+        """权重快照内容指纹（sha256）：写入 ckpt，加载时校验完整性/一致性。
+        对键排序后按 (name, dtype, shape, bytes) 累积，跨进程稳定。"""
+        h = hashlib.sha256()
+        for k in sorted(state):
+            v = state[k]
+            h.update(k.encode("utf-8"))
+            if torch.is_tensor(v):
+                h.update(str(v.dtype).encode("utf-8"))
+                h.update(str(tuple(v.shape)).encode("utf-8"))
+                h.update(v.detach().cpu().contiguous().numpy().tobytes())
+        return h.hexdigest()
+
     def _save(self, epoch: int, tag: str) -> Path:
         path = self.output_dir / f"ssl_{tag}.pt"
         if not self._is_main:          # DDP：仅 rank0 落盘
             if tag == "best":
                 self._best_saved = True
             return path
-        torch.save({
+        model_state = self._export_state_dict()
+        self._atomic_save({
             "epoch": epoch,
-            "model_state_dict": self._export_state_dict(),
+            "model_state_dict": model_state,
             "ssl_method": self.ssl.method,
             "best_loss": self.best_loss,
             "best_probe": self.best_probe,
+            "fingerprint": self._state_fingerprint(model_state),
         }, path)
         if tag == "best":
             self._best_saved = True
@@ -393,9 +431,11 @@ class SSLTrainer:
         }
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
+        state["fingerprint"] = self._state_fingerprint(
+            state["method_state_dict"])
         path = self.output_dir / "ssl_resume.pt"
         if self._is_main:              # DDP：仅 rank0 落盘
-            torch.save(state, path)
+            self._atomic_save(state, path)
         return path
 
     def _load_resume(self, path: str) -> None:
@@ -407,6 +447,13 @@ class SSLTrainer:
             raise ValueError(
                 f"Resume ckpt was written by ssl.method={method!r}, but current "
                 f"config uses {self.ssl.method!r}.")
+        fp = ckpt.get("fingerprint")
+        if fp is not None:
+            actual = self._state_fingerprint(ckpt["method_state_dict"])
+            if actual != fp:
+                raise ValueError(
+                    f"Resume ckpt fingerprint mismatch (expected {fp[:16]}…, "
+                    f"got {actual[:16]}…): file corrupted or tampered.")
         unwrap_compile(self.method.module).load_state_dict(
             ckpt["method_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -555,6 +602,19 @@ class SSLTrainer:
         for g in grads:
             dist.all_reduce(g, op=dist.ReduceOp.SUM)
 
+    def _reduce_meter_avg(self, meter: AverageMeter) -> float:
+        """DDP：按样本数加权 all-reduce 各 rank 的 meter 均值，使 best_loss 判定与
+        日志在所有副本上一致（各 rank 经 DistributedSampler 看不同分片，本地均值
+        不同 → rank0 存 best 的决策否则只代表其自身分片）。非 DDP 直接返回均值。"""
+        if not self._is_dist:
+            return meter.avg
+        t = torch.tensor(
+            [meter.avg * meter.count, float(meter.count)],
+            dtype=torch.float64, device=self.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        total, count = float(t[0]), float(t[1])
+        return total / count if count > 0 else meter.avg
+
     def _train_epoch(self, epoch: int) -> "tuple[float, Dict[str, float]]":
         """单 epoch 训练；返回 (平均 loss, 监控指标 dict（含方法 logs 与健康
         指标，仅监控启用时采集）)。"""
@@ -616,6 +676,7 @@ class SSLTrainer:
                     skip_optim_step = all_reduce_flag_any(
                         group_has_nonfinite, self.device)
                 group_has_nonfinite = False
+                stepped = False
                 if skip_optim_step:
                     logger.warning(
                         "Skipping optimizer step at epoch %d step %d/%d: "
@@ -634,22 +695,39 @@ class SSLTrainer:
                     elif health_on and self._health_grad_norm_when_no_clip:
                         self.scaler.unscale_(self.optimizer)
                         grad_norm_val = self._global_grad_norm()
+                    # 方法级梯度干预（如 DINO 末层 freeze）；取消 p.grad 与
+                    # scale 无关，故放在 unscale/clip 之后、scaler.step 之前均安全。
+                    self.method.on_before_optimizer_step()
+                    # fp16：GradScaler 在 inf/NaN 梯度时内部跳过 optimizer.step 并
+                    # 降 scale。用 scale 前后对比检测跳步，保证 EMA / 方法状态与
+                    # 权重更新严格同步（scheduler 照常推进，时钟不变）。
+                    scale_before = (float(self.scaler.get_scale())
+                                    if self._scaler_active else None)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    stepped = (scale_before is None
+                               or float(self.scaler.get_scale()) >= scale_before)
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()
-                    if self.ema is not None:
-                        self.ema.update(unwrap_compile(self.method.module))
-                    opt_steps += 1
-                    if health_on and grad_norm_val is not None and \
-                            math.isfinite(grad_norm_val):
-                        grad_norm_meter.update(grad_norm_val)
-                        grad_norm_max = max(grad_norm_max, grad_norm_val)
-                        if (tc.grad_clip_norm > 0
-                                and grad_norm_val > tc.grad_clip_norm):
-                            clipped_steps += 1
+                    if not stepped:
+                        nonfinite_steps += 1
+                        logger.warning(
+                            "GradScaler skipped optimizer step at epoch %d "
+                            "step %d/%d (inf/NaN grads); EMA and method state "
+                            "not advanced.", epoch + 1, step + 1, total_steps)
+                    else:
+                        if self.ema is not None:
+                            self.ema.update(unwrap_compile(self.method.module))
+                        opt_steps += 1
+                        if health_on and grad_norm_val is not None and \
+                                math.isfinite(grad_norm_val):
+                            grad_norm_meter.update(grad_norm_val)
+                            grad_norm_max = max(grad_norm_max, grad_norm_val)
+                            if (tc.grad_clip_norm > 0
+                                    and grad_norm_val > tc.grad_clip_norm):
+                                clipped_steps += 1
                 self._global_step += 1
-                self.method.on_after_step(self._global_step)
+                self.method.on_after_step(self._global_step, stepped=stepped)
 
             if math.isfinite(step_loss):
                 loss_meter.update(step_loss, bs)
@@ -669,7 +747,8 @@ class SSLTrainer:
                              step + 1, total_steps, step_loss,
                              self.scheduler.get_lr())
 
-        metrics: Dict[str, float] = {"loss": loss_meter.avg}
+        epoch_loss = self._reduce_meter_avg(loss_meter)
+        metrics: Dict[str, float] = {"loss": epoch_loss}
         if self._monitor is not None:
             for k, m in log_meters.items():
                 metrics[k] = m.avg
@@ -685,7 +764,7 @@ class SSLTrainer:
                     logger.warning(
                         "SSL health metric collection failed; skipping.",
                         exc_info=True)
-        return loss_meter.avg, metrics
+        return epoch_loss, metrics
 
 
 __all__ = ["SSLTrainer"]

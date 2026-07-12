@@ -75,8 +75,17 @@ class SSLMethod(ABC):
         steps_per_epoch ÷ grad_accum）。供需要全程进度的方法预计算 cosine 调度
         （如自蒸馏的 EMA 教师动量、teacher 温度 warmup）。默认 no-op。"""
 
-    def on_after_step(self, global_step: int) -> None:
-        """每个优化步边界后调用（EMA 教师更新 / 温度·动量调度）。默认 no-op。"""
+    def on_before_optimizer_step(self) -> None:
+        """每次 ``optimizer.step`` 前调用（梯度已就绪、可能已 unscale/clip）。
+        供方法取消特定参数的梯度（如 DINO 冻结投影头末层的稳定化期）。默认 no-op。"""
+
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
+        """每个优化步边界后调用（EMA 教师更新 / 温度·动量调度）。默认 no-op。
+
+        ``stepped=False`` 表示本边界的优化步被跳过（非有限 loss 丢弃梯度、或
+        fp16 GradScaler 因 inf/NaN 梯度内部跳步）：子类应照常推进调度计数
+        （与 scheduler 时钟对齐），但**不得**施加 EMA / center / queue 等状态
+        更新，并丢弃本 accum 组内缓存的待处理状态。"""
 
     def on_resume(self, global_step: int) -> None:
         """resume 加载后由 ``SSLTrainer`` 调用一次，恢复步进度（温度/动量调度的

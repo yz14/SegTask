@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
@@ -78,6 +79,10 @@ class SSLConfig:
     prior_beta: float = 0.5
     prior_black_vessels: bool = False
     prior_corrupt_input: bool = False
+    # 物理体素间距 (sz,sy,sx) mm；给定时 prior_scales 解释为物理尺度(mm)，Frangi
+    # 按各向异性 spacing 计算高斯/Hessian（各向异性数据下管径尺度物理一致）。空=
+    # 体素单位(旧行为)。数据已重采样到统一 target_spacing 时填该值即可。
+    prior_spacing: List[float] = field(default_factory=list)
 
     # --- method='simmim'：mask token 稠密掩码图像建模（SSL.md 方案②）---
     # 掩码比例（SimMIM 经验 0.5–0.6）。
@@ -136,6 +141,9 @@ class SSLConfig:
     dino_center_momentum: float = 0.9
     dino_momentum_base: float = 0.996
     dino_momentum_final: float = 1.0
+    # 前此比例的优化步内冻结学生投影头末层（原型层）梯度（DINO 稳定化技巧，
+    # 避免训练初期原型剧烈重排引发崩塌；0=不冻结）。
+    dino_freeze_last_layer_frac: float = 0.01
 
     # --- method='byol'：BYOL-3D（online/query + EMA target；无负样本）---
     byol_proj_dim: int = 128
@@ -163,8 +171,13 @@ class SSLConfig:
     vicregl_cov_coeff: float = 1.0
     # 全局/局部加权 α：L = α·L_global + (1-α)·L_local（原论文 0.75）。
     vicregl_alpha: float = 0.75
-    # 每样本取多少对位置最近的位点匹配（top-γ）。
+    # 每样本每方向取多少对位置最近的位点匹配（top-γ，双向）。
     vicregl_num_matches: int = 20
+    # 每样本每方向的特征空间最近邻匹配对数（VICRegL feature-based；0=关）。
+    vicregl_feature_matches: int = 20
+    # 位置匹配的最大距离半径（以目标视图位点间距为单位；超出则不配对，
+    # 避免两裁剪框不重叠时强造正样本；<=0 关闭过滤）。
+    vicregl_match_radius: float = 1.0
     # 两视图裁剪尺度区间（高重叠保证可匹配；翻转/强度增广复用 dino_*）。
     vicregl_crop_scale: List[float] = field(default_factory=lambda: [0.6, 1.0])
 
@@ -180,9 +193,11 @@ class SSLConfig:
     # 目标编码器 EMA 动量（cosine base→final）。
     jepa_momentum_base: float = 0.996
     jepa_momentum_final: float = 1.0
-    # 可选 VICReg 抗坍缩正则权重（方差项 / 协方差项；0=关闭）。
-    jepa_var_weight: float = 0.0
-    jepa_cov_weight: float = 0.0
+    # VICReg 抗坍缩正则权重（方差项 / 协方差项；0=关闭）。默认开启：本实现为
+    # CNN 适配（密集 mask-token 上下文 + 单尺度随机块掩码），坍缩风险高于
+    # 原版 I-JEPA（ViT 丢 token + 多目标块采样）。
+    jepa_var_weight: float = 1.0
+    jepa_cov_weight: float = 0.04
 
     # --- method='dino_gram'：DINO + Gram anchoring（SSL.md 方案⑤）---
     # 复用上面全部 dino_* 项；以下仅 Gram 分支专用。
@@ -190,8 +205,10 @@ class SSLConfig:
     dino_gram_weight: float = 1.0
     # 训练进度 < 此比例时 λ=0（只跑纯 DINO，待密集特征成形后再锚定）。
     dino_gram_start_frac: float = 0.3
-    # Gram 教师刷新间隔（优化步）：每多少步从当前 EMA 教师整份拷贝一次快照。
-    dino_gram_refresh_steps: int = 1
+    # Gram 教师刷新间隔（优化步，以 λ 首次生效的锚定时刻为原点）：每多少步从当前
+    # EMA 教师整份拷贝一次快照。须远大于 1——快照与 EMA 教师保持足够"时差"才有
+    # 锚定意义（=1 时 Gram 教师≈当前教师，anchoring 退化为空操作）。
+    dino_gram_refresh_steps: int = 1000
     # 计算 Gram 的 encoder 特征级（feats 索引，-1=瓶颈）。
     dino_gram_feature_level: int = -1
 
@@ -226,6 +243,11 @@ class SSLConfig:
     probe_val_ratio: float = 0.3        # 探针 train/val 划分比例
     probe_samples_per_volume: int = 4   # 探针每卷抽样数
     probe_seed: int = 0                 # 线性头重置 + 划分种子（保证跨 epoch 可比）
+    # 组级划分：npz 文件名 stem 即 pid；同一患者多序列用 group_regex 的第 1 个捕获
+    # 组归并，避免同患者跨 train/val 泄漏（空=按文件名 stem 分组）。
+    probe_group_regex: str = ""
+    # 只有 1 个组时是否允许 train==val（默认 False：抛错，因读数无效不能选模）。
+    probe_allow_single_group: bool = False
     probe_select_best: bool = True      # True: 以 probe_dice 选 best；False: 退回 train loss
     # 探针头结构："linear" — 逐尺度 1×1 线性头（上采样求和，严格线性探针）；
     # "unet" — 轻量 UNet 式自顶向下融合头（lateral 1×1 + 逐级上采样 3×3 融合），
@@ -249,6 +271,8 @@ class SSLConfig:
     eval_out_dir: str = ""              # 输出目录；空=自动落到 train.output_dir/eval
     eval_holdout_ratio: float = 0.2
     eval_seed: int = 0
+    eval_group_regex: str = ""           # 同 probe_group_regex（离线评测组级留出）
+    eval_allow_single_group: bool = False
     eval_entries: List[str] = field(default_factory=list)
 
     # 周期性保存 SSL ckpt 的 epoch 间隔（best-by-train-recon 始终单独保存）。
@@ -269,6 +293,13 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             float(ssl.prior_alpha) > 0 and float(ssl.prior_beta) > 0,
             f"ssl.prior_alpha/prior_beta must be > 0; "
             f"got {ssl.prior_alpha}, {ssl.prior_beta}.")
+        if ssl.prior_spacing:
+            _require(
+                len(ssl.prior_spacing) == cfg.model.spatial_dims
+                and all(float(v) > 0 for v in ssl.prior_spacing),
+                f"ssl.prior_spacing (if set) must have length "
+                f"model.spatial_dims ({cfg.model.spatial_dims}) and be "
+                f"all-positive; got {ssl.prior_spacing}.")
     if ssl.method == "simmim":
         _require(
             0.0 < float(ssl.mim_mask_ratio) < 1.0,
@@ -326,6 +357,10 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             0.0 < float(ssl.dino_warmup_teacher_temp_frac) <= 1.0,
             f"ssl.dino_warmup_teacher_temp_frac must be in (0,1]; got "
             f"{ssl.dino_warmup_teacher_temp_frac}.")
+        _require(
+            0.0 <= float(ssl.dino_freeze_last_layer_frac) <= 1.0,
+            f"ssl.dino_freeze_last_layer_frac must be in [0,1]; got "
+            f"{ssl.dino_freeze_last_layer_frac}.")
         _require(
             0.0 <= float(ssl.dino_center_momentum) < 1.0,
             f"ssl.dino_center_momentum must be in [0,1); got "
@@ -499,6 +534,10 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             _require(
                 int(getattr(ssl, name)) >= 1,
                 f"ssl.{name} must be >= 1; got {getattr(ssl, name)}.")
+        _require(
+            int(ssl.vicregl_feature_matches) >= 0,
+            f"ssl.vicregl_feature_matches must be >= 0; "
+            f"got {ssl.vicregl_feature_matches}.")
         for name in ("vicregl_sim_coeff", "vicregl_var_coeff",
                      "vicregl_cov_coeff"):
             _require(
@@ -573,6 +612,17 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             int(ssl.probe_samples_per_volume) >= 1,
             f"ssl.probe_samples_per_volume must be >= 1; "
             f"got {ssl.probe_samples_per_volume}.")
+    for _name in ("probe_group_regex", "eval_group_regex"):
+        _rx = str(getattr(ssl, _name))
+        if _rx:
+            try:
+                _compiled = re.compile(_rx)
+            except re.error as e:
+                raise ConfigError(f"ssl.{_name} is not a valid regex: {e}")
+            _require(
+                _compiled.groups >= 1,
+                f"ssl.{_name} must contain at least one capture group "
+                f"(the group key); got {_rx!r}.")
     _require(
         str(ssl.probe_head) in ("linear", "unet"),
         f"ssl.probe_head must be 'linear' or 'unet'; got {ssl.probe_head!r}.")

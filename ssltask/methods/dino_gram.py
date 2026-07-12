@@ -6,9 +6,15 @@ DINO④ 的图像级自蒸馏在长 schedule 下会让**密集**（逐位点）�
 尚佳的 EMA 教师**快照**，周期性刷新。Gram 只看相对相似度结构、不看绝对尺度，故能在不破坏
 DINO 语义聚类的前提下把局部几何"拉回"清晰。
 
-相对 ④ 仅多一个变量：``L = L_DINO + λ·L_gram``。λ 在训练进度达到 ``dino_gram_start_frac``
-前为 0（先让密集特征成形），之后启用。Gram 仅在 global 裁剪上计算（保证学生/Gram 教师
-位点数一致）。下游交接与 ④ 完全一致：只导出 **教师** ``encoder.*``（见 ``DINOMethod``）。
+相对 ④ 仅多一个变量：``L = L_DINO + λ·L_gram``。staged recipe：
+1. 进度 < ``dino_gram_start_frac``：λ=0，纯 DINO（密集特征成形期），Gram 教师不刷新；
+2. λ 首次生效的时刻，把**当时**的 EMA 教师快照为 Gram 教师（锚定"密集特征尚佳"的
+   早期教师），之后保持冻结；
+3. 此后每 ``dino_gram_refresh_steps`` 个优化步（以锚定时刻为原点）才整份刷新一次快照。
+
+断点续训时锚定时刻不入 checkpoint：恢复后首个 λ>0 的步会以当时的 EMA 教师重新锚定。
+Gram 仅在 global 裁剪上计算（保证学生/Gram 教师位点数一致）。下游交接与 ④ 完全一致：
+只导出 **教师** ``encoder.*``（见 ``DINOMethod``）。
 """
 
 from __future__ import annotations
@@ -33,6 +39,12 @@ class _DINOGramModule(_DINOModule):
         self.gram_teacher = gram_teacher
         for p in self.gram_teacher.parameters():
             p.requires_grad_(False)
+        self.gram_teacher.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)          # 已保持 teacher.eval()
+        self.gram_teacher.eval()
+        return self
 
 
 class DINOGramMethod(DINOMethod):
@@ -44,6 +56,8 @@ class DINOGramMethod(DINOMethod):
         self.gram_start_frac = float(ssl.dino_gram_start_frac)
         self.gram_refresh_steps = max(int(ssl.dino_gram_refresh_steps), 1)
         self.gram_level = int(ssl.dino_gram_feature_level)
+        # λ 首次生效时的优化步（Gram 教师锚定时刻）；-1 = 尚未启用。
+        self._gram_anchor_step = -1
 
     # ---- modules ----------------------------------------------------------
     def build_modules(self) -> nn.Module:
@@ -98,9 +112,10 @@ class DINOGramMethod(DINOMethod):
                    + tt.pow(2).sum(dim=(1, 2)))        # (B,) 逐样本 ||G_s-G_t||²_F
         return frob_sq.clamp_min(0.0).mean() / float(n * n)
 
-    def _gram_loss(self, image: torch.Tensor) -> torch.Tensor:
-        """学生 vs Gram 教师在 global 裁剪密集特征上的 Gram 矩阵 Frobenius² 距离。"""
-        global_crops: List[torch.Tensor] = self.multicrop(image)["global"]
+    def _gram_loss(self, global_crops: List[torch.Tensor]) -> torch.Tensor:
+        """学生 vs Gram 教师在 global 裁剪密集特征上的 Gram 矩阵 Frobenius² 距离。
+
+        复用 DINO 主损失的 global 裁剪（同一批视图），不再额外多裁剪。"""
         terms = []
         for g in global_crops:
             s_feat = self.module.student.encoder(g)[self.gram_level].float()
@@ -113,9 +128,14 @@ class DINOGramMethod(DINOMethod):
     def compute_loss(self, batch: Dict[str, torch.Tensor]
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
         dino_loss, logs = super().compute_loss(batch)
+        crops = self._cached_global_crops or []
+        self._cached_global_crops = None
         lam = self._gram_weight()
         if lam > 0.0:
-            gram = self._gram_loss(batch["image"])
+            if self._gram_anchor_step < 0:      # λ 首次生效：锚定当前 EMA 教师
+                self._refresh_gram_teacher()
+                self._gram_anchor_step = int(self._step)
+            gram = self._gram_loss(crops)
             loss = dino_loss + lam * gram
             logs["gram_loss"] = float(gram.detach())
         else:
@@ -125,9 +145,12 @@ class DINOGramMethod(DINOMethod):
         return loss, logs
 
     # ---- EMA teacher update + periodic gram-teacher refresh ---------------
-    def on_after_step(self, global_step: int) -> None:
-        super().on_after_step(global_step)            # 更新 EMA 教师 + self._step
-        if int(global_step) % self.gram_refresh_steps == 0:
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
+        super().on_after_step(global_step, stepped)   # 更新 EMA 教师 + self._step
+        if not stepped or self._gram_anchor_step < 0:
+            return                                    # 跳步或 Gram 尚未启用：不刷新
+        elapsed = int(global_step) - self._gram_anchor_step
+        if elapsed > 0 and elapsed % self.gram_refresh_steps == 0:
             self._refresh_gram_teacher()
 
     @torch.no_grad()

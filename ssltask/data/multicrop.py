@@ -26,16 +26,61 @@ from segtask_v1.models.blocks import INTERP_SMOOTH
 
 def _sample_box(spatial: Sequence[int], scale_lo: float, scale_hi: float
                 ) -> Tuple[List[int], List[int]]:
-    """逐轴独立采样裁剪框：每轴边长 = U(lo,hi)*dim（>=1），起点在体内随机。"""
+    """随机框采样，**体积一致**：``scale`` 解释为体积/面积占比（RandomResizedCrop
+    约定），采一个体积占比 ``f ~ U(lo,hi)``，各轴边长占比 = ``f**(1/dims)``（各向同性），
+    故实际裁剪体积占比 ≈ f 且跨样本可比。
+
+    旧实现逐轴独立采 ``U(lo,hi)`` 作**边长**占比，实际体积占比 = 各轴之积（3D 下
+    U(0.5,1) → 体积占比 [0.125,1] 严重偏小且方差极大，与 scale 语义不符）。"""
+    ndim = len(spatial)
+    vol_frac = random.uniform(scale_lo, scale_hi)
+    edge_frac = vol_frac ** (1.0 / ndim)
     origins: List[int] = []
     sizes: List[int] = []
     for dim in spatial:
-        frac = random.uniform(scale_lo, scale_hi)
-        size = max(1, min(int(round(frac * dim)), int(dim)))
+        size = max(1, min(int(round(edge_frac * dim)), int(dim)))
         origin = random.randint(0, int(dim) - size)
         origins.append(origin)
         sizes.append(size)
     return origins, sizes
+
+
+def _affine_grid(spatial: Sequence[int], out_size: Sequence[int],
+                 origins: torch.Tensor, sizes: torch.Tensor,
+                 flips: torch.Tensor, spatial_dims: int,
+                 device: torch.device) -> torch.Tensor:
+    """批量随机框 → ``grid_sample`` 归一化采样网格（align_corners=False）。
+
+    等价于「按 box 裁剪 + F.interpolate 到 out_size」：输出像素 j 沿某轴映射到输入
+    像素 ``o + (j+0.5)*s/O - 0.5``，转 [-1,1] 归一化即 ``g = a*(j+0.5)+b``，其中
+    ``a = 2s/(O·L)``、``b = 2o/L − 1``；``flips`` 为真时以 ``O−1−j`` 反向采样。
+
+    参数张量形状 ``(B, dims)``（origins/sizes 体素单位，flips 布尔）；轴序 (D,H,W)/
+    (H,W)，返回 grid 末维按 grid_sample 约定取反序 (x,y[,z])。"""
+    B = origins.shape[0]
+    coords: List[torch.Tensor] = []      # 逐轴 (B, O_axis)
+    for axis in range(spatial_dims):
+        L = int(spatial[axis])
+        O = int(out_size[axis])
+        j = torch.arange(O, dtype=torch.float32, device=device)
+        o = origins[:, axis].to(device).unsqueeze(1)
+        s = sizes[:, axis].to(device).unsqueeze(1)
+        a = 2.0 * s / (O * L)
+        b = 2.0 * o / L - 1.0
+        jj = j.unsqueeze(0).expand(B, O)
+        flip = flips[:, axis].to(device).view(B, 1)
+        jj = torch.where(flip, (O - 1) - jj, jj)
+        coords.append(a * (jj + 0.5) + b)
+    if spatial_dims == 3:
+        o0, o1, o2 = (int(out_size[0]), int(out_size[1]), int(out_size[2]))
+        gz = coords[0].view(B, o0, 1, 1).expand(B, o0, o1, o2)
+        gy = coords[1].view(B, 1, o1, 1).expand(B, o0, o1, o2)
+        gx = coords[2].view(B, 1, 1, o2).expand(B, o0, o1, o2)
+        return torch.stack([gx, gy, gz], dim=-1)       # (B,D,H,W,3)
+    o0, o1 = int(out_size[0]), int(out_size[1])
+    gy = coords[0].view(B, o0, 1).expand(B, o0, o1)
+    gx = coords[1].view(B, 1, o1).expand(B, o0, o1)
+    return torch.stack([gx, gy], dim=-1)               # (B,H,W,2)
 
 
 class MultiCropGenerator:
@@ -78,40 +123,53 @@ class MultiCropGenerator:
         self.intensity_shift = float(intensity_shift)
 
     # ------------------------------------------------------------------
-    def _crop_resize(self, sample: torch.Tensor, out_size: Tuple[int, ...],
-                     scale: Tuple[float, float]) -> torch.Tensor:
-        """单样本 (C, *spatial) → 随机框裁剪 → 重采样到 ``out_size`` → (C, *out_size)。"""
-        origins, sizes = _sample_box(sample.shape[1:], scale[0], scale[1])
-        sl = (slice(None),) + tuple(
-            slice(o, o + s) for o, s in zip(origins, sizes))
-        crop = sample[sl]                                   # (C, *box)
-        crop = F.interpolate(
-            crop.unsqueeze(0).float(), size=out_size,
-            mode=self.mode, align_corners=False).squeeze(0)
-        return crop.to(sample.dtype)
+    def _batched_crop_resize(self, x: torch.Tensor,
+                             out_size: Tuple[int, ...],
+                             scale: Tuple[float, float]) -> torch.Tensor:
+        """整批一次性「随机框裁剪 + 重采样 + 翻转」：(B,C,*spatial)→(B,C,*out_size)。
 
-    def _augment(self, crop: torch.Tensor) -> torch.Tensor:
-        """轻量增广：逐轴随机翻转 + 全局强度缩放/平移（不引入解剖以外先验）。"""
-        for axis in range(self.spatial_dims):
-            if random.random() < self.flip_prob:
-                crop = torch.flip(crop, dims=[axis + 1])    # +1：跳过通道维
+        逐样本采框/翻转（纯 RNG，开销可忽略），折叠进单次 ``grid_sample``，取代旧
+        实现的 B 次 ``F.interpolate``（大幅减少 kernel launch，GPU 上更快）。翻转直接
+        编码进采样网格，强度增广逐样本向量化。"""
+        B = x.shape[0]
+        dims = self.spatial_dims
+        spatial = [int(s) for s in x.shape[2:]]
+        origins = torch.empty(B, dims, dtype=torch.float32)
+        sizes = torch.empty(B, dims, dtype=torch.float32)
+        flips = torch.zeros(B, dims, dtype=torch.bool)
+        for b in range(B):
+            o, s = _sample_box(spatial, scale[0], scale[1])
+            origins[b] = torch.tensor(o, dtype=torch.float32)
+            sizes[b] = torch.tensor(s, dtype=torch.float32)
+            if self.flip_prob > 0:
+                for axis in range(dims):
+                    flips[b, axis] = random.random() < self.flip_prob
+        grid = _affine_grid(spatial, out_size, origins, sizes, flips, dims,
+                            x.device)
+        out = F.grid_sample(
+            x.float(), grid, mode="bilinear", align_corners=False,
+            padding_mode="border")
+        out = self._intensity_aug(out)
+        return out.to(x.dtype)
+
+    def _intensity_aug(self, out: torch.Tensor) -> torch.Tensor:
+        """逐样本全局强度缩放/平移（向量化）；out: (B,C,*spatial)。"""
+        B = out.shape[0]
+        shape = [B] + [1] * (self.spatial_dims + 1)
         if self.intensity_scale > 0:
-            s = 1.0 + random.uniform(-self.intensity_scale, self.intensity_scale)
-            crop = crop * s
+            s = 1.0 + (torch.rand(B, device=out.device) * 2 - 1) \
+                * self.intensity_scale
+            out = out * s.view(shape)
         if self.intensity_shift > 0:
-            crop = crop + random.uniform(-self.intensity_shift, self.intensity_shift)
-        return crop
+            sh = (torch.rand(B, device=out.device) * 2 - 1) \
+                * self.intensity_shift
+            out = out + sh.view(shape)
+        return out
 
     def _make_crops(self, x: torch.Tensor, n: int, out_size: Tuple[int, ...],
                     scale: Tuple[float, float]) -> List[torch.Tensor]:
-        B = x.shape[0]
-        crops: List[torch.Tensor] = []
-        for _ in range(n):
-            per_sample = [
-                self._augment(self._crop_resize(x[b], out_size, scale))
-                for b in range(B)]
-            crops.append(torch.stack(per_sample, dim=0))     # (B, C, *out_size)
-        return crops
+        return [self._batched_crop_resize(x, out_size, scale)
+                for _ in range(n)]
 
     @torch.no_grad()
     def __call__(self, x: torch.Tensor) -> Dict[str, List[torch.Tensor]]:

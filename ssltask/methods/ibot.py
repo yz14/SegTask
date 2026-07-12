@@ -41,10 +41,17 @@ class _IBOTModule(_DINOModule):
         if self.own_heads:                          # 独立 iBOT 头：教师侧冻结（靠 EMA 更新）
             for p in self.ibot_teacher_head.parameters():
                 p.requires_grad_(False)
+            self.ibot_teacher_head.eval()
         # mask-token：可广播到 (1, C, *1) 的可学习向量。
         self.mask_token = nn.Parameter(
             torch.zeros(1, int(in_channels), *([1] * int(spatial_dims))))
         self.register_buffer("ibot_center", torch.zeros(1, int(ibot_out_dim)))
+
+    def train(self, mode: bool = True):
+        super().train(mode)          # 已保持 teacher.eval()
+        if self.own_heads:
+            self.ibot_teacher_head.eval()
+        return self
 
 
 class IBOTMethod(DINOMethod):
@@ -57,6 +64,9 @@ class IBOTMethod(DINOMethod):
         self.ibot_mask_unit = int(ssl.ibot_mask_unit)
         self.ibot_level = int(ssl.ibot_feature_level)
         self.ibot_share_head = bool(ssl.ibot_share_head)
+        # 同 DINO center：iBOT center 更新延迟到优化步边界施加。
+        self._pending_ibot_center_sum: torch.Tensor | None = None
+        self._pending_ibot_center_n = 0
 
     # ---- modules ----------------------------------------------------------
     def build_modules(self) -> nn.Module:
@@ -94,9 +104,10 @@ class IBOTMethod(DINOMethod):
             in_ch, spatial, ibot_out, own_heads=own)
 
     # ---- iBOT masked dense loss ------------------------------------------
-    def _ibot_loss(self, image: torch.Tensor) -> torch.Tensor:
-        """遮学生 global 裁剪输入，对被遮位点做学生/教师密集特征的交叉熵（特征空间）。"""
-        global_crops: List[torch.Tensor] = self.multicrop(image)["global"]
+    def _ibot_loss(self, global_crops: List[torch.Tensor]) -> torch.Tensor:
+        """遮学生 global 裁剪输入，对被遮位点做学生/教师密集特征的交叉熵（特征空间）。
+
+        复用 DINO 主损失的 global 裁剪（同一批视图），不再额外多裁剪。"""
         teacher_temp = self._teacher_temp()
         center = self.module.ibot_center.float()
         terms: List[torch.Tensor] = []
@@ -123,30 +134,55 @@ class IBOTMethod(DINOMethod):
             terms.append((ce * fmask).sum() / fmask.sum().clamp_min(1.0))
             teacher_logits.append(t_logits.detach())
 
-        self._update_ibot_center(teacher_logits)
+        self._accumulate_ibot_center(teacher_logits)
         return torch.stack(terms).mean()
 
     @torch.no_grad()
-    def _update_ibot_center(self, teacher_logits: List[torch.Tensor]) -> None:
+    def _accumulate_ibot_center(self, teacher_logits: List[torch.Tensor]) -> None:
+        """累积本 micro-batch 全局教师均值；EMA 施加延迟到优化步边界。"""
         cat = torch.cat([t.reshape(-1, t.shape[-1]) for t in teacher_logits], dim=0)
         batch_center = _global_batch_mean(cat.mean(dim=0, keepdim=True))
+        if self._pending_ibot_center_sum is None:
+            self._pending_ibot_center_sum = batch_center.detach().clone()
+        else:
+            self._pending_ibot_center_sum += batch_center.detach()
+        self._pending_ibot_center_n += 1
+
+    @torch.no_grad()
+    def _apply_ibot_center_update(self) -> None:
+        if (self._pending_ibot_center_n == 0
+                or self._pending_ibot_center_sum is None):
+            return
+        batch_center = (self._pending_ibot_center_sum
+                        / float(self._pending_ibot_center_n))
         self.module.ibot_center.mul_(self.center_momentum).add_(
             batch_center.to(self.module.ibot_center.dtype),
             alpha=1.0 - self.center_momentum)
+
+    def _clear_pending_ibot_center(self) -> None:
+        self._pending_ibot_center_sum = None
+        self._pending_ibot_center_n = 0
 
     # ---- loss -------------------------------------------------------------
     def compute_loss(self, batch: Dict[str, torch.Tensor]
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
         dino_loss, logs = super().compute_loss(batch)
-        ibot = self._ibot_loss(batch["image"])
+        crops = self._cached_global_crops or []
+        self._cached_global_crops = None
+        ibot = self._ibot_loss(crops)
         loss = dino_loss + self.ibot_weight * ibot
         logs["ibot_loss"] = float(ibot.detach())
         logs["ibot_weight"] = self.ibot_weight
         return loss, logs
 
     # ---- EMA teacher update (encoder/global head via parent; iBOT head here) ---
-    def on_after_step(self, global_step: int) -> None:
-        super().on_after_step(global_step)            # EMA 教师 encoder + 全局头 + self._step
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
+        super().on_after_step(global_step, stepped)   # EMA 教师 encoder + 全局头 + self._step
+        if not stepped:                               # 跳步：丢弃待施加状态
+            self._clear_pending_ibot_center()
+            return
+        self._apply_ibot_center_update()
+        self._clear_pending_ibot_center()
         if self.module.own_heads:                     # 独立 iBOT 头需单独 EMA
             m = self._momentum()
             with torch.no_grad():
@@ -156,6 +192,14 @@ class IBOTMethod(DINOMethod):
                 for bs, bt in zip(self.module.ibot_student_head.buffers(),
                                   self.module.ibot_teacher_head.buffers()):
                     bt.copy_(bs)
+
+    # ---- last-layer freeze -------------------------------------------------
+    def on_before_optimizer_step(self) -> None:
+        """末层 freeze 同时覆盖独立 iBOT 密集头（共享头由 DINO 侧已覆盖）。"""
+        super().on_before_optimizer_step()
+        if self._step < self.freeze_last_layer_steps and self.module.own_heads:
+            for p in self.module.ibot_student_head.last_layer.parameters():
+                p.grad = None
 
 
 __all__ = ["IBOTMethod"]

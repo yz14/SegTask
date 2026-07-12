@@ -27,6 +27,11 @@ class PriorMethod(SSLMethod):
         self.spatial_dims = int(cfg.model.spatial_dims)
         self.corruptor = GenesisCorruptor(ssl, self.spatial_dims)
         self.recon_loss_fn = RECON_LOSS_FNS[ssl.recon_loss]
+        # 物理体素间距（可选）：给定时 prior_scales 按物理尺度(mm)解释，Frangi
+        # 各向异性计算；空=体素单位（旧行为）。
+        self.prior_spacing = (
+            [float(s) for s in ssl.prior_spacing] if ssl.prior_spacing
+            else None)
 
     def build_modules(self) -> nn.Module:
         return build_ssl_recon_model(self.cfg)
@@ -37,7 +42,7 @@ class PriorMethod(SSLMethod):
         target = frangi_vesselness(
             clean, scales=s.prior_scales, spatial_dims=self.spatial_dims,
             alpha=s.prior_alpha, beta=s.prior_beta,
-            black_vessels=s.prior_black_vessels)
+            black_vessels=s.prior_black_vessels, spacing=self.prior_spacing)
         model_input = self.corruptor(clean) if s.prior_corrupt_input else clean
         return model_input, target
 

@@ -39,6 +39,13 @@ class _BYOLModule(nn.Module):
         self.predictor = predictor
         for p in self.target.parameters():
             p.requires_grad_(False)
+        self.target.eval()
+
+    def train(self, mode: bool = True):
+        """冻结的 EMA 目标网络始终保持 eval 模式。"""
+        super().train(mode)
+        self.target.eval()
+        return self
 
 
 class BYOLMethod(SSLMethod):
@@ -141,8 +148,10 @@ class BYOLMethod(SSLMethod):
     def on_resume(self, global_step: int) -> None:
         self._step = int(global_step)
 
-    def on_after_step(self, global_step: int) -> None:
+    def on_after_step(self, global_step: int, stepped: bool = True) -> None:
         self._step = int(global_step)
+        if not stepped:                       # 跳步：不推进 EMA 目标网络
+            return
         m = self._momentum()
         with torch.no_grad():
             for ps, pt in zip(self.module.online.parameters(), self.module.target.parameters()):

@@ -14,7 +14,7 @@ invariance/variance/covariance 三项之上，增加**稠密局部项**：对两
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,8 +28,13 @@ from .base import SSLMethod
 
 
 def _variance_loss(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    """方差 hinge：鼓励每维标准差 >= 1（抗表示坍缩）。z: (N, D)。"""
-    std = torch.sqrt(z.var(dim=0) + eps)
+    """方差 hinge：鼓励每维标准差 >= 1（抗表示坍缩）。z: (N, D)。
+
+    总体方差（unbiased=False）：N=1 时无分母 0 的 NaN；但单样本的方差无
+    统计意义（恒为 0，hinge 会给出虚假的满额惩罚），直接返回 0。"""
+    if z.shape[0] < 2:
+        return z.new_zeros(())
+    std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)
     return torch.mean(F.relu(1.0 - std))
 
 
@@ -66,6 +71,8 @@ class VICRegLMethod(SSLMethod):
         self.cov_coeff = float(ssl.vicregl_cov_coeff)
         self.alpha = float(ssl.vicregl_alpha)          # 全局/局部加权（1=纯全局）
         self.num_matches = int(ssl.vicregl_num_matches)
+        self.feature_matches = int(ssl.vicregl_feature_matches)
+        self.match_radius = float(ssl.vicregl_match_radius)
         self.feature_level = int(ssl.vicregl_feature_level)
 
         patch = [int(s) for s in cfg.data.patch_size]
@@ -86,14 +93,38 @@ class VICRegLMethod(SSLMethod):
             dense_proj_dim=int(self.ssl.vicregl_dense_proj_dim),
             feature_level=int(self.ssl.vicregl_feature_level))
 
-    # ---- location-based dense matching -----------------------------------
+    # ---- dense matching ----------------------------------------------------
+    @staticmethod
+    def _dir_pairs(f_src: torch.Tensor, f_dst: torch.Tensor,
+                   dist: torch.Tensor, m: int,
+                   max_dist: Optional[torch.Tensor]
+                   ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """单向最近邻配对：src 位点 → dst 最近位点，保留最可靠 top-m 对。
+
+        ``max_dist`` 非 None 时丢弃超出半径的对（overlap-aware：两裁剪框不
+        重叠时不强造正样本）；无有效对时返回 None。
+        """
+        best, j = dist.min(dim=1)                       # (Ns,)
+        if max_dist is not None:
+            idx = (best <= max_dist).nonzero(as_tuple=False).squeeze(1)
+            if idx.numel() == 0:
+                return None
+        else:
+            idx = torch.arange(best.shape[0], device=best.device)
+        k = min(m, int(idx.numel()))
+        sel = idx[torch.topk(best[idx], k, largest=False).indices]
+        return f_src[sel], f_dst[j[sel]]
+
     def _matched_local(self, da: torch.Tensor, db: torch.Tensor,
                        ma: Dict[str, torch.Tensor], mb: Dict[str, torch.Tensor]
-                       ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """按原坐标最近邻，为每样本配 ``num_matches`` 对局部嵌入 (M,D)。
+                       ) -> Tuple[Optional[torch.Tensor],
+                                  Optional[torch.Tensor], int, int]:
+        """双向 location-based + 双向 feature-based 配对（VICRegL 语义）。
 
-        da/db: (B, D, *sp) 两视图稠密嵌入；ma/mb: 对应裁剪元数据。返回沿所有
-        样本堆叠的配对嵌入 ``(sum_b M_b, D)``，供稠密 VIC 项。
+        da/db: (B, D, *sp) 两视图稠密嵌入；ma/mb: 对应裁剪元数据。
+        位置配对只在两裁剪框重叠区内生效（距离 ≤ match_radius × 目标视图位点
+        间距）；特征配对无空间限制（匹配语义相似的远位点）。返回
+        ``(za, zb, n_loc, n_feat)``；整批无有效对时 za/zb 为 None。
         """
         B, D = da.shape[0], da.shape[1]
         ca = site_coords(da.shape[2:], ma)             # (B, Na, D_ax)
@@ -101,17 +132,42 @@ class VICRegLMethod(SSLMethod):
         fa = da.reshape(B, D, -1).transpose(1, 2)      # (B, Na, D)
         fb = db.reshape(B, D, -1).transpose(1, 2)
         na, nb = fa.shape[1], fb.shape[1]
-        m = min(self.num_matches, na, nb)
+        m_loc = min(self.num_matches, na, nb)
+        m_feat = min(self.feature_matches, na, nb)
+        # 目标视图位点间距（原体素）：裁剪框尺寸 / 特征图轴长，取轴向最大。
+        sp_a = torch.tensor([float(s) for s in da.shape[2:]],
+                            device=ma["size"].device)
+        sp_b = torch.tensor([float(s) for s in db.shape[2:]],
+                            device=mb["size"].device)
+        pitch_a = (ma["size"] / sp_a).max(dim=1).values          # (B,)
+        pitch_b = (mb["size"] / sp_b).max(dim=1).values
         out_a: List[torch.Tensor] = []
         out_b: List[torch.Tensor] = []
+        n_loc = n_feat = 0
         for b in range(B):
-            dist = torch.cdist(ca[b], cb[b])           # (Na, Nb)
-            j = dist.argmin(dim=1)                      # a→最近 b
-            best = dist.gather(1, j.unsqueeze(1)).squeeze(1)  # (Na,)
-            sel = torch.topk(best, m, largest=False).indices  # 最可靠 m 个 a
-            out_a.append(fa[b, sel])
-            out_b.append(fb[b, j[sel]])
-        return torch.cat(out_a, dim=0), torch.cat(out_b, dim=0)
+            dist = torch.cdist(ca[b], cb[b])           # (Na, Nb) 原体素距离
+            for f_s, f_d, d, pitch in (
+                    (fa[b], fb[b], dist, pitch_b[b]),
+                    (fb[b], fa[b], dist.T, pitch_a[b])):
+                max_d = (self.match_radius * pitch
+                         if self.match_radius > 0 else None)
+                pair = self._dir_pairs(f_s, f_d, d, m_loc, max_d)
+                if pair is not None:
+                    out_a.append(pair[0])
+                    out_b.append(pair[1])
+                    n_loc += pair[0].shape[0]
+            if m_feat > 0:
+                fdist = torch.cdist(fa[b], fb[b])      # 嵌入空间距离
+                for f_s, f_d, d in ((fa[b], fb[b], fdist),
+                                    (fb[b], fa[b], fdist.T)):
+                    pair = self._dir_pairs(f_s, f_d, d, m_feat, None)
+                    if pair is not None:
+                        out_a.append(pair[0])
+                        out_b.append(pair[1])
+                        n_feat += pair[0].shape[0]
+        if not out_a:
+            return None, None, 0, 0
+        return torch.cat(out_a, dim=0), torch.cat(out_b, dim=0), n_loc, n_feat
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -124,16 +180,21 @@ class VICRegLMethod(SSLMethod):
         global_loss = (self.sim_coeff * g_inv + self.var_coeff * g_var
                        + self.cov_coeff * g_cov)
 
-        la, lb = self._matched_local(d1.float(), d2.float(), m1, m2)
-        l_inv, l_var, l_cov = _vic_terms(la, lb)
-        local_loss = (self.sim_coeff * l_inv + self.var_coeff * l_var
-                      + self.cov_coeff * l_cov)
+        la, lb, n_loc, n_feat = self._matched_local(
+            d1.float(), d2.float(), m1, m2)
+        if la is None:                                  # 两视图无任何有效配对
+            local_loss = g1.new_zeros(())
+        else:
+            l_inv, l_var, l_cov = _vic_terms(la, lb)
+            local_loss = (self.sim_coeff * l_inv + self.var_coeff * l_var
+                          + self.cov_coeff * l_cov)
 
         loss = self.alpha * global_loss + (1.0 - self.alpha) * local_loss
         return loss, {
             "vicregl_loss": float(loss.detach()),
             "global_loss": float(global_loss.detach()),
             "local_loss": float(local_loss.detach()),
+            "n_loc_matches": float(n_loc), "n_feat_matches": float(n_feat),
             "inv": float(g_inv.detach()), "var": float(g_var.detach()),
             "cov": float(g_cov.detach())}
 

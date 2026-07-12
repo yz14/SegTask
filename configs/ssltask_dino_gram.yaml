@@ -132,7 +132,8 @@ ssl:
   # --- Gram anchoring（方案⑤专用）---
   dino_gram_weight       : 1.0          # Gram 损失权重 λ
   dino_gram_start_frac   : 0.3          # 进度 < 此比例时 λ=0（待密集特征成形）
-  dino_gram_refresh_steps: 1            # 每多少优化步从 EMA 教师刷新 Gram 教师快照
+  dino_gram_refresh_steps: 1000         # 快照刷新间隔（优化步，自锚定时刻起算；须远大于 1，
+                                        # 否则 Gram 教师≈当前教师，anchoring 退化为空操作）
   dino_gram_feature_level: -1           # Gram 取的 encoder 特征级（-1=瓶颈）
 
   # 在线分割线性探针（§0.5）：强烈建议开启以按 Dice 选 best。

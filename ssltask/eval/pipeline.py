@@ -15,7 +15,7 @@ import json
 import logging
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -26,6 +26,7 @@ from segtask_v1.trainer.checkpoint import extract_model_state_dict
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
 from .cls_probe import ClsProbe
 from .probe import SegProbe
+from .split import group_split
 
 logger = logging.getLogger(__name__)
 
@@ -83,18 +84,15 @@ def _resolve_state_dict(spec: EntrySpec) -> Optional[Dict[str, torch.Tensor]]:
     raise TypeError(f"Unsupported entry spec: {type(spec)!r}")
 
 
-def _split_holdout(paths: Sequence[str], seed: int, holdout_ratio: float) -> Tuple[List[str], List[str]]:
-    paths = list(paths)
+def _split_holdout(paths: Sequence[str], seed: int, holdout_ratio: float,
+                   group_regex: str = "",
+                   allow_single_group: bool = False) -> Tuple[List[str], List[str]]:
+    """组级（患者级）留出划分；同组文件不跨 train/holdout。"""
     if not paths:
         raise ValueError("No labelled npz found for offline evaluation.")
-    rng = random.Random(int(seed))
-    rng.shuffle(paths)
-    n_val = max(1, int(round(len(paths) * float(holdout_ratio))))
-    if len(paths) > 1:
-        n_val = min(n_val, len(paths) - 1)
-    val_paths = paths[:n_val]
-    train_paths = paths[n_val:] or list(paths)
-    return train_paths, val_paths
+    return group_split(paths, float(holdout_ratio), int(seed),
+                       group_regex=group_regex,
+                       allow_single_group=allow_single_group)
 
 
 def build_nested_shot_splits(train_pool: Sequence[str], shots: Sequence[int], seed: int) -> Dict[int, List[str]]:
@@ -110,7 +108,9 @@ def build_nested_shot_splits(train_pool: Sequence[str], shots: Sequence[int], se
 
 def _build_loader(cfg, ssl, paths: Sequence[str], task: str, batch_size: int,
                   samples_per_volume: Optional[int] = None,
-                  shuffle: bool = False) -> DataLoader:
+                  shuffle: bool = False,
+                  deterministic: bool = False,
+                  fg_aware: bool = False) -> DataLoader:
     dc = cfg.data
     if samples_per_volume is None:
         samples_per_volume = int(ssl.probe_samples_per_volume)
@@ -127,6 +127,9 @@ def _build_loader(cfg, ssl, paths: Sequence[str], task: str, batch_size: int,
         cls_label_key=str(ssl.cls_label_key) if task == "cls" else "",
         cache_enabled=dc.cache_mode == "memory",
         cache_max_volumes=dc.cache_max_volumes,
+        deterministic=deterministic,
+        fg_aware=fg_aware,
+        seed=int(ssl.eval_seed),
     )
     return DataLoader(ds, batch_size=max(int(batch_size), 1), shuffle=bool(shuffle),
                       num_workers=0, drop_last=False)
@@ -152,7 +155,10 @@ def run_eval_pipeline(cfg, ssl, entries: Optional[Sequence[EntrySpec]] = None,
     probe_ssl = copy.copy(ssl)
     probe_ssl.probe_data_dir = data_dir
     paths = discover_image_npz(data_dir, cfg.data.npz_suffix)
-    train_pool, val_pool = _split_holdout(paths, int(ssl.eval_seed), float(ssl.eval_holdout_ratio))
+    train_pool, val_pool = _split_holdout(
+        paths, int(ssl.eval_seed), float(ssl.eval_holdout_ratio),
+        group_regex=str(ssl.eval_group_regex),
+        allow_single_group=bool(ssl.eval_allow_single_group))
 
     shot_list = sorted({max(int(s), 1) for s in (shots or ssl.eval_shots)})
     readout_list = [str(r) for r in (readouts or ssl.eval_readouts)]
@@ -188,7 +194,9 @@ def run_eval_pipeline(cfg, ssl, entries: Optional[Sequence[EntrySpec]] = None,
                                                         shuffle=True)
                     probe.val_loader = _build_loader(cfg, probe_ssl, val_pool, task, cfg.data.batch_size,
                                                      samples_per_volume=max(int(probe_ssl.probe_samples_per_volume) // 2, 1),
-                                                     shuffle=False)
+                                                     shuffle=False,
+                                                     deterministic=True,
+                                                     fg_aware=(task == "seg"))
                     metrics = probe.evaluate(full_sd)
                     metrics = {k: float(v) for k, v in metrics.items()}
                     nested[entry_name][task][readout][int(shot)] = metrics

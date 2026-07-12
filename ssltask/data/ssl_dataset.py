@@ -15,7 +15,7 @@ import glob
 import logging
 import os
 import random
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -48,13 +48,51 @@ def discover_image_npz(npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
     return paths
 
 
-def _rand_center(dim: int, p: int) -> int:
+def read_npz_spacing(path: str) -> Optional[Tuple[float, float, float]]:
+    """从 npz meta 读有效体素间距 (sz, sy, sx) mm（numpy 轴序 (D,H,W)）。
+
+    make_data 写入的 meta 含 ``orig_spacing``，若 ``spacing_normalized`` 则实际
+    体素间距为 ``target_spacing``。无 meta / 字段缺失 / 非法值返 None（调用方
+    退化为体素单位）。"""
+    try:
+        with _open_npz(path) as f:
+            if "meta" not in f.files:
+                return None
+            meta = f["meta"].item()
+    except Exception:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    sp = (meta.get("target_spacing") if meta.get("spacing_normalized")
+          else meta.get("orig_spacing"))
+    if sp is None:
+        return None
+    try:
+        vals = [float(s) for s in sp]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != 3 or any((not np.isfinite(v)) or v <= 0.0 for v in vals):
+        return None
+    return (vals[0], vals[1], vals[2])
+
+
+def _rand_center(dim: int, p: int,
+                 rng: Optional[random.Random] = None) -> int:
     """在 [0, dim) 取一个 center，使大小 p 的 patch 尽量落在体内（dim<=p 时取中点）。"""
     half = p // 2
     if dim <= p:
         return dim // 2
-    lo = random.randint(0, dim - p)   # patch 起点 ∈ [0, dim-p]，保证不越界
+    r = rng if rng is not None else random
+    lo = r.randint(0, dim - p)   # patch 起点 ∈ [0, dim-p]，保证不越界
     return lo + half
+
+
+def _clamp_center(c: int, dim: int, p: int) -> int:
+    """把任意体素坐标 clamp 成合法 patch center（patch 尽量落在体内）。"""
+    half = p // 2
+    if dim <= p:
+        return dim // 2
+    return min(max(int(c), half), dim - p + half)
 
 
 class ImageOnlyPatchDataset(Dataset):
@@ -175,7 +213,10 @@ class LabeledPatchDataset(Dataset):
         spatial_dims      : int = 3,
         cls_label_key     : str = "",
         cache_enabled     : bool = False,
-        cache_max_volumes : int = 0):
+        cache_max_volumes : int = 0,
+        deterministic     : bool = False,
+        fg_aware          : bool = False,
+        seed              : int = 0):
         self.paths = list(npz_paths)
         if not self.paths:
             raise ValueError("LabeledPatchDataset got empty npz_paths.")
@@ -197,9 +238,19 @@ class LabeledPatchDataset(Dataset):
         self.global_std = float(global_std)
         self.spv = max(int(samples_per_volume), 1)
         self.cls_label_key = str(cls_label_key)
+        # deterministic：逐 idx 固定 RNG（跨 epoch/跨进程可重现，供验证集）；
+        # fg_aware：优先以 npz 预烘 fg_coords 中的前景体素为 patch 中心（clamp
+        # 到体内），避免随机 patch 大量空前景导致评测噪声；无 fg_coords/空前景
+        # 退化为均匀随机中心。
+        self.deterministic = bool(deterministic)
+        self.fg_aware = bool(fg_aware)
+        self.seed = int(seed)
+        self._fg_cache: Dict[str, Optional[np.ndarray]] = {}
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._cls_cache: Dict[str, Optional[np.ndarray]] = {}
+        # 逐卷体素间距 (sz,sy,sx) mm，供探针算 spacing-aware HD95；无 meta 退 1mm。
+        self._spacing_cache: Dict[str, Tuple[float, float, float]] = {}
         logger.info(
             "LabeledPatchDataset (probe): %d volumes x %d samples = %d, patch=%s, "
             "spatial_dims=%d (%s)",
@@ -241,13 +292,41 @@ class LabeledPatchDataset(Dataset):
             self._cls_cache[path] = cls_label
         return img, lbl, cls_label
 
+    def _load_fg_coords(self, path: str) -> Optional[np.ndarray]:
+        if path in self._fg_cache:
+            return self._fg_cache[path]
+        coords: Optional[np.ndarray] = None
+        try:
+            with _open_npz(path) as f:
+                if "fg_coords" in f.files:
+                    arr = np.asarray(f["fg_coords"])
+                    if arr.ndim == 2 and arr.shape[1] == 3 and arr.shape[0] > 0:
+                        coords = arr.astype(np.int64, copy=False)
+        except Exception:
+            coords = None
+        self._fg_cache[path] = coords
+        return coords
+
+    def _pick_center(self, idx: int, path: str, shape) -> tuple:
+        rng = (random.Random((self.seed * 1000003 + idx) * 2654435761 % (2**63))
+               if self.deterministic else None)
+        if self.fg_aware:
+            coords = self._load_fg_coords(path)
+            if coords is not None:
+                r = rng if rng is not None else random
+                c = coords[r.randrange(len(coords))]
+                return tuple(_clamp_center(int(ci), d, p)
+                             for ci, d, p in zip(c, shape, self.patch))
+        return tuple(_rand_center(d, p, rng)
+                     for d, p in zip(shape, self.patch))
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path = self.paths[idx % len(self.paths)]
         img, lbl, cls_label = self._load(path)            # (D,H,W) fp32 / raw
         if img.ndim != 3:
             raise ValueError(
                 f"probe expects 3D volume (D,H,W); got {img.shape} in {path!r}.")
-        center = tuple(_rand_center(d, p) for d, p in zip(img.shape, self.patch))
+        center = self._pick_center(idx, path, img.shape)
         img_patch = _extract_cubic_patch(img, center, self.patch)  # (pD,pH,pW)
         lbl_patch = _extract_cubic_patch(lbl, center, self.patch)  # (pD,pH,pW)
         img_t = torch.from_numpy(img_patch.astype(np.float32, copy=False))
@@ -255,8 +334,13 @@ class LabeledPatchDataset(Dataset):
         if not self.fold_2_5d:
             img_t = img_t.unsqueeze(0)                             # (1,pD,pH,pW)
             lbl_t = lbl_t.unsqueeze(0)
+        spacing = self._spacing_cache.get(path)
+        if spacing is None:
+            spacing = read_npz_spacing(path) or (1.0, 1.0, 1.0)
+            self._spacing_cache[path] = spacing
         # 2.5D：(pD,pH,pW) = (C=D, H, W)，深度折进通道。
-        out = {"image": img_t, "label": lbl_t}
+        out = {"image": img_t, "label": lbl_t,
+               "spacing": torch.tensor(spacing, dtype=torch.float64)}
         if cls_label is not None:
             out["cls_label"] = torch.from_numpy(np.asarray(cls_label))
         return out
@@ -320,5 +404,5 @@ def build_ssl_dataloader(cfg) -> DataLoader:
 
 __all__ = [
     "ImageOnlyPatchDataset", "LabeledPatchDataset",
-    "build_ssl_dataloader", "discover_image_npz",
+    "build_ssl_dataloader", "discover_image_npz", "read_npz_spacing",
 ]

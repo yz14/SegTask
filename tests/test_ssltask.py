@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -557,7 +558,8 @@ def test_labeled_dataset_yields_image_and_label(tmp_path):
         intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
         samples_per_volume=2)
     sample = ds[0]
-    assert set(sample.keys()) == {"image", "label"}
+    assert set(sample.keys()) == {"image", "label", "spacing"}
+    assert sample["spacing"].shape == (3,)
     assert sample["image"].shape == (1, 16, 32, 32)
     assert sample["label"].shape == (1, 16, 32, 32)
     assert torch.isfinite(sample["image"]).all()
@@ -595,7 +597,7 @@ def test_seg_probe_evaluate_returns_dice(tmp_path):
     # feed a freshly-built SSL recon model's weights (encoder.* loadable strict)
     sd = build_ssl_recon_model(cfg).state_dict()
     out = probe.evaluate(sd)
-    assert set(out) == {"probe_dice", "probe_hd95"}
+    assert set(out) == {"probe_dice", "probe_hd95", "probe_hd95_empty_frac", "probe_fg_recall"}
     assert 0.0 <= out["probe_dice"] <= 1.0
     assert out["probe_hd95"] >= 0.0
 
@@ -616,7 +618,7 @@ def test_seg_probe_evaluate_returns_dice_2_5d(tmp_path):
     assert probe.head_out == cfg.num_fg_classes * cfg.data.patch_size[0]
     sd = build_ssl_recon_model(cfg).state_dict()
     out = probe.evaluate(sd)
-    assert set(out) == {"probe_dice", "probe_hd95"}
+    assert set(out) == {"probe_dice", "probe_hd95", "probe_hd95_empty_frac", "probe_fg_recall"}
     assert 0.0 <= out["probe_dice"] <= 1.0
     assert out["probe_hd95"] >= 0.0
 
@@ -653,7 +655,7 @@ def test_seg_probe_frozen_and_finetune_gradients(tmp_path):
 
 
 def test_seg_probe_rejects_state_dict_without_encoder(tmp_path):
-    _write_labeled_npz(tmp_path, 1, (20, 40, 40))
+    _write_labeled_npz(tmp_path, 2, (20, 40, 40))
     cfg = _cfg("cubic")
     ssl = SSLConfig(method="genesis")
     ssl.probe_enabled = True
@@ -848,7 +850,7 @@ def test_offline_eval_pipeline_smoke(tmp_path):
             assert row["auc"] is not None and 0.0 <= row["auc"] <= 1.0
             assert row["f1"] is not None and 0.0 <= row["f1"] <= 1.0
     seg_metrics = res["nested"]["pretrained"]["seg"]["linear"][1]
-    assert set(seg_metrics) == {"probe_dice", "probe_hd95"}
+    assert set(seg_metrics) == {"probe_dice", "probe_hd95", "probe_hd95_empty_frac", "probe_fg_recall"}
     cls_metrics = res["nested"]["pretrained"]["cls"]["linear"][1]
     assert set(cls_metrics) == {"cls_auc", "cls_f1"}
 
@@ -1318,6 +1320,9 @@ def test_moco_queue_updates_and_wraps():
     assert int(m.module.queue_ptr.item()) == 0
 
     _, _ = m.compute_loss(batch)
+    # 入队延迟到优化步边界：compute_loss 只缓存 key，队列不动。
+    assert int(m.module.queue_ptr.item()) == 0
+    m.on_after_step(1)
     assert int(m.module.queue_ptr.item()) == 4
     q = m.module.queue
     assert q.shape == (ssl.moco_proj_dim, ssl.moco_queue_size)
@@ -1325,6 +1330,7 @@ def test_moco_queue_updates_and_wraps():
     assert torch.isfinite(norms).all()
     assert torch.all(norms > 0)
     _, _ = m.compute_loss(batch)
+    m.on_after_step(2)
     assert int(m.module.queue_ptr.item()) == 2
 
 
@@ -1752,7 +1758,9 @@ def test_jepa_vicreg_terms_only_when_enabled():
     cfg = _cfg("cubic")
     batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
 
-    off = build_method(cfg, _jepa_ssl(), torch.device("cpu"))
+    off = build_method(
+        cfg, _jepa_ssl(jepa_var_weight=0.0, jepa_cov_weight=0.0),
+        torch.device("cpu"))
     off.configure_schedule(10); off.train(); off._step = 1
     _, logs_off = off.compute_loss(batch)
     assert "vicreg_var" not in logs_off and "vicreg_cov" not in logs_off
@@ -1939,17 +1947,17 @@ def test_dino_gram_off_before_start_frac():
 
 
 def test_dino_gram_on_after_start_frac_and_backward():
-    """progress >= start_frac => gram active; once student diverges from the
-    gram-teacher snapshot the term is > 0; grads reach only the student."""
+    """progress >= start_frac => gram active; 首次生效时从当前 EMA 教师锚定快照；
+    学生与锚定快照发散后 Gram 项 > 0；梯度只到学生。"""
     cfg = _cfg("cubic")
     ssl = _dino_gram_ssl(dino_gram_start_frac=0.3, dino_gram_weight=2.0)
     validate_ssl(ssl, cfg)
     m = build_method(cfg, ssl, torch.device("cpu"))
     m.configure_schedule(10)
     m.train()
-    # perturb the (frozen) gram-teacher so student != snapshot => non-zero Gram.
+    # 锚定源是 EMA 教师：扰动教师使学生 != 快照 => Gram 项非零。
     with torch.no_grad():
-        for p in m.module.gram_teacher.parameters():
+        for p in m.module.teacher.parameters():
             p.add_(0.5)
     m._step = 5                                     # progress 0.5 >= 0.3
     batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
@@ -2014,14 +2022,14 @@ def test_dino_gram_sq_dist_identity_path_backward():
     assert s.grad is not None and torch.isfinite(s.grad).all()
 
 
-# ---- periodic gram-teacher refresh ----------------------------------------
-def test_dino_gram_teacher_refresh_on_interval():
+# ---- staged anchoring + periodic gram-teacher refresh ----------------------
+def test_dino_gram_no_refresh_before_activation():
+    """λ=0 阶段（进度 < start_frac）任何优化步都不刷新 Gram 教师。"""
     cfg = _cfg("cubic")
-    ssl = _dino_gram_ssl(dino_gram_refresh_steps=2)
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.9, dino_gram_refresh_steps=1)
     validate_ssl(ssl, cfg)
     m = build_method(cfg, ssl, torch.device("cpu"))
     m.configure_schedule(10)
-    # student != teacher so the EMA update actually moves the teacher.
     with torch.no_grad():
         for p in m.module.student.parameters():
             p.fill_(1.0)
@@ -2029,15 +2037,61 @@ def test_dino_gram_teacher_refresh_on_interval():
             p.zero_()
         for p in m.module.gram_teacher.parameters():
             p.zero_()
+    for s in (1, 2, 3):
+        m.on_after_step(s)                          # 教师 EMA 在动，Gram 教师不动
+    assert m._gram_anchor_step == -1
+    assert all(float(g.abs().max()) == 0.0
+               for g in m.module.gram_teacher.parameters())
 
-    m.on_after_step(1)                              # 1 % 2 != 0 -> no refresh
+
+def test_dino_gram_anchor_then_refresh_on_interval():
+    """λ 首次生效时锚定快照；之后以锚定时刻为原点按间隔刷新。"""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0, dino_gram_refresh_steps=2)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    with torch.no_grad():
+        for p in m.module.student.parameters():
+            p.fill_(1.0)
+        for p in m.module.teacher.parameters():
+            p.zero_()
+        for p in m.module.gram_teacher.parameters():
+            p.fill_(-1.0)
+
+    # λ>0 的首次 compute_loss 锚定：Gram 教师 <- 当前教师。
+    m.train()
+    m.compute_loss({"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)})
+    assert m._gram_anchor_step == 0
+    assert all(torch.allclose(g, t) for g, t in zip(
+        m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
+
+    m.on_after_step(1)                              # 锚后 1 步：不到间隔，不刷新
     moved = any(not torch.allclose(g, t) for g, t in zip(
         m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
     assert moved, "teacher EMA moved but gram-teacher refreshed off-interval"
 
-    m.on_after_step(2)                              # 2 % 2 == 0 -> refresh
+    m.on_after_step(2)                              # 锚后 2 步 = 间隔 -> 刷新
     assert all(torch.allclose(g, t) for g, t in zip(
         m.module.gram_teacher.parameters(), m.module.teacher.parameters()))
+
+
+def test_dino_gram_skipped_step_no_refresh():
+    """stepped=False 的边界即使命中刷新间隔也不刷新 Gram 教师。"""
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0, dino_gram_refresh_steps=1)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m._gram_anchor_step = 0                         # 已锚定
+    with torch.no_grad():
+        for p in m.module.teacher.parameters():
+            p.fill_(1.0)
+        for p in m.module.gram_teacher.parameters():
+            p.zero_()
+    m.on_after_step(1, stepped=False)
+    assert all(float(g.abs().max()) == 0.0
+               for g in m.module.gram_teacher.parameters())
 
 
 # ---- SSL -> downstream handoff (encoder.* only, same as DINO) --------------
@@ -2548,6 +2602,97 @@ def test_vicregl_alpha_one_is_pure_global():
     assert abs(float(loss.detach()) - logs["global_loss"]) < 1e-5
 
 
+# ---- S5: variance 保护 / overlap-aware 双向 + 特征匹配 -----------------------
+def test_vicregl_variance_loss_population_and_n1_guard():
+    from ssltask.methods.vicregl import _variance_loss
+    z1 = torch.rand(1, 8)
+    assert float(_variance_loss(z1)) == 0.0          # N=1：无意义，返回 0 非 NaN
+    z = torch.randn(64, 8) * 2.0
+    v = _variance_loss(z)
+    assert torch.isfinite(v)
+    # 总体方差口径：std 明显 > 1 时 hinge≈0。
+    assert float(v) < 1e-3
+
+
+def test_vicregl_batch1_loss_finite():
+    cfg = _cfg()
+    ssl = _vicregl_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    x = torch.rand(1, cfg.model.in_channels, 16, 32, 32)
+    loss, _ = m.compute_loss({"image": x})
+    assert torch.isfinite(loss)
+    loss.backward()
+
+
+def test_vicregl_match_radius_rejects_disjoint_boxes():
+    """两裁剪框完全不重叠时，位置匹配不强造正样本（返回 0 个位置对）。"""
+    cfg = _cfg()
+    ssl = _vicregl_ssl(vicregl_feature_matches=0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    da = torch.rand(1, 16, 2, 4, 4)
+    db = torch.rand(1, 16, 2, 4, 4)
+    ma = {"origin": torch.zeros(1, 3), "size": torch.tensor([[4., 8., 8.]]),
+          "flip": torch.zeros(1, 3, dtype=torch.bool)}
+    mb = {"origin": torch.tensor([[12., 24., 24.]]),
+          "size": torch.tensor([[4., 8., 8.]]),
+          "flip": torch.zeros(1, 3, dtype=torch.bool)}
+    la, lb, n_loc, n_feat = m._matched_local(da, db, ma, mb)
+    assert la is None and lb is None and n_loc == 0 and n_feat == 0
+    # 关闭半径过滤则退回旧行为（强配对）。
+    m.match_radius = 0.0
+    la, lb, n_loc, _ = m._matched_local(da, db, ma, mb)
+    assert la is not None and n_loc > 0
+
+
+def test_vicregl_matching_bidirectional_and_feature_pairs():
+    cfg = _cfg()
+    ssl = _vicregl_ssl(vicregl_num_matches=4, vicregl_feature_matches=4)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    da = torch.rand(2, 16, 2, 4, 4)
+    db = torch.rand(2, 16, 2, 4, 4)
+    meta = {"origin": torch.zeros(2, 3), "size": torch.tensor([[16., 32., 32.]] * 2),
+            "flip": torch.zeros(2, 3, dtype=torch.bool)}
+    la, lb, n_loc, n_feat = m._matched_local(da, db, meta, meta)
+    # 双向位置匹配：每样本每方向 4 对 → 2 样本 × 2 方向 × 4 = 16。
+    assert n_loc == 16
+    # 特征匹配同样双向。
+    assert n_feat == 16
+    assert la.shape == lb.shape == (n_loc + n_feat, 16)
+    # 同框同 flip：位置对应位点应完全一致（前 n_loc 对来自位置匹配）。
+    # （位置匹配下 a 位点的最近 b 位点是同 index → 特征来自相同网格位置。）
+
+
+def test_vicregl_disjoint_views_zero_local_loss():
+    cfg = _cfg()
+    ssl = _vicregl_ssl(vicregl_feature_matches=0, vicregl_alpha=0.5)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+
+    class _DisjointPaired:
+        def __call__(self, x):
+            v = x[..., :8, :16, :16]
+            v1 = torch.nn.functional.interpolate(
+                v, size=(16, 32, 32), mode="trilinear", align_corners=False)
+            B = x.shape[0]
+            m1 = {"origin": torch.zeros(B, 3),
+                  "size": torch.tensor([[8., 16., 16.]] * B),
+                  "flip": torch.zeros(B, 3, dtype=torch.bool)}
+            m2 = {"origin": torch.tensor([[8., 16., 16.]] * B),
+                  "size": torch.tensor([[8., 16., 16.]] * B),
+                  "flip": torch.zeros(B, 3, dtype=torch.bool)}
+            return [v1, v1.clone()], [m1, m2]
+
+    m.paired = _DisjointPaired()
+    x = torch.rand(2, cfg.model.in_channels, 16, 32, 32)
+    loss, logs = m.compute_loss({"image": x})
+    assert torch.isfinite(loss)
+    assert logs["local_loss"] == 0.0
+    assert logs["n_loc_matches"] == 0.0
+
+
 # ---- handoff: encoder-only warm-start ---------------------------------------
 def test_vicregl_handoff_encoder_only():
     cfg = _cfg()
@@ -2626,6 +2771,207 @@ def test_seg_probe_unet_head_evaluate(tmp_path):
     assert isinstance(probe._build_head(), _UNetProbeHead)
     sd = build_ssl_recon_model(cfg).state_dict()
     out = probe.evaluate(sd)
-    assert set(out) == {"probe_dice", "probe_hd95"}
+    assert set(out) == {"probe_dice", "probe_hd95", "probe_hd95_empty_frac", "probe_fg_recall"}
     assert 0.0 <= out["probe_dice"] <= 1.0
     assert out["probe_hd95"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# S7 — teacher/target eval mode + DINO last-layer freeze + JEPA anti-collapse
+# ---------------------------------------------------------------------------
+def _frozen_branches(method_name, m):
+    """返回 (冻结分支列表, 学生/在线分支)。"""
+    mod = m.module
+    if method_name in ("dino", "dino_gram", "ibot", "sparkdino"):
+        frozen = [mod.teacher]
+        if method_name == "dino_gram":
+            frozen.append(mod.gram_teacher)
+        if method_name == "ibot" and getattr(mod, "own_heads", False):
+            frozen.append(mod.ibot_teacher_head)
+        return frozen, mod.student
+    if method_name == "byol":
+        return [mod.target], mod.online
+    if method_name == "moco":
+        return [mod.key], mod.query
+    if method_name == "jepa":
+        return [mod.target_encoder], mod.context_encoder
+    raise AssertionError(method_name)
+
+
+@pytest.mark.parametrize("method_name", [
+    "dino", "dino_gram", "ibot", "byol", "moco", "jepa"])
+def test_frozen_branch_stays_eval_after_train(method_name):
+    """m.train() 后学生/在线分支 training=True，冻结 EMA 分支保持 eval。"""
+    cfg = _cfg("cubic")
+    if method_name == "dino":
+        ssl = _dino_ssl()
+    elif method_name == "dino_gram":
+        ssl = _dino_gram_ssl()
+    elif method_name == "jepa":
+        ssl = _jepa_ssl()
+    else:
+        ssl = SSLConfig(method=method_name)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.train()
+    frozen, student = _frozen_branches(method_name, m)
+    assert student.training is True
+    for br in frozen:
+        assert br.training is False
+        assert all(not sm.training for sm in br.modules())
+    # 再次切换 train/eval 也保持不变式。
+    m.module.eval()
+    m.module.train()
+    for br in frozen:
+        assert br.training is False
+
+
+def test_dino_last_layer_freeze_zeroes_grad_then_releases():
+    """前 freeze_frac·total_steps 步取消学生投影头末层梯度，之后放行。"""
+    cfg = _cfg("cubic")
+    ssl = _dino_ssl(dino_freeze_last_layer_frac=0.5)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    assert m.freeze_last_layer_steps == 5
+    m.train()
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, _ = m.compute_loss(batch)
+    loss.backward()
+    last = list(m.module.student.head.last_layer.parameters())
+    assert any(p.grad is not None for p in last)
+    m._step = 0
+    m.on_before_optimizer_step()                  # 冻结期：末层梯度被取消
+    assert all(p.grad is None for p in last)
+    assert any(p.grad is not None
+               for p in m.module.student.encoder.parameters())
+    m.module.student.zero_grad(set_to_none=True)
+    loss, _ = m.compute_loss(batch)
+    loss.backward()
+    m._step = 5
+    m.on_before_optimizer_step()                  # 冻结期结束：放行
+    assert any(p.grad is not None for p in last)
+
+
+def test_dino_freeze_disabled_by_zero_frac():
+    cfg = _cfg("cubic")
+    ssl = _dino_ssl(dino_freeze_last_layer_frac=0.0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(100)
+    assert m.freeze_last_layer_steps == 0
+    m.train()
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, _ = m.compute_loss(batch)
+    loss.backward()
+    m._step = 0
+    m.on_before_optimizer_step()
+    assert any(p.grad is not None
+               for p in m.module.student.head.last_layer.parameters())
+
+
+def test_ssl_validate_rejects_bad_freeze_frac():
+    ssl = _dino_ssl(dino_freeze_last_layer_frac=1.5)
+    with pytest.raises(ConfigError):
+        validate_ssl(ssl, _cfg())
+
+
+def test_ibot_own_head_last_layer_freeze():
+    """独立 iBOT 密集头的末层在冻结期同样被取消梯度。"""
+    cfg = _cfg("cubic")
+    ssl = SSLConfig(method="ibot")
+    ssl.dino_out_dim = 128
+    ssl.dino_hidden_dim = 64
+    ssl.dino_bottleneck_dim = 32
+    ssl.dino_local_crops = 2
+    ssl.ibot_share_head = False
+    ssl.dino_freeze_last_layer_frac = 0.5
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, _ = m.compute_loss(batch)
+    loss.backward()
+    dense_last = list(m.module.ibot_student_head.last_layer.parameters())
+    glob_last = list(m.module.student.head.last_layer.parameters())
+    assert any(p.grad is not None for p in dense_last)
+    m._step = 0
+    m.on_before_optimizer_step()
+    assert all(p.grad is None for p in dense_last)
+    assert all(p.grad is None for p in glob_last)
+
+
+def test_jepa_vicreg_default_on_and_finite():
+    """JEPA 默认开启 VICReg 抗坍缩正则，loss/日志有限。"""
+    cfg = _cfg("cubic")
+    ssl = _jepa_ssl()
+    assert float(ssl.jepa_var_weight) > 0.0
+    assert float(ssl.jepa_cov_weight) > 0.0
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert torch.isfinite(loss)
+    assert "vicreg_var" in logs and "vicreg_cov" in logs
+    assert math.isfinite(logs["vicreg_var"]) and math.isfinite(logs["vicreg_cov"])
+
+
+def test_jepa_vicreg_population_variance_batch_stability():
+    """_vicreg 使用总体方差：极小样本数(M=2)下仍有限、不产生 NaN。"""
+    cfg = _cfg("cubic")
+    ssl = _jepa_ssl()
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    feat = torch.randn(1, 4, 2, 1, 1)
+    mask = torch.zeros(1, 1, 2, 1, 1)
+    mask[0, 0, :, 0, 0] = 1.0                     # 恰好 2 个被遮位点
+    var_loss, cov_loss = m._vicreg(feat, mask)
+    assert torch.isfinite(var_loss) and torch.isfinite(cov_loss)
+
+
+# ---------------------------------------------------------------------------
+# S8 — 密集分支复用 DINO 主损失的 global 裁剪（不再重复 multicrop）
+# ---------------------------------------------------------------------------
+class _CountingMulticrop:
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+        self.last = None
+
+    def __call__(self, x):
+        self.calls += 1
+        self.last = self.inner(x)
+        return self.last
+
+
+def test_ibot_reuses_dino_global_crops():
+    """iBOT 分支复用 DINO 的 global 裁剪：每 compute_loss 仅 1 次 multicrop。"""
+    cfg = _cfg("cubic")
+    ssl = _ibot_ssl()
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m.multicrop = _CountingMulticrop(m.multicrop)
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert m.multicrop.calls == 1
+    assert torch.isfinite(loss) and "ibot_loss" in logs
+    assert m._cached_global_crops is None         # 缓存被消费后清空
+
+
+def test_dino_gram_reuses_dino_global_crops():
+    cfg = _cfg("cubic")
+    ssl = _dino_gram_ssl(dino_gram_start_frac=0.0)
+    validate_ssl(ssl, cfg)
+    m = build_method(cfg, ssl, torch.device("cpu"))
+    m.configure_schedule(10)
+    m.train()
+    m.multicrop = _CountingMulticrop(m.multicrop)
+    batch = {"image": torch.rand(2, cfg.model.in_channels, 16, 32, 32)}
+    loss, logs = m.compute_loss(batch)
+    assert m.multicrop.calls == 1
+    assert torch.isfinite(loss) and logs["gram_weight"] > 0.0
+    assert m._cached_global_crops is None

@@ -12,7 +12,7 @@ encoder/decoder，直击分割的 precision 短板（学会只在管状证据处
 
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -26,15 +26,16 @@ def _gaussian_kernel1d(sigma: float, dtype, device) -> Tuple[torch.Tensor, int]:
     return k, ks // 2
 
 
-def _separable_gaussian(x: torch.Tensor, sigma: float, spatial_dims: int
-                        ) -> torch.Tensor:
-    """可分离高斯平滑（depthwise，逐 spatial 轴 1D 卷积）。x: (B,C,*spatial)。"""
+def _separable_gaussian(x: torch.Tensor, sigma_vox: Sequence[float],
+                        spatial_dims: int) -> torch.Tensor:
+    """可分离高斯平滑（depthwise，逐 spatial 轴 1D 卷积）。x: (B,C,*spatial)。
+    ``sigma_vox`` 为逐轴体素单位 sigma（各向异性 spacing 下逐轴不同）。"""
     B, C = x.shape[:2]
     spatial = x.shape[2:]
-    k, pad = _gaussian_kernel1d(sigma, x.dtype, x.device)
     conv = F.conv3d if spatial_dims == 3 else F.conv2d
     xr = x.reshape(B * C, 1, *spatial)
     for axis in range(spatial_dims):
+        k, pad = _gaussian_kernel1d(float(sigma_vox[axis]), x.dtype, x.device)
         kshape = [1, 1] + [1] * spatial_dims
         kshape[2 + axis] = k.numel()
         ker = k.reshape(kshape)
@@ -47,14 +48,17 @@ def _separable_gaussian(x: torch.Tensor, sigma: float, spatial_dims: int
     return xr.reshape(B, C, *spatial)
 
 
-def _hessian_components(x: torch.Tensor, spatial_dims: int
+def _hessian_components(x: torch.Tensor, spatial_dims: int,
+                        spacing: Sequence[float]
                         ) -> Dict[Tuple[int, int], torch.Tensor]:
-    """二阶偏导（中心差分），返回上三角 Hessian 分量 {(i,j): tensor}。"""
+    """二阶偏导（中心差分），返回上三角 Hessian 分量 {(i,j): tensor}。
+    ``spacing`` 为逐轴物理体素间距，使差分以物理尺度计算（各向异性正确）。"""
     dims = tuple(range(2, 2 + spatial_dims))
-    first = torch.gradient(x, dim=dims)
+    sp = [float(s) for s in spacing]
+    first = torch.gradient(x, dim=dims, spacing=sp)
     comps: Dict[Tuple[int, int], torch.Tensor] = {}
     for i, gi in enumerate(first):
-        second = torch.gradient(gi, dim=dims)
+        second = torch.gradient(gi, dim=dims, spacing=sp)
         for j, gij in enumerate(second):
             if j >= i:
                 comps[(i, j)] = gij
@@ -129,23 +133,40 @@ def frangi_vesselness(
     alpha: float = 0.5,
     beta: float = 0.5,
     black_vessels: bool = False,
-    normalize: bool = True) -> torch.Tensor:
+    normalize: bool = True,
+    spacing: Optional[Sequence[float]] = None) -> torch.Tensor:
     """多尺度 Frangi vesselness。x: (B,C,*spatial) → 同形 [0,1] 置信图。
 
-    按通道独立处理；多尺度取逐体素最大；逐样本归一化到 [0,1]。"""
+    按通道独立处理；多尺度取逐体素最大；逐样本归一化到 [0,1]。
+
+    ``spacing``（逐轴物理体素间距，长度 == spatial_dims）给定时，``scales`` 解释
+    为**物理尺度**（与 spacing 同单位，如 mm）：逐轴体素 sigma = sigma_phys /
+    spacing[axis]，高斯平滑与 Hessian 差分均按各向异性 spacing 计算。为 None 时
+    退化为旧行为（scales 为体素单位各向同性 sigma，spacing=1）。"""
     if x.dim() != spatial_dims + 2:
         raise ValueError(
             f"frangi_vesselness expects (B, C, *{spatial_dims}d); "
             f"got shape {tuple(x.shape)}.")
     if not scales:
         raise ValueError("scales must be a non-empty list of sigmas.")
+    if spacing is None:
+        sp = [1.0] * spatial_dims
+    else:
+        sp = [float(s) for s in spacing]
+        if len(sp) != spatial_dims:
+            raise ValueError(
+                f"spacing length {len(sp)} != spatial_dims {spatial_dims}.")
+        if any(s <= 0 for s in sp):
+            raise ValueError(f"spacing must be all-positive; got {sp}.")
     xf = x.float()
     out = None
     for sigma in scales:
         sigma = float(sigma)
-        smoothed = _separable_gaussian(xf, sigma, spatial_dims)
-        comps = _hessian_components(smoothed, spatial_dims)
-        # γ 归一化：二阶导 × σ²，使不同尺度响应可比。
+        # 物理 sigma → 逐轴体素 sigma（各向异性）；体素尺度下 sp=1 退化为同性。
+        sigma_vox = [max(sigma / s, 1e-3) for s in sp]
+        smoothed = _separable_gaussian(xf, sigma_vox, spatial_dims)
+        comps = _hessian_components(smoothed, spatial_dims, sp)
+        # γ 归一化：二阶导 × σ_phys²，使不同尺度响应可比（物理尺度不变）。
         comps = {k: v * (sigma ** 2) for k, v in comps.items()}
         eig = _eigvals_abs_sorted(comps, spatial_dims)
         resp = _frangi_response(eig, spatial_dims, alpha, beta, black_vessels)

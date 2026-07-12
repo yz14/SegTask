@@ -33,26 +33,27 @@ from segtask_v1.trainer.checkpoint import strip_common_prefixes
 from segtask_v1.utils import compute_dice_per_class
 
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
-from .metrics import hd95
+from .metrics import hd95_batch
+from .split import group_split
 
 logger = logging.getLogger(__name__)
 
 
 def build_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
-    """从 ``ssl.probe_data_dir`` 的标注 npz 划分 train/val 探针 loader（num_workers=0）。"""
+    """从 ``ssl.probe_data_dir`` 的标注 npz 划分 train/val 探针 loader（num_workers=0）。
+
+    划分为组级（患者级，:func:`ssltask.eval.split.group_split`）：同组文件不跨
+    train/val。val 使用确定性 + 前景感知的 patch 中心（跨 epoch 可比、降低空前景
+    噪声），train 保持均匀随机。"""
     paths = discover_image_npz(ssl.probe_data_dir, cfg.data.npz_suffix)
-    rng = random.Random(int(ssl.probe_seed))
-    paths = list(paths)
-    rng.shuffle(paths)
-    n_val = max(1, int(round(len(paths) * float(ssl.probe_val_ratio))))
-    if len(paths) > 1:
-        n_val = min(n_val, len(paths) - 1)              # 保证 train 非空
-    val_paths = paths[:n_val]
-    train_paths = paths[n_val:] or list(paths)          # 单卷时 train==val
+    train_paths, val_paths = group_split(
+        paths, float(ssl.probe_val_ratio), int(ssl.probe_seed),
+        group_regex=str(ssl.probe_group_regex),
+        allow_single_group=bool(ssl.probe_allow_single_group))
     dc = cfg.data
     spatial_dims = int(cfg.model.spatial_dims)
 
-    def _mk(p, spv):
+    def _mk(p, spv, deterministic=False, fg_aware=False):
         return LabeledPatchDataset(
             npz_paths=p,
             patch_size=dc.patch_size,
@@ -64,10 +65,14 @@ def build_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
             global_std=dc.global_std,
             spatial_dims=spatial_dims,
             cache_enabled=dc.cache_mode == "memory",
-            cache_max_volumes=dc.cache_max_volumes)
+            cache_max_volumes=dc.cache_max_volumes,
+            deterministic=deterministic,
+            fg_aware=fg_aware,
+            seed=int(ssl.probe_seed))
 
     train_ds = _mk(train_paths, int(ssl.probe_samples_per_volume))
-    val_ds = _mk(val_paths, max(int(ssl.probe_samples_per_volume) // 2, 1))
+    val_ds = _mk(val_paths, max(int(ssl.probe_samples_per_volume) // 2, 1),
+                 deterministic=True, fg_aware=True)
     bs = max(int(dc.batch_size), 1)
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
                               num_workers=0, drop_last=False)
@@ -252,9 +257,22 @@ class SegProbe:
         optimizer.step()
         return loss
 
-    def _collect_scores(self, head: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, float]:
+    def _batch_spacing(self, batch: Dict[str, torch.Tensor]) -> Optional[np.ndarray]:
+        """(B, ndim) 逐样本物理间距（mm）；2.5D 折叠时取 (sy,sx)；无 spacing 键返 None（体素单位）。"""
+        sp = batch.get("spacing")
+        if sp is None:
+            return None
+        sp = np.asarray(sp, dtype=np.float64)          # (B, 3) = (sz,sy,sx)
+        if self.spatial_dims == 2:
+            sp = sp[:, 1:]                             # 深度折进通道，空间=(H,W)
+        return sp
+
+    def _collect_scores(self, head: nn.Module,
+                        loader: DataLoader) -> Tuple[float, float, Dict[str, float]]:
         dices: List[torch.Tensor] = []
-        hd_vals: List[float] = []
+        hd_sum, hd_finite = 0.0, 0
+        hd_stats = {"n_cases": 0.0, "n_both_empty": 0.0,
+                    "n_pred_empty_only": 0.0, "n_target_empty_only": 0.0}
         self.encoder.eval()
         head.eval()
         with torch.no_grad():
@@ -263,15 +281,41 @@ class SegProbe:
                 tgt = self._binary_target(batch["label"].to(self.device).float())
                 logits = self._forward_logits(head, img)
                 prob = torch.sigmoid(logits)
+                res = hd95_batch(prob.cpu().numpy(), tgt.cpu().numpy(),
+                                 spacing=self._batch_spacing(batch))
                 dices.append(compute_dice_per_class(logits, tgt).cpu())
-                hd_vals.append(hd95(prob.cpu().numpy(), tgt.cpu().numpy()))
+                hd_sum += res["hd95"] * res["n_finite"] if res["n_finite"] else 0.0
+                hd_finite += int(res["n_finite"])
+                for k in hd_stats:
+                    hd_stats[k] += res[k]
         probe_dice = float(torch.stack(dices).mean()) if dices else 0.0
-        finite = [v for v in hd_vals if np.isfinite(v)]
-        probe_hd95 = float(np.mean(finite)) if finite else 0.0
-        return probe_dice, probe_hd95
+        probe_hd95 = float(hd_sum / hd_finite) if hd_finite else 0.0
+        n_cases = max(hd_stats["n_cases"], 1.0)
+        n_one_side = (hd_stats["n_pred_empty_only"]
+                      + hd_stats["n_target_empty_only"])
+        hd_stats["empty_frac"] = n_one_side / n_cases
+        # 前景检出率：目标非空样本中预测非空的比例（漏检监控；无目标非空
+        # 样本时记 1.0）。
+        n_tgt_fg = (hd_stats["n_cases"] - hd_stats["n_both_empty"]
+                    - hd_stats["n_target_empty_only"])
+        hd_stats["fg_recall"] = (
+            (n_tgt_fg - hd_stats["n_pred_empty_only"]) / n_tgt_fg
+            if n_tgt_fg > 0 else 1.0)
+        if n_one_side:
+            logger.warning(
+                "Probe HD95: %d/%d case(s) one-side-empty (pred-empty=%d, "
+                "target-empty=%d) excluded from mean; both-empty=%d counted as 0.",
+                int(n_one_side), int(hd_stats["n_cases"]),
+                int(hd_stats["n_pred_empty_only"]),
+                int(hd_stats["n_target_empty_only"]),
+                int(hd_stats["n_both_empty"]))
+        return probe_dice, probe_hd95, hd_stats
 
     def evaluate(self, full_sd: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, float]:
-        """加载 encoder → 训练线性头 ``probe_iters`` 步 → 返回 ``{'probe_dice', 'probe_hd95'}``。"""
+        """加载 encoder → 训练线性头 ``probe_iters`` 步 → 返回
+        ``{'probe_dice', 'probe_hd95', 'probe_hd95_empty_frac', 'probe_fg_recall'}``
+        （HD95 在 npz 带 spacing meta 时为 mm，否则为体素单位；empty_frac 为一侧空
+        样本占比；fg_recall 为目标非空样本中预测非空的比例）。"""
         if full_sd is not None:
             self._load_encoder(full_sd)
         rng_state = self._save_rng_state()
@@ -302,8 +346,11 @@ class SegProbe:
                     batch = next(data_iter)
                 self._train_step(batch, head, optimizer, loss_fn)
 
-            probe_dice, probe_hd95 = self._collect_scores(head, self.val_loader)
-            return {"probe_dice": probe_dice, "probe_hd95": probe_hd95}
+            probe_dice, probe_hd95, hd_stats = self._collect_scores(
+                head, self.val_loader)
+            return {"probe_dice": probe_dice, "probe_hd95": probe_hd95,
+                    "probe_hd95_empty_frac": float(hd_stats["empty_frac"]),
+                    "probe_fg_recall": float(hd_stats["fg_recall"])}
         finally:
             self._restore_rng_state(rng_state)
 
