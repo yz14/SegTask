@@ -20,6 +20,7 @@ gentask/
 │   └── validation.py  # 生成任务配置校验
 ├── data/  # 数据与退化系统
 │   ├── __init__.py  # 数据包入口
+│   ├── augment.py  # GPU 3D 生成数据增强
 │   ├── degradation.py  # 在线超分退化算子
 │   ├── loader.py  # 路径匹配与 dataloader 工厂
 │   ├── make_data.py  # 离线预打包 npz
@@ -44,6 +45,7 @@ gentask/
 │   ├── factory.py  # generation model 装配工厂
 │   ├── generation.py  # 回归 / 扩散统一接口
 │   ├── resnet.py  # ResNet block / stage
+│   ├── sisr.py  # 经典 SISR backbone（EDSR / RCAN）
 │   ├── stem.py  # stem 与多视图融合
 │   ├── topology.py  # 派生输入 / 输出几何真相源
 │   ├── unet.py  # UNet encoder / decoder 主体
@@ -58,7 +60,13 @@ gentask/
     ├── checkpoint.py  # checkpoint 读写与兼容
     ├── gen_trainer.py  # generation 训练循环
     ├── optim.py  # 优化器 / 调度器 / warmup
-    └── pipelines/  # 生成训练管线预留目录
+    ├── views.py  # 多视图消费侧几何原语
+    └── pipelines/  # 多视图消费管线
+        ├── __init__.py  # 管线包入口
+        ├── base.py  # 管线抽象基类
+        ├── native_d.py  # 2.5D 原生深度多视图管线
+        ├── stacked.py  # 多视图堆叠管线（逐视图裁剪+resize+通道堆叠）
+        └── vanilla.py  # 单视图管线（中心裁剪回 patch_size）
 ```
 
 ## 关键概念
