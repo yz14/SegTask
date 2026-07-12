@@ -47,7 +47,8 @@ ssltask/
 │   ├── ibot_modules.py  # iBOT 密集头工具
 │   ├── jepa_modules.py  # JEPA encoder / predictor builder
 │   ├── spark_modules.py  # SparK 稀疏编码与轻量解码器
-│   └── ssl_models.py  # 重建 / MIM 模型与 head builder
+│   ├── ssl_models.py  # 重建 / MIM 模型与 head builder
+│   └── vicregl_modules.py  # VICRegL 投影 / 局部头工具
 └── trainer/  # SSL 训练循环
     ├── __init__.py  # 训练包入口
     └── ssl_trainer.py  # 方法无关的 SSL 训练循环
