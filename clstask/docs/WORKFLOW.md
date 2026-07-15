@@ -11,9 +11,11 @@
 
 ```
 配置加载（segtask Config + ClsConfig）→ npz 发现 → train/val 划分
- → Dataset 抽 patch + 标签派生 → mixup/cutmix（可选）
+ → Dataset 抽 patch + 标签派生 → GPU 增强（augment.enabled，可选）
+ → mixup/cutmix（可选）
  → encoder（4 模板）+ 池化 + cls_head → BCE/CE/Focal（fp32）
- → backward → optimizer/scheduler → EMA → 验证（AUC/F1/acc 选模）
+ → backward（非有限 loss/梯度跳组）→ optimizer/scheduler → EMA
+ → 验证（patch 级 AUC/F1/acc + 卷级 MIL vol_auc/vol_f1/vol_acc 选模）
  → 推理：整卷铺格 → patch 前向 → MIL 聚合 → 卷级/逐 slice 概率
 ```
 
@@ -38,19 +40,26 @@
 
 ```
 【Dataset，CPU worker → (B, 1, D, H, W) 或 2.5D (B, D, H, W)】
-npz 读取（image；mask 标签源 / 前景过采样时再读 label）
+npz 读取（image；mask 标签源 / 前景过采样时再读 label；
+  data.cache_mode="memory" 时逐 worker LRU 缓存预处理后的卷，
+  同卷连续索引下 samples_per_volume 次采样只读 1 次盘）
  → 预处理（img 归一化，与分割同参）
  → 采样中心（训练随机；可按 data.foreground_oversample_ratio 概率以前景 voxel 为中心；
    验证中心由 (seed, idx) 确定性派生，epoch 间可复现）
- → 三轴裁 patch（越界 edge 复制；无 H/W 整面 resize、无 GPU 增强管道）
+ → 三轴裁 patch（越界 edge 复制；无 H/W 整面 resize）
  → 标签派生（mask any() / table 继承卷标签）→ 2.5D 折叠（D→通道）
+（augment.enabled=true 时：训练集输出未折叠 (1,D,H,W) image[+label]，
+  由 trainer 在 GPU 上用 segtask GPUAugmentor 联合增强后派生 target 再折叠）
 
 【Trainer，GPU】
 mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际裁剪体积回算）
  → 前向：encoder → 池化 → cls_head → logits
  → 损失（autocast 外 fp32 + logit clamp）→ backward → 梯度裁剪
- → optimizer / warmup+scheduler → EMA
- → 每 epoch 验证（EMA shadow 权重）→ 按 cls.save_best_metric 选模存 best_model.pth
+ → 非有限守护（bf16/fp32：loss/梯度非有限丢弃本 accum 组；fp16 由 GradScaler 跳步）
+ → optimizer / warmup+scheduler（按优化步计时）→ EMA（warmup + 可选 CPU offload）
+ → 每 epoch 验证（EMA shadow 权重；patch 级 + 卷级 MIL 指标）
+ → 按 cls.save_best_metric 选模存 best_model.pth（启用 EMA 时 model_state_dict
+   为 EMA 权重，在线权重另存 model_online_state_dict）
 ```
 
 ### 模型（encoder 挂 `self.encoder`、头挂 `self.cls_head`，与 seg/SSL 命名一致）
@@ -79,14 +88,15 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 | 技巧 | 说明 |
 |---|---|
 | 混合精度 AMP | `use_amp` / `amp_dtype`（auto/bf16/fp16 + GradScaler）；损失 fp32 + logit clamp |
-| EMA | `use_ema`；验证与 best 保存均用 EMA shadow |
-| warmup + scheduler | `warmup_epochs` / `scheduler`，按 step 推进 |
+| EMA | `use_ema` / `ema_warmup` / `ema_device`；验证与 best 保存均用 EMA shadow（best 的 model_state_dict 即 EMA） |
+| GPU 增强 | `augment.enabled`（复用 segtask GPUAugmentor，image+label 联合增强后派生 target） |
+| warmup + scheduler | `warmup_epochs` / `scheduler`，按优化步推进（accum 尾组按真实尾长归一） |
 | 梯度裁剪 | `grad_clip_norm` |
 | mixup / cutmix | `cls.mixup_alpha` / `cls.cutmix_alpha`（>0 启用；同时启用每 batch 二选一；仅 volume 粒度） |
 | 前景过采样 | `data.foreground_oversample_ratio`（仅训练集；缓解类不平衡，需 npz 有 label） |
 | SSL/分割迁移 | `cls.pretrained_ckpt`：只取 `encoder.*`（strict=False，打印命中/缺失统计）；仅 `backbone='encoder'` |
 | 微调策略 | `cls.encoder_lr_mult` encoder 差分学习率；`cls.freeze_encoder=true` 只训头（linear probe） |
-| 选模 | `cls.save_best_metric`：auc / f1 / acc / loss |
+| 选模 | `cls.save_best_metric`：auc / f1 / acc / loss（patch 级）或 vol_auc / vol_f1 / vol_acc（卷级 MIL，与推理 agg_mode 同口径） |
 
 ---
 
@@ -95,7 +105,8 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 - 训练集按 `data.val_ratio` 划分；验证每卷取确定性 patch（samples_per_volume 的一半，无前景过采样），收集全量 logits/targets 统一计算；
 - 多标签：逐类 AUC（Mann-Whitney U rank 法，含并列校正）/ F1 / acc 宏平均；某类全正/全负跳过不计入；
 - 单标签：one-vs-rest 宏 AUC + argmax acc / 宏 F1；
-- slice 粒度把 (N, K, D) 摊平为 (N·D, K) 后同口径。
+- slice 粒度把 (N, K, D) 摊平为 (N·D, K) 后同口径；
+- 卷级 MIL 指标（vol_auc / vol_f1 / vol_acc）：按卷分组，用与推理同口径的 `aggregate_probs`（agg_mode/topk/lse_r）聚合 patch 概率；卷级 target 取该卷所有 patch/切片的 any()（单标签为卷内常量）。
 
 ---
 

@@ -32,7 +32,8 @@ data:
   samples_per_volume         : 8
 
 augment:
-  enabled: false
+  enabled: false           # true = 训练时 GPU 增强（复用 segtask GPUAugmentor，
+                           # image+label 联合增强后派生 target；参数见 segtask augment 段）
 
 model:
   backbone: "resnet"
@@ -55,8 +56,10 @@ train:
   grad_clip_norm: 12.0
   use_amp  : true
   amp_dtype: "auto"
-  use_ema  : true
-  ema_decay: 0.999
+  use_ema   : true
+  ema_decay : 0.999
+  ema_warmup: true         # 早期动态 decay，避免 shadow 被随机初值拖累
+  ema_device: ""           # "cpu" = shadow 放 CPU 省显存
   output_dir: "outputs/cls2_5d"
 
 cls:
@@ -71,4 +74,4 @@ cls:
   encoder_lr_mult  : 1.0
   agg_mode         : "max"         # 逐 slice → 卷级用 max 更贴合 MIL
   eval_patches_per_volume: 8
-  save_best_metric : "auc"
+  save_best_metric : "vol_auc"  # 卷级 MIL 选模（与推理 agg_mode 同口径）；也可 auc/f1/acc/loss

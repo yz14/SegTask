@@ -1,16 +1,25 @@
 """分类推理器：整卷 → patch 网格 → 前向 → MIL 聚合 → 卷级/逐 slice 概率。
 
-* patch 网格：z 轴（及 3D cubic 下 H/W）均匀铺格覆盖整卷，数量上限
-  ``cls.eval_patches_per_volume``（与验证抽样口径一致）。
+* patch 抽取口径与训练（``ClsPatchDataset``）逐位一致：
+  - ``whole``            —— 全卷 resize，单样本前向；
+  - ``z_axis`` / ``2_5d`` —— z 轴铺格（edge-padded 抽取）+ H/W 面内 resize；
+  - ``cubic``            —— 按各轴长 ceil(dim/patch) 铺格（半窗内缩贴边覆盖），
+    总数上限 ``cls.eval_patches_per_volume``。
 * volume 粒度：patch 概率经 ``cls.agg_mode``（mean/max/lse/topk）聚合为卷级
   概率（MIL：卷中任一处阳性即卷阳性 → max/topk/lse 更贴合，mean 更稳）。
 * slice 粒度：patch 的逐 slice 概率按 patch 在卷内的绝对 z 回填，重叠切片
   取 max；输出每卷 (K, Z) 概率矩阵。
+* ``cls.tta_flips=True`` 时启用翻转 TTA（口径同 segtask predictor：3D 7 种
+  轴组合翻转，2.5D 仅翻 H/W——深度折进通道后翻通道会破坏 conv 权重语义），
+  各变体概率取平均；slice 粒度下 z 翻转的输出沿 D 轴翻回。
+* ``cfg.train.use_amp=True`` 且 CUDA 设备时前向走 autocast（口径同训练；
+  概率在 fp32 下聚合）。
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -18,12 +27,27 @@ import numpy as np
 import torch
 
 from segtask_v1.config import Config as SegConfig
-from segtask_v1.data.dataset import preprocess_image
+from segtask_v1.data.dataset import (
+    extract_z_patch_padded,
+    load_npz_image,
+    resize_3d,
+)
+from segtask_v1.trainer.amp import (
+    _AMP_DTYPES,
+    autocast,
+    resolve_auto_amp_dtype,
+)
 
 from ..config import ClsConfig, resolve_num_classes
 from ..data.cls_dataset import _extract_cubic_patch
 
 logger = logging.getLogger(__name__)
+
+#: 3D 翻转 TTA 轴组合（输入 (B,1,D,H,W)：2=z, 3=y, 4=x），同 segtask 3D。
+_FLIP_SPECS_3D: Tuple[Tuple[int, ...], ...] = (
+    (2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4))
+#: 2.5D 翻转 TTA 轴组合（输入 (B,D,H,W)：2=H, 3=W）；不翻深度通道。
+_FLIP_SPECS_2_5D: Tuple[Tuple[int, ...], ...] = ((2,), (3,), (2, 3))
 
 
 def aggregate_probs(probs: torch.Tensor, mode: str, topk: int = 3,
@@ -55,23 +79,25 @@ def _grid_1d(dim: int, patch: int, n: int) -> List[int]:
 
 
 def grid_centers(shape: Sequence[int], patch: Sequence[int],
-                 max_patches: int, spatial_dims: int) -> List[Tuple[int, ...]]:
-    """patch 中心网格。2.5D / z_axis 沿 z 铺格（H/W 大于 patch 时面内也铺格，
-    保证整卷覆盖）；3D cubic 三轴铺格。总数上限 ``max_patches``。"""
-    if spatial_dims == 2:
-        # 面内铺格数：每轴 ceil(dim / patch)（含半窗重叠的贴边覆盖）。
-        ny = -(-shape[1] // patch[1])
-        nx = -(-shape[2] // patch[2])
-        ys = _grid_1d(shape[1], patch[1], ny)
-        xs = _grid_1d(shape[2], patch[2], nx)
-        n_z = max(max_patches // (len(ys) * len(xs)), 1)
-        zs = _grid_1d(shape[0], patch[0], n_z)
-        centers = [(z, y, x) for z in zs for y in ys for x in xs]
-    else:
-        per_axis = max(int(round(max_patches ** (1 / 3))), 1)
-        axes = [_grid_1d(d, p, per_axis) for d, p in zip(shape, patch)]
-        centers = [(z, y, x)
-                   for z in axes[0] for y in axes[1] for x in axes[2]]
+                 max_patches: int, patch_mode: str) -> List[Tuple[int, ...]]:
+    """patch 中心网格（几何随 ``patch_mode``，与训练抽取口径一致）。
+
+    * ``whole``           —— 单中心（全卷 resize，无铺格语义）；
+    * ``z_axis``/``2_5d`` —— 仅沿 z 铺格（H/W 面内 resize，无需面内铺格），
+      数量 = min(ceil(D/pD), max_patches)（含半窗重叠的贴边覆盖）；
+    * ``cubic``           —— 各轴 ceil(dim/patch) 铺格；总数超过
+      ``max_patches`` 时等距下采样。
+    """
+    if patch_mode == "whole":
+        return [(shape[0] // 2, shape[1] // 2, shape[2] // 2)]
+    if patch_mode in ("z_axis", "2_5d"):
+        n_z = min(max(-(-shape[0] // patch[0]), 1), max(int(max_patches), 1))
+        return [(z, shape[1] // 2, shape[2] // 2)
+                for z in _grid_1d(shape[0], patch[0], n_z)]
+    # cubic：按各轴长度成比例铺格（而非三轴等数），保证长轴不欠覆盖。
+    ns = [max(-(-d // p), 1) for d, p in zip(shape, patch)]
+    axes = [_grid_1d(d, p, n) for d, p, n in zip(shape, patch, ns)]
+    centers = [(z, y, x) for z in axes[0] for y in axes[1] for x in axes[2]]
     if len(centers) > max_patches:
         idx = np.linspace(0, len(centers) - 1, max_patches).round().astype(int)
         centers = [centers[i] for i in idx]
@@ -88,15 +114,63 @@ class ClsPredictor:
         self.cls = cls
         self.device = device
         self.patch = tuple(int(s) for s in cfg.data.patch_size)
+        self.patch_mode = str(cfg.data.patch_mode).lower()
         self.spatial_dims = int(cfg.model.spatial_dims)
         self.num_classes = resolve_num_classes(cls, cfg)
+        # AMP 前向（口径同训练）：CUDA + use_amp 时 autocast。
+        tc = cfg.train
+        self._amp_enabled = bool(tc.use_amp) and device.type == "cuda"
+        dtype_name = (resolve_auto_amp_dtype(device)
+                      if tc.amp_dtype == "auto" else tc.amp_dtype)
+        self._amp_dtype = _AMP_DTYPES.get(dtype_name, torch.float16)
+        self._flip_specs: Tuple[Tuple[int, ...], ...] = ()
+        if bool(getattr(cls, "tta_flips", False)):
+            self._flip_specs = (_FLIP_SPECS_3D if self.spatial_dims == 3
+                                else _FLIP_SPECS_2_5D)
 
     def _load_volume(self, npz_path: str) -> np.ndarray:
         dc = self.cfg.data
-        with np.load(npz_path, allow_pickle=True) as f:
-            return preprocess_image(
-                f["image"], dc.intensity_min, dc.intensity_max, dc.normalize,
-                dc.global_mean, dc.global_std, inplace=False)
+        return load_npz_image(
+            npz_path, dc.intensity_min, dc.intensity_max, dc.normalize,
+            dc.global_mean, dc.global_std)
+
+    def _extract(self, vol: np.ndarray,
+                 center: Tuple[int, ...]) -> np.ndarray:
+        """按 patch_mode 抽严格 (pD,pH,pW) patch（与训练数据集同一几何）。"""
+        pD, pH, pW = self.patch
+        if self.patch_mode == "whole":
+            return resize_3d(vol, pD, pH, pW, is_label=False)
+        if self.patch_mode == "cubic":
+            return _extract_cubic_patch(vol, center, self.patch)
+        p = extract_z_patch_padded(vol, center[0], pD)
+        return resize_3d(p, pD, pH, pW, is_label=False)
+
+    def _autocast(self):
+        return (autocast(device_type="cuda", dtype=self._amp_dtype)
+                if self._amp_enabled else nullcontext())
+
+    def _post(self, logits: torch.Tensor) -> torch.Tensor:
+        single = not self.cls.multi_label
+        return (torch.softmax(logits.float(), dim=1) if single
+                else torch.sigmoid(logits.float()))
+
+    def _forward_probs(self, x: torch.Tensor) -> torch.Tensor:
+        """micro-batch 前向 → 概率；启用 TTA 时各翻转变体概率取平均。
+
+        slice 粒度（输出 (B, K, D)）下，3D 输入含 z 翻转（dim=2）的变体沿
+        输出 D 轴翻回后再平均；volume 粒度输出无空间轴，无需回翻。
+        """
+        with self._autocast():
+            prob = self._post(self.model(x))
+            if not self._flip_specs:
+                return prob
+            total = prob
+            for dims in self._flip_specs:
+                p = self._post(self.model(torch.flip(x, dims)))
+                if p.ndim == 3 and self.spatial_dims == 3 and 2 in dims:
+                    p = torch.flip(p, (2,))
+                total = total + p
+            return total / float(1 + len(self._flip_specs))
 
     @torch.no_grad()
     def predict_volume(self, npz_path: str) -> Dict[str, np.ndarray]:
@@ -104,27 +178,24 @@ class ClsPredictor:
         vol = self._load_volume(npz_path)
         centers = grid_centers(vol.shape, self.patch,
                                self.cls.eval_patches_per_volume,
-                               self.spatial_dims)
+                               self.patch_mode)
         batch = []
         for c in centers:
-            p = _extract_cubic_patch(vol, c, self.patch)
-            t = torch.from_numpy(p.astype(np.float32, copy=False))
+            p = self._extract(vol, c)
+            t = torch.from_numpy(np.ascontiguousarray(p, dtype=np.float32))
             if self.spatial_dims == 3:
                 t = t.unsqueeze(0)
             batch.append(t)
         # micro-batch 前向，避免大卷一次性堆叠全部 patch 致 OOM。
         bs = max(int(self.cls.infer_batch_size), 1)
-        logits = torch.cat([
-            self.model(torch.stack(batch[i:i + bs]).to(self.device))
-            for i in range(0, len(batch), bs)])
-        single = not self.cls.multi_label
-        probs = (torch.softmax(logits, dim=1) if single
-                 else torch.sigmoid(logits))
+        probs = torch.cat([
+            self._forward_probs(torch.stack(batch[i:i + bs]).to(self.device))
+            for i in range(0, len(batch), bs)]).cpu()
 
         out: Dict[str, np.ndarray] = {}
         if self.cls.label_granularity == "volume":
             out["volume_probs"] = aggregate_probs(
-                probs.cpu(), self.cls.agg_mode, self.cls.agg_topk,
+                probs, self.cls.agg_mode, self.cls.agg_topk,
                 self.cls.agg_lse_r).numpy()
         else:
             # (N, K, D)：按 patch 绝对 z 回填，重叠取 max；卷级 = slice 概率
@@ -132,12 +203,19 @@ class ClsPredictor:
             z_dim = vol.shape[0]
             slice_probs = np.zeros((self.num_classes, z_dim), dtype=np.float32)
             d = self.patch[0]
-            probs_np = probs.cpu().numpy()
-            for (cz, _, _), p in zip(centers, probs_np):
-                lo = cz - d // 2
-                for j in range(d):
-                    z = min(max(lo + j, 0), z_dim - 1)
-                    slice_probs[:, z] = np.maximum(slice_probs[:, z], p[:, j])
+            probs_np = probs.numpy()
+            if self.patch_mode == "whole":
+                # 全卷 resize：patch 第 j 个 slice ↔ 原卷 z 按比例最近邻映射。
+                src = np.minimum((np.arange(z_dim) * d) // max(z_dim, 1),
+                                 d - 1)
+                slice_probs = probs_np[0][:, src]
+            else:
+                for (cz, _, _), p in zip(centers, probs_np):
+                    lo = cz - d // 2
+                    for j in range(d):
+                        z = min(max(lo + j, 0), z_dim - 1)
+                        slice_probs[:, z] = np.maximum(slice_probs[:, z],
+                                                       p[:, j])
             out["slice_probs"] = slice_probs
             out["volume_probs"] = aggregate_probs(
                 torch.from_numpy(slice_probs.T), self.cls.agg_mode,

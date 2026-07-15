@@ -67,6 +67,7 @@ def build_cls_dataloaders(
             npz_paths=split_paths,
             patch_size=dc.patch_size,
             num_classes=num_classes,
+            patch_mode=dc.patch_mode,
             label_granularity=cls.label_granularity,
             label_source=cls.label_source,
             table_targets=targets,
@@ -82,7 +83,12 @@ def build_cls_dataloaders(
             is_train=is_train,
             fg_oversample_ratio=(dc.foreground_oversample_ratio
                                  if is_train else 0.0),
-            seed=dc.split_seed)
+            seed=dc.split_seed,
+            gpu_augment=(bool(cfg.augment.enabled) and is_train),
+            val_grid_coverage=(bool(dc.val_grid_coverage)
+                               and not is_train),
+            cache_enabled=(dc.cache_mode == "memory"),
+            cache_max_volumes=dc.cache_max_volumes)
 
     train_ds = _mk(train_paths, True)
     val_ds = _mk(val_paths, False)

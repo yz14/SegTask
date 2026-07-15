@@ -129,9 +129,13 @@ class ClsConfig:
     eval_patches_per_volume: int = 8
     # 整卷推理每次前向的 patch 数（micro-batch，防大卷 OOM）。
     infer_batch_size: int = 16
+    # 推理翻转 TTA：3D 7 种轴组合翻转，2.5D 仅翻 H/W；各变体概率取平均。
+    tta_flips: bool = False
 
     # ---- 选模 -----------------------------------------------------------
-    save_best_metric: str = "auc"   # 'auc' | 'f1' | 'acc' | 'loss'
+    # patch 级：'auc' | 'f1' | 'acc' | 'loss'；卷级 MIL（与推理 agg_mode 同
+    # 口径）：'vol_auc' | 'vol_f1' | 'vol_acc'。
+    save_best_metric: str = "auc"
 
 
 def _require(cond: bool, msg: str) -> None:
@@ -155,9 +159,10 @@ def validate_cls(cls: ClsConfig, cfg: SegConfig) -> None:
              f"cls.pooling must be one of {POOLINGS}; got {cls.pooling!r}.")
     _require(cls.agg_mode in AGG_MODES,
              f"cls.agg_mode must be one of {AGG_MODES}; got {cls.agg_mode!r}.")
-    _require(cls.save_best_metric in ("auc", "f1", "acc", "loss"),
-             f"cls.save_best_metric must be auc|f1|acc|loss; "
-             f"got {cls.save_best_metric!r}.")
+    _require(cls.save_best_metric in ("auc", "f1", "acc", "loss",
+                                      "vol_auc", "vol_f1", "vol_acc"),
+             f"cls.save_best_metric must be auc|f1|acc|loss|vol_auc|vol_f1"
+             f"|vol_acc; got {cls.save_best_metric!r}.")
 
     # ---- 几何 -----------------------------------------------------------
     pm = str(cfg.data.patch_mode).lower()
@@ -246,6 +251,21 @@ def validate_cls(cls: ClsConfig, cfg: SegConfig) -> None:
         _require(cls.vit_embed_dim % cls.vit_num_heads == 0,
                  f"cls.vit_embed_dim ({cls.vit_embed_dim}) must be divisible "
                  f"by cls.vit_num_heads ({cls.vit_num_heads}).")
+
+    # ---- 选模方向 × plateau scheduler --------------------------------------
+    # plateau 的 mode 取 cfg.train.save_best_mode（seg 的单一真相源）；分类的
+    # 选模指标方向由 cls.save_best_metric 决定（loss → min，其余 → max），
+    # 二者不一致时 plateau 会在指标变好时误降 lr，这里显式拦截。
+    if str(cfg.train.scheduler).lower() == "plateau":
+        cls_mode = "min" if cls.save_best_metric == "loss" else "max"
+        seg_mode = str(cfg.train.save_best_mode)
+        _require(seg_mode == cls_mode,
+                 f"train.scheduler='plateau' derives its direction from "
+                 f"train.save_best_criterion (currently mode={seg_mode!r}), "
+                 f"which conflicts with cls.save_best_metric="
+                 f"{cls.save_best_metric!r} (mode={cls_mode!r}). Set "
+                 f"train.save_best_criterion so its mode matches (e.g. "
+                 f"'loss' for min / 'dice' for max).")
 
     _require(cls.eval_patches_per_volume >= 1,
              f"cls.eval_patches_per_volume must be >= 1; got "
