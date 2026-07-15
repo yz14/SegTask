@@ -2,11 +2,14 @@
 
 SSL 的价值来源是**大规模无标注**语料，故数据通路与分割的"标签耦合"管线解耦：
 本数据集只读 npz 的 ``image`` 键（``make_ssl_data`` 产出的 image-only npz，或任何含
-``image`` 的既有 npz 皆可），**不读** label / fg_coords / fg_slices，均匀随机抽取
-``patch_size`` 立方体（越界 edge-pad），返回 ``{"image": (1, *patch)}``。
+``image`` 的既有 npz 皆可），**不读** label / fg_coords / fg_slices。抽取几何与
+segtask ``SegDataset3D``（``patch_mode=2_5d/z_axis``）逐字一致：仅沿 z 抽片
+（越界 edge-pad），面内 H/W **整片 resize** 到 (pH,pW)（不裁窗），返回
+``{"image": (1, eD, pH, pW)}``。
 
-底层 IO / 预处理（``_open_npz`` / ``preprocess_image`` / ``_extract_cubic_patch``）直接
-复用 ``segtask_v1.data.dataset``，不另造轮子。
+底层 IO / 预处理 / 抽取（``_open_npz`` / ``preprocess_image`` /
+``extract_z_patch_padded`` / ``resize_3d``）直接复用 ``segtask_v1.data.dataset``，
+不另造轮子。
 """
 
 from __future__ import annotations
@@ -28,10 +31,25 @@ from segtask_v1.data.dataset import (
     VolumeCache,
     _extract_cubic_patch,
     _open_npz,
+    extract_z_patch_padded,
     preprocess_image,
+    resize_3d,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_zaxis_mode(patch_mode: str) -> bool:
+    """与 segtask specs 同口径：2_5d/z_axis → z 抽片 + H/W 整片 resize；
+    cubic → 三轴立方体裁窗；其余（whole 等）SSL 不支持。"""
+    pm = str(patch_mode).lower()
+    if pm in ("2_5d", "z_axis"):
+        return True
+    if pm == "cubic":
+        return False
+    raise ValueError(
+        f"SSL dataset supports patch_mode in {{'2_5d','z_axis','cubic'}}; "
+        f"got {patch_mode!r}.")
 
 
 def discover_image_npz(npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
@@ -96,17 +114,16 @@ def _clamp_center(c: int, dim: int, p: int) -> int:
 
 
 class ImageOnlyPatchDataset(Dataset):
-    """从含 ``image`` 键的 npz 均匀随机抽 patch（image-only）。
+    """从含 ``image`` 键的 npz 随机抽 2.5D/z 轴 patch（image-only）。
 
     每个 epoch 的样本数 = ``len(paths) * samples_per_volume``；``__getitem__`` 内随机
-    选体 + 随机中心抽 ``patch_size`` cube。
+    选体 + 随机 z 中心抽 z-cube（edge-pad），H/W 整片 resize 到 (pH,pW)，与
+    segtask ``SegDataset3D``（``patch_mode=2_5d/z_axis``）同口径。
 
-    输出布局随 ``spatial_dims`` 切换（与下游骨干一致）：
-
-    * ``spatial_dims==3`` —— 3D 骨干：返回 ``{"image": (1, pD, pH, pW)} fp32``。
-    * ``spatial_dims==2`` —— 2.5D 折叠骨干：把深度 D 折进通道，返回
-      ``{"image": (pD, pH, pW)} fp32``（C=pD，spatial=(pH,pW)），与 segtask 2.5D
-      ``squeeze_2_5d`` 折叠口径一致（单 FOV）。
+    输出**统一为 3D** ``{"image": (1, pD, pH, pW)} fp32``（含 2.5D）：2.5D 的
+    "深度 D 折进通道"改由 trainer 在**数据增强之后、送模型之前**统一折叠（与
+    segtask 的 ``squeeze_2_5d`` 送模型前口径一致），从而 3D ``GPUAugmentor`` 也
+    能作用于 2.5D 样本；不再在 dataset 层提前折叠。
     """
 
     def __init__(
@@ -120,6 +137,8 @@ class ImageOnlyPatchDataset(Dataset):
         global_mean      : float = 0.0,
         global_std       : float = 1.0,
         spatial_dims     : int = 3,
+        patch_mode       : str = "cubic",
+        aug_oversample_ratio: float = 1.0,
         cache_enabled    : bool = False,
         cache_max_volumes: int = 0):
         self.paths = list(npz_paths)
@@ -130,6 +149,16 @@ class ImageOnlyPatchDataset(Dataset):
             raise ValueError(
                 f"patch_size must be 3D (D,H,W) for SSL image-only dataset; "
                 f"got {patch_size}.")
+        # 仅 z 轴过采样：多抽 round(pD*ratio) 片，供增强后由 trainer 沿 z 中心裁回
+        # pD（与 segtask aug_oversample_ratio 口径一致，规避 flip/affine 边界伪影）。
+        # 无标注、纯几何余量，不涉及前景。ratio==1.0 时 extract==patch（无余量）。
+        self.oversample = float(aug_oversample_ratio)
+        if self.oversample < 1.0:
+            raise ValueError(
+                f"aug_oversample_ratio must be >= 1.0; got {self.oversample}.")
+        pD, pH, pW = self.patch
+        self.extract_size = (int(round(pD * self.oversample)), pH, pW)
+        self.zaxis = _is_zaxis_mode(patch_mode)
         self.spatial_dims = int(spatial_dims)
         if self.spatial_dims not in (2, 3):
             raise ValueError(
@@ -149,7 +178,8 @@ class ImageOnlyPatchDataset(Dataset):
             "ImageOnlyPatchDataset: %d volumes x %d samples = %d, patch=%s, "
             "spatial_dims=%d (%s)",
             len(self.paths), self.spv, len(self), self.patch,
-            self.spatial_dims, "2.5D folded" if self.fold_2_5d else "3D")
+            self.spatial_dims,
+            "2.5D (fold deferred to trainer)" if self.fold_2_5d else "3D")
 
     def __len__(self) -> int:
         return len(self.paths) * self.spv
@@ -176,28 +206,41 @@ class ImageOnlyPatchDataset(Dataset):
         if vol.ndim != 3:
             raise ValueError(
                 f"SSL expects 3D image volume (D,H,W); got {vol.shape} in {path!r}.")
-        center = tuple(_rand_center(d, p) for d, p in zip(vol.shape, self.patch))
-        patch = _extract_cubic_patch(vol, center, self.patch)  # (pD,pH,pW)
-        t = torch.from_numpy(patch.astype(np.float32, copy=False))  # (pD,pH,pW)
-        if not self.fold_2_5d:
-            t = t.unsqueeze(0)                                      # (1,pD,pH,pW)
-        # 2.5D：直接 (pD,pH,pW) = (C=D, H, W)，深度折进通道。
+        _, pH, pW = self.patch
+        eD = self.extract_size[0]
+        if self.zaxis:
+            # 与 segtask SegDataset3D(2_5d/z_axis) 抽取口径一致：仅沿 z 抽 eD 片
+            # （eD>=pD 含过采样余量，越界 edge-pad），面内 H/W 整片 resize 到
+            # (pH,pW)（不裁窗，与下游 encoder 看到的空间尺度一致）。
+            z = _rand_center(vol.shape[0], eD)
+            patch = extract_z_patch_padded(vol, z, eD)            # (eD, H, W)
+            patch = resize_3d(patch, eD, pH, pW, is_label=False)  # (eD, pH, pW)
+        else:
+            # cubic：三轴裁窗（越界 edge-pad）；z 轴含过采样余量。
+            center = tuple(_rand_center(d, p)
+                           for d, p in zip(vol.shape, self.extract_size))
+            patch = _extract_cubic_patch(vol, center, self.extract_size)
+        t = torch.from_numpy(patch.astype(np.float32, copy=False))
+        # 统一返回 3D (1,eD,pH,pW)；trainer 在增强后沿 z 中心裁回 pD，再（2.5D）
+        # 把深度折进通道（见 ssl_trainer._center_crop_z / _fold_batch），与 segtask 一致。
+        t = t.unsqueeze(0)                                            # (1,eD,pH,pW)
         return {"image": t}
 
 
 class LabeledPatchDataset(Dataset):
     """从含 ``image`` + ``label`` 键的 npz 抽**配对** patch，供 §0.5 在线探针。
 
-    与 :class:`ImageOnlyPatchDataset` 共用 IO/预处理与抽样逻辑，额外读 ``label`` 并以
-    *同一中心* 抽取对齐的 label patch（``mode='edge'`` 越界复制，与 image 一致）。
+    与 :class:`ImageOnlyPatchDataset` 共用 IO/预处理与抽取几何（z 抽片 edge-pad +
+    H/W 整片 resize，同 segtask ``SegDataset3D``），额外读 ``label`` 并以 *同一 z
+    中心* 抽取对齐的 label patch（resize 用最近邻 ``is_label=True`` 保整数取值）。
     label 为原始取值，前景二值化在探针侧按 ``label_values`` 完成。仅用于轻量评测，
     不进 SSL 训练主路径。
 
     输出布局随 ``spatial_dims`` 切换（与 :class:`ImageOnlyPatchDataset` 折叠口径一致）：
 
-    * ``spatial_dims==3`` —— ``{"image": (1, pD, pH, pW), "label": (1, pD, pH, pW)}``。
-    * ``spatial_dims==2`` —— 2.5D 折叠：``{"image": (pD, pH, pW), "label": (pD, pH, pW)}``
-      （C=pD 折进通道，spatial=(pH,pW)）；探针侧按 ``b (c d) h w`` 口径逐 (类,切片) 二值化。
+    输出**统一为 3D** ``{"image": (1, pD, pH, pW), "label": (1, pD, pH, pW)}``（含
+    2.5D）：2.5D 折叠由消费方（探针 :class:`ssltask.eval.probe.SegProbe`）在送模型
+    前完成，探针侧按 ``b (c d) h w`` 口径逐 (类,切片) 二值化。
     """
 
     def __init__(
@@ -211,6 +254,7 @@ class LabeledPatchDataset(Dataset):
         global_mean       : float = 0.0,
         global_std        : float = 1.0,
         spatial_dims      : int = 3,
+        patch_mode        : str = "cubic",
         cls_label_key     : str = "",
         cache_enabled     : bool = False,
         cache_max_volumes : int = 0,
@@ -231,6 +275,7 @@ class LabeledPatchDataset(Dataset):
                 f"spatial_dims must be 2 (2.5D folded) or 3; "
                 f"got {self.spatial_dims}.")
         self.fold_2_5d = self.spatial_dims == 2
+        self.zaxis = _is_zaxis_mode(patch_mode)
         self.intensity_min = float(intensity_min)
         self.intensity_max = float(intensity_max)
         self.normalize = str(normalize)
@@ -239,9 +284,9 @@ class LabeledPatchDataset(Dataset):
         self.spv = max(int(samples_per_volume), 1)
         self.cls_label_key = str(cls_label_key)
         # deterministic：逐 idx 固定 RNG（跨 epoch/跨进程可重现，供验证集）；
-        # fg_aware：优先以 npz 预烘 fg_coords 中的前景体素为 patch 中心（clamp
-        # 到体内），避免随机 patch 大量空前景导致评测噪声；无 fg_coords/空前景
-        # 退化为均匀随机中心。
+        # fg_aware：优先以 npz 预烘 fg_coords 中前景体素的 z 坐标为 z 中心（clamp
+        # 到体内；H/W 整片 resize，无需面内定位），避免随机 patch 大量空前景导致
+        # 评测噪声；无 fg_coords/空前景退化为均匀随机 z 中心。
         self.deterministic = bool(deterministic)
         self.fg_aware = bool(fg_aware)
         self.seed = int(seed)
@@ -255,7 +300,8 @@ class LabeledPatchDataset(Dataset):
             "LabeledPatchDataset (probe): %d volumes x %d samples = %d, patch=%s, "
             "spatial_dims=%d (%s)",
             len(self.paths), self.spv, len(self), self.patch,
-            self.spatial_dims, "2.5D folded" if self.fold_2_5d else "3D")
+            self.spatial_dims,
+            "2.5D (fold deferred to probe)" if self.fold_2_5d else "3D")
 
     def __len__(self) -> int:
         return len(self.paths) * self.spv
@@ -307,9 +353,24 @@ class LabeledPatchDataset(Dataset):
         self._fg_cache[path] = coords
         return coords
 
+    def _rng(self, idx: int) -> Optional[random.Random]:
+        if not self.deterministic:
+            return None
+        return random.Random((self.seed * 1000003 + idx) * 2654435761 % (2**63))
+
+    def _pick_z(self, idx: int, path: str, D: int) -> int:
+        pD = self.patch[0]
+        rng = self._rng(idx)
+        if self.fg_aware:
+            coords = self._load_fg_coords(path)
+            if coords is not None:
+                r = rng if rng is not None else random
+                z = int(coords[r.randrange(len(coords))][0])
+                return _clamp_center(z, D, pD)
+        return _rand_center(D, pD, rng)
+
     def _pick_center(self, idx: int, path: str, shape) -> tuple:
-        rng = (random.Random((self.seed * 1000003 + idx) * 2654435761 % (2**63))
-               if self.deterministic else None)
+        rng = self._rng(idx)
         if self.fg_aware:
             coords = self._load_fg_coords(path)
             if coords is not None:
@@ -326,14 +387,24 @@ class LabeledPatchDataset(Dataset):
         if img.ndim != 3:
             raise ValueError(
                 f"probe expects 3D volume (D,H,W); got {img.shape} in {path!r}.")
-        center = self._pick_center(idx, path, img.shape)
-        img_patch = _extract_cubic_patch(img, center, self.patch)  # (pD,pH,pW)
-        lbl_patch = _extract_cubic_patch(lbl, center, self.patch)  # (pD,pH,pW)
+        pD, pH, pW = self.patch
+        if self.zaxis:
+            # 与 SegDataset3D(2_5d/z_axis) 一致：z 抽 pD 片（edge-pad），H/W 整片
+            # resize；label 用最近邻（is_label=True）保持整数取值。
+            z = self._pick_z(idx, path, img.shape[0])
+            img_patch = resize_3d(
+                extract_z_patch_padded(img, z, pD), pD, pH, pW, is_label=False)
+            lbl_patch = resize_3d(
+                extract_z_patch_padded(lbl, z, pD), pD, pH, pW, is_label=True)
+        else:
+            center = self._pick_center(idx, path, img.shape)
+            img_patch = _extract_cubic_patch(img, center, self.patch)
+            lbl_patch = _extract_cubic_patch(lbl, center, self.patch)
         img_t = torch.from_numpy(img_patch.astype(np.float32, copy=False))
         lbl_t = torch.from_numpy(lbl_patch.astype(np.float32, copy=False))
-        if not self.fold_2_5d:
-            img_t = img_t.unsqueeze(0)                             # (1,pD,pH,pW)
-            lbl_t = lbl_t.unsqueeze(0)
+        # 统一返回 3D (1,pD,pH,pW)；2.5D 折叠由探针在送模型前完成。
+        img_t = img_t.unsqueeze(0)                                 # (1,pD,pH,pW)
+        lbl_t = lbl_t.unsqueeze(0)
         spacing = self._spacing_cache.get(path)
         if spacing is None:
             spacing = read_npz_spacing(path) or (1.0, 1.0, 1.0)
@@ -376,6 +447,8 @@ def build_ssl_dataloader(cfg) -> DataLoader:
         global_mean       = dc.global_mean,
         global_std        = dc.global_std,
         spatial_dims      = spatial_dims,
+        patch_mode        = dc.patch_mode,
+        aug_oversample_ratio = dc.aug_oversample_ratio,
         cache_enabled     = dc.cache_mode == "memory",
         cache_max_volumes = dc.cache_max_volumes)
     num_workers = int(dc.num_workers)

@@ -2,6 +2,8 @@
 
 gentask 是从 `segtask_v1` 剥离出的生成工程，覆盖医学影像超分、复原和条件生成两条主线。它既支持回归式重建，也支持条件扩散式采样，并把在线退化、训练、推理和数据预打包都放进统一的工程入口里。
 
+> 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
+
 ## 模块树
 
 ```text
@@ -31,7 +33,8 @@ gentask/
 │       ├── core.py  # npz dataset 主逻辑
 │       └── io.py  # npz / NIfTI 读取工具
 ├── docs/  # 生成模型综述与设计备忘
-│   └── generative_models_survey.md  # 生成方案综述
+│   ├── generative_models_survey.md  # 生成方案综述
+│   └── WORKFLOW.md  # 端到端训练/推理流程
 ├── losses/  # 损失库
 │   ├── __init__.py  # 损失包入口
 │   └── recon.py  # 重建损失与加权封装

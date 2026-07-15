@@ -2,7 +2,7 @@
 
 `segtask_v1` 是当前活跃的 2.5D / 3D 医学图像分割工程：训练、预测、launcher、monitor、visualization 都围绕这条主线展开。它把数据读取、patch 几何、模型装配、损失、训练循环与推理流程收拢到一套配置驱动的体系里，是仓库里其他任务的基建真相源。
 
-> 设计级细节已拆到 [`docs/DESIGN.md`](docs/DESIGN.md)。这里仅保留导航地图和关键约定。
+> 设计级细节已拆到 [`docs/DESIGN.md`](docs/DESIGN.md)，端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。这里仅保留导航地图和关键约定。
 
 ## 模块树
 
@@ -24,6 +24,9 @@ segtask_v1/
 │   ├── make_data.py  # 离线烘焙 npz
 │   ├── mixed_sampler.py  # 混合采样器
 │   └── specs.py  # patch_mode / split 策略层
+├── docs/  # 设计与流程文档
+│   ├── DESIGN.md  # 设计级细节
+│   └── WORKFLOW.md  # 四方案端到端训练/推理流程
 ├── launcher/  # 本地网页启动器
 │   ├── __init__.py  # 包入口
 │   ├── __main__.py  # launcher CLI
@@ -103,7 +106,7 @@ segtask_v1/
 - **Topology 是单一真相源**：`ModelTopology` 负责推导输入通道、输出类别、`spatial_dims`、多视图数量和 aux 头开关，避免多处重复计算。
 - **pid 命名契约**：图像、标签、bbox、region weight、npz、exclude list 都围绕 pid 对齐；缺失配对默认报错，不做静默跳过。
 - **npz 预打包**：`make_data.py` 负责把 NIfTI 烘焙成可 mmap 的 npz，减轻 gzip 解码和重复 IO 压力。
-- **设计细节下沉**：训练时序、预测时序、扩展指南和数据流图放到 `docs/DESIGN.md`，README 只保留导航。
+- **设计细节下沉**：训练时序、预测时序、扩展指南和数据流图放到 `docs/DESIGN.md`；whole / cubic / zaxis / 2.5d 四方案的端到端流程与通用训练/推理技巧见 `docs/WORKFLOW.md`。README 只保留导航。
 
 ## 用法
 

@@ -2,6 +2,8 @@
 
 ssltask 是一套与 `segtask_v1` 共骨干的自监督预训练工程：它负责在无标注或少标注数据上做表示学习，并把学到的 encoder 权重迁移回分割、分类与检测任务。方法库覆盖重建式、对比式、自蒸馏式与掩码建模式多种 SSL 路线，评测侧则提供在线 probe 与离线 few-shot 评测。
 
+> 端到端预训练/评测流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
+
 ## 模块树
 
 ```text
@@ -19,6 +21,8 @@ ssltask/
 │   ├── multicrop.py  # 多裁剪视图生成器
 │   ├── ssl_dataset.py  # image-only / labeled npz 数据集
 │   └── vesselness.py  # Frangi vesselness 目标
+├── docs/  # 流程文档
+│   └── WORKFLOW.md  # 端到端预训练/评测流程
 ├── eval/  # 评测子系统
 │   ├── __init__.py  # 评测包入口
 │   ├── cls_probe.py  # 在线分类探针

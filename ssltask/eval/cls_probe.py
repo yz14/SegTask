@@ -56,6 +56,7 @@ def build_cls_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
             global_mean=dc.global_mean,
             global_std=dc.global_std,
             spatial_dims=spatial_dims,
+            patch_mode=dc.patch_mode,
             cls_label_key=ssl.cls_label_key,
             cache_enabled=dc.cache_mode == "memory",
             cache_max_volumes=dc.cache_max_volumes,
@@ -160,6 +161,14 @@ class ClsProbe:
             targets.append((label == v).flatten(1).any(dim=1).float())
         return torch.stack(targets, dim=1)
 
+    def _fold_2_5d_t(self, x: torch.Tensor) -> torch.Tensor:
+        """2.5D：(B,1,D,H,W)→(B,D,H,W)（D 折进通道）；3D 原样返回。
+        LabeledPatchDataset 现统一输出 3D，折叠在此消费方完成。"""
+        if self.spatial_dims == 2 and x.dim() == 5:
+            b, c, d, h, w = x.shape
+            return x.reshape(b, c * d, h, w)
+        return x
+
     def _forward_logits(self, head: nn.Module, img: torch.Tensor) -> torch.Tensor:
         feats = self.encoder(img)
         pooled = feats[-1].mean(dim=tuple(range(2, feats[-1].ndim)))
@@ -168,7 +177,7 @@ class ClsProbe:
     def _train_step(self, batch: Dict[str, torch.Tensor], head: nn.Module,
                     optimizer: torch.optim.Optimizer,
                     loss_fn: nn.Module) -> torch.Tensor:
-        img = batch["image"].to(self.device).float()
+        img = self._fold_2_5d_t(batch["image"].to(self.device).float())
         target = self._target_from_batch(batch)
         if self.finetune:
             self._set_encoder_trainable(True)
@@ -192,7 +201,7 @@ class ClsProbe:
         head.eval()
         with torch.no_grad():
             for batch in loader:
-                img = batch["image"].to(self.device).float()
+                img = self._fold_2_5d_t(batch["image"].to(self.device).float())
                 target = self._target_from_batch(batch)
                 logits = self._forward_logits(head, img)
                 ys.append(target.detach().cpu().numpy())

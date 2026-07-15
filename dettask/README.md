@@ -2,6 +2,8 @@
 
 dettask 复用 `segtask_v1` 的配置、几何拓扑、预处理、优化器、AMP 和 EMA 基建，提供医学影像目标检测训练、评估与推理闭环。它把 2D / 3D 框算子统一到同一套检测几何上，支持 RetinaNet、FCOS、Faster R-CNN 和 DETR 四种检测头，并可迁移 ssltask 的 encoder 权重。
 
+> 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
+
 ## 模块树
 
 ```text
@@ -20,7 +22,8 @@ dettask/
 │   ├── det_dataset.py  # 检测样本、框读取与抽样
 │   └── loader.py  # 配对发现、切分与 dataloader 工厂
 ├── docs/  # 检测头与方案综述
-│   └── detection_models_survey.md  # 检测骨干与设计备忘
+│   ├── detection_models_survey.md  # 检测骨干与设计备忘
+│   └── WORKFLOW.md  # 端到端训练/推理流程
 ├── losses/  # 检测损失
 │   ├── __init__.py  # 损失包入口
 │   └── det_loss.py  # 检测损失实现

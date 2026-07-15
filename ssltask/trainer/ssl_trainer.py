@@ -28,7 +28,8 @@ from segtask_v1.data.augment import GPUAugmentor
 from segtask_v1.trainer.amp import (
     _AMP_DTYPES, GradScaler, autocast, resolve_auto_amp_dtype)
 from segtask_v1.trainer.checkpoint import (
-    relocate_optimizer_state, restore_rng_state, unwrap_compile)
+    AsyncCheckpointSaver, relocate_optimizer_state, restore_rng_state,
+    state_to_cpu, unwrap_compile)
 from segtask_v1.trainer.dist_utils import (
     all_reduce_flag_any, get_rank, get_world_size,
     is_dist_avail_and_initialized, is_main_process)
@@ -133,23 +134,30 @@ class SSLTrainer:
         # 复用 segtask GPUAugmentor（cfg.augment 控制）：在 corruption/mask 之前
         # 对 batch 图像做空间/强度增强，增强后图即新的自洽重建样本。SSL 为
         # 单 FOV（multi_res_scales==[1.0]），max_scale=1。
+        # dataset 现统一输出 3D (B,1,D,H,W)（含 2.5D），因此 GPUAugmentor 的 3D
+        # 空间变换对 2.5D / 3D 均适用；2.5D 的深度折叠推迟到增强之后、
+        # 送模型之前（见 ``_fold_batch``），与 segtask 送模型前口径一致。
+        self._fold_2_5d = int(cfg.model.spatial_dims) == 2
+        # z 轴过采样目标深度：dataset 抽 (1,eD,H,W)（eD=round(pD*ratio)），
+        # trainer 在增强后沿 z 中心裁回 pD（与 segtask aug_oversample_ratio 一致）。
+        self._patch_d = int(cfg.data.patch_size[0])
         self.augmentor = None
         if method.trainer_augment and bool(cfg.augment.enabled):
-            if int(cfg.model.spatial_dims) == 3:
-                self.augmentor = GPUAugmentor(cfg.augment, max_scale=1.0)
-                logger.info(
-                    "Trainer-level augmentation ENABLED for SSL method %r "
-                    "(GPUAugmentor, cfg.augment).", ssl.method)
-            else:
-                # 2.5D 在 dataset 层已把 D 折进通道（4D batch），而 GPUAugmentor
-                # 的空间变换按 (B,C,D,H,W) 3D 体实现，不适用折叠布局。
-                logger.warning(
-                    "cfg.augment.enabled=True but SSL trainer-level "
-                    "augmentation only supports spatial_dims=3 (2.5D input "
-                    "is depth-folded 4D); augmentation disabled.")
+            self.augmentor = GPUAugmentor(cfg.augment, max_scale=1.0)
+            logger.info(
+                "Trainer-level augmentation ENABLED for SSL method %r "
+                "(GPUAugmentor, cfg.augment); spatial_dims=%d (2.5D folded "
+                "after augment).", ssl.method, int(cfg.model.spatial_dims))
 
         self.output_dir = Path(tc.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Async checkpoint saver（opt-in，仅 rank0；与 seg trainer 同款）--
+        # save_async=True 时 state 先深拷到 CPU，后台线程 torch.save，主循环
+        # 不再被写盘阻塞；fit 收尾 close 排空队列保证全部落盘。
+        self._ckpt_saver = (AsyncCheckpointSaver()
+                            if tc.save_async and self._is_main else None)
+
         self.best_loss = math.inf
         self.best_probe = -math.inf
         self._best_saved = False
@@ -346,9 +354,38 @@ class SSLTrainer:
                 out[k] = v.to(self.device, non_blocking=True).float()
             else:
                 out[k] = v
-        if self._memory_format is not None and "image" in out:
+        # channels_last 仅在不需后续折叠（3D）时在此施加；2.5D 待 ``_fold_batch``
+        # 把 (B,1,D,H,W)→(B,D,H,W) 后再转成 4D channels_last（避免对 5D 张量
+        # 施加 4D 内存格式导致报错/无效）。
+        if (self._memory_format is not None and "image" in out
+                and not self._fold_2_5d):
             out["image"] = out["image"].to(memory_format=self._memory_format)
         return out
+
+    def _center_crop_z(self, batch: Dict) -> Dict:
+        """沿 z 轴把 (B,1,eD,H,W) 中心裁回 (B,1,pD,H,W)（eD=round(pD*ratio)）。
+        在数据增强之后、``_fold_batch`` 之前调用；ratio==1.0（eD==pD）时为 no-op。"""
+        img = batch.get("image")
+        if (torch.is_tensor(img) and img.dim() == 5
+                and img.shape[2] > self._patch_d):
+            start = (img.shape[2] - self._patch_d) // 2
+            batch["image"] = img[:, :, start:start + self._patch_d]
+        return batch
+
+    def _fold_batch(self, batch: Dict) -> Dict:
+        """2.5D：把 (B,1,D,H,W) 折成 (B,D,H,W)（D→通道），与 segtask 送模型前
+        ``squeeze_2_5d`` 口径一致；3D 原样返回。在数据增强之后、compute_loss
+        之前调用，使 3D GPUAugmentor 可作用于 2.5D 样本。"""
+        if not self._fold_2_5d:
+            return batch
+        img = batch.get("image")
+        if torch.is_tensor(img) and img.dim() == 5:
+            b, c, d, h, w = img.shape
+            img = img.reshape(b, c * d, h, w)
+            if self._memory_format is not None:
+                img = img.to(memory_format=self._memory_format)
+            batch["image"] = img
+        return batch
 
     def _export_state_dict(self) -> Dict:
         """EMA 优先的可迁移骨干权重快照（键与 build_model 同名）。"""
@@ -372,6 +409,17 @@ class SSLTrainer:
             os.fsync(f.fileno())
         os.replace(tmp, path)                 # 同文件系统内原子替换
 
+    def _write_ckpt(self, state: Dict, path: Path) -> None:
+        """落盘一份 ckpt：save_async 时深拷 CPU 后交后台线程（指纹已在主线程
+        对在线张量算好，深拷后字节一致），否则同步原子写。"""
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(
+                state_to_cpu(state), path,
+                on_done=lambda p=path: logger.debug(
+                    "Async checkpoint saved: %s", p))
+        else:
+            self._atomic_save(state, path)
+
     @staticmethod
     def _state_fingerprint(state: Dict[str, torch.Tensor]) -> str:
         """权重快照内容指纹（sha256）：写入 ckpt，加载时校验完整性/一致性。
@@ -393,7 +441,7 @@ class SSLTrainer:
                 self._best_saved = True
             return path
         model_state = self._export_state_dict()
-        self._atomic_save({
+        self._write_ckpt({
             "epoch": epoch,
             "model_state_dict": model_state,
             "ssl_method": self.ssl.method,
@@ -409,6 +457,14 @@ class SSLTrainer:
         """全状态 resume checkpoint（与 ssl_best/last 的导出快照正交）：
         method 完整 state_dict（含方法内 teacher/queue/center 等 buffer）+
         optimizer/scheduler/scaler/EMA + 进度/最优指标 + RNG。"""
+        # ZeRO 优化器状态分片在各 rank：保存前需全 rank 集合式 consolidate 到
+        # rank0（必须在非主 rank 早退之前调用，否则集合通信挂死）；consolidate
+        # 后仅 rank0 持有全局状态，故 state 仅在 rank0 组装/落盘。
+        if hasattr(self.optimizer, "consolidate_state_dict"):
+            self.optimizer.consolidate_state_dict(to=0)
+        path = self.output_dir / "ssl_resume.pt"
+        if not self._is_main:          # DDP：仅 rank0 落盘
+            return path
         rng_state = {
             "torch_cpu": torch.get_rng_state(),
             "torch_cuda": (torch.cuda.get_rng_state_all()
@@ -433,9 +489,7 @@ class SSLTrainer:
             state["ema_state_dict"] = self.ema.state_dict()
         state["fingerprint"] = self._state_fingerprint(
             state["method_state_dict"])
-        path = self.output_dir / "ssl_resume.pt"
-        if self._is_main:              # DDP：仅 rank0 落盘
-            self._atomic_save(state, path)
+        self._write_ckpt(state, path)
         return path
 
     def _load_resume(self, path: str) -> None:
@@ -568,6 +622,10 @@ class SSLTrainer:
                         "state as ssl_best.pt (fallback).")
 
         self._monitor_finalize("finished")
+        if self._ckpt_saver is not None:
+            # 收尾前排空异步写盘队列；写盘异常在此抛出。
+            self._ckpt_saver.close()
+            self._ckpt_saver = None
         logger.info("SSL pretrain done. best_loss=%.5f, best_probe=%.4f. Use "
                     "ssl_best.pt via train.pretrain for downstream.",
                     self.best_loss, self.best_probe)
@@ -646,6 +704,10 @@ class SSLTrainer:
                 img, _, _ = self.augmentor(
                     img, torch.zeros_like(img[:, :1]))
                 batch["image"] = img
+            # 增强（在 3D 体上）完成后：先沿 z 中心裁掉过采样余量（eD→pD），
+            # 再（2.5D）把深度折进通道，最后送方法。
+            batch = self._center_crop_z(batch)
+            batch = self._fold_batch(batch)
 
             with autocast(device_type="cuda", enabled=self.use_amp,
                           dtype=self.amp_dtype):

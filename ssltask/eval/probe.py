@@ -64,6 +64,7 @@ def build_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
             global_mean=dc.global_mean,
             global_std=dc.global_std,
             spatial_dims=spatial_dims,
+            patch_mode=dc.patch_mode,
             cache_enabled=dc.cache_mode == "memory",
             cache_max_volumes=dc.cache_max_volumes,
             deterministic=deterministic,
@@ -233,6 +234,14 @@ class SegProbe:
         if cuda_state is not None:
             torch.cuda.set_rng_state_all(cuda_state)
 
+    def _fold_2_5d_t(self, x: torch.Tensor) -> torch.Tensor:
+        """2.5D：(B,1,D,H,W)→(B,D,H,W)（D 折进通道），与 segtask 送模型前口径一致；
+        3D 原样返回。LabeledPatchDataset 现统一输出 3D，折叠在此消费方完成。"""
+        if self.spatial_dims == 2 and x.dim() == 5:
+            b, c, d, h, w = x.shape
+            return x.reshape(b, c * d, h, w)
+        return x
+
     def _forward_logits(self, head: nn.Module, img: torch.Tensor) -> torch.Tensor:
         feats = self.encoder(img)
         return head(feats, img.shape[2:])
@@ -241,8 +250,9 @@ class SegProbe:
                     optimizer: torch.optim.Optimizer,
                     loss_fn: Callable[[torch.Tensor, torch.Tensor],
                                       torch.Tensor]) -> torch.Tensor:
-        img = batch["image"].to(self.device).float()
-        target = self._binary_target(batch["label"].to(self.device).float())
+        img = self._fold_2_5d_t(batch["image"].to(self.device).float())
+        target = self._binary_target(
+            self._fold_2_5d_t(batch["label"].to(self.device).float()))
         if self.finetune:
             self._set_encoder_trainable(True)
             logits = self._forward_logits(head, img)
@@ -277,8 +287,9 @@ class SegProbe:
         head.eval()
         with torch.no_grad():
             for batch in loader:
-                img = batch["image"].to(self.device).float()
-                tgt = self._binary_target(batch["label"].to(self.device).float())
+                img = self._fold_2_5d_t(batch["image"].to(self.device).float())
+                tgt = self._binary_target(
+                    self._fold_2_5d_t(batch["label"].to(self.device).float()))
                 logits = self._forward_logits(head, img)
                 prob = torch.sigmoid(logits)
                 res = hd95_batch(prob.cpu().numpy(), tgt.cpu().numpy(),

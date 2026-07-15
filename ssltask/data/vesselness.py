@@ -12,6 +12,7 @@ encoder/decoder，直击分割的 precision 短板（学会只在管状证据处
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Sequence, Tuple
 
 import torch
@@ -65,22 +66,47 @@ def _hessian_components(x: torch.Tensor, spatial_dims: int,
     return comps
 
 
+def _eigvalsh_2x2(a: torch.Tensor, b: torch.Tensor,
+                  c: torch.Tensor) -> torch.Tensor:
+    """对称 2x2 [[a,b],[b,c]] 的特征值（闭式），按值升序返回 (...,2)。"""
+    half_tr = (a + c) * 0.5
+    delta = torch.sqrt(((a - c) * 0.5) ** 2 + b * b)
+    return torch.stack([half_tr - delta, half_tr + delta], dim=-1)
+
+
+def _eigvalsh_3x3(a00: torch.Tensor, a11: torch.Tensor, a22: torch.Tensor,
+                  a01: torch.Tensor, a02: torch.Tensor,
+                  a12: torch.Tensor) -> torch.Tensor:
+    """对称 3x3 的特征值（Smith 1961 三角闭式），按值升序返回 (...,3)。"""
+    q = (a00 + a11 + a22) / 3.0
+    p1 = a01 ** 2 + a02 ** 2 + a12 ** 2
+    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
+    p = torch.sqrt((p2 / 6.0).clamp_min(1e-12))
+    b00, b11, b22 = (a00 - q) / p, (a11 - q) / p, (a22 - q) / p
+    b01, b02, b12 = a01 / p, a02 / p, a12 / p
+    det_b = (b00 * (b11 * b22 - b12 * b12)
+             - b01 * (b01 * b22 - b12 * b02)
+             + b02 * (b01 * b12 - b11 * b02))
+    phi = torch.acos((det_b * 0.5).clamp(-1.0, 1.0)) / 3.0
+    e_hi = q + 2.0 * p * torch.cos(phi)
+    e_lo = q + 2.0 * p * torch.cos(phi + 2.0 * math.pi / 3.0)
+    e_mid = 3.0 * q - e_hi - e_lo
+    return torch.stack([e_lo, e_mid, e_hi], dim=-1)
+
+
 def _eigvals_abs_sorted(comps: Dict[Tuple[int, int], torch.Tensor],
                         spatial_dims: int) -> torch.Tensor:
-    """组装对称 Hessian → 特征值，按 |λ| 升序返回 (B,C,*spatial,spatial_dims)。"""
+    """组装对称 Hessian → 特征值，按 |λ| 升序返回 (B,C,*spatial,spatial_dims)。
+
+    采用闭式特征值（而非 ``torch.linalg.eigvalsh``）：后者在 CUDA 上走
+    cuSOLVER 批量 Jacobi，对数百万个 2x2/3x3 小矩阵会报
+    ``CUSOLVER_STATUS_INVALID_VALUE``，且无 bf16 kernel。闭式解与 dtype 无关、
+    无需 cuSOLVER、显著更快。"""
     if spatial_dims == 3:
-        h00, h11, h22 = comps[(0, 0)], comps[(1, 1)], comps[(2, 2)]
-        h01, h02, h12 = comps[(0, 1)], comps[(0, 2)], comps[(1, 2)]
-        row0 = torch.stack([h00, h01, h02], dim=-1)
-        row1 = torch.stack([h01, h11, h12], dim=-1)
-        row2 = torch.stack([h02, h12, h22], dim=-1)
-        mat = torch.stack([row0, row1, row2], dim=-2)
+        eig = _eigvalsh_3x3(comps[(0, 0)], comps[(1, 1)], comps[(2, 2)],
+                            comps[(0, 1)], comps[(0, 2)], comps[(1, 2)])
     else:
-        h00, h11, h01 = comps[(0, 0)], comps[(1, 1)], comps[(0, 1)]
-        row0 = torch.stack([h00, h01], dim=-1)
-        row1 = torch.stack([h01, h11], dim=-1)
-        mat = torch.stack([row0, row1], dim=-2)
-    eig = torch.linalg.eigvalsh(mat)                       # 升序（按值）
+        eig = _eigvalsh_2x2(comps[(0, 0)], comps[(0, 1)], comps[(1, 1)])
     order = torch.argsort(eig.abs(), dim=-1)               # 按 |λ| 升序
     return torch.gather(eig, -1, order)
 
@@ -158,7 +184,7 @@ def frangi_vesselness(
                 f"spacing length {len(sp)} != spatial_dims {spatial_dims}.")
         if any(s <= 0 for s in sp):
             raise ValueError(f"spacing must be all-positive; got {sp}.")
-    xf = x.float()
+    xf = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
     out = None
     for sigma in scales:
         sigma = float(sigma)

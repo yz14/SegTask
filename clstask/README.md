@@ -2,6 +2,8 @@
 
 clstask 复用 `segtask_v1` 的配置、几何拓扑、预处理、优化器、AMP 和 EMA 基建，提供医学影像分类训练与推理闭环。它支持 3D 与 2.5D 两种几何，能够直接接入 ssltask 预训练的 encoder 权重，也能用自己的分类骨干单独训练。
 
+> 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
+
 ## 模块树
 
 ```text
@@ -17,7 +19,8 @@ clstask/
 │   ├── cls_dataset.py  # 分类样本、标签派生与读取逻辑
 │   └── loader.py  # 配对、切分与 dataloader 工厂
 ├── docs/  # 方案与模型综述
-│   └── classification_models_survey.md  # 分类骨干与设计备忘
+│   ├── classification_models_survey.md  # 分类骨干与设计备忘
+│   └── WORKFLOW.md  # 端到端训练/推理流程
 ├── losses/  # 分类损失
 │   ├── __init__.py  # 损失包入口
 │   └── cls_loss.py  # CE / BCE / focal 等分类损失

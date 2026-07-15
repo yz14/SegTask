@@ -1,0 +1,240 @@
+# =============================================================================
+# ssltask · lung-vessel 2.5D 骨干自监督预训练（单文件多方案）
+#
+# 运行：  python -m ssltask.pretrain --config configs/ssltask_ves_pretrain.yaml
+# 产出：  outputs/ssltask_ves_prior/ssl_best.pt   （method=prior 时）
+# 衔接：  vessel 下游训练 --override train.pretrain=outputs/ssltask_ves_prior/ssl_best.pt
+#         （下游已 pretrain_strict:false → encoder.* 命中，seg/aux/深监督头保持随机）
+#
+# 本文件的 model / data 几何已与你的 vessel 分割 yaml 逐项对齐，保证 encoder 权重
+# 1:1 迁移。spatial_dims(=2) 与 in_channels(=12) 由 patch_mode=2_5d + patch_size[0]
+# 自动派生，无需手写。
+#
+# -----------------------------------------------------------------------------
+# 【推荐实施顺序】（差异只在文件末尾 `ssl:` 段，故合并到本文件；切换方法只改 ssl+output_dir）
+#
+#   阶段 1（首选，vessel 最对症）：method=prior（Frangi vesselness 回归）
+#       —— 即本文件当前激活配置。把"什么是管状结构"的几何先验灌进 encoder/decoder。
+#       BatchNorm-safe、bf16-safe。output_dir: outputs/ssltask_ves_prior
+#
+#   阶段 2（并列/对照，稠密重建、CT 原生、稳）：method=genesis
+#       —— 见文件末尾【切换到 genesis】注释块：把 ssl: 段整体替换、output_dir 改为
+#          outputs/ssltask_ves_genesis 即可，其余 data/model/train 完全不动。
+#
+#   阶段 3（两段式，vessel 提升潜力最大）：genesis 打底 → 再用 prior 续训
+#       —— 先按阶段 2 跑出 genesis_best.pt；再回到本 prior 配置，
+#          在 train: 段设 pretrain: outputs/ssltask_ves_genesis/ssl_best.pt 续训，
+#          output_dir 改 outputs/ssltask_ves_prior_ft。通用纹理 + 血管先验叠加。
+#
+#   ⚠ 不推荐用于此 backbone：spark / sparkdino（norm_type=batch 会破坏 SparK 的
+#     掩码-稠密归一化等价，spark_modules.enable_masked_instance_norm 仅对 InstanceNorm
+#     生效，BatchNorm 下统计被置零位点污染）；dino/ibot/byol/moco（全局导向，对细
+#     管状 vessel 弱 + BN teacher/student + bf16 非有限 loss 风险）。
+# =============================================================================
+
+data:
+  # SSL 价值来源：大规模【无标注】image-only npz 池（只读 "image" 键）。改成你的目录。
+  npz_dir: "/data0/yzhen/data/tx_ves/ssl_npz"   # TODO: 指向无标注大语料（可含 tx_ves 全量 + 公开胸部 CT）
+  npz_suffix: ".npz"
+
+  label_values: [0, 1]                 # 仅供 segtask Config 校验；SSL 不读 label
+  num_classes : 2
+
+  # —— 与下游 vessel yaml 对齐（2.5D） ——
+  patch_size: [12, 320, 400]           # D 折进通道 → in_channels=12（自动派生）
+  patch_mode: "2_5d"
+
+  multi_res_scales    : [1.0]          # SSL 强制单视图（validate_ssl 要求 len==1；下游的 [1.0,1.5,2.0] 多 FOV 在 image-only SSL 通路不支持）
+  aug_oversample_ratio: 1.0            # SSL 无 oversample 裁剪余量
+
+  keep_native_view_depth: true
+  z_boundary_mode       : "edge_pad"
+
+  intensity_min: -1024.0
+  intensity_max: 1024.0
+  normalize    : "minmax"
+
+  batch_size     : 2                   # 2.5D 大 patch，显存重；配 grad_accum 提升等效 batch
+  num_workers    : 16
+  prefetch_factor: 8
+  pin_memory     : true
+
+  samples_per_volume: 8
+
+
+augment:
+  # 重建/回归类 SSL 的 trainer 级通用增强（在 corruption/vesselness 之前）。
+  # 只开保守空间增强；强度扰动对 prior 关闭（保持 vesselness 目标与输入一致）。
+  enabled: true
+  random_flip_prob      : 0.2
+  random_affine_prob    : 0.3
+  random_translate_range: [0.0, 0.0]   # 禁平移，防边缘复制伪影
+  elastic_deform_prob   : 0.0
+  grid_dropout_prob     : 0.0
+  random_brightness_prob: 0.0
+  random_contrast_prob  : 0.0
+  random_gamma_prob     : 0.0
+  gaussian_noise_prob   : 0.0
+  gaussian_blur_prob    : 0.0
+
+
+model:
+  # —— 必须与下游 vessel yaml 的 model 段逐项一致，否则 strict=False 静默丢权重 ——
+  arch                    : "unet"
+  backbone                : "resnet"
+  encoder_channels        : [64, 128, 256, 512, 512]
+  blocks_per_level        : 2
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]
+  decoder_blocks_per_stage: [2, 2, 2, 2]
+  block_type              : "basic"
+
+  norm_type               : "batch"
+  norm_groups             : 8
+  activation              : "leakyrelu"
+  dropout                 : 0.0
+  drop_path_rate          : 0.0
+
+  stem_mode               : "dual"
+  decoder_type            : "unet"
+  downsample_mode         : "conv"
+  downsample_strides      : []
+  anisotropic_pooling     : false
+  upsample_mode           : "trilinear"
+  upsample_norm_act       : true
+  skip_mode               : "cat"
+
+  attention_type          : "se"
+  se_reduction            : 16
+  skip_attention          : false
+  attn_gate_norm          : "batch"
+
+  # 以下头/监督在 SSL 阶段被丢弃（仅预训练 encoder/decoder），列出以保持几何一致。
+  deep_supervision        : true
+  aux_seg_supervision     : true
+  aux_head_mode           : "conv"
+
+  stem_fusion_mode        : "multi_stem_proj"
+  lift_2_5d_to_3d         : false
+
+  grad_checkpointing      : true
+  grad_ckpt_encoder_stages: []
+
+  multirf_enabled       : true
+  multirf_dilations     : [1, 2, 3]
+  multirf_mode          : "split"
+  multirf_fusion        : "concat_proj"
+  multirf_axes          : "hw"
+  multirf_encoder_stages: [0, 1, 1, 1, 1]
+  multirf_decoder_stages: [1, 1, 1, 0]
+  multirf_branch_norm_act: true
+
+  selfattn_enabled       : true
+  selfattn_type          : "softmax"
+  selfattn_num_heads     : 4
+  selfattn_head_dim      : -1
+  selfattn_zero_init     : true
+  selfattn_rope          : false
+  selfattn_ffn           : false
+  selfattn_ffn_ratio     : 4.0
+  selfattn_encoder_stages: [0, 0, linear, softmax, softmax]
+  selfattn_decoder_stages: [softmax, linear, 0, 0]
+
+
+train:
+  # —— 省显存/提速开关一览（均已在 SSL trainer 实现，见 ssl_trainer.py / pretrain.py）——
+  #   省显存：grad_checkpointing(model 段) + zero_redundancy_optimizer + bf16 AMP
+  #           + grad_accum_steps + cuda_expandable_segments + val_empty_cache
+  #   提  速：adamw_fused + channels_last + compile_mode + save_async
+  # 本文件已把「省显存」项全部打开（2.5D 大 patch 显存吃紧，优先保显存）；
+  # 「提速」项里 compile 因动态 shape/自定义模块有失败风险，默认 none，稳定后可开。
+  epochs: 400                          # SSL 长 schedule；按语料规模与算力调整
+
+  gpus                       : [1, 3]  # 按你机器可用卡改
+  ddp_find_unused_parameters : false
+  zero_redundancy_optimizer  : true    # 省显存：优化器状态跨卡分片（ZeRO-1）
+  cuda_expandable_segments   : true    # 省显存：减少碎片，缓解大 patch OOM
+  val_empty_cache            : true    # 省显存：探针/验证后清 CUDA 缓存
+
+  optimizer   : "adamw"
+  adamw_fused : true
+  lr          : 1.0e-3                 # 从零预训练可比下游 1e-4 稍大
+  weight_decay: 1.0e-4
+
+  scheduler    : "cosine"
+  warmup_epochs: 5
+  warmup_lr    : 1.0e-6
+  cosine_min_lr: 1.0e-6
+
+  grad_accum_steps: 4                  # 等效 batch = batch_size(2) × accum(4) × #gpus
+  grad_clip_norm  : 12.0
+
+  # prior/genesis 为 L1 回归/重建，数值稳定 → bf16 安全。
+  # （注：若日后换用对比/自蒸馏类方法，SSL trainer 在 bf16 路径对非有限 loss 不阻止
+  #   optimizer.step，需先加防护再开 bf16——见 ssltask_investigation_report §4.1。）
+  use_amp  : true                      # 省显存+提速：混合精度
+  amp_dtype: "auto"                    # auto→cuda 上大概率 bf16（回归/重建数值稳）
+
+  channels_last: false                 # 提速(非省显存)：2.5D=2D conv，NHWC 在部分卡略快；有风险默认关，可试开
+  compile_mode : "none"                # 提速：torch.compile；自定义模块/动态 shape 下可能编译失败，稳定后再开 "default"
+
+  use_ema  : true
+  ema_decay: 0.999
+  # ema_device: "cpu"                  # 省显存(可选)：EMA 影子权重放 CPU，省一份模型显存，代价是每步 H2D/D2H 拷贝
+
+  output_dir: "outputs/ssltask_ves_prior"
+
+  save_async: true
+  log_every : 10
+
+  seed         : 42
+  deterministic: false
+
+  # 两段式（阶段 3）时启用：先跑 genesis，再在此填其 best 续训。
+  # pretrain      : "outputs/ssltask_ves_genesis/ssl_best.pt"
+  # pretrain_strict: false
+
+
+ssl:
+  # ===== 阶段 1（当前激活）：Frangi vesselness 回归 =====
+  method : "prior"
+  recon_loss: "l1"
+
+  prior_scales       : [1.0, 2.0, 3.0]   # 覆盖细→粗血管口径（体素单位）
+  # prior_spacing    : [sz, sy, sx]      # 【推荐】填入你数据的 spacing（长度=spatial_dims=2，即 [H,W] 的 mm），
+  #                                      #  则 prior_scales 按物理 mm 各向异性解释，对薄层/各向异性 CT 更准
+  prior_alpha        : 0.5
+  prior_beta         : 0.5
+  prior_black_vessels: false             # CT 增强血管偏亮
+  prior_corrupt_input: false             # 纯净输入 → vesselness 目标
+
+  save_every: 10
+
+  # —— 在线分割探针（强烈建议开启：按 vessel Dice 选 best，而非按 SSL 代理 loss）——
+  # 需要一小份【含 image+label】的 vessel 标注 npz 目录。
+  # probe_enabled           : true
+  # probe_data_dir          : "/data0/yzhen/data/tx_ves/probe_npz"
+  # probe_every             : 10
+  # probe_iters             : 200
+  # probe_lr                : 1.0e-2
+  # probe_val_ratio         : 0.3
+  # probe_samples_per_volume: 4
+  # probe_select_best       : true
+
+  # =========================================================================
+  # 【切换到 genesis（阶段 2）】：把上面整个 ssl: 段替换为下面这段，
+  #  并把 train.output_dir 改成 outputs/ssltask_ves_genesis：
+  #
+  # ssl:
+  #   method : "genesis"
+  #   recon_loss: "l1"
+  #   nonlinear_prob     : 0.9          # 非线性强度变换（学 HU/对比剂不变性）
+  #   local_shuffle_prob : 0.5
+  #   local_shuffle_blocks   : 100
+  #   local_shuffle_max_block: [4, 8, 8]
+  #   paint_prob      : 0.9             # 内/外补全
+  #   inner_paint_prob: 0.5
+  #   paint_count     : 5
+  #   paint_block_range: [0.1, 0.25]
+  #   save_every: 10
+  #   # probe_* 同上（建议开启）
+  # =========================================================================
