@@ -140,7 +140,11 @@ class ImageOnlyPatchDataset(Dataset):
         patch_mode       : str = "cubic",
         aug_oversample_ratio: float = 1.0,
         cache_enabled    : bool = False,
-        cache_max_volumes: int = 0):
+        cache_max_volumes: int = 0,
+        sample_content_bias: bool = False,
+        sample_fg_ratio  : float = 0.5,
+        sample_fg_thresh : float = 0.1,
+        sample_max_tries : int = 4):
         self.paths = list(npz_paths)
         if not self.paths:
             raise ValueError("ImageOnlyPatchDataset got empty npz_paths.")
@@ -171,6 +175,13 @@ class ImageOnlyPatchDataset(Dataset):
         self.global_mean = float(global_mean)
         self.global_std = float(global_std)
         self.spv = max(int(samples_per_volume), 1)
+        # 内容偏置拒绝采样（opt-in，默认关=均匀随机中心）：以 fg_ratio 概率抽
+        # max_tries 个候选中心、取前景占比（归一强度 > fg_thresh 的体素比例）
+        # 最高者；其余样本仍均匀随机，保留背景多样性（见 SSLConfig.sample_*）。
+        self.sample_content_bias = bool(sample_content_bias)
+        self.sample_fg_ratio = float(sample_fg_ratio)
+        self.sample_fg_thresh = float(sample_fg_thresh)
+        self.sample_max_tries = max(int(sample_max_tries), 1)
         # 逐 worker LRU 缓存（复用 segtask VolumeCache：pickle 到 worker 时清空），
         # 避免 samples_per_volume>1 时每个 patch 都重新解压全卷。
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -200,6 +211,15 @@ class ImageOnlyPatchDataset(Dataset):
         self._img_cache.put(path, img)
         return img
 
+    def _fg_fraction(self, patch: np.ndarray) -> float:
+        """前景占比：预处理归一后强度 > sample_fg_thresh 的体素比例。"""
+        return float((patch > self.sample_fg_thresh).mean())
+
+    def _biased(self) -> bool:
+        """本次抽样是否做内容偏置（否则均匀随机，保留背景多样性）。"""
+        return (self.sample_content_bias
+                and random.random() < self.sample_fg_ratio)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path = self.paths[idx % len(self.paths)]
         vol = self._load_volume(path)              # (D, H, W) fp32
@@ -212,14 +232,32 @@ class ImageOnlyPatchDataset(Dataset):
             # 与 segtask SegDataset3D(2_5d/z_axis) 抽取口径一致：仅沿 z 抽 eD 片
             # （eD>=pD 含过采样余量，越界 edge-pad），面内 H/W 整片 resize 到
             # (pH,pW)（不裁窗，与下游 encoder 看到的空间尺度一致）。
-            z = _rand_center(vol.shape[0], eD)
-            patch = extract_z_patch_padded(vol, z, eD)            # (eD, H, W)
+            patch = extract_z_patch_padded(
+                vol, _rand_center(vol.shape[0], eD), eD)          # (eD, H, W)
+            if self._biased():
+                # 在 resize 前的原分辨率 slab 上估前景占比，多候选取最高者。
+                best_fg = self._fg_fraction(patch)
+                for _ in range(self.sample_max_tries - 1):
+                    cand = extract_z_patch_padded(
+                        vol, _rand_center(vol.shape[0], eD), eD)
+                    fg = self._fg_fraction(cand)
+                    if fg > best_fg:
+                        best_fg, patch = fg, cand
             patch = resize_3d(patch, eD, pH, pW, is_label=False)  # (eD, pH, pW)
         else:
             # cubic：三轴裁窗（越界 edge-pad）；z 轴含过采样余量。
             center = tuple(_rand_center(d, p)
                            for d, p in zip(vol.shape, self.extract_size))
             patch = _extract_cubic_patch(vol, center, self.extract_size)
+            if self._biased():
+                best_fg = self._fg_fraction(patch)
+                for _ in range(self.sample_max_tries - 1):
+                    c = tuple(_rand_center(d, p)
+                              for d, p in zip(vol.shape, self.extract_size))
+                    cand = _extract_cubic_patch(vol, c, self.extract_size)
+                    fg = self._fg_fraction(cand)
+                    if fg > best_fg:
+                        best_fg, patch = fg, cand
         t = torch.from_numpy(patch.astype(np.float32, copy=False))
         # 统一返回 3D (1,eD,pH,pW)；trainer 在增强后沿 z 中心裁回 pD，再（2.5D）
         # 把深度折进通道（见 ssl_trainer._center_crop_z / _fold_batch），与 segtask 一致。
@@ -417,8 +455,11 @@ class LabeledPatchDataset(Dataset):
         return out
 
 
-def build_ssl_dataloader(cfg) -> DataLoader:
+def build_ssl_dataloader(cfg, ssl=None) -> DataLoader:
     """按 ``cfg.data`` 构造 image-only 训练 dataloader（无 val：见 §0.5 在线探针）。
+
+    ``ssl``（可选 :class:`ssltask.config.SSLConfig`）：提供时接入内容偏置拒绝
+    采样（``ssl.sample_content_bias`` 等；默认关，行为不变）。
 
     依据 ``cfg.model.spatial_dims`` 自动选 3D / 2.5D 折叠输出。2.5D（折叠 D 进通道）
     仅支持单 FOV：要求 ``in_channels == patch_size[0]``（即 ``multi_res_scales==[1.0]``）；
@@ -450,7 +491,11 @@ def build_ssl_dataloader(cfg) -> DataLoader:
         patch_mode        = dc.patch_mode,
         aug_oversample_ratio = dc.aug_oversample_ratio,
         cache_enabled     = dc.cache_mode == "memory",
-        cache_max_volumes = dc.cache_max_volumes)
+        cache_max_volumes = dc.cache_max_volumes,
+        sample_content_bias = bool(getattr(ssl, "sample_content_bias", False)),
+        sample_fg_ratio   = float(getattr(ssl, "sample_fg_ratio", 0.5)),
+        sample_fg_thresh  = float(getattr(ssl, "sample_fg_thresh", 0.1)),
+        sample_max_tries  = int(getattr(ssl, "sample_max_tries", 4)))
     num_workers = int(dc.num_workers)
     kwargs: Dict[str, object] = {}
     if num_workers > 0:

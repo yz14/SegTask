@@ -83,6 +83,27 @@ class SSLConfig:
     # 按各向异性 spacing 计算高斯/Hessian（各向异性数据下管径尺度物理一致）。空=
     # 体素单位(旧行为)。数据已重采样到统一 target_spacing 时填该值即可。
     prior_spacing: List[float] = field(default_factory=list)
+    # 2.5D（spatial_dims==2）下 vesselness 目标的计算维度：
+    #   True （默认，推荐）：在 trainer 折叠深度**之前**的 (B,1,D,H,W) 体上按 3D
+    #     Frangi 计算，再折回 (B,D,H,W) 作目标——沿 z 走行的血管在轴位切片里表现为
+    #     亮斑、被 2D Frangi 的 blobness 项系统性压制，3D 计算可正确检出；且归一在
+    #     整卷上进行，层间目标尺度一致。
+    #   False：对折叠后的每张切片独立算 2D（旧行为）——丢失穿面血管、层间尺度不一。
+    # 给定 prior_spacing 时，target_3d 下其长度须为 3 (sz,sy,sx)。spatial_dims==3
+    # （3D cubic）本就按 3D 计算，此项不生效。
+    prior_target_3d: bool = True
+
+    # --- image-only 采样：内容偏置拒绝采样（可选；默认关=沿 z 均匀随机中心）---
+    # SSL 无标注，默认沿 z 均匀随机抽 patch；背景切片多的数据集会产出大量近空
+    # patch（vesselness 目标近乎全零 / 掩码重建信息量低，监督退化）。开启后：以
+    # ``sample_fg_ratio`` 概率对该样本做“内容偏置”——抽 ``sample_max_tries`` 个候选
+    # z 中心，取前景占比（归一强度 > ``sample_fg_thresh`` 的体素比例）最高者；其余
+    # 样本仍均匀随机，保留背景/解剖多样性，避免过拟合强度启发式。cubic 模式同理
+    # （三轴中心）。阈值以**预处理归一后**的强度为准（minmax→[0,1]）。
+    sample_content_bias: bool = False
+    sample_fg_ratio: float = 0.5
+    sample_fg_thresh: float = 0.1
+    sample_max_tries: int = 4
 
     # --- method='simmim'：mask token 稠密掩码图像建模（SSL.md 方案②）---
     # 掩码比例（SimMIM 经验 0.5–0.6）。
@@ -294,12 +315,24 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
             f"ssl.prior_alpha/prior_beta must be > 0; "
             f"got {ssl.prior_alpha}, {ssl.prior_beta}.")
         if ssl.prior_spacing:
+            # target_3d 且 2.5D 时，目标在 (B,1,D,H,W) 体上按 3D 计算 → 需 3 轴
+            # 间距 (sz,sy,sx)；否则按 spatial_dims 轴数。
+            spacing_ndim = (3 if (bool(ssl.prior_target_3d)
+                                  and int(cfg.model.spatial_dims) == 2)
+                            else int(cfg.model.spatial_dims))
             _require(
-                len(ssl.prior_spacing) == cfg.model.spatial_dims
+                len(ssl.prior_spacing) == spacing_ndim
                 and all(float(v) > 0 for v in ssl.prior_spacing),
-                f"ssl.prior_spacing (if set) must have length "
-                f"model.spatial_dims ({cfg.model.spatial_dims}) and be "
-                f"all-positive; got {ssl.prior_spacing}.")
+                f"ssl.prior_spacing (if set) must have length {spacing_ndim} "
+                f"(=3 for 2.5D prior_target_3d else model.spatial_dims "
+                f"{cfg.model.spatial_dims}) and be all-positive; "
+                f"got {ssl.prior_spacing}.")
+    _require(
+        0.0 <= float(ssl.sample_fg_ratio) <= 1.0,
+        f"ssl.sample_fg_ratio must be in [0,1]; got {ssl.sample_fg_ratio}.")
+    _require(
+        int(ssl.sample_max_tries) >= 1,
+        f"ssl.sample_max_tries must be >= 1; got {ssl.sample_max_tries}.")
     if ssl.method == "simmim":
         _require(
             0.0 < float(ssl.mim_mask_ratio) < 1.0,

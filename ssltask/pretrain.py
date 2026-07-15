@@ -38,7 +38,7 @@ def setup_logging(output_dir: str, level: str = "INFO") -> None:
 
 def _build_and_fit(cfg, ssl, device: torch.device):
     logger = logging.getLogger(__name__)
-    train_loader = build_ssl_dataloader(cfg)
+    train_loader = build_ssl_dataloader(cfg, ssl)
     method = build_method(cfg, ssl, device)
 
     if not dist.is_initialized() or dist.get_rank() == 0:

@@ -128,7 +128,11 @@ class SSLTrainer:
 
         # --- EMA (over the method's module; orthogonal to any method-internal teacher) ---
         # 绑裸模型（compile 包装前），shadow key 无 ``_orig_mod.`` 前缀。
-        self.ema = ModelEMA(model, tc.ema_decay) if tc.use_ema else None
+        # 与 segtask trainer 一致接入 warmup（早期低 decay，避免随机初值长期拖累
+        # shadow）与 ema_device（可 offload 到 CPU 省显存，配置 train.ema_device）。
+        self.ema = (ModelEMA(model, tc.ema_decay, warmup=tc.ema_warmup,
+                             offload_device=(tc.ema_device or None))
+                    if tc.use_ema else None)
 
         # --- 通用增强（仅重建类方法，见 SSLMethod.trainer_augment）-----------
         # 复用 segtask GPUAugmentor（cfg.augment 控制）：在 corruption/mask 之前
@@ -695,6 +699,54 @@ class SSLTrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
         group_has_nonfinite = False
+        # 待同步损失/日志缓存：只缓 device 标量（0-dim tensor），仅在日志步 /
+        # bf16 累积边界处批量 ``.tolist()`` 一次性取回，从而免去每 micro-step 一次
+        # host/device 同步（与 segtask trainer 的 pending 机制同源）。每项：
+        # (step, 未缩放 loss 张量, batch_size, logs)。
+        pending: "list[tuple[int, torch.Tensor, int, Dict]]" = []
+
+        def _flush_pending() -> "float | None":
+            """把 pending 中所有 device 标量（loss + 张量型 log 值）stack 后一次
+            ``.tolist()`` 取回，更新 loss/log meter 与非有限计数；返回最后一个
+            micro-step 的 loss（供日志打印）。单次 D2H 同步。"""
+            nonlocal group_has_nonfinite, nonfinite_steps
+            if not pending:
+                return None
+            flat: "list[torch.Tensor]" = []
+            for _, lt, _, lg in pending:
+                flat.append(lt.reshape(()).float())
+                for v in lg.values():
+                    if torch.is_tensor(v):
+                        flat.append(v.reshape(()).float())
+            vals = torch.stack(flat).tolist()
+            vi = 0
+            last: "float | None" = None
+            for (s, _lt, bs_i, lg) in pending:
+                lv = vals[vi]; vi += 1
+                last = lv
+                mlogs: Dict[str, float] = {}
+                for k, v in lg.items():
+                    if torch.is_tensor(v):
+                        mlogs[k] = vals[vi]; vi += 1
+                    else:
+                        mlogs[k] = float(v)
+                if math.isfinite(lv):
+                    loss_meter.update(lv, bs_i)
+                    if self._monitor is not None:
+                        for k, fv in mlogs.items():
+                            if math.isfinite(fv):
+                                log_meters.setdefault(
+                                    k, AverageMeter()).update(fv, bs_i)
+                else:
+                    group_has_nonfinite = True
+                    nonfinite_steps += 1
+                    logger.warning(
+                        "Non-finite SSL loss (%s) at epoch %d step %d/%d; "
+                        "excluded from loss meter (surrounding optimizer step "
+                        "skipped).", lv, epoch + 1, s + 1, total_steps)
+            pending.clear()
+            return last
+
         for step, batch in enumerate(self.train_loader):
             batch = self._prepare(batch)
             bs = batch["image"].shape[0] if "image" in batch else tc.batch_size
@@ -715,50 +767,73 @@ class SSLTrainer:
             # 尾批 micro-batch 数不满 accum 时用真实尾长作分母，避免尾组梯度
             # 因除以 accum 而权重偏小。
             effective_accum = self._effective_accum(step, total_steps, accum)
+            loss_unscaled = loss.detach()          # 缓存未缩放全量 loss，暂不同步
             if effective_accum > 1:
                 loss = loss / effective_accum
             self.scaler.scale(loss).backward()
-
-            step_loss = loss.item() * effective_accum
-            if not math.isfinite(step_loss):
-                group_has_nonfinite = True
-                nonfinite_steps += 1
+            pending.append((step, loss_unscaled, bs, logs))
 
             is_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
+            is_log_step = (step + 1) % tc.log_every == 0 or step == 0
+            # bf16/fp32 无 GradScaler 保护：累积边界须先取回本组 loss 有限性以决定
+            # 跳步 → 边界（非 scaler）必 flush；日志步也 flush 以打印。
+            step_loss = None
+            if is_log_step or (is_boundary and not self._scaler_active):
+                step_loss = _flush_pending()
+
             if is_boundary:
                 # DDP：先均值 all-reduce 各 rank 梯度（与 DDP wrapper 数学等价）。
                 self._sync_grads()
+                # 梯度范数（含裁剪）在**跳步决策之前**求出，使 bf16/fp32 能把
+                # “梯度非有限”与“loss 非有限”一并纳入判定（与 segtask trainer 一致）。
+                grad_norm_val = None
+                if tc.grad_clip_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    gn = nn.utils.clip_grad_norm_(
+                        self.method.parameters(), tc.grad_clip_norm)
+                    # fp16+裁剪且未开健康监测：float(gn) 的 D2H 同步可懒惰跳过
+                    # （GradScaler 已独立保护 inf/NaN 梯度）；bf16/fp32 需其值守护。
+                    if (tc.grad_norm_lazy_sync and self._scaler_active
+                            and not self._health_monitor):
+                        grad_norm_val = None
+                    else:
+                        grad_norm_val = float(gn)
+                elif not self._scaler_active:
+                    # bf16/fp32 未裁剪：显式求全局梯度范数作非有限守护（grad 已在
+                    # 无 scaler 下即为真实尺度；all-reduce 后各 rank 一致）。
+                    grad_norm_val = self._global_grad_norm()
+                elif health_on and self._health_grad_norm_when_no_clip:
+                    self.scaler.unscale_(self.optimizer)
+                    grad_norm_val = self._global_grad_norm()
+                grad_nonfinite = (grad_norm_val is not None
+                                  and not math.isfinite(grad_norm_val))
+
                 # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；bf16/fp32
-                # 无此保护，loss 非有限时丢弃本 accum 组梯度，避免 NaN 永久污染
-                # 权重与 EMA（scheduler 照常推进，EMA 不推进）。loss 非有限是
-                # rank 本地信息，DDP 下跳步决策需 all-reduce(any) 统一，维持
-                # 各副本施加相同更新的不变量。
-                skip_optim_step = group_has_nonfinite and not self._scaler_active
-                if self._is_dist and not self._scaler_active:
-                    skip_optim_step = all_reduce_flag_any(
-                        group_has_nonfinite, self.device)
+                # 无此保护 → loss **或梯度**非有限时丢弃本 accum 组，避免 NaN 永久
+                # 污染权重与 EMA。loss/grad 非有限是 rank 本地信息，DDP 下跳步决策
+                # 用 all-reduce(any) 统一，维持各副本施加相同更新的不变量。
+                loss_nonfinite = group_has_nonfinite
                 group_has_nonfinite = False
+                skip_optim_step = False
+                if not self._scaler_active:
+                    skip_optim_step = all_reduce_flag_any(
+                        loss_nonfinite or grad_nonfinite, self.device)
                 stepped = False
                 if skip_optim_step:
+                    causes = ([n for n, f in
+                               (("loss", loss_nonfinite), ("grad", grad_nonfinite))
+                               if f] or ["value"])
                     logger.warning(
                         "Skipping optimizer step at epoch %d step %d/%d: "
-                        "non-finite loss in this accumulation group "
-                        "(amp_dtype without GradScaler protection).",
-                        epoch + 1, step + 1, total_steps)
+                        "non-finite %s in this accumulation group "
+                        "(amp_dtype without GradScaler protection); EMA/method "
+                        "state frozen, scheduler clock advances.",
+                        epoch + 1, step + 1, total_steps, "+".join(causes))
                     self.optimizer.zero_grad(set_to_none=True)
                     self.scheduler.step()
                 else:
-                    grad_norm_val = None
-                    if tc.grad_clip_norm > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        gn = nn.utils.clip_grad_norm_(
-                            self.method.parameters(), tc.grad_clip_norm)
-                        grad_norm_val = float(gn)
-                    elif health_on and self._health_grad_norm_when_no_clip:
-                        self.scaler.unscale_(self.optimizer)
-                        grad_norm_val = self._global_grad_norm()
                     # 方法级梯度干预（如 DINO 末层 freeze）；取消 p.grad 与
-                    # scale 无关，故放在 unscale/clip 之后、scaler.step 之前均安全。
+                    # scale 无关，放在 unscale/clip 之后、scaler.step 之前安全。
                     self.method.on_before_optimizer_step()
                     # fp16：GradScaler 在 inf/NaN 梯度时内部跳过 optimizer.step 并
                     # 降 scale。用 scale 前后对比检测跳步，保证 EMA / 方法状态与
@@ -791,24 +866,13 @@ class SSLTrainer:
                 self._global_step += 1
                 self.method.on_after_step(self._global_step, stepped=stepped)
 
-            if math.isfinite(step_loss):
-                loss_meter.update(step_loss, bs)
-                if self._monitor is not None:
-                    for k, v in logs.items():
-                        fv = float(v)
-                        if math.isfinite(fv):
-                            log_meters.setdefault(
-                                k, AverageMeter()).update(fv, bs)
-            else:
-                logger.warning(
-                    "Non-finite SSL loss at epoch %d step %d/%d; excluded "
-                    "from loss meter.", epoch + 1, step + 1, total_steps)
-
-            if (step + 1) % tc.log_every == 0 or step == 0:
+            if is_log_step and step_loss is not None:
                 logger.debug("  [%d/%d] loss=%.5f lr=%.2e",
                              step + 1, total_steps, step_loss,
                              self.scheduler.get_lr())
 
+        # 取回尾部残留（fp16 仅在日志步 flush，末组可能未取回）。
+        _flush_pending()
         epoch_loss = self._reduce_meter_avg(loss_meter)
         metrics: Dict[str, float] = {"loss": epoch_loss}
         if self._monitor is not None:

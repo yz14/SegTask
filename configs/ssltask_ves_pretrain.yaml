@@ -47,7 +47,7 @@ data:
   multi_res_scales    : [1.0]          # SSL 强制单视图（validate_ssl 要求 len==1；下游的 [1.0,1.5,2.0] 多 FOV 在 image-only SSL 通路不支持）
   aug_oversample_ratio: 1.0            # SSL 无 oversample 裁剪余量
 
-  keep_native_view_depth: true
+  keep_native_view_depth: false        # 单视图（multi_res_scales==[1.0]）下必须为 false（Config 校验要求 >1 视图才可开）；该开关只影响多 FOV 视图深度，对 SSL 单 FOV 无语义
   z_boundary_mode       : "edge_pad"
 
   intensity_min: -1024.0
@@ -108,9 +108,11 @@ model:
   skip_attention          : false
   attn_gate_norm          : "batch"
 
-  # 以下头/监督在 SSL 阶段被丢弃（仅预训练 encoder/decoder），列出以保持几何一致。
+  # 监督头在 SSL 阶段被丢弃（仅预训练 encoder/decoder），不影响 encoder/decoder
+  # 几何与权重命名。aux_seg_supervision 在单视图（n_views==1）下被 Config 校验
+  # 拒绝，故此处关闭（下游多 FOV yaml 照常开启，encoder 权重 1:1 迁移不受影响）。
   deep_supervision        : true
-  aux_seg_supervision     : true
+  aux_seg_supervision     : false
   aux_head_mode           : "conv"
 
   stem_fusion_mode        : "multi_stem_proj"
@@ -169,16 +171,17 @@ train:
   grad_clip_norm  : 12.0
 
   # prior/genesis 为 L1 回归/重建，数值稳定 → bf16 安全。
-  # （注：若日后换用对比/自蒸馏类方法，SSL trainer 在 bf16 路径对非有限 loss 不阻止
-  #   optimizer.step，需先加防护再开 bf16——见 ssltask_investigation_report §4.1。）
+  # （SSL trainer 在 bf16/fp32（无 GradScaler）路径已内置非有限守护：loss 或梯度
+  #   非有限时丢弃该 accum 组、冻结 EMA/方法状态，调度时钟照常推进。）
   use_amp  : true                      # 省显存+提速：混合精度
   amp_dtype: "auto"                    # auto→cuda 上大概率 bf16（回归/重建数值稳）
 
   channels_last: false                 # 提速(非省显存)：2.5D=2D conv，NHWC 在部分卡略快；有风险默认关，可试开
   compile_mode : "none"                # 提速：torch.compile；自定义模块/动态 shape 下可能编译失败，稳定后再开 "default"
 
-  use_ema  : true
-  ema_decay: 0.999
+  use_ema   : true
+  ema_decay : 0.999
+  ema_warmup: true                     # 早期低 decay 慢启动，避免随机初值长期拖累 shadow（与 segtask 一致）
   # ema_device: "cpu"                  # 省显存(可选)：EMA 影子权重放 CPU，省一份模型显存，代价是每步 H2D/D2H 拷贝
 
   output_dir: "outputs/ssltask_ves_prior"
@@ -200,12 +203,21 @@ ssl:
   recon_loss: "l1"
 
   prior_scales       : [1.0, 2.0, 3.0]   # 覆盖细→粗血管口径（体素单位）
-  # prior_spacing    : [sz, sy, sx]      # 【推荐】填入你数据的 spacing（长度=spatial_dims=2，即 [H,W] 的 mm），
-  #                                      #  则 prior_scales 按物理 mm 各向异性解释，对薄层/各向异性 CT 更准
+  prior_target_3d    : true               # 2.5D 下在折叠前的 (D,H,W) 体上按 3D Frangi 算目标（穿面血管敏感 + 层间归一一致）；false=逐切片 2D（旧行为）
+  # prior_spacing    : [sz, sy, sx]      # 【推荐】填入你数据的 spacing（prior_target_3d 时长度=3，即 [z,H,W] 的 mm；
+  #                                      #  否则长度=spatial_dims），则 prior_scales 按物理 mm 各向异性解释，对薄层/各向异性 CT 更准
   prior_alpha        : 0.5
   prior_beta         : 0.5
   prior_black_vessels: false             # CT 增强血管偏亮
   prior_corrupt_input: false             # 纯净输入 → vesselness 目标
+
+  # —— 内容偏置拒绝采样（无标注启发式；缓解背景切片多时大量近空 patch 退化监督）——
+  # 50% 样本：抽 4 个候选 z 中心取前景占比（归一强度>0.1 体素比例）最高者；
+  # 其余 50% 仍均匀随机，保留背景多样性。阈值基于 minmax 归一后强度，可按数据微调。
+  sample_content_bias: true
+  sample_fg_ratio    : 0.5
+  sample_fg_thresh   : 0.1
+  sample_max_tries   : 4
 
   save_every: 10
 
