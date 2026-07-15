@@ -47,7 +47,8 @@ clstask/
 - **标签契约**：支持 `mask` 派生弱标签与 `table` 显式标签表两种来源；`volume` 和 `slice` 粒度的输出形状不同，配置需要和数据源对齐。
 - **损失与增强**：支持 BCE、focal、CE、label smoothing、class weights，以及仅在卷级分类上启用的 mixup / cutmix。
 - **SSL 迁移**：`pretrained_ckpt` 只加载 encoder 相关权重，几何或 backbone 不一致时直接报错，不做静默降级。
-- **推理聚合**：推理时先做 patch 级预测，再按几何与 `agg_mode` 聚合成卷级结果；slice 粒度还会保留逐层输出。
+- **推理聚合**：推理时先做 patch 级预测（抽取几何与训练一致，可选 autocast 与 `cls.tta_flips` 翻转 TTA），再按几何与 `agg_mode` 聚合成卷级结果；slice 粒度还会保留逐层输出。
+- **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；warmup 段保持差分学习率倍率。
 
 ## 用法
 

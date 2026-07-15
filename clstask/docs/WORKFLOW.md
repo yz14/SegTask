@@ -44,9 +44,12 @@ npz 读取（image；mask 标签源 / 前景过采样时再读 label；
   data.cache_mode="memory" 时逐 worker LRU 缓存预处理后的卷，
   同卷连续索引下 samples_per_volume 次采样只读 1 次盘）
  → 预处理（img 归一化，与分割同参）
- → 采样中心（训练随机；可按 data.foreground_oversample_ratio 概率以前景 voxel 为中心；
-   验证中心由 (seed, idx) 确定性派生，epoch 间可复现）
- → 三轴裁 patch（越界 edge 复制；无 H/W 整面 resize）
+ → 采样中心（训练随机；可按 data.foreground_oversample_ratio 概率以前景 voxel 为中心，
+   优先读 npz 预计算 fg_coords/fg_slices（含 *_cls 键时先选类再选点，类均衡），
+   旧 npz 惰性回退一次计算并缓存；验证中心由 (seed, idx) 确定性派生，
+   data.val_grid_coverage=true 时改网格铺点（z 等距 bin / Halton(2,3,5)，与推理同口径））
+ → 按 patch_mode 抽 patch（与分割同语义：whole 全卷 resize；z_axis/2_5d z 轴抽取
+   （越界 edge pad）+ 面内 resize 到 patch H/W；cubic 安全中心域三轴裁剪）
  → 标签派生（mask any() / table 继承卷标签）→ 2.5D 折叠（D→通道）
 （augment.enabled=true 时：训练集输出未折叠 (1,D,H,W) image[+label]，
   由 trainer 在 GPU 上用 segtask GPUAugmentor 联合增强后派生 target 再折叠）
@@ -90,10 +93,15 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 | 混合精度 AMP | `use_amp` / `amp_dtype`（auto/bf16/fp16 + GradScaler）；损失 fp32 + logit clamp |
 | EMA | `use_ema` / `ema_warmup` / `ema_device`；验证与 best 保存均用 EMA shadow（best 的 model_state_dict 即 EMA） |
 | GPU 增强 | `augment.enabled`（复用 segtask GPUAugmentor，image+label 联合增强后派生 target） |
-| warmup + scheduler | `warmup_epochs` / `scheduler`，按优化步推进（accum 尾组按真实尾长归一） |
+| warmup + scheduler | `warmup_epochs` / `scheduler`，按优化步推进（accum 尾组按真实尾长归一）；warmup 段保持 encoder/head 差分 lr 倍率（_GroupWarmupScheduler）；plateau 方向与 `cls.save_best_metric` 不一致时显式报错 |
+| fused AdamW | CUDA 上自动启用 fused 实现（含差分 lr 分组分支） |
+| 续训 / 落盘 | 每 epoch 原子写 latest_model.pth（模型+optimizer/scheduler/scaler/EMA）；`train.resume` 完整恢复；history.json 逐 epoch 落盘 |
+| 早停 | `train.early_stopping`：连续 N 个 epoch 无提升即止 |
 | 梯度裁剪 | `grad_clip_norm` |
 | mixup / cutmix | `cls.mixup_alpha` / `cls.cutmix_alpha`（>0 启用；同时启用每 batch 二选一；仅 volume 粒度） |
-| 前景过采样 | `data.foreground_oversample_ratio`（仅训练集；缓解类不平衡，需 npz 有 label） |
+| 前景过采样 | `data.foreground_oversample_ratio`（仅训练集；复用 npz 预计算 fg 索引，类均衡采样） |
+| 验证网格覆盖 | `data.val_grid_coverage`：验证 patch 改确定性网格铺点，与推理同口径 |
+| 推理 TTA / AMP | `cls.tta_flips`：翻转 TTA（3D 7 组合；2.5D 仅 H/W；slice 粒度 z 翻转输出回翻）；推理 autocast 口径同训练 |
 | SSL/分割迁移 | `cls.pretrained_ckpt`：只取 `encoder.*`（strict=False，打印命中/缺失统计）；仅 `backbone='encoder'` |
 | 微调策略 | `cls.encoder_lr_mult` encoder 差分学习率；`cls.freeze_encoder=true` 只训头（linear probe） |
 | 选模 | `cls.save_best_metric`：auc / f1 / acc / loss（patch 级）或 vol_auc / vol_f1 / vol_acc（卷级 MIL，与推理 agg_mode 同口径） |
@@ -114,11 +122,14 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 
 ```
 整卷读取 → 预处理
- → patch 中心铺格（2.5d/z_axis 沿 z 均匀铺格，H/W 大于 patch 时面内也铺；
-   cubic 三轴铺格；上限 eval_patches_per_volume）
- → micro-batch 前向（infer_batch_size 防 OOM）→ patch 概率
+ → patch 中心铺格（抽取几何与训练一致：2.5d/z_axis 沿 z 铺格 + 面内 resize；
+   whole 全卷 resize；cubic 按各轴长 ceil(dim/patch) 分配铺格；
+   上限 eval_patches_per_volume）
+ → micro-batch 前向（infer_batch_size 防 OOM；autocast 口径同训练；
+   cls.tta_flips 翻转 TTA 均值）→ patch 概率
  → volume 粒度：MIL 聚合 agg_mode（mean / max / lse / topk）→ 卷级 (K,)
- → slice 粒度：逐 slice 概率按 patch 绝对 z 回填，重叠切片取 max → 每卷 (K, Z)
+ → slice 粒度：逐 slice 概率按 patch 绝对 z 回填（whole 按比例回填），
+   重叠切片取 max → 每卷 (K, Z)
 ```
 
 MIL 直觉：卷中任一处阳性即卷阳性 → max/topk/lse 更贴合，mean 更稳。

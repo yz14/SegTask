@@ -93,12 +93,15 @@ x_cat = cat([噪声图(预条件缩放), LR 条件图], dim=1)，c_noise 标量�
 |---|---|
 | 混合精度 AMP | `use_amp` / `amp_dtype` + GradScaler；损失 fp32 |
 | EMA | `use_ema`；验证与 best 保存均用 EMA shadow |
+| 非有限守护 | loss 非有限不 backward、整个 accum 组丢弃；unscale 后梯度范数非有限跳过 optimizer step；仅有效步更新 EMA |
+| fused AdamW / wd 分组 | `adamw_fused`（默认 true，仅 CUDA 生效）；norm/bias 参数免 weight decay（口径同 seg） |
 | 梯度累积 / 裁剪 | `grad_accum_steps` / `grad_clip_norm` |
 | warmup + scheduler | `warmup_epochs` + cosine/poly/step/plateau 等 |
 | torch.compile | `compile_mode` |
-| 选模 / 早停 | patch 级 PSNR 越大越好；`val_full_volume=true` 时改用整卷 PSNR；`early_stopping` |
+| 选模 / 早停 | patch 级 PSNR 越大越好；`val_full_volume=true` 时改用整卷 PSNR；`early_stopping`；扩散验证采样用固定 seed generator，选模/早停/plateau 不受采样噪声干扰 |
 | 整卷验证 | 与部署同口径：在线退化整卷 → 推理器滑窗复原（复用 predict.overlap/blend）→ 逐卷 PSNR/SSIM；`val_full_volume_max` 控耗时 |
-| 续训 / 迁移 | `resume`（模型+optimizer/scheduler/scaler/EMA）；`pretrain`（strict 可配，可载 EMA 权重） |
+| 续训 / 迁移 | `resume`（模型+optimizer/scheduler/scaler/EMA，history.json 续接）；`pretrain`（strict 可配，可载 EMA 权重） |
+| 训练历史落盘 | history.json 逐 epoch 原子写（epoch/lr/训练与验证指标） |
 | 离线预烘包 | `python -m gentask.data.make_data`：NIfTI → bbox 裁剪 npz + fg 索引，训练零重扫 |
 
 ---
@@ -107,7 +110,8 @@ x_cat = cat([噪声图(预条件缩放), LR 条件图], dim=1)，c_noise 标量�
 
 - patch 级：`degrade(hr)` → `restore(lr)` → PSNR / SSIM（归一化域，data_range 按 minmax/zscore 自适应），并报告 LR 基线 PSNR 作参照（增益读数）；
 - 整卷（可选）：`vol_psnr / vol_ssim / vol_psnr_lr`，滑窗路径与推理完全一致；
-- 验证/推理固定 `sr_kernel` / `sr_noise_std`（训练侧的随机退化池不影响可比性）。
+- 验证/推理固定 `sr_kernel` / `sr_noise_std`（训练侧的随机退化池不影响可比性）；
+- 扩散采样：验证/推理传固定 seed 的 torch.Generator（初始噪声与 DDIM/祖先采样逐步噪声均走 generator），采样逐位可复现；训练未设 generator 时仍随机。
 
 ---
 
@@ -126,7 +130,13 @@ NIfTI 读取 → 归一化 → 入网网格（predict.input_grid）
  → denormalize（归一化域 → 原强度 HU，保留物理标定）→ 写出 *_sr.nii.gz
 ```
 
-条件卷推理侧按 `cond_dirs/cond_suffixes` 逐体配对，同窗裁剪送入 `restore(lr, cond=...)`。
+- 推理 AMP：`predict.use_amp`（默认 true，仅 CUDA autocast，dtype 同 `train.amp_dtype`）；
+- 翻转 TTA：`predict.tta_flips`（默认 false），输入与 cond 同翻、预测回翻后均值；
+  2.5D 非 lift 仅 H/W 轴；`sr_sampling='decimate'` 时自动排除被退化轴（防相位错位）；
+- 扩散推理采样用固定 seed generator，两次推理逐位一致；
+- 小数据集拦截：训练集样本数 < batch_size 时（drop_last=True 会产生零批次）显式报错。
+
+条件卷推理侧按 `cond_dirs/cond_suffixes` 逐体配对，同窗裁剪送入 `restore(lr, cond=...)`；cond 整卷与输入形状不符时显式报错。
 
 ---
 
@@ -136,4 +146,5 @@ NIfTI 读取 → 归一化 → 入网网格（predict.input_grid）
 - patch 几何一致：推理滑窗 patch 尺寸 = 训练 `data.patch_size`，2.5D slab 深度 = `patch_size[0]`，多视图 FOV/深度与训练同拓扑（`build_topology` 统一推导）；
 - 2.5D 恒把 D 折进通道：退化只作用 (H,W)，SSIM/梯度损失逐通道计算，与"D 视作通道"设定一致；
 - 条件卷 cond 与 image 空间对齐：训练侧同 warp、推理侧同窗裁剪，强度归一化各自独立；
-- SISR（edsr/rcan）为 post-upsampling：输出网格 = 输入 × 倍率，倍率固定，不支持 `target_z_spacing` 自适应。
+- SISR（edsr/rcan）为 post-upsampling：输出网格 = 输入 × 倍率，倍率固定，不支持 `target_z_spacing` 自适应；
+- 已知待定（暂缓）：whole/z_axis/2_5d 训练侧整卷/面内 resize 到 patch 尺寸，而推理侧在原生分辨率滑窗/整卷前向，两侧频谱分布不等价；修改方向（候选：训练侧改原生分辨率裁剪）涉及已训模型兼容，尚未实施。

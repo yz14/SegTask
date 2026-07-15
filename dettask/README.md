@@ -49,12 +49,13 @@ dettask/
 
 ## 关键概念
 
-- **双几何**：3D 框与 2.5D slab 框共享同一套参数化和配对逻辑；2.5D 的 2D 框由 3D 真值框自动派生。
+- **双几何**：3D 框与 2.5D slab 框共享同一套参数化和配对逻辑；2.5D 的 2D 框由 3D 真值框自动派生；patch 抽取几何按 `patch_mode` 与分割同语义（whole 全卷 resize、z_axis/2_5d 面内 resize、cubic 三轴裁剪），框随裁剪/缩放/翻转全程联动。
 - **四个检测头模板**：RetinaNet、FCOS、Faster R-CNN、DETR 四头复用同一套骨干与金字塔适配器。
 - **真值来源**：框真值只保留一份，既可以来自标注文件，也可以从分割 mask 连通域派生。
 - **共享算子**：IoU、GIoU、NMS、ROIAlign、编解码都按框维度参数化，不依赖额外检测第三方扩展。
 - **训练与评估**：训练侧主要看 patch 级 mAP，体级推理用 FROC 做汇总，更贴合医学小目标场景。
-- **推理拼接**：2.5D 推理时先做 slab 级检测，再跨层 stitching 成 3D 框。
+- **推理拼接**：2.5D 推理时先做 slab 级检测，再跨层 stitching 成 3D 框（可容忍 `det.stitch_max_gap` 个漏检 slab），拼接后做最终 3D NMS；推理可选 autocast 与 `det.tta_flips` 翻转 TTA。
+- **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；非有限 loss/梯度丢弃 accum 组；warmup 段保持差分学习率倍率。
 
 ## 用法
 

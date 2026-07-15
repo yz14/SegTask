@@ -80,6 +80,8 @@ gentask/
 - **统一模型接口**：`generation.py` 把回归与扩散接口统一成同一套 `forward / restore / degrade` 语义。
 - **拓扑真相源**：输入输出几何、通道布局和视图关系都由 topology 层统一推导，不在别处重复计算。
 - **预打包数据**：`make_data.py` 支持把 NIfTI 烘焙成 npz，减少训练时的 IO 压力。
+- **训练稳健性**：非有限 loss/梯度丢弃 accum 组（仅有效步更新 EMA），history.json 逐 epoch 落盘并随 `resume` 续接；`train.adamw_fused`（CUDA）与 norm/bias 免 weight decay 分组。
+- **推理可复现与加速**：扩散验证/推理采样用固定 seed generator 逐位可复现；`predict.use_amp` 推理 autocast、`predict.tta_flips` 可选翻转 TTA（decimate 被退化轴自动排除）。
 
 ## 用法
 
