@@ -107,10 +107,14 @@ class DetConfig:
     nms_iou     : float = 0.3
     max_dets    : int = 50          # 每 patch/slab 检出上限
     infer_batch_size: int = 4       # 整卷滑窗推理每次前向的 patch/slab 数
+    # 推理 flip TTA（3D 三轴 7 组合；2.5D 仅 H/W 3 组合；框回翻后并入
+    # NMS 池）。
+    tta_flips: bool = False
 
     # ---- 2.5D 跨层拼接（Plan §3.3 stitching）----------------------------------
     stitch_link_iou: float = 0.3    # 相邻 slab 2D 框链接的最小 IoU
     stitch_min_span: int = 2        # 3D 框最少跨的 slab 数
+    stitch_max_gap : int = 1        # 链接容忍的中间漏检 slab 数（0 = 不容忍）
 
     # ---- SSL / 预训练迁移 -------------------------------------------------------
     # 只取 encoder.*（重建式 SSL 亦可命中 decoder.*），strict=False。
@@ -162,6 +166,27 @@ def validate_det(det: DetConfig, cfg: SegConfig) -> None:
              f"by det.detr_num_heads ({det.detr_num_heads}).")
     _require(det.stitch_min_span >= 1,
              f"det.stitch_min_span must be >= 1; got {det.stitch_min_span}.")
+    _require(det.stitch_max_gap >= 0,
+             f"det.stitch_max_gap must be >= 0; got {det.stitch_max_gap}.")
+    # FCOS 的距离回归不支持 smooth_l1（无 anchor 尺度归一化），显式拦截
+    # 而非静默替换。
+    _require(not (det.arch == "fcos" and det.reg_loss == "smooth_l1"),
+             "det.arch='fcos' does not support det.reg_loss='smooth_l1'; "
+             "use 'giou' or 'l1'.")
+
+    # 选模方向 × plateau scheduler：plateau 的 mode 取 cfg.train.save_best_mode
+    # （seg 的单一真相源），与 det.save_best_metric 的方向（loss → min，
+    # map → max）不一致时 plateau 会在指标变好时误降 lr，显式拦截。
+    if str(cfg.train.scheduler).lower() == "plateau":
+        det_mode = "min" if det.save_best_metric == "loss" else "max"
+        seg_mode = str(cfg.train.save_best_mode)
+        _require(seg_mode == det_mode,
+                 f"train.scheduler='plateau' derives its direction from "
+                 f"train.save_best_criterion (currently mode={seg_mode!r}), "
+                 f"which conflicts with det.save_best_metric="
+                 f"{det.save_best_metric!r} (mode={det_mode!r}). Set "
+                 f"train.save_best_criterion so its mode matches (e.g. "
+                 f"'loss' for min / 'dice' for max).")
     _require(det.infer_batch_size >= 1,
              f"det.infer_batch_size must be >= 1; got {det.infer_batch_size}.")
     _require(det.fpn_channels >= 8,

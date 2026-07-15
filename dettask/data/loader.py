@@ -35,12 +35,18 @@ def build_det_dataloaders(
     fg_values = [float(v) for v in (dc.label_values[1:] if
                                     len(dc.label_values) > 1 else [1.0])]
     spatial_dims = int(cfg.model.spatial_dims)
+    ac = cfg.augment
+    # 空间翻转在 dataset 内施加（框联动）；AugConfig 的 flip 轴为张量轴
+    # (B,C,D,H,W) 的 2/3/4，映射到空间轴 (z,y,x) = (0,1,2)。
+    flip_prob = float(ac.random_flip_prob) if ac.enabled else 0.0
+    flip_axes = [int(a) - 2 for a in ac.random_flip_axes]
 
     def _mk(split_paths: List[str], is_train: bool) -> DetPatchDataset:
         return DetPatchDataset(
             npz_paths=split_paths,
             patch_size=dc.patch_size,
             fg_values=fg_values,
+            patch_mode=dc.patch_mode,
             boxes_from_mask_ok=det.boxes_from_mask,
             min_box_voxels=det.min_box_voxels,
             intensity_min=dc.intensity_min,
@@ -54,7 +60,12 @@ def build_det_dataloaders(
             is_train=is_train,
             fg_oversample_ratio=(max(dc.foreground_oversample_ratio, 0.5)
                                  if is_train else 0.0),
-            seed=dc.split_seed)
+            seed=dc.split_seed,
+            aug_flip_prob=flip_prob if is_train else 0.0,
+            aug_flip_axes=flip_axes,
+            val_grid_coverage=dc.val_grid_coverage,
+            cache_enabled=dc.cache_mode == "memory",
+            cache_max_volumes=dc.cache_max_volumes)
 
     train_ds = _mk(train_paths, True)
     val_ds = _mk(val_paths, False)

@@ -17,7 +17,7 @@ from .ops import box_center_size, box_iou, center_size_to_box
 __all__ = [
     "generate_anchors", "grid_points", "encode_boxes", "decode_boxes",
     "assign_max_iou", "assign_atss", "flip_boxes", "crop_boxes",
-    "slice_boxes_to_2d",
+    "scale_boxes", "slice_boxes_to_2d",
 ]
 
 
@@ -169,6 +169,16 @@ def flip_boxes(boxes: torch.Tensor, axis: int, size: Sequence[int]
     return out
 
 
+def scale_boxes(boxes: torch.Tensor, scale: Sequence[float]) -> torch.Tensor:
+    """逐轴缩放联动（resize 后框坐标 = 原坐标 × 目标/原尺寸）。"""
+    dim = boxes.shape[-1] // 2
+    s = torch.as_tensor(list(scale) * 2, dtype=boxes.dtype,
+                        device=boxes.device)
+    if s.shape[-1] != 2 * dim:
+        raise ValueError(f"scale must have {dim} factors; got {scale}.")
+    return boxes * s
+
+
 def crop_boxes(boxes: torch.Tensor, labels: torch.Tensor,
                offset: Sequence[int], crop_size: Sequence[int],
                min_visibility: float = 0.25
@@ -200,8 +210,8 @@ def slice_boxes_to_2d(boxes3d: torch.Tensor, labels: torch.Tensor,
     """
     if boxes3d.numel() == 0:
         return boxes3d.new_zeros((0, 4)), labels[:0]
-    inter = (torch.min(boxes3d[:, 3], torch.tensor(float(z_hi)))
-             - torch.max(boxes3d[:, 0], torch.tensor(float(z_lo)))).clamp(min=0)
+    inter = (boxes3d[:, 3].clamp(max=float(z_hi))
+             - boxes3d[:, 0].clamp(min=float(z_lo))).clamp(min=0)
     depth = (boxes3d[:, 3] - boxes3d[:, 0]).clamp(min=1e-7)
     keep = inter / depth >= min_overlap
     b = boxes3d[keep]

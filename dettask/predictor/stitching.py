@@ -1,8 +1,10 @@
 """2.5D 跨层拼接：逐 slab 2D 框 → 3D 框（Plan §3.3 stitching）。
 
-相邻 slab 的同类 2D 框按 yx IoU >= ``link_iou`` 贪心链接成链，链的 z 范围
-取所覆盖 slab 的并集、yx 范围取链内框的 min/max 并集、分数取链内最大值；
-z 跨度不足 ``min_span`` 个 slab 的链丢弃（Plan §7-5：小病灶召回权衡点）。
+相邻 slab 的同类 2D 框按 yx IoU >= ``link_iou`` 贪心链接成链（允许中间漏检
+不超过 ``max_gap`` 个 slab，避免单 slab 漏检即断链产生重复 3D 框），链的
+z 范围取所覆盖 slab 的并集、yx 范围取链内框的 min/max 并集、分数取链内
+最大值；z 跨度不足 ``min_span`` 个 slab 的链丢弃（Plan §7-5：小病灶召回
+权衡点）。拼接后的最终 3D NMS 由调用方（predictor）执行。
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ def stitch_slab_detections(
     slab_z    : List[List[float]],       # 每 slab 的 [z_lo, z_hi)（卷坐标）
     link_iou  : float = 0.3,
     min_span  : int = 2,
+    max_gap   : int = 0,
 ) -> Dict[str, torch.Tensor]:
     """→ ``{'boxes': (N, 6), 'scores': (N,), 'labels': (N,)}`` 3D 检出。"""
     chains: List[Dict] = []          # {yx_box, score, label, z_lo, z_hi,
@@ -31,7 +34,8 @@ def stitch_slab_detections(
             b, s, l = boxes[j], float(dets["scores"][j]), int(dets["labels"][j])
             best, best_iou = None, link_iou
             for c in chains:
-                if c["label"] != l or c["last_slab"] != si - 1:
+                if (c["label"] != l or c["last_slab"] >= si
+                        or c["last_slab"] < si - 1 - max_gap):
                     continue
                 iou = float(box_iou(b[None], c["last_box"][None])[0, 0])
                 if iou >= best_iou:
