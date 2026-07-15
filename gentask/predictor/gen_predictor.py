@@ -6,6 +6,7 @@ operates on restored image volumes instead of segmentation logits.
 
 from __future__ import annotations
 
+import itertools
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -18,7 +19,9 @@ from ..config import Config
 from ..data.dataset import denormalize_image, load_nifti, preprocess_image
 from ..data.degradation import _interp_mode, _phase_aligned_linear_upsample
 from ..data.loader import match_condition_paths
+from ..models.generation import DiffusionModel
 from ..models.topology import build_topology
+from ..trainer.amp import resolve_auto_amp_dtype
 from ..trainer.checkpoint import (
     _select_state_dict,
     _strip_compile_prefix,
@@ -26,6 +29,9 @@ from ..trainer.checkpoint import (
 )
 
 logger = logging.getLogger(__name__)
+
+_AMP_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+               "float32": torch.float32}
 
 try:
     import SimpleITK as sitk
@@ -77,6 +83,60 @@ class GenerationPredictor:
             raise NotImplementedError(
                 "DiffusionModel does not support multi-view inference "
                 f"(multi_res_scales={cfg.data.multi_res_scales}).")
+        # 推理 autocast：dtype 口径同训练（train.amp_dtype）。
+        amp_name = str(cfg.train.amp_dtype)
+        if amp_name == "auto":
+            amp_name = resolve_auto_amp_dtype(device)
+        self.amp_dtype = _AMP_DTYPES.get(amp_name, torch.float32)
+        self.use_amp = bool(cfg.predict.use_amp) and device.type == "cuda"
+        # 翻转 TTA：全非空子集与原始预测平均。
+        self.tta_combos: List[Tuple[int, ...]] = []
+        if bool(cfg.predict.tta_flips):
+            dims = self._tta_dims()
+            self.tta_combos = [
+                c for r in range(1, len(dims) + 1)
+                for c in itertools.combinations(dims, r)]
+            logger.info("Flip TTA enabled: axes=%s (%d extra passes/window).",
+                        dims, len(self.tta_combos))
+
+    def _tta_dims(self) -> List[int]:
+        """TTA 可翻转的空间维（负索引）。'decimate' 退化相位对齐索引 0，
+        翻转后保留帧位置变化 → 被退化轴不可翻；'blur'（半像素相位，翻转
+        对称）全轴可翻。未 lift 的 2.5D z 折进通道，仅 H/W 可翻。"""
+        decimate = str(self.cfg.task.sr_sampling).lower() == "decimate"
+        if self.is_2_5d and not self.lift:
+            cand = [(-2, 1), (-1, 2)]
+        else:
+            cand = [(-3, 0), (-2, 1), (-1, 2)]
+        dims = []
+        for d, ax in cand:
+            degraded = self.vol_axis_scales[ax] != 1 or (
+                ax == 0 and self.input_is_lr
+                and float(self.cfg.predict.target_z_spacing) > 0.0)
+            if not (decimate and degraded):
+                dims.append(d)
+        return dims
+
+    def _restore_patch(
+        self, x: torch.Tensor,
+        cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """单窗复原：autocast +（可选）翻转 TTA 均值。"""
+        with torch.autocast(device_type=self.device.type,
+                            enabled=self.use_amp, dtype=self.amp_dtype):
+            rec = self.bare.restore(x, cond=cond)
+        rec = rec.float()
+        if not self.tta_combos:
+            return rec
+        acc = rec
+        for combo in self.tta_combos:
+            dims = list(combo)
+            xf = torch.flip(x, dims)
+            cf = None if cond is None else torch.flip(cond, dims)
+            with torch.autocast(device_type=self.device.type,
+                                enabled=self.use_amp, dtype=self.amp_dtype):
+                rf = self.bare.restore(xf, cond=cf)
+            acc = acc + torch.flip(rf.float(), dims)
+        return acc / (len(self.tta_combos) + 1)
 
     @staticmethod
     def _volume_axis_scales(cfg: Config) -> Tuple[int, int, int]:
@@ -280,7 +340,7 @@ class GenerationPredictor:
                     if cond_t is not None:
                         cond_win = self._extract_window(
                             cond_t, starts, patch)[None]
-                    rec = self.bare.restore(x, cond=cond_win)[0, 0]
+                    rec = self._restore_patch(x, cond=cond_win)[0, 0]
                     valid = [min(p, n - s) * sc
                              for p, n, s, sc in zip(patch, vol, starts, osc)]
                     vd, vh, vw = valid
@@ -302,7 +362,7 @@ class GenerationPredictor:
         if not self.is_2_5d:  # 3D
             if str(self.cfg.data.patch_mode).lower() == "whole":
                 # whole：训练即整卷，单次前向
-                rec = self.bare.restore(t[None, None], cond=(
+                rec = self._restore_patch(t[None, None], cond=(
                     None if cond_t is None else cond_t[None]))[0, 0]
             else:  # z_axis / cubic：滑窗（patch 尺度与训练一致）
                 rec = self._restore_3d_sliding(t, cond_t)
@@ -323,7 +383,7 @@ class GenerationPredictor:
             if cond_t is not None:
                 cond_slab = self._extract_window(
                     cond_t, [s, 0, 0], [d] + list(cond_t.shape[-2:]))[None]
-            rec = self.bare.restore(x, cond=cond_slab)
+            rec = self._restore_patch(x, cond=cond_slab)
             rec = rec[0, 0] if rec.ndim == 5 else rec[0]  # (d,H,W)
             valid = min(d, dz - s)
             wv = wz[:valid]
@@ -344,6 +404,17 @@ class GenerationPredictor:
             raw, dc.intensity_min, dc.intensity_max,
             dc.normalize, dc.global_mean, dc.global_std)
         cond_vol = self._load_cond_volume(cond_paths)
+        if cond_vol is not None and tuple(cond_vol.shape[1:]) != tuple(raw.shape):
+            raise ValueError(
+                f"cond volume shape {tuple(cond_vol.shape[1:])} does not "
+                f"match image shape {tuple(raw.shape)} "
+                f"({image_path} vs {cond_paths}); cond volumes must be "
+                "spatially aligned with the input image.")
+        if isinstance(self.bare, DiffusionModel):
+            # 固定 seed：同一输入重复推理结果可复现。
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.cfg.train.seed))
+            self.bare.sample_generator = gen
         scales = (self._volume_scales_for(image_path) if self.input_is_lr
                   else self.vol_axis_scales)
         if self.input_is_lr and not self.net_upsamples:

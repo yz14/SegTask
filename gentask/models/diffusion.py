@@ -214,7 +214,9 @@ class DDPMDiffusion(nn.Module):
                 dir_xt = (1 - acp_next - sigma_t ** 2).clamp(min=0).sqrt() * eps
                 x = acp_next.sqrt() * x0 + dir_xt
                 if t_next >= 0 and sigma_t > 0:
-                    x = x + sigma_t * torch.randn_like(x)
+                    x = x + sigma_t * torch.randn(
+                        x.shape, device=x.device, dtype=x.dtype,
+                        generator=generator)
             else:  # 祖先采样
                 if t_next >= 0:
                     beta_t = 1 - acp_t / acp_next
@@ -222,7 +224,9 @@ class DDPMDiffusion(nn.Module):
                         acp_next.sqrt() * beta_t / (1 - acp_t) * x0
                         + (acp_t / acp_next).sqrt() * (1 - acp_next) / (1 - acp_t) * x)
                     var = beta_t * (1 - acp_next) / (1 - acp_t)
-                    x = mean + var.clamp(min=0).sqrt() * torch.randn_like(x)
+                    x = mean + var.clamp(min=0).sqrt() * torch.randn(
+                        x.shape, device=x.device, dtype=x.dtype,
+                        generator=generator)
                 else:
                     x = x0
         return x

@@ -176,6 +176,9 @@ class DiffusionModel(nn.Module):
         self.diffusion = diffusion
         self.degradation = degradation
         self.spatial_dims = int(spatial_dims)
+        # 采样噪声 RNG：验证/推理侧设固定 seed 的 Generator 使重建确定、
+        # 逐 epoch 指标可比；None = 全局 RNG。
+        self.sample_generator: Optional[torch.Generator] = None
 
     def degrade(self, hr: torch.Tensor) -> torch.Tensor:
         if self.spatial_dims == 2 and hr.ndim == 5:
@@ -204,7 +207,8 @@ class DiffusionModel(nn.Module):
         lr = self._pack_2_5d(lr)
         cond = self._pack_2_5d(cond)
         cond_full = self._concat_cond(lr, cond)
-        return self.diffusion.sample(cond=cond_full, target_channels=lr.shape[1])
+        return self.diffusion.sample(cond=cond_full, target_channels=lr.shape[1],
+                                     generator=self.sample_generator)
 
     def forward(self, hr: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         hr = self._pack_2_5d(hr)

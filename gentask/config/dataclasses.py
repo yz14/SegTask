@@ -341,6 +341,8 @@ class TrainConfig:
     plateau_factor       : float = 0.5
     grad_accum_steps: int = 1
     grad_clip_norm: float = 12.0
+    # AdamW fused 实现（仅 CUDA 上参数生效；口径同 segtask_v1）。
+    adamw_fused: bool = True
     use_amp  : bool = True
     amp_dtype: str = "float16"
     compile_mode: str = "none"
@@ -396,6 +398,14 @@ class PredictConfig:
     # 下每体自适应）；0=禁用，用 task.sr_scale(_per_axis) 固定倍率。
     # 不支持 post-upsampling SISR（edsr/rcan 上采头倍率固定）。
     target_z_spacing: float = 0.0
+
+    # 推理 autocast（仅 CUDA；dtype 口径同 train.amp_dtype）。
+    use_amp: bool = True
+
+    # 翻转 TTA：对称轴翻转多次复原取均值。仅在翻转不破坏退化相位的轴上
+    # 生效（sr_sampling=='decimate' 时跳过被退化轴；2.5D 仅 H/W）。
+    # 扩散采样下开启代价成倍增长，默认关。
+    tta_flips: bool = False
 
 
 # ---------------------------------------------------------------------------

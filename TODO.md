@@ -35,7 +35,7 @@
 
 内容（**注意**：需查看各自对应readme/design/workflow文档理解设计）：  
 segtask_v1是2.5D/3D分割项目（项目起源，最完善）。  
-ssltask是自监督学习项目（基于segtask_v1改造），主要是对分割，生成，分类，检测进行预训练。  
+ssltask是自监督学习项目（基于segtask_v1改造），是对分割，生成，分类，检测进行预训练。  
 clstask是分类项目（基于segtask_v1改造）。  
 dettask是检测项目（基于segtask_v1改造）。  
 gentask是生成/超分项目（基于segtask_v1改造）。  

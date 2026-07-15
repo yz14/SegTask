@@ -19,16 +19,35 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Optimizer factory
 # ---------------------------------------------------------------------------
+def _param_groups(model: nn.Module, weight_decay: float):
+    """weight-decay 分组（口径同 segtask_v1）：ndim<=1（norm/bias）免 decay。
+    两组 lr 相同，不影响 ``WarmupScheduler`` 的单一 base_lr 假设。"""
+    decay, no_decay = [], []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        (no_decay if p.ndim <= 1 else decay).append(p)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": weight_decay})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
+
+
 def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
     tc = cfg.train
-    params = [p for p in model.parameters() if p.requires_grad]
+    groups = _param_groups(model, tc.weight_decay)
     if   tc.optimizer == "adamw":
-        return torch.optim.AdamW(params, lr=tc.lr, weight_decay=tc.weight_decay)
+        first = next((p for p in model.parameters() if p.requires_grad), None)
+        use_fused = (bool(tc.adamw_fused) and torch.cuda.is_available()
+                     and first is not None and first.is_cuda)
+        return torch.optim.AdamW(groups, lr=tc.lr, fused=use_fused)
     elif tc.optimizer == "adam":
-        return torch.optim.Adam(params, lr=tc.lr, weight_decay=tc.weight_decay)
+        return torch.optim.Adam(groups, lr=tc.lr)
     elif tc.optimizer == "sgd":
         return torch.optim.SGD(
-            params, lr=tc.lr, weight_decay=tc.weight_decay,
+            groups, lr=tc.lr,
             momentum=tc.momentum, nesterov=tc.nesterov)
     raise ValueError(f"Unknown optimizer: {tc.optimizer}")
 

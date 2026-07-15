@@ -562,6 +562,14 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
     train_ds = spec.make_split(train_paths, is_train=True, common=common_cfg)
     val_ds   = spec.make_split(val_paths, is_train=False, common=common_cfg)
 
+    # drop_last=True 下不足一个 batch 会静默零批次空转，显式拦截。
+    if len(train_ds) < dc.batch_size:
+        raise ValueError(
+            f"Train dataset yields only {len(train_ds)} samples but "
+            f"batch_size={dc.batch_size} with drop_last=True would produce "
+            "zero batches; lower data.batch_size or raise "
+            "data.samples_per_volume.")
+
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}
     if dc.num_workers > 0:

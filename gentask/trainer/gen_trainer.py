@@ -14,6 +14,7 @@ AMP / EMA），针对图像复原实现训练与验证：
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import math
 from pathlib import Path
@@ -27,6 +28,7 @@ import torch.nn.functional as F
 from ..config import Config
 from ..data.augment import GPUAugmentor
 from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
+from ..models.generation import DiffusionModel
 from ..utils import AverageMeter, ModelEMA
 from .amp import GradScaler, resolve_auto_amp_dtype
 from .checkpoint import unwrap_compile
@@ -111,6 +113,7 @@ class GenerationTrainer:
         self.best_epoch = 0
         self.val_full_volume = bool(tc.val_full_volume)
         self._vol_predictor = None
+        self.history: list = []
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -232,6 +235,8 @@ class GenerationTrainer:
         accum = self.grad_accum_steps
         total = len(self.train_loader)
         self.optimizer.zero_grad(set_to_none=True)
+        group_bad = False   # 当前 accum 组内出现非有限 loss，整组丢弃
+        skipped = 0
         for step, batch in enumerate(self.train_loader):
             hr = self._hr_batch(batch)
             cond = self._cond_batch(batch)
@@ -247,26 +252,51 @@ class GenerationTrainer:
                 out = self.model(hr, cond=cond)
             bd: Dict[str, float] = {}
             loss = self._step_loss(out, bd, weight_map=weight_map)
-            loss_scaled = loss / accum if accum > 1 else loss
-            self.scaler.scale(loss_scaled).backward()
+            loss_val = float(loss.item())
+            if not math.isfinite(loss_val):
+                # 非有限 loss：不反传，标记整个 accum 组丢弃，保护权重/EMA。
+                group_bad = True
+                skipped += 1
+                logger.warning("Non-finite loss (%.4g) at step %d/%d; "
+                               "dropping current accum group.",
+                               loss_val, step + 1, total)
+            else:
+                loss_scaled = loss / accum if accum > 1 else loss
+                self.scaler.scale(loss_scaled).backward()
 
             if (step + 1) % accum == 0 or (step + 1) == total:
-                if self.cfg.train.grad_clip_norm > 0:
+                stepped = False
+                if group_bad:
+                    group_bad = False
+                else:
                     self.scaler.unscale_(self.optimizer)
-                    nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.cfg.train.grad_clip_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                    clip = self.cfg.train.grad_clip_norm
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        clip if clip > 0 else float("inf"))
+                    if torch.isfinite(grad_norm):
+                        self.scaler.step(self.optimizer)
+                        stepped = True
+                    else:
+                        skipped += 1
+                        logger.warning(
+                            "Non-finite grad norm at step %d/%d; skipping "
+                            "optimizer step.", step + 1, total)
+                    self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
+                # scheduler 无条件计时，保持 horizon 与总优化步对齐。
                 self.scheduler.step()
-                if self.ema is not None:
+                if stepped and self.ema is not None:
                     self.ema.update(self.model)
 
-            if math.isfinite(loss.item()):
-                loss_meter.update(loss.item(), hr.shape[0])
+            if math.isfinite(loss_val):
+                loss_meter.update(loss_val, hr.shape[0])
             if (step + 1) % max(self.cfg.train.log_every, 1) == 0 or step == 0:
                 logger.debug("  [%d/%d] loss=%.4f lr=%.2e",
-                             step + 1, total, loss.item(), self.scheduler.get_lr())
+                             step + 1, total, loss_val, self.scheduler.get_lr())
+        if skipped:
+            logger.warning("Epoch %d: %d non-finite loss/grad event(s) skipped.",
+                           epoch + 1, skipped)
         return {"loss": loss_meter.avg}
 
     @torch.no_grad()
@@ -275,6 +305,13 @@ class GenerationTrainer:
         if self.ema is not None:
             self.ema.apply_shadow(self.model)
         psnr_m, ssim_m, base_m = AverageMeter(), AverageMeter(), AverageMeter()
+        bare0 = unwrap_compile(self.model)
+        if isinstance(bare0, DiffusionModel):
+            # 扩散采样用固定 seed 的 RNG：逐 epoch 指标确定可比，
+            # 选模/早停/plateau 不被采样噪声干扰。
+            gen = torch.Generator(device=self.device)
+            gen.manual_seed(int(self.cfg.train.seed))
+            bare0.sample_generator = gen
         try:
             for batch in self.val_loader:
                 hr = self._hr_batch(batch)
@@ -305,6 +342,8 @@ class GenerationTrainer:
             if self.val_full_volume:
                 metrics.update(self._validate_volumes())
         finally:
+            if isinstance(bare0, DiffusionModel):
+                bare0.sample_generator = None
             if self.ema is not None:
                 self.ema.restore(self.model)
         return metrics
@@ -414,6 +453,14 @@ class GenerationTrainer:
         tmp.replace(path)
         logger.info("Checkpoint saved @ epoch %d -> %s", epoch + 1, path)
 
+    def _save_history(self) -> None:
+        """逐 epoch 指标落盘 history.json（原子替换）。"""
+        path = self.output_dir / "history.json"
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+
     def _load_resume(self, path: str) -> int:
         """从 checkpoint 恢复完整训练状态；返回续训起始 epoch。"""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -430,6 +477,11 @@ class GenerationTrainer:
         self.best_metric = float(ckpt.get("best_metric", -math.inf))
         self.best_epoch = int(ckpt.get("best_epoch", 0))
         start = int(ckpt.get("epoch", -1)) + 1
+        hist_path = self.output_dir / "history.json"
+        if hist_path.exists():
+            with open(hist_path, "r", encoding="utf-8") as f:
+                self.history = [h for h in json.load(f)
+                                if int(h.get("epoch", 0)) <= start]
         logger.info(
             "Resumed from %s: start_epoch=%d, best_PSNR=%.3f @ epoch %d",
             path, start + 1, self.best_metric, self.best_epoch + 1)
@@ -469,6 +521,9 @@ class GenerationTrainer:
                             "val_every=%d)", epoch + 1, tc.epochs,
                             tr["loss"], val_every)
                 last = {**tr}
+            self.history.append(
+                {"epoch": epoch + 1, "lr": self.scheduler.get_lr(), **last})
+            self._save_history()
             if ((epoch + 1) % save_every == 0) or is_last:
                 self._save_checkpoint(epoch)
             # 早停：连续 early_stopping 个 epoch 无提升即止（按 epoch 计）。
