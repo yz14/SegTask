@@ -143,7 +143,7 @@ class BYOLMethod(SSLMethod):
                 total = total + self._pair_loss(p, z).mean()
                 n_pairs += 1
         loss = total / max(n_pairs, 1)
-        return loss, {"byol_loss": float(loss.detach()), "ema_momentum": self._momentum()}
+        return loss, {"byol_loss": loss.detach(), "ema_momentum": self._momentum()}
 
     def on_resume(self, global_step: int) -> None:
         self._step = int(global_step)

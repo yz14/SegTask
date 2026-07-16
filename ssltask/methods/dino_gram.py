@@ -12,7 +12,8 @@ DINO 语义聚类的前提下把局部几何"拉回"清晰。
    早期教师），之后保持冻结；
 3. 此后每 ``dino_gram_refresh_steps`` 个优化步（以锚定时刻为原点）才整份刷新一次快照。
 
-断点续训时锚定时刻不入 checkpoint：恢复后首个 λ>0 的步会以当时的 EMA 教师重新锚定。
+锚定时刻以 buffer ``gram_anchor_step`` 随 method state 入 checkpoint：断点续训后 Gram
+教师快照与刷新节律逐位延续（旧 ckpt 无该键时回退为未锚定，首个 λ>0 步重新锚定）。
 Gram 仅在 global 裁剪上计算（保证学生/Gram 教师位点数一致）。下游交接与 ④ 完全一致：
 只导出 **教师** ``encoder.*``（见 ``DINOMethod``）。
 """
@@ -40,6 +41,17 @@ class _DINOGramModule(_DINOModule):
         for p in self.gram_teacher.parameters():
             p.requires_grad_(False)
         self.gram_teacher.eval()
+        # λ 首次生效时的优化步（Gram 教师锚定时刻）；-1 = 尚未启用。入 buffer 使
+        # resume 后不重新锚定、刷新节律延续（快照权重本身随 submodule 持久化）。
+        self.register_buffer("gram_anchor_step",
+                             torch.tensor(-1, dtype=torch.long))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # 旧 ckpt 无 gram_anchor_step：保持默认 -1（未锚定），不报 missing key。
+        key = prefix + "gram_anchor_step"
+        if key not in state_dict:
+            state_dict[key] = self.gram_anchor_step.detach().clone()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def train(self, mode: bool = True):
         super().train(mode)          # 已保持 teacher.eval()
@@ -56,7 +68,8 @@ class DINOGramMethod(DINOMethod):
         self.gram_start_frac = float(ssl.dino_gram_start_frac)
         self.gram_refresh_steps = max(int(ssl.dino_gram_refresh_steps), 1)
         self.gram_level = int(ssl.dino_gram_feature_level)
-        # λ 首次生效时的优化步（Gram 教师锚定时刻）；-1 = 尚未启用。
+        # λ 首次生效时的优化步（Gram 教师锚定时刻）的进程内镜像；持久化真相源为
+        # module buffer ``gram_anchor_step``（见 on_resume / compute_loss）。
         self._gram_anchor_step = -1
 
     # ---- modules ----------------------------------------------------------
@@ -135,14 +148,23 @@ class DINOGramMethod(DINOMethod):
             if self._gram_anchor_step < 0:      # λ 首次生效：锚定当前 EMA 教师
                 self._refresh_gram_teacher()
                 self._gram_anchor_step = int(self._step)
+                with torch.no_grad():
+                    self.module.gram_anchor_step.fill_(self._gram_anchor_step)
             gram = self._gram_loss(crops)
             loss = dino_loss + lam * gram
-            logs["gram_loss"] = float(gram.detach())
+            logs["gram_loss"] = gram.detach()
         else:
             loss = dino_loss
             logs["gram_loss"] = 0.0
         logs["gram_weight"] = lam
         return loss, logs
+
+    # ---- resume ------------------------------------------------------------
+    def on_resume(self, global_step: int) -> None:
+        super().on_resume(global_step)
+        # 从持久化 buffer 恢复锚定时刻（一次 .item() 同步）：已锚定的运行不会在
+        # resume 后用当前教师覆盖 Gram 快照，刷新节律以原锚定时刻延续。
+        self._gram_anchor_step = int(self.module.gram_anchor_step.item())
 
     # ---- EMA teacher update + periodic gram-teacher refresh ---------------
     def on_after_step(self, global_step: int, stepped: bool = True) -> None:

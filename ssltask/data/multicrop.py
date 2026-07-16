@@ -219,35 +219,39 @@ class PairedCropGenerator:
         self.intensity_shift = float(intensity_shift)
 
     def _one_view(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """整批一次性「随机框裁剪 + 重采样 + 翻转 + 强度增广」（复用
+        :func:`_affine_grid` 的单次 ``grid_sample`` 批量路径，同
+        :meth:`MultiCropGenerator._batched_crop_resize`），并返回逐样本裁剪框/
+        翻转元数据供位置匹配。逐样本采框/翻转仍是纯 RNG（开销可忽略）。"""
         B = x.shape[0]
-        crops: List[torch.Tensor] = []
-        origins = torch.zeros(B, self.spatial_dims)
-        sizes = torch.zeros(B, self.spatial_dims)
-        flips = torch.zeros(B, self.spatial_dims, dtype=torch.bool)
+        dims = self.spatial_dims
+        spatial = [int(s) for s in x.shape[2:]]
+        origins = torch.empty(B, dims, dtype=torch.float32)
+        sizes = torch.empty(B, dims, dtype=torch.float32)
+        flips = torch.zeros(B, dims, dtype=torch.bool)
         for b in range(B):
-            o, s = _sample_box(x.shape[2:], self.scale[0], self.scale[1])
-            sl = (slice(None),) + tuple(
-                slice(oo, oo + ss) for oo, ss in zip(o, s))
-            crop = x[b][sl]
-            crop = F.interpolate(
-                crop.unsqueeze(0).float(), size=self.out_size,
-                mode=self.mode, align_corners=False).squeeze(0)
-            for axis in range(self.spatial_dims):
-                if random.random() < self.flip_prob:
-                    crop = torch.flip(crop, dims=[axis + 1])
-                    flips[b, axis] = True
-            if self.intensity_scale > 0:
-                crop = crop * (1.0 + random.uniform(
-                    -self.intensity_scale, self.intensity_scale))
-            if self.intensity_shift > 0:
-                crop = crop + random.uniform(
-                    -self.intensity_shift, self.intensity_shift)
-            crops.append(crop.to(x.dtype))
-            origins[b] = torch.tensor([float(v) for v in o])
-            sizes[b] = torch.tensor([float(v) for v in s])
+            o, s = _sample_box(spatial, self.scale[0], self.scale[1])
+            origins[b] = torch.tensor(o, dtype=torch.float32)
+            sizes[b] = torch.tensor(s, dtype=torch.float32)
+            if self.flip_prob > 0:
+                for axis in range(dims):
+                    flips[b, axis] = random.random() < self.flip_prob
+        grid = _affine_grid(spatial, self.out_size, origins, sizes, flips,
+                            dims, x.device)
+        out = F.grid_sample(
+            x.float(), grid, mode="bilinear", align_corners=False,
+            padding_mode="border")
+        if self.intensity_scale > 0:
+            sc = 1.0 + (torch.rand(B, device=out.device) * 2 - 1) \
+                * self.intensity_scale
+            out = out * sc.view([B] + [1] * (dims + 1))
+        if self.intensity_shift > 0:
+            sh = (torch.rand(B, device=out.device) * 2 - 1) \
+                * self.intensity_shift
+            out = out + sh.view([B] + [1] * (dims + 1))
         meta = {"origin": origins.to(x.device), "size": sizes.to(x.device),
                 "flip": flips.to(x.device)}
-        return torch.stack(crops, dim=0), meta
+        return out.to(x.dtype), meta
 
     @torch.no_grad()
     def __call__(self, x: torch.Tensor

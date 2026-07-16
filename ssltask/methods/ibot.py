@@ -171,7 +171,7 @@ class IBOTMethod(DINOMethod):
         self._cached_global_crops = None
         ibot = self._ibot_loss(crops)
         loss = dino_loss + self.ibot_weight * ibot
-        logs["ibot_loss"] = float(ibot.detach())
+        logs["ibot_loss"] = ibot.detach()
         logs["ibot_weight"] = self.ibot_weight
         return loss, logs
 

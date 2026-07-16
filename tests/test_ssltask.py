@@ -771,6 +771,7 @@ def test_cls_probe_encoder_only_load_and_missing_encoder_key(tmp_path):
     ssl.probe_data_dir = str(tmp_path)
     ssl.probe_iters = 1
     ssl.probe_samples_per_volume = 1
+    ssl.probe_allow_single_group = True   # 单文件 fixture：组级划分需要显式放行
     validate_ssl(ssl, cfg)
     probe = ClsProbe(cfg, ssl, torch.device("cpu"))
 
@@ -1341,6 +1342,7 @@ def test_byol_moco_handoff_can_load_probe_encoder(tmp_path):
     ssl.probe_data_dir = str(tmp_path)
     ssl.probe_iters = 1
     ssl.probe_samples_per_volume = 1
+    ssl.probe_allow_single_group = True   # 单文件 fixture：组级划分需要显式放行
     validate_ssl(ssl, cfg)
     byol_sd = build_method(cfg, _byol_ssl(), torch.device("cpu")).export_backbone_state_dict()
     moco_sd = build_method(cfg, _moco_ssl(), torch.device("cpu")).export_backbone_state_dict()

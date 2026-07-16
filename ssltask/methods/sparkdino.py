@@ -80,7 +80,7 @@ class SparkDINOMethod(DINOMethod):
         dino_loss, logs = super().compute_loss(batch)
         spark_loss = self._spark_loss(batch["image"])
         loss = spark_loss + self.dino_weight * dino_loss
-        logs["spark_loss"] = float(spark_loss.detach())
+        logs["spark_loss"] = spark_loss.detach()
         logs["dino_weight"] = self.dino_weight
         return loss, logs
 

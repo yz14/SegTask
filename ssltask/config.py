@@ -300,6 +300,24 @@ class SSLConfig:
     save_every: int = 10
 
 
+def _warn_mask_unit_alignment(name: str, unit: int, cfg: SegConfig) -> None:
+    """掩码单元与模型空间尺寸的整除性检查（仅告警，不阻断）。
+
+    单元网格以 ``ceil(spatial/unit)`` 构造并用最近邻重采样映射到输入/特征分辨率：
+    若 patch 尺寸不被 unit 整除，末尾单元偏小且掩码边界与特征位点会产生半单元
+    错位（部分"可见"位点混入被遮上下文），默默削弱 MIM/JEPA/iBOT 目标。
+    """
+    patch = [int(s) for s in cfg.data.patch_size]
+    model_spatial = patch if int(cfg.model.spatial_dims) == 3 else patch[1:]
+    bad = [s for s in model_spatial if s % max(int(unit), 1) != 0]
+    if bad:
+        logger.warning(
+            "ssl.%s=%d does not evenly divide model patch dims %s: the "
+            "trailing mask unit is smaller and mask/feature alignment is "
+            "only approximate (nearest resample). Recommend patch dims "
+            "divisible by the mask unit.", name, int(unit), model_spatial)
+
+
 def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
     """校验 SSL 配置与骨干配置的一致性；非法时抛 ``ConfigError``。"""
     _require(
@@ -343,6 +361,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
         _require(
             int(ssl.mim_head_dim) >= 0,
             f"ssl.mim_head_dim must be >= 0 (0=auto); got {ssl.mim_head_dim}.")
+        _warn_mask_unit_alignment("mim_mask_unit", int(ssl.mim_mask_unit), cfg)
     if ssl.method in ("spark", "sparkdino"):
         _require(
             0.0 < float(ssl.spark_mask_ratio) < 1.0,
@@ -350,6 +369,8 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
         _require(
             int(ssl.spark_mask_unit) >= 1,
             f"ssl.spark_mask_unit must be >= 1; got {ssl.spark_mask_unit}.")
+        _warn_mask_unit_alignment(
+            "spark_mask_unit", int(ssl.spark_mask_unit), cfg)
         _require(
             int(ssl.spark_decoder_dim_div) >= 1,
             f"ssl.spark_decoder_dim_div must be >= 1; got "
@@ -434,6 +455,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
         _require(
             int(ssl.jepa_mask_unit) >= 1,
             f"ssl.jepa_mask_unit must be >= 1; got {ssl.jepa_mask_unit}.")
+        _warn_mask_unit_alignment("jepa_mask_unit", int(ssl.jepa_mask_unit), cfg)
         _require(
             int(ssl.jepa_predictor_depth) >= 1,
             f"ssl.jepa_predictor_depth must be >= 1; got "
@@ -487,6 +509,7 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
         _require(
             int(ssl.ibot_mask_unit) >= 1,
             f"ssl.ibot_mask_unit must be >= 1; got {ssl.ibot_mask_unit}.")
+        _warn_mask_unit_alignment("ibot_mask_unit", int(ssl.ibot_mask_unit), cfg)
         _require(
             int(ssl.ibot_out_dim) >= 0,
             f"ssl.ibot_out_dim must be >= 0 (0=use dino_out_dim); got "

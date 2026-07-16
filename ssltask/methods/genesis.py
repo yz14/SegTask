@@ -35,7 +35,7 @@ class GenesisMethod(SSLMethod):
         model_input = self.corruptor(clean)          # @no_grad 内部已 clone
         pred = self.module(model_input)
         loss = self.recon_loss_fn(pred.float(), clean.float())
-        return loss, {"recon_loss": float(loss.detach())}
+        return loss, {"recon_loss": loss.detach()}
 
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:
         from segtask_v1.trainer.checkpoint import unwrap_compile

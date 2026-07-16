@@ -455,6 +455,16 @@ class LabeledPatchDataset(Dataset):
         return out
 
 
+def _seed_worker(worker_id: int) -> None:  # noqa: ARG001 (签名由 DataLoader 约定)
+    """worker 进程初始化：把 Python/numpy 全局 RNG 绑到 torch 为本 worker 派生的
+    确定性种子（base_seed+worker_id，base_seed 来自 DataLoader ``generator``）：
+    dataset 内的 ``random``/np 采样流不再依赖主进程 RNG 消耗或启动时机，同
+    seed + 同 num_workers 下逐次运行可复现。"""
+    seed = torch.initial_seed() % 2**32
+    random.seed(seed)
+    np.random.seed(seed)
+
+
 def build_ssl_dataloader(cfg, ssl=None) -> DataLoader:
     """按 ``cfg.data`` 构造 image-only 训练 dataloader（无 val：见 §0.5 在线探针）。
 
@@ -501,6 +511,12 @@ def build_ssl_dataloader(cfg, ssl=None) -> DataLoader:
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(dc.persistent_workers)
         kwargs["prefetch_factor"] = int(dc.prefetch_factor)
+        kwargs["worker_init_fn"] = _seed_worker
+    # 显式 generator：shuffle 顺序与 worker base_seed 由 train.seed(+rank) 派生，
+    # 不再取决于主进程全局 RNG 的当前状态（同 seed 可复现；各 rank 错开）。
+    gen = torch.Generator()
+    gen.manual_seed(int(cfg.train.seed) + 1000003 * get_rank())
+    kwargs["generator"] = gen
     # DDP：各 rank 分片采样（trainer 每 epoch ``set_epoch`` 重洗）。
     sampler = None
     shuffle = True

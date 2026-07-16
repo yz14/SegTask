@@ -17,8 +17,12 @@ from abc import ABC, abstractmethod
 from typing import Dict, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+from segtask_v1.trainer.dist_utils import (
+    get_rank, get_world_size, is_dist_avail_and_initialized)
 
 #: 重建/回归损失函数表（与 ``SSLConfig.recon_loss`` 取值对应）。
 RECON_LOSS_FNS = {
@@ -26,6 +30,40 @@ RECON_LOSS_FNS = {
     "smooth_l1": F.smooth_l1_loss,
     "mse": F.mse_loss,
 }
+
+
+class _GatherCatLayer(torch.autograd.Function):
+    """带梯度的 all-gather + 沿 batch 维 cat（VICReg 官方 ``FullGatherLayer`` 语义）。
+
+    前向：收集各 rank 的 ``x``（逐 rank 等形，由 DistributedSampler drop_last
+    保证）拼成全局 batch；反向：all-reduce 全局梯度后取回本 rank 切片，使跨 rank
+    统计量（variance/covariance）的梯度正确回流到本地样本。
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        world = get_world_size()
+        outs = [torch.zeros_like(x) for _ in range(world)]
+        dist.all_gather(outs, x.contiguous())
+        return torch.cat(outs, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        grad = grad.contiguous()
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+        n = grad.shape[0] // get_world_size()
+        r = get_rank()
+        return grad[r * n:(r + 1) * n]
+
+
+def gather_cat_with_grad(x: torch.Tensor) -> torch.Tensor:
+    """DDP 下把本 rank 嵌入 ``x: (N, D)`` 拼成全局 ``(world·N, D)``（保留梯度）；
+    非分布式时原样返回。供 VICReg 族的 variance/covariance 在**全局** batch 上
+    计算（官方 VICReg 做法），避免小 per-GPU batch 下正则统计噪声大/偷弱。要求
+    各 rank 的 ``x`` 等形。"""
+    if not (is_dist_avail_and_initialized() and get_world_size() > 1):
+        return x
+    return _GatherCatLayer.apply(x)
 
 
 class SSLMethod(ABC):
@@ -105,4 +143,4 @@ class SSLMethod(ABC):
         return self.module.parameters()
 
 
-__all__ = ["SSLMethod", "RECON_LOSS_FNS"]
+__all__ = ["SSLMethod", "RECON_LOSS_FNS", "gather_cat_with_grad"]

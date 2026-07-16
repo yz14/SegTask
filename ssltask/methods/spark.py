@@ -51,7 +51,7 @@ class SparKMethod(SSLMethod):
         target = (per_unit_normalize(clean, self.unit)
                   if self.norm_pix else clean)
         loss = masked_recon_loss(pred, target, mask_full, self.loss_name)
-        return loss, {"recon_loss": float(loss.detach()),
+        return loss, {"recon_loss": loss.detach(),
                       "mask_ratio": self.mask_ratio}
 
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:

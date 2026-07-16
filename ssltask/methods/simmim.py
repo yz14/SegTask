@@ -43,7 +43,7 @@ class SimMIMMethod(SSLMethod):
         x_masked = apply_mask_token(clean, mask_full, self.module.mask_token)
         pred = self.module(x_masked)
         loss = masked_recon_loss(pred, clean, mask_full, self.loss_name)
-        return loss, {"recon_loss": float(loss.detach()),
+        return loss, {"recon_loss": loss.detach(),
                       "mask_ratio": self.mask_ratio}
 
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:

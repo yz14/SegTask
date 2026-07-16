@@ -180,7 +180,7 @@ class MoCoMethod(SSLMethod):
         # 入队延迟到优化步边界（on_after_step）：跳步时整组 key 丢弃，队列与
         # 权重更新保持同步；同 accum 组内各 micro-batch 也不会互吃对方的 key 作负样本。
         self._pending_keys.append(torch.cat([k1, k2], dim=0).detach())
-        return loss, {"moco_loss": float(loss.detach()),
+        return loss, {"moco_loss": loss.detach(),
                       "queue_ptr": self._last_ptr}
 
     def on_resume(self, global_step: int) -> None:

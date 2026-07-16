@@ -24,7 +24,7 @@ from segtask_v1.trainer.checkpoint import unwrap_compile
 
 from ..data.multicrop import PairedCropGenerator, site_coords
 from ..models.vicregl_modules import build_vicregl_net
-from .base import SSLMethod
+from .base import SSLMethod, gather_cat_with_grad
 
 
 def _variance_loss(z: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -176,7 +176,12 @@ class VICRegLMethod(SSLMethod):
         g2, d2 = self.module(v2)
         g1, g2 = g1.float(), g2.float()
 
-        g_inv, g_var, g_cov = _vic_terms(g1, g2)
+        # 全局项：invariance 逐样本本地计算；variance/covariance 在跨 rank 拼接的
+        # 全局 batch 上计算（官方 VICReg 做法，小 per-GPU batch 下统计才稳）。
+        g_inv = F.mse_loss(g1, g2)
+        g1g, g2g = gather_cat_with_grad(g1), gather_cat_with_grad(g2)
+        g_var = 0.5 * (_variance_loss(g1g) + _variance_loss(g2g))
+        g_cov = 0.5 * (_covariance_loss(g1g) + _covariance_loss(g2g))
         global_loss = (self.sim_coeff * g_inv + self.var_coeff * g_var
                        + self.cov_coeff * g_cov)
 
@@ -191,12 +196,12 @@ class VICRegLMethod(SSLMethod):
 
         loss = self.alpha * global_loss + (1.0 - self.alpha) * local_loss
         return loss, {
-            "vicregl_loss": float(loss.detach()),
-            "global_loss": float(global_loss.detach()),
-            "local_loss": float(local_loss.detach()),
+            "vicregl_loss": loss.detach(),
+            "global_loss": global_loss.detach(),
+            "local_loss": local_loss.detach(),
             "n_loc_matches": float(n_loc), "n_feat_matches": float(n_feat),
-            "inv": float(g_inv.detach()), "var": float(g_var.detach()),
-            "cov": float(g_cov.detach())}
+            "inv": g_inv.detach(), "var": g_var.detach(),
+            "cov": g_cov.detach()}
 
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:
         net = unwrap_compile(self.module)

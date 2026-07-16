@@ -176,7 +176,7 @@ class DINOMethod(SSLMethod):
 
         self._accumulate_center(teacher_out)
         self._cached_global_crops = global_crops
-        return loss, {"dino_loss": float(loss.detach()),
+        return loss, {"dino_loss": loss.detach(),
                       "teacher_temp": teacher_temp,
                       "ema_momentum": self._momentum()}
 

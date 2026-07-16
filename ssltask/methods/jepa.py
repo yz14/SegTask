@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from ..data.masking import apply_mask_token, downsample_mask_to, make_unit_mask, masked_recon_loss
 from ..models.jepa_modules import build_jepa_encoder, build_jepa_predictor
-from .base import SSLMethod
+from .base import SSLMethod, gather_cat_with_grad
 
 
 class _JEPAModule(nn.Module):
@@ -113,24 +113,28 @@ class JEPAMethod(SSLMethod):
 
         feat_mask = downsample_mask_to(mask_full, pred.shape[2:])
         loss = masked_recon_loss(pred, tgt_feat.detach(), feat_mask, "mse")
-        logs = {"jepa_loss": float(loss.detach()),
+        logs = {"jepa_loss": loss.detach(),
                 "mask_ratio": self.mask_ratio,
                 "ema_momentum": self._momentum()}
 
         if self.var_weight > 0.0 or self.cov_weight > 0.0:
             var_loss, cov_loss = self._vicreg(pred, feat_mask)
             loss = loss + self.var_weight * var_loss + self.cov_weight * cov_loss
-            logs["vicreg_var"] = float(var_loss.detach())
-            logs["vicreg_cov"] = float(cov_loss.detach())
+            logs["vicreg_var"] = var_loss.detach()
+            logs["vicreg_cov"] = cov_loss.detach()
         return loss, logs
 
     def _vicreg(self, feat: torch.Tensor, feat_mask: torch.Tensor
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """VICReg 方差(hinge std>=1) + 协方差(去相关) 正则，仅在被遮特征位点上。"""
+        """VICReg 方差(hinge std>=1) + 协方差(去相关) 正则，仅在被遮特征位点上。
+
+        DDP 下先跨 rank 拼接被遮位点嵌入再算统计量（官方 VICReg 做法）：各 rank
+        的 M 相等（sample_unit_mask 逐样本遮固定 num_mask 个单元、batch 等长由
+        DistributedSampler drop_last 保证），满足等形 all-gather 前提。"""
         c = feat.shape[1]
         x = feat.float().flatten(2).permute(0, 2, 1).reshape(-1, c)   # (B*N, C)
         sel = feat_mask.flatten(2).permute(0, 2, 1).reshape(-1) > 0.5
-        z = x[sel]                                                    # (M, C)
+        z = gather_cat_with_grad(x[sel])                              # (M·world, C)
         if z.shape[0] < 2:
             zero = feat.new_zeros(())
             return zero, zero

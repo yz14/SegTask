@@ -27,21 +27,21 @@ from segtask_v1.trainer.checkpoint import strip_common_prefixes
 
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
 from .metrics import _binary_f1, _rank_auc, macro_cls_metrics
+from .split import group_split
 
 logger = logging.getLogger(__name__)
 
 
 def build_cls_probe_loaders(cfg, ssl) -> Tuple[DataLoader, DataLoader]:
-    """从 ``ssl.probe_data_dir`` 的标注 npz 划分 train/val loader。"""
+    """从 ``ssl.probe_data_dir`` 的标注 npz 划分 train/val loader。
+
+    划分为组级（患者级，:func:`ssltask.eval.split.group_split`，与分割探针
+    同口径）：同组文件不跨 train/val，避免同患者多序列泄漏。"""
     paths = discover_image_npz(ssl.probe_data_dir, cfg.data.npz_suffix)
-    rng = random.Random(int(ssl.probe_seed))
-    paths = list(paths)
-    rng.shuffle(paths)
-    n_val = max(1, int(round(len(paths) * float(ssl.probe_val_ratio))))
-    if len(paths) > 1:
-        n_val = min(n_val, len(paths) - 1)
-    val_paths = paths[:n_val]
-    train_paths = paths[n_val:] or list(paths)
+    train_paths, val_paths = group_split(
+        paths, float(ssl.probe_val_ratio), int(ssl.probe_seed),
+        group_regex=str(ssl.probe_group_regex),
+        allow_single_group=bool(ssl.probe_allow_single_group))
     dc = cfg.data
     spatial_dims = int(cfg.model.spatial_dims)
 
