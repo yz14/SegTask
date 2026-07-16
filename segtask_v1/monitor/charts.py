@@ -201,8 +201,12 @@ def build_single_payload(
         loss_series.append(_line_series(k, _color(2 + j),
                                         _points(hist, k, "train")))
     if loss_series:
+        # 标题标注口径：val 为裸 base_loss（无 DS/aux/topo 加权），与训练组合
+        # 损失不同量纲，两条曲线不可直接比较绝对值。
         panels.append({
-            "id": "loss", "title": "Loss", "kind": "line",
+            "id": "loss",
+            "title": "Loss（val = 裸 base loss，与 train 组合损失口径不同）",
+            "kind": "line",
             "group": "Training", "span": "full",
             "log_toggle": True, "best_x": best_x, "series": loss_series,
         })

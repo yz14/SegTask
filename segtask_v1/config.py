@@ -737,6 +737,12 @@ class TrainConfig:
     # 可选 channels_last 内存格式；数值等价，Ampere+ 上 3D conv 可能提速但不保证正收益（需 benchmark）；默认关。
     channels_last: bool = False
 
+    # 训练 batch 的 GPU 预取：用独立 CUDA copy stream 把下一个 batch 的 H2D
+    # 拷贝与当前 batch 的前向/反向重叠，隐藏传输延迟。数值完全等价（仅改变
+    # 拷贝与计算的重叠方式）。需 data.pin_memory=True 才有真实收益（pageable
+    # 内存下异步拷贝退化为同步）。GPU 增强 / 大 patch 场景收益 ~5-15%。默认关。
+    prefetch_to_gpu: bool = False
+
     # CUDA caching allocator 的 expandable segments（PyTorch 2.1+）：多分辨率视图 /
     # oversample 裁剪 / 滑窗尾窗等形状多变场景下显著缓解显存碎片（reserved >>
     # allocated 即碎片征兆，epoch 摘要有打印）。实现方式为进程启动早期注入
@@ -980,6 +986,12 @@ class PredictConfig:
     # ---- 滑窗核心 ----
     # z 轴重叠比（0.0 = 不重叠，0.5 = 50%）。
     z_overlap: float = 0.5
+
+    # cubic 模式 H/W 轴重叠比；None（默认）= 沿用 z_overlap（三轴同值，
+    # 现状不变）。各向异性数据（z 分辨率低、面内分辨率高）时可为面内轴
+    # 单独设置（如 z_overlap=0.5, hw_overlap=0.25 减少窗口数提速）。
+    # 仅 patch_mode='cubic' 生效；z_axis / 2_5d / whole 不受影响。
+    hw_overlap: Optional[float] = None
 
     # 重叠区融合："gaussian" 或 "average"。
     blend_mode: str = "gaussian"
@@ -2046,6 +2058,12 @@ class Config:
             float(self.train.surface_dice_tolerance_mm) >= 0.0,
             f"surface_dice_tolerance_mm must be >= 0; got "
             f"{self.train.surface_dice_tolerance_mm}")
+        # prefetch_to_gpu 依赖 pinned host 内存才能真正异步（否则正确但无收益）。
+        if self.train.prefetch_to_gpu and not self.data.pin_memory:
+            logger.warning(
+                "train.prefetch_to_gpu=True but data.pin_memory=False: "
+                "H2D copies from pageable memory are synchronous, so the "
+                "prefetch overlap has no effect. Enable data.pin_memory.")
         if self.train.pretrain_upkern and self.model.backbone != "mednext":
             logger.warning(
                 "train.pretrain_upkern=True only affects backbone='mednext'; "
@@ -2077,6 +2095,18 @@ class Config:
             _require(
                 0.0 <= float(thr_cfg) <= 1.0,
                 f"predict.threshold must be in [0,1]; got {thr_cfg}.")
+        _require(
+            0.0 <= float(self.predict.z_overlap) < 1.0,
+            f"predict.z_overlap must be in [0, 1); got {self.predict.z_overlap}.")
+        if self.predict.hw_overlap is not None:
+            _require(
+                0.0 <= float(self.predict.hw_overlap) < 1.0,
+                f"predict.hw_overlap must be in [0, 1); "
+                f"got {self.predict.hw_overlap}.")
+            if self.data.patch_mode != "cubic":
+                logger.warning(
+                    "predict.hw_overlap is only used by patch_mode='cubic'; "
+                    "current patch_mode=%r ignores it.", self.data.patch_mode)
         _require(
             str(self.predict.acc_dtype) in ("fp32", "fp16"),
             f"predict.acc_dtype must be 'fp32' or 'fp16'; "

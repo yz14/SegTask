@@ -304,9 +304,10 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     D_orig, H_orig, W_orig = vol.shape
     pD, pH, pW = p.patch_D, p.patch_H, p.patch_W
 
+    # z 轴用 z_overlap；H/W 轴用 hw_overlap（默认与 z 同值）。
     stride_d = max(1, int(pD * (1 - p.overlap)))
-    stride_h = max(1, int(pH * (1 - p.overlap)))
-    stride_w = max(1, int(pW * (1 - p.overlap)))
+    stride_h = max(1, int(pH * (1 - p.hw_overlap)))
+    stride_w = max(1, int(pW * (1 - p.hw_overlap)))
     pos_d = _blending.compute_1d_positions(D_orig, pD, stride_d)
     pos_h = _blending.compute_1d_positions(H_orig, pH, stride_h)
     pos_w = _blending.compute_1d_positions(W_orig, pW, stride_w)

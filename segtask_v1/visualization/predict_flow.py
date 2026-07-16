@@ -44,13 +44,18 @@ def build_predict_flow(
     patch_fwd = _patch_forward_shape(cfg, topo)
 
     z_interleave = bool(pc.z_interleave_enabled and dc.patch_mode == "2_5d")
+    # cubic 下 H/W 轴可单独设 overlap（hw_overlap=None 时三轴同 z_overlap）。
+    overlap_str = (
+        f"z={pc.z_overlap:g}, hw={pc.hw_overlap:g}"
+        if (dc.patch_mode == "cubic" and pc.hw_overlap is not None)
+        else f"{pc.z_overlap:g}")
     adabn_pv = bool(pc.adabn_enabled and pc.adabn_mode == "per_volume")
 
     g = VisGraph(title="预测流 Prediction Flow")
     g.meta = {
         "patch_mode": dc.patch_mode,
         "patch_size": shape_str((pD, pH, pW)),
-        "overlap": f"{pc.z_overlap:g}",
+        "overlap": overlap_str,
         "blend_mode": pc.blend_mode,
         "tta_flip": str(pc.tta_flip),
         "threshold": _threshold_str(pc.threshold),
@@ -102,7 +107,7 @@ def build_predict_flow(
     g.add_node(
         "sliding", "滑窗取块", kind="process",
         key_info={"patch": shape_str(patch_fwd),
-                  "overlap": f"{pc.z_overlap:g}",
+                  "overlap": overlap_str,
                   "batch_size": str(pc.batch_size)},
         detail={
             "dispatch": dispatch,

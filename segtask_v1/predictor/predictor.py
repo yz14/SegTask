@@ -71,7 +71,11 @@ class Predictor:
         self.model.eval()
 
         pc = cfg.predict
-        self.overlap = pc.z_overlap            # cubic 下三轴复用
+        self.overlap = pc.z_overlap            # z 轴（cubic 下 H/W 见 hw_overlap）
+        # cubic H/W 轴重叠比：None 时沿用 z_overlap（三轴同值，现状不变）。
+        self.hw_overlap = (
+            float(pc.hw_overlap) if pc.hw_overlap is not None
+            else float(pc.z_overlap))
         self.blend_mode = pc.blend_mode
         self.batch_size = pc.batch_size
         self.tta_flip = pc.tta_flip

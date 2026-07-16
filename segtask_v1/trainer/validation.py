@@ -133,12 +133,14 @@ class MetricAccumulator:
             stats["voxels"] = torch.tensor(
                 float(voxels_override), dtype=torch.float64,
                 device=stats["voxels"].device)
+        # 逐类混淆量用 float64 跨 val 集累加：float32 在累计体素数 >16M 后
+        # 整数间隔 >1，长 val 集 × 大前景会引入舍入（voxels 已是 float64）。
         if self._inter is None:
-            self._inter = stats["inter"].clone()
-            self._pred_sum = stats["pred_sum"].clone()
-            self._target_sum = stats["target_sum"].clone()
+            self._inter = stats["inter"].double()
+            self._pred_sum = stats["pred_sum"].double()
+            self._target_sum = stats["target_sum"].double()
             self._voxels = stats["voxels"].clone()
-            self._cov = stats["n_with_gt"].clone()
+            self._cov = stats["n_with_gt"].double()
         else:
             self._inter += stats["inter"]
             self._pred_sum += stats["pred_sum"]
@@ -153,8 +155,8 @@ class MetricAccumulator:
                 tolerance_mm=self.sd_tol_mm if self.sd_physical else 0.0,
                 spacing=self.sd_spacing if self.sd_physical else None)
             if self._sd_num is None:
-                self._sd_num = sd_stats["sd_num"].clone()
-                self._sd_denom = sd_stats["sd_denom"].clone()
+                self._sd_num = sd_stats["sd_num"].double()
+                self._sd_denom = sd_stats["sd_denom"].double()
             else:
                 self._sd_num += sd_stats["sd_num"]
                 self._sd_denom += sd_stats["sd_denom"]
@@ -176,22 +178,21 @@ class MetricAccumulator:
         if get_world_size() <= 1:
             return
 
-        # 各可加量的 (shape, dtype)，与 dice_batch_stats / surface_dice_batch_stats
-        # 的返回一致：逐类量为 (num_fg,) float32，唯 voxels 为标量 () float64。
+        # 各可加量的 (shape, dtype)，与 ``update()`` 的累加 dtype 一致：全部
+        # float64（逐类量在 update 处已升 double，防大计数舍入）。
         # 未分到样本的 rank 据此以正确形状/类型零初始化，保各 rank all-reduce 形状对齐
-        # （否则 collective 形状不一致会死锁）。保留各自原生 dtype，不强转 float32 以免
-        # voxel 大计数精度损失。
+        # （否则 collective 形状不一致会死锁）。
         per_class = (int(num_fg),)
         specs = {
-            "_inter":      (per_class, torch.float32),
-            "_pred_sum":   (per_class, torch.float32),
-            "_target_sum": (per_class, torch.float32),
+            "_inter":      (per_class, torch.float64),
+            "_pred_sum":   (per_class, torch.float64),
+            "_target_sum": (per_class, torch.float64),
             "_voxels":     ((),        torch.float64),
-            "_cov":        (per_class, torch.float32),
+            "_cov":        (per_class, torch.float64),
         }
         if self.compute_sd:
-            specs["_sd_num"]   = (per_class, torch.float32)
-            specs["_sd_denom"] = (per_class, torch.float32)
+            specs["_sd_num"]   = (per_class, torch.float64)
+            specs["_sd_denom"] = (per_class, torch.float64)
         for name, (shape, dtype) in specs.items():
             t = getattr(self, name)
             if t is None:

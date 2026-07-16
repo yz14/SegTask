@@ -410,6 +410,7 @@ def _train_fields() -> List[Field]:
         Field("train.amp_dtype", depends_on=[_truthy("train.use_amp")]),
         Field("train.compile_mode"),
         Field("train.channels_last"),
+        Field("train.prefetch_to_gpu"),
         Field("train.use_ema"),
         Field("train.ema_decay", depends_on=[_truthy("train.use_ema")]),
         Field("train.ema_warmup", depends_on=[_truthy("train.use_ema")]),
@@ -445,6 +446,11 @@ def _predict_fields(mode: str) -> List[Field]:
     is25 = mode == "2_5d"
     fs = [
         Field("predict.z_overlap"),
+    ]
+    # cubic 专属：H/W 轴可与 z 轴不同 overlap（None = 三轴同 z_overlap）。
+    if mode == "cubic":
+        fs += [Field("predict.hw_overlap")]
+    fs += [
         Field("predict.blend_mode"),
         Field("predict.batch_size"),
         Field("predict.tta_flip"),

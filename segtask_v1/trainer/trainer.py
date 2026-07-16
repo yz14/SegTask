@@ -21,7 +21,7 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Tuple
 
 from colorama import Fore, Style
 
@@ -48,6 +48,7 @@ from .amp import (
     resolve_auto_amp_dtype,
 )
 from .breakdown import collect_multi_res_breakdown, format_breakdown
+from .prefetch import CudaPrefetcher
 from .checkpoint import (
     AsyncCheckpointSaver,
     atomic_torch_save,
@@ -786,7 +787,13 @@ class Trainer:
             pending.clear()
             return last
 
-        for step, batch in enumerate(self.train_loader):
+        # prefetch_to_gpu：独立 copy stream 提前一个 batch 上卡，H2D 与计算重叠。
+        # 交付的张量已在 device 上，下方 .to(device) 退化为 no-op，循环体不变。
+        batch_iter: "Iterable" = self.train_loader
+        if tc.prefetch_to_gpu and self.device.type == "cuda":
+            batch_iter = CudaPrefetcher(self.train_loader, self.device)
+
+        for step, batch in enumerate(batch_iter):
             image = batch["image"].to(self.device, non_blocking=True)
             label = batch["label"].to(self.device, non_blocking=True).float()
             wmap = batch.get("weight_map")
