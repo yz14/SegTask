@@ -22,6 +22,21 @@ from .io import (
 
 logger = logging.getLogger(__name__)
 
+# 验证集确定性采样的固定基种子（与样本序号组合派生逐样本 RNG）。
+_VAL_SAMPLING_SEED = 0x5EED_2024
+
+
+def _halton(i: int, base: int) -> float:
+    """Halton 低差异序列第 i 项（i>=1），返回 [0,1) 内均匀覆盖的确定性分数；
+    不同素数 base 给出准独立维度（val_grid_coverage 的 3D 中心铺点用 2/3/5）。"""
+    f, r = 1.0, 0.0
+    while i > 0:
+        f /= base
+        r += f * (i % base)
+        i //= base
+    return r
+
+
 class VolumeNpzDatasetBase(Dataset):
     """共用 npz I/O + 缓存基类。子类负责索引构建、采样与 __getitem__。
 
@@ -52,7 +67,8 @@ class VolumeNpzDatasetBase(Dataset):
         cond_intensity_min  : float,
         cond_intensity_max  : float,
         cond_global_mean    : float,
-        cond_global_std     : float):
+        cond_global_std     : float,
+        val_grid_coverage   : bool = False):
         super().__init__()
         assert len(image_paths) == len(label_paths)
         assert npz_paths is not None and len(npz_paths) == len(image_paths), (
@@ -78,6 +94,7 @@ class VolumeNpzDatasetBase(Dataset):
         self.cond_intensity_max = cond_intensity_max
         self.cond_global_mean   = cond_global_mean
         self.cond_global_std    = cond_global_std
+        self.val_grid_coverage  = bool(val_grid_coverage)
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -91,6 +108,8 @@ class VolumeNpzDatasetBase(Dataset):
         # 逐 worker 采样 RNG（惰性创建，见 _rng）。
         self._rng_cache: Optional[np.random.Generator] = None
         self._rng_wid  : Optional[int] = None
+        # 当前 __getitem__ 的样本序号（供验证态确定性采样派生 RNG）。
+        self._sample_idx: int = 0
 
     def _rng(self) -> np.random.Generator:
         """逐 worker 采样 RNG。
@@ -107,6 +126,24 @@ class VolumeNpzDatasetBase(Dataset):
             self._rng_cache = np.random.default_rng(seed % (2 ** 63))
             self._rng_wid = wid
         return self._rng_cache
+
+    def _sample_rng(self) -> np.random.Generator:
+        """patch 采样 RNG。
+
+        训练用逐 worker 流式 RNG（每 epoch 不同，保采样多样性）；验证用
+        当前样本序号派生的确定性 RNG，使每个 epoch 评估同一组 patch，
+        save_best / early-stopping / plateau 不被采样噪声驱动。"""
+        if self.is_train:
+            return self._rng()
+        return np.random.default_rng((_VAL_SAMPLING_SEED, self._sample_idx))
+
+    def _val_coverage_pos(self) -> Optional[Tuple[int, int]]:
+        """val 确定性网格覆盖（val_grid_coverage=True）：返回当前样本在卷内的
+        序号 j 与每卷样本数 S；未启用或训练态返回 None（回退随机位置）。"""
+        if self.is_train or not self.val_grid_coverage:
+            return None
+        j = self._sample_idx // len(self.image_paths)
+        return j, max(int(self.samples_per_volume), 1)
 
     # ------------------------------------------------------------------
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
@@ -213,7 +250,8 @@ class Volume3D(VolumeNpzDatasetBase):
         cond_global_mean    : float = 0.0,
         cond_global_std     : float = 1.0,
         z_boundary_mode     : str = "stretch",
-        npz_paths           : Optional[List[str]] = None):
+        npz_paths           : Optional[List[str]] = None,
+        val_grid_coverage   : bool = False):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -235,7 +273,8 @@ class Volume3D(VolumeNpzDatasetBase):
             cond_intensity_min   = cond_intensity_min,
             cond_intensity_max   = cond_intensity_max,
             cond_global_mean     = cond_global_mean,
-            cond_global_std      = cond_global_std)
+            cond_global_std      = cond_global_std,
+            val_grid_coverage    = val_grid_coverage)
         if z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
@@ -290,6 +329,7 @@ class Volume3D(VolumeNpzDatasetBase):
         """总是发单 max-FOV z-cube (1, eD_max, eH, eW)，eD_max=round(eD*max_scale)。多分辨率交由
         trainer 中心裁拆视图；2.5D / z_axis 在数据集侧抽取逻辑完全一致。单分辨率时
         max_scale=1.0，eD_max==eD。"""
+        self._sample_idx = idx
         vol_idx  = idx % len(self.image_paths)
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
@@ -351,9 +391,15 @@ class Volume3D(VolumeNpzDatasetBase):
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
-        """采样中心 z：以 fg_ratio 概率从前景切片采样，否则均匀采样。"""
+        """采样中心 z：训练以 fg_ratio 概率从前景切片采样，否则均匀采样；
+        验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
+        cov = self._val_coverage_pos()
+        if cov is not None:
+            # 网格覆盖：卷内第 j 个样本取 z 轴等距位置（bin 中心）。
+            j, S = cov
+            return min(int((j + 0.5) * D_vol / S), D_vol - 1)
         fg_slices = self._vol_fg_slices[vol_idx]
-        rng = self._rng()
+        rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
             and rng.random() < self.fg_ratio):
@@ -483,7 +529,8 @@ class Volume3DCubic(VolumeNpzDatasetBase):
         cond_intensity_max         : float = 1024.0,
         cond_global_mean           : float = 0.0,
         cond_global_std            : float = 1.0,
-        npz_paths                  : Optional[List[str]] = None):
+        npz_paths                  : Optional[List[str]] = None,
+        val_grid_coverage          : bool = False):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -505,8 +552,9 @@ class Volume3DCubic(VolumeNpzDatasetBase):
             cond_intensity_min   = cond_intensity_min,
             cond_intensity_max   = cond_intensity_max,
             cond_global_mean     = cond_global_mean,
-            cond_global_std      = cond_global_std)
-        
+            cond_global_std      = cond_global_std,
+            val_grid_coverage    = val_grid_coverage)
+
         self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
@@ -544,6 +592,7 @@ class Volume3DCubic(VolumeNpzDatasetBase):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """总是发单 max-FOV cube (1, eD_max, eH_max, eW_max)，size = round(extract_size*max_scale)。
         多分辨率交由 trainer 中心裁拆视图。单分辨率时 max_scale=1.0，cube == extract_size。"""
+        self._sample_idx = idx
         vol_idx    = idx % len(self.image_paths)
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         D, H, W    = img.shape
@@ -622,10 +671,20 @@ class Volume3DCubic(VolumeNpzDatasetBase):
 
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
         """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
-        导致>50% 体素来自边界复制（偏移训练分布）。"""
+        导致>50% 体素来自边界复制（偏移训练分布）。验证用逐样本确定性
+        RNG（见 _sample_rng）。"""
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
+        cov = self._val_coverage_pos()
+        if cov is not None:
+            # 网格覆盖：卷内第 j 个样本用 Halton(2,3,5) 低差异序列均匀铺满
+            # 安全中心域（任意 S 均可，无需三轴因子分解）。
+            j, _ = cov
+            fd, fh, fw = (_halton(j + 1, b) for b in (2, 3, 5))
+            return (dlo + min(int(fd * (dhi - dlo)), dhi - dlo - 1),
+                    hlo + min(int(fh * (hhi - hlo)), hhi - hlo - 1),
+                    wlo + min(int(fw * (whi - wlo)), whi - wlo - 1))
         fg_coords = self._vol_fg_coords[vol_idx]
-        rng = self._rng()
+        rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
                 and rng.random() < self.fg_ratio):

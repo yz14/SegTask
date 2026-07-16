@@ -331,6 +331,31 @@ class GenerationPredictor:
         out = torch.zeros(*out_shape, device=t.device)
         weight = torch.zeros(*out_shape, device=t.device)
         w = self._blend_weight([p * s for p, s in zip(patch, osc)])
+        win_bs = max(1, int(self.cfg.predict.batch_size))
+        pending: List[Tuple[List[int], torch.Tensor,
+                            Optional[torch.Tensor]]] = []
+
+        def _flush() -> None:
+            """把积攒的窗口拼成一个 batch 前向，再逐窗加权回填。"""
+            if not pending:
+                return
+            xs = torch.cat([p[1] for p in pending], dim=0)
+            conds = (torch.cat([p[2] for p in pending], dim=0)
+                     if pending[0][2] is not None else None)
+            recs = self._restore_patch(xs, cond=conds)
+            for i, (starts, _, _) in enumerate(pending):
+                rec = recs[i, 0]
+                valid = [min(p, n - s) * sc
+                         for p, n, s, sc in zip(patch, vol, starts, osc)]
+                vd, vh, vw = valid
+                wv = w[:vd, :vh, :vw]
+                region = tuple(
+                    slice(s * sc, s * sc + v)
+                    for s, sc, v in zip(starts, osc, valid))
+                out[region] += rec[:vd, :vh, :vw] * wv
+                weight[region] += wv
+            pending.clear()
+
         for sz in axis_starts[0]:
             for sy in axis_starts[1]:
                 for sx in axis_starts[2]:
@@ -340,16 +365,10 @@ class GenerationPredictor:
                     if cond_t is not None:
                         cond_win = self._extract_window(
                             cond_t, starts, patch)[None]
-                    rec = self._restore_patch(x, cond=cond_win)[0, 0]
-                    valid = [min(p, n - s) * sc
-                             for p, n, s, sc in zip(patch, vol, starts, osc)]
-                    vd, vh, vw = valid
-                    wv = w[:vd, :vh, :vw]
-                    region = tuple(
-                        slice(s * sc, s * sc + v)
-                        for s, sc, v in zip(starts, osc, valid))
-                    out[region] += rec[:vd, :vh, :vw] * wv
-                    weight[region] += wv
+                    pending.append((starts, x, cond_win))
+                    if len(pending) >= win_bs:
+                        _flush()
+        _flush()
         return out / weight.clamp(min=1e-8)
 
     @torch.no_grad()
@@ -377,18 +396,35 @@ class GenerationPredictor:
         stride = max(1, int(round(d * (1.0 - float(self.cfg.predict.overlap)))))
         starts = self._window_starts(dz, d, stride)
         wz = self._blend_weight([d])  # (d,)
+        win_bs = max(1, int(self.cfg.predict.batch_size))
+        pending: List[Tuple[int, torch.Tensor, Optional[torch.Tensor]]] = []
+
+        def _flush() -> None:
+            """把积攒的 slab 拼成一个 batch 前向，再逐窗加权回填。"""
+            if not pending:
+                return
+            xs = torch.cat([p[1] for p in pending], dim=0)
+            conds = (torch.cat([p[2] for p in pending], dim=0)
+                     if pending[0][2] is not None else None)
+            recs = self._restore_patch(xs, cond=conds)
+            for i, (s, _, _) in enumerate(pending):
+                rec = recs[i, 0] if recs.ndim == 5 else recs[i]  # (d,H,W)
+                valid = min(d, dz - s)
+                wv = wz[:valid]
+                out[s:s + valid] += rec[:valid] * wv[:, None, None]
+                count[s:s + valid] += wv
+            pending.clear()
+
         for s in starts:
             x = self._slab_views_2_5d(t, s)
             cond_slab = None
             if cond_t is not None:
                 cond_slab = self._extract_window(
                     cond_t, [s, 0, 0], [d] + list(cond_t.shape[-2:]))[None]
-            rec = self._restore_patch(x, cond=cond_slab)
-            rec = rec[0, 0] if rec.ndim == 5 else rec[0]  # (d,H,W)
-            valid = min(d, dz - s)
-            wv = wz[:valid]
-            out[s:s + valid] += rec[:valid] * wv[:, None, None]
-            count[s:s + valid] += wv
+            pending.append((s, x, cond_slab))
+            if len(pending) >= win_bs:
+                _flush()
+        _flush()
         out = out / count[:, None, None].clamp(min=1e-8)
         return out.float().cpu().numpy()
 

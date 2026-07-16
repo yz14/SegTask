@@ -221,6 +221,15 @@ class Config:
             _require(0.0 < t.sigma_min < t.sigma_max, "require 0 < sigma_min < sigma_max.")
             _require(t.sigma_data > 0.0, "task.sigma_data must be > 0.")
             _require(t.rho > 0.0, "task.rho must be > 0.")
+            # zscore 数据 std=1，EDM 预条件的 sigma_data=0.5（minmax 默认）
+            # 会系统性偏置 c_skip/c_out/loss 权重；提示改为 1.0。
+            if (str(self.data.normalize).lower() == "zscore"
+                    and str(t.parameterization).lower() == "edm"
+                    and abs(float(t.sigma_data) - 0.5) < 1e-9):
+                logger.warning(
+                    "data.normalize='zscore' (data std≈1.0) with EDM default "
+                    "task.sigma_data=0.5 (tuned for minmax [0,1]); consider "
+                    "task.sigma_data=1.0 to match the data scale.")
             # ddpm_eps 采样必须用 ddpm/ddim；edm_* 仅适用于 edm 预条件。
             if str(t.parameterization).lower() == "ddpm_eps":
                 _require(
@@ -608,6 +617,12 @@ class Config:
                 self.is_generation,
                 "train.val_full_volume is only supported for "
                 "task.type='generation'.")
+        # prefetch_to_gpu 依赖 pinned host 内存才能真正异步（否则正确但无收益）。
+        if bool(self.train.prefetch_to_gpu) and not bool(self.data.pin_memory):
+            logger.warning(
+                "train.prefetch_to_gpu=True but data.pin_memory=False: "
+                "async H2D copy degrades to synchronous, prefetch overlap "
+                "has no effect. Enable data.pin_memory.")
 
     def _validate_predict(self) -> None:
         """predict.* 校验。"""
@@ -625,6 +640,9 @@ class Config:
             str(self.predict.blend).lower() in ("gaussian", "uniform"),
             f"Invalid predict.blend: {self.predict.blend!r}. "
             "Valid: 'gaussian' | 'uniform'.")
+        _require(
+            int(self.predict.batch_size) >= 1,
+            f"predict.batch_size must be >= 1; got {self.predict.batch_size}.")
         tz = float(self.predict.target_z_spacing)
         _require(tz >= 0.0,
                  f"predict.target_z_spacing must be >= 0; got {tz}.")

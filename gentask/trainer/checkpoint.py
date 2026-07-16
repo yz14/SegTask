@@ -8,8 +8,52 @@
 
 from __future__ import annotations
 
+import logging
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+
+def snapshot_rng_state() -> dict:
+    """快照 RNG 状态以支持位精确 resume（torch CPU/CUDA + numpy + python）。"""
+    return {
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (torch.cuda.get_rng_state_all()
+                       if torch.cuda.is_available() else None),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+
+
+def _rng_bytes_to_cpu_tensor(data: object) -> torch.Tensor:
+    """反序列化 RNG 字节或历史 Tensor 为 ``set_rng_state`` 可接受的 CPU uint8 张量。"""
+    if isinstance(data, (bytes, bytearray)):
+        return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
+    if isinstance(data, torch.Tensor):
+        return data.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    raise TypeError(
+        f"RNG cpu state must be bytes or Tensor, got {type(data).__name__}")
+
+
+def restore_rng_state(rng: dict) -> None:
+    """从 checkpoint 恢复 RNG（兼容 bytes 打包与 Tensor 格式）。"""
+    tc = rng.get("torch_cpu")
+    if tc is not None:
+        torch.set_rng_state(_rng_bytes_to_cpu_tensor(tc))
+    tcuda = rng.get("torch_cuda")
+    if tcuda is not None and torch.cuda.is_available():
+        restored = [_rng_bytes_to_cpu_tensor(t) for t in tcuda]
+        torch.cuda.set_rng_state_all(restored)
+    np_state = rng.get("numpy")
+    if np_state is not None:
+        np.random.set_state(np_state)
+    py_state = rng.get("python")
+    if py_state is not None:
+        random.setstate(py_state)
 
 
 def unwrap_compile(m: nn.Module) -> nn.Module:
@@ -115,6 +159,8 @@ def strip_common_prefixes(sd):
 
 
 __all__ = [
+    "snapshot_rng_state",
+    "restore_rng_state",
     "unwrap_compile",
     "_strip_compile_prefix",
     "_unwrap_ema_state",

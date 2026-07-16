@@ -149,13 +149,17 @@ class DDPMDiffusion(nn.Module):
         beta_schedule: str = "linear",
         sampler: str = "ddpm",
         sample_steps: int = 18,
-        ddim_eta: float = 0.0):
+        ddim_eta: float = 0.0,
+        x0_clip: float = 1.5):
         super().__init__()
         self.net = net
         self.num_train_timesteps = int(num_train_timesteps)
         self.sampler = str(sampler)
         self.sample_steps = int(sample_steps)
         self.ddim_eta = float(ddim_eta)
+        # x0 预估钳位半径（<=0 禁用）：需覆盖归一化后的数据值域，
+        # minmax([0,1]) 用 1.5；zscore（无固定值域，std=1）需更宽或禁用。
+        self.x0_clip = float(x0_clip)
         betas = _make_betas(beta_schedule, self.num_train_timesteps)
         alphas = 1.0 - betas
         acp = torch.cumprod(alphas, dim=0)
@@ -202,7 +206,8 @@ class DDPMDiffusion(nn.Module):
                 torch.cat([x, cond], dim=1),
                 t.float().expand(cond.shape[0]))
             x0 = (x - (1 - acp_t).sqrt() * eps) / acp_t.sqrt()
-            x0 = x0.clamp(-1.5, 1.5)
+            if self.x0_clip > 0:
+                x0 = x0.clamp(-self.x0_clip, self.x0_clip)
             t_next = steps[i + 1] if i + 1 < len(steps) else torch.tensor(-1)
             acp_next = (
                 self.alphas_cumprod[t_next] if t_next >= 0
@@ -236,6 +241,12 @@ def build_diffusion(cfg, net: nn.Module) -> nn.Module:
     """按 ``cfg.task.parameterization`` 构造 EDM / DDPM 扩散封装。"""
     t = cfg.task
     param = str(t.parameterization).lower()
+    # x0_clip=0 自动派生：minmax 数据≈[0,1] 用 ±1.5；zscore 数据≈N(0,1)
+    # 无固定值域，用 ±4.0（覆盖 >99.99% 体素，仅截极端发散）。
+    x0_clip = float(getattr(t, "x0_clip", 0.0))
+    if x0_clip == 0.0:
+        zscore = str(cfg.data.normalize).lower() == "zscore"
+        x0_clip = 4.0 if zscore else 1.5
     if param == "edm":
         return EDMDiffusion(
             net,
@@ -248,7 +259,7 @@ def build_diffusion(cfg, net: nn.Module) -> nn.Module:
             num_train_timesteps=t.num_train_timesteps,
             beta_schedule=t.beta_schedule,
             sampler=t.sampler, sample_steps=t.sample_steps,
-            ddim_eta=t.ddim_eta)
+            ddim_eta=t.ddim_eta, x0_clip=x0_clip)
     raise ValueError(
         f"task.parameterization must be 'edm' | 'ddpm_eps'; got {param!r}")
 

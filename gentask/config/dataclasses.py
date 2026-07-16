@@ -118,6 +118,12 @@ class DataConfig:
     # 每体积每 epoch 采样次数。
     samples_per_volume: int = 8
 
+    # 验证 patch 位置的确定性网格覆盖（opt-in，仅作用于 val split）：
+    # False（默认）= 逐样本确定性 RNG 随机位置（epoch 间一致但空间覆盖随机）；
+    # True = 卷内第 j 个样本取均匀网格位置（z 轴等距；cubic 用 Halton 序列），
+    # epoch 间指标可比性更强、噪声更小。train split 不受影响。
+    val_grid_coverage: bool = False
+
     # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
     cache_mode       : str = "memory"
     cache_max_volumes: int = 1
@@ -346,6 +352,12 @@ class TrainConfig:
     use_amp  : bool = True
     amp_dtype: str = "float16"
     compile_mode: str = "none"
+    # 可选 channels_last 内存格式；数值等价，Ampere+ 上 3D conv 可能提速但
+    # 不保证正收益（需 benchmark）；默认关。
+    channels_last: bool = False
+    # 独立 copy stream 提前一个 batch 上卡，H2D 与计算重叠（需
+    # data.pin_memory=True 才能真正异步）；数值完全等价，默认关。
+    prefetch_to_gpu: bool = False
     use_ema  : bool = True
     ema_decay: float = 0.999
     output_dir      : str = "outputs"
@@ -392,6 +404,11 @@ class PredictConfig:
 
     # 重叠区融合权重：'gaussian'（中心高权，消接缝）| 'uniform'（等权平均）。
     blend: str = "gaussian"
+
+    # 每次前向拼接的滑窗数（>1 提升 GPU 利用率，显存占用同步增长）。
+    # 回归模型数值等价；扩散模型固定 seed 下批内噪声流与逐窗不同
+    # （仍可复现，但与 batch_size=1 结果不逐位一致）。
+    batch_size: int = 1
 
     # spacing 感知 z 倍率（仅 input_grid=='lr'）：>0 时逐体读 NIfTI z spacing，
     # 以 round(z_spacing / target_z_spacing) 覆盖配置的 z 轴倍率（异质层厚数据
@@ -495,6 +512,9 @@ class TaskConfig:
     sigma_max: float = 80.0
     rho: float = 7.0
     ddim_eta: float = 0.0
+    # DDPM 采样中 x0 预估的对称钳位半径：0 = 按 data.normalize 自动派生
+    # （minmax→±1.5，zscore→±4.0）；>0 显式半径；<0 禁用钳位。
+    x0_clip: float = 0.0
 
 
 # ---------------------------------------------------------------------------
