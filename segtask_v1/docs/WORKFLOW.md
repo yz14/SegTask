@@ -78,7 +78,7 @@ GPU 同步 3D 增强（空间变换 img/lbl/wmap 同步；强度变换仅 img）
  → backward → 梯度累积/裁剪 → optimizer/scheduler → EMA
 ```
 
-推理：3 轴滑窗（stride = patch×(1-overlap)，短尾窗居中 edge-pad）→ 前向 → gaussian/average blend 加权累加 → 阈值二值化 → 还原 → 写 NIfTI。
+推理：3 轴滑窗（stride = patch×(1-overlap)，z 轴用 `z_overlap`、H/W 轴可用 `hw_overlap` 单设；短尾窗居中 edge-pad）→ 前向 → gaussian/average blend 加权累加 → 阈值二值化 → 还原 → 写 NIfTI。
 
 ---
 
@@ -170,6 +170,7 @@ checkpoint 加载 → NIfTI 读取
 | 混合精度 AMP | `train.use_amp` / `amp_dtype` | auto=Ampere+ 选 bf16 否则 fp16；fp16 自动带 GradScaler；**损失恒 fp32 计算** |
 | torch.compile | `train.compile_mode` | default / reduce-overhead / max-autotune |
 | channels_last | `train.channels_last` | 内存排布优化，数值等价 |
+| GPU 预取 | `train.prefetch_to_gpu` | 独立 copy stream 提前一个 batch 上卡，H2D 与计算重叠（需 `data.pin_memory`） |
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`) | 反向重算激活，算力换显存 |
 | CUDA 碎片缓解 | `train.cuda_expandable_segments` | expandable segments allocator |
 | fused AdamW | `train.adamw_fused` | 单 kernel 更新全部参数 |
@@ -218,9 +219,9 @@ checkpoint 加载 → NIfTI 读取
 
 | 技巧 | 配置键 | 说明 |
 |---|---|---|
-| overlap blend | `predict.z_overlap` / `blend_mode` | gaussian（中心高）/ average |
+| overlap blend | `predict.z_overlap` / `blend_mode` | gaussian（中心高）/ average；cubic 可用 `hw_overlap` 单设 H/W 轴（null=三轴同 z） |
 | flip TTA | `predict.tta_flip` | 翻转变体预测取平均（2.5d 翻 H/W 4×） |
-| AdaBN | `predict.adabn_enabled` / `adabn_mode` | 目标域重估 BN 统计（global 预热 / per_volume） |
+| AdaBN | `predict.adabn_enabled` / `adabn_mode` | 目标域重估 BN 统计（global 预热 / per_volume）；`adabn_sample_ratio`<1 抽样窗口估计降额外成本 |
 | z-interleave | `predict.z_interleave_*` | 仅 2.5d；按物理 z 间距拆 k 个交错子体推理再缝回 |
 | 阈值 | `predict.threshold` | 标量或逐前景类列表 |
 | 显存逃生门 | `predict.acc_dtype/vol_dtype: fp16`、`accumulate_on_cpu` | 累加器/整卷半精度、累加放 CPU |

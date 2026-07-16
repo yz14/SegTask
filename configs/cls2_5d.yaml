@@ -54,6 +54,7 @@ train:
   warmup_lr    : 1.0e-6
   cosine_min_lr: 1.0e-6
   grad_clip_norm: 12.0
+  prefetch_to_gpu: false   # true = 独立 copy stream 提前一个 batch 上卡（需 data.pin_memory）
   use_amp  : true
   amp_dtype: "auto"
   use_ema   : true

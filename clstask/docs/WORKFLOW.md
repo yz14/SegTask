@@ -98,6 +98,7 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 | 续训 / 落盘 | 每 epoch 原子写 latest_model.pth（模型+optimizer/scheduler/scaler/EMA）；`train.resume` 完整恢复；history.json 逐 epoch 落盘 |
 | 早停 | `train.early_stopping`：连续 N 个 epoch 无提升即止 |
 | 梯度裁剪 | `grad_clip_norm` |
+| GPU 预取 | `train.prefetch_to_gpu`（复用 seg CudaPrefetcher：独立 copy stream 提前一个 batch 上卡，需 `data.pin_memory`） |
 | mixup / cutmix | `cls.mixup_alpha` / `cls.cutmix_alpha`（>0 启用；同时启用每 batch 二选一；仅 volume 粒度） |
 | 前景过采样 | `data.foreground_oversample_ratio`（仅训练集；复用 npz 预计算 fg 索引，类均衡采样） |
 | 验证网格覆盖 | `data.val_grid_coverage`：验证 patch 改确定性网格铺点，与推理同口径 |
@@ -110,11 +111,11 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 
 ## 3. 验证与指标
 
-- 训练集按 `data.val_ratio` 划分；验证每卷取确定性 patch（samples_per_volume 的一半，无前景过采样），收集全量 logits/targets 统一计算；
+- 训练集按 `data.val_ratio` 划分；验证每卷取确定性 patch（数量 = `cls.eval_patches_per_volume`，与推理铺格上限同源，选模与部署同口径；无前景过采样），前向 autocast 口径同训练/推理，收集全量 logits/targets 统一计算；
 - 多标签：逐类 AUC（Mann-Whitney U rank 法，含并列校正）/ F1 / acc 宏平均；某类全正/全负跳过不计入；
 - 单标签：one-vs-rest 宏 AUC + argmax acc / 宏 F1；
 - slice 粒度把 (N, K, D) 摊平为 (N·D, K) 后同口径；
-- 卷级 MIL 指标（vol_auc / vol_f1 / vol_acc）：按卷分组，用与推理同口径的 `aggregate_probs`（agg_mode/topk/lse_r）聚合 patch 概率；卷级 target 取该卷所有 patch/切片的 any()（单标签为卷内常量）。
+- 卷级 MIL 指标（vol_auc / vol_f1 / vol_acc）：按卷分组，用与推理同口径的 `aggregate_probs`（agg_mode/topk/lse_r）聚合 patch 概率；卷级 target：mask 源用整卷 label 派生的精确多热真值（优先读 meta.label_counts，旧 npz 回退整卷 any()；与 patch 抽样解耦），table 源为卷内常量。
 
 ---
 

@@ -77,8 +77,9 @@ def build_cls_dataloaders(
             normalize=dc.normalize,
             global_mean=dc.global_mean,
             global_std=dc.global_std,
+            # 验证每卷 patch 数与推理铺格上限同一来源（选模与部署同口径）。
             samples_per_volume=(dc.samples_per_volume if is_train
-                                else max(dc.samples_per_volume // 2, 1)),
+                                else max(int(cls.eval_patches_per_volume), 1)),
             spatial_dims=spatial_dims,
             is_train=is_train,
             fg_oversample_ratio=(dc.foreground_oversample_ratio

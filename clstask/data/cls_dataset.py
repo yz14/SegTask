@@ -59,7 +59,9 @@ from segtask_v1.data.dataset import (
     _halton,
     _open_npz,
     extract_z_patch_padded,
-    preprocess_image,
+    load_npz_image,
+    load_npz_label,
+    load_npz_label_counts,
     resize_3d,
 )
 
@@ -378,22 +380,22 @@ class ClsPatchDataset(Dataset):
         lbl = self._lbl_cache.get(path) if self._needs_label else None
         if img is not None and (lbl is not None or not self._needs_label):
             return img, lbl
-        with np.load(path, allow_pickle=True) as f:
-            if "image" not in f.files:
-                raise KeyError(f"npz {path!r} has no 'image' key "
-                               f"(keys={list(f.files)}).")
-            img = preprocess_image(
-                f["image"], self.intensity_min, self.intensity_max,
-                self.normalize, self.global_mean, self.global_std,
-                inplace=False)
-            lbl = None
-            if self._needs_label:
-                if "label" not in f.files:
-                    raise KeyError(
-                        f"npz {path!r} has no 'label' key required by "
-                        f"label_source='mask' / fg oversampling fallback "
-                        f"(keys={list(f.files)}).")
-                lbl = np.asarray(f["label"])
+        # 键存在性先行校验（只解析 zip 目录，不解码数据），报错信息明确。
+        with _open_npz(path) as f:
+            keys = list(f.files)
+        if "image" not in keys:
+            raise KeyError(f"npz {path!r} has no 'image' key (keys={keys}).")
+        if self._needs_label and "label" not in keys:
+            raise KeyError(
+                f"npz {path!r} has no 'label' key required by "
+                f"label_source='mask' / fg oversampling fallback "
+                f"(keys={keys}).")
+        # 读取走 seg 的 memmap 零拷贝快路径（页缓存跨 worker 共享；压缩
+        # npz 自动回退 zipfile 路径，返回值逐位一致）。
+        img = load_npz_image(
+            path, self.intensity_min, self.intensity_max, self.normalize,
+            self.global_mean, self.global_std)
+        lbl = np.asarray(load_npz_label(path)) if self._needs_label else None
         if img.ndim != 3:
             raise ValueError(f"expected 3D volume (D,H,W); got {img.shape} "
                              f"in {path!r}.")
@@ -521,6 +523,29 @@ class ClsPatchDataset(Dataset):
         return {"image": img_t, "target": target, "vol_idx": vol_t}
 
 
+def derive_volume_targets(npz_paths: Sequence[str],
+                          fg_values: Sequence[float]) -> torch.Tensor:
+    """mask 源整卷级多热真值 (N, K)：每前景类在整卷 label 中是否出现。
+
+    优先读 make_data 预计算的 ``meta.label_counts``（精确且免解码 label
+    卷）；旧 npz 无该键时回退整卷 label ``any()``（仅构建时一次）。
+    与 patch 抽样解耦，供卷级 MIL 验证指标作真值。
+    """
+    out = np.zeros((len(npz_paths), len(fg_values)), dtype=np.float32)
+    for i, path in enumerate(npz_paths):
+        try:
+            counts = load_npz_label_counts(path)
+        except KeyError:      # 旧 npz 无 meta 键
+            counts = None
+        if counts is not None:
+            out[i] = [float(counts.get(int(v), 0) > 0) for v in fg_values]
+        else:
+            lbl = load_npz_label(path)
+            out[i] = [float((lbl == v).any()) for v in fg_values]
+    return torch.from_numpy(out)
+
+
 __all__ = [
     "ClsPatchDataset", "load_label_table", "match_table_to_paths",
+    "derive_volume_targets",
 ]

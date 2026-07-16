@@ -125,7 +125,8 @@ class ClsConfig:
     agg_lse_r: float = 4.0    # 仅 'lse'（log-sum-exp 温度）
 
     # ---- 验证/推理抽样 --------------------------------------------------
-    # 验证与推理时每卷的 patch 网格数上限（沿 z / 三轴均匀网格）。
+    # 每卷 patch 数：验证集每卷采样数 = 该值（选模与部署同口径），推理
+    # 铺格总数上限 = 该值（沿 z / 三轴均匀网格）。
     eval_patches_per_volume: int = 8
     # 整卷推理每次前向的 patch 数（micro-batch，防大卷 OOM）。
     infer_batch_size: int = 16

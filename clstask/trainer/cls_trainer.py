@@ -37,9 +37,11 @@ from segtask_v1.data.augment import GPUAugmentor
 from segtask_v1.trainer.amp import (
     _LOGIT_CLAMP,
     GradScaler,
+    autocast,
     resolve_auto_amp_dtype,
 )
 from segtask_v1.trainer.checkpoint import unwrap_compile
+from segtask_v1.trainer.prefetch import CudaPrefetcher
 from segtask_v1.trainer.optim import (
     WarmupScheduler,
     build_optimizer,
@@ -49,6 +51,7 @@ from segtask_v1.trainer.trainer import Trainer as _SegTrainer
 from segtask_v1.utils import AverageMeter, ModelEMA
 
 from ..config import ClsConfig, resolve_num_classes
+from ..data.cls_dataset import derive_volume_targets
 from ..losses.cls_loss import build_cls_loss
 from ..metrics import multilabel_metrics, singlelabel_metrics
 from ..predictor.cls_predictor import aggregate_probs
@@ -207,6 +210,9 @@ class ClsTrainer:
         self.best_epoch = 0
         self.start_epoch = 0
         self.history: "list[Dict[str, float]]" = []
+        # mask 源卷级 MIL 真值：整卷 label 一次性派生（与 patch 抽样解耦，
+        # 避免抽样未覆盖病灶时阳性卷被当阴性）；惰性计算一次。
+        self._val_vol_targets: "torch.Tensor | None" = None
 
     # ------------------------------------------------------------------
     def _loss_fp32(self, logits: torch.Tensor,
@@ -256,6 +262,10 @@ class ClsTrainer:
         loss_meter = AverageMeter()
         accum = self.grad_accum_steps
         total = len(self.train_loader)
+        # GPU 预取（口径同 seg Trainer）：独立 copy stream 提前一个 batch 上卡。
+        batch_iter = self.train_loader
+        if self.cfg.train.prefetch_to_gpu and self.device.type == "cuda":
+            batch_iter = CudaPrefetcher(self.train_loader, self.device)
         self.optimizer.zero_grad(set_to_none=True)
         use_mix = ((self.cls.mixup_alpha > 0 or self.cls.cutmix_alpha > 0)
                    and self.cls.label_granularity == "volume")
@@ -285,7 +295,7 @@ class ClsTrainer:
             pending.clear()
             return last
 
-        for step, batch in enumerate(self.train_loader):
+        for step, batch in enumerate(batch_iter):
             img, target = self._prepare_batch(batch)
             if use_mix:
                 img, target = apply_mixup_cutmix(
@@ -369,7 +379,11 @@ class ClsTrainer:
             for batch in self.val_loader:
                 img = batch["image"].to(self.device).float()
                 target = batch["target"].to(self.device)
-                logits = self.model(img)
+                # 验证前向 autocast 口径同训练/推理（seg validation 同）；
+                # 损失仍在 fp32 计算。
+                with autocast(device_type=self.device.type,
+                              enabled=self.use_amp, dtype=self.amp_dtype):
+                    logits = self.model(img)
                 loss_meter.update(
                     float(self._loss_fp32(logits, target).item()),
                     img.shape[0])
@@ -403,8 +417,13 @@ class ClsTrainer:
                         vols: torch.Tensor) -> Dict[str, float]:
         """卷级 MIL 指标：按卷分组，用与推理同口径的 ``aggregate_probs``
         （cls.agg_mode/topk/lse_r）聚合 patch 概率；slice 粒度先把各 patch
-        的切片展平为实例。卷级 target：多标签取该卷所有 patch/切片的
-        any()（弱标签口径）；单标签为卷内常量，取首个。"""
+        的切片展平为实例。卷级 target：mask 源用整卷 label 派生的精确多热
+        真值（:func:`derive_volume_targets`，与 patch 抽样解耦）；table 源为
+        卷内常量，取首个。"""
+        if (self.cls.label_source == "mask"
+                and self._val_vol_targets is None):
+            self._val_vol_targets = derive_volume_targets(
+                self.val_loader.dataset.paths, self.fg_values)
         vol_probs, vol_targets = [], []
         for u in torch.unique(vols):
             sel = vols == u
@@ -416,6 +435,8 @@ class ClsTrainer:
                 p, self.cls.agg_mode, self.cls.agg_topk, self.cls.agg_lse_r))
             if self.single_label:
                 vol_targets.append(t[0])
+            elif self.cls.label_source == "mask":
+                vol_targets.append(self._val_vol_targets[int(u)])
             else:
                 tt = t
                 if tt.ndim == 3:
