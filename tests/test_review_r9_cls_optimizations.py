@@ -191,3 +191,76 @@ def test_end_to_end_fit(npz_dir: Path, tmp_path: Path):
     metrics = trainer.fit()
     assert np.isfinite(metrics["loss"])
     assert 0.0 <= metrics["val_vol_auc"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# 6. 分层划分：每个标签层两侧均有代表；确定性
+# ---------------------------------------------------------------------------
+def test_stratified_split():
+    from clstask.data.loader import stratified_split
+
+    keys = ["1"] * 4 + ["0"] * 16 + ["rare"]
+    tr, va = stratified_split(keys, 0.25, seed=42)
+    assert sorted(tr + va) == list(range(len(keys)))
+    tr_k = {keys[i] for i in tr}
+    va_k = {keys[i] for i in va}
+    assert {"0", "1"} <= tr_k and {"0", "1"} <= va_k, "小类必须两侧都有代表"
+    assert keys.index("rare") in tr, "单样本层归训练集"
+    assert (tr, va) == stratified_split(keys, 0.25, seed=42), "同 seed 确定"
+    assert (tr, va) != stratified_split(keys, 0.25, seed=7)
+
+
+def test_loader_stratified_split_by_mask(npz_dir: Path):
+    from clstask.config import ClsConfig
+    from clstask.data.cls_dataset import derive_volume_targets
+    from clstask.data.loader import build_cls_dataloaders
+    from segtask_v1.config import Config
+
+    cfg = Config()
+    cfg.data.npz_dir = str(npz_dir)
+    cfg.data.patch_mode = "cubic"
+    cfg.data.patch_size = [8, 32, 32]
+    cfg.data.num_workers = 0
+    cfg.data.samples_per_volume = 2
+    cfg.data.val_ratio = 0.34
+    cfg.data.label_values = [0, 1]
+    cfg.sync()
+    train_loader, val_loader = build_cls_dataloaders(
+        cfg, ClsConfig(stratify_split=True))
+    for loader in (train_loader, val_loader):
+        vt = derive_volume_targets(loader.dataset.paths, [1.0])
+        assert vt.sum() > 0, "每侧都应含阳性卷"
+        assert vt.sum() < len(loader.dataset.paths), "每侧都应含阴性卷"
+
+
+# ---------------------------------------------------------------------------
+# 7. slice 粒度厚卷推理：z 铺格不受 eval_patches_per_volume 截断
+# ---------------------------------------------------------------------------
+def test_slice_inference_full_z_coverage(tmp_path: Path):
+    from clstask.config import ClsConfig, validate_cls
+    from clstask.models.factory import build_classifier
+    from clstask.predictor.cls_predictor import ClsPredictor
+    from segtask_v1.config import Config
+
+    z_dim, p_d = 64, 8                       # ceil(64/8)=8 > 上限 2
+    p = tmp_path / "thick.npz"
+    _make_npz(p, shape=(z_dim, 48, 48), fg=True)
+
+    cfg = Config()
+    cfg.data.npz_dir = str(tmp_path)
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.patch_size = [p_d, 32, 32]
+    cfg.data.label_values = [0, 1]
+    cfg.model.encoder_channels = [8, 16]
+    cfg.model.encoder_blocks_per_stage = [1, 1]
+    cfg.train.use_amp = False
+    cfg.sync()
+    cfg.validate()
+    cls = ClsConfig(label_granularity="slice", eval_patches_per_volume=2)
+    validate_cls(cls, cfg)
+    model = build_classifier(cfg, cls)
+    pred = ClsPredictor(model, cfg, cls, torch.device("cpu"))
+    out = pred.predict_volume(str(p))
+    sp = out["slice_probs"]
+    assert sp.shape == (1, z_dim)
+    assert (sp > 0).all(), "全部 z 切片都应被 patch 覆盖（无恒 0 残留）"

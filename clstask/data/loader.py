@@ -1,6 +1,8 @@
 """clstask DataLoader 工厂：npz 发现 → train/val 划分 → ClsPatchDataset。
 
-复用 segtask 的划分工具（``train_val_split``），npz 发现口径与 ssltask 一致
+划分：分类默认按标签**分层**（``cls.stratify_split``，保证每个标签组合在
+训练/验证集都有代表，避免小类全落单侧致验证指标无定义）；关闭时回退
+segtask 的纯随机划分（``train_val_split``）。npz 发现口径与 ssltask 一致
 （递归扫 ``data.npz_dir``）。
 """
 
@@ -9,15 +11,21 @@ from __future__ import annotations
 import glob
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
+import numpy as np
 from torch.utils.data import DataLoader
 
 from segtask_v1.config import Config as SegConfig
 from segtask_v1.data.loader import train_val_split
 
 from ..config import ClsConfig, resolve_num_classes
-from .cls_dataset import ClsPatchDataset, load_label_table, match_table_to_paths
+from .cls_dataset import (
+    ClsPatchDataset,
+    derive_volume_targets,
+    load_label_table,
+    match_table_to_paths,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +43,48 @@ def discover_npz(npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
     return paths
 
 
+def stratified_split(keys: Sequence[str], val_ratio: float,
+                     seed: int) -> Tuple[List[int], List[int]]:
+    """按标签层（key）分层的 train/val 划分。
+
+    逐层内部确定性 shuffle 后按 ``val_ratio`` 切分；层内 ≥2 个样本时
+    train/val 各至少分到 1 个（保证小类两侧都有代表）；单样本层归
+    训练集。同 (keys, val_ratio, seed) 下结果确定。
+    """
+    rng = np.random.RandomState(seed)
+    by_key: "dict[str, List[int]]" = {}
+    for i, k in enumerate(keys):
+        by_key.setdefault(str(k), []).append(i)
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+    for k in sorted(by_key):
+        idx = by_key[k]
+        perm = rng.permutation(len(idx))
+        n = len(idx)
+        if n == 1:
+            train_idx.append(idx[0])
+            continue
+        n_val = min(max(int(round(n * val_ratio)), 1), n - 1)
+        for j, p in enumerate(perm):
+            (val_idx if j < n_val else train_idx).append(idx[p])
+    return sorted(train_idx), sorted(val_idx)
+
+
+def _split_keys(paths: Sequence[str], cfg: SegConfig, cls: ClsConfig,
+                table, npz_suffix: str) -> List[str]:
+    """每卷的分层 key：table 源用显式标签，mask 源用整卷多热真值
+    （:func:`derive_volume_targets`，优先读 meta.label_counts，开销小）。"""
+    if table is not None:
+        targets = match_table_to_paths(paths, table, npz_suffix)
+        return [",".join(f"{int(round(float(x)))}" for x in
+                         np.atleast_1d(np.asarray(t)))
+                for t in targets]
+    fg_values = [float(v) for v in (cfg.data.label_values[1:] if
+                                    len(cfg.data.label_values) > 1 else [1.0])]
+    vt = derive_volume_targets(paths, fg_values).numpy()
+    return [",".join(str(int(x)) for x in row) for row in vt]
+
+
 def build_cls_dataloaders(
     cfg: SegConfig, cls: ClsConfig) -> Tuple[DataLoader, DataLoader]:
     """按 ``(cfg, cls)`` 构造 train/val DataLoader。"""
@@ -46,8 +96,16 @@ def build_cls_dataloaders(
     if cls.label_source == "table":
         table = load_label_table(cls.label_table, num_classes, cls.multi_label)
 
-    train_idx, val_idx = train_val_split(
-        len(paths), dc.val_ratio, dc.split_seed)
+    if cls.stratify_split:
+        keys = _split_keys(paths, cfg, cls, table, dc.npz_suffix)
+        train_idx, val_idx = stratified_split(
+            keys, dc.val_ratio, dc.split_seed)
+        n_strata = len(set(keys))
+        logger.info("stratified split: %d strata over %d volumes",
+                    n_strata, len(paths))
+    else:
+        train_idx, val_idx = train_val_split(
+            len(paths), dc.val_ratio, dc.split_seed)
     train_paths = [paths[i] for i in train_idx]
     val_paths = [paths[i] for i in val_idx]
     if not train_paths or not val_paths:
@@ -110,4 +168,4 @@ def build_cls_dataloaders(
     return train_loader, val_loader
 
 
-__all__ = ["discover_npz", "build_cls_dataloaders"]
+__all__ = ["discover_npz", "stratified_split", "build_cls_dataloaders"]

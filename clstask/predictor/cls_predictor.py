@@ -176,8 +176,13 @@ class ClsPredictor:
     def predict_volume(self, npz_path: str) -> Dict[str, np.ndarray]:
         """→ ``{'volume_probs': (K,)[, 'slice_probs': (K, Z)]}``。"""
         vol = self._load_volume(npz_path)
-        centers = grid_centers(vol.shape, self.patch,
-                               self.cls.eval_patches_per_volume,
+        max_patches = int(self.cls.eval_patches_per_volume)
+        # slice 粒度：z 铺格不受上限截断（否则厚卷未覆盖 z 的逐 slice 概率
+        # 恒 0，等效静默假阴性）；volume 粒度维持上限控制推理成本。
+        if (self.cls.label_granularity == "slice"
+                and self.patch_mode in ("z_axis", "2_5d")):
+            max_patches = max(-(-vol.shape[0] // self.patch[0]), max_patches)
+        centers = grid_centers(vol.shape, self.patch, max_patches,
                                self.patch_mode)
         batch = []
         for c in centers:

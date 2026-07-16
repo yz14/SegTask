@@ -111,7 +111,7 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 
 ## 3. 验证与指标
 
-- 训练集按 `data.val_ratio` 划分；验证每卷取确定性 patch（数量 = `cls.eval_patches_per_volume`，与推理铺格上限同源，选模与部署同口径；无前景过采样），前向 autocast 口径同训练/推理，收集全量 logits/targets 统一计算；
+- 训练集按 `data.val_ratio` 划分（默认 `cls.stratify_split` 按标签分层：table 源用显式标签、mask 源用整卷多热真值分层，小类两侧均有代表；关闭回退纯随机）；验证每卷取确定性 patch（数量 = `cls.eval_patches_per_volume`，与推理铺格上限同源，选模与部署同口径；无前景过采样），前向 autocast 口径同训练/推理，收集全量 logits/targets 统一计算；
 - 多标签：逐类 AUC（Mann-Whitney U rank 法，含并列校正）/ F1 / acc 宏平均；某类全正/全负跳过不计入；
 - 单标签：one-vs-rest 宏 AUC + argmax acc / 宏 F1；
 - slice 粒度把 (N, K, D) 摊平为 (N·D, K) 后同口径；
@@ -125,7 +125,8 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 整卷读取 → 预处理
  → patch 中心铺格（抽取几何与训练一致：2.5d/z_axis 沿 z 铺格 + 面内 resize；
    whole 全卷 resize；cubic 按各轴长 ceil(dim/patch) 分配铺格；
-   上限 eval_patches_per_volume）
+   上限 eval_patches_per_volume；slice 粒度 + z 铺格不受上限截断，
+   保证厚卷全 z 覆盖）
  → micro-batch 前向（infer_batch_size 防 OOM；autocast 口径同训练；
    cls.tta_flips 翻转 TTA 均值）→ patch 概率
  → volume 粒度：MIL 聚合 agg_mode（mean / max / lse / topk）→ 卷级 (K,)

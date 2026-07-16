@@ -77,5 +77,6 @@ cls:
   # pretrained_ckpt: "outputs/ssl_genesis/ssl_best.pt"   # 可选：迁移 SSL encoder
   encoder_lr_mult  : 1.0
   agg_mode         : "mean"
+  stratify_split   : true       # train/val 按标签分层划分（小类两侧均有代表）；false = 纯随机
   eval_patches_per_volume: 8
   save_best_metric : "vol_auc"  # 卷级 MIL 选模（与推理 agg_mode 同口径）；也可 auc/f1/acc/loss
