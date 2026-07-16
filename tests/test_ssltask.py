@@ -484,7 +484,8 @@ def test_image_only_dataset_yields_patches(tmp_path):
 
 
 def test_image_only_dataset_2_5d_folds_depth_to_channels(tmp_path):
-    """2.5D（spatial_dims=2）：深度 D 折进通道，样本形状为 (D, H, W)。"""
+    """2.5D（spatial_dims=2）：dataset 统一返 3D (1, D, H, W)，深度折通道由
+    trainer 在增强后、送模型前完成（见 ImageOnlyPatchDataset docstring）。"""
     p = tmp_path / "vol_0.npz"
     img = (np.random.rand(20, 40, 40) * 400 - 200).astype(np.int16)
     np.savez(p, image=img)
@@ -494,13 +495,14 @@ def test_image_only_dataset_2_5d_folds_depth_to_channels(tmp_path):
         intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
         samples_per_volume=2, spatial_dims=2)
     sample = ds[0]
-    assert sample["image"].shape == (16, 32, 32)        # (C=D, H, W)
+    assert sample["image"].shape == (1, 16, 32, 32)     # (1, D, H, W)；折叠延至 trainer
     assert sample["image"].dtype == torch.float32
     assert torch.isfinite(sample["image"]).all()
 
 
 def test_build_ssl_dataloader_2_5d_batch_shape(tmp_path):
-    """2.5D dataloader 产出 (B, D, H, W)，C=in_channels=patch_size[0]（单 FOV）。"""
+    """2.5D dataloader 产出统一 3D (B, 1, D, H, W)（D=in_channels，单 FOV）；
+    折叠 (B, D, H, W) 由 trainer 在增强后完成。"""
     from ssltask.data.ssl_dataset import build_ssl_dataloader
     for i in range(2):
         img = (np.random.rand(20, 40, 40) * 400 - 200).astype(np.int16)
@@ -515,7 +517,7 @@ def test_build_ssl_dataloader_2_5d_batch_shape(tmp_path):
 
     loader = build_ssl_dataloader(cfg)
     batch = next(iter(loader))
-    assert batch["image"].shape == (2, 16, 32, 32)           # (B, C=D, H, W)
+    assert batch["image"].shape == (2, 1, 16, 32, 32)        # (B, 1, D, H, W)
     assert torch.isfinite(batch["image"]).all()
 
 
@@ -566,7 +568,8 @@ def test_labeled_dataset_yields_image_and_label(tmp_path):
 
 
 def test_labeled_dataset_2_5d_folds_depth_to_channels(tmp_path):
-    """2.5D 探针数据集：image/label 均把深度 D 折进通道，形状 (D, H, W)。"""
+    """2.5D 探针数据集：image/label 均统一返 3D (1, D, H, W)，折叠由消费方
+    （探针）在送模型前完成（见 LabeledPatchDataset docstring）。"""
     _write_labeled_npz(tmp_path, 1, (20, 40, 40))
     from ssltask.data.ssl_dataset import discover_image_npz
     ds = LabeledPatchDataset(
@@ -575,8 +578,8 @@ def test_labeled_dataset_2_5d_folds_depth_to_channels(tmp_path):
         intensity_min=-1024.0, intensity_max=1024.0, normalize="minmax",
         samples_per_volume=2, spatial_dims=2)
     sample = ds[0]
-    assert sample["image"].shape == (16, 32, 32)        # (C=D, H, W)
-    assert sample["label"].shape == (16, 32, 32)
+    assert sample["image"].shape == (1, 16, 32, 32)     # (1, D, H, W)
+    assert sample["label"].shape == (1, 16, 32, 32)
     assert torch.isfinite(sample["image"]).all()
 
 
@@ -926,7 +929,8 @@ def test_ssl_trainer_2_5d_smoke_and_handoff(tmp_path, method):
 
     device = torch.device("cpu")
     m = build_method(cfg, ssl, device)
-    ds = _ImgDataset(4, cfg.model.in_channels, (32, 32))     # (C=D, H, W)
+    # dataset 层统一 3D (1, D, H, W)；2.5D 折叠由 trainer 在增强后完成。
+    ds = _ImgDataset(4, 1, (cfg.data.patch_size[0], 32, 32))
     loader = DataLoader(ds, batch_size=2)
     trainer = SSLTrainer(m, cfg, ssl, loader, device)
     out = trainer.fit()
