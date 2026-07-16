@@ -112,11 +112,16 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
     for idx, (z0, z1) in enumerate(z_positions):
         actual_d = z1 - z0
         is_last = idx == n_windows - 1
-        # 跳过纯背景窗：归一化后窗内最大值 <= 阈值 → 不前向、不累加（该
-        # 区域概率保持 0 = 背景）。在 CPU numpy 上判据，不引入 GPU 同步。
-        if (p.skip_empty_windows
-                and float(vol[z0:z1].max()) <= p.skip_empty_threshold):
-            n_skipped += 1
+        # AdaBN 估计期抽样：只前向部分窗口估 BN 统计（非估计期恒 keep，
+        # 真实预测路径不受影响）。跳过纯背景窗：归一化后窗内最大值 <=
+        # 阈值 → 不前向、不累加（该区域概率保持 0 = 背景）。在 CPU numpy
+        # 上判据，不引入 GPU 同步。
+        sub_skip = not p._adabn_keep_window(idx)
+        empty_skip = (not sub_skip and p.skip_empty_windows
+                      and float(vol[z0:z1].max()) <= p.skip_empty_threshold)
+        if sub_skip or empty_skip:
+            if empty_skip:
+                n_skipped += 1
             if is_last and window_inputs:
                 batch = torch.stack(window_inputs, dim=0).float()
                 probs = _forwards.forward_batch_gpu(p, batch)
@@ -389,9 +394,14 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         coords.clear()
         centers.clear()
 
+    widx = -1
     for d0, d1 in pos_d:
         for h0, h1 in pos_h:
             for w0, w1 in pos_w:
+                widx += 1
+                # AdaBN 估计期抽样（同 z 路径；尾部 _flush 不受影响）。
+                if not p._adabn_keep_window(widx):
+                    continue
                 patch = vol[d0:d1, h0:h1, w0:w1]
                 ad, ah, aw = patch.shape
 

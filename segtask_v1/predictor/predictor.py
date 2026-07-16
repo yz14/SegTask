@@ -138,6 +138,8 @@ class Predictor:
         # 再冻结预测（transductive BN）。global 模式在 run_inference 中处理，与此无关。
         self.adabn_enabled = bool(pc.adabn_enabled)
         self.adabn_mode = pc.adabn_mode
+        # BN 估计期滑窗抽样比：<1 时估计前向只跑部分窗口（见 _adabn_keep_window）。
+        self.adabn_sample_ratio = float(pc.adabn_sample_ratio)
         self._adabn_bn_modules: List[torch.nn.Module] = []
         if self.adabn_enabled and self.adabn_mode == "per_volume":
             from .adabn import collect_bn_modules
@@ -541,6 +543,15 @@ class Predictor:
         if self.use_inference_mode and not self._adabn_estimating:
             return torch.inference_mode()
         return contextlib.nullcontext()
+
+    def _adabn_keep_window(self, idx: int) -> bool:
+        """AdaBN 估计期窗口抽样判据：非估计期或 ``adabn_sample_ratio>=1``
+        恒 True（真实预测路径不受影响）；否则按 ``round(1/ratio)`` 步长
+        确定性保留（``idx==0`` 恒留，保证至少一窗驱动 BN 更新）。"""
+        if not self._adabn_estimating or self.adabn_sample_ratio >= 1.0:
+            return True
+        step = max(1, int(round(1.0 / self.adabn_sample_ratio)))
+        return idx % step == 0
 
     # ==================================================================
     # NIfTI I/O

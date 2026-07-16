@@ -464,6 +464,7 @@ def _predict_fields(mode: str) -> List[Field]:
         Field("predict.adabn_enabled"),
         Field("predict.adabn_mode", depends_on=[_truthy("predict.adabn_enabled")]),
         Field("predict.adabn_num_volumes", depends_on=[_truthy("predict.adabn_enabled"), _in("predict.adabn_mode", ["global"])]),
+        Field("predict.adabn_sample_ratio", depends_on=[_truthy("predict.adabn_enabled")]),
     ]
     # z 轴交错多流推理：仅 2.5D。
     if is25:

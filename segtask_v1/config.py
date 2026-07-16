@@ -1077,6 +1077,13 @@ class PredictConfig:
     # global 模式预热用的目标域整卷数；per_volume 模式忽略。
     adabn_num_volumes: int = 8
 
+    # BN 估计期的滑窗抽样比（(0, 1]）：<1 时估计前向只跑约 ratio 比例的
+    # 窗口（确定性等步长抽样，首窗恒保留），估 BN 均值/方差通常 1/4
+    # 窗口已足够稳定，可把 per_volume 的额外一遍推理成本从 2× 降到
+    # ≈1.25×（global 预热同比例提速）。真实预测路径不受影响；whole 模式
+    # 单前向无窗可抽，忽略此项。默认 1.0（全窗估计，现状不变）。
+    adabn_sample_ratio: float = 1.0
+
     # ---- 2.5D 专属：z 交错 ----
     # z 轴交错多流推理（仅 2.5D）：按 z 拆 k 个子体 (slices i,i+k,...)，独立推理后缝回原 z。
     # 动机：加宽 z 感受野。警告：子流表现为 k * z_spacing。
@@ -2165,6 +2172,10 @@ class Config:
                 int(self.predict.adabn_num_volumes) >= 1,
                 f"predict.adabn_num_volumes must be >= 1; "
                 f"got {self.predict.adabn_num_volumes}.")
+            _require(
+                0.0 < float(self.predict.adabn_sample_ratio) <= 1.0,
+                f"predict.adabn_sample_ratio must be in (0, 1]; "
+                f"got {self.predict.adabn_sample_ratio}.")
             # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
             if self.model.norm_type != "batch":
                 logger.warning(

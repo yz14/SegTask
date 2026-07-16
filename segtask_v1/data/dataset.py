@@ -250,6 +250,48 @@ def _open_npz(path: str) -> "np.lib.npyio.NpzFile":
     return np.load(path, allow_pickle=True)
 
 
+def _open_npy_member_mmap(path: str, name: str) -> Optional[np.memmap]:
+    """零拷贝只读 memmap npz 内未压缩（ZIP_STORED）的 ``<name>.npy`` 成员。
+
+    make_data 默认 ``np.savez``（ZIP_STORED），成员数据在容器内连续存放，
+    可对 npy 头之后的区间直接 memmap——省去 zipfile 流式解包的整卷中间
+    拷贝，且页缓存跨 DataLoader worker 共享。``--compress`` 产物
+    （ZIP_DEFLATED）/ object dtype / 解析失败时返 ``None``，由调用方回退
+    zipfile 路径（语义不变，仅读取机制不同）。
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            info = zf.getinfo(name + ".npy")
+            if info.compress_type != zipfile.ZIP_STORED:
+                return None
+            header_offset = info.header_offset
+        with open(path, "rb") as fh:
+            fh.seek(header_offset)
+            lfh = fh.read(30)
+            # 本地文件头 (PK\x03\x04)：末 4 字节为文件名长/扩展区长。
+            if len(lfh) != 30 or lfh[:4] != b"PK\x03\x04":
+                return None
+            n_name = int.from_bytes(lfh[26:28], "little")
+            n_extra = int.from_bytes(lfh[28:30], "little")
+            fh.seek(header_offset + 30 + n_name + n_extra)
+            version = np.lib.format.read_magic(fh)
+            if version == (1, 0):
+                shape, fortran, dtype = \
+                    np.lib.format.read_array_header_1_0(fh)
+            elif version == (2, 0):
+                shape, fortran, dtype = \
+                    np.lib.format.read_array_header_2_0(fh)
+            else:
+                return None
+            if dtype.hasobject:
+                return None
+            data_offset = fh.tell()
+        return np.memmap(path, dtype=dtype, mode="r", offset=data_offset,
+                         shape=shape, order="F" if fortran else "C")
+    except Exception:
+        return None
+
+
 def _read_npz_image_shape(
     f: "np.lib.npyio.NpzFile", path: str) -> Tuple[int, ...]:
     """免解码读 npz 内 image 形状：优先 meta.image_shape（make_data≥1.4）；旧 npz
@@ -276,7 +318,16 @@ def load_npz_image(
     normalize: str,
     global_mean: float = 0.0,
     global_std: float = 1.0) -> np.ndarray:
-    """读 npz image（int16 HU）后运行 preprocess_image → owned fp32。"""
+    """读 npz image（int16 HU）后运行 preprocess_image → owned fp32。
+
+    未压缩 npz 走零拷贝 memmap 快路径（直接喂页缓存，免整卷 int16 中间
+    拷贝）；preprocess_image 产出全新 fp32，返回值与 zipfile 路径逐位一致。"""
+    mm = _open_npy_member_mmap(path, "image")
+    if mm is not None:
+        return preprocess_image(
+            mm, intensity_min, intensity_max,
+            normalize, global_mean, global_std,
+            inplace=False)
     with _open_npz(path) as f:
         img_int16 = f["image"]
         return preprocess_image(
@@ -286,17 +337,26 @@ def load_npz_image(
 
 
 def load_npz_label(path: str) -> np.ndarray:
-    """返 npz 中 owned int16 label ndarray。"""
+    """返 npz 中 owned int16 label ndarray。
+
+    未压缩 npz 走 memmap 快路径（单次页缓存 memcpy，免 zipfile 流式解包）；
+    ``np.array`` 拷贝为 owned，返回值与 zipfile 路径逐位一致。"""
+    mm = _open_npy_member_mmap(path, "label")
+    if mm is not None:
+        return np.array(mm)
     with _open_npz(path) as f:
         return f["label"]
 
 
 def load_npz_region_weight(path: str) -> Optional[np.ndarray]:
-    """返 owned fp32 区域权重（+1 偏移已由 make_data 加过）；无 rw 返 None。"""
+    """返 owned fp32 区域权重（+1 偏移已由 make_data 加过）；无 rw 返 None。
+
+    未压缩 npz 走 memmap 快路径（同 load_npz_label）。"""
     with _open_npz(path) as f:
         if "rw" not in f.files:
             return None
-        rw = f["rw"]
+        mm = _open_npy_member_mmap(path, "rw")
+        rw = np.array(mm) if mm is not None else f["rw"]
     if rw.dtype != np.float32:
         rw = rw.astype(np.float32, copy=False)
     return rw

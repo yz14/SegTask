@@ -296,6 +296,7 @@ train:
   amp_dtype                    : "auto"           # 仅 use_amp=true；低精度类型；'auto'=Ampere+ 自动选 bf16 否则 fp16 | 'bfloat16'/'bf16'=免 GradScaler | 'float16'/'fp16'=需 GradScaler
   compile_mode                 : "none"           # torch.compile 编译级别；'none'=不编译 | 'default' | 'reduce-overhead' | 'max-autotune'
   channels_last                : false            # 训练用 channels_last 内存排布（数值等价，Ampere+ 卷积可能提速，需 benchmark）
+  prefetch_to_gpu              : false            # 独立 CUDA copy stream 提前一个 batch 上卡，H2D 拷贝与前向/反向重叠（数值等价；需 data.pin_memory=true 才有真实收益）
   cuda_expandable_segments     : false            # CUDA allocator 用 expandable segments，缓解形状多变场景的显存碎片（PyTorch 2.1+，旧驱动自动回退）
   val_empty_cache              : null             # 整卷验证前后 empty_cache 归还缓存块、防滑窗大累加器碎片 OOM；null=自动（high 开/medium 关） | true | false
 
@@ -363,6 +364,7 @@ predict:
   adabn_enabled          : true            # 仅 model.norm_type='batch'；推理时用目标域数据重估 BN 统计（对抗域漂移，无需标签不重训）
   adabn_mode             : "global"        # AdaBN 统计来源；'global'=先用 N 卷预热一次全程复用 | 'per_volume'=每卷各自重估再冻结预测
   adabn_num_volumes      : 8               # 仅 adabn_mode='global'；预热用的目标域卷数
+  adabn_sample_ratio     : 1.0             # BN 估计期滑窗抽样比 (0,1]；<1 只跑部分窗估 BN 统计（如 0.25 把 per_volume 额外成本从 2× 降到 ≈1.25×）；1.0=全窗估计
 
   # ---- 2.5D 专属：z 交错 ----
   z_interleave_enabled   : true            # 仅 2.5D；按 z 交错拆 k 个子体独立推理再缝回（加宽 z 感受野；k 按物理 z 间距查下表）
