@@ -51,8 +51,11 @@ class DetConfig:
     num_classes: int = 0
     # 框来源：npz 'boxes' 键优先；否则由 mask 连通域派生（fg_values 逐类）。
     boxes_from_mask: bool = True
-    # mask 派生连通域的最小体素数（滤噪点）。
+    # mask 派生连通域的最小体素数（连通域真实体素数，滤噪点）。
     min_box_voxels: int = 8
+    # train/val 按逐卷类存在集合分层划分（小类两侧都有代表，口径同
+    # clstask.stratify_split）；false 回退纯随机 train_val_split。
+    stratify_split: bool = True
 
     # ---- FPN -------------------------------------------------------------
     fpn_channels: int = 128

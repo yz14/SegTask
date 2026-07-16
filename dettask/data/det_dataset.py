@@ -43,8 +43,10 @@ from torch.utils.data import Dataset
 from segtask_v1.data.dataset import (
     VolumeCache,
     _halton,
+    _open_npz,
     extract_z_patch_padded,
-    preprocess_image,
+    load_npz_image,
+    load_npz_label,
     resize_3d,
 )
 
@@ -55,7 +57,9 @@ logger = logging.getLogger(__name__)
 
 def boxes_from_mask(lbl: np.ndarray, fg_values: Sequence[float],
                     min_voxels: int = 8) -> Tuple[np.ndarray, np.ndarray]:
-    """mask 连通域 → 3D 框。返回 (boxes (N,6) float32, labels (N,) int64)。"""
+    """mask 连通域 → 3D 框。返回 (boxes (N,6) float32, labels (N,) int64)。
+
+    ``min_voxels`` 按连通域真实体素数过滤（非包围盒体积）。"""
     all_boxes: List[List[float]] = []
     all_labels: List[int] = []
     for k, v in enumerate(fg_values):
@@ -63,10 +67,10 @@ def boxes_from_mask(lbl: np.ndarray, fg_values: Sequence[float],
         if n == 0:
             continue
         objects = ndimage.find_objects(comp)
-        for sl in objects:
+        for ci, sl in enumerate(objects, start=1):
             if sl is None:
                 continue
-            vox = np.prod([s.stop - s.start for s in sl])
+            vox = int((comp[sl] == ci).sum())
             if vox < min_voxels:
                 continue
             all_boxes.append([sl[0].start, sl[1].start, sl[2].start,
@@ -78,26 +82,36 @@ def boxes_from_mask(lbl: np.ndarray, fg_values: Sequence[float],
             np.asarray(all_labels, np.int64))
 
 
+def load_boxes(npz_path: str, fg_values: Sequence[float],
+               allow_mask: bool, min_voxels: int
+               ) -> Tuple[np.ndarray, np.ndarray]:
+    """读 npz 框真值 → (boxes3d (N,6), labels (N,))。
+
+    'boxes' 键（小数组）优先；否则由 label mask 连通域派生（label 走
+    seg 的 memmap 零拷贝快路径，压缩 npz 自动回退）。不读 image。"""
+    with _open_npz(npz_path) as f:
+        keys = list(f.files)
+        if "boxes" in keys:
+            raw = np.asarray(f["boxes"], np.float32).reshape(-1, 7)
+            return raw[:, :6], raw[:, 6].astype(np.int64)
+    if allow_mask and "label" in keys:
+        return boxes_from_mask(
+            np.asarray(load_npz_label(npz_path)), fg_values, min_voxels)
+    raise KeyError(
+        f"npz {npz_path!r} has neither 'boxes' (N,7) nor a 'label' "
+        f"mask usable with det.boxes_from_mask (keys={keys}).")
+
+
 def load_volume_boxes(npz_path: str, fg_values: Sequence[float],
                       allow_mask: bool, min_voxels: int
                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """读 npz → (image, boxes3d (N,6), labels (N,))。"""
-    with np.load(npz_path, allow_pickle=True) as f:
+    """读 npz → (原始 image, boxes3d (N,6), labels (N,))。"""
+    with _open_npz(npz_path) as f:
         if "image" not in f.files:
             raise KeyError(f"npz {npz_path!r} has no 'image' key "
                            f"(keys={list(f.files)}).")
         img = np.asarray(f["image"])
-        if "boxes" in f.files:
-            raw = np.asarray(f["boxes"], np.float32).reshape(-1, 7)
-            boxes, labels = raw[:, :6], raw[:, 6].astype(np.int64)
-        elif allow_mask and "label" in f.files:
-            boxes, labels = boxes_from_mask(
-                np.asarray(f["label"]), fg_values, min_voxels)
-        else:
-            raise KeyError(
-                f"npz {npz_path!r} has neither 'boxes' (N,7) nor a 'label' "
-                f"mask usable with det.boxes_from_mask "
-                f"(keys={list(f.files)}).")
+    boxes, labels = load_boxes(npz_path, fg_values, allow_mask, min_voxels)
     if img.ndim != 3:
         raise ValueError(f"expected 3D volume (D,H,W); got {img.shape} in "
                          f"{npz_path!r}.")
@@ -241,17 +255,20 @@ class DetPatchDataset(Dataset):
         """→ (预处理后 image, boxes3d, labels)；image/框均逐 worker 缓存。"""
         img = self._img_cache.get(path)
         cached = self._box_cache.get(path)
-        if img is None or cached is None:
-            raw, boxes_np, labels_np = load_volume_boxes(
-                path, self.fg_values, self.allow_mask, self.min_box_voxels)
-            self._box_cache[path] = (boxes_np, labels_np)
-            if img is None:
-                img = preprocess_image(
-                    raw, self.intensity_min, self.intensity_max,
-                    self.normalize, self.global_mean, self.global_std,
-                    inplace=False)
-                self._img_cache.put(path, img)
-            return img, boxes_np, labels_np
+        if cached is None:
+            cached = load_boxes(path, self.fg_values, self.allow_mask,
+                                self.min_box_voxels)
+            self._box_cache[path] = cached
+        if img is None:
+            # 读取走 seg 的 memmap 零拷贝快路径（页缓存跨 worker 共享；
+            # 压缩 npz 自动回退 zipfile 路径，返回值逐位一致）。
+            img = load_npz_image(
+                path, self.intensity_min, self.intensity_max,
+                self.normalize, self.global_mean, self.global_std)
+            if img.ndim != 3:
+                raise ValueError(f"expected 3D volume (D,H,W); got "
+                                 f"{img.shape} in {path!r}.")
+            self._img_cache.put(path, img)
         boxes_np, labels_np = cached
         return img, boxes_np, labels_np
 
@@ -371,4 +388,4 @@ def det_collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, object]:
 
 
 __all__ = ["DetPatchDataset", "det_collate", "boxes_from_mask",
-           "load_volume_boxes"]
+           "load_boxes", "load_volume_boxes"]

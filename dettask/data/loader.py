@@ -7,10 +7,14 @@ from typing import List, Tuple
 
 from torch.utils.data import DataLoader
 
+import numpy as np
+
 from segtask_v1.config import Config as SegConfig
+from segtask_v1.data.dataset import _open_npz
 from segtask_v1.data.loader import train_val_split
 
-from clstask.data.loader import discover_npz
+from clstask.data.cls_dataset import derive_volume_targets
+from clstask.data.loader import discover_npz, stratified_split
 
 from ..config import DetConfig
 from .det_dataset import DetPatchDataset, det_collate
@@ -18,12 +22,46 @@ from .det_dataset import DetPatchDataset, det_collate
 logger = logging.getLogger(__name__)
 
 
+def _det_split_keys(paths: List[str], fg_values: List[float]) -> List[str]:
+    """每卷的分层 key = 类存在集合（排序去重）。
+
+    'boxes' 键（小数组）直接取 cls 列；mask 源复用 clstask
+    ``derive_volume_targets``（优先读 meta.label_counts，免整卷解码），
+    存在性口径与框派生一致（连通域必属某前景类）。"""
+    keys: List[str] = [""] * len(paths)
+    mask_pos: List[int] = []
+    for i, p in enumerate(paths):
+        with _open_npz(p) as f:
+            if "boxes" in f.files:
+                cls = np.asarray(f["boxes"], np.float32).reshape(-1, 7)[:, 6]
+                present = sorted(set(int(c) for c in cls))
+                keys[i] = ",".join(map(str, present)) if present else "empty"
+            else:
+                mask_pos.append(i)
+    if mask_pos:
+        vt = derive_volume_targets([paths[i] for i in mask_pos],
+                                   fg_values).numpy()
+        for j, i in enumerate(mask_pos):
+            present = [str(k) for k, v in enumerate(vt[j]) if v > 0]
+            keys[i] = ",".join(present) if present else "empty"
+    return keys
+
+
 def build_det_dataloaders(
     cfg: SegConfig, det: DetConfig) -> Tuple[DataLoader, DataLoader]:
     dc = cfg.data
     paths = discover_npz(dc.npz_dir, dc.npz_suffix)
-    train_idx, val_idx = train_val_split(
-        len(paths), dc.val_ratio, dc.split_seed)
+    fg_values_split = [float(v) for v in (dc.label_values[1:] if
+                                          len(dc.label_values) > 1 else [1.0])]
+    if det.stratify_split:
+        keys = _det_split_keys(paths, fg_values_split)
+        train_idx, val_idx = stratified_split(
+            keys, dc.val_ratio, dc.split_seed)
+        logger.info("stratified split: %d strata over %d volumes",
+                    len(set(keys)), len(paths))
+    else:
+        train_idx, val_idx = train_val_split(
+            len(paths), dc.val_ratio, dc.split_seed)
     train_paths = [paths[i] for i in train_idx]
     val_paths = [paths[i] for i in val_idx]
     if not train_paths or not val_paths:

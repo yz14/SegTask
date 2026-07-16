@@ -53,6 +53,7 @@ train:
   warmup_lr    : 1.0e-6
   cosine_min_lr: 1.0e-6
   grad_clip_norm: 12.0
+  prefetch_to_gpu: false        # 独立 CUDA stream 提前一个 batch 上卡（同 seg/cls）
   use_amp  : true
   amp_dtype: "auto"
   use_ema  : true
@@ -62,6 +63,7 @@ train:
 det:
   arch          : "retinanet"    # retinanet | fcos | faster_rcnn | detr
   boxes_from_mask: true
+  stratify_split : true          # 按逐卷类存在集合分层划分 train/val
   fpn_channels  : 128
   fpn_levels    : []             # 空=decoder 全部层
   anchor_ratios : [0.5, 1.0, 2.0]

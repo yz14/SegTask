@@ -450,9 +450,10 @@ def preprocess_image(
 
     inplace=True 且输入本是 fp32 时复用 buffer（调用方拥有该数组才可启用）。。"""
     vol = np.asarray(volume, dtype=np.float32)
-    if vol is volume and not inplace:
-        # 输入本为 fp32 且未明示同意 in-place：拷贝避免污染上游。
-        vol = volume.copy()
+    if not inplace and (vol is volume or not vol.flags.writeable):
+        # 输入本为 fp32（或只读 memmap 视图）且未明示 in-place：
+        # 拷贝为 owned 可写数组，避免污染上游 / 只读 buffer 报错。
+        vol = np.array(vol)
     np.clip(vol, intensity_min, intensity_max, out=vol)
 
     if normalize == "minmax":

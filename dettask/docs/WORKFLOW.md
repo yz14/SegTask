@@ -10,7 +10,8 @@
 ## 0. 共享主干
 
 ```
-配置加载（segtask Config + DetConfig）→ npz 发现 → train/val 划分
+配置加载（segtask Config + DetConfig）→ npz 发现 → train/val 划分（默认按
+逐卷类存在集合分层，`det.stratify_split`；关闭回退纯随机）
  → Dataset 抽 patch + 框真值联动（变长框 det_collate 保持 list）
  → DetectorModel：encoder → decoder 金字塔 → FPNAdapter → 检测头（4 模板）
  → 头内 fp32 损失 dict → 求和 → backward → optimizer/scheduler → EMA
@@ -28,7 +29,7 @@
 ### 框真值契约（只存 3D 一份）
 
 - npz `boxes` 键 (N, 7)=[z1,y1,x1,z2,y2,x2,cls] 优先；
-- 否则由分割 mask 连通域派生（`det.boxes_from_mask`，逐前景类，`min_box_voxels` 滤噪点，逐卷缓存）；
+- 否则由分割 mask 连通域派生（`det.boxes_from_mask`，逐前景类，`min_box_voxels` 按连通域真实体素数滤噪点，逐卷缓存）；
 - patch 裁剪/resize/翻转时框全程同步联动（crop_boxes 平移裁剪 → scale_boxes 随 resize 缩放 → flip_boxes 随翻转镜像 → 过滤可见比例 < min_visibility 的框）；
 - 2.5D 折叠时由 3D 框对 slab 切片自动派生 2D 框。
 
@@ -38,7 +39,8 @@
 
 ```
 【Dataset，CPU worker → image (B,1,D,H,W) 或 2.5D (B,D,H,W)，boxes/labels 变长 list】
-npz 读取（image + boxes 键 / mask 派生框；VolumeCache 逐 worker LRU 缓存预处理后的卷，
+npz 读取（image + boxes 键 / mask 派生框；走 seg memmap 零拷贝快路径，页缓存跨
+  worker 共享，压缩 npz 自动回退；VolumeCache 逐 worker LRU 缓存预处理后的卷，
   同卷连续索引下 samples_per_volume 次采样只读 1 次盘）
  → 预处理（img 归一化，与分割同参）
  → 采样偏移（训练随机；按 fg_oversample_ratio 概率以某 gt 框中心为锚，保证正样本供给；
@@ -50,12 +52,14 @@ npz 读取（image + boxes 键 / mask 派生框；VolumeCache 逐 worker LRU 缓
  → 2.5D 折叠 + 3D 框切片派生 2D 框
 
 【Trainer，GPU】
+（可选 train.prefetch_to_gpu：独立 CUDA stream 提前一个 batch 上卡，同 seg/cls）
 强度增强（augment.enabled，复用 seg GPUAugmentor，空间分支清零不动框）
  → 前向：encoder → decoder 金字塔 → FPN 1×1 对齐 + 3×3 平滑（fpn_levels 选层）→ 检测头
  → 头内分配/编解码 + fp32 损失 dict（focal / GIoU 数值敏感，autocast 外）→ 求和
  → 非有限守护（loss/梯度非有限丢弃本 accum 组，保护权重/EMA）
  → backward → 梯度裁剪 → optimizer / warmup+scheduler（按优化步计时）→ EMA
- → 每 epoch 验证（EMA shadow：patch 级 predict → mAP@eval_iou_thresh）
+ → 每 epoch 验证（EMA shadow：前向 autocast 口径同训练/推理，损失仍 fp32；
+   patch 级 predict → mAP@eval_iou_thresh；非有限 val loss 排除不计）
  → 按 det.save_best_metric（map | loss）选模存 best_model.pth；每 epoch 原子写
    latest_model.pth + history.json 落盘
 ```
@@ -133,7 +137,7 @@ micro-batch 前向（`infer_batch_size`）防大卷 OOM；DETR 免 NMS（集合�
 - 训练验证：patch 级 COCO 式 mAP（逐类累计 TP/score → 全 recall 区间插值 AP → 宏平均，无 gt 类跳过）；
 - 体级：FROC——给定每卷假阳个数阈值（`froc_fp_per_vol`）下的灵敏度均值（类无关口径）；
 - FROC 统一在拼接后的 3D 框上评估：2.5D 与 3D 两几何同一读数口径；
-- 匹配统一 IoU ≥ `eval_iou_thresh`（按分数降序贪心，一 gt 至多配一检出）。
+- 匹配统一 IoU ≥ `eval_iou_thresh`（按分数降序，在未占用 gt 中取 IoU 最大者，COCO 口径；一 gt 至多配一检出）。
 
 ---
 

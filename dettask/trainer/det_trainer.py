@@ -32,6 +32,7 @@ from segtask_v1.data.augment import GPUAugmentor
 from segtask_v1.trainer.amp import GradScaler, resolve_auto_amp_dtype
 from segtask_v1.trainer.checkpoint import unwrap_compile
 from segtask_v1.trainer.optim import build_optimizer, build_scheduler
+from segtask_v1.trainer.prefetch import CudaPrefetcher
 from segtask_v1.utils import AverageMeter, ModelEMA
 
 from clstask.trainer.cls_trainer import (
@@ -152,9 +153,14 @@ class DetTrainer:
         part_meters: Dict[str, AverageMeter] = {}
         accum = self.grad_accum_steps
         total = len(self.train_loader)
+        # GPU 预取（口径同 seg/cls Trainer）：独立 copy stream 提前一个
+        # batch 上卡；boxes/labels 是 list 字段由预取器原样透传。
+        batch_iter = self.train_loader
+        if self.cfg.train.prefetch_to_gpu and self.device.type == "cuda":
+            batch_iter = CudaPrefetcher(self.train_loader, self.device)
         self.optimizer.zero_grad(set_to_none=True)
         group_has_nonfinite = False
-        for step, batch in enumerate(self.train_loader):
+        for step, batch in enumerate(batch_iter):
             img, boxes, labels = self._to_device(batch, augment=True)
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.use_amp, dtype=self.amp_dtype):
@@ -241,14 +247,23 @@ class DetTrainer:
         try:
             for batch in self.val_loader:
                 img, boxes, labels = self._to_device(batch)
-                # 金字塔只前向一次，predict 与 loss 共用。
-                feats = self.model.extract_pyramid(img)
+                # 金字塔只前向一次，predict 与 loss 共用；autocast 口径同
+                # 训练/推理（head 内损失仍 fp32）。
                 img_size = list(img.shape[2:])
-                dets = self.model.det_head.predict(feats, img_size)
-                losses = self.model.det_head.compute_loss(
-                    feats, boxes, labels, img_size)
-                loss_meter.update(float(sum(losses.values()).item()),
-                                  img.shape[0])
+                with torch.autocast(device_type=self.device.type,
+                                    enabled=self.use_amp,
+                                    dtype=self.amp_dtype):
+                    feats = self.model.extract_pyramid(img)
+                    dets = self.model.det_head.predict(feats, img_size)
+                    losses = self.model.det_head.compute_loss(
+                        feats, boxes, labels, img_size)
+                loss_val = float(sum(losses.values()).item())
+                if math.isfinite(loss_val):
+                    loss_meter.update(loss_val, img.shape[0])
+                else:
+                    logger.warning("Non-finite val loss (%s) at epoch %d; "
+                                   "excluded from val_loss.", loss_val,
+                                   epoch + 1)
                 preds.extend(dets)
                 gts.extend([(b.cpu(), l.cpu())
                             for b, l in zip(boxes, labels)])

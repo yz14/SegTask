@@ -28,8 +28,11 @@ def match_detections(pred_boxes: torch.Tensor, pred_scores: torch.Tensor,
     iou = box_iou(pred_boxes, gt_boxes)              # (N, G)
     taken = torch.zeros(gt_boxes.shape[0], dtype=torch.bool)
     for i in order.tolist():
-        best, g = iou[i].max(dim=0)
-        if best >= iou_thresh and not taken[g]:
+        # 未被占用的 gt 中取 IoU 最大者（COCO 口径：最佳 gt 已被更高分
+        # 检出占用时仍可匹配次优 gt）。
+        row = torch.where(taken, torch.full_like(iou[i], -1.0), iou[i])
+        best, g = row.max(dim=0)
+        if best >= iou_thresh:
             taken[g] = True
             tp[i] = True
     return tp

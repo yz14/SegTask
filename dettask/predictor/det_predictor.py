@@ -29,11 +29,11 @@ import numpy as np
 import torch
 
 from segtask_v1.config import Config as SegConfig
-from segtask_v1.data.dataset import preprocess_image, resize_3d
+from segtask_v1.data.dataset import load_npz_image, resize_3d
 from segtask_v1.trainer.amp import resolve_auto_amp_dtype
 
 from ..config import DetConfig
-from ..data.det_dataset import load_volume_boxes
+from ..data.det_dataset import load_boxes
 from ..metrics import froc
 from ..ops import batched_nms
 from ..targets import flip_boxes, scale_boxes
@@ -84,11 +84,11 @@ class DetPredictor:
             self._tta_combos = [()]
 
     def _load_volume(self, npz_path: str) -> np.ndarray:
+        # 读取走 seg 的 memmap 零拷贝快路径（压缩 npz 自动回退，逐位一致）。
         dc = self.cfg.data
-        with np.load(npz_path, allow_pickle=True) as f:
-            return preprocess_image(
-                f["image"], dc.intensity_min, dc.intensity_max, dc.normalize,
-                dc.global_mean, dc.global_std, inplace=False)
+        return load_npz_image(
+            npz_path, dc.intensity_min, dc.intensity_max, dc.normalize,
+            dc.global_mean, dc.global_std)
 
     def _extract(self, vol: np.ndarray, off: Sequence[int]) -> np.ndarray:
         sl = tuple(slice(o, o + p) for o, p in zip(off, self.patch))
@@ -296,7 +296,8 @@ class DetPredictor:
                         res["boxes"].shape[0])
             if evaluate and have_gt:
                 try:
-                    _, gb, gl = load_volume_boxes(
+                    # 只读框真值（image 已在 predict_volume 读过）。
+                    gb, gl = load_boxes(
                         path, fg_values, self.det.boxes_from_mask,
                         self.det.min_box_voxels)
                     gts.append((torch.from_numpy(gb), torch.from_numpy(gl)))

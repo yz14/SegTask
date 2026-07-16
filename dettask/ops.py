@@ -152,5 +152,16 @@ def roi_align(features: torch.Tensor, boxes: torch.Tensor,
         gy = grids[1][:, None, :, None].expand(n, *out_sz)
         gx = grids[2][:, None, None, :].expand(n, *out_sz)
         grid = torch.stack([gx, gy, gz], dim=-1)        # (N, od, oh, ow, 3)
-    feats = features[batch_idx.long()]                  # (N, C, *S)
-    return F.grid_sample(feats, grid, mode="bilinear", align_corners=False)
+    # 逐图 expand（零拷贝视图）分组采样：避免 features[batch_idx] 高级索引
+    # 为每个 ROI 复制一份完整特征图（3D 高分辨率层下是 GB 级峰值显存）。
+    bi = batch_idx.long()
+    out = features.new_zeros((n, C, *out_sz))
+    for i in range(features.shape[0]):
+        sel = (bi == i).nonzero(as_tuple=True)[0]
+        if sel.numel() == 0:
+            continue
+        f = features[i:i + 1].expand(sel.numel(), -1, *features.shape[2:])
+        out = out.index_put(
+            (sel,), F.grid_sample(f, grid[sel], mode="bilinear",
+                                  align_corners=False))
+    return out
