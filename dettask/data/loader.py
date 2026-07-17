@@ -9,9 +9,9 @@ from torch.utils.data import DataLoader
 
 import numpy as np
 
-from segtask_v1.config import Config as SegConfig
-from segtask_v1.data.dataset import _open_npz
-from segtask_v1.data.loader import train_val_split
+from taskcore.config.core import Config as SegConfig
+from taskcore.data.dataset import _open_npz
+from taskcore.data.loader import train_val_split
 
 from clstask.data.cls_dataset import derive_volume_targets
 from clstask.data.loader import discover_npz, stratified_split

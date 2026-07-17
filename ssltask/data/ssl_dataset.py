@@ -24,10 +24,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from segtask_v1.trainer.dist_utils import (
+from taskcore.engine.dist_utils import (
     get_rank, get_world_size, is_dist_avail_and_initialized)
 
-from segtask_v1.data.dataset import (
+from taskcore.data.dataset import (
     VolumeCache,
     _extract_cubic_patch,
     _open_npz,

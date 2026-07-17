@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Union
 
+from taskcore.config.core import MonitorConfig
+
 from .dataclasses import (
     AugConfig, ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
     TaskConfig, TrainConfig, _require,
@@ -25,6 +27,8 @@ class Config:
     predict: PredictConfig = field(default_factory=PredictConfig)
     task   : TaskConfig    = field(default_factory=TaskConfig)
     augment: AugConfig     = field(default_factory=AugConfig)
+    # 训练监测仪表盘（公用工程件，见 taskcore.monitor）。
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
 
     def sync(self) -> None:
         """同步跨子配置的对应字段。
@@ -60,7 +64,7 @@ class Config:
 
         # 单一真相源：所有通道/几何派生量在 build_topology 中一次算齐。
         # 局部 import 避免 models 包顶层依赖 config（消除循环 import 风险）。
-        from ..models.topology import build_topology
+        from taskcore.models.topology import build_topology
         topo = build_topology(self)
         self.model._in_channels = topo.in_channels
         self.model._spatial_dims = topo.spatial_dims
@@ -524,7 +528,7 @@ class Config:
                 _require(
                     depths[0] == self.data.patch_size[0],
                     f"per_view_depths[0] must equal patch_size[0]={self.data.patch_size[0]}; got {depths[0]}.")
-                from ..models.topology import build_topology
+                from taskcore.models.topology import build_topology
                 _require(
                     build_topology(self).in_ch_per_view_list is not None,
                     "keep_native_view_depth=True requires in_ch_per_view_list "
@@ -689,5 +693,5 @@ class Config:
         R5：委托给 ``build_topology`` 以保持单一真相源；仅形状计算，不依赖
         ``data.keep_native_view_depth``，调用方自行根据该标志决定是否使用。
         """
-        from ..models.topology import build_topology
+        from taskcore.models.topology import build_topology
         return list(build_topology(self).per_view_depths)

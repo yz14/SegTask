@@ -1141,7 +1141,7 @@ class MonitorConfig:
     与 ``VisConfig``（静态架构 / 数据流图）正交：本配置控制**训练时序**监测
     —— 逐 epoch 落盘损失 / 指标 / 学习率 / 显存到 ``metrics.jsonl``，并周期性
     重渲染一份自包含 HTML 仪表盘（曲线 + best 模型指标卡片），支持训练中实时
-    刷新与训练后复看 / 多 run 对比。落盘与渲染均封装在 ``segtask_v1.monitor``，
+    刷新与训练后复看 / 多 run 对比。落盘与渲染均封装在 ``taskcore.monitor``，
     失败被隔离、不会中断训练。
     """
 

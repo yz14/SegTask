@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from segtask_v1.trainer.checkpoint import extract_model_state_dict
+from taskcore.engine.checkpoint import extract_model_state_dict
 
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
 from .cls_probe import ClsProbe

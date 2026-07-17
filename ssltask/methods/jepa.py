@@ -166,7 +166,7 @@ class JEPAMethod(SSLMethod):
     # ---- export -----------------------------------------------------------
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:
         """导出 **目标** encoder（EMA，表征更稳），键命名为 ``encoder.*``。"""
-        from segtask_v1.trainer.checkpoint import unwrap_compile
+        from taskcore.engine.checkpoint import unwrap_compile
         target = unwrap_compile(self.module).target_encoder
         return {f"encoder.{k}": v.detach().cpu().clone()
                 for k, v in target.state_dict().items()}

@@ -42,7 +42,7 @@ def _ok(name: str, msg: str = "") -> None:
 # 1. Default reduction is "per_slice" + backward compatibility
 # ---------------------------------------------------------------------------
 def test_default_reduction_is_per_slice():
-    from segtask_v1.config import LossConfig
+    from taskcore.config.core import LossConfig
     from segtask_v1.losses.losses import SliceChannelLoss, BinaryDiceLoss
 
     cfg = LossConfig()
@@ -279,7 +279,7 @@ def test_pooled_dice_metric_invariant_under_reduction():
     making val curves incomparable across runs.
     """
     from segtask_v1.losses.losses import SliceChannelLoss, BinaryDiceLoss
-    from segtask_v1.utils import dice_batch_stats
+    from taskcore.utils.common import dice_batch_stats
 
     torch.manual_seed(3)
     B, num_fg, D, H, W = 3, 2, 5, 16, 16
@@ -348,7 +348,7 @@ def test_per_volume_gradient_flow_compound_dice_bce():
     """
     from segtask_v1.losses.losses import (
         SliceChannelLoss, DeepSupervisionLoss, build_loss)
-    from segtask_v1.config import LossConfig
+    from taskcore.config.core import LossConfig
 
     torch.manual_seed(4)
     B, num_fg, D, H, W = 2, 1, 6, 16, 16
@@ -382,7 +382,7 @@ def test_per_volume_gradient_flow_compound_dice_bce():
 # 8. Config validation rejects invalid reduction
 # ---------------------------------------------------------------------------
 def test_config_validate_rejects_invalid_reduction():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2

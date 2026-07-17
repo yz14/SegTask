@@ -117,7 +117,7 @@ class MixedBatchSampler(Sampler[List[int]]):
         seed: int = 0,
         rank: int = 0,
         world_size: int = 1) -> None:
-        super().__init__(data_source=None)
+        super().__init__()
         if gold_per_batch < 1 or coarse_per_batch < 1:
             raise ValueError(
                 f"gold_per_batch and coarse_per_batch must be >= 1; got "

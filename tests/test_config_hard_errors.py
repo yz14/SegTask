@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from segtask_v1.config import ConfigError, load_config
+from taskcore.config.core import ConfigError, load_config
 
 
 @pytest.mark.parametrize("yaml_text, expected", [

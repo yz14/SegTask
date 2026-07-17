@@ -42,7 +42,7 @@ def _make_ct_like(path, shape=(64, 96, 80), slope=1.0, inter=-1024.0,
 
 
 def test_ct_like_numerical_match():
-    from segtask_v1.data.dataset import load_nifti
+    from taskcore.data.dataset import load_nifti
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "ct.nii.gz"
         raw, slope, inter = _make_ct_like(
@@ -65,7 +65,7 @@ def test_ct_like_numerical_match():
 
 
 def test_mask_like_numerical_match():
-    from segtask_v1.data.dataset import load_nifti
+    from taskcore.data.dataset import load_nifti
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "mask.nii.gz"
         # No scaling: pure binary mask.
@@ -90,7 +90,7 @@ def test_mask_like_numerical_match():
 
 
 def test_nontrivial_slope_match():
-    from segtask_v1.data.dataset import load_nifti
+    from taskcore.data.dataset import load_nifti
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "scaled.nii.gz"
         raw, slope, inter = _make_ct_like(
@@ -112,7 +112,7 @@ def test_no_float64_buffer_allocated():
     volume size. We use the (n3 alloc count) tracemalloc trick: take a
     pre/post snapshot and assert no large float64 numpy block appears."""
     import tracemalloc
-    from segtask_v1.data.dataset import load_nifti
+    from taskcore.data.dataset import load_nifti
 
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "big.nii.gz"

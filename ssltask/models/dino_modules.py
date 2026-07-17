@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.models.factory import build_model
+from taskcore.models.factory import build_model
 
 logger = logging.getLogger(__name__)
 

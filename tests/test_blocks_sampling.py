@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from segtask_v1.models.blocks import (
+from taskcore.models.blocks import (
     BlurPool3d,
     CARAFE3d,
     Downsample,
@@ -209,8 +209,8 @@ def test_upsample_post_norm_act_group_norm():
 @pytest.mark.parametrize("down_mode,up_mode",
                           list(itertools.product(DOWN_MODES, UP_MODES)))
 def test_unet_build_and_forward(down_mode, up_mode):
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -238,14 +238,14 @@ def test_unet_build_and_forward(down_mode, up_mode):
 # ---------------------------------------------------------------------------
 class TestConfigValidation:
     def test_rejects_bad_downsample_mode(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.downsample_mode = "not_a_mode"
         with pytest.raises(AssertionError):
             cfg.validate()
 
     def test_rejects_bad_upsample_mode(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.upsample_mode = "not_a_mode"
         with pytest.raises(AssertionError):

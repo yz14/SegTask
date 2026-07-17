@@ -13,16 +13,16 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from segtask_v1.config import Config
-from segtask_v1.models.blocks import (
+from taskcore.config.core import Config
+from taskcore.models.blocks import (
     AttentionGate3D,
     DropPath,
     GlobalResponseNorm,
 )
-from segtask_v1.models.convnext import ConvNeXtBlock
-from segtask_v1.models.factory import build_model
-from segtask_v1.models.mednext import MedNeXtBlock
-from segtask_v1.models.resnet import (
+from taskcore.models.convnext import ConvNeXtBlock
+from taskcore.models.factory import build_model
+from taskcore.models.mednext import MedNeXtBlock
+from taskcore.models.resnet import (
     BottleneckBlock,
     MultiRFBlock,
     PreActResNetBlock,

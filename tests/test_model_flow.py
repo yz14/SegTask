@@ -17,10 +17,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from segtask_v1.config import load_config
+from taskcore.config.core import load_config
 from segtask_v1.losses.losses import build_loss
-from segtask_v1.models.factory import build_model
-from segtask_v1.models.topology import build_topology
+from taskcore.models.factory import build_model
+from taskcore.models.topology import build_topology
 from segtask_v1.trainer.pipelines.factory import build_pipeline
 from segtask_v1.visualization.data_flow import build_data_flow
 from segtask_v1.visualization.model_flow import build_model_flow

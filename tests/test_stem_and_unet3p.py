@@ -19,13 +19,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.models.stem import (
+from taskcore.models.stem import (
     STEM_MODES,
     DualConvStem,
     PatchEmbedStem,
     build_stem,
 )
-from segtask_v1.models.unet3p import UNet3PDecoder
+from taskcore.models.unet3p import UNet3PDecoder
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +75,8 @@ def test_patch_embed_stem_rejects_bad_patch():
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("stem_mode", ["conv3", "conv7", "dual", "patch2", "patch4"])
 def test_unet_restores_resolution(stem_mode):
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -100,8 +100,8 @@ def test_unet_restores_resolution(stem_mode):
 
 def test_unet_deep_supervision_with_patch_stem():
     """With patch stem: main output at input res, DS heads at decoder res."""
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -196,8 +196,8 @@ class TestUNet3PDecoder:
 @pytest.mark.parametrize("stem_mode", ["conv3", "patch2"])
 @pytest.mark.parametrize("backbone", ["resnet", "convnext"])
 def test_unet3p_end_to_end(stem_mode, backbone):
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -221,8 +221,8 @@ def test_unet3p_end_to_end(stem_mode, backbone):
 
 
 def test_unet3p_with_deep_supervision_and_skip_attention():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -251,21 +251,21 @@ def test_unet3p_with_deep_supervision_and_skip_attention():
 # ---------------------------------------------------------------------------
 class TestConfigValidation:
     def test_rejects_bad_stem_mode(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.stem_mode = "notastem"
         with pytest.raises(AssertionError):
             cfg.validate()
 
     def test_rejects_bad_decoder_type(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.decoder_type = "transformer"
         with pytest.raises(AssertionError):
             cfg.validate()
 
     def test_rejects_bad_unet3p_cat_channels(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.unet3p_cat_channels = 0
         with pytest.raises(AssertionError):

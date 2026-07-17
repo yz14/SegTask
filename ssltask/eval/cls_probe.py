@@ -22,8 +22,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from segtask_v1.models.factory import build_model
-from segtask_v1.trainer.checkpoint import strip_common_prefixes
+from taskcore.models.factory import build_model
+from taskcore.engine.checkpoint import strip_common_prefixes
 
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
 from .metrics import _binary_f1, _rank_auc, macro_cls_metrics

@@ -21,21 +21,22 @@ import dataclasses
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Dict
 
 import torch
 import torch.nn as nn
 
-from segtask_v1.config import Config as SegConfig
-from segtask_v1.data.augment import GPUAugmentor
-from segtask_v1.trainer.checkpoint import (
+from taskcore.config.core import Config as SegConfig
+from taskcore.data.augment import GPUAugmentor
+from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
     state_to_cpu, unwrap_compile,
 )
-from segtask_v1.trainer.optim import build_optimizer, build_scheduler
-from segtask_v1.trainer.prefetch import CudaPrefetcher
-from segtask_v1.utils import AverageMeter
+from taskcore.engine.optim import build_optimizer, build_scheduler
+from taskcore.engine.prefetch import CudaPrefetcher
+from taskcore.utils.common import AverageMeter
 from taskcore.engine.base_trainer import BaseTrainer
 
 from clstask.trainer.cls_trainer import (
@@ -77,6 +78,9 @@ class DetTrainer(BaseTrainer):
         self.model = model.to(device)
         tc = cfg.train
 
+        # 可选 channels_last 内存格式（数值等价；共用工程件，见 BaseTrainer）。
+        self._setup_channels_last()
+
         self.num_classes = resolve_num_classes(det, cfg)
         if abs(det.encoder_lr_mult - 1.0) > 1e-9:
             self.optimizer = _build_optimizer_with_lr_mult(
@@ -107,6 +111,14 @@ class DetTrainer(BaseTrainer):
         self._setup_ema()
         self.grad_clip_norm = float(tc.grad_clip_norm)
 
+        # --- torch.compile（最后：optimizer / EMA 已绑裸参数）----------
+        self._maybe_compile()
+
+        # --- DDP 装配与训练采样器识别（公用工程件，见 BaseTrainer）-------
+        # 单卡时 fwd_model 即裸模块，路径零变化；多卡时前向走 DDP 包装。
+        self._setup_ddp()
+        self._setup_train_sampler()
+
         # 强度增强（复用 seg GPUAugmentor，仅强度分支；框不受影响）。
         self.augmentor = (
             GPUAugmentor(_intensity_only_augcfg(cfg.augment), max_scale=1.0)
@@ -117,13 +129,28 @@ class DetTrainer(BaseTrainer):
         # save_async=True 时权重先深拷到 CPU，后台线程 torch.save，主循环
         # 不再被写盘阻塞；fit 收尾 wait+close 保证全部落盘（同 seg）。
         self._ckpt_saver = (AsyncCheckpointSaver()
-                            if self.cfg.train.save_async else None)
+                            if self.cfg.train.save_async and self._is_main
+                            else None)
         # SWA 尾段权重平均（opt-in，公用工程件，见 BaseTrainer）。
         self._setup_swa()
         self.best_key = det.save_best_metric        # map | loss
         self.best_sign = -1.0 if self.best_key == "loss" else 1.0
         self._setup_best_tracking(mode="max")
         self.history: "list[Dict[str, float]]" = []
+
+        # --- 训练监测仪表盘（公用工程件，见 BaseTrainer / taskcore.monitor；
+        #     cfg.monitor 守卫，失败隔离不阻断训练）-----------------------
+        self._setup_monitor(
+            resume_active=bool(str(tc.resume or "").strip()),
+            run_name_default="det_run",
+            save_best_metric=self.best_key,
+            save_best_mode="min" if self.best_key == "loss" else "max",
+            save_best_criterion="",
+            num_classes=0,
+            config_meta={
+                "batch_size": cfg.data.batch_size,
+                "num_classes": self.num_classes,
+            })
 
     # ------------------------------------------------------------------
     def _to_device(self, batch, augment: bool = False):
@@ -138,6 +165,8 @@ class DetTrainer(BaseTrainer):
         return img, boxes, labels
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        if self._train_sampler is not None:
+            self._train_sampler.set_epoch(epoch)   # 多卡重洗（单卡 no-op）
         self.model.train()
         loss_meter = AverageMeter()
         part_meters: Dict[str, AverageMeter] = {}
@@ -159,7 +188,7 @@ class DetTrainer(BaseTrainer):
             img, boxes, labels = self._to_device(batch, augment=True)
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.use_amp, dtype=self.amp_dtype):
-                losses = self.model(img, boxes, labels)
+                losses = self.fwd_model(img, boxes, labels)
             loss = sum(losses.values())
             # 尾组 micro-batch 不满 accum 时用真实尾长作分母。
             eff_accum = self._effective_accum(step, total, accum)
@@ -227,7 +256,7 @@ class DetTrainer(BaseTrainer):
                 if not scaler_skipped:
                     self.scheduler.step()
                     if self.ema is not None:
-                        self.ema.update(self.model)
+                        self.ema.update(unwrap_compile(self.model))
 
             if (step + 1) % max(self.cfg.train.log_every, 1) == 0 or step == 0:
                 logger.debug("  [%d/%d] loss=%.4f (%s) lr=%.2e",
@@ -305,12 +334,12 @@ class DetTrainer(BaseTrainer):
         if self.ema is not None:
             online_sd = {k: v.detach().cpu().clone()
                          for k, v in bare.state_dict().items()}
-            self.ema.apply_shadow(self.model)
+            self.ema.apply_shadow(bare)
             try:
                 primary_sd = {k: v.detach().cpu().clone()
                               for k, v in bare.state_dict().items()}
             finally:
-                self.ema.restore(self.model)
+                self.ema.restore(bare)
         else:
             online_sd = None
             primary_sd = bare.state_dict()
@@ -397,7 +426,9 @@ class DetTrainer(BaseTrainer):
         last: Dict[str, float] = dict(self.history[-1]) if self.history else {}
         patience = max(int(self.cfg.train.early_stopping), 0)
         epochs_no_improve = max(self.start_epoch - 1 - self.best_epoch, 0)
+        final_status = "completed"
         for epoch in range(self.start_epoch, self.cfg.train.epochs):
+            epoch_t0 = time.time()
             tr = self._train_epoch(epoch)
             val = self._validate(epoch)
             self.scheduler.step_epoch(val.get(self.best_key))
@@ -406,7 +437,8 @@ class DetTrainer(BaseTrainer):
                 epoch + 1, self.cfg.train.epochs, tr["loss"], val["loss"],
                 val["map"])
             score = self.best_sign * val[self.best_key]
-            if score > self.best_metric:
+            is_best = score > self.best_metric
+            if is_best:
                 self.best_metric = score
                 self.best_epoch = epoch
                 self._save_best(epoch, val)
@@ -419,11 +451,22 @@ class DetTrainer(BaseTrainer):
             self._swa_update(epoch)
             self._save_latest(epoch, val)
             self._write_history()
+            gpu_peak_mib = None
+            if self.device.type == "cuda":
+                gpu_peak_mib = (torch.cuda.max_memory_allocated(self.device)
+                                / (1 << 20))
+                torch.cuda.reset_peak_memory_stats(self.device)
+            self._monitor_log_epoch(
+                epoch, tr, val,
+                lr=self.scheduler.get_lr(), gpu_peak_mib=gpu_peak_mib,
+                wall_time_s=time.time() - epoch_t0, is_best=is_best,
+                last_epoch=(epoch + 1) == self.cfg.train.epochs)
             if patience > 0 and epochs_no_improve >= patience:
                 logger.info(
                     "Early stopping at epoch %d: no %s improvement for %d "
                     "validation(s) (best @ epoch %d).", epoch + 1,
                     self.best_key, patience, self.best_epoch + 1)
+                final_status = "early_stopped"
                 break
         try:
             self._finalize_swa(
@@ -433,6 +476,7 @@ class DetTrainer(BaseTrainer):
         except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
             logger.exception("SWA finalization failed; online/best "
                              "checkpoints are unaffected.")
+        self._monitor_finalize(final_status)
         if self._ckpt_saver is not None:
             # 收尾前排空异步写盘队列；写盘异常在此抛出。
             self._ckpt_saver.close()

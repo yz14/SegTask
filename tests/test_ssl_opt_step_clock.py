@@ -17,7 +17,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from segtask_v1.config import Config as SegConfig
+from taskcore.config.core import Config as SegConfig
 from ssltask.config import SSLConfig, validate_ssl
 from ssltask.methods import build_method
 from ssltask.trainer import SSLTrainer

@@ -19,9 +19,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.models.blocks import _CONV, INTERP_SMOOTH, ConvNormAct
-from segtask_v1.models.factory import build_model
-from segtask_v1.models.unet import SegmentationHead, _resize_logits
+from taskcore.models.blocks import _CONV, INTERP_SMOOTH, ConvNormAct
+from taskcore.models.factory import build_model
+from taskcore.models.unet import SegmentationHead, _resize_logits
 
 logger = logging.getLogger(__name__)
 

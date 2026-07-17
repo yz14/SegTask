@@ -21,7 +21,7 @@ import pytest
 # Ensure local import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from segtask_v1.data.dataset import (
+from taskcore.data.dataset import (
     SegDataset3D,
     _extract_cubic_patch,
     preprocess_image,
@@ -30,8 +30,8 @@ from segtask_v1.losses.losses import (
     BinaryDiceLoss,
     MultiResolutionLoss,
 )
-from segtask_v1.models.unet import UNet3D, Encoder, Decoder
-from segtask_v1.models.resnet import ResNetStage
+from taskcore.models.unet import UNet3D, Encoder, Decoder
+from taskcore.models.resnet import ResNetStage
 from functools import partial
 
 
@@ -262,7 +262,7 @@ def test_bug4_ema_in_place_swap():
     """EMA.apply_shadow / restore should swap tensors in place without
     allocating a fresh deepcopy every call, and the model must see EMA
     weights after apply_shadow and original weights after restore."""
-    from segtask_v1.utils import ModelEMA
+    from taskcore.utils.common import ModelEMA
 
     model = _build_tiny_unet(num_fg=2, deep_supervision=False)
     # Snapshot original weights
@@ -312,8 +312,8 @@ def test_channels_last_cpu_forward_matches():
 
 
 def test_trainer_channels_last_plumbing_cpu():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.trainer import Trainer
 
     cfg = Config()
@@ -344,8 +344,8 @@ def test_trainer_channels_last_plumbing_cpu():
 
 
 def test_compile_eager_ema_smoke_and_prefix_strip():
-    from segtask_v1.trainer.checkpoint import strip_common_prefixes, unwrap_compile
-    from segtask_v1.utils import ModelEMA
+    from taskcore.engine.checkpoint import strip_common_prefixes, unwrap_compile
+    from taskcore.utils.common import ModelEMA
 
     if not hasattr(torch, "compile"):
         pytest.skip("torch.compile unavailable")
@@ -386,8 +386,8 @@ def test_compile_eager_ema_smoke_and_prefix_strip():
 
 
 def test_trainer_one_cycle_warmup_epochs_no_raise():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.trainer import Trainer
 
     cfg = Config()
@@ -419,8 +419,8 @@ def test_trainer_one_cycle_warmup_epochs_no_raise():
 
 
 def test_trainer_skips_poisoned_nonfinite_grads_on_no_scaler_path():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.trainer import Trainer
 
     class _SpyScaler:
@@ -497,8 +497,8 @@ def test_trainer_skips_poisoned_nonfinite_grads_on_no_scaler_path():
 
 
 def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.trainer import Trainer
 
     class _SpyScaler:
@@ -588,7 +588,7 @@ def test_trainer_scaler_path_still_calls_step_on_nonfinite_grads():
 def test_bug5_plateau_mode_from_config():
     """build_scheduler should use plateau mode matching the derived save_best_mode."""
     from segtask_v1.trainer import build_scheduler
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.scheduler = "plateau"
@@ -607,7 +607,7 @@ def test_bug5_plateau_mode_from_config():
 
 
 def test_bug6_config_validate_rejects_illegal_combo():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     # z_axis + multi-res 现已合法（多分辨率 z-FOV），sync 后 in_channels=视图数。
     cfg = Config()
@@ -641,7 +641,7 @@ def test_bug6_config_validate_rejects_illegal_combo():
 
 def test_bug7_droppath_amp_dtype():
     """DropPath must produce output matching x.dtype under fp16/bf16."""
-    from segtask_v1.models.convnext import DropPath
+    from taskcore.models.convnext import DropPath
 
     dp = DropPath(drop_prob=0.2).train()
     for dt in [torch.float32, torch.float16, torch.bfloat16]:
@@ -659,7 +659,7 @@ def test_bug7_droppath_amp_dtype():
 def test_bug8_detect_label_values_full_scan():
     """detect_label_values must scan all files by default and discover
     rare classes that are absent from the first few files."""
-    from segtask_v1.data.loader import detect_label_values
+    from taskcore.data.loader import detect_label_values
     import nibabel as nib
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -694,7 +694,7 @@ def test_bug8_detect_label_values_full_scan():
 def test_bug10a_random_gamma_vectorized():
     """Vectorized gamma must produce deterministic per-sample results and
     leave un-selected samples untouched."""
-    from segtask_v1.data.augment import _random_gamma
+    from taskcore.data.augment import _random_gamma
 
     torch.manual_seed(0)
     B, C, D, H, W = 3, 1, 4, 8, 8
@@ -722,7 +722,7 @@ def test_bug10a_random_gamma_vectorized():
 
 
 def test_bug10b_grid_dropout_vectorized():
-    from segtask_v1.data.augment import _grid_dropout
+    from taskcore.data.augment import _grid_dropout
 
     torch.manual_seed(0)
     x = torch.ones(4, 1, 8, 16, 16)
@@ -744,7 +744,7 @@ def test_bug10b_grid_dropout_vectorized():
 
 
 def test_bug11_stratified_split():
-    from segtask_v1.data.loader import stratified_train_val_split
+    from taskcore.data.loader import stratified_train_val_split
     import nibabel as nib
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -779,7 +779,7 @@ def test_bug11_stratified_split():
 def test_d1_dice_pooled_vs_naive():
     """Pooled dice must be robust to empty GT batches that would otherwise
     zero-out the per-batch average."""
-    from segtask_v1.utils import dice_batch_stats
+    from taskcore.utils.common import dice_batch_stats
 
     # Batch 1: class-0 GT=1, class-1 GT=0. Pred perfect (matches GT per class).
     p1 = torch.full((1, 2, 4, 4, 4), -10.0)      # default low
@@ -820,7 +820,7 @@ def test_d3_rng_state_roundtrip():
 
 def test_rng_reseed_helper_decorrelates_ranks_after_resume():
     from segtask_v1.trainer.trainer import _reseed_rank_rng
-    from segtask_v1.utils import seed_everything
+    from taskcore.utils.common import seed_everything
 
     def _sample():
         return (

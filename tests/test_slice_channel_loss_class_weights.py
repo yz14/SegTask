@@ -345,7 +345,7 @@ def test_cw_length_mismatch_raises():
 def test_gradient_flow_with_nonuniform_cw():
     from segtask_v1.losses.losses import (
         SliceChannelLoss, build_loss)
-    from segtask_v1.config import LossConfig
+    from taskcore.config.core import LossConfig
 
     torch.manual_seed(7)
     B, num_fg, D, H, W = 2, 2, 4, 8, 8

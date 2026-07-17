@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.models.blocks import Downsample, Upsample, _as_stride_tuple
+from taskcore.models.blocks import Downsample, Upsample, _as_stride_tuple
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ def test_downsample_upsample_roundtrip_size():
 # Auto schedule
 # ---------------------------------------------------------------------------
 def test_auto_schedule_thin_z_3d():
-    from segtask_v1.models.factory import _auto_anisotropic_strides
+    from taskcore.models.factory import _auto_anisotropic_strides
     # z=32, H/W=256, 4 downsamples (5-stage encoder).
     sched = _auto_anisotropic_strides([32, 256, 256], num_down=4)
     assert len(sched) == 4
@@ -96,7 +96,7 @@ def test_auto_schedule_thin_z_3d():
 
 
 def test_auto_schedule_isotropic_when_balanced():
-    from segtask_v1.models.factory import _auto_anisotropic_strides
+    from taskcore.models.factory import _auto_anisotropic_strides
     sched = _auto_anisotropic_strides([64, 64, 64], num_down=3)
     assert all(s == (2, 2, 2) for s in sched)
 
@@ -105,7 +105,7 @@ def test_auto_schedule_isotropic_when_balanced():
 # compute_downsample_strides config plumbing
 # ---------------------------------------------------------------------------
 def _cfg_3d(**overrides):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
     cfg.data.patch_size = [16, 64, 64]
@@ -124,13 +124,13 @@ def _cfg_3d(**overrides):
 
 
 def test_compute_strides_disabled_returns_none():
-    from segtask_v1.models.factory import compute_downsample_strides
+    from taskcore.models.factory import compute_downsample_strides
     cfg = _cfg_3d()
     assert compute_downsample_strides(cfg, 3, len(cfg.model.encoder_channels)) is None
 
 
 def test_compute_strides_auto():
-    from segtask_v1.models.factory import compute_downsample_strides
+    from taskcore.models.factory import compute_downsample_strides
     cfg = _cfg_3d(anisotropic_pooling=True)
     sched = compute_downsample_strides(cfg, 3, len(cfg.model.encoder_channels))
     assert sched is not None and len(sched) == 3
@@ -139,7 +139,7 @@ def test_compute_strides_auto():
 
 
 def test_compute_strides_explicit_overrides_auto():
-    from segtask_v1.models.factory import compute_downsample_strides
+    from taskcore.models.factory import compute_downsample_strides
     cfg = _cfg_3d(anisotropic_pooling=True,
                   downsample_strides=[[1, 2, 2], [1, 2, 2], [2, 2, 2]])
     sched = compute_downsample_strides(cfg, 3, len(cfg.model.encoder_channels))
@@ -150,7 +150,7 @@ def test_compute_strides_explicit_overrides_auto():
 # End-to-end build_model
 # ---------------------------------------------------------------------------
 def test_build_model_isotropic_default_z_halves():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _cfg_3d()  # 4 stages → 3 downsamples
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)
@@ -164,7 +164,7 @@ def test_build_model_isotropic_default_z_halves():
 
 
 def test_build_model_anisotropic_preserves_z_and_reconstructs():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _cfg_3d(anisotropic_pooling=True)
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)
@@ -178,7 +178,7 @@ def test_build_model_anisotropic_preserves_z_and_reconstructs():
 
 
 def test_build_model_explicit_strides_runs():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _cfg_3d(downsample_strides=[[1, 2, 2], [1, 2, 2], [2, 2, 2]])
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)
@@ -195,7 +195,7 @@ def test_build_model_explicit_strides_runs():
 # Guards + validation
 # ---------------------------------------------------------------------------
 def test_guard_anisotropic_rejects_unetpp():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _cfg_3d(anisotropic_pooling=True, decoder_type="unetpp",
                   upsample_mode="transpose")
     with pytest.raises(ValueError):
@@ -203,7 +203,7 @@ def test_guard_anisotropic_rejects_unetpp():
 
 
 def test_guard_anisotropic_rejects_blurpool():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _cfg_3d(downsample_strides=[[1, 2, 2], [1, 2, 2], [2, 2, 2]],
                   downsample_mode="blurpool")
     with pytest.raises(ValueError):
@@ -211,7 +211,7 @@ def test_guard_anisotropic_rejects_blurpool():
 
 
 def test_validate_rejects_bad_downsample_strides_length():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.encoder_channels = [16, 32, 64, 64]
     cfg.model.downsample_strides = [[1, 2, 2]]  # need 3 entries
@@ -221,7 +221,7 @@ def test_validate_rejects_bad_downsample_strides_length():
 
 
 def test_validate_rejects_bad_stride_value():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.encoder_channels = [16, 32, 64, 64]
     cfg.model.downsample_strides = [[1, 2, 2], [1, 2, 2], [3, 2, 2]]  # 3 invalid

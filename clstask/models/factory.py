@@ -18,9 +18,9 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from segtask_v1.config import Config as SegConfig
-from segtask_v1.models.factory import build_model as build_seg_model
-from segtask_v1.trainer.checkpoint import (
+from taskcore.config.core import Config as SegConfig
+from taskcore.models.factory import build_model as build_seg_model
+from taskcore.engine.checkpoint import (
     extract_model_state_dict,
     strip_common_prefixes,
 )

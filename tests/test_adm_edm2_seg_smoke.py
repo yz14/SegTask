@@ -47,7 +47,7 @@ def _make_cfg(arch: str,
     Config + sync(). validate() is also called to exercise the relaxed
     arch != 'unet' branch.
     """
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     # Data — minimal dummy paths (not loaded).
@@ -135,7 +135,7 @@ def _run_arch(arch: str, *, ds: bool, aux: bool, keep_native_view_depth: bool,
                     keep_native_view_depth=keep_native_view_depth,
                     stem_fusion_mode=stem_fusion_mode,
                     adm_linear_attention_levels=adm_linear_attention_levels)
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
 
     model = build_model(cfg)
     pc = model.param_count()
@@ -269,7 +269,7 @@ def main() -> int:
         try:
             cfg = _make_cfg(arch, n_views=1, aux=False, keep_native_view_depth=False,
                             stem_fusion_mode="multi_stem_proj")
-            from segtask_v1.models.factory import build_model
+            from taskcore.models.factory import build_model
             model = build_model(cfg)
             x, _, _, _ = _make_input(cfg)
             model.eval()

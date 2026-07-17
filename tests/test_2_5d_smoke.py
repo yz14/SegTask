@@ -35,7 +35,7 @@ def _ok(name: str, msg: str = "") -> None:
 # Config tests
 # ---------------------------------------------------------------------------
 def test_config_2_5d_sync():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.patch_mode = "2_5d"
     cfg.data.patch_size = [12, 32, 32]
@@ -52,7 +52,7 @@ def test_config_2_5d_sync():
 
 def test_config_2_5d_multi_fov_sync():
     """2.5D multi-FOV: sync should set in_channels = D * n_views, validate should pass."""
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.patch_mode = "2_5d"
     cfg.data.patch_size = [12, 32, 32]
@@ -70,7 +70,7 @@ def test_config_2_5d_multi_fov_sync():
 
 def test_config_2_5d_rejects_view0_not_1x():
     """View 0 must be the 1× FOV (true geometry); validate should reject."""
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.patch_mode = "2_5d"
     cfg.data.patch_size = [12, 32, 32]
@@ -175,7 +175,7 @@ def test_slice_channel_loss_invalid_shapes():
 # Factory test for 2.5D
 # ---------------------------------------------------------------------------
 def _build_2_5d_cfg(D: int = 12, num_fg: int = 2, encoder=(16, 32, 64)):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.image_dir = ""   # not used for factory test
     cfg.data.label_dir = ""
@@ -190,7 +190,7 @@ def _build_2_5d_cfg(D: int = 12, num_fg: int = 2, encoder=(16, 32, 64)):
 
 
 def test_factory_2_5d_out_channels():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     D, num_fg = 12, 2
     cfg = _build_2_5d_cfg(D=D, num_fg=num_fg)
     model = build_model(cfg).eval()
@@ -213,9 +213,9 @@ def test_factory_2_5d_multi_fov_multi_stem_proj():
       - Strictly more parameters than the `shared_stem` baseline (sanity:
         per-view stems are independent weight banks).
     """
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
-    from segtask_v1.models.stem import MultiStemProj
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
+    from taskcore.models.stem import MultiStemProj
 
     D, num_fg = 8, 2
     encoder = (16, 32, 64)
@@ -283,9 +283,9 @@ def test_factory_2_5d_multi_fov_hierarchical():
       - Validate rejects n_views > n_stages.
       - Validate rejects H/W not divisible by deepest aux stride.
     """
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
-    from segtask_v1.models.stem import HierarchicalStems
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
+    from taskcore.models.stem import HierarchicalStems
 
     D, num_fg = 8, 2
     n_views = 3
@@ -368,9 +368,9 @@ def test_factory_2_5d_multi_fov_hierarchical():
 
 def test_factory_2_5d_multi_fov_shared_stem():
     """Multi-FOV with `shared_stem` fusion = single stem on n_views*D channels."""
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
-    from segtask_v1.models.stem import MultiStemProj
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
+    from taskcore.models.stem import MultiStemProj
 
     D, num_fg = 8, 2
     cfg = Config()
@@ -433,9 +433,9 @@ def _make_synthetic_dataset(out_dir: Path, n_volumes: int = 4,
 
 
 def test_end_to_end_2_5d_one_step():
-    from segtask_v1.config import Config
-    from segtask_v1.data.loader import build_dataloaders
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.data.loader import build_dataloaders
+    from taskcore.models.factory import build_model
     from segtask_v1.trainer import Trainer
 
     with tempfile.TemporaryDirectory() as td:
@@ -508,8 +508,8 @@ def test_predictor_2_5d_inference():
     matches the source volume's spatial shape, and probabilities are
     rank-4 ``(num_fg, D, H, W)``.
     """
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.predictor import Predictor
 
     with tempfile.TemporaryDirectory() as td:
@@ -564,9 +564,9 @@ def test_end_to_end_2_5d_multi_fov_one_step():
       - SliceChannelLoss receives (B, num_fg*D, H, W) head output and view-0 label.
       - predictor.forwards.reshape_2_5d_input reproduces the same layout at inference.
     """
-    from segtask_v1.config import Config
-    from segtask_v1.data.loader import build_dataloaders
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.data.loader import build_dataloaders
+    from taskcore.models.factory import build_model
     from segtask_v1.predictor import Predictor
     from segtask_v1.trainer import Trainer
 
@@ -651,10 +651,10 @@ def test_end_to_end_2_5d_hierarchical_one_step():
     aux features inject correctly through one full training step + a
     full sliding-window predict.
     """
-    from segtask_v1.config import Config
-    from segtask_v1.data.loader import build_dataloaders
-    from segtask_v1.models.factory import build_model
-    from segtask_v1.models.stem import HierarchicalStems
+    from taskcore.config.core import Config
+    from taskcore.data.loader import build_dataloaders
+    from taskcore.models.factory import build_model
+    from taskcore.models.stem import HierarchicalStems
     from segtask_v1.predictor import Predictor
     from segtask_v1.trainer import Trainer
 
@@ -732,8 +732,8 @@ def test_end_to_end_2_5d_hierarchical_one_step():
 
 def test_predictor_2_5d_inference_tta():
     """R4: predict_volume with TTA on must produce same shape + valid range."""
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.predictor import Predictor
 
     with tempfile.TemporaryDirectory() as td:
@@ -773,8 +773,8 @@ def test_predictor_2_5d_inference_tta():
 
 
 def test_regression_3d_factory_still_works():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     cfg = Config()
     cfg.data.label_values = [0, 1, 2]
     cfg.data.num_classes = 3

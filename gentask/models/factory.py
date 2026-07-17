@@ -9,13 +9,13 @@ from typing import Callable, List
 import numpy as np
 
 from ..config import Config
-from .blocks import Downsample, Upsample
-from .convnext import ConvNeXtDownsample, ConvNeXtStage
-from .resnet import ResNetStage
-from .topology import ModelTopology, build_topology
-from .unet import Encoder, Decoder, UNet3D
-from .unet3p import UNet3PDecoder
-from .unetpp import UNetPPDecoder
+from taskcore.models.blocks import Downsample, Upsample
+from taskcore.models.convnext import ConvNeXtDownsample, ConvNeXtStage
+from taskcore.models.resnet import ResNetStage
+from taskcore.models.topology import ModelTopology, build_topology
+from taskcore.models.unet import Encoder, Decoder, UNet3D
+from taskcore.models.unet3p import UNet3PDecoder
+from taskcore.models.unetpp import UNetPPDecoder
 
 logger = logging.getLogger(__name__)
 
@@ -433,10 +433,10 @@ def build_backbone(cfg: Config):
     if arch in ("edsr", "rcan"):
         return _build_sisr_backbone(cfg)
     if arch == "adm":
-        from .adm_unet import build_adm_backbone
+        from taskcore.models.adm_unet import build_adm_backbone
         return build_adm_backbone(cfg)
     if arch == "edm2":
-        from .edm2_unet import build_edm2_backbone
+        from taskcore.models.edm2_unet import build_edm2_backbone
         return build_edm2_backbone(cfg)
     if arch != "unet":
         raise ValueError(

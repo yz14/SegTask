@@ -20,7 +20,7 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from .blocks import SqueezeExcite3D, get_activation, get_conv
+from taskcore.models.blocks import SqueezeExcite3D, get_activation, get_conv
 
 
 class AnisoPixelShuffle(nn.Module):

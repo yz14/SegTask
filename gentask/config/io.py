@@ -9,6 +9,8 @@ from typing import Any, Dict, Union
 
 import yaml
 
+from taskcore.config.core import MonitorConfig
+
 from .dataclasses import (
     AugConfig, ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
     TaskConfig, TrainConfig, _require,
@@ -28,6 +30,7 @@ _SUB_CONFIGS = {
     "predict": PredictConfig,
     "task": TaskConfig,
     "augment": AugConfig,
+    "monitor": MonitorConfig,
 }
 
 

@@ -65,13 +65,18 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 
 3 重构调研：由于cls/det/gen/ssl都是基于seg构建的，而且在设计上能和seg保持一致的都和seg保持一致了（可能还有不一致我未发现），能复用技巧也基本上都复用了（可能会有没有复用的我未发现）。现在我想将公用的内容抽离出来，形成一个通用的框架，然后在各个子项目中复用，如果有的模块实在做不到通用，那就例如把通用的当父类，具体的子项目当子类，继承父类的通用部分，然后重写具体的子项目部分。仍然还是大致以数据读取、模型构建、数据增强/处理、训练全流程(含val流程)、推理全流程5部分来。先认真的彻底分析和理解现有cls/det/gen/ssl/seg项目代码（需结合对应readme/design/workflow一起理解），再仔细的调研公认高质量项目的架构设计等等（不要局限医疗，可能自然图像，NLP，LLM，VLM有更好的项目），最后再出一个最终的方案（需要用简单易懂的大白话解释清楚）。  
 
-进展：已完成调研规划与实施。新建顶层公共包 `taskcore/`（config / data / models / engine / utils 五层），公共配置、数据层、公共模型（含 gen 侧漂移合并，逐位对拍一致）、训练/推理工程件全部下沉；五任务训练器接入共用基类 `BaseTrainer`，seg/gen/cls/det 推理器接入 `BasePredictor`（任务主循环保留在各自子类）。旧 import 路径经 shim 保留、行为不变；每步全量回归的失败集与重构前基线逐项一致（1330 过 / 23 个既有失败 / 3 跳过）。总览见根 README「公共包 taskcore」一节。  
+进展：已完成调研规划与实施。新建顶层公共包 `taskcore/`（config / data / models / engine / utils 五层），公共配置、数据层、公共模型（含 gen 侧漂移合并，逐位对拍一致）、训练/推理工程件全部下沉；五任务训练器接入共用基类 `BaseTrainer`，seg/gen/cls/det 推理器接入 `BasePredictor`（任务主循环保留在各自子类）。总览见根 README「公共包 taskcore」一节。  
 
 已全部下沉共享（五任务通用）：seed/EMA(warmup+offload)/SWA 工具、AMP(auto dtype)/GradScaler、优化器/调度器/warmup、checkpoint I/O（原子写、RNG 快照、前缀剥离、compile 解包、异步保存器）、分布式辅助、显存统计、CUDA 预取、GPUAugmentor、数据发现/npz 预打包、公共骨干与 topology、BaseTrainer/BasePredictor 工程件（channels_last、compile、best-tracking、梯度/权重范数与 update-ratio 健康度、accum 尾组处理、EMA 换入换出、推理 AMP/TTA 组合）。
 
-技巧已在公共层、但部分任务还没用上（用了的：seg/cls/det/ssl 都接了健康度指标；async checkpoint 只有 seg+ssl 在用；_ema_swapped/_effective_accum gen/det 还没接）——接入属于给这些任务「加功能」，会改变它们的行为/输出，需要单独立项。
+第二轮补齐（本轮）：  
+- 公共层新增：`taskcore/monitor`（仪表盘 + history 落盘 + 离线渲染 CLI，原 seg 独有，`segtask_v1.monitor` 保留为 shim）；BaseTrainer 新增 `_setup_ddp`（DDP 装配，self.model 保持裸/已 compile，前向走 fwd_model）、`_setup_train_sampler`（set_epoch 鸭子识别 sampler/batch_sampler）、`_setup_monitor/_monitor_log_epoch/_monitor_render/_monitor_finalize`（rank0 守卫、失败隔离）；`_setup_channels_last/_maybe_compile` 支持传入外部模块（供 SSL 的 method.module）。  
+- 全部接上：cls/det 接 channels_last + compile（compile-safe EMA 走 unwrap_compile）；cls/det/gen 接 DDP 装配 + 训练采样器 set_epoch + monitor 仪表盘（gen Config 新增 monitor 节）+ async saver rank0 守卫；ssl 改用共享 channels_last/compile/monitor/采样器识别 helper（保留手动梯度 all-reduce 语义）；seg 的 SWA/DDP/monitor/采样器识别改走 BaseTrainer 共用实现。  
+- 旧 import 全部更新：内部代码（含 tests）经 shim 的 import 全部切换 taskcore 直连（约 140 文件）；shim 仅保留给外部旧脚本与 legacy checkpoint pickle 兼容（tests/test_ssltask.py 的 shim 兼容用例保持旧路径）。  
+- 修复：MixedSampler `super().__init__(data_source=None)` 新版 torch 兼容（改无参）；taskcore 内残留 segtask_v1 文案/类型注解清理；factory 的 MultiRF decoder TODO 改为明确能力边界说明。  
+- 回归：全量 pytest 1341 过 / 12 失败 / 3 跳过；12 个失败（11 个 test_model_flow 可视化 + 1 个 save_best_criterion 映射）在重构前基线上逐项复现，均为既有问题（test_model_flow 与 todo4 相关，建议先查）。
 
-仍是 seg 独有、可考虑推广的：① 滑窗推理全家桶（blending/skip-empty-window/z-interleave/AdaBN/CPU 累加）在 segtask_v1/predictor，gen 有自己的一套滑窗，未合并（两者几何语义差异大，合并风险高）；② monitor 仪表盘 + history 落盘体系只有 seg 有；③ SWA、DDP 包装、resume/pretrain 加载策略各任务仍各自实现。
+仍留在任务层（语义差异，未强行合并）：滑窗推理全家桶（seg 与 gen 几何语义差异大）；SSL 的手动梯度 all-reduce（多 forward 入口无法套 DDP 单入口假设）；cls/det/gen 入口尚未提供多进程启动（DDP 装配已就绪，单卡路径零变化）。
 
 
 4 模型流可视化需要有层次化，结构化，美化，可以清晰看到计算流的走向，可以清晰理解模型架构，可以清晰的溯源。总之：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判、讨厌"自动布局默认输出"式的无设计感结果。以下是一些例子：  

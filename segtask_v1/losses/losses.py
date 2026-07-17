@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from ..config import LossConfig
+from taskcore.config.core import LossConfig
 
 logger = logging.getLogger(__name__)
 

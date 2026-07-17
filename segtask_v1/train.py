@@ -27,13 +27,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from .config import Config, load_config, save_config
-from .data.loader import build_dataloaders
-from .logging_utils import setup_logging as _setup_logging
-from .models.factory import build_model
+from taskcore.config.core import Config, load_config, save_config
+from taskcore.data.loader import build_dataloaders
+from taskcore.utils.logging_utils import setup_logging as _setup_logging
+from taskcore.models.factory import build_model
 from .trainer import Trainer
-from .trainer.dist_utils import get_rank, get_world_size, is_main_process
-from .utils import seed_everything
+from taskcore.engine.dist_utils import get_rank, get_world_size, is_main_process
+from taskcore.utils.common import seed_everything
 
 
 def setup_logging(output_dir: str, level: str = "INFO") -> None:

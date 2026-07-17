@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import torch
 
-from segtask_v1.config import Config, ConfigError
+from taskcore.config.core import Config, ConfigError
 from segtask_v1.predictor import blending as _blending
-from segtask_v1.trainer.prefetch import CudaPrefetcher
+from taskcore.engine.prefetch import CudaPrefetcher
 from segtask_v1.trainer.validation import MetricAccumulator
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ...models.topology import build_topology
+from taskcore.models.topology import build_topology
 from .base import GenViewPipeline
 from .native_d import NativeDPipeline
 from .stacked import StackedMultiResPipeline

@@ -27,10 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from segtask_v1.models.blocks import _CONV, INTERP_SMOOTH
-from segtask_v1.models.factory import build_model
-from segtask_v1.trainer.checkpoint import strip_common_prefixes
-from segtask_v1.utils import compute_dice_per_class
+from taskcore.models.blocks import _CONV, INTERP_SMOOTH
+from taskcore.models.factory import build_model
+from taskcore.engine.checkpoint import strip_common_prefixes
+from taskcore.utils.common import compute_dice_per_class
 
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
 from .metrics import hd95_batch

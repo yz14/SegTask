@@ -27,8 +27,8 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 
-from segtask_v1.config import Config as SegConfig
-from segtask_v1.data.dataset import load_npz_image, resize_3d
+from taskcore.config.core import Config as SegConfig
+from taskcore.data.dataset import load_npz_image, resize_3d
 from taskcore.engine.base_predictor import BasePredictor
 
 from ..config import DetConfig

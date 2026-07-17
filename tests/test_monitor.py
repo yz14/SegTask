@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import math
 
-from segtask_v1.monitor import (
+from taskcore.monitor import (
     EpochRecord,
     MetricsHistory,
     MetricsLogger,
@@ -16,7 +16,7 @@ from segtask_v1.monitor import (
     render_dashboard,
     write_dashboard,
 )
-from segtask_v1.monitor import charts
+from taskcore.monitor import charts
 
 
 def _val(epoch: int) -> dict:
@@ -473,7 +473,7 @@ def test_write_dashboard_atomic(tmp_path):
 # ===========================================================================
 # Trainer 实时集成（步骤 3）—— 需要 torch 才能导入 Trainer，缺失则跳过。
 # 不跑完整数据/模型管线：用 ``Trainer.__new__`` 构造最小实例，直接驱动新增的
-# monitor 钩子（_init_monitor / _monitor_log_epoch / _monitor_finalize），
+# monitor 钩子（_setup_monitor / _monitor_log_epoch / _monitor_finalize），
 # 验证落盘节奏、best/末轮强制重渲染、收尾静态渲染与续训不重复。
 # ===========================================================================
 import pytest  # noqa: E402
@@ -497,7 +497,7 @@ def _bare_trainer(cfg, output_dir):
 
 def _make_cfg_with_monitor(output_dir, *, update_every=2, epochs=5):
     pytest.importorskip("torch")
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.output_dir = str(output_dir)
@@ -514,7 +514,7 @@ def test_trainer_monitor_logs_and_renders_on_cadence(tmp_path):
     out.mkdir()
     cfg = _make_cfg_with_monitor(out, update_every=2, epochs=5)
     t = _bare_trainer(cfg, out)
-    t._init_monitor(resume_active=False)
+    t._setup_monitor(resume_active=False, num_classes=t.num_fg)
 
     assert t._monitor is not None  # 启用且初始化成功
     html = t._monitor_html
@@ -565,7 +565,7 @@ def test_trainer_monitor_disabled_is_zero_side_effect(tmp_path):
     t = _bare_trainer(cfg, out)
     # 模拟 __init__ 中的守卫：disabled ⇒ 不初始化。
     if cfg.monitor.enabled:
-        t._init_monitor(resume_active=False)
+        t._setup_monitor(resume_active=False, num_classes=t.num_fg)
 
     for epoch in range(3):
         t._monitor_log_epoch(
@@ -586,7 +586,7 @@ def test_trainer_monitor_resume_no_duplication(tmp_path):
 
     # 第一段：epoch 0..2。
     t1 = _bare_trainer(cfg, out)
-    t1._init_monitor(resume_active=False)
+    t1._setup_monitor(resume_active=False, num_classes=t1.num_fg)
     for epoch in range(3):
         t1._monitor_log_epoch(
             epoch, _train(epoch), _val(epoch), lr=1e-3,
@@ -597,7 +597,7 @@ def test_trainer_monitor_resume_no_duplication(tmp_path):
 
     # 第二段：以 resume 续训 epoch 3..5，不应重复已有 epoch。
     t2 = _bare_trainer(cfg, out)
-    t2._init_monitor(resume_active=True)
+    t2._setup_monitor(resume_active=True, num_classes=t2.num_fg)
     for epoch in range(3, 6):
         t2._monitor_log_epoch(
             epoch, _train(epoch), _val(epoch), lr=1e-3,
@@ -615,7 +615,7 @@ def test_trainer_monitor_resume_no_duplication(tmp_path):
 # CLI（步骤 4）：python -m segtask_v1.monitor —— 离线（重）渲染 + 多 run 对比。
 # 零外部依赖，可独立运行（不触碰 torch）。
 # ===========================================================================
-from segtask_v1.monitor.__main__ import main as monitor_cli  # noqa: E402
+from taskcore.monitor.__main__ import main as monitor_cli  # noqa: E402
 
 
 def _persist_run(tmp_path, name, *, scale=0.05, n=5):

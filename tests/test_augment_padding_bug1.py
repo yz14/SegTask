@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from segtask_v1.data.augment import _random_affine_elastic
+from taskcore.data.augment import _random_affine_elastic
 
 
 def _make_inputs(B=2, C_lbl=2, D=8, H=16, W=16, device="cpu"):

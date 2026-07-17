@@ -25,7 +25,7 @@ from typing import Any, List, Tuple, Union
 
 import yaml
 
-from segtask_v1.config import (
+from taskcore.config.core import (
     Config as SegConfig,
     ConfigError,
     _dataclass_from_dict,

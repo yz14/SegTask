@@ -28,7 +28,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from ..amp import compute_loss_fp32
+from taskcore.engine.amp import compute_loss_fp32
 
 
 @dataclass

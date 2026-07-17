@@ -20,7 +20,7 @@ import SimpleITK as sitk
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from segtask_v1.data.mixed_sampler import MixedBatchSampler  # noqa: E402
+from taskcore.data.mixed_sampler import MixedBatchSampler  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +108,10 @@ def test_trainer_recognizes_batch_sampler_set_epoch():
     """trainer 的采样器识别按 set_epoch 协议鸭子识别 batch_sampler。"""
     import inspect
 
-    from segtask_v1.trainer import trainer as trainer_mod
-    src = inspect.getsource(trainer_mod.Trainer.__init__)
+    from taskcore.engine.base_trainer import BaseTrainer
+
+    # 识别逻辑已下沉公共层：BaseTrainer._setup_train_sampler。
+    src = inspect.getsource(BaseTrainer._setup_train_sampler)
     assert "batch_sampler" in src and "set_epoch" in src
 
 
@@ -151,7 +153,7 @@ def _make_pair_dirs(root: Path, n: int = 2, label_geometry=None):
 
 
 def _make_cfg(image_dir: Path, label_dir: Path, npz_dir: Path):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.image_dir = str(image_dir)
     cfg.data.label_dir = str(label_dir)
@@ -164,7 +166,7 @@ def _make_cfg(image_dir: Path, label_dir: Path, npz_dir: Path):
 
 
 def test_manifest_records_resolved_target_spacing():
-    from segtask_v1.data.make_data import prepare_dataset
+    from taskcore.data.make_data import prepare_dataset
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         image_dir, label_dir = _make_pair_dirs(root)
@@ -182,7 +184,7 @@ def test_manifest_records_resolved_target_spacing():
 
 
 def test_manifest_target_spacing_none_when_normalization_off():
-    from segtask_v1.data.make_data import prepare_dataset
+    from taskcore.data.make_data import prepare_dataset
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         image_dir, label_dir = _make_pair_dirs(root)
@@ -218,7 +220,7 @@ def test_predictor_manifest_target_spacing_helper():
 # ---------------------------------------------------------------------------
 
 def test_geometry_check_passes_for_coregistered_pair():
-    from segtask_v1.data.make_data import _check_physical_geometry
+    from taskcore.data.make_data import _check_physical_geometry
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         image_dir, label_dir = _make_pair_dirs(root, n=1)
@@ -234,7 +236,7 @@ def test_geometry_check_passes_for_coregistered_pair():
      "direction"),
 ])
 def test_geometry_check_rejects_mismatch(geometry, field):
-    from segtask_v1.data.make_data import _check_physical_geometry
+    from taskcore.data.make_data import _check_physical_geometry
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         image_dir, label_dir = _make_pair_dirs(
@@ -246,7 +248,7 @@ def test_geometry_check_rejects_mismatch(geometry, field):
 
 
 def test_prepare_one_fails_fast_on_geometry_mismatch():
-    from segtask_v1.data.make_data import prepare_one
+    from taskcore.data.make_data import prepare_one
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         image_dir, label_dir = _make_pair_dirs(

@@ -21,7 +21,7 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from segtask_v1.models.blocks import INTERP_SMOOTH
+from taskcore.models.blocks import INTERP_SMOOTH
 
 
 def _sample_box(spatial: Sequence[int], scale_lo: float, scale_hi: float

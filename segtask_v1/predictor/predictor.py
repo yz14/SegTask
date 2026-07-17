@@ -17,12 +17,12 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 
-from ..config import Config
-from ..data.dataset import (
+from taskcore.config.core import Config
+from taskcore.data.dataset import (
     load_nifti, load_nifti_with_spacing, preprocess_image,
     compute_bbox_from_volume, read_nifti_spacing, resample_to_spacing,
     resize_3d)
-from ..models.topology import ModelTopology, build_topology
+from taskcore.models.topology import ModelTopology, build_topology
 from taskcore.engine.amp import resolve_auto_amp_dtype
 from taskcore.engine.base_predictor import BasePredictor
 from . import blending as _blending
@@ -143,7 +143,7 @@ class Predictor(BasePredictor):
         self.adabn_sample_ratio = float(pc.adabn_sample_ratio)
         self._adabn_bn_modules: List[torch.nn.Module] = []
         if self.adabn_enabled and self.adabn_mode == "per_volume":
-            from .adabn import collect_bn_modules
+            from taskcore.engine.bn_stats import collect_bn_modules
             self._adabn_bn_modules = collect_bn_modules(self.model)
             if not self._adabn_bn_modules:
                 logger.warning(

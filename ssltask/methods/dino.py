@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.trainer.dist_utils import (
+from taskcore.engine.dist_utils import (
     all_reduce_sum_, get_world_size, is_dist_avail_and_initialized)
 
 from ..data.multicrop import MultiCropGenerator
@@ -236,7 +236,7 @@ class DINOMethod(SSLMethod):
     # ---- export -----------------------------------------------------------
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:
         """导出 **教师** encoder（DINO 惯例：教师表征更稳），键命名为 ``encoder.*``。"""
-        from segtask_v1.trainer.checkpoint import unwrap_compile
+        from taskcore.engine.checkpoint import unwrap_compile
         teacher = unwrap_compile(self.module).teacher
         enc_sd = teacher.encoder.state_dict()
         return {f"encoder.{k}": v.detach().cpu().clone()

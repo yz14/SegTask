@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.config import Config as SegConfig
+from taskcore.config.core import Config as SegConfig
 
 from ..config import ClsConfig, resolve_num_classes
 

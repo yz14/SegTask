@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..config import LossConfig, ModelConfig
+from taskcore.config.core import LossConfig, ModelConfig
 from .losses import _soft_erode, _soft_skeletonize
 
 

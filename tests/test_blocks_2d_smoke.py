@@ -15,7 +15,7 @@ import sys
 
 import torch
 
-from segtask_v1.models.blocks import (
+from taskcore.models.blocks import (
     INTERP_SMOOTH,
     AttentionGate3D,
     BlurPool3d,
@@ -200,7 +200,7 @@ def test_get_conv_factory():
 # R2.2: backbone stages + stems
 # ---------------------------------------------------------------------------
 def test_resnet_stages():
-    from segtask_v1.models.resnet import ResNetStage
+    from taskcore.models.resnet import ResNetStage
     for d in (2, 3):
         for block_type in ("basic", "preact", "bottleneck"):
             m = ResNetStage(
@@ -216,7 +216,7 @@ def test_resnet_stages():
 
 
 def test_convnext_stages():
-    from segtask_v1.models.convnext import ConvNeXtStage
+    from taskcore.models.convnext import ConvNeXtStage
     for d in (2, 3):
         m = ConvNeXtStage(
             in_ch=4, out_ch=8, num_blocks=2,
@@ -230,7 +230,7 @@ def test_convnext_stages():
 
 
 def test_stem_builders():
-    from segtask_v1.models.stem import build_stem
+    from taskcore.models.stem import build_stem
     for d in (2, 3):
         for mode in ("conv3", "conv7", "dual", "patch2", "patch4"):
             stem, stride = build_stem(
@@ -253,7 +253,7 @@ def test_stem_builders():
 # ---------------------------------------------------------------------------
 def _build_test_cfg(spatial_dims: int, decoder_type: str = "unet",
                     backbone: str = "resnet"):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.label_values = [0, 1, 2]
     cfg.data.num_classes = 3
@@ -273,7 +273,7 @@ def _build_test_cfg(spatial_dims: int, decoder_type: str = "unet",
 
 def test_unet_factory_3d_default():
     """Backward-compat: original 3D path still produces correct shape."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=3, decoder_type="unet")
     model = build_model(cfg).eval()
     x = torch.randn(1, 1, *cfg.data.patch_size)
@@ -285,7 +285,7 @@ def test_unet_factory_3d_default():
 
 def test_unet_factory_2d_unet():
     """End-to-end 2D UNet: input rank 4, output rank 4."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unet")
     model = build_model(cfg).eval()
     # 2D model expects (B, C_in, H, W); for 2.5D, C_in == D slices.
@@ -300,7 +300,7 @@ def test_unet_factory_2d_unet():
 
 
 def test_unet_factory_2d_unetpp():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unetpp")
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 32, 32)
@@ -310,7 +310,7 @@ def test_unet_factory_2d_unetpp():
 
 
 def test_unet_factory_2d_unet3p():
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unet3p")
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 32, 32)
@@ -321,7 +321,7 @@ def test_unet_factory_2d_unet3p():
 
 def test_unet_factory_2d_convnext_with_attention():
     """ConvNeXt backbone + skip_attention + ECA in 2D, deep supervision on."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unet",
                           backbone="convnext")
     cfg.model.attention_type = "eca"
@@ -344,7 +344,7 @@ def test_unet_factory_2d_convnext_with_attention():
 
 def test_unet_factory_2d_patch_stem_resolution_restored():
     """patch2 stem: encoder runs at 1/2 res; main output must be restored."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _build_test_cfg(spatial_dims=2, decoder_type="unet")
     cfg.model.stem_mode = "patch2"
     cfg.validate()

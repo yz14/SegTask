@@ -18,8 +18,8 @@ import sys, os, traceback, copy
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from segtask_v1.config import load_config
-from segtask_v1.models.factory import build_model
+from taskcore.config.core import load_config
+from taskcore.models.factory import build_model
 from segtask_v1.losses.losses import (
     MultiResolutionLoss, DeepSupervisionLoss, build_loss)
 

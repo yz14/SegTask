@@ -23,11 +23,11 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from segtask_v1.config import Config  # noqa: E402
-from segtask_v1.models.blocks import (  # noqa: E402
+from taskcore.config.core import Config  # noqa: E402
+from taskcore.models.blocks import (  # noqa: E402
     ATTENTION_TYPES, LKA3D, MSCA3D, make_attention,
 )
-from segtask_v1.utils import ModelSWA  # noqa: E402
+from taskcore.utils.common import ModelSWA  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -165,9 +165,9 @@ def _make_synthetic_dataset(out_dir: Path, n_volumes: int = 4,
 
 
 def test_trainer_swa_end_to_end():
-    from segtask_v1.data.loader import build_dataloaders
-    from segtask_v1.data.make_data import prepare_dataset
-    from segtask_v1.models.factory import build_model
+    from taskcore.data.loader import build_dataloaders
+    from taskcore.data.make_data import prepare_dataset
+    from taskcore.models.factory import build_model
     from segtask_v1.trainer import Trainer
     from torch.nn.modules.batchnorm import _BatchNorm
 

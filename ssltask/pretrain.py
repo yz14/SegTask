@@ -20,11 +20,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from segtask_v1.logging_utils import setup_logging as _setup_logging
+from taskcore.utils.logging_utils import setup_logging as _setup_logging
 from segtask_v1.train import (
     _find_free_port, _install_parent_death_signal, _install_term_handlers,
     _maybe_enable_expandable_segments)
-from segtask_v1.utils import seed_everything
+from taskcore.utils.common import seed_everything
 
 from .config import apply_overrides, load_config, save_config, validate_ssl
 from .data.ssl_dataset import build_ssl_dataloader

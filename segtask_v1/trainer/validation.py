@@ -24,15 +24,15 @@ from typing import TYPE_CHECKING, Dict, Optional, Sequence, Union
 
 import torch
 
-from ..utils import (
+from taskcore.utils.common import (
     AverageMeter,
     derive_overlap_metrics,
     dice_batch_stats,
     harmonic_mean_metrics,
     surface_dice_batch_stats,
 )
-from .amp import autocast, compute_loss_fp32
-from .dist_utils import (
+from taskcore.engine.amp import autocast, compute_loss_fp32
+from taskcore.engine.dist_utils import (
     all_reduce_sum_,
     get_world_size,
     is_main_process,
@@ -460,7 +460,7 @@ class VolumeValEvaluator(ValEvaluator):
 
     @torch.no_grad()
     def evaluate(self, epoch: int) -> Dict[str, float]:
-        from ..data.dataset import (
+        from taskcore.data.dataset import (
             load_npz_image, load_npz_label, load_npz_z_spacing,
             preprocess_label)
 

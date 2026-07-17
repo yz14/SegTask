@@ -48,7 +48,7 @@ def _ok(name: str, msg: str = "") -> None:
 # ---------------------------------------------------------------------------
 def test_default_z_boundary_mode_is_edge_pad_and_stretch_auto_upgrades():
     """默认已改为 edge_pad；stretch 已废弃，sync() 自动升级并告警。"""
-    from segtask_v1.config import Config, DataConfig
+    from taskcore.config.core import Config, DataConfig
     assert DataConfig().z_boundary_mode == "edge_pad"
     cfg = Config()
     assert cfg.data.z_boundary_mode == "edge_pad"
@@ -63,7 +63,7 @@ def test_default_z_boundary_mode_is_edge_pad_and_stretch_auto_upgrades():
 
 
 def test_validate_rejects_invalid_z_boundary_mode():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2
@@ -126,7 +126,7 @@ def _write_seg_npz(path: Path, img: np.ndarray, lbl: np.ndarray) -> str:
 
 
 def test_segdataset_constructor_rejects_invalid():
-    from segtask_v1.data.dataset import SegDataset3D
+    from taskcore.data.dataset import SegDataset3D
     with tempfile.TemporaryDirectory() as td:
         img = np.zeros((4, 8, 8), dtype=np.float32)
         lbl = np.zeros((4, 8, 8), dtype=np.int16)
@@ -154,7 +154,7 @@ def test_dataset_dispatch_stretch_vs_edge_pad():
       → [vol[0]]*5 + vol[0:4] + [vol[3]]*3
       = [0,0,0,0,0, 0,10,20,30, 30,30,30] / 100（minmax 归一化后）。
     传 'stretch' 与 'edge_pad' 必须给出逐位一致的输出。"""
-    from segtask_v1.data.dataset import SegDataset3D
+    from taskcore.data.dataset import SegDataset3D
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -212,7 +212,7 @@ def _build_minimal_predictor(z_boundary_mode: str, D=12, H=8, W=8,
     the model. We never call the model in these helpers — only the
     geometry-handling methods are exercised."""
     import torch.nn as nn
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     from segtask_v1.predictor import Predictor
 
     cfg = Config()
@@ -290,7 +290,7 @@ def test_predictor_build_z_window_cpu_scale_1_edge_pad():
     the CPU branch we drive it with ``multi_res_scales=[1.0, 1.5]``.
     """
     import torch.nn as nn
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     from segtask_v1.predictor import Predictor
 
     cfg = Config()
@@ -348,8 +348,8 @@ def test_predict_volume_short_volume_both_modes():
     """End-to-end inference on a thin volume (D_orig=4 < pD=12). Both
     modes must complete and produce predictions matching the source
     spatial shape."""
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.predictor import Predictor
 
     for mode in ("stretch", "edge_pad"):
@@ -403,8 +403,8 @@ def test_predict_volume_long_volume_modes_equivalent():
     length=pD). In that regime both modes must produce identical
     predictions because the edge_pad branch never activates.
     """
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
     from segtask_v1.predictor import Predictor
 
     torch.manual_seed(0)

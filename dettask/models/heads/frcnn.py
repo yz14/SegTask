@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.models.blocks import _CONV
+from taskcore.models.blocks import _CONV
 
 from ...config import DetConfig
 from ...losses.det_loss import box_reg_loss

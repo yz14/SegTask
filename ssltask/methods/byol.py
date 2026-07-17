@@ -9,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.models.factory import build_model
-from segtask_v1.trainer.checkpoint import unwrap_compile
+from taskcore.models.factory import build_model
+from taskcore.engine.checkpoint import unwrap_compile
 
 from ..data.multicrop import MultiCropGenerator
 from ..models.dino_modules import DINOHead

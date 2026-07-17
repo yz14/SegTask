@@ -15,8 +15,8 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from segtask_v1.config import Config, ConfigError
-from segtask_v1.data.mixed_sampler import (
+from taskcore.config.core import Config, ConfigError
+from taskcore.data.mixed_sampler import (
     SOURCE_PRIMARY,
     SOURCE_SECONDARY,
     MixedBatchSampler,

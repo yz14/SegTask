@@ -38,7 +38,10 @@ from .checkpoint import (
     atomic_torch_save, extract_model_state_dict, restore_rng_state,
     strip_common_prefixes, unwrap_compile,
 )
-from .dist_utils import all_reduce_bn_running_stats_
+from .dist_utils import (
+    all_reduce_bn_running_stats_, get_rank, get_world_size,
+    is_dist_avail_and_initialized, is_main_process,
+)
 from .optim import WarmupScheduler, build_optimizer, build_scheduler
 
 logger = logging.getLogger(__name__)
@@ -65,8 +68,13 @@ class BaseTrainer:
     # ------------------------------------------------------------------
     # Construction helpers（子类 __init__ 按原有顺序显式调用）
     # ------------------------------------------------------------------
-    def _setup_channels_last(self) -> None:
-        """可选 channels_last 内存格式（数值等价；输入由 conv 自动适配）。"""
+    def _setup_channels_last(
+        self, module: "Optional[torch.nn.Module]" = None,
+    ) -> "Optional[torch.nn.Module]":
+        """可选 channels_last 内存格式（数值等价；输入由 conv 自动适配）。
+
+        默认作用于 ``self.model``；传入 ``module`` 时转换并返回该模块
+        （供训练对象不是 ``self.model`` 的任务，如 SSL 的 method.module）。"""
         tc = self.cfg.train
         self._memory_format = None
         if tc.channels_last:
@@ -74,7 +82,10 @@ class BaseTrainer:
                 torch.channels_last_3d
                 if int(self.cfg.model.spatial_dims) == 3
                 else torch.channels_last)
+            if module is not None:
+                return module.to(memory_format=self._memory_format)
             self.model = self.model.to(memory_format=self._memory_format)
+        return module
 
     def _setup_optim_sched(self) -> None:
         """Optimizer + warmup 调度器。
@@ -127,8 +138,13 @@ class BaseTrainer:
                              offload_device=(tc.ema_device or None))
                     if tc.use_ema else None)
 
-    def _maybe_compile(self) -> None:
-        """torch.compile（须最后调用：optimizer / EMA / checkpoint 绑裸参数）。"""
+    def _maybe_compile(
+        self, module: "Optional[torch.nn.Module]" = None,
+    ) -> "Optional[torch.nn.Module]":
+        """torch.compile（须最后调用：optimizer / EMA / checkpoint 绑裸参数）。
+
+        默认作用于 ``self.model``；传入 ``module`` 时编译并返回该模块
+        （供训练对象不是 ``self.model`` 的任务，如 SSL 的 method.module）。"""
         tc = self.cfg.train
         self._compile_enabled = False
         if tc.compile_mode != "none" and hasattr(torch, "compile"):
@@ -143,8 +159,11 @@ class BaseTrainer:
                         tc.compile_mode)
             if triton_ok:
                 logger.info("Compiling model with mode='%s'", tc.compile_mode)
-                self.model = torch.compile(self.model, mode=tc.compile_mode)
                 self._compile_enabled = True
+                if module is not None:
+                    return torch.compile(module, mode=tc.compile_mode)
+                self.model = torch.compile(self.model, mode=tc.compile_mode)
+        return module
 
     def _setup_output_dir(self) -> None:
         self.output_dir = Path(self.cfg.train.output_dir)
@@ -424,6 +443,192 @@ class BaseTrainer:
                 logger.info("SWA model saved: %s", path)
         finally:
             self.swa.restore(bare)
+
+    # ------------------------------------------------------------------
+    # DDP 装配与训练采样器识别（公共工程件）
+    # ------------------------------------------------------------------
+    def _setup_ddp(self) -> None:
+        """DDP（多卡）装配。
+
+        ``self.model`` 始终保持“裸 / 已 compile”模块：optimizer / EMA /
+        checkpoint / predictor 全部继续作用其上，参数张量与单卡完全一致
+        （DDP 不复制参数，仅挂反传 all-reduce 钩子）。前向走
+        ``self.fwd_model``（DDP 包装）；``world_size<=1`` 时 fwd_model 即裸
+        模块，单卡路径零变化。需在 ``_maybe_compile`` 之后调用。"""
+        tc = self.cfg.train
+        self._rank       = get_rank()
+        self._world_size = get_world_size()
+        self._is_main    = is_main_process()
+        self._is_dist    = (is_dist_avail_and_initialized()
+                            and self._world_size > 1)
+        if self._is_dist:
+            ddp_kwargs: Dict[str, object] = {}
+            if self.device.type == "cuda" and self.device.index is not None:
+                ddp_kwargs = {"device_ids": [self.device.index],
+                              "output_device": self.device.index}
+            self.fwd_model = torch.nn.parallel.DistributedDataParallel(
+                self.model,
+                find_unused_parameters=bool(tc.ddp_find_unused_parameters),
+                gradient_as_bucket_view=bool(tc.ddp_gradient_as_bucket_view),
+                static_graph=bool(tc.ddp_static_graph),
+                **ddp_kwargs)
+            if tc.ddp_static_graph and tc.ddp_find_unused_parameters:
+                logger.warning(
+                    "ddp_static_graph=True 与 ddp_find_unused_parameters=True "
+                    "同时开启：static_graph 首步后会接管 unused-parameter 处理，"
+                    "建议将 ddp_find_unused_parameters 设为 False 以免首步额外开销。")
+            logger.info(
+                "DDP enabled: rank=%d/%d, device=%s, "
+                "find_unused_parameters=%s, gradient_as_bucket_view=%s, "
+                "static_graph=%s. "
+                "Training grads all-reduce per backward. Note: math-equivalence "
+                "to single-GPU under grad-accum holds for per-sample separable "
+                "losses (BCE/Focal/per-sample Dice); batch-pooled ratio losses "
+                "(batch_dice/Tversky/GDL) pool over the per-rank micro-batch, "
+                "so their effective statistics window shrinks with accum/ranks "
+                "(approximate, not strictly equivalent).",
+                self._rank, self._world_size, self.device,
+                tc.ddp_find_unused_parameters,
+                tc.ddp_gradient_as_bucket_view,
+                tc.ddp_static_graph)
+        else:
+            self.fwd_model = self.model
+
+    def _setup_train_sampler(self) -> None:
+        """训练采样器识别（每 epoch ``set_epoch`` 重洗）：单源 DDP 为
+        DistributedSampler（loader.sampler），双源混合为 MixedBatchSampler
+        （loader.batch_sampler）；均按 set_epoch 协议鸭子识别。"""
+        self._train_sampler = None
+        for _s in (getattr(self.train_loader, "sampler", None),
+                   getattr(self.train_loader, "batch_sampler", None)):
+            if _s is not None and callable(getattr(_s, "set_epoch", None)):
+                self._train_sampler = _s
+                break
+
+    # ------------------------------------------------------------------
+    # Training monitor（可选、异常隔离；见 taskcore.monitor）
+    # ------------------------------------------------------------------
+    def _setup_monitor(
+        self,
+        resume_active: bool,
+        *,
+        run_name_default: str = "run",
+        save_best_metric: "Optional[str]" = None,
+        save_best_mode: "Optional[str]" = None,
+        save_best_criterion: "Optional[str]" = None,
+        num_classes: int = 0,
+        config_meta: "Optional[Dict]" = None,
+    ) -> None:
+        """实例化 ``MetricsLogger``、确定 HTML 落点并解析健康监测开关。
+
+        由 ``cfg.monitor.enabled`` 守卫；落盘 / 渲染等副作用仅在 rank0 进行
+        （无分布式属性的任务视为 rank0）。任何失败仅告警，绝不影响训练。
+        ``save_best_metric``/``save_best_mode``/``save_best_criterion`` 缺省取
+        ``train.save_best_metric``/``train.save_best_mode``/``train.save_best_criterion``。"""
+        tc = self.cfg.train
+        self._monitor = None
+        self._monitor_html = None
+        self._monitor_cfg = getattr(self.cfg, "monitor", None)
+        mc = self._monitor_cfg
+        is_main = bool(getattr(self, "_is_main", True))
+        if mc is not None and mc.enabled and is_main:
+            try:
+                from ..monitor import MetricsLogger
+
+                root = Path(mc.output_dir) if mc.output_dir else self.output_dir
+                mon_dir = root / "monitor"
+                self._monitor_html = root / (mc.filename
+                                             or "training_monitor.html")
+                run_name = (mc.run_name or self.output_dir.name
+                            or run_name_default)
+                self._monitor = MetricsLogger(
+                    mon_dir,
+                    run_name=run_name,
+                    save_best_metric=(save_best_metric
+                                      if save_best_metric is not None
+                                      else tc.save_best_metric),
+                    save_best_mode=(save_best_mode
+                                    if save_best_mode is not None
+                                    else tc.save_best_mode),
+                    save_best_criterion=(save_best_criterion
+                                         if save_best_criterion is not None
+                                         else tc.save_best_criterion),
+                    num_classes=num_classes,
+                    total_epochs=tc.epochs,
+                    config_meta=dict(config_meta or {}),
+                    resume=resume_active,
+                )
+                logger.info(
+                    "Training monitor enabled → metrics: %s | dashboard: %s",
+                    mon_dir, self._monitor_html)
+            except Exception as e:  # 隔离：监测初始化失败绝不阻断训练
+                self._monitor = None
+                logger.warning(
+                    "Training monitor disabled (init failed): %s", e)
+        # 模型健康监测：仅当监测启用、配置开启且在 rank0 时采集（成本极低，
+        # 失败被隔离）。非有限步计数 / 梯度范数 / 裁剪比例 / 权重范数 / AMP 标度。
+        self._health_monitor = bool(
+            self._monitor is not None
+            and getattr(mc, "health_monitor", False))
+        self._health_grad_norm_when_no_clip = bool(
+            getattr(mc, "health_grad_norm_when_no_clip", True))
+        self._health_update_ratio = bool(
+            self._health_monitor
+            and getattr(mc, "health_update_ratio", False))
+
+    def _monitor_log_epoch(
+        self,
+        epoch: int,
+        train_metrics: Dict[str, float],
+        val_metrics: "Optional[Dict[str, float]]" = None,
+        *,
+        lr: float,
+        gpu_peak_mib,
+        wall_time_s: float,
+        is_best: bool,
+        last_epoch: bool,
+    ) -> None:
+        """落盘一个 epoch 并按 ``update_every`` 节奏重渲染 HTML（全程异常隔离）。"""
+        if self._monitor is None:
+            return
+        mc = self._monitor_cfg
+        try:
+            self._monitor.log_epoch(
+                epoch, train=train_metrics, val=val_metrics, lr=lr,
+                gpu_peak_mib=gpu_peak_mib, wall_time_s=wall_time_s,
+                is_best=is_best)
+        except Exception as e:
+            logger.warning(
+                "Training monitor: log_epoch failed at epoch %d: %s",
+                epoch + 1, e)
+            return
+        every = max(int(mc.update_every), 1)
+        if is_best or last_epoch or ((epoch + 1) % every == 0):
+            self._monitor_render(
+                auto_reload_seconds=int(mc.auto_reload_seconds))
+
+    def _monitor_render(self, *, auto_reload_seconds: int) -> None:
+        """从已落盘历史重渲染单 run 仪表盘 HTML（异常隔离）。"""
+        if self._monitor is None or self._monitor_html is None:
+            return
+        try:
+            from ..monitor import MetricsHistory, write_dashboard
+
+            hist = MetricsHistory.from_dir(self._monitor.dir)
+            write_dashboard(hist, self._monitor_html,
+                            auto_reload_seconds=auto_reload_seconds)
+        except Exception as e:
+            logger.warning("Training monitor: dashboard render failed: %s", e)
+
+    def _monitor_finalize(self, status: str) -> None:
+        """训练收尾：更新 run 状态并做一次静态（无自动刷新）终渲染。"""
+        if self._monitor is None:
+            return
+        try:
+            self._monitor.finalize(status)
+        except Exception as e:
+            logger.warning("Training monitor: finalize failed: %s", e)
+        self._monitor_render(auto_reload_seconds=0)
 
     def _collect_health_metrics(
         self,

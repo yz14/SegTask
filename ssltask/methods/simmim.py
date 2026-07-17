@@ -47,7 +47,7 @@ class SimMIMMethod(SSLMethod):
                       "mask_ratio": self.mask_ratio}
 
     def export_backbone_state_dict(self) -> Dict[str, torch.Tensor]:
-        from segtask_v1.trainer.checkpoint import unwrap_compile
+        from taskcore.engine.checkpoint import unwrap_compile
         sd = unwrap_compile(self.module).state_dict()
         return {k: v.detach().cpu().clone() for k, v in sd.items()}
 

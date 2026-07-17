@@ -8,7 +8,7 @@ from typing import Callable, List
 import numpy as np
 import torch.nn as nn
 
-from segtask_v1.config import Config, resolve_selfattn_stage  # Step 3 下沉 taskcore.config 后改为相对引用
+from ..config.core import Config, resolve_selfattn_stage
 from .blocks import SelfAttentionBlock
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .mednext import MedNeXtStage
@@ -363,7 +363,8 @@ def build_model(cfg: Config):
     dec_mrf_mask: List[bool] = []
     if mc.multirf_enabled:
         enc_mrf_mask = [bool(int(v)) for v in mc.multirf_encoder_stages]
-        if mc.decoder_type == "unet":  # TODO 只有unet才支持吗？
+        # decoder 侧 MultiRF 仅 unet decoder 有 mask 通路；unetpp/unet3p 未接。
+        if mc.decoder_type == "unet":
             dec_mrf_mask = [bool(int(v)) for v in mc.multirf_decoder_stages]
 
     # SelfAttention 逐 stage 类型（默认空 = 全关，逐位兼容历史）。对齐顺序同 MultiRF；

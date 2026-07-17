@@ -562,7 +562,7 @@ def discover_npz_samples(
     if not paths:
         raise ValueError(
             f"No npz packages found under {d} (suffix={npz_suffix!r}). "
-            f"Did you run `python -m segtask_v1.data.make_data` first?")
+            f"Did you run `python -m taskcore.data.make_data` first?")
     logger.info("Discovered %d npz package(s) under %s.", len(paths), d)
     return [str(p) for p in paths]
 
@@ -586,13 +586,13 @@ def _resolve_npz_paths(
             raise FileNotFoundError(
                 f"Secondary npz dir {npz_dir!r} is empty/missing. The "
                 f"secondary (coarse) source must be pre-built offline: run "
-                f"`python -m segtask_v1.data.make_data --config <yaml> "
+                f"`python -m taskcore.data.make_data --config <yaml> "
                 f"--out {npz_dir}` against the coarse-label NIfTI set first.")
         if not bool(dc.npz_auto_build):
             raise FileNotFoundError(
                 f"data.npz_dir={npz_dir!r} is empty/missing and "
                 f"data.npz_auto_build is False. Run "
-                f"`python -m segtask_v1.data.make_data --config "
+                f"`python -m taskcore.data.make_data --config "
                 f"<yaml> --out {npz_dir}` first, or set "
                 f"data.npz_auto_build: true to build inline.")
         logger.info(
@@ -692,7 +692,7 @@ def build_dataloaders(
     if not npz_dir:
         raise ValueError(
             "data.npz_dir is required for training (npz-only data path). "
-            "(or should be created); see segtask_v1.data.make_data.")
+            "(or should be created); see taskcore.data.make_data.")
     npz_suffix = dc.npz_suffix
 
     logger.info(

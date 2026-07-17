@@ -15,9 +15,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.config import Config
+from taskcore.config.core import Config
 from segtask_v1.losses.losses import build_loss
-from segtask_v1.trainer.amp import compute_loss_fp32
+from taskcore.engine.amp import compute_loss_fp32
 from segtask_v1.trainer.pipelines import (
     Lift2_5DAuxPipeline, Lift2_5DPipeline,
     Patch3DNativeMultiResPipeline,

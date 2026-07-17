@@ -129,7 +129,7 @@ def test_backbones_forward():
     """四模板 × 双几何前向。"""
     from clstask.config import ClsConfig
     from clstask.models.factory import build_classifier
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     def _mk(spatial_dims, backbone, granularity, seg_backbone="resnet"):
         cfg = Config()

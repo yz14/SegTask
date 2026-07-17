@@ -19,9 +19,9 @@ from ..data.dataset import denormalize_image, load_nifti, preprocess_image
 from ..data.degradation import _interp_mode, _phase_aligned_linear_upsample
 from ..data.loader import match_condition_paths
 from ..models.generation import DiffusionModel
-from ..models.topology import build_topology
+from taskcore.models.topology import build_topology
 from taskcore.engine.base_predictor import BasePredictor
-from ..trainer.checkpoint import (
+from taskcore.engine.checkpoint import (
     _select_state_dict,
     _strip_compile_prefix,
     unwrap_compile,

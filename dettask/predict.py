@@ -14,7 +14,7 @@ import logging
 
 import torch
 
-from segtask_v1.logging_utils import setup_logging as _setup_logging
+from taskcore.utils.logging_utils import setup_logging as _setup_logging
 
 from clstask.data.loader import discover_npz
 

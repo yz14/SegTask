@@ -10,9 +10,9 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.models.factory import build_model
-from segtask_v1.trainer.checkpoint import unwrap_compile
-from segtask_v1.trainer.dist_utils import (
+from taskcore.models.factory import build_model
+from taskcore.engine.checkpoint import unwrap_compile
+from taskcore.engine.dist_utils import (
     get_world_size, is_dist_avail_and_initialized)
 
 from ..data.multicrop import MultiCropGenerator

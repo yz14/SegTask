@@ -25,12 +25,12 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from segtask_v1.config import Config
+from taskcore.config.core import Config
 from segtask_v1.losses.losses import build_loss
 from segtask_v1.losses.topo_aux import (
     AuxTopoLoss, morph_distance_target, soft_skeleton_target,
 )
-from segtask_v1.models.factory import build_model
+from taskcore.models.factory import build_model
 from segtask_v1.trainer.pipelines import build_pipeline
 
 

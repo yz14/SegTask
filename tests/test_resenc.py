@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from segtask_v1.models.resnet import (
+from taskcore.models.resnet import (
     BLOCK_TYPES,
     BottleneckBlock,
     PreActResNetBlock,
@@ -100,7 +100,7 @@ def test_stage_rejects_zero_blocks():
     ("XL", [1, 4, 6]),
 ])
 def test_preset_populates_encoder_blocks(preset, expected_first_three):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.encoder_channels = [32, 64, 128, 256, 320]
     cfg.model.resenc_preset = preset
@@ -115,7 +115,7 @@ def test_preset_populates_encoder_blocks(preset, expected_first_three):
 def test_preset_extends_deeper_than_template():
     """If user has more encoder levels than preset template length, extend
     by repeating the deepest count."""
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.encoder_channels = [16, 32, 64, 128, 256, 320, 320, 320, 320]
     cfg.model.resenc_preset = "M"
@@ -127,7 +127,7 @@ def test_preset_extends_deeper_than_template():
 
 
 def test_user_counts_override_preset():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.encoder_channels = [16, 32, 64]
     cfg.model.encoder_blocks_per_stage = [2, 2, 2]
@@ -143,7 +143,7 @@ def test_user_counts_override_preset():
 # End-to-end build with preset / block_type
 # ---------------------------------------------------------------------------
 def _make_test_cfg(**overrides):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
     cfg.data.patch_size = [8, 32, 32]
@@ -161,7 +161,7 @@ def _make_test_cfg(**overrides):
 
 @pytest.mark.parametrize("block_type", BLOCK_TYPES)
 def test_build_model_with_block_type(block_type):
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _make_test_cfg(block_type=block_type)
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 8, 32, 32)
@@ -172,7 +172,7 @@ def test_build_model_with_block_type(block_type):
 
 @pytest.mark.parametrize("preset", ["S", "M", "L", "XL"])
 def test_build_model_with_preset(preset):
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _make_test_cfg(resenc_preset=preset)
     model = build_model(cfg).train()
     x = torch.randn(1, cfg.model.in_channels, 8, 32, 32)
@@ -183,7 +183,7 @@ def test_build_model_with_preset(preset):
 
 def test_asymmetric_encoder_decoder_depth():
     """ResEnc hallmark: encoder much deeper than decoder."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _make_test_cfg(
         encoder_blocks_per_stage=[1, 4, 4],
         decoder_blocks_per_stage=[1, 1],
@@ -199,7 +199,7 @@ def test_asymmetric_encoder_decoder_depth():
 
 def test_preset_with_preact_and_unetpp():
     """ResEnc preset composes with pre-act blocks AND UNet++ decoder."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _make_test_cfg(
         resenc_preset="M",
         block_type="preact",
@@ -214,7 +214,7 @@ def test_preset_with_preact_and_unetpp():
 
 def test_convnext_respects_per_stage_counts():
     """ConvNeXt backbone also honours per-stage counts."""
-    from segtask_v1.models.factory import build_model
+    from taskcore.models.factory import build_model
     cfg = _make_test_cfg(
         backbone="convnext",
         encoder_blocks_per_stage=[1, 2, 3],
@@ -232,21 +232,21 @@ def test_convnext_respects_per_stage_counts():
 # ---------------------------------------------------------------------------
 class TestConfigValidation:
     def test_rejects_bad_block_type(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.block_type = "bogus"
         with pytest.raises(AssertionError):
             cfg.validate()
 
     def test_rejects_bad_preset(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.resenc_preset = "ludicrous"
         with pytest.raises(AssertionError):
             cfg.validate()
 
     def test_rejects_mismatched_encoder_list(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.encoder_channels = [16, 32, 64]
         cfg.model.encoder_blocks_per_stage = [1, 2]  # wrong length
@@ -254,7 +254,7 @@ class TestConfigValidation:
             cfg.validate()
 
     def test_rejects_mismatched_decoder_list(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.encoder_channels = [16, 32, 64]
         cfg.model.decoder_blocks_per_stage = [1]  # should be 2
@@ -262,7 +262,7 @@ class TestConfigValidation:
             cfg.validate()
 
     def test_rejects_zero_blocks_in_list(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.encoder_channels = [16, 32, 64]
         cfg.model.encoder_blocks_per_stage = [1, 0, 2]

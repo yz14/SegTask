@@ -22,9 +22,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from segtask_v1.config import Config
-from segtask_v1.models.factory import build_model
-from segtask_v1.models.mednext import (
+from taskcore.config.core import Config
+from taskcore.models.factory import build_model
+from taskcore.models.mednext import (
     MedNeXtAdaptBlock,
     MedNeXtBlock,
     MedNeXtStage,

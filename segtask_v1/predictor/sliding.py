@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from ..data.dataset import resize_3d
+from taskcore.data.dataset import resize_3d
 from . import blending as _blending
 from . import forwards as _forwards
 from . import inputs as _inputs

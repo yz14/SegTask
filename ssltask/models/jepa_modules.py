@@ -17,8 +17,8 @@ import logging
 import torch
 import torch.nn as nn
 
-from segtask_v1.models.blocks import _CONV, ConvNormAct
-from segtask_v1.models.factory import build_model
+from taskcore.models.blocks import _CONV, ConvNormAct
+from taskcore.models.factory import build_model
 
 logger = logging.getLogger(__name__)
 

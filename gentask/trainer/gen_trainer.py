@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 from typing import Dict, Optional
 
 import numpy as np
@@ -30,12 +31,12 @@ from ..data.augment import GPUAugmentor
 from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
 from ..models.generation import DiffusionModel
 from ..utils import AverageMeter
-from .checkpoint import (
+from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
     state_to_cpu, unwrap_compile,
 )
 from .pipelines import build_pipeline
-from .prefetch import CudaPrefetcher
+from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.base_trainer import BaseTrainer
 
 logger = logging.getLogger(__name__)
@@ -87,11 +88,16 @@ class GenerationTrainer(BaseTrainer):
         # --- torch.compile（最后：optimizer / EMA 已绑裸参数）----------
         self._maybe_compile()
 
+        # --- DDP 装配与训练采样器识别（公用工程件，见 BaseTrainer）-------
+        # 单卡时 fwd_model 即裸模块，路径零变化；多卡时前向走 DDP 包装。
+        self._setup_ddp()
+        self._setup_train_sampler()
+
         self._setup_output_dir()
         # save_async=True 时权重先深拷到 CPU，后台线程 torch.save，主循环
         # 不再被写盘阻塞；fit 收尾 wait+close 保证全部落盘（同 seg）。
         self._ckpt_saver = (AsyncCheckpointSaver()
-                            if tc.save_async else None)
+                            if tc.save_async and self._is_main else None)
         # 选模指标：PSNR 越大越好；启用整卷验证时改用整卷 PSNR（M13）。
         self._setup_best_tracking(mode="max")
         # SWA 尾段权重平均（opt-in，公用工程件，见 BaseTrainer）。
@@ -99,6 +105,23 @@ class GenerationTrainer(BaseTrainer):
         self.val_full_volume = bool(tc.val_full_volume)
         self._vol_predictor = None
         self.history: list = []
+
+        # --- 训练监测仪表盘（公用工程件，见 BaseTrainer / taskcore.monitor；
+        #     cfg.monitor 守卫，失败隔离不阻断训练）-----------------------
+        # 选模指标口径同 fit：PSNR 越大越好（整卷验证时 fit 内改用 vol_psnr，
+        # is_best 标记以实际选模为准）。
+        self._setup_monitor(
+            resume_active=bool(tc.resume) and os.path.isfile(str(tc.resume)),
+            run_name_default="gen_run",
+            save_best_metric="psnr",
+            save_best_mode="max",
+            save_best_criterion="",
+            num_classes=0,
+            config_meta={
+                "algorithm": cfg.task.algorithm,
+                "loss": cfg.loss.name,
+                "batch_size": cfg.data.batch_size,
+            })
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -215,6 +238,8 @@ class GenerationTrainer(BaseTrainer):
         return total
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        if self._train_sampler is not None:
+            self._train_sampler.set_epoch(epoch)   # 多卡重洗（单卡 no-op）
         self.model.train()
         loss_meter = AverageMeter()
         bd_meters: Dict[str, AverageMeter] = {}
@@ -245,7 +270,7 @@ class GenerationTrainer(BaseTrainer):
                 hr, weight_map, cond)
             with torch.autocast(device_type=self.device.type,
                                 enabled=self.use_amp, dtype=self.amp_dtype):
-                out = self.model(hr, cond=cond)
+                out = self.fwd_model(hr, cond=cond)
             bd: Dict[str, float] = {}
             loss = self._step_loss(out, bd, weight_map=weight_map)
             loss_val = float(loss.item())
@@ -562,10 +587,14 @@ class GenerationTrainer(BaseTrainer):
         val_every = max(int(tc.val_every), 1)
         save_every = max(int(tc.save_every), 1)
         last: Dict[str, float] = {}
+        final_status = "completed"
         for epoch in range(start_epoch, tc.epochs):
+            epoch_t0 = time.time()
             tr = self._train_epoch(epoch)
             is_last = (epoch + 1) == tc.epochs
             do_val = ((epoch + 1) % val_every == 0) or is_last
+            is_best = False
+            val: "Dict[str, float] | None" = None
             if do_val:
                 val = self._validate(epoch)
                 # 启用整卷验证时，退火/选模以整卷 PSNR 为准（与部署一致）。
@@ -580,6 +609,7 @@ class GenerationTrainer(BaseTrainer):
                         "  full-volume: PSNR=%.3f (LR=%.3f) SSIM=%.4f",
                         val["vol_psnr"], val["vol_psnr_lr"], val["vol_ssim"])
                 if select > self.best_metric:
+                    is_best = True
                     self.best_metric = select
                     self.best_epoch = epoch
                     self._save_best(epoch)
@@ -593,6 +623,16 @@ class GenerationTrainer(BaseTrainer):
                 {"epoch": epoch + 1, "lr": self.scheduler.get_lr(), **last})
             self._swa_update(epoch)
             self._save_history()
+            gpu_peak_mib = None
+            if self.device.type == "cuda":
+                gpu_peak_mib = (torch.cuda.max_memory_allocated(self.device)
+                                / (1 << 20))
+                torch.cuda.reset_peak_memory_stats(self.device)
+            self._monitor_log_epoch(
+                epoch, tr, val,
+                lr=self.scheduler.get_lr(), gpu_peak_mib=gpu_peak_mib,
+                wall_time_s=time.time() - epoch_t0, is_best=is_best,
+                last_epoch=is_last)
             if ((epoch + 1) % save_every == 0) or is_last:
                 self._save_checkpoint(epoch)
             # 早停：连续 early_stopping 个 epoch 无提升即止（按 epoch 计）。
@@ -603,6 +643,7 @@ class GenerationTrainer(BaseTrainer):
                     "epochs; best @ epoch %d).",
                     epoch + 1, epoch - self.best_epoch, self.best_epoch + 1)
                 self._save_checkpoint(epoch)
+                final_status = "early_stopped"
                 break
         try:
             self._finalize_swa(
@@ -611,6 +652,7 @@ class GenerationTrainer(BaseTrainer):
         except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
             logger.exception("SWA finalization failed; online/best "
                              "checkpoints are unaffected.")
+        self._monitor_finalize(final_status)
         if self._ckpt_saver is not None:
             # 收尾前排空异步写盘队列；写盘异常在此抛出。
             self._ckpt_saver.close()

@@ -12,8 +12,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from ..config import Config
-from ..models.mednext import reparameterize_model
+from taskcore.config.core import Config
+from taskcore.models.mednext import reparameterize_model
 from .predictor import Predictor
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ def run_inference(
         raise ValueError(
             f"bbox_paths length {len(bbox_paths)} != image_paths "
             f"length {len(image_paths)}")
-    from ..models.factory import build_model
+    from taskcore.models.factory import build_model
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -188,7 +188,7 @@ def run_inference(
     # stats，全程复用。per_volume 模式不在此处理（见 Predictor.predict_volume）。
     if cfg.predict.adabn_enabled and \
             cfg.predict.adabn_mode == "global":
-        from .adabn import collect_bn_modules, estimate_bn_stats
+        from taskcore.engine.bn_stats import collect_bn_modules, estimate_bn_stats
 
         bn_modules = collect_bn_modules(model)
         if not bn_modules:

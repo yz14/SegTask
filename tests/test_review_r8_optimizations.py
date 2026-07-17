@@ -17,8 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from segtask_v1.config import Config
-from segtask_v1.data.dataset import (
+from taskcore.config.core import Config
+from taskcore.data.dataset import (
     _open_npy_member_mmap,
     load_npz_image,
     load_npz_label,

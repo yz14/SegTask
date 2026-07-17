@@ -16,8 +16,8 @@ from pathlib import Path
 
 import torch
 
-from segtask_v1.logging_utils import setup_logging as _setup_logging
-from segtask_v1.utils import seed_everything
+from taskcore.utils.logging_utils import setup_logging as _setup_logging
+from taskcore.utils.common import seed_everything
 
 from .config import apply_overrides, load_config, save_config, validate_det
 from .data.loader import build_det_dataloaders

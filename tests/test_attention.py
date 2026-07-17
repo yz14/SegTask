@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from segtask_v1.models.blocks import (
+from taskcore.models.blocks import (
     ATTENTION_TYPES,
     AttentionGate3D,
     CBAM3D,
@@ -121,7 +121,7 @@ class TestAttentionGate:
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("attn", ATTENTION_TYPES)
 def test_resnet_stage_with_attention(attn):
-    from segtask_v1.models.resnet import ResNetStage
+    from taskcore.models.resnet import ResNetStage
     stage = ResNetStage(4, 8, num_blocks=2, attention_type=attn)
     x = torch.randn(1, 4, 4, 8, 8, requires_grad=True)
     y = stage(x)
@@ -131,7 +131,7 @@ def test_resnet_stage_with_attention(attn):
 
 @pytest.mark.parametrize("attn", ATTENTION_TYPES)
 def test_convnext_stage_with_attention(attn):
-    from segtask_v1.models.convnext import ConvNeXtStage
+    from taskcore.models.convnext import ConvNeXtStage
     stage = ConvNeXtStage(4, 8, num_blocks=2, attention_type=attn)
     x = torch.randn(1, 4, 4, 8, 8, requires_grad=True)
     y = stage(x)
@@ -140,13 +140,13 @@ def test_convnext_stage_with_attention(attn):
 
 
 def test_attention_type_se_enables_se():
-    from segtask_v1.models.resnet import ResNetBlock
+    from taskcore.models.resnet import ResNetBlock
     blk = ResNetBlock(8, 8, attention_type="se")
     assert isinstance(blk.attn, SqueezeExcite3D)
 
 
 def test_explicit_attention_type_chooses_requested_attention():
-    from segtask_v1.models.resnet import ResNetBlock
+    from taskcore.models.resnet import ResNetBlock
     blk = ResNetBlock(8, 8, attention_type="eca")
     assert isinstance(blk.attn, ECA3D)
 
@@ -156,8 +156,8 @@ def test_explicit_attention_type_chooses_requested_attention():
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("attn", ["none", "se", "eca", "cbam", "coord"])
 def test_unet_forward_with_attention(attn):
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -180,8 +180,8 @@ def test_unet_forward_with_attention(attn):
 
 
 def test_unet_convnext_skip_attention():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -207,7 +207,7 @@ def test_unet_convnext_skip_attention():
 # Config validation
 # ---------------------------------------------------------------------------
 def test_config_rejects_bad_attention_type():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.attention_type = "not_a_thing"
     with pytest.raises(AssertionError):

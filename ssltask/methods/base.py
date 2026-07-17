@@ -21,7 +21,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.trainer.dist_utils import (
+from taskcore.engine.dist_utils import (
     get_rank, get_world_size, is_dist_avail_and_initialized)
 
 #: 重建/回归损失函数表（与 ``SSLConfig.recon_loss`` 取值对应）。

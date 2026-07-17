@@ -15,7 +15,7 @@ WarmupScheduler`` 仍然可用。
 
 from __future__ import annotations
 
-from .optim import build_optimizer, build_scheduler, WarmupScheduler
+from taskcore.engine.optim import build_optimizer, build_scheduler, WarmupScheduler
 from .trainer import Trainer
 
 __all__ = [

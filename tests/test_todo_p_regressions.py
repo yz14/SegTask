@@ -24,7 +24,7 @@ def _write_npz(
 
 
 def test_keep_last_k_checkpoint_pruning_preserves_best_and_can_disable():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     from segtask_v1.trainer import Trainer
 
     with tempfile.TemporaryDirectory() as td:
@@ -60,7 +60,7 @@ def test_keep_last_k_checkpoint_pruning_preserves_best_and_can_disable():
 
 
 def test_affine_aspect_correct_preserves_integer_voxel_mapping():
-    from segtask_v1.data.augment import _build_rotation_matrices
+    from taskcore.data.augment import _build_rotation_matrices
 
     d, h, w = 2, 4, 6
     image = torch.empty(1, 1, d, h, w, dtype=torch.float32)
@@ -105,7 +105,7 @@ def test_affine_aspect_correct_preserves_integer_voxel_mapping():
 
 
 def test_scheduler_horizon_respects_optimizer_step_accumulation():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     from segtask_v1.trainer import build_scheduler
 
     cfg = Config()
@@ -183,7 +183,7 @@ def test_ddp_no_sync_guard_only_triggers_on_nonboundary_microsteps():
 
 
 def test_val_patch_sampling_is_deterministic_for_same_sample_index():
-    from segtask_v1.data.dataset import SegDataset3D
+    from taskcore.data.dataset import SegDataset3D
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

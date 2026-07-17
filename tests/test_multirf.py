@@ -13,9 +13,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.config import Config, ConfigError
-from segtask_v1.models.factory import build_model
-from segtask_v1.models.resnet import MultiRFBlock, MultiRFStage
+from taskcore.config.core import Config, ConfigError
+from taskcore.models.factory import build_model
+from taskcore.models.resnet import MultiRFBlock, MultiRFStage
 
 
 def _nparams(m) -> int:

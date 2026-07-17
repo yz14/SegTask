@@ -52,7 +52,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from segtask_v1.data.dataset import (
+from taskcore.data.dataset import (
     VolumeCache,
     _group_fg_coords_by_class,
     _group_fg_slices_by_class,

@@ -187,8 +187,8 @@ def test_seg_backbone_unchanged():
 
 
 def test_diffusion_backbone_forward_backward():
-    from gentask.models.adm_unet import build_adm_diffusion_unet
-    from gentask.models.edm2_unet import build_edm2_diffusion_unet
+    from taskcore.models.adm_unet import build_adm_diffusion_unet
+    from taskcore.models.edm2_unet import build_edm2_diffusion_unet
 
     for arch, builder in (("adm", build_adm_diffusion_unet),
                           ("edm2", build_edm2_diffusion_unet)):

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from ..config import Config
-from ..models.topology import ModelTopology, build_topology
+from taskcore.config.core import Config
+from taskcore.models.topology import ModelTopology, build_topology
 from .graph import VisGraph, shape_str
 
 

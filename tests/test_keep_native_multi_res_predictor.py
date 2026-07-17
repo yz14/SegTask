@@ -40,11 +40,11 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from segtask_v1.config import (  # noqa: E402
+from taskcore.config.core import (  # noqa: E402
     Config, DataConfig, ModelConfig, LossConfig, TrainConfig, AugConfig,
     PredictConfig,
 )
-from segtask_v1.data.dataset import (  # noqa: E402
+from taskcore.data.dataset import (  # noqa: E402
     extract_z_patch_padded, _extract_cubic_patch,
 )
 from segtask_v1.predictor import Predictor  # noqa: E402

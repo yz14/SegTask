@@ -22,19 +22,18 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DistributedSampler
 
-from segtask_v1.data.augment import GPUAugmentor
-from segtask_v1.trainer.amp import autocast
-from segtask_v1.trainer.checkpoint import (
+from taskcore.data.augment import GPUAugmentor
+from taskcore.engine.amp import autocast
+from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, relocate_optimizer_state, restore_rng_state,
     state_to_cpu, unwrap_compile)
-from segtask_v1.trainer.dist_utils import (
+from taskcore.engine.dist_utils import (
     all_reduce_flag_any, get_rank, get_world_size,
     is_dist_avail_and_initialized, is_main_process)
-from segtask_v1.trainer.optim import (
+from taskcore.engine.optim import (
     WarmupScheduler, build_optimizer, build_scheduler)
-from segtask_v1.utils import AverageMeter, Timer
+from taskcore.utils.common import AverageMeter, Timer
 from taskcore.engine.base_trainer import BaseTrainer, _reseed_rank_rng
 
 from ..methods.base import SSLMethod
@@ -73,9 +72,9 @@ class SSLTrainer(BaseTrainer):
                 "SSL DDP enabled: rank=%d/%d (manual grad all-reduce at "
                 "accumulation boundaries; params/buffers broadcast from "
                 "rank0).", self._rank, self._world_size)
-        _sampler = getattr(train_loader, "sampler", None)
-        self._train_sampler = (
-            _sampler if isinstance(_sampler, DistributedSampler) else None)
+        # 训练采样器识别（共用工程件，见 BaseTrainer；按 set_epoch 协议鸭子
+        # 识别 sampler / batch_sampler）。
+        self._setup_train_sampler()
 
         # --- Optimizer + scheduler (复用 segtask train.*) ---
         # 关键：scheduler / warmup 只在“梯度累积边界”(= 一次 optimizer.step)推进，
@@ -106,17 +105,9 @@ class SSLTrainer(BaseTrainer):
         # --- AMP（共用工程件，见 BaseTrainer）---
         self._setup_amp()
 
-        # --- channels_last 内存格式（同母项目 TrainConfig.channels_last）-----
+        # --- channels_last 内存格式（共用工程件，见 BaseTrainer）-----------
         # 数值等价；Ampere+ 上 3D conv 可能提速。模型与 batch 同时转排布。
-        self._memory_format = None
-        if tc.channels_last:
-            self._memory_format = (
-                torch.channels_last_3d
-                if int(cfg.model.spatial_dims) == 3
-                else torch.channels_last)
-            model.to(memory_format=self._memory_format)
-            logger.info("channels_last memory format enabled (%s).",
-                        self._memory_format)
+        self._setup_channels_last()
 
         # --- EMA (over the method's module; orthogonal to any method-internal teacher) ---
         # 绑裸模型（compile 包装前），shadow key 无 ``_orig_mod.`` 前缀。
@@ -157,19 +148,24 @@ class SSLTrainer(BaseTrainer):
         self._global_step = 0
         self.start_epoch = 0
 
-        # --- 训练监控面板（复用 segtask_v1.monitor；cfg.monitor 守卫，仅 rank0，
-        #     失败隔离不阻断训练）---------------------------------------
-        self._monitor = None
-        self._monitor_html = None
-        self._monitor_cfg = getattr(cfg, "monitor", None)
-        self._health_monitor = bool(
-            self._monitor_cfg is not None
-            and getattr(self._monitor_cfg, "health_monitor", False))
-        self._health_grad_norm_when_no_clip = bool(getattr(
-            self._monitor_cfg, "health_grad_norm_when_no_clip", True))
-        if (self._monitor_cfg is not None and self._monitor_cfg.enabled
-                and self._is_main):
-            self._init_monitor(resume_active=bool(tc.resume))
+        # --- 训练监控面板（公用工程件，见 BaseTrainer / taskcore.monitor；
+        #     cfg.monitor 守卫，仅 rank0，失败隔离不阻断训练）--------------
+        # SSL 口径：无验证集，val 位置留空；选模指标为 train loss / probe dice。
+        _select_by = ("probe_dice"
+                      if bool(getattr(ssl, "probe_enabled", False))
+                      and bool(ssl.probe_select_best) else "loss")
+        self._setup_monitor(
+            resume_active=bool(tc.resume),
+            run_name_default="ssl_run",
+            save_best_metric=_select_by,
+            save_best_mode="max" if _select_by == "probe_dice" else "min",
+            save_best_criterion="",
+            num_classes=0,
+            config_meta={
+                "ssl_method": ssl.method,
+                "recon_loss": ssl.recon_loss,
+                "batch_size": cfg.data.batch_size,
+            })
 
         # 告知方法总优化步数（= boundary 数：每 grad_accum 个 micro-step 一次）。
         # 与上方 scheduler/warmup 完全同一时钟（optimizer-step）。供自蒸馏等方法
@@ -198,102 +194,12 @@ class SSLTrainer(BaseTrainer):
                     "Starting SSL pretrain from scratch.", tc.resume)
 
         # --- torch.compile（最后：optimizer/EMA/resume 已绑裸模型参数）-----
-        # 替换 ``method.module``：直接前向的重建类方法（genesis/simmim/spark 等
-        # ``self.module(x)``）被编译；子模块直调的方法（dino 系 ``module.student``）
-        # 经 OptimizedModule 属性代理回到裸子模块，行为不变。各方法的
+        # 共用工程件（见 BaseTrainer._maybe_compile）。替换 ``method.module``：
+        # 直接前向的重建类方法（genesis/simmim/spark 等 ``self.module(x)``）被
+        # 编译；子模块直调的方法（dino 系 ``module.student``）经 OptimizedModule
+        # 属性代理回到裸子模块，行为不变。各方法的
         # ``export_backbone_state_dict`` 已统一走 ``unwrap_compile``。
-        if tc.compile_mode != "none" and hasattr(torch, "compile"):
-            triton_ok = True
-            if device.type == "cuda":
-                import importlib.util
-                if importlib.util.find_spec("triton") is None:
-                    triton_ok = False
-                    logger.warning(
-                        "torch.compile (mode='%s') requested but Triton not "
-                        "installed; falling back to eager.", tc.compile_mode)
-            if triton_ok:
-                logger.info("Compiling SSL module with mode='%s'",
-                            tc.compile_mode)
-                self.method.module = torch.compile(
-                    self.method.module, mode=tc.compile_mode)
-
-    # ------------------------------------------------------------------
-    def _init_monitor(self, resume_active: bool) -> None:
-        """实例化 ``MetricsLogger``（SSL 口径：无验证集，val 位置留空；选模
-        指标为 train loss / probe dice）。失败仅告警、不影响训练。"""
-        mc = self._monitor_cfg
-        tc = self.cfg.train
-        try:
-            from segtask_v1.monitor import MetricsLogger
-
-            root = Path(mc.output_dir) if mc.output_dir else self.output_dir
-            mon_dir = root / "monitor"
-            self._monitor_html = root / (mc.filename or "training_monitor.html")
-            run_name = mc.run_name or self.output_dir.name or "ssl_run"
-            select_by = ("probe_dice"
-                         if bool(getattr(self.ssl, "probe_enabled", False))
-                         and bool(self.ssl.probe_select_best) else "loss")
-            self._monitor = MetricsLogger(
-                mon_dir,
-                run_name=run_name,
-                save_best_metric=select_by,
-                save_best_mode="max" if select_by == "probe_dice" else "min",
-                num_classes=0,
-                total_epochs=tc.epochs,
-                config_meta={
-                    "ssl_method": self.ssl.method,
-                    "recon_loss": self.ssl.recon_loss,
-                    "batch_size": self.cfg.data.batch_size,
-                },
-                resume=resume_active,
-            )
-            logger.info("SSL training monitor enabled → metrics: %s | "
-                        "dashboard: %s", mon_dir, self._monitor_html)
-        except Exception as e:  # 隔离：监测初始化失败绝不阻断训练
-            self._monitor = None
-            logger.warning("SSL training monitor disabled (init failed): %s", e)
-
-    def _monitor_log_epoch(self, epoch: int, train_metrics: Dict[str, float],
-                           *, lr: float, gpu_peak_mib, wall_time_s: float,
-                           is_best: bool, last_epoch: bool) -> None:
-        """落盘一个 epoch 并按 ``update_every`` 节奏重渲染 HTML（异常隔离）。"""
-        if self._monitor is None:
-            return
-        mc = self._monitor_cfg
-        try:
-            self._monitor.log_epoch(
-                epoch, train=train_metrics, val=None, lr=lr,
-                gpu_peak_mib=gpu_peak_mib, wall_time_s=wall_time_s,
-                is_best=is_best)
-        except Exception as e:
-            logger.warning("SSL monitor: log_epoch failed at epoch %d: %s",
-                           epoch + 1, e)
-            return
-        every = max(int(mc.update_every), 1)
-        if is_best or last_epoch or ((epoch + 1) % every == 0):
-            self._monitor_render(
-                auto_reload_seconds=int(mc.auto_reload_seconds))
-
-    def _monitor_render(self, *, auto_reload_seconds: int) -> None:
-        if self._monitor is None or self._monitor_html is None:
-            return
-        try:
-            from segtask_v1.monitor import MetricsHistory, write_dashboard
-
-            hist = MetricsHistory.from_dir(self._monitor.dir)
-            write_dashboard(hist, self._monitor_html,
-                            auto_reload_seconds=auto_reload_seconds)
-        except Exception as e:
-            logger.warning("SSL monitor: dashboard render failed: %s", e)
-
-    def _monitor_finalize(self, status: str) -> None:
-        if self._monitor is None:
-            return
-        try:
-            self._monitor.finalize(status)
-        except Exception as e:
-            logger.warning("SSL monitor: finalize failed: %s", e)
-        self._monitor_render(auto_reload_seconds=0)
+        self.method.module = self._maybe_compile(self.method.module)
 
     # ------------------------------------------------------------------
     # Model-health helpers（同母项目；仅 rank0 监测启用时调用）

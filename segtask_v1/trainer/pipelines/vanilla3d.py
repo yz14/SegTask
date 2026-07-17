@@ -11,9 +11,9 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...config import Config
+from taskcore.config.core import Config
 from ...losses.losses import DeepSupervisionLoss, MultiResolutionLoss
-from ..amp import compute_loss_fp32
+from taskcore.engine.amp import compute_loss_fp32
 from .base import SupervisionPack, ViewPipeline
 
 

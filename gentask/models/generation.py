@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from ..data.degradation import build_degradation
 from .diffusion import build_diffusion
 from .factory import build_backbone
-from .topology import build_topology
+from taskcore.models.topology import build_topology
 
 
 class RegressionModel(nn.Module):
@@ -272,10 +272,10 @@ def build_generation_model(cfg) -> nn.Module:
         cond_ch = int(cfg.model.in_channels)         # 低分条件图通道
         in_ch = target_ch + cond_ch
         if arch == "adm":
-            from .adm_unet import build_adm_diffusion_unet
+            from taskcore.models.adm_unet import build_adm_diffusion_unet
             net = build_adm_diffusion_unet(cfg, in_channels=in_ch, out_channels=target_ch)
         elif arch == "edm2":
-            from .edm2_unet import build_edm2_diffusion_unet
+            from taskcore.models.edm2_unet import build_edm2_diffusion_unet
             net = build_edm2_diffusion_unet(cfg, in_channels=in_ch, out_channels=target_ch)
         else:
             raise ValueError(

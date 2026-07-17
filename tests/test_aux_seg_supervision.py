@@ -30,12 +30,12 @@ import torch.nn as nn
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from segtask_v1.config import (
+from taskcore.config.core import (
     Config, DataConfig, ModelConfig, LossConfig, TrainConfig, AugConfig,
     PredictConfig,
 )
 from segtask_v1.losses.losses import SliceChannelLoss, build_loss
-from segtask_v1.models.factory import build_model
+from taskcore.models.factory import build_model
 
 
 def _make_cfg(

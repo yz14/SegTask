@@ -24,8 +24,8 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from segtask_v1.config import load_config
-from segtask_v1.models.factory import build_model
+from taskcore.config.core import load_config
+from taskcore.models.factory import build_model
 from segtask_v1.losses.losses import MultiResolutionLoss, build_loss
 
 

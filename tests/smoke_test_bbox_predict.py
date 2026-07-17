@@ -25,7 +25,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from segtask_v1.config import Config  # noqa: E402
+from taskcore.config.core import Config  # noqa: E402
 from segtask_v1.predictor import Predictor  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
@@ -101,7 +101,7 @@ def main() -> None:
 
     # Compute the bbox we expect the predictor to have used and verify
     # that everything OUTSIDE that bbox is exactly 0 in the prob map.
-    from segtask_v1.data.dataset import compute_bbox_from_volume, load_nifti
+    from taskcore.data.dataset import compute_bbox_from_volume, load_nifti
     bbox = compute_bbox_from_volume(load_nifti(BBX))
     assert bbox is not None
     (d0, d1), (h0, h1), (w0, w1) = bbox

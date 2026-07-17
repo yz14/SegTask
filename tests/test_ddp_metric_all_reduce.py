@@ -110,7 +110,7 @@ def test_all_reduce_matches_single_process(world_size, n_samples, tmp_path):
 # DDP 下按 world_size 平摊每卡 DataLoader 的 num_workers。
 # ---------------------------------------------------------------------------
 def test_scaled_num_workers():
-    from segtask_v1.data.loader import scaled_num_workers
+    from taskcore.data.loader import scaled_num_workers
 
     # 单卡 / 关闭 / world_size<=1：原样返回。
     assert scaled_num_workers(16, 1, True) == 16

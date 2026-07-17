@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.trainer.checkpoint import unwrap_compile
+from taskcore.engine.checkpoint import unwrap_compile
 
 from ..data.multicrop import PairedCropGenerator, site_coords
 from ..models.vicregl_modules import build_vicregl_net

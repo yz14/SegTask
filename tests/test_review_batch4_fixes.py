@@ -21,9 +21,9 @@ import numpy as np
 import pytest
 import torch
 
-from segtask_v1.config import Config, ConfigError, _CRITERION_TO_METRIC
-from segtask_v1.data.augment import GPUAugmentor, _random_affine_elastic
-from segtask_v1.data.loader import extract_group_ids, grouped_train_val_split
+from taskcore.config.core import Config, ConfigError, _CRITERION_TO_METRIC
+from taskcore.data.augment import GPUAugmentor, _random_affine_elastic
+from taskcore.data.loader import extract_group_ids, grouped_train_val_split
 from segtask_v1.losses.losses import build_loss
 from segtask_v1.predictor.blending import prob_to_label
 from segtask_v1.predictor.sliding import _SKIP_RATIO_WARN, _log_skip_stats

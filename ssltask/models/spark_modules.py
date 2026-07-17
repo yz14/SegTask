@@ -30,9 +30,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from segtask_v1.models.blocks import (
+from taskcore.models.blocks import (
     _CONV, INTERP_SMOOTH, ConvNormAct, Upsample)
-from segtask_v1.models.factory import build_model
+from taskcore.models.factory import build_model
 
 from ..data.masking import densify, downsample_mask_to
 

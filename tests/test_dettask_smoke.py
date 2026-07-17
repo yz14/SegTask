@@ -275,7 +275,7 @@ def test_dataset(npz_dir: str):
 def test_four_archs():
     from dettask.config import DetConfig, validate_det
     from dettask.models.factory import build_detector
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     def _mk_cfg(sd: int) -> Config:
         cfg = Config()

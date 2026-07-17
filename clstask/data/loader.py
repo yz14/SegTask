@@ -16,8 +16,8 @@ from typing import List, Sequence, Tuple
 import numpy as np
 from torch.utils.data import DataLoader
 
-from segtask_v1.config import Config as SegConfig
-from segtask_v1.data.loader import train_val_split
+from taskcore.config.core import Config as SegConfig
+from taskcore.data.loader import train_val_split
 
 from ..config import ClsConfig, resolve_num_classes
 from .cls_dataset import (

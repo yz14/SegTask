@@ -59,7 +59,7 @@ def npz_dir(tmp_path: Path) -> Path:
 def test_val_loader_uses_eval_patches_per_volume(npz_dir: Path):
     from clstask.config import ClsConfig
     from clstask.data.loader import build_cls_dataloaders
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.data.npz_dir = str(npz_dir)
@@ -82,7 +82,7 @@ def test_val_loader_uses_eval_patches_per_volume(npz_dir: Path):
 @pytest.mark.parametrize("compressed", [False, True])
 def test_dataset_load_matches_legacy(tmp_path: Path, compressed: bool):
     from clstask.data.cls_dataset import ClsPatchDataset
-    from segtask_v1.data.dataset import preprocess_image
+    from taskcore.data.dataset import preprocess_image
 
     p = tmp_path / "vol.npz"
     _make_npz(p, fg=True, compressed=compressed)
@@ -138,7 +138,7 @@ def _tiny_trainer(npz_dir: Path, out_dir: Path):
     from clstask.data.loader import build_cls_dataloaders
     from clstask.models.factory import build_classifier
     from clstask.trainer.cls_trainer import ClsTrainer
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.data.npz_dir = str(npz_dir)
@@ -214,7 +214,7 @@ def test_loader_stratified_split_by_mask(npz_dir: Path):
     from clstask.config import ClsConfig
     from clstask.data.cls_dataset import derive_volume_targets
     from clstask.data.loader import build_cls_dataloaders
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.data.npz_dir = str(npz_dir)
@@ -240,7 +240,7 @@ def test_slice_inference_full_z_coverage(tmp_path: Path):
     from clstask.config import ClsConfig, validate_cls
     from clstask.models.factory import build_classifier
     from clstask.predictor.cls_predictor import ClsPredictor
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     z_dim, p_d = 64, 8                       # ceil(64/8)=8 > 上限 2
     p = tmp_path / "thick.npz"

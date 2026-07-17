@@ -12,7 +12,7 @@ from typing import List, Sequence
 import torch
 import torch.nn as nn
 
-from segtask_v1.models.blocks import _CONV
+from taskcore.models.blocks import _CONV
 
 __all__ = ["FPNAdapter"]
 

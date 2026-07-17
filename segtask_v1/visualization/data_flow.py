@@ -15,8 +15,8 @@ from __future__ import annotations
 import logging
 from typing import List, Optional, Tuple
 
-from ..config import Config
-from ..models.topology import ModelTopology, build_topology
+from taskcore.config.core import Config
+from taskcore.models.topology import ModelTopology, build_topology
 from .graph import VisGraph, shape_str
 
 logger = logging.getLogger(__name__)

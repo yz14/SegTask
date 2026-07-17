@@ -19,7 +19,6 @@ import os
 import random
 import re
 import time
-from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 from colorama import Fore, Style
@@ -29,20 +28,20 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from ..config import Config
-from ..data.augment import GPUAugmentor
+from taskcore.config.core import Config
+from taskcore.data.augment import GPUAugmentor
 from ..losses.losses import build_loss
-from ..models.unet import UNet3D
-from ..models.mednext import upkern_remap_state_dict
-from ..predictor.adabn import collect_bn_modules, estimate_bn_stats
-from ..utils import (
-    AverageMeter, ModelSWA, Timer, compute_dice_per_class,
+from taskcore.models.unet import UNet3D
+from taskcore.models.mednext import upkern_remap_state_dict
+from taskcore.engine.bn_stats import collect_bn_modules, estimate_bn_stats
+from taskcore.utils.common import (
+    AverageMeter, Timer, compute_dice_per_class,
 )
 from . import views
-from .amp import autocast
+from taskcore.engine.amp import autocast
 from .breakdown import collect_multi_res_breakdown, format_breakdown
-from .prefetch import CudaPrefetcher
-from .checkpoint import (
+from taskcore.engine.prefetch import CudaPrefetcher
+from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver,
     atomic_torch_save,
     extract_model_state_dict,
@@ -52,16 +51,12 @@ from .checkpoint import (
     strip_common_prefixes,
     unwrap_compile,
 )
-from .dist_utils import (
+from taskcore.engine.dist_utils import (
     all_reduce_bn_running_stats_,
     all_reduce_flag_any,
     barrier,
-    get_rank,
-    get_world_size,
-    is_dist_avail_and_initialized,
-    is_main_process,
 )
-from .memory import estimate_train_memory
+from taskcore.engine.memory import estimate_train_memory
 from .pipelines import (
     Patch3DNativeMultiResPipeline,
     Slab2_5DNativeDPipeline,
@@ -130,11 +125,8 @@ class Trainer(BaseTrainer):
         self._setup_amp()
         self._setup_ema()
 
-        # --- SWA 尾段权重平均（opt-in，见 TrainConfig.swa_enabled）---------
-        self.swa = ModelSWA(self.model) if tc.swa_enabled else None
-        self._swa_start_epoch = (
-            int(math.floor(tc.swa_start_ratio * tc.epochs))
-            if tc.swa_enabled else 0)
+        # --- SWA 尾段权重平均（opt-in，公用工程件，见 BaseTrainer）---------
+        self._setup_swa()
 
         # --- torch.compile (最后) -------------------------------------
         self._first_step_mem_logged = False
@@ -145,52 +137,8 @@ class Trainer(BaseTrainer):
         # predictor 全部继续作用其上，参数张量与单卡完全一致（DDP 不复制参数，仅挂
         # 反传 all-reduce 钩子）。前向走 ``self.fwd_model``（DDP 包装），梯度即在各卡
         # 间同步。``world_size<=1`` 时 fwd_model 即裸模块，单卡路径零变化。
-        self._rank       = get_rank()
-        self._world_size = get_world_size()
-        self._is_main    = is_main_process()
-        self._is_dist    = is_dist_avail_and_initialized() and self._world_size > 1
-        if self._is_dist:
-            ddp_kwargs: Dict[str, object] = {}
-            if device.type == "cuda" and device.index is not None:
-                ddp_kwargs = {"device_ids": [device.index],
-                              "output_device": device.index}
-            self.fwd_model = nn.parallel.DistributedDataParallel(
-                self.model,
-                find_unused_parameters=bool(tc.ddp_find_unused_parameters),
-                gradient_as_bucket_view=bool(tc.ddp_gradient_as_bucket_view),
-                static_graph=bool(tc.ddp_static_graph),
-                **ddp_kwargs)
-            if tc.ddp_static_graph and tc.ddp_find_unused_parameters:
-                logger.warning(
-                    "ddp_static_graph=True 与 ddp_find_unused_parameters=True "
-                    "同时开启：static_graph 首步后会接管 unused-parameter 处理，"
-                    "建议将 ddp_find_unused_parameters 设为 False 以免首步额外开销。")
-            logger.info(
-                "DDP enabled: rank=%d/%d, device=%s, "
-                "find_unused_parameters=%s, gradient_as_bucket_view=%s, "
-                "static_graph=%s. "
-                "Training grads all-reduce per backward. Note: math-equivalence "
-                "to single-GPU under grad-accum holds for per-sample separable "
-                "losses (BCE/Focal/per-sample Dice); batch-pooled ratio losses "
-                "(batch_dice/Tversky/GDL) pool over the per-rank micro-batch, "
-                "so their effective statistics window shrinks with accum/ranks "
-                "(approximate, not strictly equivalent).",
-                self._rank, self._world_size, device,
-                tc.ddp_find_unused_parameters,
-                tc.ddp_gradient_as_bucket_view,
-                tc.ddp_static_graph)
-        else:
-            self.fwd_model = self.model
-
-        # 训练采样器（每 epoch set_epoch 重洗）：单源 DDP 为 DistributedSampler
-        # （loader.sampler），双源混合为 MixedBatchSampler（loader.batch_sampler，
-        # DDP 下各 rank 依赖 set_epoch 对齐全局排列）；均按 set_epoch 协议鸭子识别。
-        self._train_sampler = None
-        for _s in (getattr(self.train_loader, "sampler", None),
-                   getattr(self.train_loader, "batch_sampler", None)):
-            if _s is not None and callable(getattr(_s, "set_epoch", None)):
-                self._train_sampler = _s
-                break
+        self._setup_ddp()
+        self._setup_train_sampler()
 
         # --- 增强 ------------------------------------------------------
         _scales = cfg.data.multi_res_scales or [1.0]
@@ -248,26 +196,17 @@ class Trainer(BaseTrainer):
                     "Training will start from scratch.", tc.pretrain)
 
         # --- Training monitor (optional; fully isolated) --------------
-        # 逐 epoch 把指标落盘并周期性重渲染自包含 HTML 仪表盘。整套逻辑封装在
-        # ``segtask_v1.monitor``，由 ``cfg.monitor.enabled`` 守卫，任何失败都被
-        # 隔离（仅告警），绝不影响训练本身。
-        self._monitor = None
-        self._monitor_html = None
-        self._monitor_cfg = getattr(self.cfg, "monitor", None)
-        # 落盘 / 渲染等副作用仅在 rank0 进行，避免多进程争抢同一文件。
-        if (self._monitor_cfg is not None and self._monitor_cfg.enabled
-                and self._is_main):
-            self._init_monitor(resume_active)
-        # 模型健康监测：仅当监测启用、配置开启且在 rank0 时采集（成本极低，
-        # 失败被隔离）。非有限步计数 / 梯度范数 / 裁剪比例 / 权重范数 / AMP 标度。
-        self._health_monitor = bool(
-            self._monitor is not None
-            and getattr(self._monitor_cfg, "health_monitor", False))
-        self._health_grad_norm_when_no_clip = bool(
-            getattr(self._monitor_cfg, "health_grad_norm_when_no_clip", True))
-        self._health_update_ratio = bool(
-            self._health_monitor
-            and getattr(self._monitor_cfg, "health_update_ratio", False))
+        # 逐 epoch 把指标落盘并周期性重渲染自包含 HTML 仪表盘（公用工程件，
+        # 见 BaseTrainer / ``taskcore.monitor``）。由 ``cfg.monitor.enabled``
+        # 守卫，落盘 / 渲染等副作用仅在 rank0 进行，任何失败仅告警。
+        self._setup_monitor(
+            resume_active,
+            num_classes=self.num_fg,
+            config_meta={
+                "loss": self.cfg.loss.name,
+                "batch_size": self.cfg.data.batch_size,
+                "val_metric_mode": tc.val_metric_mode,
+            })
 
     # ------------------------------------------------------------------
     # Public API
@@ -331,8 +270,7 @@ class Trainer(BaseTrainer):
             train_metrics = self._train_epoch(epoch)
             train_time_s = time.time() - epoch_t0
 
-            if self.swa is not None and epoch >= self._swa_start_epoch:
-                self.swa.update(unwrap_compile(self.model))
+            self._swa_update(epoch)
 
             val_metrics: Dict[str, float] = {}
             val_time_s = 0.0
@@ -445,93 +383,6 @@ class Trainer(BaseTrainer):
         # DDP：收尾屏障，确保 rank0 完成 best/checkpoint 落盘后各进程再退出。
         barrier()
         return best_metrics
-
-    # ------------------------------------------------------------------
-    # Training monitor (optional, isolated) —— 见 segtask_v1.monitor
-    # ------------------------------------------------------------------
-    def _init_monitor(self, resume_active: bool) -> None:
-        """实例化 ``MetricsLogger`` 并确定 HTML 落点。失败仅告警、不影响训练。"""
-        mc = self._monitor_cfg
-        tc = self.cfg.train
-        try:
-            from ..monitor import MetricsLogger
-
-            root = Path(mc.output_dir) if mc.output_dir else self.output_dir
-            mon_dir = root / "monitor"
-            self._monitor_html = root / (mc.filename or "training_monitor.html")
-            run_name = mc.run_name or self.output_dir.name or "run"
-            self._monitor = MetricsLogger(
-                mon_dir,
-                run_name=run_name,
-                save_best_metric=tc.save_best_metric,
-                save_best_mode=tc.save_best_mode,
-                save_best_criterion=tc.save_best_criterion,
-                num_classes=self.num_fg,
-                total_epochs=tc.epochs,
-                config_meta={
-                    "loss": self.cfg.loss.name,
-                    "batch_size": self.cfg.data.batch_size,
-                    "val_metric_mode": tc.val_metric_mode,
-                },
-                resume=resume_active,
-            )
-            logger.info("Training monitor enabled → metrics: %s | dashboard: %s",
-                        mon_dir, self._monitor_html)
-        except Exception as e:  # 隔离：监测初始化失败绝不阻断训练
-            self._monitor = None
-            logger.warning("Training monitor disabled (init failed): %s", e)
-
-    def _monitor_log_epoch(
-        self,
-        epoch: int,
-        train_metrics: Dict[str, float],
-        val_metrics: Dict[str, float],
-        *,
-        lr: float,
-        gpu_peak_mib,
-        wall_time_s: float,
-        is_best: bool,
-        last_epoch: bool,
-    ) -> None:
-        """落盘一个 epoch 并按 ``update_every`` 节奏重渲染 HTML（全程异常隔离）。"""
-        if self._monitor is None:
-            return
-        mc = self._monitor_cfg
-        try:
-            self._monitor.log_epoch(
-                epoch, train=train_metrics, val=val_metrics, lr=lr,
-                gpu_peak_mib=gpu_peak_mib, wall_time_s=wall_time_s,
-                is_best=is_best)
-        except Exception as e:
-            logger.warning("Training monitor: log_epoch failed at epoch %d: %s",
-                           epoch + 1, e)
-            return
-        every = max(int(mc.update_every), 1)
-        if is_best or last_epoch or ((epoch + 1) % every == 0):
-            self._monitor_render(auto_reload_seconds=int(mc.auto_reload_seconds))
-
-    def _monitor_render(self, *, auto_reload_seconds: int) -> None:
-        """从已落盘历史重渲染单 run 仪表盘 HTML（异常隔离）。"""
-        if self._monitor is None or self._monitor_html is None:
-            return
-        try:
-            from ..monitor import MetricsHistory, write_dashboard
-
-            hist = MetricsHistory.from_dir(self._monitor.dir)
-            write_dashboard(hist, self._monitor_html,
-                            auto_reload_seconds=auto_reload_seconds)
-        except Exception as e:
-            logger.warning("Training monitor: dashboard render failed: %s", e)
-
-    def _monitor_finalize(self, status: str) -> None:
-        """训练收尾：更新 run 状态并做一次静态（无自动刷新）终渲染。"""
-        if self._monitor is None:
-            return
-        try:
-            self._monitor.finalize(status)
-        except Exception as e:
-            logger.warning("Training monitor: finalize failed: %s", e)
-        self._monitor_render(auto_reload_seconds=0)
 
     # ------------------------------------------------------------------
     # Training / validation loops

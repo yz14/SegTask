@@ -16,7 +16,7 @@ from typing import List
 import torch
 import torch.nn as nn
 
-from segtask_v1.models.blocks import get_activation, get_norm
+from taskcore.models.blocks import get_activation, get_norm
 
 
 def _conv_nd(spatial_dims: int):

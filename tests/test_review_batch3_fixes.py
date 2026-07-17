@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from segtask_v1.utils import (  # noqa: E402
+from taskcore.utils.common import (  # noqa: E402
     _nsd_stats_spacing_aware,
     surface_dice_batch_stats,
 )
@@ -179,7 +179,7 @@ def test_metric_accumulator_uses_physical_nsd_when_configured():
 # ---------------------------------------------------------------------------
 
 def test_bn_all_reduce_noop_without_process_group():
-    from segtask_v1.trainer.dist_utils import all_reduce_bn_running_stats_
+    from taskcore.engine.dist_utils import all_reduce_bn_running_stats_
 
     bn = torch.nn.BatchNorm3d(4)
     bn.running_mean.fill_(3.0)
@@ -194,9 +194,9 @@ def test_bn_all_reduce_noop_without_process_group():
 def _bn_worker(rank: int, world_size: int, port: int, results):
     import torch.distributed as dist
 
-    from segtask_v1.predictor.adabn import (
+    from taskcore.engine.bn_stats import (
         collect_bn_modules, estimate_bn_stats)
-    from segtask_v1.trainer.dist_utils import all_reduce_bn_running_stats_
+    from taskcore.engine.dist_utils import all_reduce_bn_running_stats_
 
     dist.init_process_group(
         backend="gloo", init_method=f"tcp://127.0.0.1:{port}",
@@ -231,7 +231,7 @@ def test_bn_stats_aggregated_across_ranks_match_single_process():
     """gloo 双进程：聚合后各 rank stats 一致，且等于单进程跑全部 batch 的结果。"""
     import multiprocessing as mp
 
-    from segtask_v1.predictor.adabn import (
+    from taskcore.engine.bn_stats import (
         collect_bn_modules, estimate_bn_stats)
 
     world_size = 2
@@ -289,7 +289,7 @@ def _write_npz(path: Path, meta: dict) -> None:
 
 
 def test_load_npz_z_spacing_normalized_prefers_target():
-    from segtask_v1.data.dataset import load_npz_z_spacing
+    from taskcore.data.dataset import load_npz_z_spacing
 
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "a.npz"
@@ -300,7 +300,7 @@ def test_load_npz_z_spacing_normalized_prefers_target():
 
 
 def test_load_npz_z_spacing_unnormalized_uses_orig():
-    from segtask_v1.data.dataset import load_npz_z_spacing
+    from taskcore.data.dataset import load_npz_z_spacing
 
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "a.npz"
@@ -311,7 +311,7 @@ def test_load_npz_z_spacing_unnormalized_uses_orig():
 
 
 def test_load_npz_z_spacing_legacy_meta_returns_none():
-    from segtask_v1.data.dataset import load_npz_z_spacing
+    from taskcore.data.dataset import load_npz_z_spacing
 
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "a.npz"

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import logging
 
-from ...config import Config
+from taskcore.config.core import Config
 from ...losses.topo_aux import build_aux_topo_loss
-from ...models.topology import ModelTopology, build_topology
+from taskcore.models.topology import ModelTopology, build_topology
 from .base import ViewPipeline
 from .lift25d import Lift2_5DAuxPipeline, Lift2_5DPipeline
 from .patch3d import Patch3DNativeMultiResPipeline

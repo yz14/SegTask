@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
-    from segtask_v1.config import Config
+    from taskcore.config import Config
 
 logger = logging.getLogger(__name__)
 

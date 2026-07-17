@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..data.dataset import _extract_cubic_patch, extract_z_patch_padded, resize_3d
+from taskcore.data.dataset import _extract_cubic_patch, extract_z_patch_padded, resize_3d
 
 logger = logging.getLogger(__name__)
 

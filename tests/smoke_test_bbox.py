@@ -13,10 +13,10 @@ from pathlib import Path
 # Make the in-tree package importable when running as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from segtask_v1.data.dataset import (  # noqa: E402
+from taskcore.data.dataset import (  # noqa: E402
     SegDataset3D, SegDataset3DCubic, SegDataset3DWhole,
     load_nifti, precompute_bboxes)
-from segtask_v1.data.loader import (  # noqa: E402
+from taskcore.data.loader import (  # noqa: E402
     detect_label_values, discover_samples, match_bbox_paths)
 
 logging.basicConfig(level=logging.INFO,

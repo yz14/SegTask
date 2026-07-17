@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import pytest
 
-from segtask_v1.config import Config
-from segtask_v1.models.topology import ModelTopology, build_topology
+from taskcore.config.core import Config
+from taskcore.models.topology import ModelTopology, build_topology
 
 
 # ---------------------------------------------------------------------------

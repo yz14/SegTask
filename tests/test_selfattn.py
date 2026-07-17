@@ -16,12 +16,12 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from segtask_v1.config import Config, ConfigError, resolve_selfattn_stage
-from segtask_v1.models.blocks import (
+from taskcore.config.core import Config, ConfigError, resolve_selfattn_stage
+from taskcore.models.blocks import (
     SelfAttentionBlock, _GridQKVAttention, _LinearQKVAttention,
     _SoftmaxQKVAttention, _WindowQKVAttention, _apply_rope_nd,
     _window_partition_tokens, _window_unpartition_tokens, _ROPE_ND_CACHE)
-from segtask_v1.models.factory import build_model
+from taskcore.models.factory import build_model
 
 
 def _count_attn(model):

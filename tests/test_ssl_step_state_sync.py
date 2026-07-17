@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.config import Config as SegConfig
+from taskcore.config.core import Config as SegConfig
 from ssltask.config import SSLConfig, validate_ssl
 from ssltask.methods import build_method
 

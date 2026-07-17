@@ -42,13 +42,13 @@ import torch
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from segtask_v1.config import (  # noqa: E402
+from taskcore.config.core import (  # noqa: E402
     Config, DataConfig, ModelConfig, LossConfig, TrainConfig, AugConfig,
     PredictConfig,
 )
-from segtask_v1.data.dataset import SegDataset3D  # noqa: E402
+from taskcore.data.dataset import SegDataset3D  # noqa: E402
 from segtask_v1.losses.losses import SliceChannelLoss, build_loss  # noqa: E402
-from segtask_v1.models.factory import build_model  # noqa: E402
+from taskcore.models.factory import build_model  # noqa: E402
 from segtask_v1.trainer import views  # noqa: E402
 
 
@@ -269,7 +269,7 @@ def test_dataset_native_d_shape_and_geometry():
     # View-0 reference: an independent edge_pad extraction of exactly D
     # slices around the same z-center, resized in-plane to (H, W). This is
     # the geometric ground truth the trainer's view-0 center-crop must equal.
-    from segtask_v1.data.dataset import resize_3d
+    from taskcore.data.dataset import resize_3d
     z = 40 // 2
     img_pre = ds_on._load_image(0)   # already preprocessed (normalised)
     lbl_pre = ds_on._load_label(0)
@@ -346,7 +346,7 @@ def test_dataset_native_d_aux_view_geometry():
     img_v1, _ = ds_on._extract_z_patch_padded(
         img_pre, ds_on._load_label(0), z, D1)
     # H, W resize matches the dataset path.
-    from segtask_v1.data.dataset import resize_3d
+    from taskcore.data.dataset import resize_3d
     img_v1 = resize_3d(img_v1, D1, H, W, is_label=False)
 
     if not np.allclose(view1_from_cube, img_v1, atol=1e-5):

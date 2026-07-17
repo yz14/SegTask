@@ -31,7 +31,7 @@ import torch
 # 1. dice_batch_stats — 字段新增 & 恒等式
 # ---------------------------------------------------------------------------
 def test_dice_batch_stats_new_keys_identities():
-    from segtask_v1.utils import dice_batch_stats
+    from taskcore.utils.common import dice_batch_stats
 
     torch.manual_seed(0)
     B, C, D, H, W = 2, 3, 4, 8, 8
@@ -79,7 +79,7 @@ def _np_metrics(tp, fp, fn, tn, eps=1e-5):
 
 
 def test_derive_overlap_metrics_matches_numpy():
-    from segtask_v1.utils import derive_overlap_metrics
+    from taskcore.utils.common import derive_overlap_metrics
 
     # 显式构造已知混淆矩阵（3 个类，便于核对）。
     # 类 0：完全匹配；类 1：纯过分割；类 2：纯欠分割。
@@ -119,7 +119,7 @@ def test_derive_overlap_metrics_matches_numpy():
 
 def test_derive_overlap_metrics_matches_pooled_dice_formula():
     """新闭式 dice 与历史 (2·inter+ε)/(denom+ε) 数值一致 — 不破坏已有 val 曲线。"""
-    from segtask_v1.utils import derive_overlap_metrics, dice_batch_stats
+    from taskcore.utils.common import derive_overlap_metrics, dice_batch_stats
 
     torch.manual_seed(1)
     B, C, D, H, W = 3, 2, 4, 8, 8
@@ -139,7 +139,7 @@ def test_derive_overlap_metrics_matches_pooled_dice_formula():
 
 def test_derive_overlap_metrics_empty_class_no_nan():
     """既无 GT 又无 pred 的类必须返回有限值（dice/iou=1 因平滑，mcc=0）。"""
-    from segtask_v1.utils import derive_overlap_metrics
+    from taskcore.utils.common import derive_overlap_metrics
 
     inter = torch.zeros(2)
     pred_sum = torch.zeros(2)
@@ -156,7 +156,7 @@ def test_derive_overlap_metrics_empty_class_no_nan():
 # ---------------------------------------------------------------------------
 def test_new_stats_invariant_under_reduction():
     """per_slice (B*D,C,H,W) 与 per_volume (B,C,D,H,W) 累加和必须一致。"""
-    from segtask_v1.utils import dice_batch_stats
+    from taskcore.utils.common import dice_batch_stats
 
     torch.manual_seed(2)
     B, C, D, H, W = 2, 2, 3, 16, 16
@@ -181,7 +181,7 @@ def test_new_stats_invariant_under_reduction():
 # 4. harmonic_mean_metrics 行为
 # ---------------------------------------------------------------------------
 def test_harmonic_mean_metrics_extremes_and_mid():
-    from segtask_v1.utils import harmonic_mean_metrics
+    from taskcore.utils.common import harmonic_mean_metrics
 
     # 全 1 ≈ 1。
     out_one = harmonic_mean_metrics([torch.tensor(1.0)] * 4).item()
@@ -217,7 +217,7 @@ def test_harmonic_mean_metrics_extremes_and_mid():
     ("balanced",          "mean_balanced",  "max"),
 ])
 def test_save_best_criterion_mapping(crit, expected_metric, expected_mode):
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.save_best_criterion = crit
@@ -227,7 +227,7 @@ def test_save_best_criterion_mapping(crit, expected_metric, expected_mode):
 
 
 def test_save_best_criterion_invalid_rejected():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.save_best_criterion = "not_a_real_metric"
@@ -253,7 +253,7 @@ def test_save_best_criterion_invalid_rejected():
 def test_save_best_preset_expands(
         preset, exp_crit, exp_tol, exp_w, exp_metric, exp_mode):
     """preset 必须覆盖 (criterion, sd_tol, sd_w) 并联动 (metric, mode)。"""
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     # 先显式塞入完全不同的值，证明 preset 真的覆盖了它们。
@@ -272,7 +272,7 @@ def test_save_best_preset_expands(
 
 def test_save_best_preset_empty_is_noop():
     """空 preset 不得修改用户显式设置（向后兼容必须）。"""
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.save_best_preset       = ""  # 默认空。
@@ -290,7 +290,7 @@ def test_save_best_preset_empty_is_noop():
 
 def test_save_best_preset_case_insensitive_and_trim():
     """preset 名应大小写/空白不敏感（yaml 编辑常误带空格）。"""
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.save_best_preset = "  Vessel  "
@@ -300,7 +300,7 @@ def test_save_best_preset_case_insensitive_and_trim():
 
 
 def test_save_best_preset_invalid_rejected():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
 
     cfg = Config()
     cfg.train.save_best_preset = "definitely_not_a_preset"
@@ -313,7 +313,7 @@ def test_save_best_preset_yaml_roundtrip(tmp_path):
     """preset 必须能完整经过 yaml dump/load 后保留。"""
     import yaml
 
-    from segtask_v1.config import Config, load_config
+    from taskcore.config.core import Config, load_config
 
     cfg = Config()
     cfg.train.save_best_preset = "lung"

@@ -22,8 +22,8 @@ if str(_ROOT) not in sys.path:
 import pytest
 import torch
 
-from segtask_v1.config import Config
-from segtask_v1.models.factory import build_model
+from taskcore.config.core import Config
+from taskcore.models.factory import build_model
 
 
 # ---------------------------------------------------------------------------

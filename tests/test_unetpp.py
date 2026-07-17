@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from segtask_v1.models.unetpp import UNetPPDecoder
+from taskcore.models.unetpp import UNetPPDecoder
 
 
 def _fake_encoder_features(channels, base_shape=(8, 16, 16)):
@@ -105,8 +105,8 @@ class TestUNetPPDecoder:
 @pytest.mark.parametrize("backbone", ["resnet", "convnext"])
 @pytest.mark.parametrize("stem_mode", ["conv3", "patch2"])
 def test_unetpp_end_to_end(backbone, stem_mode):
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -129,8 +129,8 @@ def test_unetpp_end_to_end(backbone, stem_mode):
 
 
 def test_unetpp_with_deep_supervision_and_skip_attention():
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -161,8 +161,8 @@ def test_unetpp_with_deep_supervision_and_skip_attention():
 
 def test_unetpp_trains_one_step():
     """Smoke test: one full forward + backward + optimizer step."""
-    from segtask_v1.config import Config
-    from segtask_v1.models.factory import build_model
+    from taskcore.config.core import Config
+    from taskcore.models.factory import build_model
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"
@@ -198,7 +198,7 @@ def test_unetpp_trains_one_step():
 # Config validation
 # ---------------------------------------------------------------------------
 def test_config_accepts_unetpp():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.decoder_type = "unetpp"
     cfg.sync()
@@ -206,7 +206,7 @@ def test_config_accepts_unetpp():
 
 
 def test_config_still_rejects_unknown_decoder():
-    from segtask_v1.config import Config
+    from taskcore.config.core import Config
     cfg = Config()
     cfg.model.decoder_type = "transformer"
     with pytest.raises(AssertionError):

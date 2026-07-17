@@ -32,7 +32,7 @@ from segtask_v1.losses.losses import (
     _lovasz_grad_batched, _soft_skeletonize,
     build_loss,
 )
-from segtask_v1.config import LossConfig, Config
+from taskcore.config.core import LossConfig, Config
 
 
 # ---------------------------------------------------------------------------

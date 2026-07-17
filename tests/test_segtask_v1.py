@@ -40,14 +40,14 @@ def _write_seg_npz(path, img, lbl):
 # ---------------------------------------------------------------------------
 class TestConfig:
     def test_load_config(self):
-        from segtask_v1.config import load_config
+        from taskcore.config.core import load_config
         cfg = load_config("configs/seg3d.yaml")
         assert cfg.data.patch_size == [16, 128, 128]
         assert cfg.model.backbone == "resnet"
         assert cfg.loss.name == "dice_focal"
 
     def test_sync_label_values(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1, 2, 3]
         cfg.sync()
@@ -55,7 +55,7 @@ class TestConfig:
         assert cfg.num_fg_classes == 3
 
     def test_validate_rejects_bad_backbone(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.model.backbone = "bad"
         cfg.data.label_values = [0, 1]
@@ -64,7 +64,7 @@ class TestConfig:
             cfg.validate()
 
     def test_new_config_fields(self):
-        from segtask_v1.config import load_config
+        from taskcore.config.core import load_config
         cfg = load_config("configs/seg3d.yaml")
         assert cfg.train.grad_accum_steps == 1
         assert cfg.train.compile_mode == "none"
@@ -78,7 +78,7 @@ class TestConfig:
 # ---------------------------------------------------------------------------
 class TestDataset:
     def test_preprocess_label(self):
-        from segtask_v1.data.dataset import preprocess_label
+        from taskcore.data.dataset import preprocess_label
         vol = np.array([[[0, 1], [2, 0]]], dtype=np.float32)  # (1, 2, 2)
         result = preprocess_label(vol, [0, 1, 2])
         assert result.shape == (2, 1, 2, 2)  # 2 fg classes
@@ -86,13 +86,13 @@ class TestDataset:
         assert result[1, 0, 1, 0] == 1.0  # class 2 at position (1,0)
 
     def test_resize_3d(self):
-        from segtask_v1.data.dataset import resize_3d
+        from taskcore.data.dataset import resize_3d
         arr = np.random.rand(10, 20, 30).astype(np.float32)
         out = resize_3d(arr, 8, 16, 24, is_label=False)
         assert out.shape == (8, 16, 24)
 
     def test_resize_3d_4d(self):
-        from segtask_v1.data.dataset import resize_3d
+        from taskcore.data.dataset import resize_3d
         arr = np.random.rand(3, 10, 20, 30).astype(np.float32)
         out = resize_3d(arr, 8, 16, 24, is_label=False)
         assert out.shape == (3, 8, 16, 24)
@@ -103,8 +103,8 @@ class TestDataset:
 # ---------------------------------------------------------------------------
 class TestModel:
     def test_resnet_unet_forward(self):
-        from segtask_v1.config import Config
-        from segtask_v1.models.factory import build_model
+        from taskcore.config.core import Config
+        from taskcore.models.factory import build_model
         cfg = Config()
         cfg.data.label_values = [0, 1, 2]
         cfg.data.num_classes = 3
@@ -116,8 +116,8 @@ class TestModel:
         assert y.shape == (1, 2, 32, 64, 64)  # 2 fg classes
 
     def test_convnext_unet_forward(self):
-        from segtask_v1.config import Config
-        from segtask_v1.models.factory import build_model
+        from taskcore.config.core import Config
+        from taskcore.models.factory import build_model
         cfg = Config()
         cfg.data.label_values = [0, 1, 2]
         cfg.data.num_classes = 3
@@ -130,8 +130,8 @@ class TestModel:
         assert y.shape == (1, 2, 32, 64, 64)
 
     def test_resnet_se_forward(self):
-        from segtask_v1.config import Config
-        from segtask_v1.models.factory import build_model
+        from taskcore.config.core import Config
+        from taskcore.models.factory import build_model
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -145,7 +145,7 @@ class TestModel:
         assert y.shape == (1, 1, 32, 64, 64)
 
     def test_use_se_is_rejected(self, tmp_path):
-        from segtask_v1.config import ConfigError, load_config
+        from taskcore.config.core import ConfigError, load_config
         path = tmp_path / "use_se.yaml"
         path.write_text(
             "data:\n"
@@ -163,8 +163,8 @@ class TestModel:
             load_config(str(path))
 
     def test_deep_supervision(self):
-        from segtask_v1.config import Config
-        from segtask_v1.models.factory import build_model
+        from taskcore.config.core import Config
+        from taskcore.models.factory import build_model
         cfg = Config()
         cfg.data.label_values = [0, 1, 2]
         cfg.data.num_classes = 3
@@ -181,8 +181,8 @@ class TestModel:
         assert y[0].shape == (1, 2, 32, 64, 64)
 
     def test_param_count(self):
-        from segtask_v1.config import Config
-        from segtask_v1.models.factory import build_model
+        from taskcore.config.core import Config
+        from taskcore.models.factory import build_model
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -235,7 +235,7 @@ class TestLoss:
 
     def test_compound_loss(self):
         from segtask_v1.losses.losses import build_loss
-        from segtask_v1.config import LossConfig
+        from taskcore.config.core import LossConfig
         cfg = LossConfig(name="dice_bce")
         loss_fn = build_loss(cfg)
         pred, target = self._make_pred_target()
@@ -244,7 +244,7 @@ class TestLoss:
 
     def test_dice_focal(self):
         from segtask_v1.losses.losses import build_loss
-        from segtask_v1.config import LossConfig
+        from taskcore.config.core import LossConfig
         cfg = LossConfig(name="dice_focal")
         loss_fn = build_loss(cfg)
         pred, target = self._make_pred_target()
@@ -260,7 +260,7 @@ class TestLoss:
 
     def test_deep_supervision_loss(self):
         from segtask_v1.losses.losses import build_loss, DeepSupervisionLoss
-        from segtask_v1.config import LossConfig
+        from taskcore.config.core import LossConfig
         base = build_loss(LossConfig(name="dice_bce"))
         ds_loss = DeepSupervisionLoss(base, [1.0, 0.5])
         pred_main = torch.randn(2, 2, 16, 32, 32)
@@ -275,8 +275,8 @@ class TestLoss:
 # ---------------------------------------------------------------------------
 class TestAugmentation:
     def test_augmentor_shapes(self):
-        from segtask_v1.config import AugConfig
-        from segtask_v1.data.augment import GPUAugmentor
+        from taskcore.config.core import AugConfig
+        from taskcore.data.augment import GPUAugmentor
         aug = GPUAugmentor(AugConfig(enabled=True))
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.zeros(2, 2, 16, 32, 32)
@@ -285,8 +285,8 @@ class TestAugmentation:
         assert lbl_out.shape == lbl.shape
 
     def test_augmentor_disabled(self):
-        from segtask_v1.config import AugConfig
-        from segtask_v1.data.augment import GPUAugmentor
+        from taskcore.config.core import AugConfig
+        from taskcore.data.augment import GPUAugmentor
         aug = GPUAugmentor(AugConfig(enabled=False))
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.ones(2, 2, 16, 32, 32)
@@ -295,7 +295,7 @@ class TestAugmentation:
         assert torch.equal(lbl_out, lbl)
 
     def test_gaussian_blur_3d(self):
-        from segtask_v1.data.augment import _gaussian_blur_3d
+        from taskcore.data.augment import _gaussian_blur_3d
         img = torch.randn(1, 1, 8, 16, 16)
         out = _gaussian_blur_3d(img.clone(), prob=1.0, sigma_range=[1.0, 1.0])
         assert out.shape == img.shape
@@ -308,7 +308,7 @@ class TestAugmentation:
 # ---------------------------------------------------------------------------
 class TestUtils:
     def test_dice_per_class(self):
-        from segtask_v1.utils import compute_dice_per_class
+        from taskcore.utils.common import compute_dice_per_class
         # Perfect prediction
         pred = torch.ones(2, 3, 8, 16, 16) * 10  # high logits
         target = torch.ones(2, 3, 8, 16, 16)
@@ -317,14 +317,14 @@ class TestUtils:
         assert (dice > 0.99).all()
 
     def test_dice_zero_prediction(self):
-        from segtask_v1.utils import compute_dice_per_class
+        from taskcore.utils.common import compute_dice_per_class
         pred = torch.ones(2, 2, 8, 16, 16) * -10  # all negative
         target = torch.ones(2, 2, 8, 16, 16)
         dice = compute_dice_per_class(pred, target)
         assert (dice < 0.01).all()
 
     def test_ema(self):
-        from segtask_v1.utils import ModelEMA
+        from taskcore.utils.common import ModelEMA
         import torch.nn as nn
         model = nn.Linear(10, 10)
         ema = ModelEMA(model, decay=0.9)
@@ -339,14 +339,14 @@ class TestUtils:
         assert model.weight.mean().item() == 1.0
 
     def test_average_meter(self):
-        from segtask_v1.utils import AverageMeter
+        from taskcore.utils.common import AverageMeter
         m = AverageMeter()
         m.update(1.0, 2)
         m.update(3.0, 2)
         assert abs(m.avg - 2.0) < 1e-6
 
     def test_seed_everything(self):
-        from segtask_v1.utils import seed_everything
+        from taskcore.utils.common import seed_everything
         seed_everything(42)
         a = torch.randn(5)
         seed_everything(42)
@@ -359,14 +359,14 @@ class TestUtils:
 # ---------------------------------------------------------------------------
 class TestSEBlock:
     def test_se_forward(self):
-        from segtask_v1.models.blocks import SqueezeExcite3D
+        from taskcore.models.blocks import SqueezeExcite3D
         se = SqueezeExcite3D(channels=32, reduction=8)
         x = torch.randn(2, 32, 8, 16, 16)
         y = se(x)
         assert y.shape == x.shape
 
     def test_se_output_range(self):
-        from segtask_v1.models.blocks import SqueezeExcite3D
+        from taskcore.models.blocks import SqueezeExcite3D
         se = SqueezeExcite3D(channels=16, reduction=4)
         x = torch.randn(1, 16, 4, 8, 8)
         y = se(x)
@@ -379,7 +379,7 @@ class TestSEBlock:
 # ---------------------------------------------------------------------------
 class TestScheduler:
     def test_cosine_warm_restarts(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         from segtask_v1.trainer import build_scheduler
         cfg = Config()
         cfg.data.label_values = [0, 1]
@@ -402,7 +402,7 @@ class TestScheduler:
         assert optimizer.param_groups[0]["lr"] != 0.01
 
     def test_one_cycle_pct_start_follows_warmup_epochs(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         from segtask_v1.trainer import build_scheduler
 
         cfg = Config()
@@ -430,7 +430,7 @@ class TestScheduler:
 # ---------------------------------------------------------------------------
 class TestRegionWeights:
     def test_compute_region_weight_map(self):
-        from segtask_v1.data.dataset import compute_region_weight_map
+        from taskcore.data.dataset import compute_region_weight_map
         vol = np.array([[[0, 1], [2, 0]]], dtype=np.float32)  # (1, 2, 2)
         wmap = compute_region_weight_map(vol, [0, 1, 2], [1.0, 3.0, 2.0])
         assert wmap.shape == (1, 1, 2, 2)
@@ -495,7 +495,7 @@ class TestRegionWeights:
 # ---------------------------------------------------------------------------
 class TestNewAugmentation:
     def test_per_sample_flip(self):
-        from segtask_v1.data.augment import _random_flip
+        from taskcore.data.augment import _random_flip
         torch.manual_seed(0)
         img = torch.arange(24).reshape(2, 1, 3, 2, 2).float()
         lbl = img.clone()
@@ -506,7 +506,7 @@ class TestNewAugmentation:
 
     def test_affine_shapes(self):
         # 旧 _random_affine / _elastic_deform 已融合为 _random_affine_elastic。
-        from segtask_v1.data.augment import _random_affine_elastic
+        from taskcore.data.augment import _random_affine_elastic
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.zeros(2, 2, 16, 32, 32)
         img_a, lbl_a, _ = _random_affine_elastic(
@@ -517,7 +517,7 @@ class TestNewAugmentation:
         assert lbl_a.shape == lbl.shape
 
     def test_elastic_deform_shapes(self):
-        from segtask_v1.data.augment import _random_affine_elastic
+        from taskcore.data.augment import _random_affine_elastic
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.zeros(2, 2, 16, 32, 32)
         img_e, lbl_e, _ = _random_affine_elastic(
@@ -528,7 +528,7 @@ class TestNewAugmentation:
         assert lbl_e.shape == lbl.shape
 
     def test_grid_dropout_shapes(self):
-        from segtask_v1.data.augment import _grid_dropout
+        from taskcore.data.augment import _grid_dropout
         img = torch.randn(2, 1, 16, 32, 32)
         lbl = torch.ones(2, 2, 16, 32, 32)
         img_d, lbl_d, _ = _grid_dropout(img.clone(), lbl.clone(), prob=1.0, ratio=0.3, num_holes=4)
@@ -539,14 +539,14 @@ class TestNewAugmentation:
         assert img_d.sum() < img.sum()
 
     def test_simulate_lowres(self):
-        from segtask_v1.data.augment import _simulate_lowres
+        from taskcore.data.augment import _simulate_lowres
         img = torch.randn(2, 1, 16, 32, 32)
         img_lr = _simulate_lowres(img.clone(), prob=1.0, zoom_range=[0.3, 0.5])
         assert img_lr.shape == img.shape
 
     def test_full_augmentor_pipeline(self):
-        from segtask_v1.config import AugConfig
-        from segtask_v1.data.augment import GPUAugmentor
+        from taskcore.config.core import AugConfig
+        from taskcore.data.augment import GPUAugmentor
         cfg = AugConfig(
             enabled=True, random_flip_prob=0.5,
             random_affine_prob=0.5, elastic_deform_prob=0.3,
@@ -618,7 +618,7 @@ class TestPredictor:
 # ---------------------------------------------------------------------------
 class TestCubicDataset:
     def test_extract_cubic_patch_normal(self):
-        from segtask_v1.data.dataset import _extract_cubic_patch
+        from taskcore.data.dataset import _extract_cubic_patch
         vol = np.random.rand(100, 80, 80).astype(np.float32)
         patch = _extract_cubic_patch(vol, (50, 40, 40), (32, 32, 32))
         assert patch.shape == (32, 32, 32)
@@ -628,7 +628,7 @@ class TestCubicDataset:
         edge-replication (see dataset.py docstring — avoids the anisotropic
         stretch artefact that clip-then-resize produced at volume corners).
         """
-        from segtask_v1.data.dataset import _extract_cubic_patch
+        from taskcore.data.dataset import _extract_cubic_patch
         vol = np.random.rand(20, 20, 20).astype(np.float32)
         # Center near corner → padded with edge-replicated voxels.
         patch = _extract_cubic_patch(vol, (2, 2, 2), (32, 32, 32))
@@ -640,14 +640,14 @@ class TestCubicDataset:
         Because the input is a constant-1 volume, the padded output must
         be all-ones as well (a strict correctness check on the pad mode).
         """
-        from segtask_v1.data.dataset import _extract_cubic_patch
+        from taskcore.data.dataset import _extract_cubic_patch
         vol = np.ones((10, 10, 10), dtype=np.float32)
         patch = _extract_cubic_patch(vol, (5, 5, 5), (32, 32, 32))
         assert patch.shape == (32, 32, 32)
         assert np.all(patch == 1.0)
 
     def test_cubic_dataset_getitem(self):
-        from segtask_v1.data.dataset import SegDataset3DCubic
+        from taskcore.data.dataset import SegDataset3DCubic
         # Create small temp volumes
         img = np.random.rand(50, 40, 40).astype(np.float32)
         lbl = np.zeros((50, 40, 40), dtype=np.float32)
@@ -671,7 +671,7 @@ class TestCubicDataset:
         Only the depth axis may be oversampled — H, W already land at
         patch_size in-plane since the window slides along z only.
         """
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         ds = SegDataset3D.__new__(SegDataset3D)
         ds.patch_size = (16, 128, 128)
         ds.oversample = 1.5
@@ -684,7 +684,7 @@ class TestCubicDataset:
 
     def test_z_axis_dataset_getitem_shape(self):
         """z_axis sample shape: (1, eD, pH, pW) with full-res H,W collapsed."""
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         # Anisotropic volume — H,W far larger than patch H,W to prove
         # in-plane full-size extraction then resize in one step.
         img = np.random.rand(60, 256, 256).astype(np.float32)
@@ -708,7 +708,7 @@ class TestCubicDataset:
 
     def test_z_axis_dataset_no_oversample(self):
         """oversample=1.0 → extract_size == patch_size exactly on all axes."""
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         ds = SegDataset3D.__new__(SegDataset3D)
         ds.patch_size = (32, 96, 96)
         ds.oversample = 1.0
@@ -718,7 +718,7 @@ class TestCubicDataset:
 
     def test_z_axis_multires_shape_default_is_backward_compatible(self):
         """Default multi_res_scales=[1.0] must produce the legacy 1-channel shape."""
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         img = np.random.rand(60, 128, 128).astype(np.float32)
         lbl = np.zeros((60, 128, 128), dtype=np.float32)
         lbl[20:40, 40:80, 40:80] = 1.0
@@ -738,7 +738,7 @@ class TestCubicDataset:
     def test_z_axis_multires_shape_three_scales(self):
         """multi_res_scales=[1.0, 1.5, 2.0] → dataset 发单 max-FOV cube
         (1, round(eD*max_scale), pH, pW)，trainer 侧再中心裁拆视图。"""
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         img = np.random.rand(80, 128, 128).astype(np.float32)
         lbl = np.zeros((80, 128, 128), dtype=np.float32)
         lbl[30:50, 40:80, 40:80] = 1.0
@@ -762,7 +762,7 @@ class TestCubicDataset:
         """Scale > 1 extraction at volume boundary must return EXACTLY D_patch
         slices (edge-padded), preserving physical z-FOV vs. clamp-and-stretch.
         """
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         ds = SegDataset3D.__new__(SegDataset3D)
         # Small volume so scale=2 around center exceeds bounds.
         img = np.arange(20 * 4 * 4, dtype=np.float32).reshape(20, 4, 4)
@@ -790,7 +790,7 @@ class TestCubicDataset:
     def test_z_axis_multires_scale1_matches_legacy(self):
         """多分辨率 max-FOV cube 的中心 eD 层必须与单分辨率抽取位对位一致
         （scale-1 视图 = 中心裁，确认视图 0 与 legacy 单分辨率兼容）。"""
-        from segtask_v1.data.dataset import SegDataset3D
+        from taskcore.data.dataset import SegDataset3D
         np.random.seed(0)
         img = np.random.rand(50, 64, 64).astype(np.float32)
         lbl = np.zeros((50, 64, 64), dtype=np.float32)
@@ -875,7 +875,7 @@ class TestCubicDataset:
         extract_size (no cropping, no sliding). Output shape matches the
         single-channel z_axis contract for interoperability.
         """
-        from segtask_v1.data.dataset import SegDataset3DWhole
+        from taskcore.data.dataset import SegDataset3DWhole
         img = np.random.rand(70, 90, 90).astype(np.float32)
         lbl = np.zeros((70, 90, 90), dtype=np.float32)
         lbl[20:50, 30:60, 30:60] = 1.0
@@ -896,7 +896,7 @@ class TestCubicDataset:
 
     def test_whole_dataset_oversample(self):
         """Oversample inflates all 3 axes so the trainer can center-crop."""
-        from segtask_v1.data.dataset import SegDataset3DWhole
+        from taskcore.data.dataset import SegDataset3DWhole
         img = np.random.rand(30, 40, 40).astype(np.float32)
         lbl = np.zeros((30, 40, 40), dtype=np.float32)
 
@@ -914,7 +914,7 @@ class TestCubicDataset:
 
     def test_whole_mode_config_rejects_multires(self):
         """Whole-volume mode must reject multi_res_scales beyond [1.0]."""
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -926,7 +926,7 @@ class TestCubicDataset:
 
     def test_whole_mode_config_single_res_passes(self):
         """Whole-volume + default [1.0] validates cleanly."""
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -938,7 +938,7 @@ class TestCubicDataset:
     def test_config_z_axis_multires_allowed(self):
         """z_axis + multi_res_scales>1 should now validate and auto-sync
         model.in_channels = len(scales)."""
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -949,7 +949,7 @@ class TestCubicDataset:
         assert cfg.model.in_channels == 3
 
     def test_cubic_dataset_oversample(self):
-        from segtask_v1.data.dataset import SegDataset3DCubic
+        from taskcore.data.dataset import SegDataset3DCubic
         img = np.random.rand(80, 60, 60).astype(np.float32)
         lbl = np.zeros((80, 60, 60), dtype=np.float32)
         lbl[30:50, 20:40, 20:40] = 1.0
@@ -970,7 +970,7 @@ class TestCubicDataset:
             assert sample["image"].shape == (1, eD, eH, eW)
 
     def test_config_patch_mode_validation(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -1049,7 +1049,7 @@ class TestTrainerCenterCrop:
 class TestMultiResolution:
     def test_multi_res_loss(self):
         from segtask_v1.losses.losses import build_loss, MultiResolutionLoss
-        from segtask_v1.config import LossConfig
+        from taskcore.config.core import LossConfig
         base = build_loss(LossConfig(name="dice_bce"))
         mr_loss = MultiResolutionLoss(
             base_loss=base, num_fg_classes=2, num_res=3, label_values=[0, 1, 2])
@@ -1075,7 +1075,7 @@ class TestMultiResolution:
         assert binary[0, 0, 0, 0] == 0.0  # bg
 
     def test_config_multi_res_sync(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1, 2]
         cfg.data.num_classes = 3
@@ -1085,7 +1085,7 @@ class TestMultiResolution:
         assert cfg.model.in_channels == 3
 
     def test_config_multi_res_validates_scales(self):
-        from segtask_v1.config import Config
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
@@ -1095,8 +1095,8 @@ class TestMultiResolution:
             cfg.validate()
 
     def test_model_output_channels(self):
-        from segtask_v1.config import Config
-        from segtask_v1.models.factory import build_model
+        from taskcore.config.core import Config
+        from taskcore.models.factory import build_model
         cfg = Config()
         cfg.data.label_values = [0, 1, 2]
         cfg.data.num_classes = 3

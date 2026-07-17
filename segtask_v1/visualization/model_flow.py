@@ -25,8 +25,8 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
-from ..config import Config
-from ..models.topology import ModelTopology, build_topology
+from taskcore.config.core import Config
+from taskcore.models.topology import ModelTopology, build_topology
 from .data_flow import _model_input_shape
 from .graph import VisGraph, shape_str
 

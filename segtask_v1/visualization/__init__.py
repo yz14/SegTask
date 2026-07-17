@@ -15,8 +15,8 @@ from typing import Optional
 
 import torch.nn as nn
 
-from ..config import Config
-from ..models.topology import build_topology
+from taskcore.config.core import Config
+from taskcore.models.topology import build_topology
 from .data_flow import build_data_flow
 from .graph import VisGraph
 from .model_flow import build_model_flow

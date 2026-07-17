@@ -15,9 +15,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from segtask_v1.config import Config
+from taskcore.config.core import Config
 from segtask_v1.data import specs as specs_mod
-from segtask_v1.data.specs import (
+from taskcore.data.specs import (
     CubicSpec, DatasetCommonCfg, SplitPaths, WholeSpec, ZCubeSpec,
     build_data_spec,
 )

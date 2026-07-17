@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from segtask_v1.trainer.checkpoint import (
+from taskcore.engine.checkpoint import (
     pack_rng_state_for_save,
     relocate_optimizer_state,
     restore_rng_state,

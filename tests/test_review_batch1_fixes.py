@@ -108,7 +108,7 @@ def test_prob_to_label_per_class_threshold_equality_is_background():
 # P2-08: checkpoint 原子写
 # ---------------------------------------------------------------------------
 def test_atomic_torch_save_writes_loadable_file_and_leaves_no_tmp():
-    from segtask_v1.trainer.checkpoint import atomic_torch_save
+    from taskcore.engine.checkpoint import atomic_torch_save
 
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "best_model.pth"
@@ -120,7 +120,7 @@ def test_atomic_torch_save_writes_loadable_file_and_leaves_no_tmp():
 
 
 def test_atomic_torch_save_failure_preserves_previous_checkpoint():
-    from segtask_v1.trainer.checkpoint import atomic_torch_save
+    from taskcore.engine.checkpoint import atomic_torch_save
 
     class _Unpicklable:
         def __reduce__(self):
@@ -137,7 +137,7 @@ def test_atomic_torch_save_failure_preserves_previous_checkpoint():
 
 
 def test_async_checkpoint_saver_uses_atomic_write():
-    from segtask_v1.trainer.checkpoint import AsyncCheckpointSaver
+    from taskcore.engine.checkpoint import AsyncCheckpointSaver
 
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "checkpoint_epoch_1.pth"

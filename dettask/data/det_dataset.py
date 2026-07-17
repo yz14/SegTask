@@ -40,7 +40,7 @@ import torch
 from scipy import ndimage
 from torch.utils.data import Dataset
 
-from segtask_v1.data.dataset import (
+from taskcore.data.dataset import (
     VolumeCache,
     _halton,
     _open_npz,
