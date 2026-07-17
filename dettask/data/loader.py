@@ -5,13 +5,17 @@ from __future__ import annotations
 import logging
 from typing import List, Tuple
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 import numpy as np
 
 from taskcore.config.core import Config as SegConfig
 from taskcore.data.dataset import _open_npz
-from taskcore.data.loader import train_val_split
+from taskcore.data.loader import (
+    ValBatchShardSampler,
+    scaled_num_workers,
+    train_val_split,
+)
 
 from clstask.data.cls_dataset import derive_volume_targets
 from clstask.data.loader import discover_npz, stratified_split
@@ -48,7 +52,13 @@ def _det_split_keys(paths: List[str], fg_values: List[float]) -> List[str]:
 
 
 def build_det_dataloaders(
-    cfg: SegConfig, det: DetConfig) -> Tuple[DataLoader, DataLoader]:
+    cfg: SegConfig, det: DetConfig,
+    rank: int = 0, world_size: int = 1,
+) -> Tuple[DataLoader, DataLoader]:
+    """``world_size > 1``（DDP）时：训练集用 ``DistributedSampler`` 不相交
+    切分到各 rank（每 epoch 需在外层 ``set_epoch``）；验证集用
+    ``ValBatchShardSampler`` 按 batch 块不相交切分，指标在训练器内跨 rank
+    聚合。单进程路径零变化。"""
     dc = cfg.data
     paths = discover_npz(dc.npz_dir, dc.npz_suffix)
     fg_values_split = [float(v) for v in (dc.label_values[1:] if
@@ -107,19 +117,37 @@ def build_det_dataloaders(
 
     train_ds = _mk(train_paths, True)
     val_ds = _mk(val_paths, False)
+    eff_num_workers = scaled_num_workers(
+        dc.num_workers, world_size,
+        bool(cfg.train.ddp_scale_dataloader_per_rank))
     common = dict(
-        num_workers=dc.num_workers,
+        num_workers=eff_num_workers,
         pin_memory=dc.pin_memory,
         collate_fn=det_collate,
-        persistent_workers=dc.persistent_workers and dc.num_workers > 0)
-    if dc.num_workers > 0:
+        persistent_workers=dc.persistent_workers and eff_num_workers > 0)
+    if eff_num_workers > 0:
         common["prefetch_factor"] = dc.prefetch_factor
-    train_loader = DataLoader(
-        train_ds, batch_size=dc.batch_size, shuffle=True, drop_last=False,
-        **common)
-    val_loader = DataLoader(
-        val_ds, batch_size=dc.batch_size, shuffle=False, drop_last=False,
-        **common)
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True)
+        train_loader = DataLoader(
+            train_ds, batch_size=dc.batch_size, sampler=train_sampler,
+            drop_last=True, **common)
+        val_loader = DataLoader(
+            val_ds, batch_size=dc.batch_size,
+            sampler=ValBatchShardSampler(
+                len(val_ds), dc.batch_size, rank, world_size),
+            drop_last=False, **common)
+        logger.info("dettask DDP samplers: rank=%d/%d, ~%d train samples/rank",
+                    rank, world_size, len(train_sampler))
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=dc.batch_size, shuffle=True, drop_last=False,
+            **common)
+        val_loader = DataLoader(
+            val_ds, batch_size=dc.batch_size, shuffle=False, drop_last=False,
+            **common)
     logger.info("dettask loaders: %d train / %d val volume(s)",
                 len(train_paths), len(val_paths))
     return train_loader, val_loader

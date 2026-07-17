@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
-from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -21,9 +19,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from taskcore.utils.logging_utils import setup_logging as _setup_logging
-from segtask_v1.train import (
-    _find_free_port, _install_parent_death_signal, _install_term_handlers,
-    _maybe_enable_expandable_segments)
+from taskcore.engine.launch import (
+    find_free_port, finalize_ddp_worker, init_ddp_worker,
+    maybe_enable_expandable_segments)
 from taskcore.utils.common import seed_everything
 
 from .config import apply_overrides, load_config, save_config, validate_ssl
@@ -54,20 +52,8 @@ def _build_and_fit(cfg, ssl, device: torch.device):
 def _pretrain_worker(local_rank: int, gpus: list, cfg, ssl,
                      log_level: str, master_port: int) -> None:
     """每个 DDP 进程的入口（由 mp.spawn 调用，与 segtask train.py 同模式）。"""
-    physical_gpu = int(gpus[local_rank])
     world_size = len(gpus)
-
-    _install_parent_death_signal()
-    _install_term_handlers()
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ["MASTER_PORT"] = str(master_port)
-
-    torch.cuda.set_device(physical_gpu)
-    dist.init_process_group(
-        backend="nccl", world_size=world_size, rank=local_rank,
-        timeout=timedelta(minutes=int(cfg.train.ddp_timeout_minutes)))
-    device = torch.device(f"cuda:{physical_gpu}")
+    device = init_ddp_worker(local_rank, gpus, cfg, master_port)
 
     if local_rank == 0:
         setup_logging(cfg.train.output_dir, log_level)
@@ -86,13 +72,7 @@ def _pretrain_worker(local_rank: int, gpus: list, cfg, ssl,
         _build_and_fit(cfg, ssl, device)
         completed = True
     finally:
-        if dist.is_initialized():
-            if completed:
-                try:
-                    dist.barrier()
-                except Exception:
-                    pass
-            dist.destroy_process_group()
+        finalize_ddp_worker(completed)
 
 
 def main():
@@ -109,13 +89,13 @@ def main():
         cfg.validate()
         validate_ssl(ssl, cfg)
 
-    _maybe_enable_expandable_segments(cfg)
+    maybe_enable_expandable_segments(cfg)
 
     gpus = [int(g) for g in cfg.train.gpus]
     cuda_ok = torch.cuda.is_available()
     if cuda_ok and len(gpus) >= 2:
         # 多卡 DDP：每卡 spawn 一个进程（与 segtask train.py 同模式）。
-        master_port = int(cfg.train.ddp_master_port) or _find_free_port()
+        master_port = int(cfg.train.ddp_master_port) or find_free_port()
         mp.spawn(
             _pretrain_worker,
             args=(gpus, cfg, ssl, args.log_level, master_port),

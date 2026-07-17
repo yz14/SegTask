@@ -36,6 +36,7 @@ from taskcore.engine.checkpoint import (
     state_to_cpu, unwrap_compile,
 )
 from .pipelines import build_pipeline
+from taskcore.engine.dist_utils import all_reduce_meters_, shard_for_rank
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.base_trainer import BaseTrainer
 
@@ -401,6 +402,9 @@ class GenerationTrainer(BaseTrainer):
                     float(ssim(rec, hr_m, self.spatial_dims, data_range=dr)),
                     hr_m.shape[0])
                 base_m.update(float(psnr(lr_m, hr_m, data_range=dr)), hr_m.shape[0])
+            # DDP：val 集按 batch 块分片到各 rank，(sum, count) 跨 rank 求和
+            # 后 avg 即全集加权均值，选模/早停决策各 rank 天然一致。
+            all_reduce_meters_([psnr_m, ssim_m, base_m], self.device)
             metrics = {"psnr": psnr_m.avg, "ssim": ssim_m.avg,
                        "psnr_lr": base_m.avg}
             if self.val_full_volume:
@@ -441,7 +445,8 @@ class GenerationTrainer(BaseTrainer):
             n = min(n, limit)
         psnr_m, ssim_m, base_m = AverageMeter(), AverageMeter(), AverageMeter()
         dr = self.val_data_range
-        for i in range(n):
+        # DDP：整卷列表不相交切给各 rank，逐卷指标经 all-reduce 汇总。
+        for i in shard_for_rank(list(range(n))):
             hr_np = ds._load_image(i)
             cond_np = ds._load_cond(i)
             hr = torch.from_numpy(
@@ -473,10 +478,13 @@ class GenerationTrainer(BaseTrainer):
             psnr_m.update(float(psnr(rec, hr_t, data_range=dr)))
             ssim_m.update(float(ssim(rec, hr_t, 3, data_range=dr)))
             base_m.update(float(psnr(lr_up, hr_t, data_range=dr)))
+        all_reduce_meters_([psnr_m, ssim_m, base_m], self.device)
         return {"vol_psnr": psnr_m.avg, "vol_ssim": ssim_m.avg,
                 "vol_psnr_lr": base_m.avg}
 
     def _save_best(self, epoch: int) -> None:
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         bare = unwrap_compile(self.model)
         state = {
             "epoch": epoch,
@@ -504,6 +512,8 @@ class GenerationTrainer(BaseTrainer):
     # ------------------------------------------------------------------
     def _save_checkpoint(self, epoch: int) -> None:
         """周期保存可续训 checkpoint（模型 + optimizer/scheduler/scaler/EMA）。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         bare = unwrap_compile(self.model)
         state = {
             "epoch": epoch,
@@ -531,6 +541,8 @@ class GenerationTrainer(BaseTrainer):
 
     def _save_history(self) -> None:
         """逐 epoch 指标落盘 history.json（原子替换）。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         path = self.output_dir / "history.json"
         tmp = path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:

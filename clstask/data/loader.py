@@ -14,10 +14,14 @@ import os
 from typing import List, Sequence, Tuple
 
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from taskcore.config.core import Config as SegConfig
-from taskcore.data.loader import train_val_split
+from taskcore.data.loader import (
+    ValBatchShardSampler,
+    scaled_num_workers,
+    train_val_split,
+)
 
 from ..config import ClsConfig, resolve_num_classes
 from .cls_dataset import (
@@ -86,8 +90,15 @@ def _split_keys(paths: Sequence[str], cfg: SegConfig, cls: ClsConfig,
 
 
 def build_cls_dataloaders(
-    cfg: SegConfig, cls: ClsConfig) -> Tuple[DataLoader, DataLoader]:
-    """按 ``(cfg, cls)`` 构造 train/val DataLoader。"""
+    cfg: SegConfig, cls: ClsConfig,
+    rank: int = 0, world_size: int = 1,
+) -> Tuple[DataLoader, DataLoader]:
+    """按 ``(cfg, cls)`` 构造 train/val DataLoader。
+
+    ``world_size > 1``（DDP）时：训练集用 ``DistributedSampler`` 不相交切分
+    到各 rank（每 epoch 需在外层 ``set_epoch``）；验证集用
+    ``ValBatchShardSampler`` 按 batch 块不相交切分，指标在训练器内跨 rank
+    聚合。单进程路径零变化。"""
     dc = cfg.data
     paths = discover_npz(dc.npz_dir, dc.npz_suffix)
     num_classes = resolve_num_classes(cls, cfg)
@@ -151,18 +162,36 @@ def build_cls_dataloaders(
 
     train_ds = _mk(train_paths, True)
     val_ds = _mk(val_paths, False)
+    eff_num_workers = scaled_num_workers(
+        dc.num_workers, world_size,
+        bool(cfg.train.ddp_scale_dataloader_per_rank))
     common = dict(
-        num_workers=dc.num_workers,
+        num_workers=eff_num_workers,
         pin_memory=dc.pin_memory,
-        persistent_workers=dc.persistent_workers and dc.num_workers > 0)
-    if dc.num_workers > 0:
+        persistent_workers=dc.persistent_workers and eff_num_workers > 0)
+    if eff_num_workers > 0:
         common["prefetch_factor"] = dc.prefetch_factor
-    train_loader = DataLoader(
-        train_ds, batch_size=dc.batch_size, shuffle=True, drop_last=False,
-        **common)
-    val_loader = DataLoader(
-        val_ds, batch_size=dc.batch_size, shuffle=False, drop_last=False,
-        **common)
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True)
+        train_loader = DataLoader(
+            train_ds, batch_size=dc.batch_size, sampler=train_sampler,
+            drop_last=True, **common)
+        val_loader = DataLoader(
+            val_ds, batch_size=dc.batch_size,
+            sampler=ValBatchShardSampler(
+                len(val_ds), dc.batch_size, rank, world_size),
+            drop_last=False, **common)
+        logger.info("clstask DDP samplers: rank=%d/%d, ~%d train samples/rank",
+                    rank, world_size, len(train_sampler))
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=dc.batch_size, shuffle=True, drop_last=False,
+            **common)
+        val_loader = DataLoader(
+            val_ds, batch_size=dc.batch_size, shuffle=False, drop_last=False,
+            **common)
     logger.info("clstask loaders: %d train / %d val volume(s), K=%d",
                 len(train_paths), len(val_paths), num_classes)
     return train_loader, val_loader

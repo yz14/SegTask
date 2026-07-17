@@ -208,7 +208,9 @@ def test_harmonic_mean_metrics_extremes_and_mid():
 # 5. Config 新选模标准映射 & 校验
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("crit,expected_metric,expected_mode", [
-    ("loss",              "val_loss",       "min"),
+    # loss → val_base_loss：只看主任务损失（不含深监督/aux/正则等附加项），
+    # 口径稳定、跨配置可比；总损失 val_loss 会随辅助项权重日程漂移。
+    ("loss",              "val_base_loss",  "min"),
     ("dice",              "mean_dice",      "max"),
     ("dice+surface_dice", "mean_combined",  "max"),
     ("iou",               "mean_iou",       "max"),

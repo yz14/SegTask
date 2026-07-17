@@ -22,6 +22,8 @@ __all__ = [
     "all_reduce_sum_",
     "all_reduce_flag_any",
     "all_reduce_bn_running_stats_",
+    "all_gather_objects",
+    "all_reduce_meters_",
     "shard_for_rank",
 ]
 
@@ -110,6 +112,34 @@ def all_reduce_bn_running_stats_(bn_modules: List) -> None:
             m.running_var.copy_(
                 (var_w / n_total).to(m.running_var.dtype))
         all_reduce_sum_(n)
+
+
+def all_gather_objects(obj) -> List:
+    """各 rank 的 obj 汇总为按 rank 排序的 list；非分布式时返回 ``[obj]``。
+
+    用于验证集分片后把各 rank 的预测/真值聚齐，再在每个 rank 上算不可
+    分解指标（AUC / mAP 等），使选模/早停决策各 rank 天然一致。对象经
+    pickle 传输，应事先搬到 CPU、保持小体积。"""
+    if not is_dist_avail_and_initialized():
+        return [obj]
+    out: List = [None] * dist.get_world_size()
+    dist.all_gather_object(out, obj)
+    return out
+
+
+def all_reduce_meters_(meters: List, device: torch.device) -> None:
+    """把一组 ``AverageMeter`` 的 (sum, count) 跨 rank 求和（就地写回）。
+
+    各 rank 看不同验证分片时，reduce 后 ``avg`` 即全集加权均值，且各 rank
+    一致；非分布式时 no-op。"""
+    if not is_dist_avail_and_initialized():
+        return
+    vals = torch.tensor(
+        [x for m in meters for x in (float(m.sum), float(m.count))],
+        dtype=torch.float64, device=device)
+    dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+    for i, m in enumerate(meters):
+        m.sum, m.count = float(vals[2 * i]), int(vals[2 * i + 1])
 
 
 def shard_for_rank(items: List) -> List:

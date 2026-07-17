@@ -40,6 +40,7 @@ from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
     state_to_cpu, unwrap_compile,
 )
+from taskcore.engine.dist_utils import all_gather_objects
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.optim import (
     WarmupScheduler,
@@ -436,11 +437,29 @@ class ClsTrainer(BaseTrainer):
             all_logits.append(logits.float().cpu())
             all_targets.append(target.cpu())
             all_vols.append(batch["vol_idx"].cpu())
-        if not all_logits:
+        if not all_logits and not self._is_dist:
             raise RuntimeError("validation loader yielded no batches.")
-        logits = torch.cat(all_logits)
-        targets = torch.cat(all_targets)
-        vols = torch.cat(all_vols)
+        # DDP：val 集按 batch 块分片到各 rank；把 (logits, targets, vols,
+        # loss 累计) 聚齐后在每个 rank 上算全集指标（AUC/F1 不可分解，
+        # 不能逐 rank 算后平均），选模/早停决策各 rank 天然一致。
+        parts = all_gather_objects({
+            "logits": (torch.cat(all_logits) if all_logits
+                       else torch.empty(0)),
+            "targets": (torch.cat(all_targets) if all_targets
+                        else torch.empty(0, dtype=torch.long)),
+            "vols": (torch.cat(all_vols) if all_vols
+                     else torch.empty(0, dtype=torch.long)),
+            "loss_sum": float(loss_meter.sum),
+            "loss_count": int(loss_meter.count),
+        })
+        parts = [p for p in parts if p["loss_count"] > 0 or len(p["logits"])]
+        if not parts:
+            raise RuntimeError("validation loader yielded no batches.")
+        logits = torch.cat([p["logits"] for p in parts])
+        targets = torch.cat([p["targets"] for p in parts])
+        vols = torch.cat([p["vols"] for p in parts])
+        loss_meter.sum = sum(p["loss_sum"] for p in parts)
+        loss_meter.count = sum(p["loss_count"] for p in parts)
         if self.single_label:
             probs = torch.softmax(logits, dim=1)
             m = singlelabel_metrics(probs, targets)
@@ -498,6 +517,8 @@ class ClsTrainer(BaseTrainer):
         """best checkpoint（口径同 seg：EMA 为主）：启用 EMA 时
         ``model_state_dict`` 存 EMA 权重（与选模/部署一致），在线权重另存
         ``model_online_state_dict``。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         bare = unwrap_compile(self.model)
         if self.ema is not None:
             online_sd = {k: v.detach().cpu().clone()
@@ -540,6 +561,8 @@ class ClsTrainer(BaseTrainer):
         """latest checkpoint（续训用，口径同 seg）：在线权重 + EMA +
         optimizer/scheduler/scaler/epoch/best 状态/history 全量落盘；先写
         临时文件再原子替换，防中断留半个 checkpoint。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         bare = unwrap_compile(self.model)
         state = {
             "epoch": epoch,
@@ -584,6 +607,8 @@ class ClsTrainer(BaseTrainer):
             self.best_sign * self.best_metric, self.best_epoch + 1)
 
     def _write_history(self) -> None:
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         (self.output_dir / "history.json").write_text(
             json.dumps(self.history, indent=2), encoding="utf-8")
 

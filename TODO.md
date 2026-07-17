@@ -76,7 +76,16 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 - 修复：MixedSampler `super().__init__(data_source=None)` 新版 torch 兼容（改无参）；taskcore 内残留 segtask_v1 文案/类型注解清理；factory 的 MultiRF decoder TODO 改为明确能力边界说明。  
 - 回归：全量 pytest 1341 过 / 12 失败 / 3 跳过；12 个失败（11 个 test_model_flow 可视化 + 1 个 save_best_criterion 映射）在重构前基线上逐项复现，均为既有问题（test_model_flow 与 todo4 相关，建议先查）。
 
-仍留在任务层（语义差异，未强行合并）：滑窗推理全家桶（seg 与 gen 几何语义差异大）；SSL 的手动梯度 all-reduce（多 forward 入口无法套 DDP 单入口假设）；cls/det/gen 入口尚未提供多进程启动（DDP 装配已就绪，单卡路径零变化）。
+第三轮补齐（本轮）：  
+- 选模口径定案：`save_best_criterion="loss"` 统一映射 `val_base_loss`（只看主任务损失，不含深监督/aux/正则附加项，口径稳定跨配置可比）；测试期望已同步（此前唯一非 model_flow 既有失败已消除）。  
+- 多卡启动公共化：新建 `taskcore/engine/launch.py`（空闲端口、孤儿进程兜底 PR_SET_PDEATHSIG、SIGTERM/SIGINT 处理、allocator 碎片治理、`init_ddp_worker`/`finalize_ddp_worker`），原 seg 独有启动工程下沉；seg train / ssl pretrain 改用公用件。  
+- cls/det/gen 多进程入口：三个 train 入口接入与 seg 同模式的 `mp.spawn` DDP 启动（YAML 配 `train.gpus` 即启用；单卡/CPU 路径零变化）；单卡时支持 `gpus: [k]` 指定物理卡。  
+- 数据切分：cls/det/gen 的 dataloader 工厂新增 `rank/world_size`，多卡时训练集用 `DistributedSampler`（set_epoch 已由 `_setup_train_sampler` 接好）、验证集用 `ValBatchShardSampler` 按 batch 块不相交切分，num_workers 按卡数平摊（同 seg）。  
+- 验证指标全局归约：dist_utils 新增 `all_gather_objects`/`all_reduce_meters_`；cls（logits/targets/vols 聚齐后算全集 AUC/F1 等不可分解指标）、det（预测/真值聚齐后算全集 mAP）、gen（PSNR/SSIM meter 加权 all-reduce；整卷验证逐 rank 切分后汇总）；选模/早停决策各 rank 天然一致。  
+- 落盘 rank0 守卫：cls/det/gen 的 best/latest checkpoint、history、resolved config 仅 rank0 写。  
+- 验证：全量 pytest 1342 过 / 11 失败（均为既有 test_model_flow）/ 3 跳过；另经 2 进程 gloo smoke 验证 all_gather/all_reduce/分片聚合与单进程全集等价。多 GPU 真机验证待有卡环境进行。
+
+仍留在任务层（语义差异，未强行合并，已定案保持独立）：滑窗推理全家桶（seg 与 gen 几何语义差异大）；SSL 的手动梯度 all-reduce（多 forward 入口无法套 DDP 单入口假设）。
 
 
 4 模型流可视化需要有层次化，结构化，美化，可以清晰看到计算流的走向，可以清晰理解模型架构，可以清晰的溯源。总之：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判、讨厌"自动布局默认输出"式的无设计感结果。以下是一些例子：  

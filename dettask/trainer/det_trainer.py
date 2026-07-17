@@ -34,6 +34,7 @@ from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
     state_to_cpu, unwrap_compile,
 )
+from taskcore.engine.dist_utils import all_gather_objects
 from taskcore.engine.optim import build_optimizer, build_scheduler
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.utils.common import AverageMeter
@@ -318,9 +319,22 @@ class DetTrainer(BaseTrainer):
                 logger.warning("Non-finite val loss (%s) at epoch %d; "
                                "excluded from val_loss.", loss_val,
                                epoch + 1)
-            preds.extend(dets)
+            preds.extend([{k: v.cpu() for k, v in d.items()}
+                          for d in dets])
             gts.extend([(b.cpu(), l.cpu())
                         for b, l in zip(boxes, labels)])
+        # DDP：val 集按 batch 块分片到各 rank；把预测/真值聚齐后在每个
+        # rank 上算全集 mAP（AP 不可分解，不能逐 rank 算后平均），选模/
+        # 早停决策各 rank 天然一致。
+        parts = all_gather_objects({
+            "preds": preds, "gts": gts,
+            "loss_sum": float(loss_meter.sum),
+            "loss_count": int(loss_meter.count),
+        })
+        preds = [d for p in parts for d in p["preds"]]
+        gts = [g for p in parts for g in p["gts"]]
+        loss_meter.sum = sum(p["loss_sum"] for p in parts)
+        loss_meter.count = sum(p["loss_count"] for p in parts)
         m = detection_map(preds, gts, self.num_classes,
                           self.det.eval_iou_thresh)
         m["loss"] = loss_meter.avg
@@ -330,6 +344,8 @@ class DetTrainer(BaseTrainer):
         """best checkpoint（口径同 seg：EMA 为主）：启用 EMA 时
         ``model_state_dict`` 存 EMA 权重（与选模/部署一致），在线权重另存
         ``model_online_state_dict``。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         bare = unwrap_compile(self.model)
         if self.ema is not None:
             online_sd = {k: v.detach().cpu().clone()
@@ -372,6 +388,8 @@ class DetTrainer(BaseTrainer):
         """latest checkpoint（续训用，口径同 seg）：在线权重 + EMA +
         optimizer/scheduler/scaler/epoch/best 状态/history 全量落盘；先写
         临时文件再原子替换，防中断留半个 checkpoint。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         bare = unwrap_compile(self.model)
         state = {
             "epoch": epoch,
@@ -416,6 +434,8 @@ class DetTrainer(BaseTrainer):
             self.best_sign * self.best_metric, self.best_epoch + 1)
 
     def _write_history(self) -> None:
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
         (self.output_dir / "history.json").write_text(
             json.dumps(self.history, indent=2), encoding="utf-8")
 

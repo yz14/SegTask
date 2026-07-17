@@ -9,7 +9,9 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 SuffixSpec = Union[str, Sequence[str]]
 
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
+
+from taskcore.data.loader import ValBatchShardSampler, scaled_num_workers
 
 from ..config import Config
 from .dataset import load_nifti, load_npz_label_for_split
@@ -114,9 +116,16 @@ def discover_npz_samples(
     return [str(p) for p in paths]
 
 
-def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
+def build_dataloaders(
+    cfg: Config, rank: int = 0, world_size: int = 1,
+) -> Tuple[DataLoader, DataLoader]:
     """构建 train/val DataLoader。训练仅读 npz：data.npz_dir 必须设。
-    目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。"""
+    目录为空且 npz_auto_build=True 时，从 NIfTI 目录内联调 make_data.prepare_dataset 生成。
+
+    ``world_size > 1``（DDP）时：训练集用 ``DistributedSampler`` 不相交切分
+    到各 rank（每 epoch 需在外层 ``set_epoch``）；验证集用
+    ``ValBatchShardSampler`` 按 batch 块不相交切分，指标在训练器内跨 rank
+    聚合。单进程路径零变化。"""
     dc = cfg.data
 
     npz_dir = dc.npz_dir
@@ -226,32 +235,60 @@ def build_dataloaders(cfg: Config) -> Tuple[DataLoader, DataLoader]:
             "data.samples_per_volume.")
 
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
+    eff_num_workers = scaled_num_workers(
+        dc.num_workers, world_size,
+        bool(cfg.train.ddp_scale_dataloader_per_rank))
     loader_kwargs: Dict[str, object] = {}
-    if dc.num_workers > 0:
+    if eff_num_workers > 0:
         loader_kwargs["persistent_workers"] = bool(dc.persistent_workers)
         loader_kwargs["prefetch_factor"] = int(dc.prefetch_factor)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size  = dc.batch_size,
-        shuffle     = True,
-        num_workers = dc.num_workers,
-        pin_memory  = dc.pin_memory,
-        drop_last   = True,
-        **loader_kwargs)
-    val_loader = DataLoader(
-        val_ds,
-        batch_size  = dc.batch_size,
-        shuffle     = False,
-        num_workers = dc.num_workers,
-        pin_memory  = dc.pin_memory,
-        drop_last   = False,
-        **loader_kwargs)
+    if world_size > 1:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size  = dc.batch_size,
+            sampler     = train_sampler,
+            num_workers = eff_num_workers,
+            pin_memory  = dc.pin_memory,
+            drop_last   = True,
+            **loader_kwargs)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size  = dc.batch_size,
+            sampler     = ValBatchShardSampler(
+                len(val_ds), dc.batch_size, rank, world_size),
+            num_workers = eff_num_workers,
+            pin_memory  = dc.pin_memory,
+            drop_last   = False,
+            **loader_kwargs)
+        logger.info(
+            "gentask DDP samplers: rank=%d/%d, ~%d train samples/rank",
+            rank, world_size, len(train_sampler))
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size  = dc.batch_size,
+            shuffle     = True,
+            num_workers = eff_num_workers,
+            pin_memory  = dc.pin_memory,
+            drop_last   = True,
+            **loader_kwargs)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size  = dc.batch_size,
+            shuffle     = False,
+            num_workers = eff_num_workers,
+            pin_memory  = dc.pin_memory,
+            drop_last   = False,
+            **loader_kwargs)
 
     logger.info(
         "DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, "
         "persistent_workers=%s, prefetch_factor=%s",
-        dc.batch_size, dc.num_workers, dc.pin_memory,
+        dc.batch_size, eff_num_workers, dc.pin_memory,
         loader_kwargs.get("persistent_workers", "n/a"),
         loader_kwargs.get("prefetch_factor", "n/a"))
 
