@@ -159,6 +159,8 @@ checkpoint 加载 → NIfTI 读取
 
 对比 zaxis：数据抽取、增强、裁剪、视图拆分、滑窗几何全部相同；唯一差异：zaxis 不折叠、用 3D 模型，2.5d 折叠用 2D 模型 + 可选 z-interleave。
 
+2.5D 折叠时机契约（全仓统一，seg/ssl/cls/gen 遵守）：dataset 恒发未折叠 3D（max-FOV × `aug_oversample_ratio` 余量），GPU 3D 增强 → 裁余量/视图拆分 → **送模型前**才折叠（`squeeze_2_5d`）；唯一例外是 det（折叠需与框几何联动 `slice_boxes_to_2d`，在 dataset 层完成）。
+
 ---
 
 ## 5. 通用训练技巧
@@ -210,7 +212,7 @@ checkpoint 加载 → NIfTI 读取
 | 预训练迁移 | `train.pretrain` (+`pretrain_strict/load_ema/upkern`) | 仅加载权重初始化 |
 | 早停 | `train.early_stopping` | 连续 N 次验证无提升即停 |
 | 验证口径 | `train.val_metric_mode` | medium=随机 patch（快）/ high=整卷滑窗（与部署同口径） |
-| 选模标准 | `train.save_best_criterion` (+`save_best_preset`) | loss / dice / iou / mcc / min_dice / dice+surface_dice / balanced |
+| 选模标准 | `train.save_best_criterion` (+`save_best_preset`) | loss / dice / iou / mcc / min_dice / dice+surface_dice / balanced；`loss` 口径定案为 `val_base_loss`（仅主任务损失，不含深监督/aux/正则等随日程变化的附加项，跨配置可比） |
 | 监控 | `monitor.*` | jsonl + HTML 仪表盘 + 梯度/权重健康指标 |
 
 ---

@@ -2,7 +2,7 @@
 
 > 入口：`python -m clstask.train --config configs/cls3d_cubic.yaml | cls2_5d.yaml`；
 > 推理：`python -m clstask.predict --ckpt best_model.pth`。
-> 复用 `segtask_v1` 的配置/几何拓扑/预处理/优化器/AMP/EMA 基建，分类专属设置集中在 YAML 顶层 `cls:` 段；
+> 复用 `taskcore` 的配置/几何拓扑/预处理/优化器/AMP/EMA 基建，分类专属设置集中在 YAML 顶层 `cls:` 段；
 > 可直接接入 ssltask 预训练 encoder（`cls.pretrained_ckpt`），几何不一致直接报错、不静默降级。
 
 ---
@@ -24,7 +24,7 @@
 | 几何 | patch_mode | 模型输入 |
 |---|---|---|
 | 3D | `whole` / `z_axis` / `cubic` | (B, 1, D, H, W)，spatial_dims=3 |
-| 2.5D | `2_5d` | (B, D, H, W)，D 折进通道（Dataset 侧即折叠）；仅单 FOV（`multi_res_scales=[1.0]`），不支持 `lift_2_5d_to_3d` |
+| 2.5D | `2_5d` | (B, D, H, W)，D 折进通道（GPU 增强开启时增强后折叠，关闭时 Dataset 侧折叠，见 §5 契约）；仅单 FOV（`multi_res_scales=[1.0]`），不支持 `lift_2_5d_to_3d` |
 
 ### 标签契约（`cls.label_source` × `cls.label_granularity`）
 
@@ -101,6 +101,8 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 | GPU 预取 | `train.prefetch_to_gpu`（复用 seg CudaPrefetcher：独立 copy stream 提前一个 batch 上卡，需 `data.pin_memory`） |
 | mixup / cutmix | `cls.mixup_alpha` / `cls.cutmix_alpha`（>0 启用；同时启用每 batch 二选一；仅 volume 粒度） |
 | 前景过采样 | `data.foreground_oversample_ratio`（仅训练集；复用 npz 预计算 fg 索引，类均衡采样） |
+| 梯度检查点 | `model.grad_checkpointing`：反向重算激活、算力换显存；四模板全支持（encoder 系逐 stage（可配 `grad_ckpt_encoder_stages` 掩码）、DenseNet 逐 DenseBlock、ViT 逐 transformer Block）；eval/no_grad 零开销，数值与关闭时严格一致 |
+| DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler（逐 epoch set_epoch 重洗）、验证集按 batch 块不相交分片；验证指标先跨卡聚齐全集 logits/targets 再算 AUC/F1（不可分解指标不做卡间平均）；checkpoint/history/monitor 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 验证网格覆盖 | `data.val_grid_coverage`：验证 patch 改确定性网格铺点，与推理同口径 |
 | 推理 TTA / AMP | `cls.tta_flips`：翻转 TTA（3D 7 组合；2.5D 仅 H/W；slice 粒度 z 翻转输出回翻）；推理 autocast 口径同训练 |
 | SSL/分割迁移 | `cls.pretrained_ckpt`：只取 `encoder.*`（strict=False，打印命中/缺失统计）；仅 `backbone='encoder'` |
@@ -143,4 +145,5 @@ MIL 直觉：卷中任一处阳性即卷阳性 → max/topk/lse 更贴合，mean
 - 几何逐位一致：`patch_mode` × `build_topology` → `spatial_dims` / `in_channels` 与分割/SSL 同一派生路径，保证 encoder 权重无缝迁移；
 - 预训练迁移时 patch_mode / spatial_dims / in_channels 必须与预训练一致（`validate_cls` 交叉校验，不一致直接报错）；
 - 2.5D 仅单 FOV，与 image-only SSL 预训练口径一致；多 FOV 折叠为后续扩展点；
+- 2.5D 折叠时机契约（全仓统一）：折叠发生在**数据增强之后、送模型之前**——GPU 增强路径 dataset 发未折叠 (1,D,H,W)，trainer 增强后派生 target 再折叠；关闭增强时 dataset 侧直接折叠（该路径无 3D 空间增强，两者等价）；
 - mask 标签源要求 npz 含 `label` 键且 `len(fg_values)==num_classes`；table 源 pid 匹配缺失即报错（宁缺毋滥）。

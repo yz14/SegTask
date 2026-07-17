@@ -1,6 +1,6 @@
 # dettask — 3D / 2.5D 医学影像目标检测
 
-dettask 复用 `taskcore` 公共基建（配置、几何拓扑、预处理、优化器、AMP、EMA；经 `segtask_v1` 的 shim 路径引用），提供医学影像目标检测训练、评估与推理闭环。它把 2D / 3D 框算子统一到同一套检测几何上，支持 RetinaNet、FCOS、Faster R-CNN 和 DETR 四种检测头，并可迁移 ssltask 的 encoder 权重。
+dettask 复用 `taskcore` 公共基建（配置、几何拓扑、预处理、优化器、AMP、EMA，直连 import），提供医学影像目标检测训练、评估与推理闭环。它把 2D / 3D 框算子统一到同一套检测几何上，支持 RetinaNet、FCOS、Faster R-CNN 和 DETR 四种检测头，并可迁移 ssltask 的 encoder 权重。
 
 > 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
 
@@ -55,7 +55,7 @@ dettask/
 - **共享算子**：IoU、GIoU、NMS、ROIAlign、编解码都按框维度参数化，不依赖额外检测第三方扩展。
 - **训练与评估**：训练侧主要看 patch 级 mAP，体级推理用 FROC 做汇总，更贴合医学小目标场景。
 - **推理拼接**：2.5D 推理时先做 slab 级检测，再跨层 stitching 成 3D 框（可容忍 `det.stitch_max_gap` 个漏检 slab），拼接后做最终 3D NMS；推理可选 autocast 与 `det.tta_flips` 翻转 TTA。
-- **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；非有限 loss/梯度丢弃 accum 组；warmup 段保持差分学习率倍率。
+- **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；非有限 loss/梯度丢弃 accum 组；warmup 段保持差分学习率倍率；`model.grad_checkpointing` 支持（encoder/decoder 经公共 factory）；`train.gpus` 配多卡即启用 DDP（mp.spawn 每卡一进程，验证时预测/真值跨卡聚齐算全集 mAP，落盘仅 rank0），单卡/CPU 路径零变化。
 
 ## 用法
 

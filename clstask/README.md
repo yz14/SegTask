@@ -1,6 +1,6 @@
 # clstask — 3D / 2.5D 医学影像分类
 
-clstask 复用 `taskcore` 公共基建（配置、几何拓扑、预处理、优化器、AMP、EMA；经 `segtask_v1` 的 shim 路径引用），提供医学影像分类训练与推理闭环。它支持 3D 与 2.5D 两种几何，能够直接接入 ssltask 预训练的 encoder 权重，也能用自己的分类骨干单独训练。
+clstask 复用 `taskcore` 公共基建（配置、几何拓扑、预处理、优化器、AMP、EMA，直连 import），提供医学影像分类训练与推理闭环。它支持 3D 与 2.5D 两种几何，能够直接接入 ssltask 预训练的 encoder 权重，也能用自己的分类骨干单独训练。
 
 > 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
 
@@ -48,7 +48,7 @@ clstask/
 - **损失与增强**：支持 BCE、focal、CE、label smoothing、class weights，以及仅在卷级分类上启用的 mixup / cutmix。
 - **SSL 迁移**：`pretrained_ckpt` 只加载 encoder 相关权重，几何或 backbone 不一致时直接报错，不做静默降级。
 - **推理聚合**：推理时先做 patch 级预测（抽取几何与训练一致，可选 autocast 与 `cls.tta_flips` 翻转 TTA），再按几何与 `agg_mode` 聚合成卷级结果；slice 粒度还会保留逐层输出。
-- **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；warmup 段保持差分学习率倍率。
+- **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；warmup 段保持差分学习率倍率；`model.grad_checkpointing` 四条 backbone 全支持（算力换显存）；`train.gpus` 配多卡即启用 DDP（mp.spawn 每卡一进程，验证指标跨卡聚齐全集计算，落盘仅 rank0），单卡/CPU 路径零变化。
 
 ## 用法
 

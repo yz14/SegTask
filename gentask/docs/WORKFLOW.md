@@ -98,6 +98,8 @@ x_cat = cat([噪声图(预条件缩放), LR 条件图], dim=1)，c_noise 标量�
 | 梯度累积 / 裁剪 | `grad_accum_steps` / `grad_clip_norm` |
 | warmup + scheduler | `warmup_epochs` + cosine/poly/step/plateau 等 |
 | torch.compile | `compile_mode` |
+| 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：仅 UNet 系 backbone（unet/unetpp/unet3p）支持，encoder 逐 stage / decoder 逐 level 反向重算激活；非 UNet 架构（edsr/rcan/adm/edm2，含扩散路径）开启时 warning 提示忽略，不静默失效 |
+| DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler、验证集按 batch 块不相交分片；patch 级 PSNR/SSIM meter 加权 all-reduce，整卷验证逐 rank 切分后汇总；best/checkpoint/history 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 选模 / 早停 | patch 级 PSNR 越大越好；`val_full_volume=true` 时改用整卷 PSNR；`early_stopping`；扩散验证采样用固定 seed generator，选模/早停/plateau 不受采样噪声干扰 |
 | 整卷验证 | 与部署同口径：在线退化整卷 → 推理器滑窗复原（复用 predict.overlap/blend）→ 逐卷 PSNR/SSIM；`val_full_volume_max` 控耗时 |
 | 续训 / 迁移 | `resume`（模型+optimizer/scheduler/scaler/EMA，history.json 续接）；`pretrain`（strict 可配，可载 EMA 权重） |
@@ -145,6 +147,7 @@ NIfTI 读取 → 归一化 → 入网网格（predict.input_grid）
 - 训练-推理退化同参：`sr_scale(_per_axis)` / `sr_kernel(_up)` / `sr_sampling` 决定训练造 LR 与推理入网重采样，必须一致；
 - patch 几何一致：推理滑窗 patch 尺寸 = 训练 `data.patch_size`，2.5D slab 深度 = `patch_size[0]`，多视图 FOV/深度与训练同拓扑（`build_topology` 统一推导）；
 - 2.5D 恒把 D 折进通道：退化只作用 (H,W)，SSIM/梯度损失逐通道计算，与"D 视作通道"设定一致；
+- 2.5D 折叠时机契约（全仓统一）：dataset 发未折叠 max-FOV cube（含 `aug_oversample_ratio` 余量）→ GPU 3D 增强 → Pipeline 裁余量/拆视图 → 送模型前才折叠 (B, n·D, H, W)（lift 保 rank-5 走真 3D）；
 - 条件卷 cond 与 image 空间对齐：训练侧同 warp、推理侧同窗裁剪，强度归一化各自独立；
 - SISR（edsr/rcan）为 post-upsampling：输出网格 = 输入 × 倍率，倍率固定，不支持 `target_z_spacing` 自适应；
 - 已知待定（暂缓）：whole/z_axis/2_5d 训练侧整卷/面内 resize 到 patch 尺寸，而推理侧在原生分辨率滑窗/整卷前向，两侧频谱分布不等价；修改方向（候选：训练侧改原生分辨率裁剪）涉及已训模型兼容，尚未实施。

@@ -123,6 +123,7 @@ jepa      EMA 目标编码器编码完整图 → 上下文编码器看遮后输�
 | DDP 多卡 | mp.spawn + 初始参数广播 + accum 边界手动梯度均值 all-reduce（方法直调子模块，不套 DDP wrapper）；epoch loss 按样本数加权 all-reduce |
 | ZeRO-1 | 优化器状态分片；保存前集合式 consolidate 到 rank0 |
 | torch.compile / channels_last | `compile_mode` / `channels_last`（2.5D 折叠后转 4D 排布） |
+| 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建即生效；SSL 特有 wrapper（投影头/predictor 等）激活占用小，刻意不包检查点 |
 | checkpoint | 原子写（临时文件 + os.replace）+ sha256 状态指纹；`save_async` 后台线程写盘；仅 rank0 落盘 |
 | resume | 全状态：method（含 teacher/queue/center buffer）+ optimizer/scheduler/scaler/EMA + RNG；指纹校验、方法名校验；rank>0 重新分流 RNG |
 | 监控 | 复用 segtask monitor：jsonl + HTML 仪表盘 + 梯度/权重健康指标（失败隔离不阻断训练） |
@@ -155,4 +156,8 @@ ssl_best.pt（EMA 优先导出）/ ssl_last.pt / ssl_resume.pt（全状态续训
 
 **一致性契约**：patch_size / patch_mode / 归一化参数须与下游任务一致（探针 encoder
 `strict=True` 校验同名同形）；2.5D 预训练仅支持单 FOV（`in_channels==patch_size[0]`、
-`multi_res_scales==[1.0]`），多 FOV 需增强级多分辨率裁剪、不在 image-only 通路内。
+`multi_res_scales==[1.0]`），多 FOV 需增强级多分辨率裁剪、不在 image-only 通路内；
+patch_mode 支持 `2_5d`/`z_axis`/`cubic`——**有意不支持 `whole`**（整体 resize 抹掉分辨率
+信息，与 SSL 学局部结构的目标冲突，且预训练分布与下游 patch 训练分布不一致）；
+2.5D 折叠时机契约（全仓统一）：dataset 恒发未折叠 3D，折叠由 trainer 在**数据增强之后、
+送模型之前**统一完成（同 seg `squeeze_2_5d` 口径），3D GPUAugmentor 因此也作用于 2.5D 样本。

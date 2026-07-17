@@ -1,6 +1,6 @@
 # ssltask — 与分割主线共骨干的自监督预训练
 
-ssltask 是一套与 `segtask_v1` 共骨干的自监督预训练工程（公共基建经 `segtask_v1` 的 shim 层来自顶层公共包 `taskcore`）：它负责在无标注或少标注数据上做表示学习，并把学到的 encoder 权重迁移回分割、分类与检测任务。方法库覆盖重建式、对比式、自蒸馏式与掩码建模式多种 SSL 路线，评测侧则提供在线 probe 与离线 few-shot 评测。
+ssltask 是一套与 `segtask_v1` 共骨干的自监督预训练工程（公共基建直连顶层公共包 `taskcore`）：它负责在无标注或少标注数据上做表示学习，并把学到的 encoder 权重迁移回分割、分类与检测任务。方法库覆盖重建式、对比式、自蒸馏式与掩码建模式多种 SSL 路线，评测侧则提供在线 probe 与离线 few-shot 评测。
 
 > 端到端预训练/评测流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
 

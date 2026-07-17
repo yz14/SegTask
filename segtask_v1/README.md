@@ -55,7 +55,7 @@ segtask_v1/
 │   ├── unet.py  # UNet 主体
 │   ├── unet3p.py  # UNet3+
 │   └── unetpp.py  # UNet++
-├── monitor/  # 训练监控仪表盘
+├── monitor/  # [shim → taskcore.monitor] 训练监控仪表盘
 │   ├── __init__.py  # 监控包入口
 │   ├── __main__.py  # monitor CLI
 │   ├── assets.py  # 页面样式与脚本

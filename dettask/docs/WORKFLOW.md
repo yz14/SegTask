@@ -2,7 +2,7 @@
 
 > 入口：`python -m dettask.train --config configs/det3d.yaml | det2_5d.yaml`；
 > 推理：`python -m dettask.predict --ckpt best_model.pth`。
-> 复用 `segtask_v1` 的配置/几何拓扑/预处理/优化器/AMP/EMA 基建，检测专属设置集中在 YAML 顶层 `det:` 段；
+> 复用 `taskcore` 的配置/几何拓扑/预处理/优化器/AMP/EMA 基建，检测专属设置集中在 YAML 顶层 `det:` 段；
 > 框算子（IoU/GIoU/NMS/ROIAlign/编解码）全部按框维度参数化、2D/3D 同一实现，不依赖 torchvision/CUDA 扩展。
 
 ---
@@ -105,6 +105,8 @@ RPN（anchor + objectness）→ proposal（解码 + NMS，pre/post topk）
 | gt 框中心过采样 | 训练集 `max(data.foreground_oversample_ratio, 0.5)` 概率以 gt 框中心为锚（保证正样本供给；验证关闭）；验证每卷 patch 数 = samples_per_volume 的一半 |
 | SSL/分割迁移 | `det.pretrained_ckpt`：命中 `encoder.*`（重建式 SSL 亦命中 `decoder.*`），strict=False + 命中统计，0 命中报错（几何不一致不静默） |
 | 微调策略 | `det.encoder_lr_mult` 差分学习率（复用 clstask 分组实现）；`det.freeze_encoder` |
+| 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建，反向重算激活、算力换显存；eval/no_grad 零开销 |
+| DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler、验证集按 batch 块不相交分片；验证时预测/真值跨卡聚齐后算全集 mAP（不做卡间平均）；checkpoint/history 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 选模 | `det.save_best_metric`：map / loss（mAP@`eval_iou_thresh`，默认 0.1 医学小目标口径） |
 
 ---
@@ -146,4 +148,5 @@ micro-batch 前向（`infer_batch_size`）防大卷 OOM；DETR 免 NMS（集合�
 - 参数命名 `encoder.* / decoder.* / fpn.* / det_head.*`：encoder/decoder 与分割/SSL 同名同形，预训练权重 strict=False 直接迁移；
 - 迁移时 patch_mode / spatial_dims / in_channels 必须与预训练一致（`validate_det` 交叉校验）；
 - 框格式统一 (N, 2·dim) 体素坐标半开区间，坐标序与体素轴一致（2D=(y,x)，3D=(z,y,x)）；所有算子按 `dim = 列数 // 2` 自适应 2D/3D；
-- 2.5D 的 2D 框永远由 3D 真值派生（训练裁剪联动、推理拼接还原），保证两几何在 3D 框上可比。
+- 2.5D 的 2D 框永远由 3D 真值派生（训练裁剪联动、推理拼接还原），保证两几何在 3D 框上可比；
+- 2.5D 折叠时机：det 是全仓“增强后、送模型前折叠”契约的**唯一例外**——折叠在 dataset 层完成，因为折叠需同步 `slice_boxes_to_2d`（由 3D 框对 slab 切片派生 2D 框），且空间增强（翻转）必须在 dataset 内与框几何联动；GPU 侧只做强度增强（不动框，与折叠无关）。
