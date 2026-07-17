@@ -317,7 +317,9 @@ def _build_unet_backbone(cfg: Config):
         in_ch_per_view_list   = in_ch_per_view_list,
         cond_in_channels      = cond_in_channels,
         downsample_builder    = downsample_builder,
-        downsample_strides    = ds_strides)
+        downsample_strides    = ds_strides,
+        grad_checkpointing    = mc.grad_checkpointing,
+        grad_ckpt_stages      = mc.grad_ckpt_encoder_stages)
 
     if mc.decoder_type == "unet3p":
         decoder = UNet3PDecoder(
@@ -327,7 +329,8 @@ def _build_unet_backbone(cfg: Config):
             norm_groups=mc.norm_groups,
             activation=mc.activation,
             skip_attention=mc.skip_attention,
-            spatial_dims=spatial_dims)
+            spatial_dims=spatial_dims,
+            grad_checkpointing=mc.grad_checkpointing)
     elif mc.decoder_type == "unetpp":
         decoder = UNetPPDecoder(
             encoder_channels=enc_channels,
@@ -336,7 +339,8 @@ def _build_unet_backbone(cfg: Config):
             skip_attention=mc.skip_attention,
             # 生成主线历史语义：门控上采样分支（分割主线为门控 skips）。
             attn_gate_target="upsample",
-            spatial_dims=spatial_dims)
+            spatial_dims=spatial_dims,
+            grad_checkpointing=mc.grad_checkpointing)
     else:
         decoder = Decoder(
             encoder_channels   = enc_channels,
@@ -345,7 +349,8 @@ def _build_unet_backbone(cfg: Config):
             skip_mode          = mc.skip_mode,
             skip_attention     = mc.skip_attention,
             spatial_dims       = spatial_dims,
-            downsample_strides = ds_strides)
+            downsample_strides = ds_strides,
+            grad_checkpointing = mc.grad_checkpointing)
 
     aux_seg_supervision = topo.aux_seg_active
     aux_head_out_channels_arg = (
@@ -430,6 +435,11 @@ def _build_sisr_backbone(cfg: Config):
 def build_backbone(cfg: Config):
     """按 `model.arch` 构造共享 backbone：UNet、ADM、EDM2、EDSR/RCAN。"""
     arch = str(cfg.model.arch).lower()
+    if cfg.model.grad_checkpointing and arch != "unet":
+        # 梯度检查点目前仅 UNet 系 backbone 支持（Encoder/Decoder 逐 stage 包装）。
+        logger.warning(
+            "model.grad_checkpointing=True is not supported for arch=%r "
+            "(only 'unet'); ignored.", arch)
     if arch in ("edsr", "rcan"):
         return _build_sisr_backbone(cfg)
     if arch == "adm":

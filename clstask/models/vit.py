@@ -17,7 +17,7 @@ from typing import List, Sequence
 import torch
 import torch.nn as nn
 
-from taskcore.models.blocks import DropPath
+from taskcore.models.blocks import DropPath, checkpoint_if
 
 
 class PatchEmbed(nn.Module):
@@ -89,8 +89,12 @@ class ViTEncoder(nn.Module):
         drop_path_rate: float = 0.1,
         patch_size  : Sequence[int] = (4, 16, 16),
         input_size  : Sequence[int] = (16, 128, 128),
-        spatial_dims: int = 3):
+        spatial_dims: int = 3,
+        grad_checkpointing: bool = False):
         super().__init__()
+        # 逐 transformer Block 梯度检查点；eval/no_grad 下零开销，重算时
+        # 复现 DropPath 随机掩码（语义见 taskcore.models.blocks.checkpoint_if）。
+        self.grad_checkpointing = bool(grad_checkpointing)
         if spatial_dims not in (2, 3):
             raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}")
         if embed_dim % num_heads != 0:
@@ -149,7 +153,7 @@ class ViTEncoder(nn.Module):
         grid = self.patch_embed.grid
         tokens = tokens + self._positional(grid)
         for blk in self.blocks:
-            tokens = blk(tokens)
+            tokens = checkpoint_if(self.grad_checkpointing, blk, tokens)
         tokens = self.norm(tokens)
         feat = tokens.transpose(1, 2).reshape(
             tokens.shape[0], tokens.shape[2], *grid)    # (B, C, *grid)

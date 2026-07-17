@@ -16,7 +16,7 @@ from typing import List
 import torch
 import torch.nn as nn
 
-from taskcore.models.blocks import get_activation, get_norm
+from taskcore.models.blocks import checkpoint_if, get_activation, get_norm
 
 
 def _conv_nd(spatial_dims: int):
@@ -93,8 +93,12 @@ class DenseNetEncoder(nn.Module):
         norm_type   : str = "instance",
         norm_groups : int = 8,
         activation  : str = "leakyrelu",
-        spatial_dims: int = 3):
+        spatial_dims: int = 3,
+        grad_checkpointing: bool = False):
         super().__init__()
+        # 逐 DenseBlock 梯度检查点（dense cat 激活是显存大头）；eval/no_grad
+        # 下零开销，语义见 taskcore.models.blocks.checkpoint_if。
+        self.grad_checkpointing = bool(grad_checkpointing)
         if spatial_dims not in (2, 3):
             raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}")
         if not 0.0 < compression <= 1.0:
@@ -129,7 +133,7 @@ class DenseNetEncoder(nn.Module):
         x = self.stem(x)
         features: List[torch.Tensor] = []
         for i, block in enumerate(self.blocks):
-            x = block(x)
+            x = checkpoint_if(self.grad_checkpointing, block, x)
             if i == len(self.blocks) - 1:
                 x = self.final(x)
             features.append(x)

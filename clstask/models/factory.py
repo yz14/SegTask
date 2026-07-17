@@ -55,7 +55,8 @@ def _build_encoder(cfg: SegConfig, cls: ClsConfig) -> Tuple[nn.Module, int]:
             norm_type=cfg.model.norm_type,
             norm_groups=cfg.model.norm_groups,
             activation=cfg.model.activation,
-            spatial_dims=sd)
+            spatial_dims=sd,
+            grad_checkpointing=cfg.model.grad_checkpointing)
         return encoder, encoder.out_channels_list[-1]
     if cls.backbone == "vit":
         encoder = ViTEncoder(
@@ -67,7 +68,8 @@ def _build_encoder(cfg: SegConfig, cls: ClsConfig) -> Tuple[nn.Module, int]:
             drop_path_rate=cls.vit_drop_path_rate,
             patch_size=list(cls.vit_patch_size),
             input_size=list(cfg.data.patch_size),
-            spatial_dims=sd)
+            spatial_dims=sd,
+            grad_checkpointing=cfg.model.grad_checkpointing)
         return encoder, cls.vit_embed_dim
     raise ValueError(f"Unknown cls.backbone: {cls.backbone!r}")
 

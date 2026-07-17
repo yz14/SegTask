@@ -84,6 +84,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 - 验证指标全局归约：dist_utils 新增 `all_gather_objects`/`all_reduce_meters_`；cls（logits/targets/vols 聚齐后算全集 AUC/F1 等不可分解指标）、det（预测/真值聚齐后算全集 mAP）、gen（PSNR/SSIM meter 加权 all-reduce；整卷验证逐 rank 切分后汇总）；选模/早停决策各 rank 天然一致。  
 - 落盘 rank0 守卫：cls/det/gen 的 best/latest checkpoint、history、resolved config 仅 rank0 写。  
 - 验证：全量 pytest 1342 过 / 11 失败（均为既有 test_model_flow）/ 3 跳过；另经 2 进程 gloo smoke 验证 all_gather/all_reduce/分片聚合与单进程全集等价。多 GPU 真机验证待有卡环境进行。
+- 梯度检查点补齐：gen 的 UNet 系 factory 透传 `grad_checkpointing`/`grad_ckpt_encoder_stages`（此前公共层支持但 gen 未接线）；cls 的 DenseNet（逐 DenseBlock）与 ViT（逐 transformer Block）经 `checkpoint_if` 接入；gen 非 UNet 架构（adm/edm2/edsr/rcan）开检查点时 warning 提示忽略；ssl 走公共 factory 已天然生效无需改。ckpt on/off 前向+梯度逐位一致已验证。
 
 仍留在任务层（语义差异，未强行合并，已定案保持独立）：滑窗推理全家桶（seg 与 gen 几何语义差异大）；SSL 的手动梯度 all-reduce（多 forward 入口无法套 DDP 单入口假设）。
 
