@@ -1,6 +1,6 @@
 # dettask — 3D / 2.5D 医学影像目标检测
 
-dettask 复用 `segtask_v1` 的配置、几何拓扑、预处理、优化器、AMP 和 EMA 基建，提供医学影像目标检测训练、评估与推理闭环。它把 2D / 3D 框算子统一到同一套检测几何上，支持 RetinaNet、FCOS、Faster R-CNN 和 DETR 四种检测头，并可迁移 ssltask 的 encoder 权重。
+dettask 复用 `taskcore` 公共基建（配置、几何拓扑、预处理、优化器、AMP、EMA；经 `segtask_v1` 的 shim 路径引用），提供医学影像目标检测训练、评估与推理闭环。它把 2D / 3D 框算子统一到同一套检测几何上，支持 RetinaNet、FCOS、Faster R-CNN 和 DETR 四种检测头，并可迁移 ssltask 的 encoder 权重。
 
 > 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
 
@@ -40,11 +40,11 @@ dettask/
 │       └── retina.py  # RetinaNet
 ├── predictor/  # 推理器
 │   ├── __init__.py  # 推理包入口
-│   ├── det_predictor.py  # 滑窗 / slab 推理
+│   ├── det_predictor.py  # 滑窗 / slab 推理（继承 taskcore.engine.BasePredictor）
 │   └── stitching.py  # 2.5D 跨 slab 链接成 3D 框
 └── trainer/  # 训练循环
     ├── __init__.py  # 训练包入口
-    └── det_trainer.py  # 检测训练与验证
+    └── det_trainer.py  # 检测训练与验证（继承 taskcore.engine.BaseTrainer）
 ```
 
 ## 关键概念

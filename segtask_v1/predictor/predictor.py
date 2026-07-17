@@ -23,7 +23,8 @@ from ..data.dataset import (
     compute_bbox_from_volume, read_nifti_spacing, resample_to_spacing,
     resize_3d)
 from ..models.topology import ModelTopology, build_topology
-from ..trainer.amp import resolve_auto_amp_dtype
+from taskcore.engine.amp import resolve_auto_amp_dtype
+from taskcore.engine.base_predictor import BasePredictor
 from . import blending as _blending
 from . import sliding as _sliding
 
@@ -55,7 +56,7 @@ def _manifest_target_spacing(npz_dir: str) -> Optional[List[float]]:
     return None
 
 
-class Predictor:
+class Predictor(BasePredictor):
     """3D 分割滑窗推理器。假定多标签 sigmoid 训练，前 num_fg 个输出通道
     1∶1 对应 cfg.data.label_values[1:]。"""
 

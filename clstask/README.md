@@ -1,6 +1,6 @@
 # clstask — 3D / 2.5D 医学影像分类
 
-clstask 复用 `segtask_v1` 的配置、几何拓扑、预处理、优化器、AMP 和 EMA 基建，提供医学影像分类训练与推理闭环。它支持 3D 与 2.5D 两种几何，能够直接接入 ssltask 预训练的 encoder 权重，也能用自己的分类骨干单独训练。
+clstask 复用 `taskcore` 公共基建（配置、几何拓扑、预处理、优化器、AMP、EMA；经 `segtask_v1` 的 shim 路径引用），提供医学影像分类训练与推理闭环。它支持 3D 与 2.5D 两种几何，能够直接接入 ssltask 预训练的 encoder 权重，也能用自己的分类骨干单独训练。
 
 > 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
 
@@ -33,10 +33,10 @@ clstask/
 │   └── vit.py  # ViT 分类骨干
 ├── predictor/  # 推理器
 │   ├── __init__.py  # 推理包入口
-│   └── cls_predictor.py  # 整例 / 整卷分类推理与聚合
+│   └── cls_predictor.py  # 整例 / 整卷分类推理与聚合（继承 taskcore.engine.BasePredictor）
 └── trainer/  # 训练循环
     ├── __init__.py  # 训练包入口
-    ├── cls_trainer.py  # 训练、验证与选模
+    ├── cls_trainer.py  # 训练、验证与选模（继承 taskcore.engine.BaseTrainer）
     └── mixup.py  # mixup / cutmix 增强
 ```
 

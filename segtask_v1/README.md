@@ -1,6 +1,6 @@
 # segtask_v1 — 分割主线导航地图
 
-`segtask_v1` 是当前活跃的 2.5D / 3D 医学图像分割工程：训练、预测、launcher、monitor、visualization 都围绕这条主线展开。它把数据读取、patch 几何、模型装配、损失、训练循环与推理流程收拢到一套配置驱动的体系里，是仓库里其他任务的基建真相源。
+`segtask_v1` 是当前活跃的 2.5D / 3D 医学图像分割工程：训练、预测、launcher、monitor、visualization 都围绕这条主线展开。它把数据读取、patch 几何、模型装配、损失、训练循环与推理流程收拢到一套配置驱动的体系里。公共基建（配置 / 数据 / 模型 / 训练推理工程件 / 工具）现已下沉到顶层公共包 `taskcore`，本包保留分割任务层；被迁移模块以 shim 保留旧 import 路径，行为不变（模块树中以 `[shim → taskcore.*]` 标注）。
 
 > 设计级细节已拆到 [`docs/DESIGN.md`](docs/DESIGN.md)，端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。这里仅保留导航地图和关键约定。
 
@@ -13,10 +13,10 @@ segtask_v1/
 ├── __main__.py  # python -m segtask_v1 入口
 ├── train.py  # 训练 CLI
 ├── predict.py  # 推理 CLI
-├── config.py  # 配置系统与派生字段
-├── logging_utils.py  # 日志工具
-├── utils.py  # 通用工具
-├── data/  # 数据发现 / IO / patch / 预打包
+├── config.py  # [shim → taskcore.config.core] 配置系统与派生字段
+├── logging_utils.py  # [shim → taskcore.utils.logging_utils] 日志工具
+├── utils.py  # [shim → taskcore.utils.common] 通用工具
+├── data/  # [shim → taskcore.data] 数据发现 / IO / patch / 预打包
 │   ├── __init__.py  # 数据包入口
 │   ├── augment.py  # GPU 共享增强
 │   ├── dataset.py  # NIfTI / npz 读取、patch 抽取、bbox / 缓存、Dataset
@@ -41,7 +41,7 @@ segtask_v1/
 │   ├── __init__.py  # 损失包入口
 │   ├── losses.py  # Dice / BCE / Focal / Tversky / GDL / clDice / wrapper
 │   └── topo_aux.py  # 拓扑辅助损失
-├── models/  # 模型骨架
+├── models/  # [shim → taskcore.models] 模型骨架
 │   ├── __init__.py  # 模型包入口
 │   ├── adm_unet.py  # ADM UNet
 │   ├── blocks.py  # 通用积木与采样算子
@@ -69,17 +69,17 @@ segtask_v1/
 │   ├── forwards.py  # forward / TTA 变体
 │   ├── inputs.py  # 窗口与 batch 构造
 │   ├── io.py  # checkpoint / precision / run_inference
-│   ├── predictor.py  # Predictor 外壳与入口
+│   ├── predictor.py  # Predictor 外壳与入口（继承 taskcore.engine.BasePredictor）
 │   └── sliding.py  # whole / z / interleave / cubic 滑窗主循环
 ├── trainer/  # 训练循环与策略管线
 │   ├── __init__.py  # 训练包入口
-│   ├── amp.py  # AMP 相关封装
+│   ├── amp.py  # [shim → taskcore.engine.amp] AMP 相关封装
 │   ├── breakdown.py  # 多分辨率损失分解
-│   ├── checkpoint.py  # checkpoint I/O
-│   ├── dist_utils.py  # 分布式辅助
-│   ├── memory.py  # 显存预算与统计
-│   ├── optim.py  # 优化器 / 调度器 / warmup
-│   ├── trainer.py  # Trainer 主类
+│   ├── checkpoint.py  # [shim → taskcore.engine.checkpoint] checkpoint I/O
+│   ├── dist_utils.py  # [shim → taskcore.engine.dist_utils] 分布式辅助
+│   ├── memory.py  # [shim → taskcore.engine.memory] 显存预算与统计
+│   ├── optim.py  # [shim → taskcore.engine.optim] 优化器 / 调度器 / warmup
+│   ├── trainer.py  # Trainer 主类（继承 taskcore.engine.BaseTrainer）
 │   ├── validation.py  # 验证逻辑
 │   ├── views.py  # 视图切分与拼接
 │   └── pipelines/  # ViewPipeline 策略对象

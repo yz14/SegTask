@@ -57,6 +57,11 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
     mc = cfg.model
     spatial_dims = mc.spatial_dims
 
+    # 旧 use_se 兼容：等价于 attention_type='none' 时提升为 'se'（与块内语义一致）。
+    attention_type = mc.attention_type
+    if attention_type == "none" and mc.use_se:
+        attention_type = "se"
+
     def factory(in_ch: int, out_ch: int, num_blocks: int) -> ResNetStage:
         return ResNetStage(
             in_ch, out_ch,
@@ -65,9 +70,8 @@ def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStage
             norm_groups    = mc.norm_groups,
             activation     = mc.activation,
             dropout        = mc.dropout,
-            use_se         = mc.use_se,
             se_reduction   = mc.se_reduction,
-            attention_type = mc.attention_type,
+            attention_type = attention_type,
             block_type     = mc.block_type,
             spatial_dims   = spatial_dims)
 
@@ -330,6 +334,8 @@ def _build_unet_backbone(cfg: Config):
             stage_builder=dec_builder,
             upsample_mode=mc.upsample_mode,
             skip_attention=mc.skip_attention,
+            # 生成主线历史语义：门控上采样分支（分割主线为门控 skips）。
+            attn_gate_target="upsample",
             spatial_dims=spatial_dims)
     else:
         decoder = Decoder(

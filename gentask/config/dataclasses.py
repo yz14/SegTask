@@ -1,54 +1,35 @@
-"""Dataclass + YAML config. Each YAML file maps directly to nested dataclasses."""
+"""gentask 配置段：组合复用 ``taskcore.config`` 核心段 + 生成任务扩展。
+
+设计（与 ssltask / clstask 同构）：核心段（data/model/loss/train/predict/aug）
+直接子类化 ``taskcore.config`` 的同名 dataclass——公共字段/语义只有一份真相源；
+生成任务专有字段（cond_* 条件卷、sisr_* 经典超分、val_full_volume 整卷验证、
+滑窗复原 predict 字段等）在子类中追加；生成侧默认值不同的字段（保守增强
+概率、predict.batch_size 等）在子类中显式覆盖，行为与迁移前逐位一致。
+
+``TaskConfig``（分割 vs 生成的任务段）是 gentask 自有段，留在本包。
+"""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, fields, asdict
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import List, Union
 
-import yaml
+from taskcore.config.core import (  # noqa: F401  (re-export: io.py/validation.py 使用)
+    ConfigError,
+    _require,
+)
+from taskcore.config import core as _core
 
 logger = logging.getLogger(__name__)
-
-
-class ConfigError(AssertionError, ValueError):
-    """配置校验错误。
-
-    同时继承 AssertionError（历史上 validate() 用裸 assert，调用方/测试捕
-    AssertionError）与 ValueError（语义上是非法输入），保证向后兼容的同时
-    不再依赖 assert 语句（``python -O`` 下不会被剥除）。新代码应捕
-    ConfigError 或 ValueError。
-    """
-
-
-def _require(cond: bool, msg: str) -> None:
-    """运行时配置校验：条件不成立时抛 ConfigError。"""
-    if not cond:
-        raise ConfigError(msg)
 
 
 # ---------------------------------------------------------------------------
 # Data configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class DataConfig:
-    """Data paths and preprocessing."""
-
-    image_dir: str = ""
-    label_dir: str = ""
-    # 后缀：单值或候选列表（取首个存在）。例：".nii.gz" 或 [".nii.gz", "-seg.nii.gz"]。
-    image_suffix: Union[str, List[str]] = ".nii.gz"
-    label_suffix: Union[str, List[str]] = ".nii.gz"
-
-    # 可选 ROI bbox 掩码目录；设置后按 bbox 裁剪。空=禁用。
-    bbox_dir   : str = ""
-    bbox_suffix: Union[str, List[str]] = ".nii.gz"
-
-    # 可选逐样本体素重要性图目录（值 + 1）。预计算、与标签无关；生成任务可直接
-    # 作为 batch["weight_map"] 使用。优先级：此目录 > data.region_weights。
-    region_weight_dir   : str = ""
-    region_weight_suffix: Union[str, List[str]] = ".nii.gz"
+class DataConfig(_core.DataConfig):
+    """数据路径与预处理（核心段 + 生成任务扩展）。"""
 
     # 静态按标签区域权重（值 + 1）；仅适用于基于标签的旧路径，生成任务不使用。
     # 空表示不启用。优先级低于 region_weight_dir。
@@ -63,209 +44,17 @@ class DataConfig:
     cond_global_mean: float = 0.0
     cond_global_std : float = 1.0
 
-    # 预生成 npz 包目录；设置后忽略上述 NIfTI 目录，避免多 worker gzip OOM。
-    npz_dir   : str = ""
-    npz_suffix: str = ".npz"
-
-    # True=启动时自动调用 make_data 生成；False=要求手动预生成。
-    npz_auto_build: bool = True
-
-    # 样本排除清单路径（每行一个 pid）。空=不过滤。
-    exclude_list: str = ""
-
-    # 标签取值集（0=背景）。空=从数据自动探测。
-    label_values: List[int] = field(default_factory=list)
-    num_classes : int = 0  # 由 label_values 自动设置
-
-    # 3D patch 尺寸 [D, H, W]。
-    patch_size: List[int] = field(default_factory=lambda: [64, 128, 128])
-
-    # Patch 抽取模式。示例："z_axis"（仅 z 滑块，H/W 全尺寸）、"2_5d"（D 折叠为通道驱动 2D UNet）。
-    # 其他："cubic" 3 轴中心抽取；"whole" 整体 resize。
-    patch_mode: str = "z_axis"
-
-    # 增强过采样比：先抽 round(patch_size*ratio)，增强后中心裁回。1.0=禁用；affine/elastic 建议 1.4–1.5。
-    aug_oversample_ratio: float = 1.0
-
-    # 多分辨率 FOV：各 scale 同中心抽更宽 FOV，resize 后作额外输入通道。
-    # 示例：[1.0] 单通道；[1.0, 1.5, 2.0] 3 通道。cubic 作用 3 轴，z_axis 仅 z 轴。
-    multi_res_scales: List[float] = field(default_factory=lambda: [1.0])
-
-    # 强度窗（CT HU）。
-    intensity_min: float = -1024.0
-    intensity_max: float = 1024.0
-    # 归一化："minmax"→[0,1]；"zscore"→零均值单位方差。
-    normalize  : str = "minmax"
-    global_mean: float = 0.0
-    global_std : float = 1.0
-
-    # 训/验划分。
-    val_ratio : float = 0.2
-    split_seed: int = 42
-    # 按首个前景类分层；样本太少时回退随机。
-    stratified_split: bool = True
-
-    # DataLoader。
-    batch_size        : int = 2
-    num_workers       : int = 4
-    pin_memory        : bool = True
-    persistent_workers: bool = True
-    prefetch_factor   : int = 4
-
-    # 前景过采样：中心点落在前景上的概率。
-    foreground_oversample_ratio: float = 0.5
-
-    # 每体积每 epoch 采样次数。
-    samples_per_volume: int = 8
-
-    # 验证 patch 位置的确定性网格覆盖（opt-in，仅作用于 val split）：
-    # False（默认）= 逐样本确定性 RNG 随机位置（epoch 间一致但空间覆盖随机）；
-    # True = 卷内第 j 个样本取均匀网格位置（z 轴等距；cubic 用 Halton 序列），
-    # epoch 间指标可比性更强、噪声更小。train split 不受影响。
-    val_grid_coverage: bool = False
-
-    # 缓存："none" 或 "memory"（每 worker LRU）。cache_max_volumes=0 不限（OOM 风险）。
-    cache_mode       : str = "memory"
-    cache_max_volumes: int = 1
-
-    # z 轴边界填充（z_axis/2.5D）："stretch" 范围内拉伸；"edge_pad" 边缘复制后 resize（推荐）。
-    z_boundary_mode: str = "edge_pad"
-
-    # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
-    # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
-    keep_native_view_depth: bool = False
-
-    # 3D 多 FOV 懒加载单 cube（z_axis/cubic）。True：dataset 发单 cube，trainer 逐视图裁剪/重采样。
-    # 约束：scales[0]==1.0；与 keep_native_view_depth 互斥；z_axis 强制 edge_pad。
-    keep_native_multi_res: bool = False
-
 
 # ---------------------------------------------------------------------------
 # Model configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class ModelConfig:
-    """模型架构设置。"""
+class ModelConfig(_core.ModelConfig):
+    """模型架构设置（核心段 + 生成任务扩展）。"""
 
-    # 架构族。示例："unet"（本项目 UNet，读下面 backbone/block/norm 等）、"adm"（ADM U-Net，仅 2.5D，读 adm_*）。
-    # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）；"edsr" | "rcan"（经典 SISR，post-upsampling，
-    # 仅生成回归任务，读 sisr_*）。
-    arch: str = "unet"
-
-    # Backbone："resnet" 或 "convnext"。
-    backbone: str = "resnet"
-
-    # 注：spatial_dims（2/3）与 in_channels 是由 patch_mode/multi_res_scales 等
-    # 决定的"几何派生量"，不再作为可写字段/YAML 接口暴露（避免设了却被 sync 静默
-    # 重写的困惑）。它们由 sync() 经 build_topology 算出，并以只读 property 暴露
-    # （见类末尾），读 cfg.model.in_channels / spatial_dims 不变。
-
-    # 每级 encoder 通道数，决定深度。例：[32, 64, 128, 256, 512] = 5 级。
-    encoder_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128, 256, 512])
-
-    # 每级 block 数默认值（仅在 encoder/decoder_blocks_per_stage 都为空时使用）。
-    blocks_per_level: int = 2
-
-    # 残差块变体（仅 resnet）。示例："basic" 标准 ResNet；"r2plus1d" (1,3,3)+(3,1,1) 分解卷积（需 spatial_dims=3）。
-    # 还有 "preact" / "bottleneck"。
-    block_type: str = "basic"
-
-    # 逐级 block 数（nnU-Net ResEncUNet 风格）。非空时长度须与网络深度匹配。
-    encoder_blocks_per_stage: List[int] = field(default_factory=list)
-    decoder_blocks_per_stage: List[int] = field(default_factory=list)
-
-    # nnU-Net ResEnc 预设："none" | "S" | "M" | "L" | "XL"。非 none 且 *_blocks_per_stage 为空时 sync() 自填。
-    resenc_preset: str = "none"
-
-    # 归一化："batch" | "instance" | "group"。
-    norm_type  : str = "instance"
-    norm_groups: int = 8
-
-    # 激活："relu" | "leakyrelu" | "gelu" | "swish"。
-    activation: str = "leakyrelu"
-
-    dropout: float = 0.0
-
-    # 旧 SE 开关（仅 attention_type=='none' 生效）。
-    use_se      : bool = False
-    se_reduction: int = 16
-
-    # 块内注意力："none" | "se" | "eca" | "cbam" | "coord"。
-    attention_type: str = "none"
-
-    # skip 连接上的 AttentionGate3D（Oktay 2018）。
-    skip_attention: bool = False
-
-    # 深度监督：多 decoder 级输出预测。
-    deep_supervision: bool = False
-
-    # 多 FOV 辅助重建监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，
-    # 辅助 view k 输出对应 view_k 的 HR slice；损失权重见 loss.aux_recon_weights（空则默认 0.5^k）。
-    # 单视图/3D 不生效。
-    # 生成任务多 FOV / 多视野辅助重建监督（仅 2.5D multi-view）。
-    aux_seg_supervision: bool = False
-
-    # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
-    aux_head_mode: str = "linear"
-
-    # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
-    # 与 data.keep_native_view_depth 互斥，仅在 2.5D 生效。
-    lift_2_5d_to_3d: bool = False
-
-    # Stem / patch-embed："conv3" | "conv7" | "dual" | "patch2" | "patch4"。patchN 降 N 倍分辨率（UNet3D 主输出加上采样）。
-    stem_mode: str = "conv3"
-
-    # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
-    # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
-    stem_fusion_mode: str = "multi_stem_proj"
-
-    # Decoder 拓扑："unet" 对称（默认）；"unetpp" 嵌套稠密；"unet3p" 全尺度 skip。
-    decoder_type: str = "unet"
-
-    # UNet3+ 各分支通道数（仅 decoder_type=="unet3p"）。
-    unet3p_cat_channels: int = 64
-
-    # 下采样："conv" | "maxpool" | "avgpool" | "blurpool" | "pixelunshuffle"。
-    downsample_mode: str = "conv"
-
-    # 上采样："transpose" | "trilinear" | "nearest" | "pixelshuffle" | "carafe" | "dysample"。
-    upsample_mode: str = "transpose"
-
-    # 各向异性下采样。True 时按 patch_size 自动推导逐级 per-axis stride：薄轴（如 z）
-    # 分辨率落后才不降采样，避免深层被压成 1（nnU-Net 思路，保持各轴分辨率 2× 以内）。
-    # 仅 decoder_type='unet' + downsample_mode∈{conv,maxpool,avgpool} +
-    # upsample_mode∈{transpose,trilinear,nearest} + 非 ConvNeXt LN-first 下采样时支持。
-    # 2.5D（spatial_dims=2）下 z 折进通道，仅作用于 H/W（通常各向同性，无实质变化）。
-    anisotropic_pooling: bool = False
-
-    # 显式逐级下采样 stride（非空时覆盖 anisotropic_pooling 自动推导）。
-    # 长度 = len(encoder_channels)-1，每项长度 = spatial_dims，值 ∈ {1,2}。
-    # 例（3D，5 级，保 z）：[[1,2,2],[1,2,2],[2,2,2],[2,2,2]]。
-    downsample_strides: List[List[int]] = field(default_factory=list)
-
-    # skip："cat" 或 "add"。
-    skip_mode: str = "cat"
-
-    # ConvNeXt: drop path / LayerScale / LN-first downsample。
-    drop_path_rate: float = 0.0
-    convnext_layer_scale_init: float = 1e-6  # <=0 禁用
-    convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
-
-    # ---- ADM 专用（arch=="adm"） ----
-    # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空=默认最深两级。
-    adm_attention_levels: List[int] = field(default_factory=list)
-
-    # 头数：仅在 adm_num_head_channels==-1 时使用。
-    adm_num_heads: int = 4
-    # !=-1 时 num_heads = channels // num_head_channels。
-    adm_num_head_channels: int = -1
-
-    # ---- LinearAttention（lucidrains 风格，可选） ----
-    # 在指定级追加 Residual(PreNorm(LinearAttention))；O(N) 复杂度，可与 adm_attention_levels 叠加。
-    adm_linear_attention_levels: List[int] = field(default_factory=list)
-    adm_linear_attention_num_heads: int = 4
-    adm_linear_attention_head_dim: int = 32
+    # 旧 SE 开关（仅 attention_type=='none' 生效）。核心段已迁移到
+    # attention_type: "se"；生成侧保留兼容字段。
+    use_se: bool = False
 
     # ---- 经典 SISR 专用（arch in ("edsr","rcan")，post-upsampling） ----
     # 特征通道数（EDSR baseline 64）。
@@ -277,47 +66,15 @@ class ModelConfig:
     # EDSR 块残差缩放（大模型建议 0.1 稳定训练；RCAN 忽略）。
     sisr_res_scale: float = 1.0
 
-    # ---- EDM2 专用（arch=="edm2"） ----
-    # 带自注意力的级索引。空=默认仅 bottleneck。
-    edm2_attention_levels: List[int] = field(default_factory=list)
-
-    # heads = out_ch // channels_per_head。
-    edm2_channels_per_head: int = 64
-
-    # MP 残差/注意力/skip-cat 平衡系数（论文 Eq. 88 / 103）。
-    edm2_res_balance: float = 0.3
-    edm2_attn_balance: float = 0.3
-    edm2_concat_balance: float = 0.5
-
-    # 输出激活裁剪（论文 6.4）；<=0 禁用。
-    edm2_clip_act: float = 256.0
-
-    # ---- 几何派生只读量（不暴露写接口；由 Config.sync() 经 build_topology 写入）----
-    # 用私有 backing 字段承载，sync() 前读到的是安全默认值（3D / 单通道）。
-    def __post_init__(self) -> None:
-        self._spatial_dims: int = 3
-        self._in_channels: int = 1
-
-    @property
-    def spatial_dims(self) -> int:
-        """3 = 3D UNet（z_axis/cubic/whole）；2 = 2D UNet（2.5D 折叠 D）。"""
-        return self._spatial_dims
-
-    @property
-    def in_channels(self) -> int:
-        """模型输入通道数（2.5D 多 FOV 为 n_views*D 等，见 build_topology）。"""
-        return self._in_channels
-
 
 # ---------------------------------------------------------------------------
 # Loss configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class LossConfig:
-    """Generation-side loss settings."""
+class LossConfig(_core.LossConfig):
+    """损失设置（核心段 + 生成侧多视野辅助重建权重）。"""
 
-    deep_supervision_weights: List[float] = field(
-        default_factory=lambda: [1.0, 0.5, 0.25, 0.125])
+    # 多 FOV 辅助重建监督权重（空则默认 0.5^k）。
     aux_recon_weights: List[float] = field(default_factory=list)
 
 
@@ -325,69 +82,23 @@ class LossConfig:
 # Training configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class TrainConfig:
-    """训练循环设置。"""
+class TrainConfig(_core.TrainConfig):
+    """训练循环设置（核心段 + 生成任务整卷验证）。"""
 
-    epochs: int = 200
-    optimizer   : str = "adamw"
-    lr          : float = 1e-3
-    weight_decay: float = 1e-4
-    momentum    : float = 0.99
-    nesterov    : bool = True
-    scheduler    : str = "cosine"
-    warmup_epochs: int = 5
-    warmup_lr    : float = 1e-6
-    cosine_min_lr: float = 1e-6
-    cosine_restart_period: int = 50
-    cosine_restart_mult  : int = 2
-    poly_power           : float = 0.9
-    step_size            : int = 50
-    step_gamma           : float = 0.1
-    plateau_patience     : int = 10
-    plateau_factor       : float = 0.5
-    grad_accum_steps: int = 1
-    grad_clip_norm: float = 12.0
-    # AdamW fused 实现（仅 CUDA 上参数生效；口径同 segtask_v1）。
-    adamw_fused: bool = True
-    use_amp  : bool = True
-    amp_dtype: str = "float16"
-    compile_mode: str = "none"
-    # 可选 channels_last 内存格式；数值等价，Ampere+ 上 3D conv 可能提速但
-    # 不保证正收益（需 benchmark）；默认关。
-    channels_last: bool = False
-    # 独立 copy stream 提前一个 batch 上卡，H2D 与计算重叠（需
-    # data.pin_memory=True 才能真正异步）；数值完全等价，默认关。
-    prefetch_to_gpu: bool = False
-    use_ema  : bool = True
-    ema_decay: float = 0.999
-    output_dir      : str = "outputs"
-    save_every      : int = 10
-    early_stopping: int = 0
-    log_every: int = 10
-    val_every: int = 1
-    vis_every: int = 10
     # 整卷验证（M13，仅生成任务）：与部署同口径——在线退化整卷 → 推理器
     # 滑窗复原（复用 predict.overlap/blend 路径）→ 逐卷 PSNR/SSIM 平均；
     # 启用后选模/早停改用整卷 PSNR（patch 级指标仍一并报告）。
     val_full_volume: bool = False
     # 整卷验证最多评前 N 卷（控耗时）；0=全部 val 卷。
     val_full_volume_max: int = 0
-    seed         : int = 42
-    deterministic: bool = False
-    resume: str = ""
-    pretrain: str = ""
-    pretrain_strict: bool = False
-    pretrain_load_ema: bool = False
 
 
 # ---------------------------------------------------------------------------
 # Prediction / Inference configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class PredictConfig:
-    """Generation inference output settings."""
-
-    output_dir: str = "predictions"
+class PredictConfig(_core.PredictConfig):
+    """生成推理输出设置（核心段 + 滑窗复原字段）。"""
 
     # 输入所在网格："hr"（输入已在 HR 网格上，例如已插值好的体 / 在线退化实验）
     # | "lr"（真实低分辨率输入，如原生厚层 CT）。"lr" 时先按 task.sr_scale
@@ -521,74 +232,21 @@ class TaskConfig:
 # Augmentation configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class AugConfig:
+class AugConfig(_core.AugConfig):
     """GPU 数据增强（生成任务变体：无 label，作用于 image + cond + weight_map）。
 
-    与 segtask 同名字段保持一致以便配置迁移；默认取"生成安全"的保守参数：
+    与核心段同名字段保持一致以便配置迁移；默认覆盖为"生成安全"的保守参数：
     空间变换保留（image/cond 同步 warp，重建目标 = 增强后的 image 自身，
     空间一致性不受影响）；破坏 HR 目标保真度的强度增强（noise / blur /
     lowres / dropout）默认关闭，仅保留温和的亮度 / 对比度 / gamma。
     """
 
-    enabled: bool = True
-
-    # --- 空间变换（image + cond + weight_map 同步） ---
-    random_flip_prob: float = 0.2
-    random_flip_axes: List[int] = field(default_factory=lambda: [2, 3, 4])
-
-    # Affine：小角旋转 + 缩放 + 平移合成单一仿射；与 elastic 融合为单次 grid_sample。
-    random_affine_prob : float = 0.3
-    random_rotate_range: List[float] = field(default_factory=lambda: [-15.0, 15.0])
-    # 缩放作用在采样网格上（反向语义）：>1 采样窗外扩→物体在输出中变小。
-    random_scale_range : List[float] = field(default_factory=lambda: [0.85, 1.15])
-    # 逐轴旋转角范围（(x,y,z)=(W,H,D) 三对 [lo,hi]，度）。None=三轴共用 random_rotate_range。
-    random_rotate_range_per_axis: Optional[List[List[float]]] = None
-    # 各向异性长宽比校正：在 voxel-count 各向同性坐标里旋转（R←A⁻¹RA）。
-    random_affine_aspect_correct: bool = True
-    # 随机平移范围（affine_grid 归一化坐标）；[0,0]=禁用。
-    random_translate_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
-
-    # 弹性形变（B-spline 随机位移场）。
-    elastic_deform_prob : float = 0.2
-    elastic_deform_sigma: float = 5.0
-    elastic_deform_alpha: float = 7.0
-
-    # Grid dropout：随机遮挡矩形子区域。生成任务默认关闭（洞会进入重建目标）。
-    grid_dropout_prob : float = 0.0
-    grid_dropout_ratio: float = 0.3
-    grid_dropout_holes: int = 4
-
-    # --- 强度变换（仅 image；cond 是独立模态、有自己的归一化，不动） ---
-    random_brightness_prob : float = 0.15
-    random_brightness_range: List[float] = field(default_factory=lambda: [-0.1, 0.1])
-
-    random_contrast_prob : float = 0.15
-    random_contrast_range: List[float] = field(default_factory=lambda: [0.9, 1.1])
-
-    random_gamma_prob : float = 0.1
-    random_gamma_range: List[float] = field(default_factory=lambda: [0.9, 1.1])
-
-    # 以下强度退化增强破坏 HR 目标保真度（超分目标 = 增强后 image 自身），
-    # 生成任务默认关闭；如确有需要可显式开启。
-    gaussian_noise_prob: float = 0.0
-    gaussian_noise_std : float = 0.05
-
-    gaussian_blur_prob : float = 0.0
-    gaussian_blur_sigma: List[float] = field(default_factory=lambda: [0.5, 1.5])
-
-    simulate_lowres_prob: float = 0.0
-    simulate_lowres_zoom: List[float] = field(default_factory=lambda: [0.5, 1.0])
-
-    # 强度增强后按增强前逐样本逐通道 min/max 夹取（nnU-Net 惯例）。
-    intensity_clamp: bool = True
-
-    # weight_map 插值模式："nearest" 保持离散权重；"bilinear" 仅适连续场。
-    wmap_interp_mode: str = "nearest"
-
-    # 就地增强快路径：True 时跳过入口 clone（调用方须保证输入张量可被消费）。
-    inplace: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Top-level configuration
-# ---------------------------------------------------------------------------
+    # --- 生成侧默认值覆盖（字段语义同核心段） ---
+    random_brightness_prob: float = 0.15
+    random_contrast_prob  : float = 0.15
+    random_contrast_range : List[float] = field(default_factory=lambda: [0.9, 1.1])
+    random_gamma_prob     : float = 0.1
+    random_gamma_range    : List[float] = field(default_factory=lambda: [0.9, 1.1])
+    gaussian_noise_prob   : float = 0.0
+    gaussian_blur_prob    : float = 0.0
+    simulate_lowres_prob  : float = 0.0

@@ -19,16 +19,15 @@ import os
 import random
 import re
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 from colorama import Fore, Style
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 
 from ..config import Config
 from ..data.augment import GPUAugmentor
@@ -37,16 +36,10 @@ from ..models.unet import UNet3D
 from ..models.mednext import upkern_remap_state_dict
 from ..predictor.adabn import collect_bn_modules, estimate_bn_stats
 from ..utils import (
-    AverageMeter, ModelEMA, ModelSWA, Timer, compute_dice_per_class,
-    seed_everything,
+    AverageMeter, ModelSWA, Timer, compute_dice_per_class,
 )
 from . import views
-from .amp import (
-    _AMP_DTYPES,
-    GradScaler,
-    autocast,
-    resolve_auto_amp_dtype,
-)
+from .amp import autocast
 from .breakdown import collect_multi_res_breakdown, format_breakdown
 from .prefetch import CudaPrefetcher
 from .checkpoint import (
@@ -69,7 +62,6 @@ from .dist_utils import (
     is_main_process,
 )
 from .memory import estimate_train_memory
-from .optim import WarmupScheduler, build_optimizer, build_scheduler
 from .pipelines import (
     Patch3DNativeMultiResPipeline,
     Slab2_5DNativeDPipeline,
@@ -77,26 +69,18 @@ from .pipelines import (
     build_pipeline,
 )
 from .validation import build_val_evaluator
+from taskcore.engine.base_trainer import (  # noqa: F401  (_reseed_rank_rng re-export供旧路径)
+    BaseTrainer,
+    _reseed_rank_rng,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# RNG helper
-# ---------------------------------------------------------------------------
-def _reseed_rank_rng(seed: int, rank: int, epoch: int, deterministic: bool) -> None:
-    """按 rank/epoch 重新分流 RNG。rank0 保持原流不动。"""
-    if int(rank) <= 0:
-        return
-    # resume 后 rank>0 重新分流，避免所有 DDP rank 退化成 rank0 的随机流。
-    mix = int(seed) + int(epoch) * 100003 + int(rank)
-    seed_everything(mix, deterministic)
-
-
-# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
-class Trainer:
+class Trainer(BaseTrainer):
     """3D / 2.5D 分割完整训练 pipeline。"""
 
     def __init__(
@@ -114,13 +98,7 @@ class Trainer:
 
         # 顺序：先 to(device)（optimizer/EMA 绑已迁移参数），最后 torch.compile。
         self.model = model.to(device)
-        self._memory_format = None
-        if tc.channels_last:
-            self._memory_format = (
-                torch.channels_last_3d
-                if int(cfg.model.spatial_dims) == 3
-                else torch.channels_last)
-            self.model = self.model.to(memory_format=self._memory_format)
+        self._setup_channels_last()
 
         # --- Pipeline (criterion + view ops) -------------------------
         self.base_loss = build_loss(cfg.loss)  # 预设dice/bce等等这些
@@ -147,48 +125,10 @@ class Trainer:
         self.target_patch_size = self.pipeline.target_patch_size  # 模型输入尺寸
         self.needs_crop         = cfg.data.aug_oversample_ratio > 1.0
 
-        # --- Optimizer + scheduler ------------------------------------
-        self.optimizer = build_optimizer(self.model, cfg)
-        # 调度器以优化步（optimizer.step 次数）为单位推进：梯度累积下每
-        # epoch 的优化步数为 ceil(micro-batch 数 / accum)（epoch 尾部不满
-        # accum 的尾组也触发一步，见 _train_epoch 的 is_step_boundary）。
-        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
-        steps_per_epoch = math.ceil(len(train_loader) / self.grad_accum_steps)
-        warmup_steps    = tc.warmup_epochs * steps_per_epoch
-        total_steps     = tc.epochs * steps_per_epoch
-        post_warmup     = total_steps - warmup_steps
-
-        base_scheduler = build_scheduler(
-            self.optimizer, cfg, steps_per_epoch, post_warmup_steps=post_warmup)
-        # one_cycle 用 warmup_epochs 映射 pct_start，外层不再做线性 warmup，
-        # 避免 warmup 双重叠加。
-        warmup_steps = 0 if tc.scheduler == "one_cycle" else warmup_steps
-        self.scheduler = WarmupScheduler(
-            self.optimizer, base_scheduler, warmup_steps=warmup_steps,
-            warmup_lr=tc.warmup_lr, base_lr=tc.lr)
-
-        # --- AMP -------------------------------------------------------
-        amp_dtype_cfg = tc.amp_dtype
-        if amp_dtype_cfg == "auto":
-            amp_dtype_cfg = resolve_auto_amp_dtype(device)
-            logger.info("amp_dtype='auto' resolved to %r (device=%s).",
-                        amp_dtype_cfg, device)
-        if amp_dtype_cfg not in _AMP_DTYPES:
-            raise ValueError(
-                f"Unknown amp_dtype: {tc.amp_dtype!r}. "
-                f"Expected one of {sorted(_AMP_DTYPES) + ['auto']}.")
-        self.amp_dtype = _AMP_DTYPES[amp_dtype_cfg]
-        self._amp_dtype_name = amp_dtype_cfg
-        self.use_amp = tc.use_amp and device.type == "cuda"
-        self._scaler_active = self.use_amp and self.amp_dtype == torch.float16
-        self.scaler = GradScaler("cuda", enabled=self._scaler_active)
-
-        # --- EMA -------------------------------------------------------
-        # ema_device="cpu" 时 shadow/backup 常驻 CPU（省 1× 参数量 GPU 显存，
-        # 数学等价）；默认 "" 跟随模型设备，行为不变。
-        self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup,
-                             offload_device=(tc.ema_device or None))
-                    if tc.use_ema else None)
+        # --- Optimizer + scheduler / AMP / EMA（共用工程件，见 BaseTrainer）---
+        self._setup_optim_sched()
+        self._setup_amp()
+        self._setup_ema()
 
         # --- SWA 尾段权重平均（opt-in，见 TrainConfig.swa_enabled）---------
         self.swa = ModelSWA(self.model) if tc.swa_enabled else None
@@ -197,22 +137,8 @@ class Trainer:
             if tc.swa_enabled else 0)
 
         # --- torch.compile (最后) -------------------------------------
-        self._compile_enabled = False
         self._first_step_mem_logged = False
-        if tc.compile_mode != "none" and hasattr(torch, "compile"):
-            triton_ok = True
-            if device.type == "cuda":
-                import importlib.util
-                if importlib.util.find_spec("triton") is None:
-                    triton_ok = False
-                    logger.warning(
-                        "torch.compile (mode='%s') requested but Triton not installed; "
-                        "falling back to eager. Install Triton or set compile_mode='none'.",
-                        tc.compile_mode)
-            if triton_ok:
-                logger.info("Compiling model with mode='%s'", tc.compile_mode)
-                self.model = torch.compile(self.model, mode=tc.compile_mode)
-                self._compile_enabled = True
+        self._maybe_compile()
 
         # --- DDP (多卡) ------------------------------------------------
         # ``self.model`` 始终保持"裸 / 已 compile"模块：optimizer / EMA / checkpoint /
@@ -275,13 +201,8 @@ class Trainer:
             cfg.augment, max_scale=max(_scales), label_fill=_bg)
 
         # --- Tracking --------------------------------------------------
-        self.num_fg           = cfg.num_fg_classes
-        self._best_mode       = tc.save_best_mode  # "max" or "min"
-        self.best_metric      = (-math.inf if self._best_mode == "max" else math.inf)
-        self.has_best         = False
-        self.best_epoch       = 0
-        self.start_epoch      = 0
-        self.patience_counter = 0
+        self.num_fg = cfg.num_fg_classes
+        self._setup_best_tracking(mode=tc.save_best_mode)  # "max" or "min"
 
         # --- Validation / model-selection evaluator -------------------
         # medium（随机 patch 指标）/ high（整卷滑窗指标）由 val_metric_mode 决定；
@@ -291,8 +212,7 @@ class Trainer:
                     tc.val_metric_mode, type(self.evaluator).__name__)
 
         # --- Output directory -----------------------------------------
-        self.output_dir = Path(tc.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_output_dir()
 
         # --- Async checkpoint saver（opt-in，仅 rank0）-------------------
         # save_async=True 时权重先深拷到 CPU，后台线程 torch.save，主循环
@@ -614,124 +534,8 @@ class Trainer:
         self._monitor_render(auto_reload_seconds=0)
 
     # ------------------------------------------------------------------
-    # EMA swap helper (exception-safe)
-    # ------------------------------------------------------------------
-    @contextmanager
-    def _ema_swapped(self) -> Iterator[None]:
-        """临时将 EMA 权重换入 model；try/finally 保证异常时也能还原在线权重。"""
-        if self.ema is None:
-            yield
-            return
-        self.ema.apply_shadow(unwrap_compile(self.model))
-        try:
-            yield
-        finally:
-            self.ema.restore(unwrap_compile(self.model))
-
-    # ------------------------------------------------------------------
-    # Effective grad-accum denominator (尾批不满 accum 时取真实尾长)
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _effective_accum(step: int, total_steps: int, accum: int) -> int:
-        """尾批 micro-batch 数不满 ``accum`` 时，用真实尾长作分母，
-        以免最后一组 micro-batch 因被除以 ``accum`` 而权重偏小。"""
-        if accum <= 1:
-            return 1
-        remainder = total_steps % accum
-        partial_start = total_steps - remainder
-        return remainder if (remainder > 0 and step >= partial_start) else accum
-
-    # ------------------------------------------------------------------
-    # Model-health helpers (轻量；仅 rank0 监测启用时调用)
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def _global_grad_norm(self) -> "float | None":
-        """当前已 unscale 的全局梯度 L2 范数（遍历一次有梯度的参数）。
-
-        仅在未开启 grad_clip（无现成范数可复用）且监测需要时手动调用；调用方
-        负责在 AMP fp16 下先 ``scaler.unscale_``，以免量纲被 loss scale 污染。
-        """
-        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
-        if not grads:
-            return None
-        # foreach 批量算逐张量范数后聚合，全程仅末尾一次 .item() 同步（逐参数
-        # .item() 会打断 CUDA 流水）。任一梯度含 inf/NaN 时结果同样非有限。
-        norms = torch._foreach_norm(grads, 2)
-        return float(torch.linalg.vector_norm(
-            torch.stack([n.float() for n in norms])).item())
-
-    @torch.no_grad()
-    def _global_weight_norm(self) -> "float | None":
-        """全部参数的全局 L2 范数（每 epoch 仅算一次，开销可忽略）。"""
-        params = [p.detach() for p in self.model.parameters()]
-        if not params:
-            return None
-        norms = torch._foreach_norm(params, 2)
-        return float(torch.linalg.vector_norm(
-            torch.stack([n.float() for n in norms])).item())
-
-    @torch.no_grad()
-    def _param_snapshot(self) -> "list":
-        """对全部参数做一次瞬时 clone（用于 update/weight 比值，每 epoch 仅一次）。"""
-        return [p.detach().clone() for p in self.model.parameters()]
-
-    @torch.no_grad()
-    def _update_ratio_from_snapshot(self, snapshot: "list") -> "float | None":
-        """由 ``optimizer.step`` 前的快照算全局 ‖Δw‖/‖w‖（用完释放快照）。
-
-        参数遍历顺序与 ``_param_snapshot`` 一致，逐张量累加更新量与原权重的平方和。
-        若原权重范数为 0（理论上不会发生）则返回 ``None`` 以免除零。
-        """
-        params = [p.detach() for p in self.model.parameters()]
-        if not params:
-            return None
-        diffs = torch._foreach_sub(params, snapshot)
-        upd = torch.linalg.vector_norm(torch.stack(
-            [n.float() for n in torch._foreach_norm(diffs, 2)]))
-        w = torch.linalg.vector_norm(torch.stack(
-            [n.float() for n in torch._foreach_norm(snapshot, 2)]))
-        w_norm = float(w.item())
-        if w_norm <= 0.0:
-            return None
-        return float(upd.item()) / w_norm
-
-    def _collect_health_metrics(
-        self,
-        out: Dict[str, float],
-        *,
-        grad_norm_meter: AverageMeter,
-        grad_norm_max: float,
-        nonfinite_steps: int,
-        clipped_steps: int,
-        opt_steps: int,
-        grad_clip_norm: float,
-        update_ratio: "float | None" = None,
-    ) -> None:
-        """把本 epoch 聚合的健康指标并入 ``out``（仅写入有意义的键）。
-
-        - ``grad_norm`` / ``grad_norm_max``：仅在采集到范数时写入。
-        - ``nonfinite_steps``：非有限 loss 的 micro-batch 计数。
-        - ``grad_clip_frac``：开启 grad_clip 时，范数超阈值的优化步占比。
-        - ``weight_norm``：每 epoch 末一次全参数范数。
-        - ``amp_scale``：AMP fp16 scaler 标度（仅 scaler 实际启用时）。
-        - ``update_ratio``：全局 ‖Δw‖/‖w‖（仅开启且本 epoch 成功测得时）。
-        """
-        if grad_norm_meter.count > 0:
-            out["grad_norm"] = grad_norm_meter.avg
-            out["grad_norm_max"] = grad_norm_max
-        out["nonfinite_steps"] = float(nonfinite_steps)
-        if grad_clip_norm > 0 and opt_steps > 0:
-            out["grad_clip_frac"] = clipped_steps / opt_steps
-        wn = self._global_weight_norm()
-        if wn is not None:
-            out["weight_norm"] = wn
-        if self._scaler_active:
-            out["amp_scale"] = float(self.scaler.get_scale())
-        if update_ratio is not None and math.isfinite(update_ratio):
-            out["update_ratio"] = update_ratio
-
-    # ------------------------------------------------------------------
     # Training / validation loops
+    # （EMA 换入 / 梯度累积尾批 / 模型健康监测等共用件见 BaseTrainer）
     # ------------------------------------------------------------------
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         """单 epoch 训练，支持梯度累积。模式判断完全交给 ``self.pipeline``。"""

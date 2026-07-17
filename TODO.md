@@ -59,10 +59,37 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 审查主要内容为代码、算法、设计、架构等等：  
 是否正确、合理；是否有优化空间；是否有训练加速/GPU优化空间；是否有更好的高质量内容（算法/模块/设计/架构/损失等等）可以借鉴、适配或新增（现在是2026年7月，不局限医学图像领域，可能自然图像的分类/分割/检测/生成等等、NLP、LLM、VLM等等有更好，更先进的灵感）。  
 
+
+建议改成这样（保持你原有框架，只把审查对象按重构后的两级结构写清楚）：
+
+---
+
+2 分割项目代码审查（需结合对应 readme/design/workflow 一起理解）：需认真、仔细、严谨的理解、分析、思考和调研。为保证高质量完成，本轮不动任何代码/文档：
+
+重构后分割项目 = 公共框架层 `taskcore/` + 任务层 `segtask_v1/`，审查按此两级展开。代码仍大致分 5 部分，每部分先审公共层、再审任务层，可先独立深度审查，再串联起来全局分析：
+- 数据读取：`taskcore/data`（loader / dataset / make_data / specs）；
+- 模型构建：`taskcore/models`（topology + 公共骨干）+ `segtask_v1` 侧装配用法；
+- 数据增强/处理：`taskcore/data/augment.py`（GPUAugmentor）；
+- 训练全流程（含 val）：`taskcore/engine`（BaseTrainer + amp/optim/checkpoint/dist/prefetch）+ `segtask_v1/trainer`（主循环、validation、views/pipelines）；
+- 推理全流程：`taskcore/engine/base_predictor.py` + `segtask_v1/predictor`（滑窗 / blending / TTA / AdaBN）。
+
+注意：taskcore 是五任务共享的公共层，审查发现的问题和改进对全部任务生效，优先级最高；`segtask_v1` 内标注 `[shim → taskcore.*]` 的别名文件跳过不审。
+
+审查主要内容为代码、算法、设计、架构等等：
+是否正确、合理；是否有优化空间；是否有训练加速/GPU优化空间；是否有更好的高质量内容（算法/模块/设计/架构/损失等等）可以借鉴、适配或新增（现在是2026年7月，不局限医学图像领域，可能自然图像的分类/分割/检测/生成等等、NLP、LLM、VLM等等有更好，更先进的灵感）。
+
 进展：  
 
 
 3 重构调研：由于cls/det/gen/ssl都是基于seg构建的，而且在设计上能和seg保持一致的都和seg保持一致了（可能还有不一致我未发现），能复用技巧也基本上都复用了（可能会有没有复用的我未发现）。现在我想将公用的内容抽离出来，形成一个通用的框架，然后在各个子项目中复用，如果有的模块实在做不到通用，那就例如把通用的当父类，具体的子项目当子类，继承父类的通用部分，然后重写具体的子项目部分。仍然还是大致以数据读取、模型构建、数据增强/处理、训练全流程(含val流程)、推理全流程5部分来。先认真的彻底分析和理解现有cls/det/gen/ssl/seg项目代码（需结合对应readme/design/workflow一起理解），再仔细的调研公认高质量项目的架构设计等等（不要局限医疗，可能自然图像，NLP，LLM，VLM有更好的项目），最后再出一个最终的方案（需要用简单易懂的大白话解释清楚）。  
+
+进展：已完成调研规划与实施。新建顶层公共包 `taskcore/`（config / data / models / engine / utils 五层），公共配置、数据层、公共模型（含 gen 侧漂移合并，逐位对拍一致）、训练/推理工程件全部下沉；五任务训练器接入共用基类 `BaseTrainer`，seg/gen/cls/det 推理器接入 `BasePredictor`（任务主循环保留在各自子类）。旧 import 路径经 shim 保留、行为不变；每步全量回归的失败集与重构前基线逐项一致（1330 过 / 23 个既有失败 / 3 跳过）。总览见根 README「公共包 taskcore」一节。  
+
+已全部下沉共享（五任务通用）：seed/EMA(warmup+offload)/SWA 工具、AMP(auto dtype)/GradScaler、优化器/调度器/warmup、checkpoint I/O（原子写、RNG 快照、前缀剥离、compile 解包、异步保存器）、分布式辅助、显存统计、CUDA 预取、GPUAugmentor、数据发现/npz 预打包、公共骨干与 topology、BaseTrainer/BasePredictor 工程件（channels_last、compile、best-tracking、梯度/权重范数与 update-ratio 健康度、accum 尾组处理、EMA 换入换出、推理 AMP/TTA 组合）。
+
+技巧已在公共层、但部分任务还没用上（用了的：seg/cls/det/ssl 都接了健康度指标；async checkpoint 只有 seg+ssl 在用；_ema_swapped/_effective_accum gen/det 还没接）——接入属于给这些任务「加功能」，会改变它们的行为/输出，需要单独立项。
+
+仍是 seg 独有、可考虑推广的：① 滑窗推理全家桶（blending/skip-empty-window/z-interleave/AdaBN/CPU 累加）在 segtask_v1/predictor，gen 有自己的一套滑窗，未合并（两者几何语义差异大，合并风险高）；② monitor 仪表盘 + history 落盘体系只有 seg 有；③ SWA、DDP 包装、resume/pretrain 加载策略各任务仍各自实现。
 
 
 4 模型流可视化需要有层次化，结构化，美化，可以清晰看到计算流的走向，可以清晰理解模型架构，可以清晰的溯源。总之：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判、讨厌"自动布局默认输出"式的无设计感结果。以下是一些例子：  

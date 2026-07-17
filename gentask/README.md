@@ -1,6 +1,6 @@
 # gentask — 医学影像超分与生成任务
 
-gentask 是从 `segtask_v1` 剥离出的生成工程，覆盖医学影像超分、复原和条件生成两条主线。它既支持回归式重建，也支持条件扩散式采样，并把在线退化、训练、推理和数据预打包都放进统一的工程入口里。
+gentask 是从 `segtask_v1` 剥离出的生成工程，覆盖医学影像超分、复原和条件生成两条主线。它既支持回归式重建，也支持条件扩散式采样，并把在线退化、训练、推理和数据预打包都放进统一的工程入口里。公共骨干 / 配置公共段 / 训练推理工程件已下沉到顶层公共包 `taskcore`，本包保留生成任务层；被迁移模块以 shim 保留旧 import 路径，行为不变（模块树中以 `[shim → taskcore.*]` 标注）。
 
 > 端到端训练/推理流程见 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)。
 
@@ -17,7 +17,7 @@ gentask/
 ├── utils.py  # 通用工具
 ├── config/  # 配置系统
 │   ├── __init__.py  # 配置包入口
-│   ├── dataclasses.py  # Config / Task / Model dataclass 定义
+│   ├── dataclasses.py  # Config dataclass：公共段继承 taskcore.config.core，叠加生成任务段
 │   ├── io.py  # YAML 读写与 resolved config 保存
 │   └── validation.py  # 生成任务配置校验
 ├── data/  # 数据与退化系统
@@ -40,29 +40,29 @@ gentask/
 │   └── recon.py  # 重建损失与加权封装
 ├── models/  # 网络与生成接口
 │   ├── __init__.py  # 模型包入口
-│   ├── adm_unet.py  # ADM backbone
-│   ├── blocks.py  # 共享积木与注意力模块
-│   ├── convnext.py  # ConvNeXt stage / block
+│   ├── adm_unet.py  # [shim → taskcore.models.adm_unet] ADM backbone
+│   ├── blocks.py  # [shim → taskcore.models.blocks] 共享积木与注意力模块
+│   ├── convnext.py  # [shim → taskcore.models.convnext] ConvNeXt stage / block
 │   ├── diffusion.py  # 扩散 sampler / scheduler
-│   ├── edm2_unet.py  # EDM2 backbone
+│   ├── edm2_unet.py  # [shim → taskcore.models.edm2_unet] EDM2 backbone
 │   ├── factory.py  # generation model 装配工厂
 │   ├── generation.py  # 回归 / 扩散统一接口
-│   ├── resnet.py  # ResNet block / stage
+│   ├── resnet.py  # [shim → taskcore.models.resnet] ResNet block / stage
 │   ├── sisr.py  # 经典 SISR backbone（EDSR / RCAN）
-│   ├── stem.py  # stem 与多视图融合
-│   ├── topology.py  # 派生输入 / 输出几何真相源
-│   ├── unet.py  # UNet encoder / decoder 主体
-│   ├── unet3p.py  # UNet3+ decoder
-│   └── unetpp.py  # UNet++ decoder
+│   ├── stem.py  # [shim → taskcore.models.stem] stem 与多视图融合
+│   ├── topology.py  # [shim → taskcore.models.topology] 派生输入 / 输出几何真相源
+│   ├── unet.py  # [shim → taskcore.models.unet] UNet encoder / decoder 主体
+│   ├── unet3p.py  # [shim → taskcore.models.unet3p] UNet3+ decoder
+│   └── unetpp.py  # [shim → taskcore.models.unetpp] UNet++ decoder
 ├── predictor/  # 推理器
 │   ├── __init__.py  # 预测器包入口
-│   └── gen_predictor.py  # generation 推理器
+│   └── gen_predictor.py  # generation 推理器（继承 taskcore.engine.BasePredictor）
 └── trainer/  # 训练循环
     ├── __init__.py  # 训练包入口
-    ├── amp.py  # AMP / GradScaler 工具
-    ├── checkpoint.py  # checkpoint 读写与兼容
-    ├── gen_trainer.py  # generation 训练循环
-    ├── optim.py  # 优化器 / 调度器 / warmup
+    ├── amp.py  # [shim → taskcore.engine.amp] AMP / GradScaler 工具
+    ├── checkpoint.py  # [shim → taskcore.engine.checkpoint] checkpoint 读写与兼容
+    ├── gen_trainer.py  # generation 训练循环（继承 taskcore.engine.BaseTrainer）
+    ├── optim.py  # [shim → taskcore.engine.optim] 优化器 / 调度器 / warmup
     ├── views.py  # 多视图消费侧几何原语
     └── pipelines/  # 多视图消费管线
         ├── __init__.py  # 管线包入口

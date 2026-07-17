@@ -6,7 +6,6 @@ operates on restored image volumes instead of segmentation logits.
 
 from __future__ import annotations
 
-import itertools
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -21,7 +20,7 @@ from ..data.degradation import _interp_mode, _phase_aligned_linear_upsample
 from ..data.loader import match_condition_paths
 from ..models.generation import DiffusionModel
 from ..models.topology import build_topology
-from ..trainer.amp import resolve_auto_amp_dtype
+from taskcore.engine.base_predictor import BasePredictor
 from ..trainer.checkpoint import (
     _select_state_dict,
     _strip_compile_prefix,
@@ -30,16 +29,13 @@ from ..trainer.checkpoint import (
 
 logger = logging.getLogger(__name__)
 
-_AMP_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16,
-               "float32": torch.float32}
-
 try:
     import SimpleITK as sitk
 except ImportError:  # pragma: no cover - 仅写出阶段需要
     sitk = None
 
 
-class GenerationPredictor:
+class GenerationPredictor(BasePredictor):
     """超分复原推理器（回归 / 扩散通用，经 ``model.restore``）。"""
 
     def __init__(self, model: torch.nn.Module, cfg: Config, device: torch.device):
@@ -84,18 +80,12 @@ class GenerationPredictor:
                 "DiffusionModel does not support multi-view inference "
                 f"(multi_res_scales={cfg.data.multi_res_scales}).")
         # 推理 autocast：dtype 口径同训练（train.amp_dtype）。
-        amp_name = str(cfg.train.amp_dtype)
-        if amp_name == "auto":
-            amp_name = resolve_auto_amp_dtype(device)
-        self.amp_dtype = _AMP_DTYPES.get(amp_name, torch.float32)
-        self.use_amp = bool(cfg.predict.use_amp) and device.type == "cuda"
+        self._setup_infer_amp(bool(cfg.predict.use_amp))
         # 翻转 TTA：全非空子集与原始预测平均。
         self.tta_combos: List[Tuple[int, ...]] = []
         if bool(cfg.predict.tta_flips):
             dims = self._tta_dims()
-            self.tta_combos = [
-                c for r in range(1, len(dims) + 1)
-                for c in itertools.combinations(dims, r)]
+            self.tta_combos = self.flip_tta_combos(dims)
             logger.info("Flip TTA enabled: axes=%s (%d extra passes/window).",
                         dims, len(self.tta_combos))
 
@@ -121,8 +111,7 @@ class GenerationPredictor:
         self, x: torch.Tensor,
         cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         """单窗复原：autocast +（可选）翻转 TTA 均值。"""
-        with torch.autocast(device_type=self.device.type,
-                            enabled=self.use_amp, dtype=self.amp_dtype):
+        with self._autocast():
             rec = self.bare.restore(x, cond=cond)
         rec = rec.float()
         if not self.tta_combos:
@@ -132,8 +121,7 @@ class GenerationPredictor:
             dims = list(combo)
             xf = torch.flip(x, dims)
             cf = None if cond is None else torch.flip(cond, dims)
-            with torch.autocast(device_type=self.device.type,
-                                enabled=self.use_amp, dtype=self.amp_dtype):
+            with self._autocast():
                 rf = self.bare.restore(xf, cond=cf)
             acc = acc + torch.flip(rf.float(), dims)
         return acc / (len(self.tta_combos) + 1)

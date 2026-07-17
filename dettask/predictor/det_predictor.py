@@ -20,7 +20,6 @@ FROC 统一在 3D 框上评估（两几何同一读数口径，Plan §7-5）。
 
 from __future__ import annotations
 
-import itertools
 import logging
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -30,7 +29,7 @@ import torch
 
 from segtask_v1.config import Config as SegConfig
 from segtask_v1.data.dataset import load_npz_image, resize_3d
-from segtask_v1.trainer.amp import resolve_auto_amp_dtype
+from taskcore.engine.base_predictor import BasePredictor
 
 from ..config import DetConfig
 from ..data.det_dataset import load_boxes
@@ -40,9 +39,6 @@ from ..targets import flip_boxes, scale_boxes
 from .stitching import stitch_slab_detections
 
 logger = logging.getLogger(__name__)
-
-_AMP_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16,
-               "float32": torch.float32}
 
 
 def _grid_offsets(dim: int, patch: int, stride: int) -> List[int]:
@@ -54,7 +50,7 @@ def _grid_offsets(dim: int, patch: int, stride: int) -> List[int]:
     return sorted(set(offs))
 
 
-class DetPredictor:
+class DetPredictor(BasePredictor):
     """整卷检测推理；``predict_volume`` 返回 3D 框检出。"""
 
     def __init__(self, model: torch.nn.Module, cfg: SegConfig,
@@ -68,18 +64,13 @@ class DetPredictor:
         self.mode = str(cfg.data.patch_mode).lower()
 
         tc = cfg.train
-        amp_name = tc.amp_dtype
-        if amp_name == "auto":
-            amp_name = resolve_auto_amp_dtype(device)
-        self.amp_dtype = _AMP_DTYPES.get(amp_name, torch.float32)
-        self.use_amp = tc.use_amp and device.type == "cuda"
+        self._setup_infer_amp(bool(tc.use_amp))
 
         # flip TTA 组合（空组合 = 原图；轴为 patch 空间轴）。
         if det.tta_flips:
             axes = (1, 2) if self.spatial_dims == 2 else (0, 1, 2)
-            self._tta_combos: List[Tuple[int, ...]] = [
-                c for r in range(len(axes) + 1)
-                for c in itertools.combinations(axes, r)]
+            self._tta_combos: List[Tuple[int, ...]] = self.flip_tta_combos(
+                axes, include_identity=True)
         else:
             self._tta_combos = [()]
 
@@ -120,8 +111,7 @@ class DetPredictor:
                 xin = torch.flip(x, dims=dims)
             else:
                 xin = x
-            with torch.autocast(device_type=self.device.type,
-                                enabled=self.use_amp, dtype=self.amp_dtype):
+            with self._autocast():
                 dets = self.model(xin)
             for i, d in enumerate(dets):
                 b = d["boxes"].float()

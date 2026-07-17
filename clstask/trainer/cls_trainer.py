@@ -34,21 +34,19 @@ import torch.nn as nn
 
 from segtask_v1.config import Config as SegConfig
 from segtask_v1.data.augment import GPUAugmentor
-from segtask_v1.trainer.amp import (
-    _LOGIT_CLAMP,
-    GradScaler,
-    autocast,
-    resolve_auto_amp_dtype,
+from segtask_v1.trainer.amp import _LOGIT_CLAMP, autocast
+from segtask_v1.trainer.checkpoint import (
+    AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
+    state_to_cpu, unwrap_compile,
 )
-from segtask_v1.trainer.checkpoint import unwrap_compile
 from segtask_v1.trainer.prefetch import CudaPrefetcher
 from segtask_v1.trainer.optim import (
     WarmupScheduler,
     build_optimizer,
     build_scheduler,
 )
-from segtask_v1.trainer.trainer import Trainer as _SegTrainer
-from segtask_v1.utils import AverageMeter, ModelEMA
+from segtask_v1.utils import AverageMeter
+from taskcore.engine.base_trainer import BaseTrainer
 
 from ..config import ClsConfig, resolve_num_classes
 from ..data.cls_dataset import derive_volume_targets
@@ -58,9 +56,6 @@ from ..predictor.cls_predictor import aggregate_probs
 from .mixup import apply_mixup_cutmix
 
 logger = logging.getLogger(__name__)
-
-_AMP_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16,
-               "float32": torch.float32}
 
 
 def _build_optimizer_with_lr_mult(model: nn.Module, cfg: SegConfig,
@@ -129,7 +124,7 @@ class _GroupWarmupScheduler(WarmupScheduler):
             self.scheduler.step()
 
 
-class ClsTrainer:
+class ClsTrainer(BaseTrainer):
     """分类训练器；``fit()`` 返回 best 指标摘要。"""
 
     def __init__(self, model: nn.Module, cfg: SegConfig, cls: ClsConfig,
@@ -170,25 +165,9 @@ class ClsTrainer:
             group_base_lrs=[float(pg["lr"])
                             for pg in self.optimizer.param_groups])
 
-        amp_name = tc.amp_dtype
-        if amp_name == "auto":
-            amp_name = resolve_auto_amp_dtype(device)
-        self.amp_dtype = _AMP_DTYPES.get(amp_name, torch.float32)
-        self.use_amp = tc.use_amp and device.type == "cuda"
-        self.scaler = GradScaler(
-            "cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
-        self._scaler_active = self.use_amp and self.amp_dtype == torch.float16
-
-        self.ema = (
-            ModelEMA(
-                self.model,
-                tc.ema_decay,
-                warmup=tc.ema_warmup,
-                offload_device=(tc.ema_device or None),
-            )
-            if tc.use_ema
-            else None
-        )
+        # --- AMP / EMA（共用工程件，见 BaseTrainer）------------------------
+        self._setup_amp()
+        self._setup_ema()
 
         # GPU 增强（复用 segtask GPUAugmentor）：在未折叠的 (B,1,D,H,W) 上
         # 对 image+label 联合施加，增强后派生分类 target 再折叠（见
@@ -202,13 +181,16 @@ class ClsTrainer:
             if len(cfg.data.label_values) > 1 else [1.0])]
         self.fold_2_5d = int(cfg.model.spatial_dims) == 2
 
-        self.output_dir = Path(tc.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_output_dir()
+        # save_async=True 时权重先深拷到 CPU，后台线程 torch.save，主循环
+        # 不再被写盘阻塞；fit 收尾 wait+close 保证全部落盘（同 seg）。
+        self._ckpt_saver = (AsyncCheckpointSaver()
+                            if self.cfg.train.save_async else None)
+        # SWA 尾段权重平均（opt-in，公用工程件，见 BaseTrainer）。
+        self._setup_swa()
         self.best_key = cls.save_best_metric        # auc|f1|acc|loss|vol_*
         self.best_sign = -1.0 if self.best_key == "loss" else 1.0
-        self.best_metric = -math.inf
-        self.best_epoch = 0
-        self.start_epoch = 0
+        self._setup_best_tracking(mode="max")
         self.history: "list[Dict[str, float]]" = []
         # mask 源卷级 MIL 真值：整卷 label 一次性派生（与 patch 抽样解耦，
         # 避免抽样未覆盖病灶时阳性卷被当阴性）；惰性计算一次。
@@ -251,17 +233,16 @@ class ClsTrainer:
             img = img.reshape(b, d, h, w)                      # 深度折进通道
         return img, target
 
-    @torch.no_grad()
-    def _global_grad_norm(self) -> float:
-        """当前全局梯度 L2 范数（clip 关时供非有限守护；inf 上限不会裁剪）。"""
-        return float(nn.utils.clip_grad_norm_(
-            self.model.parameters(), float("inf")))
-
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
         loss_meter = AverageMeter()
         accum = self.grad_accum_steps
         total = len(self.train_loader)
+        grad_norm_meter = AverageMeter()
+        grad_norm_max = 0.0
+        nonfinite_steps = 0
+        clipped_steps = 0
+        opt_steps = 0
         # GPU 预取（口径同 seg Trainer）：独立 copy stream 提前一个 batch 上卡。
         batch_iter = self.train_loader
         if self.cfg.train.prefetch_to_gpu and self.device.type == "cuda":
@@ -278,7 +259,7 @@ class ClsTrainer:
 
         def _flush_pending() -> "float | None":
             """单次同步取回缓存损失并更新 meter；返回最后一步的损失值。"""
-            nonlocal group_has_nonfinite
+            nonlocal group_has_nonfinite, nonfinite_steps
             if not pending:
                 return None
             vals = torch.stack([t for _, t, _ in pending]).tolist()
@@ -289,6 +270,7 @@ class ClsTrainer:
                     loss_meter.update(v, bs)
                 else:
                     group_has_nonfinite = True
+                    nonfinite_steps += 1
                     logger.warning(
                         "Non-finite train loss (%s) at epoch %d step %d/%d; "
                         "skipping meter update.", v, epoch + 1, s + 1, total)
@@ -307,7 +289,7 @@ class ClsTrainer:
                 logits = self.model(img)
             loss = self._loss_fp32(logits, target)
             # 尾组 micro-batch 不满 accum 时用真实尾长作分母（同 seg）。
-            eff_accum = _SegTrainer._effective_accum(step, total, accum)
+            eff_accum = self._effective_accum(step, total, accum)
             loss_scaled = loss / eff_accum if eff_accum > 1 else loss
             self.scaler.scale(loss_scaled).backward()
 
@@ -333,6 +315,12 @@ class ClsTrainer:
                     grad_norm_val = self._global_grad_norm()
                 grad_nonfinite = (grad_norm_val is not None
                                   and not math.isfinite(grad_norm_val))
+                if grad_norm_val is not None and not grad_nonfinite:
+                    grad_norm_meter.update(grad_norm_val)
+                    grad_norm_max = max(grad_norm_max, grad_norm_val)
+                    if (self.cfg.train.grad_clip_norm > 0
+                            and grad_norm_val > self.cfg.train.grad_clip_norm):
+                        clipped_steps += 1
 
                 # bf16/fp32：loss/梯度非有限则丢弃本 accum 组，不推
                 # scheduler/EMA，避免 NaN 永久污染权重；fp16 由 GradScaler
@@ -356,6 +344,7 @@ class ClsTrainer:
                 scaler_skipped = (scale_before is not None
                                   and self.scaler.get_scale() < scale_before)
                 self.optimizer.zero_grad(set_to_none=True)
+                opt_steps += 1
                 # scheduler/EMA 仅在 optimizer 真正更新后推进（同 seg）。
                 if not scaler_skipped:
                     self.scheduler.step()
@@ -366,33 +355,57 @@ class ClsTrainer:
                 logger.debug("  [%d/%d] loss=%.4f lr=%.2e", step + 1, total,
                              loss_val, self.scheduler.get_lr())
         _flush_pending()
-        return {"loss": loss_meter.avg}
+        out = {"loss": loss_meter.avg}
+        self._collect_health_metrics(
+            out,
+            grad_norm_meter=grad_norm_meter,
+            grad_norm_max=grad_norm_max,
+            nonfinite_steps=nonfinite_steps,
+            clipped_steps=clipped_steps,
+            opt_steps=opt_steps,
+            grad_clip_norm=float(self.cfg.train.grad_clip_norm))
+        return out
 
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
         self.model.eval()
-        if self.ema is not None:
-            self.ema.apply_shadow(self.model)
+        with self._ema_swapped():
+            return self._validate_inner(epoch)
+
+    @torch.no_grad()
+    def _swa_bn_forward(self) -> None:
+        """SWA BN 重估用前向：未增强训练数据，与推理分布同构。"""
+        steps = int(self.cfg.train.swa_bn_update_steps)
+        for step, batch in enumerate(self.train_loader):
+            if step >= steps:
+                break
+            img = batch["image"].to(self.device, non_blocking=True).float()
+            if self.fold_2_5d:
+                b, _, d, h, w = img.shape
+                img = img.reshape(b, d, h, w)
+            with autocast(device_type=self.device.type,
+                          enabled=self.use_amp, dtype=self.amp_dtype):
+                self.model(img)
+
+    @torch.no_grad()
+    def _validate_inner(self, epoch: int) -> Dict[str, float]:
+        """在**当前权重**上评测（不换 EMA；供 _validate / SWA 收尾共用）。"""
         all_logits, all_targets, all_vols = [], [], []
         loss_meter = AverageMeter()
-        try:
-            for batch in self.val_loader:
-                img = batch["image"].to(self.device).float()
-                target = batch["target"].to(self.device)
-                # 验证前向 autocast 口径同训练/推理（seg validation 同）；
-                # 损失仍在 fp32 计算。
-                with autocast(device_type=self.device.type,
-                              enabled=self.use_amp, dtype=self.amp_dtype):
-                    logits = self.model(img)
-                loss_meter.update(
-                    float(self._loss_fp32(logits, target).item()),
-                    img.shape[0])
-                all_logits.append(logits.float().cpu())
-                all_targets.append(target.cpu())
-                all_vols.append(batch["vol_idx"].cpu())
-        finally:
-            if self.ema is not None:
-                self.ema.restore(self.model)
+        for batch in self.val_loader:
+            img = batch["image"].to(self.device).float()
+            target = batch["target"].to(self.device)
+            # 验证前向 autocast 口径同训练/推理（seg validation 同）；
+            # 损失仍在 fp32 计算。
+            with autocast(device_type=self.device.type,
+                          enabled=self.use_amp, dtype=self.amp_dtype):
+                logits = self.model(img)
+            loss_meter.update(
+                float(self._loss_fp32(logits, target).item()),
+                img.shape[0])
+            all_logits.append(logits.float().cpu())
+            all_targets.append(target.cpu())
+            all_vols.append(batch["vol_idx"].cpu())
         if not all_logits:
             raise RuntimeError("validation loader yielded no batches.")
         logits = torch.cat(all_logits)
@@ -481,9 +494,17 @@ class ClsTrainer:
             state["model_online_state_dict"] = online_sd
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
-        torch.save(state, self.output_dir / "best_model.pth")
-        logger.info("Best cls model saved (%s=%.4f) @ epoch %d",
-                    self.best_key, metrics[self.best_key], epoch + 1)
+        path = self.output_dir / "best_model.pth"
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(
+                state_to_cpu(state), path,
+                on_done=lambda e=epoch, m=metrics[self.best_key]: logger.info(
+                    "Best cls model saved (%s=%.4f) @ epoch %d",
+                    self.best_key, m, e + 1))
+        else:
+            atomic_torch_save(state, path)
+            logger.info("Best cls model saved (%s=%.4f) @ epoch %d",
+                        self.best_key, metrics[self.best_key], epoch + 1)
 
     def _save_latest(self, epoch: int, metrics: Dict[str, float]) -> None:
         """latest checkpoint（续训用，口径同 seg）：在线权重 + EMA +
@@ -502,12 +523,15 @@ class ClsTrainer:
             "history": self.history,
             "config": self.cfg,
             "cls_config": self.cls,
+            "rng_state": snapshot_rng_state(),
         }
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
-        tmp = self.output_dir / "latest_model.pth.tmp"
-        torch.save(state, tmp)
-        tmp.replace(self.output_dir / "latest_model.pth")
+        path = self.output_dir / "latest_model.pth"
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(state_to_cpu(state), path)
+        else:
+            atomic_torch_save(state, path)  # 原子替换，防中断写坏
 
     def _try_resume(self) -> None:
         """``train.resume`` 指向 checkpoint 时完整恢复（model/EMA/optimizer/
@@ -521,19 +545,8 @@ class ClsTrainer:
                                     f"{path!r}")
         ckpt = torch.load(path, map_location=self.device,
                           weights_only=False)
-        bare = unwrap_compile(self.model)
-        bare.load_state_dict(ckpt["model_state_dict"])
-        if self.ema is not None and "ema_state_dict" in ckpt:
-            self.ema.load_state_dict(ckpt["ema_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-        self.start_epoch = int(ckpt.get("epoch", -1)) + 1
-        self.best_metric = float(ckpt.get("best_metric", -math.inf))
-        self.best_epoch = int(ckpt.get("best_epoch", 0))
+        # 公共段（model/EMA/optim/sched/scaler/best/RNG）见 BaseTrainer。
+        self.start_epoch = self._restore_train_state(ckpt)
         self.history = list(ckpt.get("history", []))
         logger.info(
             "Resumed from %s: next epoch %d, best %s=%.4f @ epoch %d",
@@ -545,6 +558,8 @@ class ClsTrainer:
             json.dumps(self.history, indent=2), encoding="utf-8")
 
     def fit(self) -> Dict[str, float]:
+        # 公共加载策略：resume 全状态恢复；pretrain 仅权重；同设优先 resume。
+        self._try_pretrain()
         self._try_resume()
         last: Dict[str, float] = dict(self.history[-1]) if self.history else {}
         patience = max(int(self.cfg.train.early_stopping), 0)
@@ -572,6 +587,7 @@ class ClsTrainer:
             last = {"epoch": float(epoch), **tr,
                     **{f"val_{k}": v for k, v in val.items()}}
             self.history.append(last)
+            self._swa_update(epoch)
             self._save_latest(epoch, val)
             self._write_history()
             if patience > 0 and epochs_no_improve >= patience:
@@ -580,6 +596,18 @@ class ClsTrainer:
                     "validation(s) (best @ epoch %d).", epoch + 1,
                     self.best_key, patience, self.best_epoch + 1)
                 break
+        try:
+            self._finalize_swa(
+                validate_fn=lambda: self._validate_inner(
+                    self.cfg.train.epochs - 1),
+                bn_forward_fn=self._swa_bn_forward)
+        except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
+            logger.exception("SWA finalization failed; online/best "
+                             "checkpoints are unaffected.")
+        if self._ckpt_saver is not None:
+            # 收尾前排空异步写盘队列；写盘异常在此抛出。
+            self._ckpt_saver.close()
+            self._ckpt_saver = None
         return {f"best_{self.best_key}": self.best_sign * self.best_metric,
                 "best_epoch": float(self.best_epoch), **last}
 

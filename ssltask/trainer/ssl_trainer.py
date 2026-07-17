@@ -25,25 +25,24 @@ import torch.nn as nn
 from torch.utils.data import DistributedSampler
 
 from segtask_v1.data.augment import GPUAugmentor
-from segtask_v1.trainer.amp import (
-    _AMP_DTYPES, GradScaler, autocast, resolve_auto_amp_dtype)
+from segtask_v1.trainer.amp import autocast
 from segtask_v1.trainer.checkpoint import (
     AsyncCheckpointSaver, relocate_optimizer_state, restore_rng_state,
     state_to_cpu, unwrap_compile)
 from segtask_v1.trainer.dist_utils import (
     all_reduce_flag_any, get_rank, get_world_size,
     is_dist_avail_and_initialized, is_main_process)
-from segtask_v1.trainer.trainer import _reseed_rank_rng
 from segtask_v1.trainer.optim import (
     WarmupScheduler, build_optimizer, build_scheduler)
-from segtask_v1.utils import AverageMeter, ModelEMA, Timer
+from segtask_v1.utils import AverageMeter, Timer
+from taskcore.engine.base_trainer import BaseTrainer, _reseed_rank_rng
 
 from ..methods.base import SSLMethod
 
 logger = logging.getLogger(__name__)
 
 
-class SSLTrainer:
+class SSLTrainer(BaseTrainer):
     """方法无关的 SSL 预训练 pipeline。"""
 
     def __init__(self, method: SSLMethod, cfg, ssl, train_loader, device):
@@ -54,6 +53,7 @@ class SSLTrainer:
         self.train_loader = train_loader
         tc = cfg.train
         model = method.module
+        self.model = model
 
         # --- DDP（多卡）---------------------------------------------------
         # SSL 方法插件在 ``compute_loss`` 内直调子模块（dino 系 ``module.student``
@@ -103,16 +103,8 @@ class SSLTrainer:
         self._opt_steps_per_epoch = opt_steps_per_epoch
         self._total_opt_steps = total_steps
 
-        # --- AMP ---
-        amp_dtype_cfg = tc.amp_dtype
-        if amp_dtype_cfg == "auto":
-            amp_dtype_cfg = resolve_auto_amp_dtype(device)
-        if amp_dtype_cfg not in _AMP_DTYPES:
-            raise ValueError(f"Unknown amp_dtype: {tc.amp_dtype!r}.")
-        self.amp_dtype = _AMP_DTYPES[amp_dtype_cfg]
-        self.use_amp = tc.use_amp and device.type == "cuda"
-        self._scaler_active = self.use_amp and self.amp_dtype == torch.float16
-        self.scaler = GradScaler("cuda", enabled=self._scaler_active)
+        # --- AMP（共用工程件，见 BaseTrainer）---
+        self._setup_amp()
 
         # --- channels_last 内存格式（同母项目 TrainConfig.channels_last）-----
         # 数值等价；Ampere+ 上 3D conv 可能提速。模型与 batch 同时转排布。
@@ -130,9 +122,7 @@ class SSLTrainer:
         # 绑裸模型（compile 包装前），shadow key 无 ``_orig_mod.`` 前缀。
         # 与 segtask trainer 一致接入 warmup（早期低 decay，避免随机初值长期拖累
         # shadow）与 ema_device（可 offload 到 CPU 省显存，配置 train.ema_device）。
-        self.ema = (ModelEMA(model, tc.ema_decay, warmup=tc.ema_warmup,
-                             offload_device=(tc.ema_device or None))
-                    if tc.use_ema else None)
+        self._setup_ema()
 
         # --- 通用增强（仅重建类方法，见 SSLMethod.trainer_augment）-----------
         # 复用 segtask GPUAugmentor（cfg.augment 控制）：在 corruption/mask 之前
@@ -153,8 +143,7 @@ class SSLTrainer:
                 "(GPUAugmentor, cfg.augment); spatial_dims=%d (2.5D folded "
                 "after augment).", ssl.method, int(cfg.model.spatial_dims))
 
-        self.output_dir = Path(tc.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_output_dir()
 
         # --- Async checkpoint saver（opt-in，仅 rank0；与 seg trainer 同款）--
         # save_async=True 时 state 先深拷到 CPU，后台线程 torch.save，主循环

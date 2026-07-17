@@ -18,7 +18,6 @@ import json
 import logging
 import math
 import os
-from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
@@ -30,23 +29,19 @@ from ..config import Config
 from ..data.augment import GPUAugmentor
 from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
 from ..models.generation import DiffusionModel
-from ..utils import AverageMeter, ModelEMA
-from .amp import GradScaler, resolve_auto_amp_dtype
+from ..utils import AverageMeter
 from .checkpoint import (
-    extract_model_state_dict, restore_rng_state, snapshot_rng_state,
-    strip_common_prefixes, unwrap_compile,
+    AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
+    state_to_cpu, unwrap_compile,
 )
-from .optim import WarmupScheduler, build_optimizer, build_scheduler
 from .pipelines import build_pipeline
 from .prefetch import CudaPrefetcher
+from taskcore.engine.base_trainer import BaseTrainer
 
 logger = logging.getLogger(__name__)
 
-_AMP_DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16,
-               "float32": torch.float32}
 
-
-class GenerationTrainer:
+class GenerationTrainer(BaseTrainer):
     """超分生成训练器（回归 / 扩散）。"""
 
     def __init__(
@@ -64,11 +59,7 @@ class GenerationTrainer:
         tc = cfg.train
 
         # 可选 channels_last 内存格式（数值等价；输入由 conv 自动适配）。
-        if tc.channels_last:
-            fmt = (torch.channels_last_3d
-                   if int(cfg.model.spatial_dims) == 3
-                   else torch.channels_last)
-            self.model = self.model.to(memory_format=fmt)
+        self._setup_channels_last()
 
         self.is_diffusion = str(cfg.task.algorithm).lower() == "diffusion"
         # 单一真相源：topology 派生量（sync() 写入），2.5D+lift 时为 3。
@@ -88,58 +79,23 @@ class GenerationTrainer:
                                        max_scale=float(max(scales)))
                           if cfg.augment.enabled else None)
 
-        self.optimizer = build_optimizer(self.model, cfg)
-        self.grad_accum_steps = max(tc.grad_accum_steps, 1)
-        # scheduler.step() 每个优化器步触发一次，horizon 按优化器步计（而非
-        # 批次数），否则 grad_accum_steps>1 时 warmup/退火时长被放大 accum 倍。
-        steps_per_epoch = max(len(train_loader), 1)
-        updates_per_epoch = max(math.ceil(steps_per_epoch / self.grad_accum_steps), 1)
-        warmup_steps = tc.warmup_epochs * updates_per_epoch
-        if tc.scheduler == "one_cycle" and warmup_steps > 0:
-            # OneCycleLR 自带 warmup（pct_start），不叠加外层线性 warmup。
-            logger.info("scheduler='one_cycle' has built-in warmup; "
-                        "outer linear warmup disabled.")
-            warmup_steps = 0
-        total_steps = tc.epochs * updates_per_epoch
-        base_scheduler = build_scheduler(
-            self.optimizer, cfg, updates_per_epoch,
-            post_warmup_steps=total_steps - warmup_steps)
-        self.scheduler = WarmupScheduler(
-            self.optimizer, base_scheduler, warmup_steps=warmup_steps,
-            warmup_lr=tc.warmup_lr, base_lr=tc.lr)
-
-        amp_name = tc.amp_dtype
-        if amp_name == "auto":
-            amp_name = resolve_auto_amp_dtype(device)
-        self.amp_dtype = _AMP_DTYPES.get(amp_name, torch.float32)
-        self.use_amp = tc.use_amp and device.type == "cuda"
-        self.scaler = GradScaler(
-            "cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
-
-        self.ema = ModelEMA(self.model, tc.ema_decay) if tc.use_ema else None
+        # --- Optimizer + scheduler / AMP / EMA（共用工程件，见 BaseTrainer）---
+        self._setup_optim_sched()
+        self._setup_amp()
+        self._setup_ema()
 
         # --- torch.compile（最后：optimizer / EMA 已绑裸参数）----------
-        self._compile_enabled = False
-        if tc.compile_mode != "none" and hasattr(torch, "compile"):
-            triton_ok = True
-            if device.type == "cuda":
-                import importlib.util
-                if importlib.util.find_spec("triton") is None:
-                    triton_ok = False
-                    logger.warning(
-                        "torch.compile (mode='%s') requested but Triton not "
-                        "installed; falling back to eager. Install Triton or "
-                        "set compile_mode='none'.", tc.compile_mode)
-            if triton_ok:
-                logger.info("Compiling model with mode='%s'", tc.compile_mode)
-                self.model = torch.compile(self.model, mode=tc.compile_mode)
-                self._compile_enabled = True
+        self._maybe_compile()
 
-        self.output_dir = Path(tc.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_output_dir()
+        # save_async=True 时权重先深拷到 CPU，后台线程 torch.save，主循环
+        # 不再被写盘阻塞；fit 收尾 wait+close 保证全部落盘（同 seg）。
+        self._ckpt_saver = (AsyncCheckpointSaver()
+                            if tc.save_async else None)
         # 选模指标：PSNR 越大越好；启用整卷验证时改用整卷 PSNR（M13）。
-        self.best_metric = -math.inf
-        self.best_epoch = 0
+        self._setup_best_tracking(mode="max")
+        # SWA 尾段权重平均（opt-in，公用工程件，见 BaseTrainer）。
+        self._setup_swa()
         self.val_full_volume = bool(tc.val_full_volume)
         self._vol_predictor = None
         self.history: list = []
@@ -267,6 +223,11 @@ class GenerationTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         group_bad = False   # 当前 accum 组内出现非有限 loss，整组丢弃
         skipped = 0
+        grad_norm_meter = AverageMeter()
+        grad_norm_max = 0.0
+        nonfinite_steps = 0
+        clipped_steps = 0
+        opt_steps = 0
         # prefetch_to_gpu：独立 copy stream 提前一个 batch 上卡，H2D 与计算
         # 重叠。交付的张量已在 device 上，下方 .to(device) 退化为 no-op。
         batch_iter = self.train_loader
@@ -292,11 +253,14 @@ class GenerationTrainer:
                 # 非有限 loss：不反传，标记整个 accum 组丢弃，保护权重/EMA。
                 group_bad = True
                 skipped += 1
+                nonfinite_steps += 1
                 logger.warning("Non-finite loss (%.4g) at step %d/%d; "
                                "dropping current accum group.",
                                loss_val, step + 1, total)
             else:
-                loss_scaled = loss / accum if accum > 1 else loss
+                # 尾组 micro-batch 不满 accum 时用真实尾长作分母。
+                eff_accum = self._effective_accum(step, total, accum)
+                loss_scaled = loss / eff_accum if eff_accum > 1 else loss
                 self.scaler.scale(loss_scaled).backward()
 
             if (step + 1) % accum == 0 or (step + 1) == total:
@@ -310,6 +274,11 @@ class GenerationTrainer:
                         self.model.parameters(),
                         clip if clip > 0 else float("inf"))
                     if torch.isfinite(grad_norm):
+                        gn = float(grad_norm)
+                        grad_norm_meter.update(gn)
+                        grad_norm_max = max(grad_norm_max, gn)
+                        if clip > 0 and gn > clip:
+                            clipped_steps += 1
                         self.scaler.step(self.optimizer)
                         stepped = True
                     else:
@@ -318,6 +287,7 @@ class GenerationTrainer:
                             "Non-finite grad norm at step %d/%d; skipping "
                             "optimizer step.", step + 1, total)
                     self.scaler.update()
+                    opt_steps += 1
                 self.optimizer.zero_grad(set_to_none=True)
                 # scheduler 无条件计时，保持 horizon 与总优化步对齐。
                 self.scheduler.step()
@@ -336,6 +306,14 @@ class GenerationTrainer:
             logger.warning("Epoch %d: %d non-finite loss/grad event(s) skipped.",
                            epoch + 1, skipped)
         out = {"loss": loss_meter.avg}
+        self._collect_health_metrics(
+            out,
+            grad_norm_meter=grad_norm_meter,
+            grad_norm_max=grad_norm_max,
+            nonfinite_steps=nonfinite_steps,
+            clipped_steps=clipped_steps,
+            opt_steps=opt_steps,
+            grad_clip_norm=float(self.cfg.train.grad_clip_norm))
         # 分项损失均值进 history/日志（单项时与总 loss 重复，省略）。
         if len(bd_meters) > 1:
             out.update({k: m.avg for k, m in sorted(bd_meters.items())})
@@ -347,8 +325,24 @@ class GenerationTrainer:
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
         self.model.eval()
-        if self.ema is not None:
-            self.ema.apply_shadow(unwrap_compile(self.model))
+        with self._ema_swapped():
+            return self._validate_inner(epoch)
+
+    @torch.no_grad()
+    def _swa_bn_forward(self) -> None:
+        """SWA BN 重估用前向：未增强训练数据，与推理分布同构。"""
+        steps = int(self.cfg.train.swa_bn_update_steps)
+        for step, batch in enumerate(self.train_loader):
+            if step >= steps:
+                break
+            hr = self._hr_batch(batch)
+            cond = self._cond_batch(batch)
+            hr, _, cond = self.pipeline.prepare_batch(hr, None, cond)
+            with torch.autocast(device_type=self.device.type,
+                                enabled=self.use_amp, dtype=self.amp_dtype):
+                self.model(hr, cond=cond)
+
+    def _validate_inner(self, epoch: int) -> Dict[str, float]:
         psnr_m, ssim_m, base_m = AverageMeter(), AverageMeter(), AverageMeter()
         bare0 = unwrap_compile(self.model)
         if isinstance(bare0, DiffusionModel):
@@ -389,8 +383,6 @@ class GenerationTrainer:
         finally:
             if isinstance(bare0, DiffusionModel):
                 bare0.sample_generator = None
-            if self.ema is not None:
-                self.ema.restore(unwrap_compile(self.model))
         return metrics
 
     # ------------------------------------------------------------------
@@ -470,9 +462,17 @@ class GenerationTrainer:
         }
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
-        torch.save(state, self.output_dir / "best_model.pth")
-        logger.info("Best generation model saved (PSNR=%.3f) @ epoch %d",
-                    self.best_metric, epoch + 1)
+        path = self.output_dir / "best_model.pth"
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(
+                state_to_cpu(state), path,
+                on_done=lambda e=epoch: logger.info(
+                    "Best generation model saved (PSNR=%.3f) @ epoch %d",
+                    self.best_metric, e + 1))
+        else:
+            atomic_torch_save(state, path)
+            logger.info("Best generation model saved (PSNR=%.3f) @ epoch %d",
+                        self.best_metric, epoch + 1)
 
     # ------------------------------------------------------------------
     # 断点续训（M14）：last_checkpoint 保存完整训练状态
@@ -495,10 +495,14 @@ class GenerationTrainer:
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
         path = self.output_dir / "last_checkpoint.pth"
-        tmp = path.with_suffix(".pth.tmp")  # 原子替换，防中断写坏
-        torch.save(state, tmp)
-        tmp.replace(path)
-        logger.info("Checkpoint saved @ epoch %d -> %s", epoch + 1, path)
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(
+                state_to_cpu(state), path,
+                on_done=lambda e=epoch, p=path: logger.info(
+                    "Checkpoint saved @ epoch %d -> %s", e + 1, p))
+        else:
+            atomic_torch_save(state, path)  # 原子替换，防中断写坏
+            logger.info("Checkpoint saved @ epoch %d -> %s", epoch + 1, path)
 
     def _save_history(self) -> None:
         """逐 epoch 指标落盘 history.json（原子替换）。"""
@@ -511,27 +515,8 @@ class GenerationTrainer:
     def _load_resume(self, path: str) -> int:
         """从 checkpoint 恢复完整训练状态；返回续训起始 epoch。"""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        bare = unwrap_compile(self.model)
-        bare.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if self.ema is not None and "ema_state_dict" in ckpt:
-            self.ema.load_state_dict(ckpt["ema_state_dict"])
-        self.best_metric = float(ckpt.get("best_metric", -math.inf))
-        self.best_epoch = int(ckpt.get("best_epoch", 0))
-        # 恢复 RNG；旧版 ckpt 无该键时静默跳过（训练仍正常但非位精确）。
-        rng = ckpt.get("rng_state")
-        if rng:
-            try:
-                restore_rng_state(rng)
-                logger.info("Restored RNG state from checkpoint.")
-            except Exception as e:  # pragma: no cover
-                logger.warning("Failed to restore RNG state: %s", e)
-        start = int(ckpt.get("epoch", -1)) + 1
+        # 公共段（model/EMA/optim/sched/scaler/best/RNG）见 BaseTrainer。
+        start = self._restore_train_state(ckpt)
         hist_path = self.output_dir / "history.json"
         if hist_path.exists():
             with open(hist_path, "r", encoding="utf-8") as f:
@@ -543,49 +528,8 @@ class GenerationTrainer:
         return start
 
     def _load_pretrain(self, path: str, strict: bool, load_ema: bool) -> None:
-        """仅加载权重作迁移初始化：不动 optimizer/scheduler/scaler/RNG，
-        不推进 epoch，重对齐 EMA shadow 以免带着随机初始泄露。"""
-        logger.info(
-            "Loading pretrain weights: %s (strict=%s, load_ema=%s)",
-            path, strict, load_ema)
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        sd, source = extract_model_state_dict(ckpt, prefer_ema=load_ema)
-        sd = strip_common_prefixes(sd)
-
-        bare = unwrap_compile(self.model)
-        result = bare.load_state_dict(sd, strict=strict)
-        missing = list(getattr(result, "missing_keys", []) or [])
-        unexpected = list(getattr(result, "unexpected_keys", []) or [])
-
-        def _preview(keys, n=8):
-            head = ", ".join(keys[:n])
-            return head + (f", ... (+{len(keys) - n} more)"
-                           if len(keys) > n else "")
-
-        if missing:
-            logger.warning(
-                "Pretrain: %d missing key(s) [%s]. These params keep their "
-                "random init.", len(missing), _preview(missing))
-        if unexpected:
-            logger.warning(
-                "Pretrain: %d unexpected key(s) [%s]. These ckpt params are "
-                "discarded.", len(unexpected), _preview(unexpected))
-        if not missing and not unexpected:
-            logger.info("Pretrain: all keys matched cleanly.")
-
-        if self.ema is not None:
-            with torch.no_grad():
-                live_sd = bare.state_dict()
-                for k, v in live_sd.items():
-                    if k in self.ema.shadow:
-                        self.ema.shadow[k].copy_(v)
-            logger.info("Pretrain: EMA shadow re-aligned to loaded weights.")
-
-        logger.info(
-            "Pretrain loaded from `%s` slot. Training will start from "
-            "epoch 0 with fresh optimizer / scheduler / scaler / best / RNG.",
-            source)
+        """仅加载权重作迁移初始化（公共策略见 BaseTrainer）。"""
+        self._load_pretrain_weights(path, strict=strict, load_ema=load_ema)
 
     def fit(self) -> Dict[str, float]:
         self._check_supported_data_options(self.cfg)
@@ -647,6 +591,7 @@ class GenerationTrainer:
                 last = {**tr}
             self.history.append(
                 {"epoch": epoch + 1, "lr": self.scheduler.get_lr(), **last})
+            self._swa_update(epoch)
             self._save_history()
             if ((epoch + 1) % save_every == 0) or is_last:
                 self._save_checkpoint(epoch)
@@ -659,6 +604,17 @@ class GenerationTrainer:
                     epoch + 1, epoch - self.best_epoch, self.best_epoch + 1)
                 self._save_checkpoint(epoch)
                 break
+        try:
+            self._finalize_swa(
+                validate_fn=lambda: self._validate_inner(tc.epochs - 1),
+                bn_forward_fn=self._swa_bn_forward)
+        except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
+            logger.exception("SWA finalization failed; online/best "
+                             "checkpoints are unaffected.")
+        if self._ckpt_saver is not None:
+            # 收尾前排空异步写盘队列；写盘异常在此抛出。
+            self._ckpt_saver.close()
+            self._ckpt_saver = None
         return {"best_psnr": self.best_metric, "best_epoch": self.best_epoch,
                 **last}
 

@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -32,11 +31,7 @@ from segtask_v1.data.dataset import (
     load_npz_image,
     resize_3d,
 )
-from segtask_v1.trainer.amp import (
-    _AMP_DTYPES,
-    autocast,
-    resolve_auto_amp_dtype,
-)
+from taskcore.engine.base_predictor import BasePredictor
 
 from ..config import ClsConfig, resolve_num_classes
 from ..data.cls_dataset import _extract_cubic_patch
@@ -104,7 +99,7 @@ def grid_centers(shape: Sequence[int], patch: Sequence[int],
     return centers
 
 
-class ClsPredictor:
+class ClsPredictor(BasePredictor):
     """整卷分类推理；``predict_volume`` 返回卷级（及可选逐 slice）概率。"""
 
     def __init__(self, model: torch.nn.Module, cfg: SegConfig, cls: ClsConfig,
@@ -118,11 +113,7 @@ class ClsPredictor:
         self.spatial_dims = int(cfg.model.spatial_dims)
         self.num_classes = resolve_num_classes(cls, cfg)
         # AMP 前向（口径同训练）：CUDA + use_amp 时 autocast。
-        tc = cfg.train
-        self._amp_enabled = bool(tc.use_amp) and device.type == "cuda"
-        dtype_name = (resolve_auto_amp_dtype(device)
-                      if tc.amp_dtype == "auto" else tc.amp_dtype)
-        self._amp_dtype = _AMP_DTYPES.get(dtype_name, torch.float16)
+        self._setup_infer_amp(bool(cfg.train.use_amp))
         self._flip_specs: Tuple[Tuple[int, ...], ...] = ()
         if bool(getattr(cls, "tta_flips", False)):
             self._flip_specs = (_FLIP_SPECS_3D if self.spatial_dims == 3
@@ -145,9 +136,7 @@ class ClsPredictor:
         p = extract_z_patch_padded(vol, center[0], pD)
         return resize_3d(p, pD, pH, pW, is_label=False)
 
-    def _autocast(self):
-        return (autocast(device_type="cuda", dtype=self._amp_dtype)
-                if self._amp_enabled else nullcontext())
+
 
     def _post(self, logits: torch.Tensor) -> torch.Tensor:
         single = not self.cls.multi_label
