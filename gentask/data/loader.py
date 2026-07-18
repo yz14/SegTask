@@ -31,6 +31,11 @@ from taskcore.data.loader import (  # noqa: F401  (re-export，保持旧 import 
     match_region_weight_paths,
     stratified_train_val_split,
 )
+from taskcore.data.loader import (  # noqa: F401  (re-export)
+    detect_label_values,
+    discover_npz_samples,
+    train_val_split,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,75 +50,8 @@ def match_condition_paths(
         image_paths, cond_dir, image_suffix, cond_suffix, kind="Condition")
 
 
-def detect_label_values(
-    label_paths: List[str],
-    max_scan: Optional[int] = None,
-    label_loader_fn=None,
-    *,
-    return_primaries: bool = False,
-) -> Union[List[int], Tuple[List[int], List[Dict[int, int]]]]:
-    """自动探测标签取值；默认扫描全部。max_scan 指定部分扫描（会警告）；label_loader_fn 切换读器（NIfTI vs npz）。返按升序整数，含 bg。
-
-    ``return_primaries=True`` 时额外返回每个样本的 ``{label_value: voxel_count}``
-    字典列表，供 ``stratified_train_val_split`` 直接使用，避免重复扫描。"""
-    if label_loader_fn is None:
-        label_loader_fn = _default_label_loader
-    n_total = len(label_paths)
-    if max_scan is None or max_scan >= n_total:
-        scan_paths = label_paths
-        partial    = False
-    else:
-        scan_paths = label_paths[:max_scan]
-        partial = True
-
-    all_labels: set = set()
-    per_sample_counts: List[Dict[int, int]] = []
-    for path in scan_paths:
-        lbl    = label_loader_fn(path)
-        lbl_int = lbl.astype(np.int32, copy=False)
-        unique = np.unique(lbl_int).tolist()
-        all_labels.update(unique)
-        if return_primaries:
-            per_sample_counts.append(
-                {int(v): int((lbl_int == v).sum()) for v in unique})
-
-    result = sorted(all_labels)
-    if partial:
-        logger.warning(
-            "Auto-detected label values from partial scan (%d/%d files): %s. "
-            "Rare classes may be missed; pass max_scan=None to scan all.",
-            len(scan_paths), n_total, result)
-    else:
-        logger.info(
-            "Auto-detected label values (scanned %d files): %s",
-            n_total, result)
-    if return_primaries:
-        return result, per_sample_counts
-    return result
-
-
-def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
-    """随机（非分层）按索引划分 train/val。"""
-    rng = np.random.RandomState(seed)
-    indices = rng.permutation(n).tolist()
-    n_val = max(1, int(n * val_ratio))
-    return indices[n_val:], indices[:n_val]
-
-
-def discover_npz_samples(
-    npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
-    """列出 npz_dir 下的 make_data npz 包；忽略 '_' / '.' 附件。"""
-    d = Path(npz_dir)
-    assert d.is_dir(), f"NPZ dir not found: {d}"
-    paths = sorted(
-        p for p in d.glob(f"*{npz_suffix}")
-        if not p.name.startswith(("_", ".")))
-    if not paths:
-        raise ValueError(
-            f"No npz packages found under {d} (suffix={npz_suffix!r}). "
-            f"Did you run `python -m gentask.data.make_data` first?")
-    logger.info("Discovered %d npz package(s) under %s.", len(paths), d)
-    return [str(p) for p in paths]
+# detect_label_values / train_val_split / discover_npz_samples 已与 taskcore
+# 合流（taskcore 版含 meta.label_counts 快路与 n==1 边界修正），见上方 re-export。
 
 
 def build_dataloaders(

@@ -180,6 +180,11 @@ def test_load_checkpoint_source_uses_restore_helper():
 
     from segtask_v1.trainer import Trainer
 
+    from taskcore.engine.base_trainer import BaseTrainer
+
+    # resume 公共段已上提 BaseTrainer._restore_train_state；seg 侧委托之。
     src = inspect.getsource(Trainer._load_checkpoint)
-    assert "restore_rng_state" in src
-    assert "relocate_optimizer_state" in src
+    assert "_restore_train_state" in src
+    base_src = inspect.getsource(BaseTrainer._restore_train_state)
+    assert "restore_rng_state" in base_src
+    assert "relocate_optimizer_state" in base_src

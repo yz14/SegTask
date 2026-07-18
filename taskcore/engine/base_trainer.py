@@ -35,8 +35,8 @@ from ..utils import AverageMeter, ModelEMA, ModelSWA, seed_everything
 from .amp import _AMP_DTYPES, GradScaler, resolve_auto_amp_dtype
 from .bn_stats import collect_bn_modules, estimate_bn_stats
 from .checkpoint import (
-    atomic_torch_save, extract_model_state_dict, restore_rng_state,
-    strip_common_prefixes, unwrap_compile,
+    atomic_torch_save, extract_model_state_dict, relocate_optimizer_state,
+    restore_rng_state, strip_common_prefixes, unwrap_compile,
 )
 from .dist_utils import (
     all_reduce_bn_running_stats_, get_rank, get_world_size,
@@ -264,13 +264,17 @@ class BaseTrainer:
     # Resume / Pretrain 公共加载策略
     # ------------------------------------------------------------------
     def _restore_train_state(self, ckpt: Dict) -> int:
-        """resume 公共段：model/EMA/optimizer/scheduler/scaler/best/RNG。
+        """resume 公共段：model/EMA/optimizer/scheduler/scaler/SWA/best/RNG。
 
-        返回续训起始 epoch（= ckpt epoch + 1）。任务专有字段（history、
-        早停计数等）由子类自行恢复。旧版 ckpt 无 rng_state 时静默跳过
+        返回续训起始 epoch（= ckpt epoch + 1）。任务专有字段（history 等）
+        由子类自行恢复。旧版 ckpt 无 rng_state 时静默跳过
         （训练仍正常但非位精确）。"""
         bare = unwrap_compile(self.model)
-        bare.load_state_dict(ckpt["model_state_dict"])
+        # EMA-as-online 布局的 ckpt（如 seg）把在线权重存
+        # ``model_online_state_dict``；其余任务只有 ``model_state_dict``。
+        model_sd = ckpt.get("model_online_state_dict",
+                            ckpt["model_state_dict"])
+        bare.load_state_dict(model_sd)
         if self.ema is not None and "ema_state_dict" in ckpt:
             self.ema.load_state_dict(ckpt["ema_state_dict"])
         for key, obj in (("optimizer_state_dict", self.optimizer),
@@ -278,8 +282,18 @@ class BaseTrainer:
                          ("scaler_state_dict", self.scaler)):
             if key in ckpt:
                 obj.load_state_dict(ckpt[key])
-        self.best_metric = float(ckpt.get("best_metric", -math.inf))
+        if "optimizer_state_dict" in ckpt:
+            # CPU 写盘的优化器状态搬回参数所在设备（无 CPU offload 时 no-op）。
+            relocate_optimizer_state(self.optimizer)
+        if getattr(self, "swa", None) is not None and "swa_state_dict" in ckpt:
+            self.swa.load_state_dict(ckpt["swa_state_dict"])
+        mode = getattr(self, "_best_mode", "max")
+        default_best = -math.inf if mode == "max" else math.inf
+        self.best_metric = float(ckpt.get("best_metric", default_best))
         self.best_epoch = int(ckpt.get("best_epoch", 0))
+        self.has_best = bool(ckpt.get(
+            "has_best", math.isfinite(self.best_metric)))
+        self.patience_counter = int(ckpt.get("patience_counter", 0))
         rng = ckpt.get("rng_state")
         if rng:
             try:
@@ -289,13 +303,20 @@ class BaseTrainer:
                 logger.warning("Failed to restore RNG state: %s", e)
         return int(ckpt.get("epoch", -1)) + 1
 
+    def _pretrain_transform_state_dict(
+        self, sd: Dict, bare: "torch.nn.Module") -> Dict:
+        """pretrain 钩子：子类可在加载前变换 state_dict（如 seg 的 UpKern
+        升核重采样）。默认原样返回。"""
+        return sd
+
     def _load_pretrain_weights(self, path: str, *, strict: bool,
                                load_ema: bool) -> None:
         """pretrain 公共策略：仅加载模型权重作迁移初始化。
 
         不动 optimizer/scheduler/scaler/RNG、不推进 epoch；支持任意任务的
         checkpoint 容器（``extract_model_state_dict`` 选 EMA/在线权重，
-        ``strip_common_prefixes`` 去 compile/DDP 前缀）；加载后重对齐 EMA
+        ``strip_common_prefixes`` 去 compile/DDP 前缀）；任务专有的 state_dict
+        变换经 ``_pretrain_transform_state_dict`` 钩子接入；加载后重对齐 EMA
         shadow 以免带着随机初始泄露。"""
         logger.info(
             "Loading pretrain weights: %s (strict=%s, load_ema=%s)",
@@ -304,6 +325,7 @@ class BaseTrainer:
         sd, source = extract_model_state_dict(ckpt, prefer_ema=load_ema)
         sd = strip_common_prefixes(sd)
         bare = unwrap_compile(self.model)
+        sd = self._pretrain_transform_state_dict(sd, bare)
         result = bare.load_state_dict(sd, strict=strict)
         missing = list(getattr(result, "missing_keys", []) or [])
         unexpected = list(getattr(result, "unexpected_keys", []) or [])

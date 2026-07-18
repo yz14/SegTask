@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -565,6 +567,49 @@ def discover_npz_samples(
             f"Did you run `python -m taskcore.data.make_data` first?")
     logger.info("Discovered %d npz package(s) under %s.", len(paths), d)
     return [str(p) for p in paths]
+
+
+def discover_npz_recursive(npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
+    """递归发现 ``npz_dir`` 下所有 ``*{npz_suffix}``，按路径排序。
+
+    与 :func:`discover_npz_samples`（仅顶层、忽略 '_'/'.' 附件）互补：
+    cls/det/ssl 的 npz 数据目录允许按子目录组织，用本函数递归扫描。"""
+    if not npz_dir or not os.path.isdir(npz_dir):
+        raise FileNotFoundError(
+            f"data.npz_dir not found: {npz_dir!r}. Expected a directory of "
+            f"pre-generated npz packages (image [+ label]).")
+    paths = sorted(glob.glob(
+        os.path.join(npz_dir, "**", f"*{npz_suffix}"), recursive=True))
+    if not paths:
+        raise RuntimeError(f"No '*{npz_suffix}' found under {npz_dir!r}.")
+    return paths
+
+
+def stratified_split_by_key(keys: Sequence[str], val_ratio: float,
+                            seed: int) -> Tuple[List[int], List[int]]:
+    """按标签层（key）分层的 train/val 划分。
+
+    逐层内部确定性 shuffle 后按 ``val_ratio`` 切分；层内 ≥2 个样本时
+    train/val 各至少分到 1 个（保证小类两侧都有代表）；单样本层归
+    训练集。同 (keys, val_ratio, seed) 下结果确定。
+    """
+    rng = np.random.RandomState(seed)
+    by_key: "dict[str, List[int]]" = {}
+    for i, k in enumerate(keys):
+        by_key.setdefault(str(k), []).append(i)
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+    for k in sorted(by_key):
+        idx = by_key[k]
+        perm = rng.permutation(len(idx))
+        n = len(idx)
+        if n == 1:
+            train_idx.append(idx[0])
+            continue
+        n_val = min(max(int(round(n * val_ratio)), 1), n - 1)
+        for j, p in enumerate(perm):
+            (val_idx if j < n_val else train_idx).append(idx[p])
+    return sorted(train_idx), sorted(val_idx)
 
 
 def _resolve_npz_paths(

@@ -17,8 +17,11 @@ from taskcore.data.loader import (
     train_val_split,
 )
 
-from clstask.data.cls_dataset import derive_volume_targets
-from clstask.data.loader import discover_npz, stratified_split
+from taskcore.data.dataset import derive_volume_targets
+from taskcore.data.loader import (
+    discover_npz_recursive as discover_npz,
+    stratified_split_by_key as stratified_split,
+)
 
 from ..config import DetConfig
 from .det_dataset import DetPatchDataset, det_collate

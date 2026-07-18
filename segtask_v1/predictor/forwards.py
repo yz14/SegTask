@@ -16,6 +16,8 @@ import torch
 from einops import rearrange
 from torch.amp import autocast
 
+from taskcore.engine.views import fold_depth_to_channels
+
 if TYPE_CHECKING:  # pragma: no cover
     from .predictor import Predictor
 
@@ -50,7 +52,7 @@ def reshape_2_5d_input(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             f"2.5D input D-axis ({D}) != patch_D ({p.patch_D}). "
             "Window builder produced an unexpected slice count.")
-    return rearrange(x, 'b c d h w -> b (c d) h w').contiguous()
+    return fold_depth_to_channels(x)
 
 
 # ---------------------------------------------------------------------------

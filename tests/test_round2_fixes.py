@@ -813,8 +813,12 @@ def test_d3_rng_state_roundtrip():
     import inspect, re
     src = inspect.getsource(Trainer._build_state_dict)
     assert '"rng_state"' in src, "rng_state key missing from saved state"
+    # resume 公共段已上提 BaseTrainer._restore_train_state；load 侧断言基类。
+    from taskcore.engine.base_trainer import BaseTrainer
     src_load = inspect.getsource(Trainer._load_checkpoint)
-    assert "rng_state" in src_load, "rng_state not restored on load"
+    assert "_restore_train_state" in src_load, "load must delegate to base"
+    base_src = inspect.getsource(BaseTrainer._restore_train_state)
+    assert "rng_state" in base_src, "rng_state not restored on load"
     print("[D-3] PASS — rng_state included in save/load paths.")
 
 

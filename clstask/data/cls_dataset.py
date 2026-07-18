@@ -58,6 +58,7 @@ from taskcore.data.dataset import (
     _group_fg_slices_by_class,
     _halton,
     _open_npz,
+    derive_volume_targets,
     extract_z_patch_padded,
     load_npz_image,
     load_npz_label,
@@ -523,26 +524,7 @@ class ClsPatchDataset(Dataset):
         return {"image": img_t, "target": target, "vol_idx": vol_t}
 
 
-def derive_volume_targets(npz_paths: Sequence[str],
-                          fg_values: Sequence[float]) -> torch.Tensor:
-    """mask 源整卷级多热真值 (N, K)：每前景类在整卷 label 中是否出现。
-
-    优先读 make_data 预计算的 ``meta.label_counts``（精确且免解码 label
-    卷）；旧 npz 无该键时回退整卷 label ``any()``（仅构建时一次）。
-    与 patch 抽样解耦，供卷级 MIL 验证指标作真值。
-    """
-    out = np.zeros((len(npz_paths), len(fg_values)), dtype=np.float32)
-    for i, path in enumerate(npz_paths):
-        try:
-            counts = load_npz_label_counts(path)
-        except KeyError:      # 旧 npz 无 meta 键
-            counts = None
-        if counts is not None:
-            out[i] = [float(counts.get(int(v), 0) > 0) for v in fg_values]
-        else:
-            lbl = load_npz_label(path)
-            out[i] = [float((lbl == v).any()) for v in fg_values]
-    return torch.from_numpy(out)
+# derive_volume_targets 已上提 taskcore.data.dataset；此处保留旧路径 re-export。
 
 
 __all__ = [

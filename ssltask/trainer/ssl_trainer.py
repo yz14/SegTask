@@ -33,6 +33,7 @@ from taskcore.engine.dist_utils import (
     is_dist_avail_and_initialized, is_main_process)
 from taskcore.engine.optim import (
     WarmupScheduler, build_optimizer, build_scheduler)
+from taskcore.engine.views import fold_depth_to_channels
 from taskcore.utils.common import AverageMeter, Timer
 from taskcore.engine.base_trainer import BaseTrainer, _reseed_rank_rng
 
@@ -279,8 +280,7 @@ class SSLTrainer(BaseTrainer):
             return batch
         img = batch.get("image")
         if torch.is_tensor(img) and img.dim() == 5:
-            b, c, d, h, w = img.shape
-            img = img.reshape(b, c * d, h, w)
+            img = fold_depth_to_channels(img)
             if self._memory_format is not None:
                 img = img.to(memory_format=self._memory_format)
             batch["image"] = img

@@ -16,7 +16,7 @@ import torch
 
 from taskcore.utils.logging_utils import setup_logging as _setup_logging
 
-from clstask.data.loader import discover_npz
+from taskcore.data.loader import discover_npz_recursive as discover_npz
 
 from .config import apply_overrides, load_config, validate_det
 from .models.factory import build_detector

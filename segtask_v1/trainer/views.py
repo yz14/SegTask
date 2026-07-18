@@ -11,7 +11,11 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+
+from taskcore.engine.views import (  # noqa: F401  (re-export)
+    squeeze_2_5d,
+    squeeze_2_5d_keep_views,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,46 +235,9 @@ def split_views_2_5d_folded(
 
 
 # ---------------------------------------------------------------------------
-# 2.5D fold ops
+# 2.5D fold ops —— 已上提 taskcore.engine.views（折叠契约见该模块 docstring），
+# 此处 re-export 保留旧路径。
 # ---------------------------------------------------------------------------
-def squeeze_2_5d(
-    image: torch.Tensor,
-    label: torch.Tensor,
-    wmap: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """``(B,C_res,D,H,W) → (B,C_res*D,H,W)`` for image；label/wmap 仅取 view 0。"""
-    if image.ndim != 5:
-        raise ValueError(
-            f"2.5D _squeeze expects rank-5 image (B, C_res, D, H, W); "
-            f"got shape={tuple(image.shape)}")
-    if label.shape[:2] != image.shape[:2]:
-        raise ValueError(
-            f"image / label batch+C_res mismatch: image="
-            f"{tuple(image.shape)}, label={tuple(label.shape)}")
-    image = rearrange(image, 'b c d h w -> b (c d) h w').contiguous()
-    label = label[:, 0]
-    if wmap is not None:
-        wmap = wmap[:, 0]
-    return image, label, wmap
-
-
-def squeeze_2_5d_keep_views(
-    image: torch.Tensor,
-    label: torch.Tensor,
-    wmap: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """``squeeze_2_5d`` 的 aux 变体：image 折叠，label/wmap 保 rank-5 供逐视图索引。"""
-    if image.ndim != 5:
-        raise ValueError(
-            f"2.5D _squeeze_keep_views expects rank-5 image "
-            f"(B, C_res, D, H, W); got shape={tuple(image.shape)}")
-    if label.shape[:2] != image.shape[:2]:
-        raise ValueError(
-            f"image / label batch+C_res mismatch: image="
-            f"{tuple(image.shape)}, label={tuple(label.shape)}")
-    image_2d = rearrange(image, 'b c d h w -> b (c d) h w').contiguous()
-    return image_2d, label, wmap
-
 
 __all__ = [
     "center_crop",

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
 from torch.utils.data import Dataset
@@ -72,18 +72,8 @@ class DatasetCommonCfg:
                                  if cfg.loss.region_weights else None))
 
     def to_kwargs(self) -> dict:
-        """直接展开为 ``SegDataset3D*.__init__`` 的 kwargs。"""
-        return dict(
-            label_values      = self.label_values,
-            patch_size        = self.patch_size,
-            intensity_min     = self.intensity_min,
-            intensity_max     = self.intensity_max,
-            normalize         = self.normalize,
-            global_mean       = self.global_mean,
-            global_std        = self.global_std,
-            cache_enabled     = self.cache_enabled,
-            cache_max_volumes = self.cache_max_volumes,
-            region_weights    = self.region_weights)
+        """直接展开为 dataset ``__init__`` 的 kwargs（含子类扩展字段）。"""
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -105,9 +95,13 @@ class SplitPaths:
 # Strategy base + concrete specs
 # ---------------------------------------------------------------------------
 class DatasetSpec(ABC):
-    """Data 侧策略对象：把 ``cfg`` + (paths, is_train) 翻译成具体 ``Dataset``。"""
+    """Data 侧策略对象：把 ``cfg`` + (paths, is_train) 翻译成具体 ``Dataset``。
+
+    子项目（如 gentask）可通过覆盖各具体 spec 的 ``dataset_cls`` 类属性
+    把同一套选择/参数逻辑接到自己的 dataset 实现上。"""
 
     name: str = "abstract"
+    dataset_cls: "Optional[type]" = None
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -146,6 +140,7 @@ class WholeSpec(DatasetSpec):
     """整体模式，无 multi_res / 无 fg 过采样"""
 
     name = "whole"
+    dataset_cls = SegDataset3DWhole
 
     def log_summary(self) -> None:
         logger.info(
@@ -158,7 +153,7 @@ class WholeSpec(DatasetSpec):
         # whole 在 Config.validate 中已强制 multi_res_scales=[1.0]、忽略 fg 过采样。
         # val 无增强、整卷输入确定：spv>1 只是等比重复同一样本（pooled Dice
         # 数值不变，纯白算），固定 1。
-        return SegDataset3DWhole(
+        return type(self).dataset_cls(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio = self._aug_oversample(is_train),
@@ -175,6 +170,7 @@ class ZCubeSpec(DatasetSpec):
     """
 
     name = "z_axis|2_5d"
+    dataset_cls = SegDataset3D
 
     def log_summary(self) -> None:
         dc        = self.cfg.data
@@ -192,7 +188,7 @@ class ZCubeSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         dc = self.cfg.data
-        return SegDataset3D(
+        return type(self).dataset_cls(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio        = self._aug_oversample(is_train),
@@ -208,6 +204,7 @@ class CubicSpec(DatasetSpec):
     """3 轴 cubic max-FOV 模式（``patch_mode='cubic'``）。"""
 
     name = "cubic"
+    dataset_cls = SegDataset3DCubic
 
     def log_summary(self) -> None:
         dc = self.cfg.data
@@ -222,7 +219,7 @@ class CubicSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         dc = self.cfg.data
-        return SegDataset3DCubic(
+        return type(self).dataset_cls(
             **paths.to_kwargs(),
             **common.to_kwargs(),
             aug_oversample_ratio        = self._aug_oversample(is_train),

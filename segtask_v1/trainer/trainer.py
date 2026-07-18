@@ -44,11 +44,7 @@ from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver,
     atomic_torch_save,
-    extract_model_state_dict,
-    relocate_optimizer_state,
-    restore_rng_state,
     state_to_cpu,
-    strip_common_prefixes,
     unwrap_compile,
 )
 from taskcore.engine.dist_utils import (
@@ -904,38 +900,8 @@ class Trainer(BaseTrainer):
         logger.info("Loading checkpoint: %s", path)
         # PyTorch 2.6+ 默认 weights_only=True 会拒 numpy RNG / Config；ckpt 为本 trainer 写，显式关闭。
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        model_sd = ckpt.get("model_online_state_dict",
-                            ckpt["model_state_dict"])
-        unwrap_compile(self.model).load_state_dict(model_sd)
-
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        relocate_optimizer_state(self.optimizer)
-        if "scheduler_state_dict" in ckpt:
-            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "scaler_state_dict" in ckpt:
-            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if self.ema is not None and "ema_state_dict" in ckpt:
-            self.ema.load_state_dict(ckpt["ema_state_dict"])
-        if self.swa is not None and "swa_state_dict" in ckpt:
-            self.swa.load_state_dict(ckpt["swa_state_dict"])
-
-        self.start_epoch = ckpt.get("epoch", -1) + 1
-        default_best = -math.inf if self._best_mode == "max" else math.inf
-        self.best_metric = ckpt.get("best_metric", default_best)
-        self.best_epoch = ckpt.get("best_epoch", 0)
-        self.has_best = ckpt.get(
-            "has_best", math.isfinite(self.best_metric))
-        self.patience_counter = ckpt.get("patience_counter", 0)
-
-        # 恢复 RNG；旧版 ckpt 无该键时静默跳过（训练仍正常但非位精确）。
-        rng = ckpt.get("rng_state")
-        if rng:
-            try:
-                restore_rng_state(rng)
-                logger.info("Restored RNG state from checkpoint.")
-            except Exception as e:  # pragma: no cover
-                logger.warning("Failed to restore RNG state: %s", e)
+        # 公共段（model/EMA/optim/sched/scaler/SWA/best/RNG）见 BaseTrainer。
+        self.start_epoch = self._restore_train_state(ckpt)
         if self._is_dist and self._rank > 0:
             _reseed_rank_rng(
                 self.cfg.train.seed, self._rank, self.start_epoch,
@@ -950,67 +916,34 @@ class Trainer(BaseTrainer):
     # ------------------------------------------------------------------
     # Pretrain (weights-only initialisation)
     # ------------------------------------------------------------------
+    def _pretrain_transform_state_dict(self, sd, bare):
+        """seg 专有：``train.pretrain_upkern`` 时对 depthwise 卷积核做 UpKern
+        升核重采样（trilinear 插值到目标 kernel 尺寸），其余走公共策略。"""
+        if not self.cfg.train.pretrain_upkern:
+            return sd
+        target_sd = bare.state_dict()
+        n_upkern = 0
+        for key, src_tensor in sd.items():
+            tgt_tensor = target_sd.get(key)
+            if (tgt_tensor is None or not torch.is_tensor(src_tensor)
+                    or not torch.is_tensor(tgt_tensor)):
+                continue
+            if (src_tensor.shape != tgt_tensor.shape
+                    and src_tensor.ndim in (4, 5)
+                    and tgt_tensor.ndim == src_tensor.ndim
+                    and src_tensor.shape[:2] == tgt_tensor.shape[:2]
+                    and src_tensor.shape[2:] != tgt_tensor.shape[2:]):
+                n_upkern += 1
+        sd = upkern_remap_state_dict(sd, bare)
+        logger.info(
+            "Pretrain: applied UpKern remap to %d depthwise tensor(s).",
+            n_upkern)
+        return sd
+
     def _load_pretrain(self, path: str, strict: bool, load_ema: bool) -> None:
-        """仅加载权重作迁移初始化：不动 optimizer/scheduler/scaler/RNG，不推进 epoch，
-        重对齐 EMA shadow 以免带着随机初始泄露。"""
-        logger.info(
-            "Loading pretrain weights: %s (strict=%s, load_ema=%s)",
-            path, strict, load_ema)
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        sd, source = extract_model_state_dict(ckpt, prefer_ema=load_ema)
-        sd = strip_common_prefixes(sd)
-
-        bare = unwrap_compile(self.model)
-        if self.cfg.train.pretrain_upkern:
-            target_sd = bare.state_dict()
-            n_upkern = 0
-            for key, src_tensor in sd.items():
-                tgt_tensor = target_sd.get(key)
-                if (tgt_tensor is None or not torch.is_tensor(src_tensor)
-                        or not torch.is_tensor(tgt_tensor)):
-                    continue
-                if (src_tensor.shape != tgt_tensor.shape
-                        and src_tensor.ndim in (4, 5)
-                        and tgt_tensor.ndim == src_tensor.ndim
-                        and src_tensor.shape[:2] == tgt_tensor.shape[:2]
-                        and src_tensor.shape[2:] != tgt_tensor.shape[2:]):
-                    n_upkern += 1
-            sd = upkern_remap_state_dict(sd, bare)
-            logger.info(
-                "Pretrain: applied UpKern remap to %d depthwise tensor(s).",
-                n_upkern)
-        result = bare.load_state_dict(sd, strict=strict)
-        missing = list(getattr(result, "missing_keys", []) or [])
-        unexpected = list(getattr(result, "unexpected_keys", []) or [])
-
-        def _preview(keys, n=8):
-            head = ", ".join(keys[:n])
-            return head + (f", ... (+{len(keys) - n} more)" if len(keys) > n else "")
-
-        if missing:
-            logger.warning(
-                "Pretrain: %d missing key(s) [%s]. These params keep their "
-                "random init.", len(missing), _preview(missing))
-        if unexpected:
-            logger.warning(
-                "Pretrain: %d unexpected key(s) [%s]. These ckpt params are "
-                "discarded.", len(unexpected), _preview(unexpected))
-        if not missing and not unexpected:
-            logger.info("Pretrain: all keys matched cleanly.")
-
-        if self.ema is not None:
-            with torch.no_grad():
-                live_sd = bare.state_dict()
-                for k, v in live_sd.items():
-                    if k in self.ema.shadow:
-                        self.ema.shadow[k].copy_(v)
-            logger.info("Pretrain: EMA shadow re-aligned to loaded weights.")
-
-        logger.info(
-            "Pretrain loaded from `%s` slot. Training will start from "
-            "epoch 0 with fresh optimizer / scheduler / scaler / best / RNG.",
-            source)
+        """仅加载权重作迁移初始化（公共策略见 BaseTrainer；UpKern 经
+        ``_pretrain_transform_state_dict`` 钩子接入）。"""
+        self._load_pretrain_weights(path, strict=strict, load_ema=load_ema)
 
 
 __all__ = ["Trainer"]

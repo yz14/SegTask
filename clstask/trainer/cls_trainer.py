@@ -43,8 +43,9 @@ from taskcore.engine.checkpoint import (
 from taskcore.engine.dist_utils import all_gather_objects
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.optim import (
-    WarmupScheduler,
+    GroupWarmupScheduler,
     build_optimizer,
+    build_optimizer_with_lr_mult,
     build_scheduler,
 )
 from taskcore.utils.common import AverageMeter
@@ -60,70 +61,9 @@ from .mixup import apply_mixup_cutmix
 logger = logging.getLogger(__name__)
 
 
-def _build_optimizer_with_lr_mult(model: nn.Module, cfg: SegConfig,
-                                  encoder_lr_mult: float):
-    """AdamW/Adam/SGD + weight-decay 分组 + encoder 学习率倍率。
-
-    分组口径与 ``segtask_v1.trainer.optim._param_groups`` 一致（ndim<=1 免
-    decay），再按参数属于 encoder 与否二分（2×2 组）。AdamW 的 fused 开关
-    口径同 ``segtask_v1.trainer.optim.build_optimizer``。
-    """
-    tc = cfg.train
-    enc_ids = {id(p) for p in model.encoder.parameters()}
-    groups = []
-    for is_enc in (True, False):
-        lr = tc.lr * (encoder_lr_mult if is_enc else 1.0)
-        for wd, pred in ((tc.weight_decay, lambda p: p.ndim >= 2),
-                         (0.0, lambda p: p.ndim <= 1)):
-            params = [p for p in model.parameters()
-                      if p.requires_grad and (id(p) in enc_ids) == is_enc
-                      and pred(p)]
-            if params:
-                groups.append(
-                    {"params": params, "lr": lr, "weight_decay": wd})
-    if tc.optimizer == "adamw":
-        first = next((p for p in model.parameters()), None)
-        on_cuda = first is not None and first.is_cuda
-        use_fused = tc.adamw_fused and torch.cuda.is_available()
-        return torch.optim.AdamW(groups, lr=tc.lr,
-                                 fused=(use_fused and on_cuda))
-    if tc.optimizer == "adam":
-        return torch.optim.Adam(groups, lr=tc.lr)
-    if tc.optimizer == "sgd":
-        return torch.optim.SGD(groups, lr=tc.lr, momentum=tc.momentum,
-                               nesterov=tc.nesterov)
-    raise ValueError(f"Unknown optimizer: {tc.optimizer}")
-
-
-class _GroupWarmupScheduler(WarmupScheduler):
-    """保留各参数组 lr 倍率的线性 warmup。
-
-    seg 的 ``WarmupScheduler`` 假定所有组同一 base_lr，warmup 段对全部组写
-    统一 lr —— 与 encoder 差分学习率（``cls.encoder_lr_mult``）矛盾。这里
-    在构造时记下各组 base lr，warmup 段按 ``组 base / 全局 base`` 的比例
-    缩放整段 ramp，各组倍率全程不变；全组同 lr 时退化为父类行为。
-    """
-
-    def __init__(self, optimizer, scheduler, warmup_steps: int,
-                 warmup_lr: float, base_lr: float,
-                 group_base_lrs: "list[float]"):
-        self._ratios = [
-            (g / base_lr) if base_lr > 0 else 1.0 for g in group_base_lrs]
-        super().__init__(optimizer, scheduler, warmup_steps=warmup_steps,
-                         warmup_lr=warmup_lr, base_lr=base_lr)
-        if warmup_steps > 0:
-            for pg, r in zip(optimizer.param_groups, self._ratios):
-                pg["lr"] = warmup_lr * r
-
-    def step(self) -> None:
-        self.current_step += 1
-        if self.current_step <= self.warmup_steps:
-            alpha = self.current_step / max(self.warmup_steps, 1)
-            lr = self.warmup_lr + alpha * (self.base_lr - self.warmup_lr)
-            for pg, r in zip(self.optimizer.param_groups, self._ratios):
-                pg["lr"] = lr * r
-        elif self.scheduler is not None and not self._is_plateau:
-            self.scheduler.step()
+# 通用件已上提 taskcore.engine.optim；此处保留旧私名别名（dettask/外部脚本兼容）。
+_build_optimizer_with_lr_mult = build_optimizer_with_lr_mult
+_GroupWarmupScheduler = GroupWarmupScheduler
 
 
 class ClsTrainer(BaseTrainer):

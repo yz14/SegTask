@@ -1,64 +1,42 @@
-"""Dataset selection strategy for the shared gentask data layer.
+"""Dataset selection strategy：复用 ``taskcore.data.specs`` 的策略骨架。
 
-R4：把 ``loader.py::build_dataloaders`` 中"按 ``patch_mode`` 选 dataset 类
-+ 准备各模式专属 kwargs"的 6 处重复构造收敛到 3 个 ``DatasetSpec`` 子类与
-1 个 ``build_data_spec`` 工厂。
+gentask 仅扩展两点：
+* ``DatasetCommonCfg`` 追加条件体（cond_*）公共构造参数，且
+  ``region_weights`` 取自 ``cfg.data``（生成任务的静态区域权重挂在 data 段）；
+* 三个具体 spec 通过 ``dataset_cls`` 类属性接到 gentask 的
+  ``Volume3D`` / ``Volume3DCubic`` / ``Volume3DWhole`` 上。
 
-* ``DatasetCommonCfg``  —— 14 个公共构造参数（与模式无关）的不可变快照
-* ``SplitPaths``        —— 单 split 的路径三元组
-* ``DatasetSpec``       —— 策略基类，``make_split(paths, is_train, common)``
-* ``WholeSpec`` / ``ZCubeSpec`` / ``CubicSpec`` —— 3 个具体策略
-* ``build_data_spec``   —— **整个 codebase 唯一允许 patch_mode if/elif 的地方
-  （data 侧）**
-
-注意：本文件不修改 ``dataset.py`` 的 ``__init__`` 签名，仅在 spec 内部封装
-"split-dependent kwargs（``aug_oversample_ratio`` / ``samples_per_volume`` /
-``foreground_oversample_ratio``）随 ``is_train`` 切换"的逻辑，使
-``loader.py`` 不再涉及训练/验证差异。
+选择逻辑（patch_mode → spec）、train/val 动态参数（aug_oversample /
+samples_per_volume / fg_ratio）全部继承 taskcore 实现。
 """
 
 from __future__ import annotations
 
-import logging
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List
 
-from torch.utils.data import Dataset
+from taskcore.data.specs import (  # noqa: F401  (re-export，保持旧 import 路径可用)
+    CubicSpec as _CoreCubicSpec,
+    DatasetCommonCfg as _CoreDatasetCommonCfg,
+    DatasetSpec,
+    SplitPaths,
+    WholeSpec as _CoreWholeSpec,
+    ZCubeSpec as _CoreZCubeSpec,
+)
 
 from ..config import Config
 from .dataset import Volume3D, Volume3DCubic, Volume3DWhole
 
-logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Common config snapshot
-# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class DatasetCommonCfg:
-    """与 patch_mode 无关的 dataset 公共构造参数（shared image-to-image data path）。
+class DatasetCommonCfg(_CoreDatasetCommonCfg):
+    """公共构造参数（taskcore 11 字段 + gentask cond 扩展）。"""
 
-    所有 3 个 dataset 子类（``Volume3D`` / ``Volume3DCubic`` /
-    ``Volume3DWhole``）共享这 16 个字段。原 ``loader.py:522-532`` 的
-    ``common_kwargs`` dict 已被这个 dataclass 替代。
-    """
-
-    label_values: List[int]
-    patch_size: Tuple[int, int, int]
-    intensity_min: float
-    intensity_max: float
-    normalize: str
-    global_mean: float
-    global_std: float
-    cache_enabled: bool
-    cache_max_volumes: int
-    region_weights: Optional[List[float]]
-    cond_normalize: str
-    cond_intensity_min: float
-    cond_intensity_max: float
-    cond_global_mean: float
-    cond_global_std: float
+    cond_normalize: str = "minmax"
+    cond_intensity_min: float = -1024.0
+    cond_intensity_max: float = 1024.0
+    cond_global_mean: float = 0.0
+    cond_global_std: float = 1.0
 
     @classmethod
     def from_cfg(cls, cfg: Config) -> "DatasetCommonCfg":
@@ -81,175 +59,21 @@ class DatasetCommonCfg:
             cond_global_mean  = float(dc.cond_global_mean),
             cond_global_std   = float(dc.cond_global_std))
 
-    def to_kwargs(self) -> dict:
-        """直接展开为 ``Volume3D*.__init__`` 的 kwargs。"""
-        return dict(
-            label_values      = self.label_values,
-            patch_size        = self.patch_size,
-            intensity_min     = self.intensity_min,
-            intensity_max     = self.intensity_max,
-            normalize         = self.normalize,
-            global_mean       = self.global_mean,
-            global_std        = self.global_std,
-            cache_enabled     = self.cache_enabled,
-            cache_max_volumes = self.cache_max_volumes,
-            region_weights    = self.region_weights,
-            cond_normalize    = self.cond_normalize,
-            cond_intensity_min = self.cond_intensity_min,
-            cond_intensity_max = self.cond_intensity_max,
-            cond_global_mean  = self.cond_global_mean,
-            cond_global_std   = self.cond_global_std)
+
+class WholeSpec(_CoreWholeSpec):
+    dataset_cls = Volume3DWhole
 
 
-@dataclass(frozen=True)
-class SplitPaths:
-    """单个 split（train 或 val）的样本路径三元组。"""
-
-    image_paths: List[str]
-    label_paths: List[str]
-    npz_paths  : List[str]
-
-    def to_kwargs(self) -> dict:
-        return dict(
-            image_paths = self.image_paths,
-            label_paths = self.label_paths,
-            npz_paths   = self.npz_paths)
+class ZCubeSpec(_CoreZCubeSpec):
+    dataset_cls = Volume3D
 
 
-# ---------------------------------------------------------------------------
-# Strategy base + concrete specs
-# ---------------------------------------------------------------------------
-class DatasetSpec(ABC):
-    """Data 侧策略对象：把 ``cfg`` + (paths, is_train) 翻译成具体 ``Dataset``，用于 gentask 的共享 data path。"""
-
-    name: str = "abstract"
-
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-
-    @abstractmethod
-    def make_split(
-        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg) -> Dataset:
-        """返回某一 split 对应的 dataset 实例。"""
-
-    # ------------------------------------------------------------------
-    # 共用辅助：随 is_train 切换的 4 个动态参数。
-    # ------------------------------------------------------------------
-    def _aug_oversample(self, is_train: bool) -> float:
-        """train 取 ``max(aug_oversample_ratio, 1.0)``；val 始终 1.0。"""
-        if is_train:
-            return max(float(self.cfg.data.aug_oversample_ratio), 1.0)
-        return 1.0
-
-    def _samples_per_volume(self, is_train: bool) -> int:
-        """train 完整 ``samples_per_volume``；val 减半（不少于 1）。"""
-        spv = int(self.cfg.data.samples_per_volume)
-        return spv if is_train else max(spv // 2, 1)
-
-    def _fg_ratio(self, is_train: bool) -> float:
-        """val 不做前景过采样以避免污染验证分布。"""
-        return float(self.cfg.data.foreground_oversample_ratio) if is_train else 0.0
-
-    def log_summary(self) -> None:
-        """供 ``build_dataloaders`` 在构造 split 前打印模式概要（默认无操作）。"""
-
-    def __repr__(self) -> str:  # pragma: no cover
-        return f"<{type(self).__name__}>"
+class CubicSpec(_CoreCubicSpec):
+    dataset_cls = Volume3DCubic
 
 
-class WholeSpec(DatasetSpec):
-    """整体模式，无 multi_res / 无 fg 过采样"""
-
-    name = "whole"
-
-    def log_summary(self) -> None:
-        logger.info(
-            "Using WHOLE-VOLUME patch mode (oversample=%.2f)",
-            self._aug_oversample(is_train=True))
-
-    def make_split(
-        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
-        ) -> Dataset:
-        # whole 在 Config.validate 中已强制 multi_res_scales=[1.0]、忽略 fg 过采样。
-        return Volume3DWhole(
-            **paths.to_kwargs(),
-            **common.to_kwargs(),
-            aug_oversample_ratio = self._aug_oversample(is_train),
-            samples_per_volume   = self._samples_per_volume(is_train),
-            is_train=is_train)
-
-
-class ZCubeSpec(DatasetSpec):
-    """z 轴 single max-FOV cube 模式（共享 data path）。（``patch_mode in {z_axis, 2_5d}``）。
-
-    两种 patch_mode 在 dataset 侧抽取逻辑完全一致 —— 都发 max-FOV z-cube；
-    多分辨率拆视图全部交给 trainer/predictor 完成。仅日志区分。
-    """
-
-    name = "z_axis|2_5d"
-
-    def log_summary(self) -> None:
-        dc        = self.cfg.data
-        n_views   = max(len(dc.multi_res_scales), 1)
-        max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
-        logger.info(
-            "Using %s patch mode (oversample=%.2f, scales=%s, n_views=%d, "
-            "max_scale=%.2f, z_boundary=%s) — SINGLE max-FOV z-cube extraction; "
-            "trainer crops+resizes per view before forward.",
-            dc.patch_mode.upper(), self._aug_oversample(is_train=True),
-            dc.multi_res_scales, n_views, max_scale,
-            dc.z_boundary_mode)
-
-    def make_split(
-        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
-        ) -> Dataset:
-        dc = self.cfg.data
-        return Volume3D(
-            **paths.to_kwargs(),
-            **common.to_kwargs(),
-            aug_oversample_ratio        = self._aug_oversample(is_train),
-            multi_res_scales            = list(dc.multi_res_scales),
-            foreground_oversample_ratio = self._fg_ratio(is_train),
-            samples_per_volume          = self._samples_per_volume(is_train),
-            is_train                    = is_train,
-            z_boundary_mode             = dc.z_boundary_mode,
-            val_grid_coverage           = dc.val_grid_coverage)
-
-
-class CubicSpec(DatasetSpec):
-    """3 轴 cubic max-FOV 模式（共享 data path）。（``patch_mode='cubic'``）。"""
-
-    name = "cubic"
-
-    def log_summary(self) -> None:
-        dc = self.cfg.data
-        max_scale = max(dc.multi_res_scales) if dc.multi_res_scales else 1.0
-        logger.info(
-            "Using CUBIC patch mode (oversample=%.2f, scales=%s, "
-            "max_scale=%.2f) — SINGLE max-FOV cube extraction; trainer "
-            "crops+resizes per view before the 3D forward.",
-            self._aug_oversample(is_train=True), dc.multi_res_scales, max_scale)
-
-    def make_split(
-        self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
-        ) -> Dataset:
-        dc = self.cfg.data
-        return Volume3DCubic(
-            **paths.to_kwargs(),
-            **common.to_kwargs(),
-            aug_oversample_ratio        = self._aug_oversample(is_train),
-            multi_res_scales            = list(dc.multi_res_scales),
-            foreground_oversample_ratio = self._fg_ratio(is_train),
-            samples_per_volume          = self._samples_per_volume(is_train),
-            is_train                    = is_train,
-            val_grid_coverage           = dc.val_grid_coverage)
-
-
-# ---------------------------------------------------------------------------
-# Factory — 整个 data 子包中唯一允许 patch_mode if/elif 的地方
-# ---------------------------------------------------------------------------
 def build_data_spec(cfg: Config) -> DatasetSpec:
-    """``cfg.data.patch_mode`` → ``DatasetSpec``。新增 patch_mode 仅需在此追加一行（shared data path）。"""
+    """``cfg.data.patch_mode`` → ``DatasetSpec``。新增 patch_mode 仅需在此追加一行。"""
     pm = str(cfg.data.patch_mode).lower()
     if pm in ("2_5d", "z_axis"):
         return ZCubeSpec(cfg)

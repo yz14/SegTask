@@ -7,8 +7,8 @@
   梯度非有限时丢弃本 accum 组，不推 scheduler/EMA（口径同 segtask）。
 * 验证：patch 级 predict → mAP@``det.eval_iou_thresh``（体级 FROC 由
   predictor 在拼接后的 3D 框上给出）；按 ``det.save_best_metric`` 选模。
-* encoder 差分学习率复用 clstask 的分组实现；warmup 段保留各组倍率
-  （:class:`clstask.trainer.cls_trainer._GroupWarmupScheduler`）。
+* encoder 差分学习率复用 taskcore 的分组实现；warmup 段保留各组倍率
+  （:class:`taskcore.engine.optim.GroupWarmupScheduler`）。
 * 工程能力（口径同 seg / cls Trainer）：每 epoch 落盘 ``latest_model.pth``
   （含 model/EMA/optimizer/scheduler/scaler/epoch/best 状态）与
   ``history.json``；``train.resume`` 完整恢复续训；``train.early_stopping``
@@ -35,15 +35,15 @@ from taskcore.engine.checkpoint import (
     state_to_cpu, unwrap_compile,
 )
 from taskcore.engine.dist_utils import all_gather_objects
-from taskcore.engine.optim import build_optimizer, build_scheduler
+from taskcore.engine.optim import (
+    GroupWarmupScheduler,
+    build_optimizer,
+    build_optimizer_with_lr_mult,
+    build_scheduler,
+)
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.utils.common import AverageMeter
 from taskcore.engine.base_trainer import BaseTrainer
-
-from clstask.trainer.cls_trainer import (
-    _build_optimizer_with_lr_mult,
-    _GroupWarmupScheduler,
-)
 
 from ..config import DetConfig, resolve_num_classes
 from ..metrics import detection_map
@@ -84,7 +84,7 @@ class DetTrainer(BaseTrainer):
 
         self.num_classes = resolve_num_classes(det, cfg)
         if abs(det.encoder_lr_mult - 1.0) > 1e-9:
-            self.optimizer = _build_optimizer_with_lr_mult(
+            self.optimizer = build_optimizer_with_lr_mult(
                 self.model, cfg, det.encoder_lr_mult)
         else:
             self.optimizer = build_optimizer(self.model, cfg)
@@ -101,7 +101,7 @@ class DetTrainer(BaseTrainer):
         # one_cycle 自带 warmup（pct_start），外层不再叠加线性 warmup。
         warmup_steps = 0 if tc.scheduler == "one_cycle" else warmup_steps
         # 差分学习率下 warmup 保留各组倍率（全组同 lr 时退化为父类行为）。
-        self.scheduler = _GroupWarmupScheduler(
+        self.scheduler = GroupWarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr,
             group_base_lrs=[float(pg["lr"])

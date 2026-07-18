@@ -145,9 +145,10 @@ class TestSpecMakeSplit:
                 return MagicMock(name=f"{name}_instance")
             return _ctor
 
-        monkeypatch.setattr(specs_mod, "SegDataset3D", _factory("SegDataset3D"))
-        monkeypatch.setattr(specs_mod, "SegDataset3DCubic", _factory("SegDataset3DCubic"))
-        monkeypatch.setattr(specs_mod, "SegDataset3DWhole", _factory("SegDataset3DWhole"))
+        # dataset 类经各 spec 的 dataset_cls 类属性解析（子项目可覆盖）。
+        monkeypatch.setattr(ZCubeSpec, "dataset_cls", _factory("SegDataset3D"))
+        monkeypatch.setattr(CubicSpec, "dataset_cls", _factory("SegDataset3DCubic"))
+        monkeypatch.setattr(WholeSpec, "dataset_cls", _factory("SegDataset3DWhole"))
         return kw_box
 
     def test_zcube_train(self, captured):
