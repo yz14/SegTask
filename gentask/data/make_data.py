@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import Config, load_config
+from taskcore.data.make_data import _check_physical_geometry
+
 from .dataset import (
     BBox,
     compute_bbox_from_volume,
@@ -38,7 +40,7 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.0"
+_TOOL_VERSION = "make_data/1.1"  # 1.1: meta.label_counts + 物理几何校验
 
 # 同 Volume3DCubic._build_index 上限；可由 CLI 覆盖。
 _DEFAULT_FG_SUBSAMPLE = 50_000
@@ -106,6 +108,13 @@ def prepare_one(
     t0 = time.perf_counter()
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
+    # 0. 物理几何校验：label/bbox/rw/cond 必须与 image 共 spacing/origin/direction
+    #    （shape 相等不蕴含共坐标系；只读头，成本可忽略）。
+    _check_physical_geometry(
+        pid, image_path,
+        [("label", label_path), ("bbox", bbox_path), ("rw", rw_path)]
+        + [(f"cond{i}", c) for i, c in enumerate(cond_paths or [])])
+
     # 1. mask → bbox（无/空为 None）。
     bbox = _bbox_from_mask_path(bbox_path)
 
@@ -161,6 +170,12 @@ def prepare_one(
     bg_val = int(label_values[0])
     fg_slices, fg_coords = _compute_fg_indices(label, bg_val, fg_subsample)
 
+    # 5.5 逐值精确体素计数（落盘 label 同坐标系）：供 loader 直接从 meta 读取
+    #     label_values / 分层划分统计，免去启动期全量解码 label。
+    uniq_vals, uniq_counts = np.unique(
+        label.astype(np.int32, copy=False), return_counts=True)
+    label_counts = {int(v): int(c) for v, c in zip(uniq_vals, uniq_counts)}
+
     # 6. 谱系 meta（自描述）。
     meta = {
         "pid"         : pid,
@@ -171,6 +186,7 @@ def prepare_one(
         "src_cond"    : list(map(str, cond_paths)) if cond_paths else [],
         "bbox"        : (list(map(list, bbox)) if bbox is not None else None),
         "label_values": list(map(int, label_values)),
+        "label_counts": label_counts,
         "spacing_zyx" : [float(s) for s in spacing_zyx],
         "has_rw"      : rw is not None,
         "has_cond"    : cond is not None,
@@ -438,7 +454,7 @@ def _short_exc(exc: BaseException, max_len: int = 200) -> str:
 
 def _setup_logging(level: str = "INFO") -> None:
     # 复用集中式日志配置；out_dir=None 表示只配控制台（彩色），不写文件。
-    from ..logging_utils import setup_logging
+    from taskcore.utils.logging_utils import setup_logging
     setup_logging(output_dir=None, level=level)
 
 

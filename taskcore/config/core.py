@@ -847,9 +847,11 @@ class TrainConfig:
 
     # ---- 恢复 / 预训练 ----
     # Resume：从 checkpoint 完整恢复（model/EMA/optimizer/scheduler/scaler/epoch/RNG）。
+    # 路径不存在即报错（fail-fast，防静默从头训；全任务统一口径）。
     resume: str = ""
 
-    # Pretrain：仅加载 model 权重作初始化。若同时设置了 resume 且存在则 pretrain 被忽略。
+    # Pretrain：仅加载 model 权重作初始化。若同时设置了 resume 则 pretrain 被忽略；
+    # 路径不存在即报错。
     pretrain: str = ""
 
     # strict 加载；默认 False 允许 head 形状不一致。

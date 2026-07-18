@@ -166,30 +166,26 @@ class Trainer(BaseTrainer):
 
         # --- Resume / Pretrain ----------------------------------------
         # resume：全状态恢复；pretrain：仅加载权重。同设优先 resume。
-        resume_active = bool(tc.resume) and os.path.isfile(tc.resume)
-        pretrain_active = bool(tc.pretrain) and os.path.isfile(tc.pretrain)
-
-        if resume_active:
+        # 显式路径不存在即报错（fail-fast，防静默从头训；口径同 cls/det）。
+        resume_active = bool(tc.resume)
+        if tc.resume:
             if tc.pretrain:
                 logger.warning(
                     "Both `train.resume` and `train.pretrain` are set; "
                     "using resume (%s). Pretrain weights from %s are ignored.",
                     tc.resume, tc.pretrain)
+            if not os.path.isfile(tc.resume):
+                raise FileNotFoundError(
+                    f"train.resume checkpoint not found: {tc.resume!r}")
             self._load_checkpoint(tc.resume)
-        elif pretrain_active:
+        elif tc.pretrain:
+            if not os.path.isfile(tc.pretrain):
+                raise FileNotFoundError(
+                    f"train.pretrain checkpoint not found: {tc.pretrain!r}")
             self._load_pretrain(
                 tc.pretrain,
                 strict=tc.pretrain_strict,
                 load_ema=tc.pretrain_load_ema)
-        else:
-            if tc.resume and not os.path.isfile(tc.resume):
-                logger.warning(
-                    "`train.resume` is set but file not found: %s. "
-                    "Training will start from scratch.", tc.resume)
-            if tc.pretrain and not os.path.isfile(tc.pretrain):
-                logger.warning(
-                    "`train.pretrain` is set but file not found: %s. "
-                    "Training will start from scratch.", tc.pretrain)
 
         # --- Training monitor (optional; fully isolated) --------------
         # 逐 epoch 把指标落盘并周期性重渲染自包含 HTML 仪表盘（公用工程件，

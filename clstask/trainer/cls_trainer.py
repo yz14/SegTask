@@ -14,7 +14,7 @@
   ``model_online_state_dict``）。
 * encoder 差分学习率：``cls.encoder_lr_mult`` 对 encoder 参数组缩放 lr
   （微调预训练权重的惯用手段）；头部参数保持 ``train.lr``。warmup 段亦
-  保持各组倍率（见 :class:`_GroupWarmupScheduler`）。
+  保持各组倍率（见 :class:`taskcore.engine.optim.GroupWarmupScheduler`）。
 * 工程能力（口径同 seg Trainer）：每 epoch 落盘 ``latest_model.pth``（含
   model/EMA/optimizer/scheduler/scaler/epoch/best 状态）与 ``history.json``；
   ``train.resume`` 指向 checkpoint 时完整恢复续训；``train.early_stopping``
@@ -87,7 +87,7 @@ class ClsTrainer(BaseTrainer):
         self.single_label = not cls.multi_label
 
         if abs(cls.encoder_lr_mult - 1.0) > 1e-9:
-            self.optimizer = _build_optimizer_with_lr_mult(
+            self.optimizer = build_optimizer_with_lr_mult(
                 self.model, cfg, cls.encoder_lr_mult)
         else:
             self.optimizer = build_optimizer(self.model, cfg)
@@ -104,7 +104,7 @@ class ClsTrainer(BaseTrainer):
         # one_cycle 自带 warmup（pct_start），外层不再叠加线性 warmup。
         warmup_steps = 0 if tc.scheduler == "one_cycle" else warmup_steps
         # 差分学习率下 warmup 保留各组倍率（全组同 lr 时退化为父类行为）。
-        self.scheduler = _GroupWarmupScheduler(
+        self.scheduler = GroupWarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr,
             group_base_lrs=[float(pg["lr"])

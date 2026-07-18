@@ -24,10 +24,10 @@ from taskcore.engine.launch import (
 
 from .config import load_config, save_config
 from .data.loader import build_dataloaders
-from .logging_utils import setup_logging as _setup_logging
+from taskcore.utils.logging_utils import setup_logging as _setup_logging
 from .models.factory import build_model
 from .trainer import GenerationTrainer
-from .utils import seed_everything
+from taskcore.utils.common import seed_everything
 
 
 def setup_logging(output_dir: str, level: str = "INFO") -> None:

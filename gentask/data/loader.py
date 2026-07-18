@@ -15,6 +15,7 @@ from taskcore.data.loader import ValBatchShardSampler, scaled_num_workers
 
 from ..config import Config
 from .dataset import load_nifti, load_npz_label_for_split
+from taskcore.data.dataset import load_npz_label_counts
 from .specs import DatasetCommonCfg, SplitPaths, build_data_spec
 # 公共纯函数工具从 taskcore.data.loader 复用（与迁移前逐字符一致）。
 from taskcore.data.loader import (  # noqa: F401  (re-export，保持旧 import 路径可用)
@@ -126,9 +127,11 @@ def build_dataloaders(
     # 自动探测时顺便记录逐样本体素计数，供分层划分复用（避免二次全量扫描）。
     per_sample_counts: Optional[List[Dict[int, int]]] = None
     if not dc.label_values:
+        # npz meta 含 label_counts（make_data≥1.3）时走快路，启动期不解码 label 卷；
+        # 旧包无该键自动回退全量扫描。
         dc.label_values, per_sample_counts = detect_label_values(
             label_paths, label_loader_fn=label_loader_fn,
-            return_primaries=True)
+            return_primaries=True, label_counts_fn=load_npz_label_counts)
         dc.num_classes  = len(dc.label_values)
         cfg.sync()
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",

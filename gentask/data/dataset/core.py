@@ -9,16 +9,16 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .cache import VolumeCache
-from .io import (
-    BBox, compute_bbox_from_volume, compute_region_weight_map,
+from taskcore.data.dataset import (
+    BBox, VolumeCache, _open_npz, compute_bbox_from_volume,
+    compute_region_weight_map,
     load_nifti, load_nifti_cropped, load_nifti_with_spacing,
     load_npz_fg_coords, load_npz_fg_slices, load_npz_image,
-    load_npz_cond, load_npz_label, load_npz_label_for_split,
-    load_npz_region_weight,
-    load_region_weight_volume, npz_has_rw, preprocess_image,
-    resize_3d, _open_npz,
+    load_npz_label, load_npz_label_for_split, load_npz_region_weight,
+    load_region_weight_volume, npz_has_rw, preprocess_image, resize_3d,
 )
+
+from .io import load_npz_cond
 
 logger = logging.getLogger(__name__)
 

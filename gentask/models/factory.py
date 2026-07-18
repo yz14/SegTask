@@ -3,205 +3,25 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
-from typing import Callable, List
+from typing import List
 
-import numpy as np
 
 from ..config import Config
-from taskcore.models.blocks import Downsample, Upsample
-from taskcore.models.convnext import ConvNeXtDownsample, ConvNeXtStage
-from taskcore.models.resnet import ResNetStage
+# 共享 stage/stride 构建件与 taskcore 合流（gen ModelConfig 继承核心段，
+# multirf/selfattn/drop-path 等扩展默认关闭时逐位兼容历史行为）。
+from taskcore.models.factory import (
+    _make_convnext_downsample_builder,
+    _make_convnext_stage_builder,
+    _make_resnet_stage_builder,
+    _resolve_blocks_per_stage,
+    compute_downsample_strides,
+)
 from taskcore.models.topology import ModelTopology, build_topology
 from taskcore.models.unet import Encoder, Decoder, UNet3D
 from taskcore.models.unet3p import UNet3PDecoder
 from taskcore.models.unetpp import UNetPPDecoder
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_blocks_per_stage(
-    explicit: List[int],
-    n_stages: int,
-    fallback: int) -> List[int]:
-    """逐级 block 数：显式列表优先，否则广播 fallback。"""
-    if explicit:
-        if len(explicit) != n_stages:
-            raise ValueError(
-                f"Per-stage block list length {len(explicit)} "
-                f"!= expected {n_stages}")
-        return list(explicit)
-    return [fallback] * n_stages
-
-
-class _StatefulStageBuilder:
-    """有状态 stage 构建器：逐次调用从 counts[idx] 读 num_blocks。"""
-
-    def __init__(self, factory_fn, counts: List[int]):
-        self._fn     = factory_fn
-        self._counts = counts
-        self._idx    = 0
-
-    def __call__(self, in_ch: int, out_ch: int):
-        if self._idx >= len(self._counts):
-            raise RuntimeError(
-                f"StageBuilder exhausted after {self._idx} calls, "
-                f"counts={self._counts}")
-        n_blocks = self._counts[self._idx]
-        self._idx += 1
-        return self._fn(in_ch, out_ch, n_blocks)
-
-
-def _make_resnet_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
-    """返回按逐级 block 数构建 ResNet stage 的有状态函数。"""
-    mc = cfg.model
-    spatial_dims = mc.spatial_dims
-
-    # 旧 use_se 兼容：等价于 attention_type='none' 时提升为 'se'（与块内语义一致）。
-    attention_type = mc.attention_type
-    if attention_type == "none" and mc.use_se:
-        attention_type = "se"
-
-    def factory(in_ch: int, out_ch: int, num_blocks: int) -> ResNetStage:
-        return ResNetStage(
-            in_ch, out_ch,
-            num_blocks     = num_blocks,
-            norm_type      = mc.norm_type,
-            norm_groups    = mc.norm_groups,
-            activation     = mc.activation,
-            dropout        = mc.dropout,
-            se_reduction   = mc.se_reduction,
-            attention_type = attention_type,
-            block_type     = mc.block_type,
-            spatial_dims   = spatial_dims)
-
-    return _StatefulStageBuilder(factory, counts)
-
-
-def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStageBuilder:
-    """ConvNeXt stage 构建器：块内硬编码 LN+GELU；用户设其他 norm/act 时警告。"""
-    mc = cfg.model
-    spatial_dims = mc.spatial_dims
-    non_default = []
-    if mc.norm_type != "instance":
-        non_default.append(f"norm_type={mc.norm_type!r}")
-    if mc.activation != "leakyrelu":
-        non_default.append(f"activation={mc.activation!r}")
-    if mc.use_se:
-        non_default.append("use_se=True")
-    if mc.dropout and mc.dropout > 0.0:
-        non_default.append(f"dropout={mc.dropout}")
-    if non_default:
-        logger.warning(
-            "Backbone=convnext: block-internal norm/activation are fixed to "
-            "LayerNorm+GELU and the following settings are IGNORED inside "
-            "ConvNeXt blocks: %s. (They still apply to the stem/decoder "
-            "skip projections built in Encoder/Decoder.)",
-            ", ".join(non_default))
-    # 总 block 上线性增的 drop-path。
-    total_blocks = sum(counts)
-    dp_rates     = np.linspace(0, mc.drop_path_rate, max(total_blocks, 1)).tolist()
-    rate_idx     = [0]
-    ls_init      = float(mc.convnext_layer_scale_init)  # <=0 禁用
-
-    def factory(in_ch: int, out_ch: int, num_blocks: int) -> ConvNeXtStage:
-        start = rate_idx[0]
-        end   = start + num_blocks
-        rates = dp_rates[start:end] if dp_rates else [0.0] * num_blocks
-        rate_idx[0] = end
-        return ConvNeXtStage(
-            in_ch, out_ch,
-            num_blocks             = num_blocks,
-            drop_path_rates        = rates,
-            attention_type         = mc.attention_type,
-            spatial_dims           = spatial_dims,
-            layer_scale_init_value = ls_init)
-
-    return _StatefulStageBuilder(factory, counts)
-
-
-def _make_convnext_downsample_builder(
-    cfg: Config) -> Callable[[int, int], ConvNeXtDownsample]:
-    """论文风 ConvNeXt 阶间下采样 LN→Conv(s=2) 构建器。"""
-    spatial_dims = cfg.model.spatial_dims
-
-    def build(in_ch: int, out_ch: int) -> ConvNeXtDownsample:
-        return ConvNeXtDownsample(in_ch, out_ch, spatial_dims=spatial_dims)
-
-    return build
-
-
-# 各向异性自动调度的最小特征边长（nnU-Net 默认 4）：降采样后某轴不小于此值才继续降。
-_MIN_FEATURE_SIZE = 4
-
-#: 各向异性下采样兼容的下/上采样模式（其余模式核结构要求各向同性 2）。
-_ANISO_DOWN_MODES = ("conv", "maxpool", "avgpool")
-_ANISO_UP_MODES   = ("transpose", "trilinear", "nearest")
-
-
-def _stem_stride_of(stem_mode: str) -> int:
-    """patchN stem 在进 encoder stage 前先各向同性降 N 倍；其余 stem stride=1。"""
-    if stem_mode == "patch2":
-        return 2
-    if stem_mode == "patch4":
-        return 4
-    return 1
-
-
-def _auto_anisotropic_strides(
-    spatial_sizes: List[int],
-    num_down     : int,
-    min_size     : int = _MIN_FEATURE_SIZE) -> List[tuple]:
-    """nnU-Net 式各向异性调度：逐级仅对"分辨率仍偏大"的轴降采样。
-
-    某轴本级降采样（stride 2）的条件：(a) 当前尺寸为偶数；(b) 减半后仍 >= min_size；
-    (c) 当前尺寸 > 本级最大轴尺寸的一半（即该轴分辨率落后不超过 2×）。这样各轴分辨率
-    始终保持在彼此 2× 以内，避免薄 z 轴被过早压成 1。
-    """
-    sizes = [int(s) for s in spatial_sizes]
-    nd = len(sizes)
-    schedule: List[tuple] = []
-    for _ in range(num_down):
-        ref = max(sizes)
-        stride = []
-        for ax in range(nd):
-            do_pool = (sizes[ax] % 2 == 0
-                       and sizes[ax] // 2 >= min_size
-                       and sizes[ax] * 2 > ref)  # sizes[ax] > ref/2
-            if do_pool:
-                stride.append(2)
-                sizes[ax] //= 2
-            else:
-                stride.append(1)
-        schedule.append(tuple(stride))
-    return schedule
-
-
-def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
-    """决定逐级下采样 stride。
-
-    优先级：显式 ``model.downsample_strides`` > ``model.anisotropic_pooling``
-    自动推导 > None（各向同性，沿用历史行为）。返回 ``None`` 或长度 ``n_levels-1``
-    的 per-axis stride 元组列表。
-    """
-    mc       = cfg.model
-    num_down = n_levels - 1
-    if num_down <= 0:
-        return None
-
-    explicit = list(mc.downsample_strides or [])
-    if explicit:
-        return [tuple(int(x) for x in s) for s in explicit]
-
-    if not bool(mc.anisotropic_pooling):
-        return None  # 各向同性默认：Downsample/Upsample 用 stride=2
-
-    # 自动推导：基于 patch 的"模型空间轴"尺寸（2.5D 的 D 折进通道，不计）。
-    patch         = [int(x) for x in cfg.data.patch_size]  # [D, H, W]
-    spatial_sizes = patch[1:] if spatial_dims == 2 else patch
-    stem_stride   = _stem_stride_of(mc.stem_mode)
-    spatial_sizes = [max(1, s // stem_stride) for s in spatial_sizes]
-    return _auto_anisotropic_strides(spatial_sizes, num_down)
 
 
 def build_model(cfg: Config):
@@ -236,6 +56,10 @@ def _resolve_decoder_counts(mc, n_levels: int) -> list[int]:
 def _resolve_backbone_stage_builders(cfg: Config, enc_counts, dec_counts):
     """按 backbone 解析 encoder/decoder stage builder。"""
     mc = cfg.model
+    # 旧 use_se 兼容（生成侧遗留字段）：attention_type='none' 时提升为 'se'，
+    # 与块内语义一致；共享 builder 只读 attention_type。
+    if mc.use_se and mc.attention_type == "none":
+        mc.attention_type = "se"
     downsample_builder = None
     if mc.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(cfg, enc_counts)

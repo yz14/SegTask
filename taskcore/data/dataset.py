@@ -405,8 +405,10 @@ def _group_fg_slices_by_class(
 
 def load_npz_label_counts(path: str) -> Optional[Dict[int, int]]:
     """返 meta.label_counts（{label_value: voxel_count}，精确不抽采，make_data≥1.3）；
-    旧 npz 无此键返 None。只反序列化小体积 meta，不解码 label 卷。"""
+    旧 npz 无此键（或无 meta）返 None。只反序列化小体积 meta，不解码 label 卷。"""
     with _open_npz(path) as f:
+        if "meta" not in f.files:
+            return None
         meta = f["meta"].item()
     counts = meta.get("label_counts")
     if counts is None:

@@ -30,7 +30,7 @@ from ..config import Config
 from ..data.augment import GPUAugmentor
 from ..losses.recon import DiffusionLoss, build_recon_loss, psnr, ssim
 from ..models.generation import DiffusionModel
-from ..utils import AverageMeter
+from taskcore.utils.common import AverageMeter
 from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
     state_to_cpu, unwrap_compile,
@@ -112,7 +112,7 @@ class GenerationTrainer(BaseTrainer):
         # 选模指标口径同 fit：PSNR 越大越好（整卷验证时 fit 内改用 vol_psnr，
         # is_best 标记以实际选模为准）。
         self._setup_monitor(
-            resume_active=bool(tc.resume) and os.path.isfile(str(tc.resume)),
+            resume_active=bool(tc.resume),
             run_name_default="gen_run",
             save_best_metric="psnr",
             save_best_mode="max",
@@ -572,30 +572,26 @@ class GenerationTrainer(BaseTrainer):
         self._check_supported_data_options(self.cfg)
         tc = self.cfg.train
         # resume：全状态恢复；pretrain：仅加载权重。同设优先 resume。
-        resume_active = bool(tc.resume) and os.path.isfile(tc.resume)
-        pretrain_active = bool(tc.pretrain) and os.path.isfile(tc.pretrain)
+        # 显式路径不存在即报错（fail-fast，防静默从头训；口径同 cls/det）。
         start_epoch = 0
-        if resume_active:
+        if tc.resume:
             if tc.pretrain:
                 logger.warning(
                     "Both `train.resume` and `train.pretrain` are set; "
                     "using resume (%s). Pretrain weights from %s are ignored.",
                     tc.resume, tc.pretrain)
+            if not os.path.isfile(tc.resume):
+                raise FileNotFoundError(
+                    f"train.resume checkpoint not found: {tc.resume!r}")
             start_epoch = self._load_resume(tc.resume)
-        elif pretrain_active:
+        elif tc.pretrain:
+            if not os.path.isfile(tc.pretrain):
+                raise FileNotFoundError(
+                    f"train.pretrain checkpoint not found: {tc.pretrain!r}")
             self._load_pretrain(
                 tc.pretrain,
                 strict=tc.pretrain_strict,
                 load_ema=tc.pretrain_load_ema)
-        else:
-            if tc.resume and not os.path.isfile(tc.resume):
-                logger.warning(
-                    "`train.resume` is set but file not found: %s. "
-                    "Training will start from scratch.", tc.resume)
-            if tc.pretrain and not os.path.isfile(tc.pretrain):
-                logger.warning(
-                    "`train.pretrain` is set but file not found: %s. "
-                    "Training will start from scratch.", tc.pretrain)
         val_every = max(int(tc.val_every), 1)
         save_every = max(int(tc.save_every), 1)
         last: Dict[str, float] = {}

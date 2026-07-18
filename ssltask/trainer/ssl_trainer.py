@@ -186,13 +186,12 @@ class SSLTrainer(BaseTrainer):
                 "probe_dice" if ssl.probe_select_best else "train_loss")
 
         # --- Resume (全状态：method/optimizer/scheduler/scaler/EMA/RNG) ---
+        # 显式路径不存在即报错（fail-fast，防静默从头训；口径同 cls/det）。
         if tc.resume:
-            if os.path.isfile(tc.resume):
-                self._load_resume(tc.resume)
-            else:
-                logger.warning(
-                    "`train.resume` is set but file not found: %s. "
-                    "Starting SSL pretrain from scratch.", tc.resume)
+            if not os.path.isfile(tc.resume):
+                raise FileNotFoundError(
+                    f"train.resume checkpoint not found: {tc.resume!r}")
+            self._load_resume(tc.resume)
 
         # --- torch.compile（最后：optimizer/EMA/resume 已绑裸模型参数）-----
         # 共用工程件（见 BaseTrainer._maybe_compile）。替换 ``method.module``：
