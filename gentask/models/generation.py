@@ -270,11 +270,6 @@ def build_generation_model(cfg) -> nn.Module:
 
     if algo == "diffusion":
         arch = str(cfg.model.arch).lower()
-        if cfg.model.grad_checkpointing:
-            # 梯度检查点目前仅 UNet 系 backbone 支持（Encoder/Decoder 逐 stage 包装）。
-            logger.warning(
-                "model.grad_checkpointing=True is not supported for diffusion "
-                "arch=%r; ignored.", arch)
         D = _slab_depth(cfg)
         target_ch = int(task.out_channels) * D       # 高分（噪声）图折叠通道
         cond_ch = int(cfg.model.in_channels)         # 低分条件图通道

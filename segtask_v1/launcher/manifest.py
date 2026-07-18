@@ -274,8 +274,9 @@ def _model_fields(mode: str) -> List[Field]:
         Field("model.upsample_norm_act", depends_on=unet + [_in("model.upsample_mode", ["trilinear", "nearest"])]),
         Field("model.downsample_strides", depends_on=unet),
         Field("model.skip_mode", depends_on=unet),
-        # 梯度检查点（所有 backbone 通用）。
-        Field("model.grad_checkpointing", depends_on=unet),
+        # 梯度检查点（unet/adm/edm2 全 backbone 支持）。
+        Field("model.grad_checkpointing",
+              depends_on=[_in("model.arch", ["unet", "adm", "edm2"])]),
         Field("model.grad_ckpt_encoder_stages",
               depends_on=unet + [_truthy("model.grad_checkpointing")]),
         # ConvNeXt 专属。

@@ -259,11 +259,11 @@ def _build_sisr_backbone(cfg: Config):
 def build_backbone(cfg: Config):
     """按 `model.arch` 构造共享 backbone：UNet、ADM、EDM2、EDSR/RCAN。"""
     arch = str(cfg.model.arch).lower()
-    if cfg.model.grad_checkpointing and arch != "unet":
-        # 梯度检查点目前仅 UNet 系 backbone 支持（Encoder/Decoder 逐 stage 包装）。
+    if cfg.model.grad_checkpointing and arch in ("edsr", "rcan"):
+        # SISR 网络较浅，未接检查点；UNet/ADM/EDM2 均已逐块包装。
         logger.warning(
             "model.grad_checkpointing=True is not supported for arch=%r "
-            "(only 'unet'); ignored.", arch)
+            "(only 'unet' | 'adm' | 'edm2'); ignored.", arch)
     if arch in ("edsr", "rcan"):
         return _build_sisr_backbone(cfg)
     if arch == "adm":

@@ -212,6 +212,95 @@ def test_grad_checkpoint_2_5d_droppath_runs():
     assert all(torch.isfinite(g).all() for g in grads)
 
 
+# ---------------------------------------------------------------------------
+# ADM / EDM2（分割 + 扩散 backbone）：逐块检查点开/关数值一致
+# ---------------------------------------------------------------------------
+def _make_arch_cfg(arch: str, grad_checkpointing: bool) -> Config:
+    cfg = Config()
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.patch_size = [4, 32, 32]
+    cfg.data.multi_res_scales = [1.0]
+    cfg.data.label_values = [0, 1]
+    cfg.model.arch = arch
+    cfg.model.encoder_channels = [16, 32]
+    cfg.model.blocks_per_level = 1
+    cfg.model.deep_supervision = False
+    cfg.model.grad_checkpointing = grad_checkpointing
+    cfg.sync()
+    cfg.validate()
+    return cfg
+
+
+def _assert_forward_backward_match(m_off, m_on, x, *extra):
+    torch.manual_seed(1)
+    out_off = m_off(x, *extra)
+    torch.manual_seed(1)
+    out_on = m_on(x, *extra)
+    flat_off, flat_on = _flatten(out_off), _flatten(out_on)
+    assert len(flat_off) == len(flat_on) and len(flat_off) >= 1
+    for a, b in zip(flat_off, flat_on):
+        assert a.shape == b.shape
+        assert torch.allclose(a, b, atol=1e-5, rtol=1e-4)
+    _scalar(out_off).backward()
+    _scalar(out_on).backward()
+    params_off = dict(m_off.named_parameters())
+    params_on = dict(m_on.named_parameters())
+    assert params_off.keys() == params_on.keys()
+    n_checked = 0
+    for name, p_off in params_off.items():
+        p_on = params_on[name]
+        if p_off.grad is None:
+            assert p_on.grad is None, name
+            continue
+        assert p_on.grad is not None, name
+        assert torch.allclose(p_off.grad, p_on.grad, atol=1e-4, rtol=1e-3), name
+        n_checked += 1
+    assert n_checked > 0
+
+
+@pytest.mark.parametrize("arch", ["adm", "edm2"])
+def test_grad_checkpoint_arch_flag_plumbed(arch):
+    model = build_model(_make_arch_cfg(arch, grad_checkpointing=True))
+    assert model.encoder.grad_checkpointing is True
+    assert model.decoder.grad_checkpointing is True
+    model_off = build_model(_make_arch_cfg(arch, grad_checkpointing=False))
+    assert model_off.encoder.grad_checkpointing is False
+    assert model_off.decoder.grad_checkpointing is False
+
+
+@pytest.mark.parametrize("arch", ["adm", "edm2"])
+def test_grad_checkpoint_seg_arch_matches_baseline(arch):
+    cfg_off = _make_arch_cfg(arch, grad_checkpointing=False)
+    cfg_on = _make_arch_cfg(arch, grad_checkpointing=True)
+    torch.manual_seed(0)
+    m_off = build_model(cfg_off).train()
+    torch.manual_seed(0)
+    m_on = build_model(cfg_on).train()
+    m_on.load_state_dict(m_off.state_dict())
+    x = torch.randn(1, cfg_off.model.in_channels, 32, 32)
+    _assert_forward_backward_match(m_off, m_on, x)
+
+
+@pytest.mark.parametrize("arch", ["adm", "edm2"])
+def test_grad_checkpoint_diffusion_arch_matches_baseline(arch):
+    if arch == "adm":
+        from taskcore.models.adm_unet import build_adm_diffusion_unet as build
+    else:
+        from taskcore.models.edm2_unet import build_edm2_diffusion_unet as build
+    cfg_off = _make_arch_cfg(arch, grad_checkpointing=False)
+    cfg_on = _make_arch_cfg(arch, grad_checkpointing=True)
+    torch.manual_seed(0)
+    m_off = build(cfg_off, in_channels=8, out_channels=4).train()
+    torch.manual_seed(0)
+    m_on = build(cfg_on, in_channels=8, out_channels=4).train()
+    m_on.load_state_dict(m_off.state_dict())
+    assert m_on.encoder.grad_checkpointing is True
+    assert m_on.decoder.grad_checkpointing is True
+    x = torch.randn(1, 8, 32, 32)
+    c_noise = torch.randn(1)
+    _assert_forward_backward_match(m_off, m_on, x, c_noise)
+
+
 def test_config_rejects_bad_grad_ckpt_mask_length():
     cfg = Config()
     cfg.model.encoder_channels = [16, 32, 64]

@@ -408,7 +408,8 @@ class ModelConfig:
     # ---- 显存 ----
     # 梯度检查点（gradient checkpointing）：以约 +20~33% 算力换取激活显存大幅下降，可放大
     # 3D patch/batch（利于气道/血管等需大上下文的细结构）或更深更宽的 backbone。覆盖 encoder
-    # 各 stage 与 decoder（unet/unetpp/unet3p）各节点；stem/上下采样/头不包裹（开销小）。
+    # 各 stage 与 decoder（unet/unetpp/unet3p）各节点，以及 ADM/EDM2（含扩散 backbone）的
+    # 逐块（ResBlock/Attention/Block）包装；stem/上下采样/头不包裹（开销小）。
     # 反向重算前向 → 数值/收敛与关闭时一致（use_reentrant=False + preserve_rng_state 保
     # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
     # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。

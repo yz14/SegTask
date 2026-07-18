@@ -98,7 +98,7 @@ x_cat = cat([噪声图(预条件缩放), LR 条件图], dim=1)，c_noise 标量�
 | 梯度累积 / 裁剪 | `grad_accum_steps` / `grad_clip_norm` |
 | warmup + scheduler | `warmup_epochs` + cosine/poly/step/plateau 等 |
 | torch.compile | `compile_mode` |
-| 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：仅 UNet 系 backbone（unet/unetpp/unet3p）支持，encoder 逐 stage / decoder 逐 level 反向重算激活；非 UNet 架构（edsr/rcan/adm/edm2，含扩散路径）开启时 warning 提示忽略，不静默失效 |
+| 梯度检查点 | `model.grad_checkpointing`：UNet 系（unet/unetpp/unet3p，encoder 逐 stage，可配 `grad_ckpt_encoder_stages` 掩码 / decoder 逐 level）与 ADM/EDM2（含扩散 backbone，逐块 ResBlock/Attention/Block 包装）均支持，反向重算激活、算力换显存；edsr/rcan 未接（网络浅），开启时 warning 提示忽略，不静默失效 |
 | DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler、验证集按 batch 块不相交分片；patch 级 PSNR/SSIM meter 加权 all-reduce，整卷验证逐 rank 切分后汇总；best/checkpoint/history 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 选模 / 早停 | patch 级 PSNR 越大越好；`val_full_volume=true` 时改用整卷 PSNR；`early_stopping`；扩散验证采样用固定 seed generator，选模/早停/plateau 不受采样噪声干扰 |
 | 整卷验证 | 与部署同口径：在线退化整卷 → 推理器滑窗复原（复用 predict.overlap/blend）→ 逐卷 PSNR/SSIM；`val_full_volume_max` 控耗时 |

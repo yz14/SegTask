@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .blocks import ConvNormAct
+from .blocks import ConvNormAct, checkpoint_if
 from .stem import build_context_stem, build_stem
 from .topology import build_topology
 from .unet import SegmentationHead, build_head
@@ -333,8 +333,11 @@ class _ADMEncoder(nn.Module):
         cond_stem: Optional[nn.Module] = None,
         cond_fuse: Optional[nn.Module] = None,
         cond_in_channels: int = 0,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
+        # 梯度检查点：逐块（ResBlock/Attention）包裹前向，反向重算以省激活显存。
+        self.grad_checkpointing = bool(grad_checkpointing)
         self.stem = stem
         self.cond_stem = cond_stem
         self.cond_fuse = cond_fuse
@@ -398,10 +401,10 @@ class _ADMEncoder(nn.Module):
         for level, blocks in enumerate(self.levels):
             for blk in blocks:
                 if isinstance(blk, _ResBlockBase):
-                    x = blk(x, emb)
+                    x = checkpoint_if(self.grad_checkpointing, blk, x, emb)
                     enc_skips.append(x)
                 else:  # AttentionBlock
-                    x = blk(x)
+                    x = checkpoint_if(self.grad_checkpointing, blk, x)
                     # ADM 顺序：attended 特征替换上一个 skip，而非追加。
                     enc_skips[-1] = x
             enc_features.append(x)
@@ -424,15 +427,20 @@ class _ADMMiddle(nn.Module):
         num_head_channels: int,
         dropout: float,
         emb_channels: int = 0,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
+        self.grad_checkpointing = bool(grad_checkpointing)
         self.r1 = _make_resblock(channels, channels, dropout, emb_channels)
         self.a = _AttentionBlock(
             channels, num_heads=num_heads, num_head_channels=num_head_channels)
         self.r2 = _make_resblock(channels, channels, dropout, emb_channels)
 
-    def forward(self, x, emb: Optional[torch.Tensor] = None):
+    def _blocks(self, x, emb: Optional[torch.Tensor] = None):
         return self.r2(self.a(self.r1(x, emb)), emb)
+
+    def forward(self, x, emb: Optional[torch.Tensor] = None):
+        return checkpoint_if(self.grad_checkpointing, self._blocks, x, emb)
 
 
 class _ADMDecoder(nn.Module):
@@ -452,8 +460,11 @@ class _ADMDecoder(nn.Module):
         linear_attention_num_heads: int = 4,
         linear_attention_head_dim: int = 32,
         emb_channels: int = 0,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
+        # 梯度检查点：逐块（cat skip → ResBlock / Attention）包裹前向。
+        self.grad_checkpointing = bool(grad_checkpointing)
         self.emb_channels = int(emb_channels)
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
@@ -536,9 +547,11 @@ class _ADMDecoder(nn.Module):
                         skip = F.interpolate(
                             skip, size=x.shape[2:],
                             mode="bilinear", align_corners=False)
-                    x = blk(torch.cat([x, skip], dim=1), emb)
+                    x = checkpoint_if(
+                        self.grad_checkpointing, blk,
+                        torch.cat([x, skip], dim=1), emb)
                 else:  # AttentionBlock
-                    x = blk(x)
+                    x = checkpoint_if(self.grad_checkpointing, blk, x)
             # 除最深级外均抓取，以合 UNet3D 约定。
             if level < self.n_levels - 1:
                 dec_features.append(x)
@@ -581,6 +594,7 @@ class ADMSegModel(nn.Module):
         cond_stem: Optional[nn.Module] = None,
         cond_fuse: Optional[nn.Module] = None,
         cond_in_channels: int = 0,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
         self.spatial_dims = 2
@@ -604,12 +618,14 @@ class ADMSegModel(nn.Module):
             linear_attention_levels=linear_attention_levels,
             linear_attention_num_heads=linear_attention_num_heads,
             linear_attention_head_dim=linear_attention_head_dim,
+            grad_checkpointing=grad_checkpointing,
         )
         self.middle = _ADMMiddle(
             channels=encoder_channels[-1],
             num_heads=num_heads,
             num_head_channels=num_head_channels,
             dropout=dropout,
+            grad_checkpointing=grad_checkpointing,
         )
         self.decoder = _ADMDecoder(
             encoder_channels=encoder_channels,
@@ -622,6 +638,7 @@ class ADMSegModel(nn.Module):
             linear_attention_levels=linear_attention_levels,
             linear_attention_num_heads=linear_attention_num_heads,
             linear_attention_head_dim=linear_attention_head_dim,
+            grad_checkpointing=grad_checkpointing,
         )
 
         # 1×1 logit conv（论文为 Conv3+GN+SiLU），与 UNet3D / DS 约定一致。
@@ -864,6 +881,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         aux_seg_supervision=aux_seg,
         aux_head_mode=str(mc.aux_head_mode),
         aux_head_out_channels=aux_head_out_channels,
+        grad_checkpointing=bool(mc.grad_checkpointing),
     )
 
     pc = model.param_count()
@@ -932,7 +950,8 @@ class ADMDiffusionUNet(nn.Module):
         attention_levels: List[int],
         num_heads: int = 4,
         num_head_channels: int = -1,
-        dropout: float = 0.0):
+        dropout: float = 0.0,
+        grad_checkpointing: bool = False):
         super().__init__()
         self.spatial_dims = 2
         self.in_channels = int(in_channels)
@@ -959,13 +978,15 @@ class ADMDiffusionUNet(nn.Module):
             num_heads=num_heads,
             num_head_channels=num_head_channels,
             dropout=dropout,
-            emb_channels=emb_ch)
+            emb_channels=emb_ch,
+            grad_checkpointing=grad_checkpointing)
         self.middle = _ADMMiddle(
             channels=encoder_channels[-1],
             num_heads=num_heads,
             num_head_channels=num_head_channels,
             dropout=dropout,
-            emb_channels=emb_ch)
+            emb_channels=emb_ch,
+            grad_checkpointing=grad_checkpointing)
         self.decoder = _ADMDecoder(
             encoder_channels=encoder_channels,
             skip_channels=self.encoder.skip_channels,
@@ -974,7 +995,8 @@ class ADMDiffusionUNet(nn.Module):
             num_heads=num_heads,
             num_head_channels=num_head_channels,
             dropout=dropout,
-            emb_channels=emb_ch)
+            emb_channels=emb_ch,
+            grad_checkpointing=grad_checkpointing)
         # 输出：GroupNorm + SiLU + zero-init conv（ADM 风格）。
         self.out_norm = _norm(self.decoder.out_channels[-1])
         self.out_conv = _zero_(
@@ -1016,7 +1038,8 @@ def build_adm_diffusion_unet(
         attention_levels=attn_levels,
         num_heads=int(mc.adm_num_heads),
         num_head_channels=int(mc.adm_num_head_channels),
-        dropout=float(mc.dropout))
+        dropout=float(mc.dropout),
+        grad_checkpointing=bool(mc.grad_checkpointing))
     logger.info(
         "Built ADMDiffusionUNet: total=%.2fM, channels=%s, enc_blocks=%s, "
         "attn_levels=%s, in_ch=%d, out_ch=%d",

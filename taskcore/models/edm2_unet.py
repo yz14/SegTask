@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .blocks import checkpoint_if
 from .stem import HierarchicalStems, build_stem  # only for the explicit reject branch
 from .topology import build_topology
 
@@ -299,8 +300,11 @@ class _EDM2Encoder(nn.Module):
         cond_stem: Optional[nn.Module] = None,
         cond_fuse: Optional[nn.Module] = None,
         cond_in_channels: int = 0,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
+        # 梯度检查点：逐 Block 包裹前向，反向重算以省激活显存。
+        self.grad_checkpointing = bool(grad_checkpointing)
         self.stem = stem
         self.cond_stem = cond_stem
         self.cond_fuse = cond_fuse
@@ -362,10 +366,10 @@ class _EDM2Encoder(nn.Module):
         for level in range(self.n_levels):
             entry = self.level_entries[level]
             if not isinstance(entry, nn.Identity):
-                x = entry(x, emb)
+                x = checkpoint_if(self.grad_checkpointing, entry, x, emb)
                 enc_skips.append(x)
             for blk in self.level_blocks[level]:
-                x = blk(x, emb)
+                x = checkpoint_if(self.grad_checkpointing, blk, x, emb)
                 enc_skips.append(x)
             enc_features.append(x)
         return {
@@ -386,8 +390,11 @@ class _EDM2Decoder(nn.Module):
         attention_levels: List[int],
         concat_balance: float,
         block_kwargs: Dict[str, Any],
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
+        # 梯度检查点：逐 Block（mp_cat skip → dec Block）包裹前向。
+        self.grad_checkpointing = bool(grad_checkpointing)
         self.encoder_channels = list(encoder_channels)
         n_levels = len(encoder_channels)
         self.n_levels = n_levels
@@ -446,9 +453,9 @@ class _EDM2Decoder(nn.Module):
         for ridx, level in enumerate(reversed(range(self.n_levels))):
             entry = self.level_entries[ridx]
             kind = self.level_entries_kind[ridx]
-            x = entry(x, emb)
+            x = checkpoint_if(self.grad_checkpointing, entry, x, emb)
             if kind == "in0_in1":
-                x = self._in1(x, emb)
+                x = checkpoint_if(self.grad_checkpointing, self._in1, x, emb)
             for blk in self.level_blocks[ridx]:
                 skip = skip_stack.pop()
                 if skip.shape[2:] != x.shape[2:]:
@@ -456,7 +463,7 @@ class _EDM2Decoder(nn.Module):
                         skip, size=x.shape[2:],
                         mode="bilinear", align_corners=False)
                 x = _mp_cat(x, skip, dim=1, t=self.concat_balance)
-                x = blk(x, emb)
+                x = checkpoint_if(self.grad_checkpointing, blk, x, emb)
             if level < self.n_levels - 1:
                 dec_features.append(x)
         if skip_stack:
@@ -519,6 +526,7 @@ class EDM2SegModel(nn.Module):
         cond_stem: Optional[nn.Module] = None,
         cond_fuse: Optional[nn.Module] = None,
         cond_in_channels: int = 0,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
         self.spatial_dims = 2
@@ -545,6 +553,7 @@ class EDM2SegModel(nn.Module):
             cond_stem=cond_stem,
             cond_fuse=cond_fuse,
             cond_in_channels=cond_in_channels,
+            grad_checkpointing=grad_checkpointing,
         )
         self.decoder = _EDM2Decoder(
             encoder_channels=encoder_channels,
@@ -553,6 +562,7 @@ class EDM2SegModel(nn.Module):
             attention_levels=attention_levels,
             concat_balance=concat_balance,
             block_kwargs=block_kwargs,
+            grad_checkpointing=grad_checkpointing,
         )
 
         # Main + DS heads (MP-style).
@@ -740,6 +750,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         cond_stem=cond_stem,
         cond_fuse=cond_fuse,
         cond_in_channels=cond_in_channels,
+        grad_checkpointing=bool(mc.grad_checkpointing),
     )
 
     pc = model.param_count()
@@ -821,7 +832,8 @@ class EDM2DiffusionUNet(nn.Module):
         res_balance: float = 0.3,
         attn_balance: float = 0.3,
         concat_balance: float = 0.5,
-        clip_act: float = 256.0):
+        clip_act: float = 256.0,
+        grad_checkpointing: bool = False):
         super().__init__()
         self.spatial_dims = 2
         self.in_channels = int(in_channels)
@@ -848,14 +860,16 @@ class EDM2DiffusionUNet(nn.Module):
             encoder_channels=encoder_channels,
             encoder_blocks_per_stage=encoder_blocks_per_stage,
             attention_levels=attention_levels,
-            block_kwargs=block_kwargs)
+            block_kwargs=block_kwargs,
+            grad_checkpointing=grad_checkpointing)
         self.decoder = _EDM2Decoder(
             encoder_channels=encoder_channels,
             skip_channels=self.encoder.skip_channels,
             decoder_blocks_per_stage=list(encoder_blocks_per_stage),
             attention_levels=attention_levels,
             concat_balance=concat_balance,
-            block_kwargs=block_kwargs)
+            block_kwargs=block_kwargs,
+            grad_checkpointing=grad_checkpointing)
         self.out_conv = _MPConv(self.decoder.out_channels[-1], self.out_channels, kernel=[3, 3])
         self.out_gain = nn.Parameter(torch.zeros([]))
 
@@ -896,7 +910,8 @@ def build_edm2_diffusion_unet(
         res_balance=float(mc.edm2_res_balance),
         attn_balance=float(mc.edm2_attn_balance),
         concat_balance=float(mc.edm2_concat_balance),
-        clip_act=float(mc.edm2_clip_act))
+        clip_act=float(mc.edm2_clip_act),
+        grad_checkpointing=bool(mc.grad_checkpointing))
     logger.info(
         "Built EDM2DiffusionUNet: total=%.2fM, channels=%s, enc_blocks=%s, "
         "attn_levels=%s, in_ch=%d, out_ch=%d",
