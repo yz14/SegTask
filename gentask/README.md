@@ -13,8 +13,8 @@ gentask/
 ├── __main__.py  # python -m gentask 入口
 ├── train.py  # 训练 CLI
 ├── predict.py  # 推理 CLI
-├── logging_utils.py  # 日志初始化工具
-├── utils.py  # 通用工具
+├── logging_utils.py  # [shim → taskcore.utils.logging_utils] 日志初始化工具
+├── utils.py  # [shim → taskcore.utils.common] 通用工具
 ├── config/  # 配置系统
 │   ├── __init__.py  # 配置包入口
 │   ├── dataclasses.py  # Config dataclass：公共段继承 taskcore.config.core，叠加生成任务段
@@ -24,14 +24,14 @@ gentask/
 │   ├── __init__.py  # 数据包入口
 │   ├── augment.py  # GPU 3D 生成数据增强
 │   ├── degradation.py  # 在线超分退化算子
-│   ├── loader.py  # 路径匹配与 dataloader 工厂
-│   ├── make_data.py  # 离线预打包 npz
-│   ├── specs.py  # patch / view 规格推导
+│   ├── loader.py  # 路径匹配与 dataloader 工厂（公共发现/划分直连 taskcore.data.loader）
+│   ├── make_data.py  # 离线预打包 npz（含物理几何校验与 meta.label_counts）
+│   ├── specs.py  # patch / view 规格推导（继承 taskcore.data.specs，dataset_cls 参数化）
 │   └── dataset/  # npz 数据集子包
 │       ├── __init__.py  # dataset 子包入口
-│       ├── cache.py  # 缓存与 LRU 管理
+│       ├── cache.py  # [shim → taskcore.data.dataset] VolumeCache
 │       ├── core.py  # npz dataset 主逻辑
-│       └── io.py  # npz / NIfTI 读取工具
+│       └── io.py  # gen 专有读取（cond/spacing/反归一）+ 公共 I/O re-export taskcore
 ├── docs/  # 生成模型综述与设计备忘
 │   ├── generative_models_survey.md  # 生成方案综述
 │   └── WORKFLOW.md  # 端到端训练/推理流程
@@ -45,7 +45,7 @@ gentask/
 │   ├── convnext.py  # [shim → taskcore.models.convnext] ConvNeXt stage / block
 │   ├── diffusion.py  # 扩散 sampler / scheduler
 │   ├── edm2_unet.py  # [shim → taskcore.models.edm2_unet] EDM2 backbone
-│   ├── factory.py  # generation model 装配工厂
+│   ├── factory.py  # generation model 装配工厂（stage/stride 构建件直连 taskcore.models.factory）
 │   ├── generation.py  # 回归 / 扩散统一接口
 │   ├── resnet.py  # [shim → taskcore.models.resnet] ResNet block / stage
 │   ├── sisr.py  # 经典 SISR backbone（EDSR / RCAN）
@@ -80,7 +80,7 @@ gentask/
 - **统一模型接口**：`generation.py` 把回归与扩散接口统一成同一套 `forward / restore / degrade` 语义。
 - **拓扑真相源**：输入输出几何、通道布局和视图关系都由 topology 层统一推导，不在别处重复计算。
 - **预打包数据**：`make_data.py` 支持把 NIfTI 烘焙成 npz，减少训练时的 IO 压力。
-- **训练稳健性**：非有限 loss/梯度丢弃 accum 组（仅有效步更新 EMA），history.json 逐 epoch 落盘并随 `resume` 续接；`train.adamw_fused`（CUDA）与 norm/bias 免 weight decay 分组。
+- **训练稳健性**：非有限 loss/梯度丢弃 accum 组（仅有效步更新 EMA），history.json 逐 epoch 落盘并随 `resume` 续接（resume/pretrain 路径不存在即报错，不静默从头训）；`train.adamw_fused`（CUDA）与 norm/bias 免 weight decay 分组。
 - **显存与多卡**：`model.grad_checkpointing` UNet 系 backbone 支持（非 UNet 架构开启时 warning 提示忽略）；`train.gpus` 配多卡即启用 DDP（mp.spawn 每卡一进程，PSNR/SSIM 加权跨卡归约，落盘仅 rank0），单卡/CPU 路径零变化。
 - **推理可复现与加速**：扩散验证/推理采样用固定 seed generator 逐位可复现；`predict.use_amp` 推理 autocast、`predict.tta_flips` 可选翻转 TTA（decimate 被退化轴自动排除）。
 

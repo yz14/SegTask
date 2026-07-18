@@ -81,7 +81,7 @@ segtask_v1/
 │   ├── optim.py  # [shim → taskcore.engine.optim] 优化器 / 调度器 / warmup
 │   ├── trainer.py  # Trainer 主类（继承 taskcore.engine.BaseTrainer）
 │   ├── validation.py  # 验证逻辑
-│   ├── views.py  # 视图切分与拼接
+│   ├── views.py  # 视图切分与拼接（2.5D 折叠原语 re-export taskcore.engine.views）
 │   └── pipelines/  # ViewPipeline 策略对象
 │       ├── __init__.py  # 管线包入口
 │       ├── base.py  # 管线基类与监督包
