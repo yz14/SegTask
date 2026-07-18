@@ -66,7 +66,32 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 3 重构调研：由于cls/det/gen/ssl都是基于seg构建的，而且在设计上能和seg保持一致的都和seg保持一致了（可能还有不一致我未发现），能复用技巧也基本上都复用了（可能会有没有复用的我未发现）。现在我想将公用的内容抽离出来，形成一个通用的框架，然后在各个子项目中复用，如果有的模块实在做不到通用，那就例如把通用的当父类，具体的子项目当子类，继承父类的通用部分，然后重写具体的子项目部分。仍然还是大致以数据读取、模型构建、数据增强/处理、训练全流程(含val流程)、推理全流程5部分来。先认真的彻底分析和理解现有cls/det/gen/ssl/seg项目代码（需结合对应readme/design/workflow一起理解），再仔细的调研公认高质量项目的架构设计等等（不要局限医疗，可能自然图像，NLP，LLM，VLM有更好的项目）。  
 
 进展：
-① 把 squeeze_2_5d/squeeze_2_5d_keep_views 从 segtask_v1/trainer/views.py 提升到 taskcore（gen/ssl 各自有等价折叠逻辑，统一成一个公共函数 + 统一 b (c d) h w 口径注释），消除三处平行实现；② 在 taskcore 文档/注释里把"折叠时机约定：增强后、送模型前；det 因框联动例外"写成明确契约，防止以后新任务乱放折叠点。det 想要更强空间增强（旋转/缩放）时，再立项做 GPU box 联动，那时折叠时机自然也统一了。
+代码侧的确定性欠账已经清完，剩下的都是此前列过、需要你决策或 GPU 配合的项，按价值排序：
+
+augment 合流（设计文档已交付）：把 taskcore 增强管线泛化为"伴随张量 spec 化"，五任务共用一份实现，gen 的 cond 作为 bilinear companion 接入。这是最后一个真正的实现分叉；需要 GPU 做固定 seed 等价性验证和短程训练 sanity check。
+gen spacing 归一化 + 逐类前景索引：taskcore make_data 已有、gen 未接；属功能增强（需新增 gen 配置字段、重新打包数据、dataset 端同步消费），取决于你的生成任务是否需要各向同性重采样与类均衡采样。
+gen 训练/推理频谱不等价（WORKFLOW 里你标注的"已知待定"）：whole/z_axis/2_5d 训练侧 resize 到 patch、推理侧原生分辨率；候选方案是训练侧改原生分辨率裁剪，但涉及已训模型兼容，需要你拍板方向。
+可选清理：确认外部无脚本/旧 pickle 依赖后删各任务 shim（目前留着无害）。
+小项：ssl 未接 CudaPrefetcher、双源混采/AdaBN 仅 seg——是否接入属产品决策，不是欠账。
+另外建议你在 Windows GPU 环境权威复核一遍全量测试，并对新开的 ADM/EDM2 检查点跑一小段扩散训练确认显存收益。要继续的话，1 是我建议的下一轮。
+
+
+11:07 AM
+除此之外，还有什么技巧没有全部接入吗？
+
+我重新扫一遍"通用技巧 × 五任务"的接入矩阵（训练工程、数据、推理侧），给你一份完整的差异清单。
+
+
+11:17 AM
+Worked for 1 minute 55 seconds
+扫完接入矩阵。全员接入的（AMP/bf16、torch.compile、channels_last、expandable segments、fused AdamW+wd 分组、梯度累积/裁剪、非有限守护、EMA(+CPU offload)、warmup 调度、resume fail-fast、原子 checkpoint+history、DDP、梯度检查点(本轮补齐)、label_counts 快路）不再列。真正"只有部分项目接入"的还剩这些：
+
+建议接入（欠账性质）
+
+CudaPrefetcher：仅 ssl 缺（seg/cls/det/gen 都有）。SSL multicrop 批量大、H2D 拷贝重，接入收益明确，改动小——这是唯一我认为算欠账的项。
+有意不接 / 需要你决策的 2. SWA + early stopping：ssl 缺。SSL 预训练通常固定 schedule、已有 EMA teacher，SWA/早停语义存疑，倾向维持现状。 3. 双源混采（npz_dir_secondary/mix_ratio）：仅 seg。cls/det/gen 理论上也可用粗标数据混训，但是否需要取决于你有没有对应数据源，属产品决策。 4. AdaBN：仅 seg（推理期 BN 统计域自适应）。cls/det 推理遇域偏移时同样适用，可上提 taskcore；gen 意义不大。 5. UpKern pretrain 重映射：仅 seg。gen 的 UNet 理论上也能吃（不同 kernel 尺寸预训练迁移），需要时可挂到已有的 pretrain hook 上。 6. z-interleaved 滑窗推理：仅 seg（按 z spacing 拆互斥子流）。gen 的 SR 任务语义不同（z 本身是退化轴），不建议硬搬。
+
+微小不一致：TTA 配置键名 seg 是 predict.tta_flip、cls/det/gen 是 tta_flips，功能都有，仅命名不统一——改了会破坏已有配置文件，不值得。
 
 
 4 模型流可视化需要有层次化，结构化，美化，可以清晰看到计算流的走向，可以清晰理解模型架构，可以清晰的溯源。总之：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判、讨厌"自动布局默认输出"式的无设计感结果。以下是一些例子：  
