@@ -794,6 +794,14 @@ class TrainConfig:
     # 默认 "medium" 保持既有行为不变。
     val_metric_mode: str = "medium"
 
+    # 混合验证调度（仅 val_metric_mode='high' 时生效）：每 N 次验证才跑一次
+    # 整卷滑窗 high 评估（及末 epoch 必跑），其余验证轮次跑 medium patch 评估
+    # 作趋势监控。选模/早停/plateau 只看 high 轮次的指标（medium 与 high 口径
+    # 不同，混用会污染 best 追踪）；早停/plateau 的"验证次数"单位相应变为
+    # high 次数。高轮次判定按 epoch 推导（(epoch+1) % (val_every*N) == 0），
+    # resume 后调度相位不变。1 = 每次验证都跑 high（既有行为）。
+    val_high_interval: int = 1
+
     # 整卷验证（val_metric_mode='high'）指标计算前先按 pred∪GT 并集 bbox 裁剪：
     # dice/iou/recall/precision/vol_sim 只依赖 TP/FP/FN（全部落在并集 bbox 内），
     # 裁剪后严格等价；MCC 的 TN 通过按整卷形状回传总体素数保持严格等价；
@@ -2068,6 +2076,10 @@ class Config:
             str(self.train.val_metric_mode).lower().strip() in ("medium", "high"),
             f"Invalid val_metric_mode: {self.train.val_metric_mode!r}; "
             "expected 'medium' (patch-level) or 'high' (full-volume).")
+        _require(
+            int(self.train.val_high_interval) >= 1,
+            f"train.val_high_interval must be >= 1, "
+            f"got {self.train.val_high_interval}")
         # high 模式在整卷 blended 概率上算指标，无可逆 logits 故不产出 val_base_loss；
         # 因此 'loss' criterion 与 high 互斥（否则永远选不出 best）。改用重叠类指标。
         if (str(self.train.val_metric_mode).lower().strip() == "high"

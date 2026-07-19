@@ -33,7 +33,6 @@ from taskcore.data.augment import GPUAugmentor
 from ..losses.losses import build_loss
 from taskcore.models.unet import UNet3D
 from taskcore.models.mednext import upkern_remap_state_dict
-from taskcore.engine.bn_stats import collect_bn_modules, estimate_bn_stats
 from taskcore.utils.common import (
     AverageMeter, Timer, compute_dice_per_class,
 )
@@ -48,7 +47,6 @@ from taskcore.engine.checkpoint import (
     unwrap_compile,
 )
 from taskcore.engine.dist_utils import (
-    all_reduce_bn_running_stats_,
     all_reduce_flag_any,
     barrier,
 )
@@ -273,18 +271,23 @@ class Trainer(BaseTrainer):
 
             val_metrics: Dict[str, float] = {}
             val_time_s = 0.0
+            val_selects = True
             if (epoch + 1) % tc.val_every == 0 or epoch == tc.epochs - 1:
                 val_t0 = time.time()
                 val_metrics = self._validate(epoch)
                 val_time_s = time.time() - val_t0
+                # 混合调度的 medium 监控轮次不参与选模/早停/plateau（口径
+                # 与 high 不同）；非混合 evaluator 恒 True，行为不变。
+                val_selects = self.evaluator.selects_model()
 
             # 仅 plateau 逐 epoch 驱动。
-            plateau_metric = val_metrics.get(tc.save_best_metric, None)
+            plateau_metric = (val_metrics.get(tc.save_best_metric, None)
+                              if val_selects else None)
             self.scheduler.step_epoch(metric=plateau_metric)
 
             # --- Best-checkpoint 决策 -----------------------------------
             is_best = False
-            if tc.save_best_metric in val_metrics:
+            if val_selects and tc.save_best_metric in val_metrics:
                 tracked = val_metrics[tc.save_best_metric]
                 if not self.has_best:
                     is_best = True
@@ -370,7 +373,12 @@ class Trainer(BaseTrainer):
                         "Time: %s", timer.elapsed_str())
         logger.info("=" * 60)
         try:
-            self._finalize_swa()
+            # SWA 收尾走 base 版（换入平均权重 → 重估 BN → 验证 → rank0 另存）；
+            # validate_fn 在 SWA 权重上直调 evaluator（不再换入 EMA）。
+            self._finalize_swa(
+                validate_fn=lambda: self.evaluator.evaluate(tc.epochs - 1),
+                bn_forward_fn=self._swa_bn_forward,
+                is_main=self._is_main)
         except Exception:  # SWA 收尾失败不影响已完成的训练/best 产物。
             logger.exception("SWA finalization failed; online/best "
                              "checkpoints are unaffected.")
@@ -710,92 +718,27 @@ class Trainer(BaseTrainer):
                 torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # SWA finalization（见 TrainConfig.swa_enabled）
+    # SWA BN 重估前向（收尾流程走 base 版 ``_finalize_swa`` 回调）
     # ------------------------------------------------------------------
-    def _finalize_swa(self) -> None:
-        """SWA 收尾：换入平均权重 → 重估 BN → 验证 → rank0 另存 swa_model.pth。
-
-        所有 rank 均参与（验证/BN 重估可能含集合通信），仅 rank0 落盘。
-        早停等原因未收集到任何快照时跳过。结束后恢复在线权重。"""
-        if self.swa is None:
-            return
-        tc = self.cfg.train
-        if self.swa.n_averaged == 0:
-            logger.warning(
-                "SWA enabled but no snapshots collected (training ended "
-                "before start epoch %d = swa_start_ratio %.2f x %d epochs); "
-                "skipping SWA finalization.",
-                self._swa_start_epoch + 1, tc.swa_start_ratio, tc.epochs)
-            return
-        bare = unwrap_compile(self.model)
-        self.swa.apply_shadow(bare)
-        try:
-            self.model.eval()
-            self._swa_recalibrate_bn()
-            metrics: Dict[str, float] = {}
-            try:
-                metrics = self.evaluator.evaluate(tc.epochs - 1)
-            except Exception:
-                logger.warning(
-                    "SWA validation failed; saving SWA weights anyway.",
-                    exc_info=True)
-            metric_str = ", ".join(
-                f"{k}={v:.4f}" for k, v in metrics.items()
-                if isinstance(v, (int, float))) or "n/a"
-            logger.info(
-                "SWA (avg of %d epoch snapshots, from epoch %d): %s",
-                self.swa.n_averaged, self._swa_start_epoch + 1, metric_str)
-            if self._is_main:
-                path = self.output_dir / "swa_model.pth"
-                atomic_torch_save({
-                    "model_state_dict": bare.state_dict(),
-                    "swa_n_averaged": self.swa.n_averaged,
-                    "swa_val_metrics": metrics,
-                    "config": self.cfg,
-                }, path)
-                logger.info("SWA model saved: %s", path)
-        finally:
-            self.swa.restore(bare)
-
-    def _swa_recalibrate_bn(self) -> None:
-        """在若干 train batch 上重估 BN running stats（AdaBN 同款累积平均）。
-
-        平均权重下各层激活分布改变，BN 的 running stats 不再匹配；用未增强
-        的训练数据前向重估（与推理分布同构）。模型无 BatchNorm（instance/
-        group norm）时为 no-op。"""
+    @torch.no_grad()
+    def _swa_bn_forward(self) -> None:
+        """SWA BN 重估用前向：未增强训练数据，与推理分布同构。"""
         steps = int(self.cfg.train.swa_bn_update_steps)
-        if steps <= 0:
-            return
-        bn_modules = collect_bn_modules(unwrap_compile(self.model))
-        if not bn_modules:
-            return
-        n_batches = min(steps, len(self.train_loader))
-        logger.info(
-            "SWA: re-estimating %d BatchNorm module(s) running stats on "
-            "%d train batch(es).", len(bn_modules), n_batches)
-
-        @torch.no_grad()
-        def _run_forward() -> None:
-            for step, batch in enumerate(self.train_loader):
-                if step >= steps:
-                    break
-                image = batch["image"].to(self.device, non_blocking=True)
-                label = batch["label"].to(
-                    self.device, non_blocking=True).float()
-                if self.needs_crop:
-                    image, label, _ = views.center_crop(
-                        image, label, None, self.target_patch_size)
-                image, _sup = self.pipeline.prepare_batch(image, label, None)
-                if self._memory_format is not None:
-                    image = image.to(memory_format=self._memory_format)
-                with autocast(device_type="cuda", enabled=self.use_amp,
-                              dtype=self.amp_dtype):
-                    self.model(image)
-
-        estimate_bn_stats(bn_modules, _run_forward)
-        # DDP：各 rank 只看到自己的 train shard，聚合后 running stats 才代表
-        # 全训练集（rank0 落盘的 swa_model.pth 否则只含 rank0 shard 的统计）。
-        all_reduce_bn_running_stats_(bn_modules)
+        for step, batch in enumerate(self.train_loader):
+            if step >= steps:
+                break
+            image = batch["image"].to(self.device, non_blocking=True)
+            label = batch["label"].to(
+                self.device, non_blocking=True).float()
+            if self.needs_crop:
+                image, label, _ = views.center_crop(
+                    image, label, None, self.target_patch_size)
+            image, _sup = self.pipeline.prepare_batch(image, label, None)
+            if self._memory_format is not None:
+                image = image.to(memory_format=self._memory_format)
+            with autocast(device_type="cuda", enabled=self.use_amp,
+                          dtype=self.amp_dtype):
+                self.model(image)
 
     # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)

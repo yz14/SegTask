@@ -229,14 +229,14 @@ A0（跨步项，Step 1-A3 结论：安全，非 bug） — DDP 验证不等长�
 
 A1【核验后撤销：结论不成立】 — 原述“fp16+GradScaler 路径下 nonfinite_steps 健康计数会漏计”有误：pending 列表在非日志步并不清空，每个 micro-step 的 loss 都会 append（trainer.py:496）；_flush_pending 在下一个日志步（:499）与 epoch 末（:654）处理全部积压条目并逐条判 isfinite 累加 nonfinite_steps（:421-426），该计数在 epoch 末上报（:665）前已完整。fp16 下计数仅延迟到日志步/epoch 末，不会漏计；无需修改。
 
-A2（低，可维护性） — seg 重实现了 _finalize_swa/_swa_recalibrate_bn（trainer.py:708-791），与 BaseTrainer 的回调式通用版本（base_trainer.py:397-467）并行存在。base 版本被其它任务复用（非全局死代码），但 seg 未走 base 的 validate_fn/bn_forward_fn/run_forward 注入口径，两份逻辑几乎等价却各自维护——SWA 收尾若日后修一处易漏另一处。建议 seg 改为提供 bn_forward_fn/validate_fn 闭包复用 base 版本。
+A2（低，可维护性） — seg 重实现了 _finalize_swa/_swa_recalibrate_bn（trainer.py:708-791），与 BaseTrainer 的回调式通用版本（base_trainer.py:397-467）并行存在。base 版本被其它任务复用（非全局死代码），但 seg 未走 base 的 validate_fn/bn_forward_fn/run_forward 注入口径，两份逻辑几乎等价却各自维护——SWA 收尾若日后修一处易漏另一处。建议 seg 改为提供 bn_forward_fn/validate_fn 闭包复用 base 版本。【已修复：删除 seg 的 _finalize_swa/_swa_recalibrate_bn 重实现，改为传 validate_fn=evaluator.evaluate 与 _swa_bn_forward 闭包调 base 版（与 cls/det/ssl/gen 同构）；DDP BN 聚合由 base 版 _swa_recalibrate_bn 内的 all_reduce_bn_running_stats_ 保留】
 
 A3（低，冗余同步） — 日志步存在重复 D2H。compute_loss 在 breakdown 分支写 breakdown["L_total"]=loss.detach().item()（如 @d:/codes/work-projects/SegTask/segtask_v1/trainer/pipelines/slab25d.py:121），而同一日志步 _flush_pending 又对同一 loss 做 stack().tolist()（trainer.py:418）。两次同步都只在日志步发生、开销可忽略，但可合并（L_total 由 pending 值回填）。属一致性瑕疵。
 
 B. 优化空间（性能 / 显存 / GPU）
 B1（低-中，热路径 H2D） — 损失内每次 forward 重建 fg_values 张量，触发逐步微小 H2D。MultiResolutionLoss._label_to_binary（@d:/codes/work-projects/SegTask/segtask_v1/losses/losses.py:784）、SliceChannelLoss._label_to_binary/_label_to_binary_5d（losses.py:868、losses.py:942）均 torch.tensor(self.fg_values, device=label.device, ...)。这在每个训练步（主路 + 每个 aux 视图）执行，从 Python list 构造并落 device，是可能的隐式同步点。建议构造时 register_buffer("fg_values", ..., persistent=False) 一次性驻留，forward 直接复用。低成本、纯提速。【已修复：改为首次 forward 惰性构建设备张量后缓存复用（_fg_tensor）；未用 register_buffer，因 criterion 不随 model .to(device)，buffer 会永驻 CPU 仍逐步 H2D】
 
-B2（中，训练加速专项） — val 成本可占 epoch 相当比例，且无"低频高保真"档。trainer 已逐 epoch 打印 val 占比（trainer.py:321-329），说明作者已察觉。val_metric_mode 为全局单选：medium 每 epoch 逐 batch loss.item()（validation.py:404，每 val batch 一次 D2H）、high 每 epoch 对全部 val 卷重载 npz + 滑窗（validation.py:483-495，Predictor 已缓存但整卷每 epoch 重读重预处理）。建议加"medium 每 epoch + high 每 N epoch/末段"的混合验证调度，显著降 high 模式 val 墙钟；high 模式若 RAM 允许可缓存预处理整卷。属训练总时长优化。
+B2（中，训练加速专项） — val 成本可占 epoch 相当比例，且无"低频高保真"档。trainer 已逐 epoch 打印 val 占比（trainer.py:321-329），说明作者已察觉。val_metric_mode 为全局单选：medium 每 epoch 逐 batch loss.item()（validation.py:404，每 val batch 一次 D2H）、high 每 epoch 对全部 val 卷重载 npz + 滑窗（validation.py:483-495，Predictor 已缓存但整卷每 epoch 重读重预处理）。建议加"medium 每 epoch + high 每 N epoch/末段"的混合验证调度，显著降 high 模式 val 墙钟；high 模式若 RAM 允许可缓存预处理整卷。属训练总时长优化。【已修复（调度部分）：新增 train.val_high_interval（默认 1=既有行为），>1 时 HybridValEvaluator 每 N 次验证跑一次 high（及末 epoch 必跑）、其余轮次跑 medium 监控；选模/早停/plateau 只看 high 轮次（selects_model 门控，避免口径混用污染 best）；高轮次按 epoch 推导，resume 相位不变。整卷 RAM 缓存未做（内存权衡需实测）】
 
 B3（低，训练加速已到位，记录） — DDP 梯度重叠、no_sync 非边界步免 all-reduce（trainer.py:466-468）、fused AdamW（@d:/codes/work-projects/SegTask/taskcore/engine/optim.py:87-91）、ZeRO-1（optim.py:54-101）、TF32/cudnn.benchmark 经 seed_everything 默认开（taskcore/utils/common.py:586-589）、channels_last、CudaPrefetcher、grad-ckpt 均已接入。batch-pooled 损失（batch_dice/GDL/Tversky）在 accum/DDP 下统计窗口收缩已显式告警（base_trainer.py:506-511）——为已知取舍，非缺陷。无需改动，仅记录加速面已充分。
 
@@ -323,7 +323,7 @@ P3	增强 RNG 跨两套全局生成器，等价性验证脆弱【已修复：GPU
 P4	blend_mode 无枚举校验，拼错静默退化【已修复】	低	中价值·极低成本	blending.py:55-71	Step5-A1 / X5
 P5	augment sigma/std/zoom 无正性/区间校验【已修复】	低	中价值·极低成本	core.py:1738-1771	Step3-A1 / X5
 P6	ConvNeXt/MedNeXt 块内 attention 未透传 norm/reduction 配置（含核验新发现 N1：se_reduction 被静默忽略）【已修复 reduction 部分；norm 有意保持块内固定 norm 设计】	低	低价值·低成本	convnext.py:58 mednext.py:424	Step2-A3 / N1
-P7	seg 重实现 SWA/BN 重校准，与 base 双份维护	低	低价值·中成本	trainer.py:708-791	Step4-A2
+P7	seg 重实现 SWA/BN 重校准，与 base 双份维护【已修复：合流回 base 回调版】	低	低价值·中成本	trainer.py:708-791	Step4-A2
 P8	识别性冗余 except / whole 缓存别名一致性瑕疵（含核验新发现 N2：dataset.py:1169-1172 旧注释称“无越界填充时返回缓存卷视图”，与 extractor 无条件 .copy() 的实现矛盾）【已修复：删死 except、改正注释、whole 恒等 resize 补 copy 断别名】	低	低价值·低成本	dataset.py:430,1169-1172,1307-1311	Step1-A1/A2 / N2
 已撤销：P9（fp16 路径 nonfinite 健康计数漏计）经核验不成立——pending 非日志步不清空，_flush_pending 在日志步/epoch 末处理全部积压条目，计数仅延迟不漏计（见 Step4-A1）。
 已关闭：Step 1-A3（DDP val 不等长死锁）经 Step 4-A0 核对——验证全程无逐 batch collective，无死锁风险。
@@ -331,7 +331,7 @@ P8	识别性冗余 except / whole 缓存别名一致性瑕疵（含核验新发�
 四、优化建议（性能/显存/GPU，按价值×成本排序）
 #	主题	价值/成本	位置	来源
 O1	cubic 单分辨率补 GPU 常驻 builder（对齐 z 路径），消 CPU 抽取+H2D	高价值·中成本（收益随 cubic 窗口数放大）	inputs.py:262-290 sliding.py:369-374	Step5-B1
-O2	val 混合调度（medium 每 epoch + high 每 N epoch），降 high 墙钟	高价值·低成本	validation.py:483-495	Step4-B2
+O2	val 混合调度（medium 每 epoch + high 每 N epoch），降 high 墙钟【已修复：val_high_interval + HybridValEvaluator；整卷 RAM 缓存未做】	高价值·低成本	validation.py:483-495	Step4-B2
 O3	损失 fg_values 改设备张量驻留，消热路径逐步 H2D【已修复：首次 forward 惰性构建后缓存复用（非 register_buffer：criterion 不随 model .to(device)，惰性缓存更稳妥）】	中价值·低成本	losses.py:784,868,942	Step4-B1
 O4	trainer 侧显式开 inplace=True，省过采样 cube 一份瞬时显存【已修复：GPUAugmentor 新增 inplace 覆写参，seg trainer 传 inplace=True（H2D 私有拷贝满足契约）；config 默认 False 保留防御】	中价值·低成本	augment.py:52-56	Step3-B1
 O5	手写 LayerNorm/GRN 统计 fp32 累加（对齐既有 fp16→fp32 范式）	中价值·低成本	convnext.py:27-29 blocks.py:97-99	Step2-B1

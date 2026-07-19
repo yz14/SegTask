@@ -373,6 +373,13 @@ class ValEvaluator(ABC):
     def evaluate(self, epoch: int) -> Dict[str, float]:
         """运行一次完整验证，返回 metrics dict。"""
 
+    def selects_model(self) -> bool:
+        """最近一次 ``evaluate`` 的指标是否用于选模/早停/plateau。
+
+        默认恒 True；``HybridValEvaluator`` 的 medium 监控轮次返 False，
+        避免 medium 口径的指标污染 high 口径的 best 追踪。"""
+        return True
+
 
 class PatchValEvaluator(ValEvaluator):
     """medium：遍历 ``val_loader`` 的随机 patch，逐 batch 前向取指标（既有行为）。"""
@@ -538,13 +545,51 @@ class VolumeValEvaluator(ValEvaluator):
         return acc.compute(log_prefix=self.log_prefix, log=is_main_process())
 
 
+class HybridValEvaluator(ValEvaluator):
+    """混合调度（``val_metric_mode='high'`` 且 ``val_high_interval>1``）。
+
+    每 N 次验证才跑一次整卷滑窗 high 评估（及末 epoch 必跑），其余验证
+    轮次跑 medium patch 评估作趋势监控，显著降 high 模式的 val 墙钟。
+
+    选模/早停/plateau 只看 high 轮次（``selects_model``）：medium 与 high
+    的指标口径不同（随机 patch vs 整卷滑窗），混用会污染 best 追踪。
+    高轮次判定按 epoch 推导（``(epoch+1) % (val_every*N) == 0`` 或末
+    epoch），不依赖运行期计数，resume 后调度相位不变。"""
+
+    def __init__(self, trainer: "Trainer"):
+        super().__init__(trainer)
+        self._patch = PatchValEvaluator(trainer)
+        self._volume = VolumeValEvaluator(trainer)
+        self._last_was_high = False
+
+    def _is_high_epoch(self, epoch: int) -> bool:
+        tc = self.trainer.cfg.train
+        if epoch >= int(tc.epochs) - 1:
+            return True
+        period = max(int(tc.val_every), 1) * max(int(tc.val_high_interval), 1)
+        return (epoch + 1) % period == 0
+
+    @torch.no_grad()
+    def evaluate(self, epoch: int) -> Dict[str, float]:
+        self._last_was_high = self._is_high_epoch(epoch)
+        if self._last_was_high:
+            return self._volume.evaluate(epoch)
+        return self._patch.evaluate(epoch)
+
+    def selects_model(self) -> bool:
+        return self._last_was_high
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 def build_val_evaluator(trainer: "Trainer") -> ValEvaluator:
-    """``cfg.train.val_metric_mode`` → ``ValEvaluator``。"""
-    mode = str(trainer.cfg.train.val_metric_mode).lower().strip()
+    """``cfg.train.val_metric_mode``（+ ``val_high_interval``）→ ``ValEvaluator``。"""
+    tc = trainer.cfg.train
+    mode = str(tc.val_metric_mode).lower().strip()
     if mode == "high":
+        if int(tc.val_high_interval) > 1:
+            return HybridValEvaluator(trainer)
         return VolumeValEvaluator(trainer)
     return PatchValEvaluator(trainer)
 
@@ -554,5 +599,6 @@ __all__ = [
     "ValEvaluator",
     "PatchValEvaluator",
     "VolumeValEvaluator",
+    "HybridValEvaluator",
     "build_val_evaluator",
 ]
