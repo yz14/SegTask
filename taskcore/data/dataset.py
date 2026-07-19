@@ -425,10 +425,8 @@ def derive_volume_targets(npz_paths, fg_values) -> torch.Tensor:
     """
     out = np.zeros((len(npz_paths), len(fg_values)), dtype=np.float32)
     for i, path in enumerate(npz_paths):
-        try:
-            counts = load_npz_label_counts(path)
-        except KeyError:      # 旧 npz 无 meta 键
-            counts = None
+        # 旧 npz 无 meta/label_counts 时 load_npz_label_counts 返 None（不抛异常）。
+        counts = load_npz_label_counts(path)
         if counts is not None:
             out[i] = [float(counts.get(int(v), 0) > 0) for v in fg_values]
         else:
@@ -1168,9 +1166,9 @@ class SegDataset3DCubic(SegDatasetNpzBase):
 
         result = {
             # 领头 "1" = 压叠 C_res 轴；trainer 逐视图裁+resize。
-            # ascontiguousarray：无越界填充时 _extract_cubic_patch 返回的是缓存卷
-            # 的视图，这里复制断开别名，避免下游 in-place 操作污染 LRU 缓存；
-            # 同时保证内存连续，利于 pin_memory。
+            # 别名安全：_extract_cubic_patch 末尾无条件 copy，返回的已是私有
+            # 副本（非缓存卷视图）；此处 ascontiguousarray 仅保证内存连续与
+            # dtype，利于 pin_memory。
             "image": torch.from_numpy(
                 np.ascontiguousarray(img_s[None], dtype=np.float32)),
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
@@ -1303,9 +1301,15 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         eD, eH, eW = self.extract_size
 
-        # 全卷单次 3D zoom。
+        # 全卷单次 3D zoom。resize 恒等（形状已匹配）时 resize_3d 直接返回
+        # 入参——即 worker LRU 缓存卷本身；copy 断开别名，防下游 in-place
+        # 操作污染缓存（与 cubic/z 路径 extractor 内的无条件 copy 对齐）。
         img_r = resize_3d(img, eD, eH, eW, is_label=False)
         lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
+        if img_r is img:
+            img_r = img_r.copy()
+        if lbl_r is lbl:
+            lbl_r = lbl_r.copy()
 
         result = {
             "image": torch.from_numpy(img_r[np.newaxis]).float(),
@@ -1313,10 +1317,12 @@ class SegDataset3DWhole(SegDatasetNpzBase):
 
         # 区域权重优先级：样本文件 > 静态映射。
         if self._has_region_weight_file(vol_idx):
-            rw_vol = self._load_region_weight(vol_idx)
+            rw_cached = self._load_region_weight(vol_idx)
             # rw 是分级权重（离散），必须 nearest 避免产生伪连续值；与 z_axis/cubic
             # 路径一致（resize_3d(is_label=True) = order=0）。
-            rw_vol = resize_3d(rw_vol, eD, eH, eW, is_label=True)
+            rw_vol = resize_3d(rw_cached, eD, eH, eW, is_label=True)
+            if rw_vol is rw_cached:
+                rw_vol = rw_vol.copy()
             result["weight_map"] = torch.from_numpy(rw_vol[np.newaxis]).float()
         elif self.region_weights:
             rw_vol = compute_region_weight_map(

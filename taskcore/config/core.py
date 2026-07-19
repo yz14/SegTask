@@ -1769,6 +1769,36 @@ class Config:
                     "建议增大 aug_oversample_ratio 或减小平移幅度。",
                     tr, max_tr / 2.0 * 100.0,
                     self.data.aug_oversample_ratio, margin * 100.0)
+        # 数值正性/区间校验：非法配置在 augment 运行期会产生 div-by-zero /
+        # NaN 核或空尺寸，这里 fail-fast。
+        blur = self.augment.gaussian_blur_sigma
+        _require(
+            len(blur) == 2 and 0.0 < float(blur[0]) <= float(blur[1]),
+            "augment.gaussian_blur_sigma must be [lo, hi] with 0 < lo <= hi; "
+            f"got {blur!r}.")
+        _require(
+            float(self.augment.elastic_deform_sigma) > 0.0,
+            "augment.elastic_deform_sigma must be > 0; "
+            f"got {self.augment.elastic_deform_sigma}.")
+        _require(
+            float(self.augment.elastic_deform_alpha) >= 0.0,
+            "augment.elastic_deform_alpha must be >= 0; "
+            f"got {self.augment.elastic_deform_alpha}.")
+        _require(
+            float(self.augment.gaussian_noise_std) >= 0.0,
+            "augment.gaussian_noise_std must be >= 0; "
+            f"got {self.augment.gaussian_noise_std}.")
+        zoom_r = self.augment.simulate_lowres_zoom
+        _require(
+            len(zoom_r) == 2
+            and 0.0 < float(zoom_r[0]) <= float(zoom_r[1]) <= 1.0,
+            "augment.simulate_lowres_zoom must be [lo, hi] with "
+            f"0 < lo <= hi <= 1; got {zoom_r!r}.")
+        gamma_r = self.augment.random_gamma_range
+        _require(
+            len(gamma_r) == 2 and 0.0 < float(gamma_r[0]) <= float(gamma_r[1]),
+            "augment.random_gamma_range must be [lo, hi] with 0 < lo <= hi; "
+            f"got {gamma_r!r}.")
 
     def _validate_loss(self) -> None:
         """loss.* 名称与参数校验。"""
@@ -2117,6 +2147,10 @@ class Config:
                 logger.warning(
                     "predict.hw_overlap is only used by patch_mode='cubic'; "
                     "current patch_mode=%r ignores it.", self.data.patch_mode)
+        _require(
+            self.predict.blend_mode in ("gaussian", "average"),
+            f"predict.blend_mode must be 'gaussian' or 'average'; "
+            f"got {self.predict.blend_mode!r}.")
         _require(
             str(self.predict.acc_dtype) in ("fp32", "fp16"),
             f"predict.acc_dtype must be 'fp32' or 'fp16'; "

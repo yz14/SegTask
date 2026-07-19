@@ -763,9 +763,10 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         raise ValueError(
             "arch='adm' is currently only wired for patch_mode='2_5d'; "
             f"got {cfg.data.patch_mode!r}.")
-    D = int(cfg.data.patch_size[0])
-    out_classes = num_fg * D
-    n_views = max(len(cfg.data.multi_res_scales), 1)
+    # 几何/通道量统一读 topology（单一真相源，见 topology.py 模块注释 R5）。
+    D = int(topo.slab_depth)
+    out_classes = int(topo.out_classes)
+    n_views = int(topo.n_views)
 
     # 逐级块计数。
     enc_bps = list(mc.encoder_blocks_per_stage)
@@ -808,18 +809,14 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
             "'hierarchical'. Use 'shared_stem' or 'multi_stem_proj' "
             "for ADM. (Hierarchical fusion will be added in a follow-up.)")
 
-    # 原生深度 ON：逐视图 D_k 可变；OFF：统一 D。
-    in_ch_per_view_list = None
-    aux_head_out_channels = None
-    if bool(cfg.data.keep_native_view_depth) and n_views > 1:
-        depths = list(cfg.per_view_depths)
-        in_ch_per_view_list = depths
-        aux_head_out_channels = [num_fg * d_k for d_k in depths[1:]]
-        in_channels = sum(depths)
-    else:
-        in_channels = D * n_views
-    base_ch_per_view = D  # 统一深度（无列表时的默认值）
+    # 原生深度 ON：逐视图 D_k 可变（in_ch_per_view_list 非 None）；OFF：统一 D。
+    in_ch_per_view_list = (list(topo.in_ch_per_view_list)
+                           if topo.in_ch_per_view_list is not None else None)
+    aux_head_out_channels = (list(topo.aux_head_out_channels)
+                             if topo.aux_head_out_channels is not None else None)
     cond_in_channels = int(topo.cond_in_channels)
+    in_channels = int(topo.in_channels) - cond_in_channels  # recon 主输入（仅日志）
+    base_ch_per_view = D  # 统一深度（无列表时的默认值）
 
     stem, stem_stride = build_context_stem(
         mode=mc.stem_mode,
@@ -856,7 +853,7 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
             activation="swish",
             spatial_dims=2)
 
-    aux_seg = bool(mc.aux_seg_supervision) and n_views > 1
+    aux_seg = bool(topo.aux_seg_active)
 
     model = ADMSegModel(
         stem=stem,

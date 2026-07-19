@@ -175,7 +175,8 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             attention_type         = mc.attention_type,
             use_grn                = mc.grn_enabled,
             spatial_dims           = spatial_dims,
-            layer_scale_init_value = ls_init)
+            layer_scale_init_value = ls_init,
+            attn_reduction         = mc.se_reduction)
 
     return _StatefulStageBuilder(factory, counts)
 
@@ -230,6 +231,7 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
             attention_type = mc.attention_type,
             use_grn        = mc.grn_enabled,
             spatial_dims   = spatial_dims,
+            attn_reduction = mc.se_reduction,
             dilated_reparam = mc.mednext_dilated_reparam,
             dilated_reparam_branch_kernel_sizes = (
                 mc.mednext_dilated_reparam_kernel_sizes or None),
@@ -460,6 +462,7 @@ def build_model(cfg: Config):
         num_stem_fusion_views = num_stem_fusion_views,
         stem_fusion_mode      = mc.stem_fusion_mode,
         in_ch_per_view_list   = in_ch_per_view_list,
+        cond_in_channels      = topo.cond_in_channels,
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides,
         grad_checkpointing    = mc.grad_checkpointing,

@@ -43,7 +43,8 @@ class ConvNeXtBlock(nn.Module):
         attention_type        : str = "none",
         use_grn               : bool = False,
         spatial_dims          : int = 3,
-        layer_scale_init_value: float = 1e-6):
+        layer_scale_init_value: float = 1e-6,
+        attn_reduction        : int = 16):
         super().__init__()
         d = spatial_dims
         self.spatial_dims = d
@@ -55,7 +56,10 @@ class ConvNeXtBlock(nn.Module):
         self.act     = nn.GELU()
         self.grn     = GlobalResponseNorm(hidden, spatial_dims=d) if use_grn else nn.Identity()
         self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
-        self.attn    = make_attention(attention_type, dim, spatial_dims=d)
+        # reduction 跟随 config（model.se_reduction，与 ResNet 系一致）；coord 内部
+        # 归一化保持其默认 group/8（ConvNeXt 块内 norm 固定为 LN，不跟随全局 norm_type）。
+        self.attn    = make_attention(attention_type, dim, spatial_dims=d,
+                                      reduction=attn_reduction)
         # LayerScale: init small → near-identity start; <=0 disables
         if layer_scale_init_value > 0.0:
             self.gamma = nn.Parameter(
@@ -91,7 +95,8 @@ class ConvNeXtAdaptBlock(nn.Module):
         attention_type        : str = "none",
         use_grn               : bool = False,
         spatial_dims          : int = 3,
-        layer_scale_init_value: float = 1e-6):
+        layer_scale_init_value: float = 1e-6,
+        attn_reduction        : int = 16):
         super().__init__()
         d = spatial_dims
         self.proj = (
@@ -104,7 +109,8 @@ class ConvNeXtAdaptBlock(nn.Module):
             attention_type=attention_type,
             use_grn=use_grn,
             spatial_dims=d,
-            layer_scale_init_value=layer_scale_init_value)
+            layer_scale_init_value=layer_scale_init_value,
+            attn_reduction=attn_reduction)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(self.proj(x))
@@ -123,7 +129,8 @@ class ConvNeXtStage(nn.Module):
         attention_type        : str = "none",
         use_grn               : bool = False,
         spatial_dims          : int = 3,
-        layer_scale_init_value: float = 1e-6):
+        layer_scale_init_value: float = 1e-6,
+        attn_reduction        : int = 16):
         super().__init__()
         d = spatial_dims
         if drop_path_rates is None:
@@ -133,7 +140,8 @@ class ConvNeXtStage(nn.Module):
             drop_path_rates[0], attention_type,
             use_grn=use_grn,
             spatial_dims=d,
-            layer_scale_init_value=layer_scale_init_value)]
+            layer_scale_init_value=layer_scale_init_value,
+            attn_reduction=attn_reduction)]
         for i in range(1, num_blocks):
             dp = drop_path_rates[i] if i < len(drop_path_rates) else 0.0
             blocks.append(ConvNeXtAdaptBlock(
@@ -141,6 +149,7 @@ class ConvNeXtStage(nn.Module):
                 dp, attention_type,
                 use_grn=use_grn,
                 spatial_dims=d,
+                attn_reduction=attn_reduction,
                 layer_scale_init_value=layer_scale_init_value))
         self.blocks = nn.Sequential(*blocks)
 

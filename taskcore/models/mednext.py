@@ -400,7 +400,8 @@ class MedNeXtBlock(nn.Module):
         spatial_dims  : int = 3,
         dilated_reparam: bool = False,
         dilated_reparam_branch_kernel_sizes: list[int] | None = None,
-        dilated_reparam_branch_dilations: list[int] | None = None):
+        dilated_reparam_branch_dilations: list[int] | None = None,
+        attn_reduction: int = 16):
         super().__init__()
         d = spatial_dims
         self.spatial_dims = d
@@ -421,7 +422,10 @@ class MedNeXtBlock(nn.Module):
         self.act     = nn.GELU()
         self.grn     = GlobalResponseNorm(hidden, spatial_dims=d) if use_grn else nn.Identity()
         self.pwconv2 = _CONV[d](hidden, dim, kernel_size=1, bias=True)
-        self.attn    = make_attention(attention_type, dim, spatial_dims=d)
+        # reduction 跟随 config（model.se_reduction，与 ResNet 系一致）；coord 内部
+        # 归一化保持其默认 group/8（MedNeXt 块内 norm 固定为通道级 GroupNorm）。
+        self.attn    = make_attention(attention_type, dim, spatial_dims=d,
+                                      reduction=attn_reduction)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -455,7 +459,8 @@ class MedNeXtAdaptBlock(nn.Module):
         spatial_dims  : int = 3,
         dilated_reparam: bool = False,
         dilated_reparam_branch_kernel_sizes: list[int] | None = None,
-        dilated_reparam_branch_dilations: list[int] | None = None):
+        dilated_reparam_branch_dilations: list[int] | None = None,
+        attn_reduction: int = 16):
         super().__init__()
         d = spatial_dims
         self.proj = (
@@ -466,7 +471,8 @@ class MedNeXtAdaptBlock(nn.Module):
         self.block = MedNeXtBlock(
             out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
             drop_path=drop_path, attention_type=attention_type,
-            use_grn=use_grn, spatial_dims=d, dilated_reparam=dilated_reparam,
+            use_grn=use_grn, spatial_dims=d, attn_reduction=attn_reduction,
+            dilated_reparam=dilated_reparam,
             dilated_reparam_branch_kernel_sizes=
             dilated_reparam_branch_kernel_sizes,
             dilated_reparam_branch_dilations=
@@ -492,7 +498,8 @@ class MedNeXtStage(nn.Module):
         spatial_dims  : int = 3,
         dilated_reparam: bool = False,
         dilated_reparam_branch_kernel_sizes: list[int] | None = None,
-        dilated_reparam_branch_dilations: list[int] | None = None):
+        dilated_reparam_branch_dilations: list[int] | None = None,
+        attn_reduction: int = 16):
         super().__init__()
         d = spatial_dims
         if drop_path_rates is None:
@@ -500,7 +507,8 @@ class MedNeXtStage(nn.Module):
         blocks = [MedNeXtAdaptBlock(
             in_ch, out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
             drop_path=drop_path_rates[0], attention_type=attention_type,
-            use_grn=use_grn, spatial_dims=d, dilated_reparam=dilated_reparam,
+            use_grn=use_grn, spatial_dims=d, attn_reduction=attn_reduction,
+            dilated_reparam=dilated_reparam,
             dilated_reparam_branch_kernel_sizes=
             dilated_reparam_branch_kernel_sizes,
             dilated_reparam_branch_dilations=
@@ -510,7 +518,8 @@ class MedNeXtStage(nn.Module):
             blocks.append(MedNeXtBlock(
                 out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,
                 drop_path=dp, attention_type=attention_type,
-                use_grn=use_grn, spatial_dims=d, dilated_reparam=dilated_reparam,
+                use_grn=use_grn, spatial_dims=d, attn_reduction=attn_reduction,
+                dilated_reparam=dilated_reparam,
                 dilated_reparam_branch_kernel_sizes=
                 dilated_reparam_branch_kernel_sizes,
                 dilated_reparam_branch_dilations=
