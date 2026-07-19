@@ -183,6 +183,11 @@ class DataConfig:
     # 直接实例化时的后备，经 Config 路径始终以此处为准。
     cache_mode       : str = "memory"
     cache_max_volumes: int = 1
+    # 缓存存储粒度："fp32"（默认，缓存预处理后卷，取用零开销）或
+    # "int16"（缓存原始 int16 卷，内存减半，每次取用重跑强度窗+归一，
+    # 以 CPU 换 RAM；大数据集/多 worker 更划算）。仅影响 image 缓存
+    # （label/rw 本就按原始粒度缓存），两模式产出逐位一致。
+    cache_dtype      : str = "fp32"
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +813,12 @@ class TrainConfig:
     # surface_dice 按 tolerance+1 外扩边距后同样严格等价。前景占比小的整卷上
     # surface_dice 的 3D maxpool 可省一个量级计算与显存。默认关，行为与现状一致。
     val_metric_bbox_crop: bool = False
+
+    # 整卷验证 RAM 缓存（仅 val_metric_mode='high' 时生效）：首次整卷验证把本
+    # rank 分片的预处理 image（fp32）/原始 label（int16）/z_spacing 常驻 RAM，
+    # 后续验证轮免磁盘读取与预处理。RAM 占用 ≈ 分片 val 卷总体素 × 6B/voxel
+    # （逐 rank，不随 epoch 增长），需按数据规模评估。默认关，行为与现状一致。
+    val_volume_cache: bool = False
 
     # 选模标准（互斥）：
     #   * "loss"              → val_base_loss ↓
@@ -1807,6 +1818,27 @@ class Config:
             len(gamma_r) == 2 and 0.0 < float(gamma_r[0]) <= float(gamma_r[1]),
             "augment.random_gamma_range must be [lo, hi] with 0 < lo <= hi; "
             f"got {gamma_r!r}.")
+        # brightness/noise 幅值为绝对量、隐含 image≈[0,1]（minmax）。zscore
+        # （std≈1）下沿用 minmax 默认幅值时扰动相对偏弱且量纲不符，提示改配
+        # （以 σ 为单位，典型 brightness±0.5σ、noise 0.1σ 量级）。
+        if self.data.normalize == "zscore" and self.augment.enabled:
+            b_r = [float(v) for v in self.augment.random_brightness_range]
+            n_std = float(self.augment.gaussian_noise_std)
+            defaults = AugConfig()
+            hints = []
+            if (self.augment.random_brightness_prob > 0
+                    and b_r == list(defaults.random_brightness_range)):
+                hints.append(
+                    f"random_brightness_range={b_r}")
+            if (self.augment.gaussian_noise_prob > 0
+                    and n_std == float(defaults.gaussian_noise_std)):
+                hints.append(f"gaussian_noise_std={n_std}")
+            if hints:
+                logger.warning(
+                    "data.normalize='zscore' 下 %s 仍为 minmax 量纲的默认绝对"
+                    "幅值：zscore（std≈1）上同数值扰动约弱一个量级。建议按 σ "
+                    "为单位改配（如 brightness ±0.3~0.5、noise std 0.1）。",
+                    "、".join(hints))
 
     def _validate_loss(self) -> None:
         """loss.* 名称与参数校验。"""
@@ -1877,6 +1909,10 @@ class Config:
             self.data.z_boundary_mode in ("stretch", "edge_pad"),
             f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
             "expected 'stretch' or 'edge_pad'.")
+        _require(
+            self.data.cache_dtype in ("fp32", "int16"),
+            f"Invalid data.cache_dtype: {self.data.cache_dtype!r}; "
+            "expected 'fp32' or 'int16'.")
         if self.data.patch_mode == "whole":
             # whole 模式下多分辨率无物理意义。
             _require(

@@ -129,7 +129,13 @@ class SSLTrainer(BaseTrainer):
         self._patch_d = int(cfg.data.patch_size[0])
         self.augmentor = None
         if method.trainer_augment and bool(cfg.augment.enabled):
-            self.augmentor = GPUAugmentor(cfg.augment, max_scale=1.0)
+            # 逐 rank 分流的独立增强 RNG（与 seg trainer 同构）；训练循环传入的
+            # image 是 H2D 私有拷贝且增强后即覆写 batch["image"]，满足
+            # inplace 所有权契约，省一次入口 clone。
+            _aug_seed = (int(tc.seed)
+                         + 7919 * (self._rank + 1)) & 0x7FFFFFFF
+            self.augmentor = GPUAugmentor(
+                cfg.augment, max_scale=1.0, seed=_aug_seed, inplace=True)
             logger.info(
                 "Trainer-level augmentation ENABLED for SSL method %r "
                 "(GPUAugmentor, cfg.augment); spatial_dims=%d (2.5D folded "

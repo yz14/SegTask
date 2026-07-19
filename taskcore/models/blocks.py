@@ -94,9 +94,12 @@ class GlobalResponseNorm(nn.Module):
         self.beta = nn.Parameter(torch.zeros(channels))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 平方和统计 fp32 累加（AMP 下 fp16 大空间求和易溢出/失准），归一
+        # 因子转回输入 dtype（同 adm_unet fp32 范式）。
         dims = tuple(range(2, x.ndim))
-        gx = torch.sqrt(torch.sum(x * x, dim=dims, keepdim=True) + self.eps)
-        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        xf = x.float()
+        gx = torch.sqrt(torch.sum(xf * xf, dim=dims, keepdim=True) + self.eps)
+        nx = (gx / (gx.mean(dim=1, keepdim=True) + self.eps)).type(x.dtype)
         pat = "c -> 1 c" + " 1" * self.spatial_dims
         gamma = rearrange(self.gamma, pat)
         beta = rearrange(self.beta, pat)
@@ -524,21 +527,26 @@ def _rope_axis_cos_sin(
     dtype: torch.dtype,
     axis: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _rope_cache_key(
-        spatial_shape, rot_dim, position_offsets, device, dtype, axis)
-    cached = _ROPE_ND_CACHE.get(key)
-    if cached is not None:
-        _ROPE_ND_CACHE.move_to_end(key)
-        return cached
+    # torch.compile 下绕过 Python dict LRU（读/写缓存会 graph break），直接
+    # 现算——cos/sin 构建会被编译器融入图内，无需跨步缓存。
+    use_cache = not torch.compiler.is_compiling()
+    if use_cache:
+        key = _rope_cache_key(
+            spatial_shape, rot_dim, position_offsets, device, dtype, axis)
+        cached = _ROPE_ND_CACHE.get(key)
+        if cached is not None:
+            _ROPE_ND_CACHE.move_to_end(key)
+            return cached
     inv_freq = 1.0 / (
         10000 ** (torch.arange(
             0, rot_dim, 2, device=device, dtype=torch.float32) / rot_dim))
     angles = pos.to(dtype=torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
     cos = angles.cos().to(dtype=dtype)
     sin = angles.sin().to(dtype=dtype)
-    _ROPE_ND_CACHE[key] = (cos, sin)
-    while len(_ROPE_ND_CACHE) > _ROPE_ND_CACHE_MAX:
-        _ROPE_ND_CACHE.popitem(last=False)
+    if use_cache:
+        _ROPE_ND_CACHE[key] = (cos, sin)
+        while len(_ROPE_ND_CACHE) > _ROPE_ND_CACHE_MAX:
+            _ROPE_ND_CACHE.popitem(last=False)
     return cos, sin
 
 
@@ -572,8 +580,10 @@ def _apply_rope_nd(
     flat_coords = [m.reshape(-1) for m in mesh]
     tokens = flat_coords[0].numel()
     rot_pairs = rot_dim // 2
-    q_out = q.clone()
-    k_out = k.clone()
+    # 非就地 rotate：逐轴旋转块收集后一次 cat（而非 clone+切片写回），
+    # 对 torch.compile 友好（无 in-place 变异），且省去整张 clone。
+    q_blocks: list = []
+    k_blocks: list = []
     for axis, pos in enumerate(flat_coords):
         start = axis * rot_dim
         end = start + rot_dim
@@ -582,13 +592,17 @@ def _apply_rope_nd(
         cos = cos.reshape(1, 1, tokens, rot_pairs, 1)
         sin = sin.reshape(1, 1, tokens, rot_pairs, 1)
 
-        q_blk = q_out[..., start:end].reshape(*q_out.shape[:-1], rot_pairs, 2)
-        k_blk = k_out[..., start:end].reshape(*k_out.shape[:-1], rot_pairs, 2)
-        q_out[..., start:end] = (
-            q_blk * cos + _rope_rotate_half(q_blk) * sin).flatten(-2)
-        k_out[..., start:end] = (
-            k_blk * cos + _rope_rotate_half(k_blk) * sin).flatten(-2)
-    return q_out, k_out
+        q_blk = q[..., start:end].reshape(*q.shape[:-1], rot_pairs, 2)
+        k_blk = k[..., start:end].reshape(*k.shape[:-1], rot_pairs, 2)
+        q_blocks.append(
+            (q_blk * cos + _rope_rotate_half(q_blk) * sin).flatten(-2))
+        k_blocks.append(
+            (k_blk * cos + _rope_rotate_half(k_blk) * sin).flatten(-2))
+    rot_total = num_axes * rot_dim
+    if rot_total < head_dim:
+        q_blocks.append(q[..., rot_total:])
+        k_blocks.append(k[..., rot_total:])
+    return torch.cat(q_blocks, dim=-1), torch.cat(k_blocks, dim=-1)
 
 
 def _normalize_spatial_sizes(

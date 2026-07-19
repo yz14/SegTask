@@ -930,8 +930,10 @@ def build_dataloaders(
             _f = _peek_npz(npz_paths_train[0])
             sample_voxels  = int(np.prod(_f["image"].shape))
             has_rw_runtime = "rw" in _f.files
-            # image fp32 (4B)、label int16 (2B)、rw fp32 (4B 可选)。
-            bytes_per_img = sample_voxels * 4
+            # image fp32 (4B)（cache_dtype='int16' 时 2B）、label int16
+            # (2B)、rw fp32 (4B 可选)。
+            img_b = 2 if str(dc.cache_dtype) == "int16" else 4
+            bytes_per_img = sample_voxels * img_b
             bytes_per_lbl = sample_voxels * 2
             bytes_per_rw = sample_voxels * 4 if has_rw_runtime else 0
             per_vol_bytes = bytes_per_img + bytes_per_lbl + bytes_per_rw
@@ -947,14 +949,15 @@ def build_dataloaders(
                 % (world_size, total_gb * world_size))
             logger.info(
                 "Volume cache estimate: ~%.2f MiB per volume "
-                "(image fp32 + label int16%s, bbox-cropped); effective "
+                "(image %s + label int16%s, bbox-cropped); effective "
                 "cap=%d, num_workers=%d => up to ~%.2f GiB RAM (all "
                 "workers, caches only; transient decode peaks add "
                 "~%.2f MiB/worker)%s.",
                 per_vol_bytes / (1024 ** 2),
+                "int16" if img_b == 2 else "fp32",
                 " + region_weight fp32" if bytes_per_rw else "",
                 eff_cap, workers, total_gb,
-                bytes_per_img / (1024 ** 2), agg_note)
+                sample_voxels * 4 / (1024 ** 2), agg_note)
             agg_workers = workers * max(world_size, 1)
             if cap == 0 and n_train_vols * agg_workers >= 16:
                 # 在 8 GiB 预算下建议一个合适的 cap。

@@ -125,9 +125,14 @@ class ClsTrainer(BaseTrainer):
         # GPU 增强（复用 segtask GPUAugmentor）：在未折叠的 (B,1,D,H,W) 上
         # 对 image+label 联合施加，增强后派生分类 target 再折叠（见
         # ClsPatchDataset 的 gpu_augment 模式）。
+        # 逐 rank 分流的独立增强 RNG（与 seg trainer 同构）；_prepare_batch 传入
+        # 的 img/lbl 是 H2D 私有拷贝且增强后不再以原值复用，满足 inplace
+        # 所有权契约，省一次入口 clone。
+        _aug_seed = (int(tc.seed) + 7919 * (self._rank + 1)) & 0x7FFFFFFF
         self.augmentor = (
             GPUAugmentor(cfg.augment, max_scale=1.0,
-                         label_fill=float(cfg.data.label_values[0]))
+                         label_fill=float(cfg.data.label_values[0]),
+                         seed=_aug_seed, inplace=True)
             if cfg.augment.enabled else None)
         self.fg_values = [float(v) for v in (
             cfg.data.label_values[1:]

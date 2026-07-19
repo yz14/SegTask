@@ -336,6 +336,18 @@ def load_npz_image(
             inplace=False)
 
 
+def load_npz_image_raw(path: str) -> np.ndarray:
+    """返 npz 中 owned 原始 int16 image ndarray（不预处理）。
+
+    供 cache_dtype='int16' 缓存原始卷：memmap 快路径下拷成 owned 数组
+    （缓存需常驻 RAM 而非页缓存视图）。"""
+    mm = _open_npy_member_mmap(path, "image")
+    if mm is not None:
+        return np.array(mm)
+    with _open_npz(path) as f:
+        return f["image"]
+
+
 def load_npz_label(path: str) -> np.ndarray:
     """返 npz 中 owned int16 label ndarray。
 
@@ -662,6 +674,7 @@ class SegDatasetNpzBase(Dataset):
         is_train            : bool,
         cache_enabled       : bool,
         cache_max_volumes   : int,
+        cache_int16         : bool,
         region_weights      : Optional[List[float]],
         val_grid_coverage   : bool = False):
         super().__init__()
@@ -689,6 +702,7 @@ class SegDatasetNpzBase(Dataset):
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
+        self._cache_int16 = bool(cache_int16)
 
         # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw。
         self._npz_paths       : List[str]       = list(npz_paths)
@@ -739,8 +753,21 @@ class SegDatasetNpzBase(Dataset):
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
     # ------------------------------------------------------------------
     def _load_image(self, vol_idx: int) -> np.ndarray:
-        """加载+预处理 image（npz，带缓存）。"""
-        path   = self._npz_paths[vol_idx]
+        """加载+预处理 image（npz，带缓存）。
+
+        cache_int16：缓存原始 int16 卷（RAM 减半），每次取用重跑
+        preprocess_image（产出与 fp32 缓存逐位一致，且恒为新 owned
+        数组，无缓存别名）。"""
+        path = self._npz_paths[vol_idx]
+        if self._cache_int16:
+            raw = self._img_cache.get(path)
+            if raw is None:
+                raw = load_npz_image_raw(path)
+                self._img_cache.put(path, raw)
+            return preprocess_image(
+                raw, self.intensity_min, self.intensity_max,
+                self.normalize, self.global_mean, self.global_std,
+                inplace=False)
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
@@ -811,6 +838,7 @@ class SegDataset3D(SegDatasetNpzBase):
         is_train                   : bool = True,
         cache_enabled              : bool = True,
         cache_max_volumes          : int = 0,
+        cache_int16                : bool = False,
         region_weights             : Optional[List[float]] = None,
         z_boundary_mode            : str = "stretch",
         npz_paths                  : Optional[List[str]] = None,
@@ -832,6 +860,7 @@ class SegDataset3D(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
+            cache_int16          = cache_int16,
             region_weights       = region_weights,
             val_grid_coverage    = val_grid_coverage)
         if z_boundary_mode not in ("stretch", "edge_pad"):
@@ -1070,6 +1099,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         is_train                   : bool = True,
         cache_enabled              : bool = True,
         cache_max_volumes          : int = 0,
+        cache_int16                : bool = False,
         region_weights             : Optional[List[float]] = None,
         npz_paths                  : Optional[List[str]] = None,
         val_grid_coverage          : bool = False):
@@ -1089,6 +1119,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
+            cache_int16          = cache_int16,
             region_weights       = region_weights,
             val_grid_coverage    = val_grid_coverage)
 
@@ -1267,6 +1298,7 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         is_train            : bool = True,
         cache_enabled       : bool = True,
         cache_max_volumes   : int = 0,
+        cache_int16         : bool = False,
         region_weights      : Optional[List[float]] = None,
         npz_paths           : Optional[List[str]] = None):
         super().__init__(
@@ -1285,6 +1317,7 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
+            cache_int16          = cache_int16,
             region_weights       = region_weights)
         # 3 轴同步过采样：与 cubic 一致，给增强（旋转/弹性）留中心裁余量。
         self.extract_size = tuple(

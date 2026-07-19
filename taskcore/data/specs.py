@@ -40,7 +40,7 @@ class DatasetCommonCfg:
     """与 patch_mode 无关的 dataset 公共构造参数。
 
     所有 3 个 dataset 子类（``SegDataset3D`` / ``SegDataset3DCubic`` /
-    ``SegDataset3DWhole``）共享这 11 个字段。原 ``loader.py:522-532`` 的
+    ``SegDataset3DWhole``）共享这 12 个字段。原 ``loader.py:522-532`` 的
     ``common_kwargs`` dict 已被这个 dataclass 替代。
     """
 
@@ -53,6 +53,7 @@ class DatasetCommonCfg:
     global_std: float
     cache_enabled: bool
     cache_max_volumes: int
+    cache_int16: bool
     region_weights: Optional[List[float]]
 
     @classmethod
@@ -68,6 +69,7 @@ class DatasetCommonCfg:
             global_std        = float(dc.global_std),
             cache_enabled     = (str(dc.cache_mode) == "memory"),
             cache_max_volumes = int(dc.cache_max_volumes),
+            cache_int16       = (str(dc.cache_dtype) == "int16"),
             region_weights    = (list(cfg.loss.region_weights)
                                  if cfg.loss.region_weights else None))
 

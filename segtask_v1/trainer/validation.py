@@ -453,6 +453,9 @@ class VolumeValEvaluator(ValEvaluator):
     def __init__(self, trainer: "Trainer"):
         super().__init__(trainer)
         self._predictor = None  # 懒构建，复用同一 Predictor（引用 trainer.model）
+        # val_volume_cache：逐卷 (预处理 image fp32, 原始 label int16, z_spacing)
+        # 常驻缓存；只存本 rank 分片，容量随首轮填满后不再增长。
+        self._vol_cache: "Dict[str, tuple]" = {}
 
     def _get_predictor(self):
         if self._predictor is None:
@@ -486,16 +489,27 @@ class VolumeValEvaluator(ValEvaluator):
         acc = self._new_accumulator()
         label_values = list(dc.label_values)
 
+        use_cache = bool(t.cfg.train.val_volume_cache)
         # 多卡：把去重后的整卷列表按 rank 不相交切分（每卷恰好一次，无重复计数）。
+        # shard_for_rank 切分确定，各 epoch 同 rank 拿同一批卷，缓存跨轮命中。
         for path in shard_for_rank(npz_paths):
-            vol = load_npz_image(
-                path, dc.intensity_min, dc.intensity_max, dc.normalize,
-                dc.global_mean, dc.global_std)
-            label = load_npz_label(path)
-            # 物理 z spacing（npz meta，make_data≥1.4/1.6）：使 2.5D z-interleave
-            # 因子选择与部署路径一致；旧 npz 无记录时为 None（回退标准滑窗）。
-            z_spacing = (load_npz_z_spacing(path)
-                         if predictor.z_interleave_enabled else None)
+            cached = self._vol_cache.get(path) if use_cache else None
+            if cached is not None:
+                vol, label, zs = cached
+            else:
+                vol = load_npz_image(
+                    path, dc.intensity_min, dc.intensity_max, dc.normalize,
+                    dc.global_mean, dc.global_std)
+                label = load_npz_label(path)
+                # 物理 z spacing（npz meta，make_data≥1.4/1.6）：使 2.5D
+                # z-interleave 因子选择与部署路径一致；旧 npz 无记录时为
+                # None（回退标准滑窗）。z_interleave 开关运行期固定，缓存值
+                # 与逐轮读取语义一致。
+                zs = (load_npz_z_spacing(path)
+                      if predictor.z_interleave_enabled else None)
+                if use_cache:
+                    self._vol_cache[path] = (vol, label, zs)
+            z_spacing = zs
             # (num_fg, D, H, W) 概率体（已 sigmoid，跨窗 blended）。
             prob = predictor.predict_preprocessed_array(
                 vol, z_spacing=z_spacing)

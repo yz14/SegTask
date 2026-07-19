@@ -14,6 +14,7 @@ from taskcore.data.dataset import (
     compute_region_weight_map,
     load_nifti, load_nifti_cropped, load_nifti_with_spacing,
     load_npz_fg_coords, load_npz_fg_slices, load_npz_image,
+    load_npz_image_raw,
     load_npz_label, load_npz_label_for_split, load_npz_region_weight,
     load_region_weight_volume, npz_has_rw, preprocess_image, resize_3d,
 )
@@ -62,6 +63,7 @@ class VolumeNpzDatasetBase(Dataset):
         is_train            : bool,
         cache_enabled       : bool,
         cache_max_volumes   : int,
+        cache_int16         : bool,
         region_weights      : Optional[List[float]],
         cond_normalize      : str,
         cond_intensity_min  : float,
@@ -100,6 +102,7 @@ class VolumeNpzDatasetBase(Dataset):
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._rw_cache  = VolumeCache(cache_enabled, cache_max_volumes)
         self._cond_cache = VolumeCache(cache_enabled, cache_max_volumes)
+        self._cache_int16 = bool(cache_int16)
 
         # NPZ 预计算包（make_data 产出）提供 bbox / fg 索引 / 可选 rw。
         self._npz_paths       : List[str]       = list(npz_paths)
@@ -149,8 +152,20 @@ class VolumeNpzDatasetBase(Dataset):
     # 共用 npz 读取（子类可直接复用，缓存按 path 共享于同一 worker）
     # ------------------------------------------------------------------
     def _load_image(self, vol_idx: int) -> np.ndarray:
-        """加载+预处理 image（npz，带缓存）。"""
-        path   = self._npz_paths[vol_idx]
+        """加载+预处理 image（npz，带缓存）。
+
+        cache_int16：缓存原始 int16 卷（RAM 减半），每次取用重跑
+        preprocess_image（产出与 fp32 缓存逐位一致）。"""
+        path = self._npz_paths[vol_idx]
+        if self._cache_int16:
+            raw = self._img_cache.get(path)
+            if raw is None:
+                raw = load_npz_image_raw(path)
+                self._img_cache.put(path, raw)
+            return preprocess_image(
+                raw, self.intensity_min, self.intensity_max,
+                self.normalize, self.global_mean, self.global_std,
+                inplace=False)
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
@@ -243,6 +258,7 @@ class Volume3D(VolumeNpzDatasetBase):
         is_train            : bool = True,
         cache_enabled       : bool = True,
         cache_max_volumes   : int = 0,
+        cache_int16         : bool = False,
         region_weights      : Optional[List[float]] = None,
         cond_normalize      : str = "minmax",
         cond_intensity_min  : float = -1024.0,
@@ -268,6 +284,7 @@ class Volume3D(VolumeNpzDatasetBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
+            cache_int16          = cache_int16,
             region_weights       = region_weights,
             cond_normalize       = cond_normalize,
             cond_intensity_min   = cond_intensity_min,
@@ -523,6 +540,7 @@ class Volume3DCubic(VolumeNpzDatasetBase):
         is_train                   : bool = True,
         cache_enabled              : bool = True,
         cache_max_volumes          : int = 0,
+        cache_int16                : bool = False,
         region_weights             : Optional[List[float]] = None,
         cond_normalize             : str = "minmax",
         cond_intensity_min         : float = -1024.0,
@@ -547,6 +565,7 @@ class Volume3DCubic(VolumeNpzDatasetBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
+            cache_int16          = cache_int16,
             region_weights       = region_weights,
             cond_normalize       = cond_normalize,
             cond_intensity_min   = cond_intensity_min,
@@ -727,6 +746,7 @@ class Volume3DWhole(VolumeNpzDatasetBase):
         is_train            : bool = True,
         cache_enabled       : bool = True,
         cache_max_volumes   : int = 0,
+        cache_int16         : bool = False,
         region_weights      : Optional[List[float]] = None,
         cond_normalize      : str = "minmax",
         cond_intensity_min  : float = -1024.0,
@@ -750,6 +770,7 @@ class Volume3DWhole(VolumeNpzDatasetBase):
             is_train             = is_train,
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
+            cache_int16          = cache_int16,
             region_weights       = region_weights,
             cond_normalize       = cond_normalize,
             cond_intensity_min   = cond_intensity_min,

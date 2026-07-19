@@ -36,7 +36,9 @@ from taskcore.engine.checkpoint import (
     state_to_cpu, unwrap_compile,
 )
 from .pipelines import build_pipeline
-from taskcore.engine.dist_utils import all_reduce_meters_, shard_for_rank
+from taskcore.engine.dist_utils import (
+    all_reduce_meters_, get_rank, shard_for_rank,
+)
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.base_trainer import BaseTrainer
 
@@ -77,8 +79,13 @@ class GenerationTrainer(BaseTrainer):
         # batch 几何准备管线（过采样余量裁剪 / 多视图拆分打包）与 GPU 增强。
         self.pipeline = build_pipeline(cfg)
         scales = cfg.data.multi_res_scales or [1.0]
+        # 逐 rank 分流的独立增强 RNG（与 seg trainer 同构）；训练循环传入的
+        # hr/weight_map/cond 均是 H2D 私有拷贝且增强后不再以原值复用，
+        # 满足 inplace 所有权契约，省一次入口 clone。
+        _aug_seed = (int(tc.seed) + 7919 * (get_rank() + 1)) & 0x7FFFFFFF
         self.augmentor = (GPUAugmentor(cfg.augment,
-                                       max_scale=float(max(scales)))
+                                       max_scale=float(max(scales)),
+                                       seed=_aug_seed, inplace=True)
                           if cfg.augment.enabled else None)
 
         # --- Optimizer + scheduler / AMP / EMA（共用工程件，见 BaseTrainer）---

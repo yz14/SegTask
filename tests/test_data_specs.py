@@ -116,13 +116,14 @@ class TestDatasetCommonCfg:
         assert common.region_weights is None
 
     def test_to_kwargs_keys_match_dataset_init(self):
-        """``to_kwargs`` 必须覆盖 ``SegDatasetNpzBase.__init__`` 的 11 个公共参数。"""
+        """``to_kwargs`` 必须覆盖 ``SegDatasetNpzBase.__init__`` 的 12 个公共参数。"""
         common = DatasetCommonCfg.from_cfg(_base_cfg())
         expected = {
             "label_values", "patch_size",
             "intensity_min", "intensity_max", "normalize",
             "global_mean", "global_std",
-            "cache_enabled", "cache_max_volumes", "region_weights",
+            "cache_enabled", "cache_max_volumes", "cache_int16",
+            "region_weights",
         }
         assert set(common.to_kwargs().keys()) == expected
 

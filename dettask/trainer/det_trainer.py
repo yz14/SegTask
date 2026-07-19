@@ -121,8 +121,13 @@ class DetTrainer(BaseTrainer):
         self._setup_train_sampler()
 
         # 强度增强（复用 seg GPUAugmentor，仅强度分支；框不受影响）。
+        # 逐 rank 分流的独立增强 RNG（与 seg trainer 同构）；_to_device 传入的
+        # x 是 H2D 私有拷贝（2.5D 时为其 unsqueeze 视图）且增强后即覆写 img，
+        # 满足 inplace 所有权契约，省一次入口 clone。
+        _aug_seed = (int(tc.seed) + 7919 * (self._rank + 1)) & 0x7FFFFFFF
         self.augmentor = (
-            GPUAugmentor(_intensity_only_augcfg(cfg.augment), max_scale=1.0)
+            GPUAugmentor(_intensity_only_augcfg(cfg.augment), max_scale=1.0,
+                         seed=_aug_seed, inplace=True)
             if cfg.augment.enabled else None)
         self.fold_2_5d = int(cfg.model.spatial_dims) == 2
 

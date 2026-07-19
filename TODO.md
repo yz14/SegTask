@@ -134,7 +134,7 @@ A2（低）whole 模式 resize 恒等时的缓存别名 @/Users/.../taskcore/dat
 A3（中，跨步）DDP 验证采样器不等长 → 需确认验证无逐 batch 集合通信 @/Users/.../taskcore/data/loader.py:40-70 ValBatchShardSampler 各 rank batch 数可不等长（block strided 切分），注释假设"指标经 all-reduce 一次汇总"。若 validation.py 存在逐 batch 的 all_reduce/barrier，会因 rank 间 batch 数不齐而死锁。MixedBatchSampler/DistributedSampler(drop_last) 等长无此风险，唯 val 分片不等长。留作 Step 4 重点核对项。
 
 B. 优化空间（性能 / 内存）
-B1（中）LRU 缓存存 fp32 预处理卷，内存翻倍 @/Users/.../taskcore/data/dataset.py:749-753 _img_cache 缓存的是 preprocess_image 后的 fp32（4B/voxel），是原始 int16（2B）的 2×。loader.py:924-973 已有 RAM 估计与 OOM 告警，但可提供"缓存 int16 原始卷、取用时再 preprocess"选项，以 CPU 换 RAM（大数据集/多 worker 更划算）。属可配置增强，非缺陷。
+B1（中）LRU 缓存存 fp32 预处理卷，内存翻倍 @/Users/.../taskcore/data/dataset.py:749-753 _img_cache 缓存的是 preprocess_image 后的 fp32（4B/voxel），是原始 int16（2B）的 2×。loader.py:924-973 已有 RAM 估计与 OOM 告警，但可提供"缓存 int16 原始卷、取用时再 preprocess"选项，以 CPU 换 RAM（大数据集/多 worker 更划算）。属可配置增强，非缺陷。【已修复：见 O6（data.cache_dtype='int16'）】
 
 B2（中）CPU 端 scipy.ndimage.zoom 面内/整卷 resize 是潜在吞吐瓶颈 @/Users/.../taskcore/data/dataset.py:554（resize_3d），z_axis 面内 resize dataset.py:928、whole 整卷 dataset.py:1307 每样本每 epoch 在 worker 内做一次 zoom。设计上数据管线纯 CPU（GPU 增强在 trainer 侧），此为合理取舍，但大 H/W 时是主要 CPU 成本。可评估：H/W 面内 resize 改逐切片更快的后端，或将 resize 后移到 GPU（需打破当前 worker 契约，权衡较大）。列为观察项。
 
@@ -199,7 +199,7 @@ A3（中，确定性）增强 RNG 跨 CPU/CUDA 两套全局生成器，"固定 s
 A4（低，取舍非 bug）纯 affine（无 elastic）样本旋转角点：image 走 border 复制、label 置背景，二者语义不一致 — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:283-288 image 用 padding_mode='border'，而越界点 label 被强制 label_fill（背景）。这是刻意取舍（避免边缘外推伪前景，对齐 nnU-Net 常数填充），但会给模型"有复制纹理却标背景"的监督点。当前靠 oversample 余量把角点裁掉（center_crop）缓解；z_axis 模式 H/W 无余量（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:235-236）时角点会留在 patch 内。记为观察项。
 
 B. 优化空间（性能 / 显存 / GPU）
-B1（中，显存）默认 inplace=False 在过采样 cube 上多克隆一份 img/lbl/wmap — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:52-56 入口 clone。而训练循环的输入本就是 H2D 私有拷贝（batch["image"].to(device, non_blocking=True)，@/d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:444-448，增强后不再以原值复用），恰好满足 AugConfig.inplace 契约（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:201-205）。aug_oversample_ratio>1 时这份克隆按过采样体积放大。建议 seg/ssl/gen trainer 侧显式开 inplace=True（或在文档明确推荐），省一份过采样 cube 的瞬时显存；保持 config 默认 False 作防御。【已修复（seg）：GPUAugmentor 新增 inplace 覆写参，seg trainer 传 inplace=True；ssl/gen 未动，待各自调用方确认所有权后同样接入】
+B1（中，显存）默认 inplace=False 在过采样 cube 上多克隆一份 img/lbl/wmap — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:52-56 入口 clone。而训练循环的输入本就是 H2D 私有拷贝（batch["image"].to(device, non_blocking=True)，@/d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:444-448，增强后不再以原值复用），恰好满足 AugConfig.inplace 契约（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:201-205）。aug_oversample_ratio>1 时这份克隆按过采样体积放大。建议 seg/ssl/gen trainer 侧显式开 inplace=True（或在文档明确推荐），省一份过采样 cube 的瞬时显存；保持 config 默认 False 作防御。【已修复（全任务）：GPUAugmentor 新增 inplace 覆写参，seg/ssl/cls/det/gen 五个 trainer 均已确认 H2D 私有拷贝所有权后传 inplace=True；gentask 的生成变体 augment 同步镜像支持 seed/inplace；config 默认 False 保留防御】
 
 B2（低，显存）elastic 位移场在过采样全尺寸上生成 fp32 (n,3,D,H,W) — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:181-182 粗网格 randn 后 interpolate 到过采样 (D,H,W)，峰值随选中样本数线性增长。空间增强必须在裁剪前完成（否则边缘伪影入 patch），故无法把这步后移到 center_crop 之后——取舍合理，列为观察；可评估 disp 融入 grid 后（:277）提前 del 以压峰值。
 
@@ -208,7 +208,7 @@ B3（低，GPU）_grid_dropout 逐洞 Python 循环 + 高级索引 scatter — @
 C. 可借鉴 / 新增（2026 视角，跨领域）
 C1（中，跨步 TODO3）增强实现的 seg/gen 双分叉应收敛为"伴随张量 spec 化" — taskcore.data.augment 与 @/d:/codes/work-projects/SegTask/gentask/data/augment.py:1-122 是两份近重复实现：gen 去掉 label、把 cond 作为 bilinear companion 同 warp（@/d:/codes/work-projects/SegTask/gentask/data/augment.py:282-285），seg 则保留 label（nearest）+ OOB 语义。这正是 TODO 进展标注的"最后一个真正的实现分叉"（@/d:/codes/work-projects/SegTask/TODO.md:138）。建议把 (image, label, wmap) 泛化为 primary + companions[spec]（每 companion 携 interp_mode/oob_fill/受强度增强 标志）：一份实现覆盖 seg 的 label/wmap 与 gen 的 cond，也让 seg 未来接 cond/多标签更干净。属 TODO3 重构范畴，此处标注。
 
-C2（中）强度增强对 zscore 归一化不自适应 — brightness/noise 幅值为绝对量、隐含 image≈[0,1]（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:252-253）。而 normalize 可为 zscore（@/d:/codes/work-projects/SegTask/taskcore/data/dataset.py:489-492），此时同幅值扰动量纲不符、偏弱。建议幅值按归一化模式自适应（zscore 时以 σ 为单位），或在 config.validate 当 normalize=='zscore' 且沿用默认绝对幅值时告警。低成本稳健性提升。
+C2（中）强度增强对 zscore 归一化不自适应 — brightness/noise 幅值为绝对量、隐含 image≈[0,1]（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:252-253）。而 normalize 可为 zscore（@/d:/codes/work-projects/SegTask/taskcore/data/dataset.py:489-492），此时同幅值扰动量纲不符、偏弱。建议幅值按归一化模式自适应（zscore 时以 σ 为单位），或在 config.validate 当 normalize=='zscore' 且沿用默认绝对幅值时告警。低成本稳健性提升。【已修复（告警方案）：_validate_augment 在 normalize='zscore' 且 brightness/noise 仍为 minmax 量纲默认幅值（且对应 prob>0）时告警并给 σ 量纲建议幅值；改过幅值/禁用项不告警，不自动改值（语义不变）】
 
 C3（低）spacing 校正只在 offline 做，aspect_correct 仅纠正 voxel-count 各向异性 — random_affine_aspect_correct 在 voxel 计数坐标里旋转（R←A⁻¹RA, A=diag(W,H,D)，@/d:/codes/work-projects/SegTask/taskcore/data/augment.py:160-162），文档明确"不代替真实 spacing 校正"（:133-134）。当 make_data 未做各向同性重采样（spacing_normalized=False，@/d:/codes/work-projects/SegTask/taskcore/data/dataset.py:447-448）时，物理各向异性下的旋转仍混入剪切。呼应 Step 1 C1（nnU-Net v2 高各向异性轴用高百分位 spacing）。建议：文档提示"开 affine 旋转时优先启用 spacing 归一化"，或让 aspect 用物理 spacing 而非纯 voxel 计数。
 
@@ -236,7 +236,7 @@ A3（低，冗余同步） — 日志步存在重复 D2H。compute_loss 在 brea
 B. 优化空间（性能 / 显存 / GPU）
 B1（低-中，热路径 H2D） — 损失内每次 forward 重建 fg_values 张量，触发逐步微小 H2D。MultiResolutionLoss._label_to_binary（@d:/codes/work-projects/SegTask/segtask_v1/losses/losses.py:784）、SliceChannelLoss._label_to_binary/_label_to_binary_5d（losses.py:868、losses.py:942）均 torch.tensor(self.fg_values, device=label.device, ...)。这在每个训练步（主路 + 每个 aux 视图）执行，从 Python list 构造并落 device，是可能的隐式同步点。建议构造时 register_buffer("fg_values", ..., persistent=False) 一次性驻留，forward 直接复用。低成本、纯提速。【已修复：改为首次 forward 惰性构建设备张量后缓存复用（_fg_tensor）；未用 register_buffer，因 criterion 不随 model .to(device)，buffer 会永驻 CPU 仍逐步 H2D】
 
-B2（中，训练加速专项） — val 成本可占 epoch 相当比例，且无"低频高保真"档。trainer 已逐 epoch 打印 val 占比（trainer.py:321-329），说明作者已察觉。val_metric_mode 为全局单选：medium 每 epoch 逐 batch loss.item()（validation.py:404，每 val batch 一次 D2H）、high 每 epoch 对全部 val 卷重载 npz + 滑窗（validation.py:483-495，Predictor 已缓存但整卷每 epoch 重读重预处理）。建议加"medium 每 epoch + high 每 N epoch/末段"的混合验证调度，显著降 high 模式 val 墙钟；high 模式若 RAM 允许可缓存预处理整卷。属训练总时长优化。【已修复（调度部分）：新增 train.val_high_interval（默认 1=既有行为），>1 时 HybridValEvaluator 每 N 次验证跑一次 high（及末 epoch 必跑）、其余轮次跑 medium 监控；选模/早停/plateau 只看 high 轮次（selects_model 门控，避免口径混用污染 best）；高轮次按 epoch 推导，resume 相位不变。整卷 RAM 缓存未做（内存权衡需实测）】
+B2（中，训练加速专项） — val 成本可占 epoch 相当比例，且无"低频高保真"档。trainer 已逐 epoch 打印 val 占比（trainer.py:321-329），说明作者已察觉。val_metric_mode 为全局单选：medium 每 epoch 逐 batch loss.item()（validation.py:404，每 val batch 一次 D2H）、high 每 epoch 对全部 val 卷重载 npz + 滑窗（validation.py:483-495，Predictor 已缓存但整卷每 epoch 重读重预处理）。建议加"medium 每 epoch + high 每 N epoch/末段"的混合验证调度，显著降 high 模式 val 墙钟；high 模式若 RAM 允许可缓存预处理整卷。属训练总时长优化。【已修复（调度部分）：新增 train.val_high_interval（默认 1=既有行为），>1 时 HybridValEvaluator 每 N 次验证跑一次 high（及末 epoch 必跑）、其余轮次跑 medium 监控；选模/早停/plateau 只看 high 轮次（selects_model 门控，避免口径混用污染 best）；高轮次按 epoch 推导，resume 相位不变。整卷 RAM 缓存也已做：train.val_volume_cache（默认关），见 O2】
 
 B3（低，训练加速已到位，记录） — DDP 梯度重叠、no_sync 非边界步免 all-reduce（trainer.py:466-468）、fused AdamW（@d:/codes/work-projects/SegTask/taskcore/engine/optim.py:87-91）、ZeRO-1（optim.py:54-101）、TF32/cudnn.benchmark 经 seed_everything 默认开（taskcore/utils/common.py:586-589）、channels_last、CudaPrefetcher、grad-ckpt 均已接入。batch-pooled 损失（batch_dice/GDL/Tversky）在 accum/DDP 下统计窗口收缩已显式告警（base_trainer.py:506-511）——为已知取舍，非缺陷。无需改动，仅记录加速面已充分。
 
@@ -319,7 +319,7 @@ config.validate 对训练/数据/topology 覆盖严密，但：blend_mode 无枚
 #	主题	严重度	价值/成本	位置	来源
 P1	ADM/EDM2 build 不读 topo，就地重算几何【已修复】	中	高价值·低成本	adm_unet.py:766-859 edm2_unet.py:661-728	Step2-A1 / X1
 P2	factory 未透传 cond 到 Encoder（seg 接 cond 会静默错配）【已修复】	低-中	中价值·低成本	factory.py:450-466	Step2-A2 / X2
-P3	增强 RNG 跨两套全局生成器，等价性验证脆弱【已修复：GPUAugmentor 独立 Generator，seg trainer 逐 rank 分流】	中	中价值·中成本	augment.py:22,181,322	Step3-A3 / X4
+P3	增强 RNG 跨两套全局生成器，等价性验证脆弱【已修复：GPUAugmentor 独立 Generator，seg/ssl/cls/det/gen 五 trainer 均逐 rank 分流（seed+7919*(rank+1)）；gentask 生成变体同构接入】	中	中价值·中成本	augment.py:22,181,322	Step3-A3 / X4
 P4	blend_mode 无枚举校验，拼错静默退化【已修复】	低	中价值·极低成本	blending.py:55-71	Step5-A1 / X5
 P5	augment sigma/std/zoom 无正性/区间校验【已修复】	低	中价值·极低成本	core.py:1738-1771	Step3-A1 / X5
 P6	ConvNeXt/MedNeXt 块内 attention 未透传 norm/reduction 配置（含核验新发现 N1：se_reduction 被静默忽略）【已修复 reduction 部分；norm 有意保持块内固定 norm 设计】	低	低价值·低成本	convnext.py:58 mednext.py:424	Step2-A3 / N1
@@ -331,12 +331,12 @@ P8	识别性冗余 except / whole 缓存别名一致性瑕疵（含核验新发�
 四、优化建议（性能/显存/GPU，按价值×成本排序）
 #	主题	价值/成本	位置	来源
 O1	cubic 单分辨率补 GPU 常驻 builder（对齐 z 路径），消 CPU 抽取+H2D	高价值·中成本（收益随 cubic 窗口数放大）	inputs.py:262-290 sliding.py:369-374	Step5-B1
-O2	val 混合调度（medium 每 epoch + high 每 N epoch），降 high 墙钟【已修复：val_high_interval + HybridValEvaluator；整卷 RAM 缓存未做】	高价值·低成本	validation.py:483-495	Step4-B2
+O2	val 混合调度（medium 每 epoch + high 每 N epoch），降 high 墙钟【已修复：val_high_interval + HybridValEvaluator；整卷 RAM 缓存也已做：train.val_volume_cache（默认关）逐 rank 常驻分片的预处理整卷/label/z_spacing，后续 high 轮免磁盘重读重预处理，指标逐位不变；RAM≈分片体素×6B/voxel 需按数据规模评估】	高价值·低成本	validation.py:483-495	Step4-B2
 O3	损失 fg_values 改设备张量驻留，消热路径逐步 H2D【已修复：首次 forward 惰性构建后缓存复用（非 register_buffer：criterion 不随 model .to(device)，惰性缓存更稳妥）】	中价值·低成本	losses.py:784,868,942	Step4-B1
-O4	trainer 侧显式开 inplace=True，省过采样 cube 一份瞬时显存【已修复：GPUAugmentor 新增 inplace 覆写参，seg trainer 传 inplace=True（H2D 私有拷贝满足契约）；config 默认 False 保留防御】	中价值·低成本	augment.py:52-56	Step3-B1
-O5	手写 LayerNorm/GRN 统计 fp32 累加（对齐既有 fp16→fp32 范式）	中价值·低成本	convnext.py:27-29 blocks.py:97-99	Step2-B1
-O6	LRU 缓存可选存 int16 原始卷（以 CPU 换 RAM，大数据集划算）	中价值·中成本	dataset.py:749-753	Step1-B1
-O7	RoPE 路径 torch.compile 友好化（buffer 化坐标、非就地 rotate）	中价值·中成本（仅开 RoPE 时）	blocks.py:35-36,568-591	Step2-B2
+O4	trainer 侧显式开 inplace=True，省过采样 cube 一份瞬时显存【已修复：GPUAugmentor 新增 inplace 覆写参，seg/ssl/cls/det/gen 五 trainer 均传 inplace=True（H2D 私有拷贝满足契约）；config 默认 False 保留防御】	中价值·低成本	augment.py:52-56	Step3-B1
+O5	手写 LayerNorm/GRN 统计 fp32 累加（对齐既有 fp16→fp32 范式）【已修复：LayerNorm3d 均值/方差与 GRN 平方和统计改 fp32 计算后转回输入 dtype（同 adm_unet 范式）；fp32 输入下数值不变】	中价值·低成本	convnext.py:27-29 blocks.py:97-99	Step2-B1
+O6	LRU 缓存可选存 int16 原始卷（以 CPU 换 RAM，大数据集划算）【已修复：新增 data.cache_dtype（'fp32' 默认=现状 / 'int16' 缓原始卷取用时重跑 preprocess，产出逐位一致）；taskcore 与 gentask dataset 基类同步支持，RAM 估算日志随模式自适应；cond 缓存（gentask）未动】	中价值·中成本	dataset.py:749-753	Step1-B1
+O7	RoPE 路径 torch.compile 友好化（buffer 化坐标、非就地 rotate）【已修复：_apply_rope_nd 改非就地 rotate（逐轴块 cat，无 clone+切片写回）；cos/sin LRU 缓存在 compile 下绕过直接现算入图（torch.compiler.is_compiling 门控），dynamo fullgraph 可整图追踪且数值与 eager 一致；eager 路径行为不变】	中价值·中成本（仅开 RoPE 时）	blocks.py:35-36,568-591	Step2-B2
 O8	CPU zoom resize 后端评估（大 H/W 面内 resize 逐切片）	低价值·中成本（观察项）	dataset.py:554,928,1307	Step1-B2
 五、借鉴清单（2026 视角，按价值×成本排序）
 第一梯队（高价值，与本项目"细管/栓子小前景"主打强相关）

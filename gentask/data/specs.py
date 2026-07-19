@@ -30,7 +30,7 @@ from .dataset import Volume3D, Volume3DCubic, Volume3DWhole
 
 @dataclass(frozen=True)
 class DatasetCommonCfg(_CoreDatasetCommonCfg):
-    """公共构造参数（taskcore 11 字段 + gentask cond 扩展）。"""
+    """公共构造参数（taskcore 12 字段 + gentask cond 扩展）。"""
 
     cond_normalize: str = "minmax"
     cond_intensity_min: float = -1024.0
@@ -51,6 +51,7 @@ class DatasetCommonCfg(_CoreDatasetCommonCfg):
             global_std        = float(dc.global_std),
             cache_enabled     = (str(dc.cache_mode) == "memory"),
             cache_max_volumes = int(dc.cache_max_volumes),
+            cache_int16       = (str(dc.cache_dtype) == "int16"),
             region_weights    = (list(dc.region_weights)
                                  if dc.region_weights else None),
             cond_normalize    = str(dc.cond_normalize),

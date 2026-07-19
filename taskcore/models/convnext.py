@@ -23,10 +23,13 @@ class LayerNorm3d(nn.Module):
         self.eps    = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, *spatial)
-        u = x.mean(dim=1, keepdim=True)
-        s = (x - u).pow(2).mean(dim=1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
+        # x: (B, C, *spatial)；统计量 fp32 累加（AMP 下 fp16/bf16 求均值/方差
+        # 精度不足），归一后转回输入 dtype（同 adm_unet fp32 范式）。
+        dtype = x.dtype
+        xf = x.float()
+        u = xf.mean(dim=1, keepdim=True)
+        s = (xf - u).pow(2).mean(dim=1, keepdim=True)
+        x = ((xf - u) / torch.sqrt(s + self.eps)).type(dtype)
         # 动态阐广播形：(C,) → (1, C, 1, ..., 1)。
         pat = 'c -> 1 c' + ' 1' * (x.ndim - 2)
         return x * rearrange(self.weight, pat) + rearrange(self.bias, pat)

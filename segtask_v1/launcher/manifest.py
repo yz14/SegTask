@@ -51,6 +51,7 @@ class Group:
 ENUMS: Dict[str, List[str]] = {
     "data.normalize":              ["minmax", "zscore"],
     "data.cache_mode":             ["none", "memory"],
+    "data.cache_dtype":            ["fp32", "int16"],
     "data.z_boundary_mode":        ["stretch", "edge_pad"],
     "augment.wmap_interp_mode":    ["nearest", "bilinear"],
     "model.backbone":              ["resnet", "convnext", "mednext"],
@@ -186,6 +187,7 @@ def _data_fields(mode: str) -> List[Field]:
         Field("data.samples_per_volume"),
         Field("data.cache_mode"),
         Field("data.cache_max_volumes"),
+        Field("data.cache_dtype"),
     ]
     if is25:
         # z_boundary_mode 在 2.5D 始终生效；keep_native_view_depth 为 2.5D 专属。
