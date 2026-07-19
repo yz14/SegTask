@@ -13,6 +13,8 @@ import argparse
 import logging
 from pathlib import Path
 
+import yaml
+
 import torch
 import torch.multiprocessing as mp
 
@@ -47,8 +49,10 @@ def apply_overrides(cfg, overrides: list) -> None:
             obj = getattr(obj, p)
         attr = parts[-1]
         old_val = getattr(obj, attr)
-        # 转为原类型。
-        if   isinstance(old_val, bool):
+        # 转为原类型；默认值为 None 的 Optional 字段按 YAML 语义解析。
+        if old_val is None:
+            new_val = yaml.safe_load(val)
+        elif isinstance(old_val, bool):
             new_val = val.lower() in ("true", "1", "yes")
         elif isinstance(old_val, int):
             new_val = int(val)

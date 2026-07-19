@@ -757,6 +757,10 @@ def save_config(cfg: SegConfig, ssl: SSLConfig, path: Union[str, Path]) -> None:
 
 def _coerce(old: Any, val: str) -> Any:
     """按既有字段类型把字符串 override 值转回原类型（与 segtask 行为一致）。"""
+    if old is None:
+        # 默认值为 None 的 Optional 字段无既有类型可依，按 YAML 语义解析
+        # （list/bool/数值/字符串均可）。
+        return yaml.safe_load(val)
     if isinstance(old, bool):
         return val.lower() in ("true", "1", "yes")
     if isinstance(old, int):

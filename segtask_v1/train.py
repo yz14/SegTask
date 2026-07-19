@@ -13,6 +13,8 @@ import logging
 import warnings
 from pathlib import Path
 
+import yaml
+
 # torch 2.4 的 torch.utils.checkpoint 内部仍调用已弃用的 torch.cpu.amp.autocast，
 # 属 torch 自身告警；须在 import torch 之前注册，spawn 子进程 re-import 时同样生效。
 warnings.filterwarnings(
@@ -51,8 +53,10 @@ def apply_overrides(cfg, overrides: list) -> None:
             obj = getattr(obj, p)
         attr = parts[-1]
         old_val = getattr(obj, attr)
-        # 转为原类型。
-        if   isinstance(old_val, bool):
+        # 转为原类型；默认值为 None 的 Optional 字段按 YAML 语义解析。
+        if old_val is None:
+            new_val = yaml.safe_load(val)
+        elif isinstance(old_val, bool):
             new_val = val.lower() in ("true", "1", "yes")
         elif isinstance(old_val, int):
             new_val = int(val)
