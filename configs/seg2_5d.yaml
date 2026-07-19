@@ -250,7 +250,7 @@ loss:
 
 train:
   # ---- 基本 ----
-  epochs                       : 2                # 总训练轮数
+  epochs                       : 4                # 总训练轮数
   seed                         : 42               # 全局随机种子
   deterministic                : false            # cudnn 确定性算法，结果可复现但更慢
   gpus                         : [0]              # 物理卡号列表（如 [0,2]）；[]/单元素=单卡（或 CPU），len>1 才进入 DDP

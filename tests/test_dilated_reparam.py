@@ -248,6 +248,9 @@ def test_build_model_dilated_reparam_train_backward_finite(patch_mode, xshape):
 
 
 def test_run_inference_reparam_deploy_toggle(monkeypatch, tmp_path):
+    # 强制 CPU 路径：CUDA 下 run_inference 会将模型转 cuda+fp16，
+    # 与闭包中的 CPU fp32 输入/参考输出不兼容。
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     cfg = _make_cfg(patch_mode="z_axis", deep_supervision=False, dilated_reparam=True)
     cfg.model.reparam_deploy = True
     cfg.predict.output_dir = str(tmp_path / "predictions")
