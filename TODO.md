@@ -199,7 +199,7 @@ A3（中，确定性）增强 RNG 跨 CPU/CUDA 两套全局生成器，"固定 s
 A4（低，取舍非 bug）纯 affine（无 elastic）样本旋转角点：image 走 border 复制、label 置背景，二者语义不一致 — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:283-288 image 用 padding_mode='border'，而越界点 label 被强制 label_fill（背景）。这是刻意取舍（避免边缘外推伪前景，对齐 nnU-Net 常数填充），但会给模型"有复制纹理却标背景"的监督点。当前靠 oversample 余量把角点裁掉（center_crop）缓解；z_axis 模式 H/W 无余量（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:235-236）时角点会留在 patch 内。记为观察项。
 
 B. 优化空间（性能 / 显存 / GPU）
-B1（中，显存）默认 inplace=False 在过采样 cube 上多克隆一份 img/lbl/wmap — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:52-56 入口 clone。而训练循环的输入本就是 H2D 私有拷贝（batch["image"].to(device, non_blocking=True)，@/d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:444-448，增强后不再以原值复用），恰好满足 AugConfig.inplace 契约（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:201-205）。aug_oversample_ratio>1 时这份克隆按过采样体积放大。建议 seg/ssl/gen trainer 侧显式开 inplace=True（或在文档明确推荐），省一份过采样 cube 的瞬时显存；保持 config 默认 False 作防御。
+B1（中，显存）默认 inplace=False 在过采样 cube 上多克隆一份 img/lbl/wmap — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:52-56 入口 clone。而训练循环的输入本就是 H2D 私有拷贝（batch["image"].to(device, non_blocking=True)，@/d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:444-448，增强后不再以原值复用），恰好满足 AugConfig.inplace 契约（@/d:/codes/work-projects/SegTask/taskcore/config/core.py:201-205）。aug_oversample_ratio>1 时这份克隆按过采样体积放大。建议 seg/ssl/gen trainer 侧显式开 inplace=True（或在文档明确推荐），省一份过采样 cube 的瞬时显存；保持 config 默认 False 作防御。【已修复（seg）：GPUAugmentor 新增 inplace 覆写参，seg trainer 传 inplace=True；ssl/gen 未动，待各自调用方确认所有权后同样接入】
 
 B2（低，显存）elastic 位移场在过采样全尺寸上生成 fp32 (n,3,D,H,W) — @/d:/codes/work-projects/SegTask/taskcore/data/augment.py:181-182 粗网格 randn 后 interpolate 到过采样 (D,H,W)，峰值随选中样本数线性增长。空间增强必须在裁剪前完成（否则边缘伪影入 patch），故无法把这步后移到 center_crop 之后——取舍合理，列为观察；可评估 disp 融入 grid 后（:277）提前 del 以压峰值。
 
@@ -234,7 +234,7 @@ A2（低，可维护性） — seg 重实现了 _finalize_swa/_swa_recalibrate_b
 A3（低，冗余同步） — 日志步存在重复 D2H。compute_loss 在 breakdown 分支写 breakdown["L_total"]=loss.detach().item()（如 @d:/codes/work-projects/SegTask/segtask_v1/trainer/pipelines/slab25d.py:121），而同一日志步 _flush_pending 又对同一 loss 做 stack().tolist()（trainer.py:418）。两次同步都只在日志步发生、开销可忽略，但可合并（L_total 由 pending 值回填）。属一致性瑕疵。
 
 B. 优化空间（性能 / 显存 / GPU）
-B1（低-中，热路径 H2D） — 损失内每次 forward 重建 fg_values 张量，触发逐步微小 H2D。MultiResolutionLoss._label_to_binary（@d:/codes/work-projects/SegTask/segtask_v1/losses/losses.py:784）、SliceChannelLoss._label_to_binary/_label_to_binary_5d（losses.py:868、losses.py:942）均 torch.tensor(self.fg_values, device=label.device, ...)。这在每个训练步（主路 + 每个 aux 视图）执行，从 Python list 构造并落 device，是可能的隐式同步点。建议构造时 register_buffer("fg_values", ..., persistent=False) 一次性驻留，forward 直接复用。低成本、纯提速。
+B1（低-中，热路径 H2D） — 损失内每次 forward 重建 fg_values 张量，触发逐步微小 H2D。MultiResolutionLoss._label_to_binary（@d:/codes/work-projects/SegTask/segtask_v1/losses/losses.py:784）、SliceChannelLoss._label_to_binary/_label_to_binary_5d（losses.py:868、losses.py:942）均 torch.tensor(self.fg_values, device=label.device, ...)。这在每个训练步（主路 + 每个 aux 视图）执行，从 Python list 构造并落 device，是可能的隐式同步点。建议构造时 register_buffer("fg_values", ..., persistent=False) 一次性驻留，forward 直接复用。低成本、纯提速。【已修复：改为首次 forward 惰性构建设备张量后缓存复用（_fg_tensor）；未用 register_buffer，因 criterion 不随 model .to(device)，buffer 会永驻 CPU 仍逐步 H2D】
 
 B2（中，训练加速专项） — val 成本可占 epoch 相当比例，且无"低频高保真"档。trainer 已逐 epoch 打印 val 占比（trainer.py:321-329），说明作者已察觉。val_metric_mode 为全局单选：medium 每 epoch 逐 batch loss.item()（validation.py:404，每 val batch 一次 D2H）、high 每 epoch 对全部 val 卷重载 npz + 滑窗（validation.py:483-495，Predictor 已缓存但整卷每 epoch 重读重预处理）。建议加"medium 每 epoch + high 每 N epoch/末段"的混合验证调度，显著降 high 模式 val 墙钟；high 模式若 RAM 允许可缓存预处理整卷。属训练总时长优化。
 
@@ -310,7 +310,7 @@ X3（低）训推一致性有一处永不被 val 覆盖的口径差
 val(high) 直调 predict_preprocessed_array 吃已烘焙 npz（Step 5-A2，@/d:/codes/work-projects/SegTask/segtask_v1/trainer/validation.py:493），而部署 predict_volume 走 resample_to_spacing 前处理+概率回采（@/d:/codes/work-projects/SegTask/segtask_v1/predictor/predictor.py:432-486）。训练期选出的 best 模型指标从不经历部署侧两次重采样误差。开 spacing_normalization 时，选模口径与部署口径存在未被验证的细微差。呼应 Step 1-C1/Step 3-C3 的 spacing 主题。
 
 X4（低）确定性契约横跨两套全局 RNG
-增强的 Bernoulli/标量走 CPU 全局 RNG、弹性位移/grid-dropout 走 CUDA 全局 RNG（Step 3-A3，@/d:/codes/work-projects/SegTask/taskcore/data/augment.py:22,181,322）。而数据层已有逐 worker 独立 RNG 的良好范式（Step 1）。增强层是全项目唯一依赖全局 RNG 状态的随机源，"固定 seed 等价性验证"（TODO3 的前置）因此脆弱。价值中（阻塞 TODO3 的 augment 合流验证）。
+增强的 Bernoulli/标量走 CPU 全局 RNG、弹性位移/grid-dropout 走 CUDA 全局 RNG（Step 3-A3，@/d:/codes/work-projects/SegTask/taskcore/data/augment.py:22,181,322）。而数据层已有逐 worker 独立 RNG 的良好范式（Step 1）。增强层是全项目唯一依赖全局 RNG 状态的随机源，"固定 seed 等价性验证"（TODO3 的前置）因此脆弱。价值中（阻塞 TODO3 的 augment 合流验证）。【已修复：GPUAugmentor 新增 seed 参数，非 None 时创建专属 CPU/设备 Generator 并透传到全部采样点（Bernoulli/标量 uniform_/弹性 randn/噪声 randn/grid-dropout randint），与全局 RNG 完全解耦；None 时沿用全局 RNG 保持历史行为。seg trainer 以 train.seed 逐 rank 分流构造；其余任务 trainer 未传 seed，行为不变。】
 
 X5（低）误配防护在 predict/augment 两处有枚举/正性校验缺口
 config.validate 对训练/数据/topology 覆盖严密，但：blend_mode 无枚举校验（拼错静默退化为均匀平均，Step 5-A1）、augment 的 sigma/std/zoom 无正性/区间校验（[0,0]/负值配置必炸、下界 0 小概率 NaN，Step 3-A1）。同类"fail-fast 覆盖面"缺口，宜合并一轮补齐。【均已修复：_validate_predict 补 blend_mode 枚举；_validate_augment 补 sigma/std/zoom/gamma 区间校验】
@@ -319,7 +319,7 @@ config.validate 对训练/数据/topology 覆盖严密，但：blend_mode 无枚
 #	主题	严重度	价值/成本	位置	来源
 P1	ADM/EDM2 build 不读 topo，就地重算几何【已修复】	中	高价值·低成本	adm_unet.py:766-859 edm2_unet.py:661-728	Step2-A1 / X1
 P2	factory 未透传 cond 到 Encoder（seg 接 cond 会静默错配）【已修复】	低-中	中价值·低成本	factory.py:450-466	Step2-A2 / X2
-P3	增强 RNG 跨两套全局生成器，等价性验证脆弱	中	中价值·中成本	augment.py:22,181,322	Step3-A3 / X4
+P3	增强 RNG 跨两套全局生成器，等价性验证脆弱【已修复：GPUAugmentor 独立 Generator，seg trainer 逐 rank 分流】	中	中价值·中成本	augment.py:22,181,322	Step3-A3 / X4
 P4	blend_mode 无枚举校验，拼错静默退化【已修复】	低	中价值·极低成本	blending.py:55-71	Step5-A1 / X5
 P5	augment sigma/std/zoom 无正性/区间校验【已修复】	低	中价值·极低成本	core.py:1738-1771	Step3-A1 / X5
 P6	ConvNeXt/MedNeXt 块内 attention 未透传 norm/reduction 配置（含核验新发现 N1：se_reduction 被静默忽略）【已修复 reduction 部分；norm 有意保持块内固定 norm 设计】	低	低价值·低成本	convnext.py:58 mednext.py:424	Step2-A3 / N1
@@ -332,8 +332,8 @@ P8	识别性冗余 except / whole 缓存别名一致性瑕疵（含核验新发�
 #	主题	价值/成本	位置	来源
 O1	cubic 单分辨率补 GPU 常驻 builder（对齐 z 路径），消 CPU 抽取+H2D	高价值·中成本（收益随 cubic 窗口数放大）	inputs.py:262-290 sliding.py:369-374	Step5-B1
 O2	val 混合调度（medium 每 epoch + high 每 N epoch），降 high 墙钟	高价值·低成本	validation.py:483-495	Step4-B2
-O3	损失 fg_values 改 register_buffer 一次性驻留，消热路径逐步 H2D	中价值·低成本	losses.py:784,868,942	Step4-B1
-O4	trainer 侧显式开 inplace=True，省过采样 cube 一份瞬时显存	中价值·低成本	augment.py:52-56	Step3-B1
+O3	损失 fg_values 改设备张量驻留，消热路径逐步 H2D【已修复：首次 forward 惰性构建后缓存复用（非 register_buffer：criterion 不随 model .to(device)，惰性缓存更稳妥）】	中价值·低成本	losses.py:784,868,942	Step4-B1
+O4	trainer 侧显式开 inplace=True，省过采样 cube 一份瞬时显存【已修复：GPUAugmentor 新增 inplace 覆写参，seg trainer 传 inplace=True（H2D 私有拷贝满足契约）；config 默认 False 保留防御】	中价值·低成本	augment.py:52-56	Step3-B1
 O5	手写 LayerNorm/GRN 统计 fp32 累加（对齐既有 fp16→fp32 范式）	中价值·低成本	convnext.py:27-29 blocks.py:97-99	Step2-B1
 O6	LRU 缓存可选存 int16 原始卷（以 CPU 换 RAM，大数据集划算）	中价值·中成本	dataset.py:749-753	Step1-B1
 O7	RoPE 路径 torch.compile 友好化（buffer 化坐标、非就地 rotate）	中价值·中成本（仅开 RoPE 时）	blocks.py:35-36,568-591	Step2-B2

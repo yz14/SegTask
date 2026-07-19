@@ -730,6 +730,9 @@ class MultiResolutionLoss(nn.Module):
     输入预测值 (B, num_fg*C_res, D,H,W)、标签 (B, C_res, D,H,W) 。
     按 C_res 拆 pred、逐尺度 binary 化 label、逐分辨率 base_loss 后取均。"""
 
+    # fg_values 设备张量缓存（首次 forward 惰性构建后驻留，免逐步 H2D）。
+    _fg_cache: Optional[torch.Tensor] = None
+
     def __init__(self, base_loss: nn.Module, num_fg_classes: int, num_res: int, label_values: List[int]):
         super().__init__()
         self.base_loss    = base_loss
@@ -779,9 +782,18 @@ class MultiResolutionLoss(nn.Module):
         self._per_res_history.append(torch.stack(per_res_row))
         return total / self.num_res
 
+    def _fg_tensor(self, device: torch.device,
+                   dtype: torch.dtype) -> torch.Tensor:
+        """返驻留于目标设备/dtype 的 fg_values 张量；首次构建后缓存复用。"""
+        fg = self._fg_cache
+        if fg is None or fg.device != device or fg.dtype != dtype:
+            fg = torch.tensor(self.fg_values, device=device, dtype=dtype)
+            self._fg_cache = fg
+        return fg
+
     def _label_to_binary(self, label: torch.Tensor) -> torch.Tensor:
         """整数 label (B,D,H,W) → 二值掊叠 (B,num_fg,D,H,W)，GPU 向量化。。"""
-        fg = torch.tensor(self.fg_values, device=label.device, dtype=label.dtype)
+        fg = self._fg_tensor(label.device, label.dtype)
         # label (B,D,H,W) → (B,1,D,H,W); fg (num_fg,) → (1,num_fg,1,1,1)。
         label_exp = label.unsqueeze(1)
         fg_pat    = 'c -> 1 c' + ' 1' * (label.ndim - 1)
@@ -822,6 +834,9 @@ class SliceChannelLoss(nn.Module):
 
     _VALID_REDUCTIONS = ("per_slice", "per_volume")
 
+    # fg_values 设备张量缓存（首次 forward 惰性构建后驻留，免逐步 H2D）。
+    _fg_cache: Optional[torch.Tensor] = None
+
     def __init__(
         self, base_loss: nn.Module, num_fg_classes: int, num_slices: int, label_values: List[int], reduction: str = "per_slice"):
         super().__init__()
@@ -852,6 +867,15 @@ class SliceChannelLoss(nn.Module):
     # ------------------------------------------------------------------
     # Per-slice reshape helpers (rank-4 contract: (B*D, num_fg, H, W))
     # ------------------------------------------------------------------
+    def _fg_tensor(self, device: torch.device,
+                   dtype: torch.dtype) -> torch.Tensor:
+        """返驻留于目标设备/dtype 的 fg_values 张量；首次构建后缓存复用。"""
+        fg = self._fg_cache
+        if fg is None or fg.device != device or fg.dtype != dtype:
+            fg = torch.tensor(self.fg_values, device=device, dtype=dtype)
+            self._fg_cache = fg
+        return fg
+
     def _label_to_binary(self, label_raw: torch.Tensor) -> torch.Tensor:
         """(B,D,H,W) 整数 → (B*D, num_fg, H, W) 二值（rank-4 供 2D base loss）。。"""
         if label_raw.ndim != 4:
@@ -865,7 +889,7 @@ class SliceChannelLoss(nn.Module):
                 f"label slice count {D} != configured num_slices "
                 f"{self.num_slices}")
 
-        fg   = torch.tensor(self.fg_values, device=label_raw.device, dtype=label_raw.dtype)
+        fg   = self._fg_tensor(label_raw.device, label_raw.dtype)
         fg_b = rearrange(fg, 'c -> 1 c 1 1')                        # (1, num_fg, 1, 1)
         flat = rearrange(label_raw, 'b d h w -> (b d) 1 h w')        # (B*D, 1, H, W)
         return (flat == fg_b).float()                               # (B*D, num_fg, H, W)
@@ -939,7 +963,7 @@ class SliceChannelLoss(nn.Module):
                 f"label slice count {D} != configured num_slices "
                 f"{self.num_slices}")
 
-        fg   = torch.tensor(self.fg_values, device=label_raw.device, dtype=label_raw.dtype)
+        fg   = self._fg_tensor(label_raw.device, label_raw.dtype)
         fg_b = rearrange(fg, 'c -> 1 c 1 1 1')                       # (1, num_fg, 1, 1, 1)
         flat = label_raw.unsqueeze(1)                                # (B, 1, D, H, W)
         return (flat == fg_b).float()                                # (B, num_fg, D, H, W)

@@ -141,8 +141,15 @@ class Trainer(BaseTrainer):
         # label_fill：affine/elastic 越界区域的背景 label 值（label_values[0]，
         # loader 构建后必已填充）。
         _bg = float(cfg.data.label_values[0]) if cfg.data.label_values else 0.0
+        # 独立增强随机流：与全局 RNG（模型初始化/dropout/DataLoader）解耦并逐
+        # rank 分流；固定 seed 下增强序列可复现（augment 合流等价性验证前置）。
+        # inplace=True：本循环的 image/label/wmap 是 H2D 私有拷贝（trainer
+        # _train_epoch），增强后不再以原值复用，满足 inplace 契约，省一份
+        # 过采样 cube 的瞬时显存。
+        _aug_seed = (int(cfg.train.seed) + 7919 * (self._rank + 1)) & 0x7FFFFFFF
         self.augmentor = GPUAugmentor(
-            cfg.augment, max_scale=max(_scales), label_fill=_bg)
+            cfg.augment, max_scale=max(_scales), label_fill=_bg,
+            seed=_aug_seed, inplace=True)
 
         # --- Tracking --------------------------------------------------
         self.num_fg = cfg.num_fg_classes
