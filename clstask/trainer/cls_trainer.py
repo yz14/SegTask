@@ -36,12 +36,10 @@ import torch.nn as nn
 from taskcore.config.core import Config as SegConfig
 from taskcore.data.augment import GPUAugmentor
 from taskcore.engine.amp import _LOGIT_CLAMP, autocast
-from taskcore.engine.checkpoint import (
-    AsyncCheckpointSaver, atomic_torch_save, snapshot_rng_state,
-    state_to_cpu, unwrap_compile,
-)
+from taskcore.engine.checkpoint import AsyncCheckpointSaver
 from taskcore.engine.dist_utils import all_gather_objects
 from taskcore.engine.prefetch import CudaPrefetcher
+from taskcore.engine.views import maybe_fold_depth_to_channels
 from taskcore.engine.optim import (
     GroupWarmupScheduler,
     build_optimizer,
@@ -203,8 +201,7 @@ class ClsTrainer(BaseTrainer):
             img, _, _ = self.augmentor(img, dummy)
             target = batch["target"].to(self.device, non_blocking=True)
         if self.fold_2_5d:
-            b, _, d, h, w = img.shape
-            img = img.reshape(b, d, h, w)                      # 深度折进通道
+            img = maybe_fold_depth_to_channels(img)
         return img, target
 
     def _train_epoch(self, epoch: int) -> Dict[str, float]:
@@ -260,17 +257,20 @@ class ClsTrainer(BaseTrainer):
                     img, target, self.num_classes,
                     self.cls.mixup_alpha, self.cls.cutmix_alpha,
                     self.cls.mixup_prob)
-            with torch.autocast(device_type=self.device.type,
-                                enabled=self.use_amp, dtype=self.amp_dtype):
-                logits = self.fwd_model(img)
-            loss = self._loss_fp32(logits, target)
             # 尾组 micro-batch 不满 accum 时用真实尾长作分母（同 seg）。
             eff_accum = self._effective_accum(step, total, accum)
-            loss_scaled = loss / eff_accum if eff_accum > 1 else loss
-            self.scaler.scale(loss_scaled).backward()
+            is_boundary = (step + 1) % accum == 0 or (step + 1) == total
+            # 非边界步免 all-reduce；forward 也必须放进 no_sync（同 seg）。
+            sync_ctx = self._ddp_no_sync(is_boundary)
+            with sync_ctx:
+                with torch.autocast(device_type=self.device.type,
+                                    enabled=self.use_amp, dtype=self.amp_dtype):
+                    logits = self.fwd_model(img)
+                loss = self._loss_fp32(logits, target)
+                loss_scaled = loss / eff_accum if eff_accum > 1 else loss
+                self.scaler.scale(loss_scaled).backward()
 
             pending.append((step, loss.detach(), img.shape[0]))
-            is_boundary = (step + 1) % accum == 0 or (step + 1) == total
             is_log_step = ((step + 1) % max(self.cfg.train.log_every, 1) == 0
                            or step == 0)
             loss_val: "float | None" = None
@@ -278,54 +278,20 @@ class ClsTrainer(BaseTrainer):
                 loss_val = _flush_pending()
 
             if is_boundary:
-                # 梯度范数：clip 开时复用其范数；bf16/fp32 无 GradScaler 保护，
-                # clip 关时也算一次全局范数作非有限守护（同 seg）。
-                grad_norm_val = None
-                if self.cfg.train.grad_clip_norm > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    gn = nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.cfg.train.grad_clip_norm)
-                    if not self._scaler_active:
-                        grad_norm_val = float(gn)
-                elif not self._scaler_active:
-                    grad_norm_val = self._global_grad_norm()
-                grad_nonfinite = (grad_norm_val is not None
-                                  and not math.isfinite(grad_norm_val))
-                if grad_norm_val is not None and not grad_nonfinite:
+                result = self._optimizer_step_boundary(
+                    group_has_nonfinite=group_has_nonfinite,
+                    epoch=epoch, step=step, total_steps=total)
+                group_has_nonfinite = False
+                grad_norm_val = result.grad_norm
+                if result.skipped_nonfinite:
+                    continue
+                opt_steps += 1
+                if grad_norm_val is not None and math.isfinite(grad_norm_val):
                     grad_norm_meter.update(grad_norm_val)
                     grad_norm_max = max(grad_norm_max, grad_norm_val)
                     if (self.cfg.train.grad_clip_norm > 0
                             and grad_norm_val > self.cfg.train.grad_clip_norm):
                         clipped_steps += 1
-
-                # bf16/fp32：loss/梯度非有限则丢弃本 accum 组，不推
-                # scheduler/EMA，避免 NaN 永久污染权重；fp16 由 GradScaler
-                # 内部跳过含 inf/NaN 梯度的优化步。
-                if not self._scaler_active and (group_has_nonfinite
-                                                or grad_nonfinite):
-                    logger.warning(
-                        "Skipping optimizer step at epoch %d step %d/%d: "
-                        "non-finite %s in this accumulation group.",
-                        epoch + 1, step + 1, total,
-                        "loss" if group_has_nonfinite else "gradient")
-                    self.optimizer.zero_grad(set_to_none=True)
-                    group_has_nonfinite = False
-                    continue
-                group_has_nonfinite = False
-
-                scale_before = (self.scaler.get_scale()
-                                if self._scaler_active else None)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                scaler_skipped = (scale_before is not None
-                                  and self.scaler.get_scale() < scale_before)
-                self.optimizer.zero_grad(set_to_none=True)
-                opt_steps += 1
-                # scheduler/EMA 仅在 optimizer 真正更新后推进（同 seg）。
-                if not scaler_skipped:
-                    self.scheduler.step()
-                    if self.ema is not None:
-                        self.ema.update(unwrap_compile(self.model))
 
             if is_log_step and loss_val is not None:
                 logger.debug("  [%d/%d] loss=%.4f lr=%.2e", step + 1, total,
@@ -357,8 +323,7 @@ class ClsTrainer(BaseTrainer):
                 break
             img = batch["image"].to(self.device, non_blocking=True).float()
             if self.fold_2_5d:
-                b, _, d, h, w = img.shape
-                img = img.reshape(b, d, h, w)
+                img = maybe_fold_depth_to_channels(img)
             with autocast(device_type=self.device.type,
                           enabled=self.use_amp, dtype=self.amp_dtype):
                 self.model(img)
@@ -458,78 +423,11 @@ class ClsTrainer(BaseTrainer):
         return {f"vol_{k}": v for k, v in vm.items()
                 if k in ("auc", "f1", "acc")}
 
-    def _save_best(self, epoch: int, metrics: Dict[str, float]) -> None:
-        """best checkpoint（口径同 seg：EMA 为主）：启用 EMA 时
-        ``model_state_dict`` 存 EMA 权重（与选模/部署一致），在线权重另存
-        ``model_online_state_dict``。"""
-        if not self._is_main:   # DDP：落盘仅 rank0
-            return
-        bare = unwrap_compile(self.model)
-        if self.ema is not None:
-            online_sd = {k: v.detach().cpu().clone()
-                         for k, v in bare.state_dict().items()}
-            self.ema.apply_shadow(bare)
-            try:
-                primary_sd = {k: v.detach().cpu().clone()
-                              for k, v in bare.state_dict().items()}
-            finally:
-                self.ema.restore(bare)
-        else:
-            online_sd = None
-            primary_sd = bare.state_dict()
-        state = {
-            "epoch": epoch,
-            "model_state_dict": primary_sd,
-            "best_metric": self.best_metric,
-            "best_epoch": self.best_epoch,
-            "metrics": metrics,
-            "config": self.cfg,
-            "cls_config": self.cls,
-        }
-        if online_sd is not None:
-            state["model_online_state_dict"] = online_sd
-        if self.ema is not None:
-            state["ema_state_dict"] = self.ema.state_dict()
-        path = self.output_dir / "best_model.pth"
-        if self._ckpt_saver is not None:
-            self._ckpt_saver.submit(
-                state_to_cpu(state), path,
-                on_done=lambda e=epoch, m=metrics[self.best_key]: logger.info(
-                    "Best cls model saved (%s=%.4f) @ epoch %d",
-                    self.best_key, m, e + 1))
-        else:
-            atomic_torch_save(state, path)
-            logger.info("Best cls model saved (%s=%.4f) @ epoch %d",
-                        self.best_key, metrics[self.best_key], epoch + 1)
+    # best/latest 落盘走 BaseTrainer 模板（EMA 为主 + 全量续训状态）。
+    _ckpt_task_label = "cls"
 
-    def _save_latest(self, epoch: int, metrics: Dict[str, float]) -> None:
-        """latest checkpoint（续训用，口径同 seg）：在线权重 + EMA +
-        optimizer/scheduler/scaler/epoch/best 状态/history 全量落盘；先写
-        临时文件再原子替换，防中断留半个 checkpoint。"""
-        if not self._is_main:   # DDP：落盘仅 rank0
-            return
-        bare = unwrap_compile(self.model)
-        state = {
-            "epoch": epoch,
-            "model_state_dict": bare.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "scaler_state_dict": self.scaler.state_dict(),
-            "best_metric": self.best_metric,
-            "best_epoch": self.best_epoch,
-            "metrics": metrics,
-            "history": self.history,
-            "config": self.cfg,
-            "cls_config": self.cls,
-            "rng_state": snapshot_rng_state(),
-        }
-        if self.ema is not None:
-            state["ema_state_dict"] = self.ema.state_dict()
-        path = self.output_dir / "latest_model.pth"
-        if self._ckpt_saver is not None:
-            self._ckpt_saver.submit(state_to_cpu(state), path)
-        else:
-            atomic_torch_save(state, path)  # 原子替换，防中断写坏
+    def _ckpt_extra_state(self) -> Dict:
+        return {"cls_config": self.cls}
 
     def _try_resume(self) -> None:
         """``train.resume`` 指向 checkpoint 时完整恢复（model/EMA/optimizer/

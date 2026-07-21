@@ -5,22 +5,15 @@ from __future__ import annotations
 import logging
 from typing import List, Tuple
 
-from torch.utils.data import DataLoader, DistributedSampler
-
 import numpy as np
 
 from taskcore.config.core import Config as SegConfig
-from taskcore.data.dataset import _open_npz
+from taskcore.data.dataset import _open_npz, derive_volume_targets
 from taskcore.data.loader import (
-    ValBatchShardSampler,
-    scaled_num_workers,
-    train_val_split,
-)
-
-from taskcore.data.dataset import derive_volume_targets
-from taskcore.data.loader import (
+    assemble_train_val_loaders,
     discover_npz_recursive as discover_npz,
     stratified_split_by_key as stratified_split,
+    train_val_split,
 )
 
 from ..config import DetConfig
@@ -120,37 +113,10 @@ def build_det_dataloaders(
 
     train_ds = _mk(train_paths, True)
     val_ds = _mk(val_paths, False)
-    eff_num_workers = scaled_num_workers(
-        dc.num_workers, world_size,
-        bool(cfg.train.ddp_scale_dataloader_per_rank))
-    common = dict(
-        num_workers=eff_num_workers,
-        pin_memory=dc.pin_memory,
-        collate_fn=det_collate,
-        persistent_workers=dc.persistent_workers and eff_num_workers > 0)
-    if eff_num_workers > 0:
-        common["prefetch_factor"] = dc.prefetch_factor
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_ds, num_replicas=world_size, rank=rank,
-            shuffle=True, drop_last=True)
-        train_loader = DataLoader(
-            train_ds, batch_size=dc.batch_size, sampler=train_sampler,
-            drop_last=True, **common)
-        val_loader = DataLoader(
-            val_ds, batch_size=dc.batch_size,
-            sampler=ValBatchShardSampler(
-                len(val_ds), dc.batch_size, rank, world_size),
-            drop_last=False, **common)
-        logger.info("dettask DDP samplers: rank=%d/%d, ~%d train samples/rank",
-                    rank, world_size, len(train_sampler))
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=dc.batch_size, shuffle=True, drop_last=False,
-            **common)
-        val_loader = DataLoader(
-            val_ds, batch_size=dc.batch_size, shuffle=False, drop_last=False,
-            **common)
+    train_loader, val_loader = assemble_train_val_loaders(
+        train_ds, val_ds, cfg, rank=rank, world_size=world_size,
+        collate_fn=det_collate, log_prefix="dettask",
+        train_drop_last=False)
     logger.info("dettask loaders: %d train / %d val volume(s)",
                 len(train_paths), len(val_paths))
     return train_loader, val_loader

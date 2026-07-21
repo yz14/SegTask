@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import unwrap_compile
 from taskcore.engine.dist_utils import (
     get_world_size, is_dist_avail_and_initialized)
@@ -107,8 +107,8 @@ class MoCoMethod(SSLMethod):
     def build_modules(self) -> nn.Module:
         proj_dim = int(self.ssl.moco_proj_dim)
         hidden_dim = int(self.ssl.dino_hidden_dim)
-        q_enc = build_model(self.cfg).encoder
-        k_enc = build_model(self.cfg).encoder
+        q_enc = build_backbone(self.cfg)
+        k_enc = build_backbone(self.cfg)
         k_enc.load_state_dict(q_enc.state_dict())   # key 初始 = query
         q_proj = DINOHead(
             in_dim=int(self.cfg.model.encoder_channels[-1]),

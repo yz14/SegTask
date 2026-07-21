@@ -12,13 +12,11 @@ import logging
 from typing import List, Sequence, Tuple
 
 import numpy as np
-from torch.utils.data import DataLoader, DistributedSampler
 
 from taskcore.config.core import Config as SegConfig
 from taskcore.data.loader import (
-    ValBatchShardSampler,
+    assemble_train_val_loaders,
     discover_npz_recursive,
-    scaled_num_workers,
     stratified_split_by_key,
     train_val_split,
 )
@@ -127,36 +125,9 @@ def build_cls_dataloaders(
 
     train_ds = _mk(train_paths, True)
     val_ds = _mk(val_paths, False)
-    eff_num_workers = scaled_num_workers(
-        dc.num_workers, world_size,
-        bool(cfg.train.ddp_scale_dataloader_per_rank))
-    common = dict(
-        num_workers=eff_num_workers,
-        pin_memory=dc.pin_memory,
-        persistent_workers=dc.persistent_workers and eff_num_workers > 0)
-    if eff_num_workers > 0:
-        common["prefetch_factor"] = dc.prefetch_factor
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_ds, num_replicas=world_size, rank=rank,
-            shuffle=True, drop_last=True)
-        train_loader = DataLoader(
-            train_ds, batch_size=dc.batch_size, sampler=train_sampler,
-            drop_last=True, **common)
-        val_loader = DataLoader(
-            val_ds, batch_size=dc.batch_size,
-            sampler=ValBatchShardSampler(
-                len(val_ds), dc.batch_size, rank, world_size),
-            drop_last=False, **common)
-        logger.info("clstask DDP samplers: rank=%d/%d, ~%d train samples/rank",
-                    rank, world_size, len(train_sampler))
-    else:
-        train_loader = DataLoader(
-            train_ds, batch_size=dc.batch_size, shuffle=True, drop_last=False,
-            **common)
-        val_loader = DataLoader(
-            val_ds, batch_size=dc.batch_size, shuffle=False, drop_last=False,
-            **common)
+    train_loader, val_loader = assemble_train_val_loaders(
+        train_ds, val_ds, cfg, rank=rank, world_size=world_size,
+        log_prefix="clstask", train_drop_last=False)
     logger.info("clstask loaders: %d train / %d val volume(s), K=%d",
                 len(train_paths), len(val_paths), num_classes)
     return train_loader, val_loader

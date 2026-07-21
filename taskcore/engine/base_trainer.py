@@ -14,8 +14,8 @@
 * ``_setup_best_tracking``  —— 最优指标 / 早停计数初始化。
 
 运行期共用件：``_ema_swapped``（异常安全的 EMA 换入换出）、``_effective_accum``
-（梯度累积尾批分母）、模型健康监测 helpers（全局梯度/权重范数、update ratio、
-``_collect_health_metrics``）。
+（梯度累积尾批分母）、``_ddp_no_sync`` / ``_optimizer_step_boundary``（累积边界
+跳步 + scaler/scheduler/EMA）、模型健康监测 helpers。
 
 子类约定：调用 helpers 前需已设置 ``self.cfg`` / ``self.model`` /
 ``self.device`` / ``self.train_loader``。
@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from contextlib import contextmanager
@@ -30,21 +31,42 @@ from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional
 
 import torch
+import torch.nn as nn
 
 from ..utils import AverageMeter, ModelEMA, ModelSWA, seed_everything
 from .amp import _AMP_DTYPES, GradScaler, resolve_auto_amp_dtype
 from .bn_stats import collect_bn_modules, estimate_bn_stats
 from .checkpoint import (
     atomic_torch_save, extract_model_state_dict, relocate_optimizer_state,
-    restore_rng_state, strip_common_prefixes, unwrap_compile,
+    restore_rng_state, snapshot_rng_state, state_to_cpu,
+    strip_common_prefixes, unwrap_compile,
 )
 from .dist_utils import (
-    all_reduce_bn_running_stats_, get_rank, get_world_size,
-    is_dist_avail_and_initialized, is_main_process,
+    all_reduce_bn_running_stats_, all_reduce_flag_any, get_rank,
+    get_world_size, is_dist_avail_and_initialized, is_main_process,
 )
 from .optim import WarmupScheduler, build_optimizer, build_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+class OptimStepResult:
+    """``_optimizer_step_boundary`` 的返回值。"""
+
+    __slots__ = ("stepped", "skipped_nonfinite", "scaler_skipped", "grad_norm")
+
+    def __init__(
+        self,
+        *,
+        stepped: bool,
+        skipped_nonfinite: bool,
+        scaler_skipped: bool,
+        grad_norm: "float | None",
+    ) -> None:
+        self.stepped = stepped
+        self.skipped_nonfinite = skipped_nonfinite
+        self.scaler_skipped = scaler_skipped
+        self.grad_norm = grad_norm
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +228,156 @@ class BaseTrainer:
         partial_start = total_steps - remainder
         return remainder if (remainder > 0 and step >= partial_start) else accum
 
+    def _ddp_no_sync(self, is_boundary: bool, module: "Optional[nn.Module]" = None):
+        """累积非边界步返回 ``module.no_sync()``，否则 ``nullcontext``。
+
+        ``module`` 默认取 ``self.fwd_model``（DDP 包装后的前向入口），缺省回退
+        ``self.model``。ssl 等无单一 ``fwd_model`` 的任务可显式传入或不调用。
+        """
+        if module is None:
+            module = getattr(self, "fwd_model", None) or self.model
+        if (getattr(self, "_is_dist", False) and not is_boundary
+                and hasattr(module, "no_sync")):
+            return module.no_sync()
+        return contextlib.nullcontext()
+
+    def _boundary_grad_norm(
+        self,
+        parameters,
+        *,
+        grad_clip_norm: float,
+    ) -> "float | None":
+        """累积边界：可选 clip，并返回用于非有限守护 / 健康监测的梯度范数。
+
+        口径与 seg trainer 一致：clip 开时复用 ``clip_grad_norm_``；bf16/fp32
+        无 scaler 时即便未 clip 也算全局范数；fp16+lazy_sync 且未开健康监测时
+        可跳过 D2H（GradScaler 已独立保护）。
+        """
+        tc = self.cfg.train
+        grad_norm_val = None
+        if grad_clip_norm > 0:
+            self.scaler.unscale_(self.optimizer)
+            gn = nn.utils.clip_grad_norm_(parameters, grad_clip_norm)
+            if (getattr(tc, "grad_norm_lazy_sync", False)
+                    and self._scaler_active
+                    and not getattr(self, "_health_monitor", False)):
+                grad_norm_val = None
+            else:
+                grad_norm_val = float(gn)
+        elif not self._scaler_active:
+            grad_norm_val = self._global_grad_norm()
+        elif (getattr(self, "_health_monitor", False)
+              and getattr(self, "_health_grad_norm_when_no_clip", True)):
+            try:
+                self.scaler.unscale_(self.optimizer)
+                grad_norm_val = self._global_grad_norm()
+            except Exception:  # 监测失败绝不打断训练
+                logger.warning(
+                    "Health grad-norm computation failed; skipping.",
+                    exc_info=True)
+                grad_norm_val = None
+        return grad_norm_val
+
+    def _optimizer_step_boundary(
+        self,
+        *,
+        group_has_nonfinite: bool,
+        epoch: int,
+        step: int,
+        total_steps: int,
+        parameters=None,
+        ema_module: "Optional[nn.Module]" = None,
+        before_step: "Optional[Callable[[], None]]" = None,
+        warn_scaler_skip: bool = False,
+        grad_clip_norm: "Optional[float]" = None,
+        always_step_scheduler: bool = False,
+    ) -> OptimStepResult:
+        """累积边界：clip / 非有限跳步 / scaler.step / scheduler+EMA。
+
+        语义（与 seg 参考实现对齐；ssl 见 ``always_step_scheduler``）：
+        * bf16/fp32：``all_reduce_flag_any(loss|grad 非有限)`` 统一各 rank 跳步。
+        * fp16：由 GradScaler 内部跳步。
+        * 默认仅在权重真正更新时推进 scheduler/EMA（seg/cls/det/gen）。
+        * ``always_step_scheduler=True``（ssl）：边界上无论是否跳步都推进
+          scheduler（方法时钟 / LR 与 global_step 对齐），EMA 仍仅在真正更新时推进。
+        * ``before_step`` 在确定不因非有限跳步之后、``scaler.step`` 之前调用。
+
+        调用方负责清零 ``group_has_nonfinite``、健康计数与 ``continue``。
+        """
+        if parameters is None:
+            parameters = self.model.parameters()
+        if grad_clip_norm is None:
+            grad_clip_norm = float(self.cfg.train.grad_clip_norm)
+        if ema_module is None:
+            ema_module = unwrap_compile(self.model)
+
+        grad_norm_val = self._boundary_grad_norm(
+            parameters, grad_clip_norm=grad_clip_norm)
+        grad_nonfinite = (
+            grad_norm_val is not None and not math.isfinite(grad_norm_val))
+        loss_nonfinite = bool(group_has_nonfinite)
+
+        # fp16 由 GradScaler 基于 all-reduce 后一致的梯度内部跳步；bf16/fp32
+        # 需 all-reduce(any) 统一跳步，维持 DDP 副本同步不变量。
+        skip_optim_step = False
+        if not self._scaler_active:
+            skip_optim_step = all_reduce_flag_any(
+                loss_nonfinite or grad_nonfinite, self.device)
+
+        if skip_optim_step:
+            causes = []
+            if loss_nonfinite:
+                causes.append("non-finite loss")
+            if grad_nonfinite:
+                causes.append("non-finite gradient")
+            logger.warning(
+                "Skipping optimizer step at epoch %d step %d/%d: "
+                "%s in this accumulation group "
+                "(amp_dtype=%s has no GradScaler protection).",
+                epoch + 1, step + 1, total_steps,
+                " and ".join(causes) if causes
+                else "non-finite on a peer rank",
+                getattr(self, "_amp_dtype_name", "unknown"))
+            self.optimizer.zero_grad(set_to_none=True)
+            if always_step_scheduler:
+                self.scheduler.step()
+            return OptimStepResult(
+                stepped=False, skipped_nonfinite=True,
+                scaler_skipped=False, grad_norm=grad_norm_val)
+
+        if before_step is not None:
+            before_step()
+
+        scale_before = (self.scaler.get_scale()
+                        if self._scaler_active else None)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        scaler_skipped = (
+            scale_before is not None
+            and self.scaler.get_scale() < scale_before)
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # scheduler：默认仅真正更新后推进；ssl 时钟与边界对齐则始终推进。
+        # EMA：仅真正更新后推进（与五任务一致）。
+        if not scaler_skipped:
+            self.scheduler.step()
+            if self.ema is not None:
+                self.ema.update(ema_module)
+        else:
+            if always_step_scheduler:
+                self.scheduler.step()
+            if warn_scaler_skip:
+                logger.warning(
+                    "GradScaler skipped optimizer step at epoch %d "
+                    "step %d/%d (inf/NaN grads); EMA/method state "
+                    "not advanced.", epoch + 1, step + 1, total_steps)
+
+        return OptimStepResult(
+            stepped=not scaler_skipped,
+            skipped_nonfinite=False,
+            scaler_skipped=bool(scaler_skipped),
+            grad_norm=grad_norm_val)
+
     # ------------------------------------------------------------------
     # Model-health helpers (轻量；仅 rank0 监测启用时调用)
     # ------------------------------------------------------------------
@@ -259,6 +431,93 @@ class BaseTrainer:
         if w_norm <= 0.0:
             return None
         return float(upd.item()) / w_norm
+
+    # ------------------------------------------------------------------
+    # checkpoint 保存模板（best/latest 双文件布局，cls/det 共用；
+    # seg/gen/ssl 的保存布局/命名各异，自留实现）
+    # ------------------------------------------------------------------
+    # 日志里的任务标签（"Best <label> model saved ..."）。
+    _ckpt_task_label = "model"
+
+    def _ckpt_extra_state(self) -> Dict:
+        """任务附加落盘字段（如 ``{"cls_config": self.cls}``），随
+        best/latest 一并写入。"""
+        return {}
+
+    def _save_best(self, epoch: int, metrics: Dict[str, float]) -> None:
+        """best checkpoint（EMA 为主）：启用 EMA 时 ``model_state_dict`` 存
+        EMA 权重（与选模/部署一致），在线权重另存
+        ``model_online_state_dict``。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
+        bare = unwrap_compile(self.model)
+        if self.ema is not None:
+            online_sd = {k: v.detach().cpu().clone()
+                         for k, v in bare.state_dict().items()}
+            self.ema.apply_shadow(bare)
+            try:
+                primary_sd = {k: v.detach().cpu().clone()
+                              for k, v in bare.state_dict().items()}
+            finally:
+                self.ema.restore(bare)
+        else:
+            online_sd = None
+            primary_sd = bare.state_dict()
+        state = {
+            "epoch": epoch,
+            "model_state_dict": primary_sd,
+            "best_metric": self.best_metric,
+            "best_epoch": self.best_epoch,
+            "metrics": metrics,
+            "config": self.cfg,
+            **self._ckpt_extra_state(),
+        }
+        if online_sd is not None:
+            state["model_online_state_dict"] = online_sd
+        if self.ema is not None:
+            state["ema_state_dict"] = self.ema.state_dict()
+        path = self.output_dir / "best_model.pth"
+        label = self._ckpt_task_label
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(
+                state_to_cpu(state), path,
+                on_done=lambda e=epoch, m=metrics[self.best_key]: logger.info(
+                    "Best %s model saved (%s=%.4f) @ epoch %d",
+                    label, self.best_key, m, e + 1))
+        else:
+            atomic_torch_save(state, path)
+            logger.info("Best %s model saved (%s=%.4f) @ epoch %d",
+                        label, self.best_key, metrics[self.best_key],
+                        epoch + 1)
+
+    def _save_latest(self, epoch: int, metrics: Dict[str, float]) -> None:
+        """latest checkpoint（续训用）：在线权重 + EMA + optimizer/
+        scheduler/scaler/epoch/best 状态/history 全量落盘；原子替换
+        防中断写坏。"""
+        if not self._is_main:   # DDP：落盘仅 rank0
+            return
+        bare = unwrap_compile(self.model)
+        state = {
+            "epoch": epoch,
+            "model_state_dict": bare.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "best_metric": self.best_metric,
+            "best_epoch": self.best_epoch,
+            "metrics": metrics,
+            "history": self.history,
+            "config": self.cfg,
+            "rng_state": snapshot_rng_state(),
+            **self._ckpt_extra_state(),
+        }
+        if self.ema is not None:
+            state["ema_state_dict"] = self.ema.state_dict()
+        path = self.output_dir / "latest_model.pth"
+        if self._ckpt_saver is not None:
+            self._ckpt_saver.submit(state_to_cpu(state), path)
+        else:
+            atomic_torch_save(state, path)  # 原子替换，防中断写坏
 
     # ------------------------------------------------------------------
     # Resume / Pretrain 公共加载策略
@@ -688,4 +947,4 @@ class BaseTrainer:
             out["update_ratio"] = update_ratio
 
 
-__all__ = ["BaseTrainer", "_reseed_rank_rng"]
+__all__ = ["BaseTrainer", "OptimStepResult", "_reseed_rank_rng"]

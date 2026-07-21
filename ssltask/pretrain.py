@@ -24,7 +24,7 @@ from taskcore.engine.launch import (
     maybe_enable_expandable_segments)
 from taskcore.utils.common import seed_everything
 
-from .config import apply_overrides, load_config, save_config, validate_ssl
+from .config import apply_overrides, load_config, save_config, validate_ssl, validate_core
 from .data.ssl_dataset import build_ssl_dataloader
 from .methods import build_method
 from .trainer import SSLTrainer
@@ -86,7 +86,7 @@ def main():
     if args.override:
         apply_overrides(cfg, ssl, args.override)
         cfg.sync()
-        cfg.validate()
+        validate_core(cfg)
         validate_ssl(ssl, cfg)
 
     maybe_enable_expandable_segments(cfg)

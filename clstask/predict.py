@@ -16,7 +16,7 @@ import torch
 
 from taskcore.utils.logging_utils import setup_logging as _setup_logging
 
-from .config import apply_overrides, load_config, validate_cls
+from .config import apply_overrides, load_config, validate_cls, validate_core
 from .data.loader import discover_npz
 from .models.factory import build_classifier
 from .predictor.cls_predictor import ClsPredictor
@@ -40,7 +40,7 @@ def main():
     if args.override:
         apply_overrides(cfg, cls, args.override)
         cfg.sync()
-        cfg.validate()
+        validate_core(cfg)
         validate_cls(cls, cfg)
 
     _setup_logging(output_dir=args.out_dir, level=args.log_level,

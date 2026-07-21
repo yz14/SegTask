@@ -26,15 +26,11 @@ import numpy as np
 import torch
 
 from taskcore.config.core import Config as SegConfig
-from taskcore.data.dataset import (
-    extract_z_patch_padded,
-    load_npz_image,
-    resize_3d,
-)
+from taskcore.data.dataset import load_npz_image
+from taskcore.data.patch_extract import extract_patch_by_mode
 from taskcore.engine.base_predictor import BasePredictor
 
 from ..config import ClsConfig, resolve_num_classes
-from ..data.cls_dataset import _extract_cubic_patch
 
 logger = logging.getLogger(__name__)
 
@@ -128,13 +124,8 @@ class ClsPredictor(BasePredictor):
     def _extract(self, vol: np.ndarray,
                  center: Tuple[int, ...]) -> np.ndarray:
         """按 patch_mode 抽严格 (pD,pH,pW) patch（与训练数据集同一几何）。"""
-        pD, pH, pW = self.patch
-        if self.patch_mode == "whole":
-            return resize_3d(vol, pD, pH, pW, is_label=False)
-        if self.patch_mode == "cubic":
-            return _extract_cubic_patch(vol, center, self.patch)
-        p = extract_z_patch_padded(vol, center[0], pD)
-        return resize_3d(p, pD, pH, pW, is_label=False)
+        return extract_patch_by_mode(
+            vol, self.patch_mode, center, self.patch, is_label=False)
 
 
 

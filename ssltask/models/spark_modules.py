@@ -15,7 +15,7 @@ SparK 的 CNN 原生掩码图像建模。本实现遵守 ``TODO`` 决策 D4「�
 densify（被遮位点填入逐尺度可学习 ``mask_embed``），再逐级三线性上采样 + 融合同尺度
 encoder 横向特征，最终输出单通道重建。
 
-交接契约：``encoder`` 取自 ``segtask_v1.models.factory.build_model(cfg).encoder``（逐
+交接契约：``encoder`` 取自 ``segtask_v1.models.factory.build_backbone(cfg)``（逐
 参数同名同形）；解码器命名为 ``spark_decoder.*``、嵌入为 ``spark_decoder.mask_embed.*``，
 **绝不复用** ``decoder.*``/``seg_head.*`` 前缀 → 下游 ``train.pretrain``（strict=False）
 仅命中 ``encoder.*``，其余作 unexpected 干净丢弃（MIM 不预训练解码器）。
@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 from taskcore.models.blocks import (
     _CONV, INTERP_SMOOTH, ConvNormAct, Upsample)
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 
 from ..data.masking import densify, downsample_mask_to
 
@@ -435,18 +435,17 @@ def build_ssl_spark_model(cfg, dim_div: int = 4, min_dim: int = 16,
     if mode not in ("light", "seg"):
         raise ValueError(
             f"decoder_mode must be 'light' or 'seg'; got {decoder_mode!r}.")
-    seg_model = build_model(cfg)                 # 同一构建路径，确保 encoder 同名同形
-    encoder = seg_model.encoder
-    if masked_norm:
-        n_conv = enable_masked_instance_norm(encoder)
-        logger.info(
-            "SparK masked InstanceNorm enabled: %d norm layer(s) converted.",
-            n_conv)
     spatial_dims = int(cfg.model.spatial_dims)
     out_ch = int(cfg.model.in_channels)
     if mode == "seg":
+        encoder, decoder = build_backbone(cfg, with_decoder=True)
+        if masked_norm:
+            n_conv = enable_masked_instance_norm(encoder)
+            logger.info(
+                "SparK masked InstanceNorm enabled: %d norm layer(s) converted.",
+                n_conv)
         model: nn.Module = SSLSparkSegDecModel(
-            encoder=encoder, decoder=seg_model.decoder,
+            encoder=encoder, decoder=decoder,
             encoder_channels=[int(c) for c in cfg.model.encoder_channels],
             in_channels=out_ch, spatial_dims=spatial_dims)
         pc = model.param_count()
@@ -455,6 +454,12 @@ def build_ssl_spark_model(cfg, dim_div: int = 4, min_dim: int = 16,
             "decoder=%.2fM (downstream-transferable), total=%.2fM.",
             pc["encoder"] / 1e6, pc["spark_decoder"] / 1e6, pc["total"] / 1e6)
         return model
+    encoder = build_backbone(cfg)
+    if masked_norm:
+        n_conv = enable_masked_instance_norm(encoder)
+        logger.info(
+            "SparK masked InstanceNorm enabled: %d norm layer(s) converted.",
+            n_conv)
     decoder = build_spark_decoder(cfg, encoder, dim_div=dim_div, min_dim=min_dim)
     model = SSLSparkModel(
         encoder=encoder, decoder=decoder, in_channels=out_ch,

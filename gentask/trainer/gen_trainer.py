@@ -251,20 +251,49 @@ class GenerationTrainer(BaseTrainer):
         self.model.train()
         loss_meter = AverageMeter()
         bd_meters: Dict[str, AverageMeter] = {}
+        tc = self.cfg.train
         accum = self.grad_accum_steps
         total = len(self.train_loader)
         self.optimizer.zero_grad(set_to_none=True)
-        group_bad = False   # 当前 accum 组内出现非有限 loss，整组丢弃
+        group_has_nonfinite = False
         skipped = 0
         grad_norm_meter = AverageMeter()
         grad_norm_max = 0.0
         nonfinite_steps = 0
         clipped_steps = 0
         opt_steps = 0
+
+        # 未缩放损失先以 GPU 张量缓存，延迟到日志步 / bf16 边界单次同步
+        # （与 seg trainer pending 同源），避免每 micro-step loss.item()。
+        pending: "list[tuple[int, torch.Tensor, int]]" = []
+
+        def _flush_pending() -> "float | None":
+            nonlocal group_has_nonfinite, nonfinite_steps, skipped
+            if not pending:
+                return None
+            vals = torch.stack([t for _, t, _ in pending]).tolist()
+            last: "float | None" = None
+            for (s, _, bs), v in zip(pending, vals):
+                last = v
+                if math.isfinite(v):
+                    loss_meter.update(v, bs)
+                else:
+                    group_has_nonfinite = True
+                    nonfinite_steps += 1
+                    skipped += 1
+                    logger.warning(
+                        "Non-finite train loss (%s) at epoch %d step %d/%d; "
+                        "surrounding optimizer step will be skipped (%s).",
+                        v, epoch + 1, s + 1, total,
+                        "by GradScaler" if self._scaler_active
+                        else "non-finite loss guard")
+            pending.clear()
+            return last
+
         # prefetch_to_gpu：独立 copy stream 提前一个 batch 上卡，H2D 与计算
         # 重叠。交付的张量已在 device 上，下方 .to(device) 退化为 no-op。
         batch_iter = self.train_loader
-        if self.cfg.train.prefetch_to_gpu and self.device.type == "cuda":
+        if tc.prefetch_to_gpu and self.device.type == "cuda":
             batch_iter = CudaPrefetcher(self.train_loader, self.device)
         for step, batch in enumerate(batch_iter):
             hr = self._hr_batch(batch)
@@ -276,65 +305,62 @@ class GenerationTrainer(BaseTrainer):
                 hr, weight_map, cond = self.augmentor(hr, weight_map, cond)
             hr, weight_map, cond = self.pipeline.prepare_batch(
                 hr, weight_map, cond)
-            with torch.autocast(device_type=self.device.type,
-                                enabled=self.use_amp, dtype=self.amp_dtype):
-                out = self.fwd_model(hr, cond=cond)
+
+            eff_accum = self._effective_accum(step, total, accum)
+            is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total)
+            # 非边界步免 all-reduce；forward 也必须放进 no_sync（与 seg 同）。
+            sync_ctx = self._ddp_no_sync(is_step_boundary)
+            is_log_step = ((step + 1) % max(tc.log_every, 1) == 0 or step == 0)
             bd: Dict[str, float] = {}
-            loss = self._step_loss(out, bd, weight_map=weight_map)
-            loss_val = float(loss.item())
-            if not math.isfinite(loss_val):
-                # 非有限 loss：不反传，标记整个 accum 组丢弃，保护权重/EMA。
-                group_bad = True
-                skipped += 1
-                nonfinite_steps += 1
-                logger.warning("Non-finite loss (%.4g) at step %d/%d; "
-                               "dropping current accum group.",
-                               loss_val, step + 1, total)
-            else:
-                # 尾组 micro-batch 不满 accum 时用真实尾长作分母。
-                eff_accum = self._effective_accum(step, total, accum)
+
+            # 恒反传：非有限 loss 也走 backward，保证 DDP 各 rank 集体计数一致；
+            # 跳步决策在边界用 all_reduce_flag_any 统一（见下）。
+            with sync_ctx:
+                with torch.autocast(device_type=self.device.type,
+                                    enabled=self.use_amp, dtype=self.amp_dtype):
+                    out = self.fwd_model(hr, cond=cond)
+                loss = self._step_loss(
+                    out, bd if is_log_step else None, weight_map=weight_map)
                 loss_scaled = loss / eff_accum if eff_accum > 1 else loss
                 self.scaler.scale(loss_scaled).backward()
 
-            if (step + 1) % accum == 0 or (step + 1) == total:
-                stepped = False
-                if group_bad:
-                    group_bad = False
-                else:
-                    self.scaler.unscale_(self.optimizer)
-                    clip = self.cfg.train.grad_clip_norm
-                    grad_norm = nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        clip if clip > 0 else float("inf"))
-                    if torch.isfinite(grad_norm):
-                        gn = float(grad_norm)
-                        grad_norm_meter.update(gn)
-                        grad_norm_max = max(grad_norm_max, gn)
-                        if clip > 0 and gn > clip:
-                            clipped_steps += 1
-                        self.scaler.step(self.optimizer)
-                        stepped = True
-                    else:
-                        skipped += 1
-                        logger.warning(
-                            "Non-finite grad norm at step %d/%d; skipping "
-                            "optimizer step.", step + 1, total)
-                    self.scaler.update()
-                    opt_steps += 1
-                self.optimizer.zero_grad(set_to_none=True)
-                # scheduler 无条件计时，保持 horizon 与总优化步对齐。
-                self.scheduler.step()
-                if stepped and self.ema is not None:
-                    self.ema.update(unwrap_compile(self.model))
+            pending.append((step, loss.detach(), hr.shape[0]))
 
-            if math.isfinite(loss_val):
-                loss_meter.update(loss_val, hr.shape[0])
+            step_loss: "float | None" = None
+            if is_log_step or (is_step_boundary and not self._scaler_active):
+                step_loss = _flush_pending()
+            if step_loss is not None and math.isfinite(step_loss):
                 for k, v in bd.items():
-                    bd_meters.setdefault(k, AverageMeter()).update(
-                        v, hr.shape[0])
-            if (step + 1) % max(self.cfg.train.log_every, 1) == 0 or step == 0:
-                logger.debug("  [%d/%d] loss=%.4f lr=%.2e",
-                             step + 1, total, loss_val, self.scheduler.get_lr())
+                    if math.isfinite(v):
+                        bd_meters.setdefault(k, AverageMeter()).update(
+                            v, hr.shape[0])
+
+            if is_step_boundary:
+                result = self._optimizer_step_boundary(
+                    group_has_nonfinite=group_has_nonfinite,
+                    epoch=epoch, step=step, total_steps=total)
+                group_has_nonfinite = False
+                grad_norm_val = result.grad_norm
+                if result.skipped_nonfinite:
+                    if self._health_monitor:
+                        opt_steps += 1
+                    continue
+                opt_steps += 1
+                if grad_norm_val is not None and math.isfinite(grad_norm_val):
+                    grad_norm_meter.update(grad_norm_val)
+                    grad_norm_max = max(grad_norm_max, grad_norm_val)
+                    if (tc.grad_clip_norm > 0
+                            and grad_norm_val > tc.grad_clip_norm):
+                        clipped_steps += 1
+
+            if is_log_step:
+                logger.debug(
+                    "  [%d/%d] loss=%.4f lr=%.2e",
+                    step + 1, total,
+                    step_loss if step_loss is not None else float("nan"),
+                    self.scheduler.get_lr())
+
+        _flush_pending()
         if skipped:
             logger.warning("Epoch %d: %d non-finite loss/grad event(s) skipped.",
                            epoch + 1, skipped)

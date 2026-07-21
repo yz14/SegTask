@@ -9,7 +9,7 @@
   1×1 卷积头（对每级 encoder 特征预测前景 logits，上采样求和）；微调时 encoder 也
   参与训练，但学习率更低。
 * **可比性**：每次评估都从固定随机种子重置头、训练固定步数，跨 epoch 可比。
-* **零侵入下游**：encoder 经 ``build_model(cfg).encoder`` 构造（与 SSL 同构），探
+* **零侵入下游**：encoder 经 ``build_backbone(cfg)`` 构造（与 SSL 同构），探
 针仅读 SSL 导出 state_dict 的 ``encoder.*`` 子集（``strict=True`` 校验同名同形）。
 * **范围**：3D（``spatial_dims==3``）与 2.5D（``spatial_dims==2``，深度 D 折进通
 道）均支持。
@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from taskcore.models.blocks import _CONV, INTERP_SMOOTH
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import strip_common_prefixes
 from taskcore.utils.common import compute_dice_per_class
 
@@ -169,7 +169,7 @@ class SegProbe:
         self.seed = int(ssl.probe_seed)
         self.finetune = bool(ssl.probe_finetune if finetune is None else finetune)
 
-        self.encoder = build_model(cfg).encoder.to(device)
+        self.encoder = build_backbone(cfg).to(device)
         for p in self.encoder.parameters():
             p.requires_grad_(False)
         self.train_loader, self.val_loader = build_probe_loaders(cfg, ssl)

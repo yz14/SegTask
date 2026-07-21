@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from taskcore.models.blocks import _CONV, ConvNormAct
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def build_jepa_encoder(cfg) -> nn.Module:
     if arch != "unet":
         raise ValueError(
             f"build_jepa_encoder requires model.arch=='unet'; got {arch!r}.")
-    return build_model(cfg).encoder
+    return build_backbone(cfg)
 
 
 def build_jepa_predictor(cfg, channels: int, hidden: int, depth: int

@@ -34,10 +34,15 @@ def _line_series(label: str, color: str, points: List[List[float]]) -> Dict[str,
     return {"label": label, "color": color, "points": points}
 
 
-# 概览指标：均值类（按出现顺序取存在者）。
+# 概览指标：均值/任务主指标（按出现顺序取存在者）。
+# seg 专属在前；其后为 cls / det / gen / ssl 常见验证键，避免非 seg run 概览空窗。
 _OVERVIEW_METRICS: List[str] = [
     "mean_dice", "mean_iou", "mean_recall", "mean_precision",
     "mean_mcc", "mean_vol_sim", "mean_surface_dice", "min_class_dice",
+    "auc", "f1", "acc", "vol_auc", "vol_f1", "vol_acc",
+    "map",
+    "psnr", "ssim", "psnr_lr", "vol_psnr", "vol_ssim", "vol_psnr_lr",
+    "probe_dice",
 ]
 
 # 逐类指标前缀 → 人类可读名。[0,1] 同尺度的合并到一张图（线型区分指标）；
@@ -188,11 +193,14 @@ def build_single_payload(
         s["emphasis"] = True
         loss_series.append(s)
     # 新历史产 val_base_loss（裸 base_loss，无 DS/aux/topo 加权）；旧历史仍是
-    # val_loss，取存在的那个键以兼容旧 run 的图表渲染。
-    vloss_key = ("val_base_loss" if "val_base_loss" in val_keys
-                 else ("val_loss" if "val_loss" in val_keys else None))
+    # val_loss；cls/det 等任务 val 字典用裸 "loss"。取存在的那个键。
+    vloss_key = next(
+        (k for k in ("val_base_loss", "val_loss", "loss") if k in val_keys),
+        None)
     if vloss_key is not None:
-        s = _line_series("val base loss", _color(1),
+        label = ("val base loss" if vloss_key == "val_base_loss"
+                 else "val loss")
+        s = _line_series(label, _color(1),
                          _points(hist, vloss_key, "val"))
         s["emphasis"] = True
         loss_series.append(s)
@@ -205,7 +213,7 @@ def build_single_payload(
         # 损失不同量纲，两条曲线不可直接比较绝对值。
         panels.append({
             "id": "loss",
-            "title": "Loss（val = 裸 base loss，与 train 组合损失口径不同）",
+            "title": "Loss（val 与 train 口径可能不同，勿直接比绝对值）",
             "kind": "line",
             "group": "Training", "span": "full",
             "log_toggle": True, "best_x": best_x, "series": loss_series,
@@ -417,11 +425,11 @@ def build_compare_payload(
     run_colors = [_color(i) for i in range(len(hs))]
 
     # 对比的指标集合：验证损失 + 概览均值指标（取任一 run 出现过的）。
-    # val_base_loss 为新键，val_loss 兼容旧历史。
+    # val_base_loss 为新键，val_loss 兼容旧历史；裸 "loss" 兼容 cls/det。
     val_union = set()
     for h in hs:
         val_union.update(h.metric_keys("val"))
-    compare_metrics = [k for k in ("val_base_loss", "val_loss")
+    compare_metrics = [k for k in ("val_base_loss", "val_loss", "loss")
                        if k in val_union] \
         + [m for m in _OVERVIEW_METRICS if m in val_union]
 

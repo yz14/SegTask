@@ -5,7 +5,7 @@ DINO 把 image-only 自监督建模为"学生网络匹配 EMA 教师网络的软
 输出 ``out_dim`` 个原型上的 logits。学生看全部裁剪、教师只看 global 裁剪，损失为
 教师（centering+sharpening 后）与学生分布的交叉熵（见 ``methods/dino.py``）。
 
-骨干复用：``DINONet.encoder`` 取自 ``segtask_v1.models.factory.build_model(cfg).encoder``
+骨干复用：``DINONet.encoder`` 取自 ``segtask_v1.models.factory.build_backbone(cfg)``
 （保证与下游逐参数同名同形）；DINO 不预训练解码器，故下游 ``train.pretrain``
 （strict=False）仅命中 ``encoder.*``、``decoder.*``/``seg_head.*`` 保持随机。``DINOHead``
 与 student/teacher 前缀在导出时被丢弃（见 ``DINOMethod.export_backbone_state_dict``）。
@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +107,7 @@ def build_dino_net(
     if arch != "unet":
         raise ValueError(
             f"build_dino_net requires model.arch=='unet'; got {arch!r}.")
-    seg_model = build_model(cfg)            # 同一构建路径，确保 encoder 同名同形
-    encoder = seg_model.encoder
+    encoder = build_backbone(cfg)
     in_dim = int(cfg.model.encoder_channels[-1])
     head = DINOHead(
         in_dim=in_dim, out_dim=int(out_dim), hidden_dim=int(hidden_dim),

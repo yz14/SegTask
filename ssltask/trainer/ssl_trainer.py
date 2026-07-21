@@ -29,10 +29,11 @@ from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, relocate_optimizer_state, restore_rng_state,
     state_to_cpu, unwrap_compile)
 from taskcore.engine.dist_utils import (
-    all_reduce_flag_any, get_rank, get_world_size,
+    get_rank, get_world_size,
     is_dist_avail_and_initialized, is_main_process)
 from taskcore.engine.optim import (
     WarmupScheduler, build_optimizer, build_scheduler)
+from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.views import fold_depth_to_channels
 from taskcore.utils.common import AverageMeter, Timer
 from taskcore.engine.base_trainer import BaseTrainer, _reseed_rank_rng
@@ -91,12 +92,12 @@ class SSLTrainer(BaseTrainer):
         warmup_steps = tc.warmup_epochs * opt_steps_per_epoch
         total_steps = tc.epochs * opt_steps_per_epoch
         post_warmup = total_steps - warmup_steps
-        if tc.scheduler == "one_cycle" and warmup_steps > 0:
-            raise ValueError(
-                "OneCycleLR has built-in warmup; set train.warmup_epochs=0.")
         base_scheduler = build_scheduler(
             self.optimizer, cfg, opt_steps_per_epoch,
             post_warmup_steps=post_warmup)
+        # one_cycle 自带 warmup（warmup_epochs 已映射 pct_start，见
+        # build_scheduler），外层不再叠加线性 warmup（口径同 seg/cls/det）。
+        warmup_steps = 0 if tc.scheduler == "one_cycle" else warmup_steps
         self.scheduler = WarmupScheduler(
             self.optimizer, base_scheduler, warmup_steps=warmup_steps,
             warmup_lr=tc.warmup_lr, base_lr=tc.lr)
@@ -507,15 +508,22 @@ class SSLTrainer(BaseTrainer):
 
             # --- 监控面板：逐 epoch 落盘 + 节奏化重渲染（异常隔离）---
             if self._monitor is not None:
+                # 选模指标镜像进 val，供 MetricsLogger._compute_best 与 charts
+                # Validation 概览使用（SSL 无独立验证集）。
+                val_metrics: Dict[str, float] = {}
                 if probe_dice is not None:
                     train_metrics["probe_dice"] = float(probe_dice)
+                    val_metrics["probe_dice"] = float(probe_dice)
+                if "loss" in train_metrics:
+                    val_metrics["loss"] = float(train_metrics["loss"])
                 gpu_peak = (
                     torch.cuda.max_memory_allocated(self.device) / 1024 ** 2
                     if self.device.type == "cuda" else None)
                 is_best = (improved_probe if use_probe_select
                            else improved_loss)
                 self._monitor_log_epoch(
-                    epoch, train_metrics, lr=self.scheduler.get_lr(),
+                    epoch, train_metrics, val_metrics,
+                    lr=self.scheduler.get_lr(),
                     gpu_peak_mib=gpu_peak, wall_time_s=elapsed - epoch_t0,
                     is_best=is_best, last_epoch=is_last)
 
@@ -647,7 +655,13 @@ class SSLTrainer(BaseTrainer):
             pending.clear()
             return last
 
-        for step, batch in enumerate(self.train_loader):
+        # prefetch_to_gpu：独立 copy stream 提前一个 batch 上卡；顶层 Tensor
+        # 已在 device 时下方 _prepare 的 .to(device) 退化为 no-op。
+        batch_iter = self.train_loader
+        if tc.prefetch_to_gpu and self.device.type == "cuda":
+            batch_iter = CudaPrefetcher(self.train_loader, self.device)
+
+        for step, batch in enumerate(batch_iter):
             batch = self._prepare(batch)
             bs = batch["image"].shape[0] if "image" in batch else tc.batch_size
             if self.augmentor is not None and "image" in batch:
@@ -684,85 +698,31 @@ class SSLTrainer(BaseTrainer):
             if is_boundary:
                 # DDP：先均值 all-reduce 各 rank 梯度（与 DDP wrapper 数学等价）。
                 self._sync_grads()
-                # 梯度范数（含裁剪）在**跳步决策之前**求出，使 bf16/fp32 能把
-                # “梯度非有限”与“loss 非有限”一并纳入判定（与 segtask trainer 一致）。
-                grad_norm_val = None
-                if tc.grad_clip_norm > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    gn = nn.utils.clip_grad_norm_(
-                        self.method.parameters(), tc.grad_clip_norm)
-                    # fp16+裁剪且未开健康监测：float(gn) 的 D2H 同步可懒惰跳过
-                    # （GradScaler 已独立保护 inf/NaN 梯度）；bf16/fp32 需其值守护。
-                    if (tc.grad_norm_lazy_sync and self._scaler_active
-                            and not self._health_monitor):
-                        grad_norm_val = None
-                    else:
-                        grad_norm_val = float(gn)
-                elif not self._scaler_active:
-                    # bf16/fp32 未裁剪：显式求全局梯度范数作非有限守护（grad 已在
-                    # 无 scaler 下即为真实尺度；all-reduce 后各 rank 一致）。
-                    grad_norm_val = self._global_grad_norm()
-                elif health_on and self._health_grad_norm_when_no_clip:
-                    self.scaler.unscale_(self.optimizer)
-                    grad_norm_val = self._global_grad_norm()
-                grad_nonfinite = (grad_norm_val is not None
-                                  and not math.isfinite(grad_norm_val))
-
-                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步；bf16/fp32
-                # 无此保护 → loss **或梯度**非有限时丢弃本 accum 组，避免 NaN 永久
-                # 污染权重与 EMA。loss/grad 非有限是 rank 本地信息，DDP 下跳步决策
-                # 用 all-reduce(any) 统一，维持各副本施加相同更新的不变量。
-                loss_nonfinite = group_has_nonfinite
+                result = self._optimizer_step_boundary(
+                    group_has_nonfinite=group_has_nonfinite,
+                    epoch=epoch, step=step, total_steps=total_steps,
+                    parameters=self.method.parameters(),
+                    ema_module=unwrap_compile(self.method.module),
+                    before_step=self.method.on_before_optimizer_step,
+                    warn_scaler_skip=True,
+                    always_step_scheduler=True)
                 group_has_nonfinite = False
-                skip_optim_step = False
-                if not self._scaler_active:
-                    skip_optim_step = all_reduce_flag_any(
-                        loss_nonfinite or grad_nonfinite, self.device)
-                stepped = False
-                if skip_optim_step:
-                    causes = ([n for n, f in
-                               (("loss", loss_nonfinite), ("grad", grad_nonfinite))
-                               if f] or ["value"])
-                    logger.warning(
-                        "Skipping optimizer step at epoch %d step %d/%d: "
-                        "non-finite %s in this accumulation group "
-                        "(amp_dtype without GradScaler protection); EMA/method "
-                        "state frozen, scheduler clock advances.",
-                        epoch + 1, step + 1, total_steps, "+".join(causes))
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                else:
-                    # 方法级梯度干预（如 DINO 末层 freeze）；取消 p.grad 与
-                    # scale 无关，放在 unscale/clip 之后、scaler.step 之前安全。
-                    self.method.on_before_optimizer_step()
-                    # fp16：GradScaler 在 inf/NaN 梯度时内部跳过 optimizer.step 并
-                    # 降 scale。用 scale 前后对比检测跳步，保证 EMA / 方法状态与
-                    # 权重更新严格同步（scheduler 照常推进，时钟不变）。
-                    scale_before = (float(self.scaler.get_scale())
-                                    if self._scaler_active else None)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    stepped = (scale_before is None
-                               or float(self.scaler.get_scale()) >= scale_before)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scheduler.step()
-                    if not stepped:
-                        nonfinite_steps += 1
-                        logger.warning(
-                            "GradScaler skipped optimizer step at epoch %d "
-                            "step %d/%d (inf/NaN grads); EMA and method state "
-                            "not advanced.", epoch + 1, step + 1, total_steps)
-                    else:
-                        if self.ema is not None:
-                            self.ema.update(unwrap_compile(self.method.module))
+                stepped = result.stepped
+                grad_norm_val = result.grad_norm
+                if result.skipped_nonfinite:
+                    if health_on:
                         opt_steps += 1
-                        if health_on and grad_norm_val is not None and \
-                                math.isfinite(grad_norm_val):
-                            grad_norm_meter.update(grad_norm_val)
-                            grad_norm_max = max(grad_norm_max, grad_norm_val)
-                            if (tc.grad_clip_norm > 0
-                                    and grad_norm_val > tc.grad_clip_norm):
-                                clipped_steps += 1
+                elif result.scaler_skipped:
+                    nonfinite_steps += 1
+                else:
+                    opt_steps += 1
+                    if health_on and grad_norm_val is not None and \
+                            math.isfinite(grad_norm_val):
+                        grad_norm_meter.update(grad_norm_val)
+                        grad_norm_max = max(grad_norm_max, grad_norm_val)
+                        if (tc.grad_clip_norm > 0
+                                and grad_norm_val > tc.grad_clip_norm):
+                            clipped_steps += 1
                 self._global_step += 1
                 self.method.on_after_step(self._global_step, stepped=stepped)
 

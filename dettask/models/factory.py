@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from taskcore.config.core import Config as SegConfig
-from taskcore.models.factory import build_model as build_seg_model
+from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import (
     extract_model_state_dict,
     strip_common_prefixes,
@@ -64,8 +64,7 @@ def load_pretrained_backbone(model: DetectorModel, ckpt_path: str) -> None:
 
 
 def build_detector(cfg: SegConfig, det: DetConfig) -> DetectorModel:
-    seg = build_seg_model(cfg)
-    encoder, decoder = seg.encoder, seg.decoder
+    encoder, decoder = build_backbone(cfg, with_decoder=True)
     dec_channels = list(decoder.out_channels)        # low-res → high-res
     levels = list(det.fpn_levels) or list(range(len(dec_channels)))
     for i in levels:

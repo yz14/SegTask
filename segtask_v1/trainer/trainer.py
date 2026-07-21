@@ -12,7 +12,6 @@ fp32 计算与 breakdown 格式化位于 ``trainer.amp`` / ``trainer.breakdown``
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import math
 import os
@@ -47,7 +46,6 @@ from taskcore.engine.checkpoint import (
     unwrap_compile,
 )
 from taskcore.engine.dist_utils import (
-    all_reduce_flag_any,
     barrier,
 )
 from taskcore.engine.memory import estimate_train_memory
@@ -478,9 +476,7 @@ class Trainer(BaseTrainer):
             effective_accum = self._effective_accum(step, total_steps, accum)
             is_step_boundary = ((step + 1) % accum == 0 or (step + 1) == total_steps)
             # 非边界步免 all-reduce；forward 也必须放进 no_sync。
-            sync_ctx = (self.fwd_model.no_sync()
-                        if (self._is_dist and not is_step_boundary)
-                        else contextlib.nullcontext())
+            sync_ctx = self._ddp_no_sync(is_step_boundary)
 
             # 分量诊断仅在日志步抽取：breakdown 的逐分量 .item() 会强制
             # CUDA→CPU 同步，非日志步传 None 让 pipeline 跳过标量抽取。
@@ -522,98 +518,33 @@ class Trainer(BaseTrainer):
 
             # 参数更新
             if is_step_boundary:
-                # 梯度范数：clip 开时复用其范数；bf16/fp32 无 scaler 保护，clip
-                # 关时也在所有 rank 上算一次全局范数作非有限守护（DDP
-                # all-reduce 后各 rank 梯度一致，范数天然跨 rank 一致），
-                # 与仅 rank0 的健康监测采集解耦。
-                grad_norm_val = None
-                if tc.grad_clip_norm > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    gn = nn.utils.clip_grad_norm_(
-                        self.model.parameters(), tc.grad_clip_norm)
-                    # 懒同步（grad_norm_lazy_sync）：fp16+GradScaler 且健康监控
-                    # 关闭时，该范数无任何消费者（非有限守护由 scaler 完成），
-                    # 跳过 float(gn) 的 D2H 同步；裁剪本身已照常执行。
-                    if (tc.grad_norm_lazy_sync and self._scaler_active
-                            and not self._health_monitor):
-                        grad_norm_val = None
-                    else:
-                        grad_norm_val = float(gn)
-                elif not self._scaler_active:
-                    grad_norm_val = self._global_grad_norm()
-                elif self._health_monitor and self._health_grad_norm_when_no_clip:
-                    try:
-                        self.scaler.unscale_(self.optimizer)
-                        grad_norm_val = self._global_grad_norm()
-                    except Exception:  # 监测失败绝不打断训练
-                        logger.warning(
-                            "Health grad-norm computation failed; skipping.",
-                            exc_info=True)
-                        grad_norm_val = None
-                grad_nonfinite = (
-                    grad_norm_val is not None and not math.isfinite(grad_norm_val))
-                loss_nonfinite = group_has_nonfinite
+                # update/weight 比值：每 epoch 仅首个优化步测一次（step 前快照）。
+                # 快照放在 before_step，仅当未因非有限跳步时才会执行。
+                pre_step_snapshot = None
 
-                # fp16 由 GradScaler 内部跳过含 inf/NaN 梯度的优化步（基于
-                # all-reduce 后一致的梯度，各 rank 天然同步）；bf16/fp32 在
-                # loss 或梯度非有限时丢弃本 accum 组梯度，避免 NaN 永久污染
-                # 权重与 EMA（scheduler/EMA 均只在 optimizer 真正更新后推进，
-                # LR schedule 按“参数更新次数”而非“尝试步数”前进）。loss 非有限
-                # 是各 rank 本地信息，跳步决策需 all-reduce(any) 统一，维持
-                # DDP 各副本施加相同更新的不变量。
-                skip_optim_step = False
-                if not self._scaler_active:
-                    skip_optim_step = all_reduce_flag_any(
-                        loss_nonfinite or grad_nonfinite, self.device)
+                def _before_step() -> None:
+                    nonlocal pre_step_snapshot, update_ratio_val
+                    if self._health_update_ratio and update_ratio_val is None:
+                        try:
+                            pre_step_snapshot = self._param_snapshot()
+                        except Exception:  # 监测失败绝不打断训练
+                            logger.warning(
+                                "Health param snapshot failed; skipping "
+                                "update/weight ratio this epoch.",
+                                exc_info=True)
+                            pre_step_snapshot = None
+
+                result = self._optimizer_step_boundary(
+                    group_has_nonfinite=group_has_nonfinite,
+                    epoch=epoch, step=step, total_steps=total_steps,
+                    before_step=_before_step)
                 group_has_nonfinite = False
-                if skip_optim_step:
-                    causes = []
-                    if loss_nonfinite:
-                        causes.append("non-finite loss")
-                    if grad_nonfinite:
-                        causes.append("non-finite gradient")
-                    logger.warning(
-                        "Skipping optimizer step at epoch %d step %d/%d: "
-                        "%s in this accumulation group "
-                        "(amp_dtype=%s has no GradScaler protection).",
-                        epoch + 1, step + 1, total_steps,
-                        " and ".join(causes) if causes
-                        else "non-finite on a peer rank",
-                        self._amp_dtype_name)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    # 不推 scheduler/EMA：权重未变，推进只会消耗 LR schedule /
-                    # 白增 num_updates（跳步决策已 all-reduce，各 rank 一致）。
+                grad_norm_val = result.grad_norm
+
+                if result.skipped_nonfinite:
                     if self._health_monitor:
                         opt_steps += 1
                     continue
-
-                # update/weight 比值：每 epoch 仅首个优化步测一次（step 前快照）。
-                pre_step_snapshot = None
-                if self._health_update_ratio and update_ratio_val is None:
-                    try:
-                        pre_step_snapshot = self._param_snapshot()
-                    except Exception:  # 监测失败绝不打断训练
-                        logger.warning(
-                            "Health param snapshot failed; skipping "
-                            "update/weight ratio this epoch.", exc_info=True)
-                        pre_step_snapshot = None
-
-                scale_before = (self.scaler.get_scale()
-                                if self._scaler_active else None)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                # GradScaler 跳步（梯度含 inf/NaN）时会把 scale 回退减半；
-                # 据此识别未生效的优化步，不推 scheduler/EMA。
-                scaler_skipped = (
-                    scale_before is not None
-                    and self.scaler.get_scale() < scale_before)
-                self.optimizer.zero_grad(set_to_none=True)
-                # scheduler/EMA 仅在 optimizer 真正更新后推进（GradScaler 跳步
-                # 基于 all-reduce 后一致的梯度，各 rank 判定天然同步）。
-                if not scaler_skipped:
-                    self.scheduler.step()
-                    if self.ema is not None:
-                        self.ema.update(unwrap_compile(self.model))
 
                 if pre_step_snapshot is not None:
                     try:

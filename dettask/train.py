@@ -29,7 +29,7 @@ from taskcore.engine.launch import (
 from taskcore.utils.logging_utils import setup_logging as _setup_logging
 from taskcore.utils.common import seed_everything
 
-from .config import apply_overrides, load_config, save_config, validate_det
+from .config import apply_overrides, load_config, save_config, validate_det, validate_core
 from .data.loader import build_det_dataloaders
 from .models.factory import build_detector
 from .trainer.det_trainer import DetTrainer
@@ -98,7 +98,7 @@ def main():
     if args.override:
         apply_overrides(cfg, det, args.override)
         cfg.sync()
-        cfg.validate()
+        validate_core(cfg)
         validate_det(det, cfg)
 
     # 碎片治理：需在任何 CUDA 分配前注入（DDP 子进程经环境继承生效）。

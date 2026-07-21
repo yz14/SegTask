@@ -32,6 +32,17 @@ def fold_depth_to_channels(x: torch.Tensor) -> torch.Tensor:
     return rearrange(x, 'b c d h w -> b (c d) h w').contiguous()
 
 
+def maybe_fold_depth_to_channels(x: torch.Tensor) -> torch.Tensor:
+    """rank-5 时折叠 D 进通道；rank-4 已折叠则原样返回。"""
+    if x.ndim == 5:
+        return fold_depth_to_channels(x)
+    if x.ndim == 4:
+        return x
+    raise ValueError(
+        f"maybe_fold_depth_to_channels expects rank-4 or rank-5; "
+        f"got shape={tuple(x.shape)}")
+
+
 def squeeze_2_5d(
     image: torch.Tensor,
     label: torch.Tensor,
@@ -71,4 +82,9 @@ def squeeze_2_5d_keep_views(
     return image_2d, label, wmap
 
 
-__all__ = ["fold_depth_to_channels", "squeeze_2_5d", "squeeze_2_5d_keep_views"]
+__all__ = [
+    "fold_depth_to_channels",
+    "maybe_fold_depth_to_channels",
+    "squeeze_2_5d",
+    "squeeze_2_5d_keep_views",
+]

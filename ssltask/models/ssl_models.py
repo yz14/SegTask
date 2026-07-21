@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from taskcore.models.blocks import _CONV, INTERP_SMOOTH, ConvNormAct
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 from taskcore.models.unet import SegmentationHead, _resize_logits
 
 logger = logging.getLogger(__name__)
@@ -81,10 +81,10 @@ def build_ssl_recon_model(cfg) -> SSLReconModel:
     if arch != "unet":
         raise ValueError(
             f"build_ssl_recon_model requires model.arch=='unet'; got {arch!r}.")
-    seg_model = build_model(cfg)  # 同一构建路径，确保 enc/dec 同名同形
+    encoder, decoder = build_backbone(cfg, with_decoder=True)
     model = SSLReconModel(
-        encoder      = seg_model.encoder,
-        decoder      = seg_model.decoder,
+        encoder      = encoder,
+        decoder      = decoder,
         out_channels = int(cfg.model.in_channels),
         spatial_dims = int(cfg.model.spatial_dims))
     pc = model.param_count()
@@ -189,8 +189,7 @@ def build_ssl_mim_model(cfg, head_dim: int = 0) -> SSLMIMModel:
     if arch != "unet":
         raise ValueError(
             f"build_ssl_mim_model requires model.arch=='unet'; got {arch!r}.")
-    seg_model = build_model(cfg)  # 同一构建路径，确保 encoder 同名同形
-    encoder = seg_model.encoder
+    encoder = build_backbone(cfg)
     spatial_dims = int(cfg.model.spatial_dims)
     enc_last = int(cfg.model.encoder_channels[-1])
     out_ch = int(cfg.model.in_channels)

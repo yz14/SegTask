@@ -21,21 +21,19 @@ import torch
 from scipy.ndimage import zoom
 from torch.utils.data import Dataset
 
+from .patch_ops import extract_cubic_patch as _extract_cubic_patch
+from .patch_ops import safe_center_range
+from .sampling import (
+    VAL_SAMPLING_SEED as _VAL_SAMPLING_SEED,
+    WorkerNumpyRng,
+    halton as _halton,
+    halton_center,
+    val_coverage_j_interleaved,
+    val_sample_rng,
+    z_grid_center,
+)
+
 logger = logging.getLogger(__name__)
-
-# 验证集确定性采样的固定基种子（与样本序号组合派生逐样本 RNG）。
-_VAL_SAMPLING_SEED = 0x5EED_2024
-
-
-def _halton(i: int, base: int) -> float:
-    """Halton 低差异序列第 i 项（i>=1），返回 [0,1) 内均匀覆盖的确定性分数；
-    不同素数 base 给出准独立维度（val_grid_coverage 的 3D 中心铺点用 2/3/5）。"""
-    f, r = 1.0, 0.0
-    while i > 0:
-        f /= base
-        r += f * (i % base)
-        i //= base
-    return r
 
 
 # ---------------------------------------------------------------------------
@@ -708,27 +706,14 @@ class SegDatasetNpzBase(Dataset):
         self._npz_paths       : List[str]       = list(npz_paths)
         self._npz_has_rw_cache: Dict[int, bool] = {}
 
-        # 逐 worker 采样 RNG（惰性创建，见 _rng）。
-        self._rng_cache: Optional[np.random.Generator] = None
-        self._rng_wid  : Optional[int] = None
+        # 逐 worker 采样 RNG（惰性创建，见 _worker_rng）。
+        self._worker_rng = WorkerNumpyRng()
         # 当前样本序号（__getitem__ 入口处写入，驱动验证确定性采样）。
         self._sample_idx: int = 0
 
     def _rng(self) -> np.random.Generator:
-        """逐 worker 采样 RNG。
-
-        DataLoader fork 后 numpy 全局 RNG 状态在各 worker 间复制，直接用
-        ``np.random.*`` 会导致跨 worker 重复采样。这里以 PyTorch 逐 worker
-        基种子（主进程则用 ``torch.initial_seed()``）惰性创建独立的
-        ``np.random.Generator``。
-        """
-        info = torch.utils.data.get_worker_info()
-        wid = -1 if info is None else info.id
-        if self._rng_cache is None or self._rng_wid != wid:
-            seed = torch.initial_seed() if info is None else info.seed
-            self._rng_cache = np.random.default_rng(seed % (2 ** 63))
-            self._rng_wid = wid
-        return self._rng_cache
+        """逐 worker 采样 RNG（``WorkerNumpyRng`` 包装）。"""
+        return self._worker_rng.get()
 
     def _sample_rng(self) -> np.random.Generator:
         """patch 采样 RNG。
@@ -737,16 +722,14 @@ class SegDatasetNpzBase(Dataset):
         当前样本序号派生的确定性 RNG，使每个 epoch 评估同一组 patch，
         save_best / early-stopping / plateau 不被采样噪声驱动。
         """
-        if self.is_train:
-            return self._rng()
-        return np.random.default_rng((_VAL_SAMPLING_SEED, self._sample_idx))
+        return val_sample_rng(self.is_train, self._worker_rng, self._sample_idx)
 
     def _val_coverage_pos(self) -> Optional[Tuple[int, int]]:
         """val 确定性网格覆盖（val_grid_coverage=True）：返回当前样本在卷内的
         序号 j 与每卷样本数 S；未启用或训练态返回 None（回退随机位置）。"""
         if self.is_train or not self.val_grid_coverage:
             return None
-        j = self._sample_idx // len(self.image_paths)
+        j = val_coverage_j_interleaved(self._sample_idx, len(self.image_paths))
         return j, max(int(self.samples_per_volume), 1)
 
     # ------------------------------------------------------------------
@@ -807,6 +790,17 @@ class SegDatasetNpzBase(Dataset):
 
     def __len__(self) -> int:
         return len(self.image_paths) * self.samples_per_volume
+
+    def _pack_extra_sample_tensors(
+        self,
+        result: Dict[str, torch.Tensor],
+        *,
+        vol_idx: int,
+        mode: str,
+        **loc,
+    ) -> None:
+        """子类 hook：向样本 dict 追加额外张量（如 gen 的 cond）。默认 no-op。"""
+        del vol_idx, mode, loc
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +916,7 @@ class SegDataset3D(SegDatasetNpzBase):
         max_scale=1.0，eD_max==eD。"""
         self._sample_idx = idx
         vol_idx  = idx % len(self.image_paths)
+        self._current_vol_idx = vol_idx
         img, lbl = self._load_image(vol_idx), self._load_label(vol_idx)
         D_vol    = img.shape[0]
         # extract_size = (eD,pH,pW)；仅 z 过采样，oversample=1 时 eD==pD，trainer 跳裁。
@@ -968,6 +963,16 @@ class SegDataset3D(SegDatasetNpzBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        self._pack_extra_sample_tensors(
+            result,
+            vol_idx=self._current_vol_idx,
+            mode="z_axis",
+            z=z,
+            eD=eD,
+            eH=eH,
+            eW=eW,
+            eD_max=eD_max,
+        )
         return result
 
     def _sample_z(self, vol_idx: int, D_vol: int) -> int:
@@ -976,9 +981,8 @@ class SegDataset3D(SegDatasetNpzBase):
         验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
         cov = self._val_coverage_pos()
         if cov is not None:
-            # 网格覆盖：卷内第 j 个样本取 z 轴等距位置（bin 中心）。
             j, S = cov
-            return min(int((j + 0.5) * D_vol / S), D_vol - 1)
+            return z_grid_center(j, S, D_vol)
         fg_slices = self._vol_fg_slices[vol_idx]
         rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
@@ -1038,44 +1042,6 @@ def extract_z_patch_padded(
 # ---------------------------------------------------------------------------
 # 3D Cubic Patch Dataset
 # ---------------------------------------------------------------------------
-def _extract_cubic_patch(
-    vol: np.ndarray, center: Tuple[int, int, int], size: Tuple[int, int, int]) -> np.ndarray:
-    """以 (d,h,w) 为中心抽出严格 (pD,pH,pW) cube；越界部分 mode='edge' 复制边界。"""
-    D, H, W    = vol.shape
-    pD, pH, pW = size
-    cd, ch, cw = center
-
-    # 逐轴计算起止与填充
-    starts, ends, pad_before, pad_after = [], [], [], []
-    for c, p, s in [(cd, pD, D), (ch, pH, H), (cw, pW, W)]:
-        half = p // 2
-        lo = c - half
-        hi = lo + p
-        # 夹匯到边界并计算 padding
-        src_lo = max(lo, 0)
-        src_hi = min(hi, s)
-        starts.append(src_lo)
-        ends.append(src_hi)
-        pad_before.append(max(-lo, 0))
-        pad_after.append(max(hi - s, 0))
-
-    patch = vol[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]]
-
-    # 越界时 mode='edge' 填充以保证准确 size；避免下游 resize_3d 各向异性拉伸，
-    # 也与 predictor.sliding.sliding_window_cubic 默认 pad 一致。
-    if any(pb > 0 or pa > 0 for pb, pa in zip(pad_before, pad_after)):
-        patch = np.pad(
-            patch,
-            list(zip(pad_before, pad_after)),
-            mode="edge")
-    else:
-        # 无 padding 时切片是缓存卷的视图；强制 copy 防下游 in-place 操作
-        # 污染 LRU 缓存（与 extract_z_patch_padded 末尾的 .copy() 同理）。
-        patch = patch.copy()
-
-    return patch
-
-
 class SegDataset3DCubic(SegDatasetNpzBase):
     """3D cubic patch dataset：以 (d,h,w) 为中心抽 3D cube。支持增强过采样与
     多分辨率（同中心多 scale resize 后拼通道）。输出与 SegDataset3D 一致：(C_res, eD, eH, eW)，
@@ -1166,6 +1132,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         多分辨率交由 trainer 中心裁拆视图。单分辨率时 max_scale=1.0，cube == extract_size。"""
         self._sample_idx = idx
         vol_idx    = idx % len(self.image_paths)
+        self._current_vol_idx = vol_idx
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         D, H, W    = img.shape
         center     = self._sample_center(vol_idx, D, H, W)
@@ -1212,6 +1179,18 @@ class SegDataset3DCubic(SegDatasetNpzBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        self._pack_extra_sample_tensors(
+            result,
+            vol_idx=self._current_vol_idx,
+            mode="cubic",
+            center=center,
+            eD=eD,
+            eH=eH,
+            eW=eW,
+            eD_max=eD_max,
+            eH_max=eH_max,
+            eW_max=eW_max,
+        )
         return result
 
     def _safe_center_range(
@@ -1219,22 +1198,10 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         """逐轴返中心点 (lo,hi) 区间（hi 独立上界，供 randint/clip）：使最大 scale cube 在界内。
         轴 size < patch 时退为体积中心，接受边界填充（与旧行为一致）。。"""
         eD, eH, eW = self.extract_size
-        sD         = int(round(eD * self._max_scale))
-        sH         = int(round(eH * self._max_scale))
-        sW         = int(round(eW * self._max_scale))
-
-        def _axis(size: int, patch: int) -> Tuple[int, int]:
-            half = patch // 2
-            lo   = half
-            # _extract_cubic_patch 取 [c-patch//2, c-patch//2+patch)
-            hi = size - (patch - half)
-            if hi <= lo:
-                # 该轴体积太小：中心采样，接受填充。
-                mid = size // 2
-                return mid, mid + 1
-            return lo, hi
-
-        return _axis(D, sD), _axis(H, sH), _axis(W, sW)
+        sD = int(round(eD * self._max_scale))
+        sH = int(round(eH * self._max_scale))
+        sW = int(round(eW * self._max_scale))
+        return safe_center_range((D, H, W), (sD, sH, sW))
 
     def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
         """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
@@ -1243,13 +1210,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
         cov = self._val_coverage_pos()
         if cov is not None:
-            # 网格覆盖：卷内第 j 个样本用 Halton(2,3,5) 低差异序列均匀铺满
-            # 安全中心域（任意 S 均可，无需三轴因子分解）。
             j, _ = cov
-            fd, fh, fw = (_halton(j + 1, b) for b in (2, 3, 5))
-            return (dlo + min(int(fd * (dhi - dlo)), dhi - dlo - 1),
-                    hlo + min(int(fh * (hhi - hlo)), hhi - hlo - 1),
-                    wlo + min(int(fw * (whi - wlo)), whi - wlo - 1))
+            return halton_center(j, ((dlo, dhi), (hlo, hhi), (wlo, whi)))
         fg_coords = self._vol_fg_coords[vol_idx]
         rng = self._sample_rng()
         if (self.is_train and self.fg_ratio > 0
@@ -1361,4 +1323,12 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             rw_vol = compute_region_weight_map(
                 lbl_r, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(rw_vol).float()
+        self._pack_extra_sample_tensors(
+            result,
+            vol_idx=vol_idx,
+            mode="whole",
+            eD=eD,
+            eH=eH,
+            eW=eW,
+        )
         return result

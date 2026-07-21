@@ -52,10 +52,6 @@ class DataConfig(_core.DataConfig):
 class ModelConfig(_core.ModelConfig):
     """模型架构设置（核心段 + 生成任务扩展）。"""
 
-    # 旧 SE 开关（仅 attention_type=='none' 生效）。核心段已迁移到
-    # attention_type: "se"；生成侧保留兼容字段。
-    use_se: bool = False
-
     # ---- 经典 SISR 专用（arch in ("edsr","rcan")，post-upsampling） ----
     # 特征通道数（EDSR baseline 64）。
     sisr_channels: int = 64

@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import strip_common_prefixes
 
 from ..data.ssl_dataset import LabeledPatchDataset, discover_image_npz
@@ -115,7 +115,7 @@ class ClsProbe:
         self.fg_values = [float(v) for v in lv[1:]] if len(lv) > 1 else [1.0]
         self.cls_label_key = str(ssl.cls_label_key)
 
-        self.encoder = build_model(cfg).encoder.to(device)
+        self.encoder = build_backbone(cfg).to(device)
         self.train_loader, self.val_loader = build_cls_probe_loaders(cfg, ssl)
 
     def _set_encoder_trainable(self, trainable: bool) -> None:

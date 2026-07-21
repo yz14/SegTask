@@ -15,17 +15,22 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
-
-import yaml
+from typing import List, Tuple, Union
 
 from taskcore.config.core import (
     Config as SegConfig,
     ConfigError,
-    _dataclass_from_dict,
     _require,
+)
+from taskcore.config.registry import (
+    TaskSectionSpec,
+    apply_task_overrides,
+    load_task_config,
+    register_task_section,
+    save_task_config as save_task_config_registry,
+    validate_core_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -715,93 +720,41 @@ def validate_ssl(ssl: SSLConfig, cfg: SegConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
-# YAML I/O + overrides
+# YAML I/O + overrides（收敛到 taskcore.config.registry）
 # ---------------------------------------------------------------------------
-def _ssl_from_dict(d: Dict[str, Any]) -> SSLConfig:
-    """从 ``ssl:`` YAML 段构造 :class:`SSLConfig`（未知键仅告警并忽略）。"""
-    return _dataclass_from_dict(SSLConfig, dict(d or {}))
-
-
-def _seg_from_dict(raw: Dict[str, Any]) -> SegConfig:
-    """从 YAML（已剔除 ``ssl`` 段）构造并校验 segtask ``Config``。"""
-    cfg = _dataclass_from_dict(SegConfig, raw)
-    cfg.sync()
-    cfg.validate()
-    return cfg
+register_task_section(TaskSectionSpec(
+    name="ssl",
+    task_cls=SSLConfig,
+    validate_task=validate_ssl,
+))
 
 
 def load_config(path: Union[str, Path]) -> Tuple[SegConfig, SSLConfig]:
     """加载 ssltask YAML，返回 ``(cfg, ssl)``。"""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-    ssl_raw = dict(raw.pop("ssl", {}) or {})
-    cfg = _seg_from_dict(raw)
-    ssl = _ssl_from_dict(ssl_raw)
-    validate_ssl(ssl, cfg)
-    return cfg, ssl
+    return load_task_config(path, "ssl")
 
 
 def save_config(cfg: SegConfig, ssl: SSLConfig, path: Union[str, Path]) -> None:
     """把 ``(cfg, ssl)`` 落盘为单个 YAML（``ssl`` 段覆盖 seg 端可能残留的同名段）。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    blob = asdict(cfg)
-    blob["ssl"] = asdict(ssl)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(blob, f, default_flow_style=False, sort_keys=False,
-                  allow_unicode=True)
-
-
-def _coerce(old: Any, val: str) -> Any:
-    """按既有字段类型把字符串 override 值转回原类型（与 segtask 行为一致）。"""
-    if old is None:
-        # 默认值为 None 的 Optional 字段无既有类型可依，按 YAML 语义解析
-        # （list/bool/数值/字符串均可）。
-        return yaml.safe_load(val)
-    if isinstance(old, bool):
-        return val.lower() in ("true", "1", "yes")
-    if isinstance(old, int):
-        return int(val)
-    if isinstance(old, float):
-        return float(val)
-    if isinstance(old, list):
-        import json
-        return json.loads(val)
-    return val
-
-
-def _set_dotted(obj: Any, dotted: str, val: str) -> None:
-    parts = dotted.split(".")
-    for p in parts[:-1]:
-        obj = getattr(obj, p)
-    attr = parts[-1]
-    old = getattr(obj, attr)
-    new = _coerce(old, val)
-    setattr(obj, attr, new)
-    logger.info("Override: %s = %s -> %s", dotted, old, new)
+    save_task_config_registry(cfg, ssl, path, "ssl")
 
 
 def apply_overrides(cfg: SegConfig, ssl: SSLConfig, overrides: List[str]) -> None:
     """应用点记法 override；``ssl.*`` 路由到 ``ssl``，其余路由到 ``cfg``。
 
     示例：``--override train.epochs=50 ssl.method=prior ssl.recon_loss=mse``。
-    调用方应在其后自行 ``cfg.sync(); cfg.validate(); validate_ssl(ssl, cfg)``。
+    调用方应在其后自行 ``cfg.sync(); validate_core(cfg); validate_ssl(ssl, cfg)``。
     """
-    for ov in overrides:
-        if "=" not in ov:
-            continue
-        key, val = ov.split("=", 1)
-        if key.startswith("ssl."):
-            _set_dotted(ssl, key[len("ssl."):], val)
-        else:
-            _set_dotted(cfg, key, val)
+    apply_task_overrides(cfg, ssl, overrides, "ssl")
+
+
+def validate_core(cfg: SegConfig) -> None:
+    """校验 core Config（跳过 ssl 不消费的 seg 专属 loss/predict 段）。"""
+    validate_core_config(cfg, "ssl")
 
 
 __all__ = [
     "SSLConfig", "SegConfig", "ConfigError",
-    "validate_ssl", "load_config", "save_config", "apply_overrides",
+    "validate_ssl", "load_config", "save_config", "apply_overrides", "validate_core",
     "RECON_LOSSES", "METHODS",
 ]

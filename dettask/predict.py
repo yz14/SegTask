@@ -18,7 +18,7 @@ from taskcore.utils.logging_utils import setup_logging as _setup_logging
 
 from taskcore.data.loader import discover_npz_recursive as discover_npz
 
-from .config import apply_overrides, load_config, validate_det
+from .config import apply_overrides, load_config, validate_det, validate_core
 from .models.factory import build_detector
 from .predictor.det_predictor import DetPredictor
 
@@ -43,7 +43,7 @@ def main():
     if args.override:
         apply_overrides(cfg, det, args.override)
         cfg.sync()
-        cfg.validate()
+        validate_core(cfg)
         validate_det(det, cfg)
 
     _setup_logging(output_dir=args.out_dir, level=args.log_level,

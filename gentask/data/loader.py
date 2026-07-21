@@ -9,13 +9,10 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 SuffixSpec = Union[str, Sequence[str]]
 
 import numpy as np
-from torch.utils.data import DataLoader, DistributedSampler
-
-from taskcore.data.loader import ValBatchShardSampler, scaled_num_workers
 
 from ..config import Config
 from .dataset import load_nifti, load_npz_label_for_split
-from taskcore.data.dataset import load_npz_label_counts
+from taskcore.data.dataset import _open_npz, load_npz_label_counts
 from .specs import DatasetCommonCfg, SplitPaths, build_data_spec
 # 公共纯函数工具从 taskcore.data.loader 复用（与迁移前逐字符一致）。
 from taskcore.data.loader import (  # noqa: F401  (re-export，保持旧 import 路径可用)
@@ -33,8 +30,11 @@ from taskcore.data.loader import (  # noqa: F401  (re-export，保持旧 import 
     stratified_train_val_split,
 )
 from taskcore.data.loader import (  # noqa: F401  (re-export)
+    assemble_train_val_loaders,
     detect_label_values,
     discover_npz_samples,
+    log_volume_cache_estimate,
+    resolve_dataloader_workers,
     train_val_split,
 )
 
@@ -167,122 +167,14 @@ def build_dataloaders(
     train_ds = spec.make_split(train_paths, is_train=True, common=common_cfg)
     val_ds   = spec.make_split(val_paths, is_train=False, common=common_cfg)
 
-    # drop_last=True 下不足一个 batch 会静默零批次空转，显式拦截。
-    if len(train_ds) < dc.batch_size:
-        raise ValueError(
-            f"Train dataset yields only {len(train_ds)} samples but "
-            f"batch_size={dc.batch_size} with drop_last=True would produce "
-            "zero batches; lower data.batch_size or raise "
-            "data.samples_per_volume.")
-
-    # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
-    eff_num_workers = scaled_num_workers(
-        dc.num_workers, world_size,
-        bool(cfg.train.ddp_scale_dataloader_per_rank))
-    loader_kwargs: Dict[str, object] = {}
-    if eff_num_workers > 0:
-        loader_kwargs["persistent_workers"] = bool(dc.persistent_workers)
-        loader_kwargs["prefetch_factor"] = int(dc.prefetch_factor)
-
-    if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_ds, num_replicas=world_size, rank=rank,
-            shuffle=True, drop_last=True)
-        train_loader = DataLoader(
-            train_ds,
-            batch_size  = dc.batch_size,
-            sampler     = train_sampler,
-            num_workers = eff_num_workers,
-            pin_memory  = dc.pin_memory,
-            drop_last   = True,
-            **loader_kwargs)
-        val_loader = DataLoader(
-            val_ds,
-            batch_size  = dc.batch_size,
-            sampler     = ValBatchShardSampler(
-                len(val_ds), dc.batch_size, rank, world_size),
-            num_workers = eff_num_workers,
-            pin_memory  = dc.pin_memory,
-            drop_last   = False,
-            **loader_kwargs)
-        logger.info(
-            "gentask DDP samplers: rank=%d/%d, ~%d train samples/rank",
-            rank, world_size, len(train_sampler))
-    else:
-        train_loader = DataLoader(
-            train_ds,
-            batch_size  = dc.batch_size,
-            shuffle     = True,
-            num_workers = eff_num_workers,
-            pin_memory  = dc.pin_memory,
-            drop_last   = True,
-            **loader_kwargs)
-        val_loader = DataLoader(
-            val_ds,
-            batch_size  = dc.batch_size,
-            shuffle     = False,
-            num_workers = eff_num_workers,
-            pin_memory  = dc.pin_memory,
-            drop_last   = False,
-            **loader_kwargs)
-
-    logger.info(
-        "DataLoader: batch_size=%d, num_workers=%d, pin_memory=%s, "
-        "persistent_workers=%s, prefetch_factor=%s",
-        dc.batch_size, eff_num_workers, dc.pin_memory,
-        loader_kwargs.get("persistent_workers", "n/a"),
-        loader_kwargs.get("prefetch_factor", "n/a"))
-
-    # 内存缓存足迹估计（仅诊断；逐 worker 倍增）。
-    if dc.cache_mode == "memory":
-        try:
-            # NPZ-only：读首个 npz 的 shape 与 rw 存在性。
-            from .dataset import _open_npz as _peek_npz
-            npz_paths_train = train_ds._npz_paths
-            _f = _peek_npz(npz_paths_train[0])
-            sample_voxels  = int(np.prod(_f["image"].shape))
-            has_rw_runtime = "rw" in _f.files
-            # image fp32 (4B)（cache_dtype='int16' 时 2B）、label int16
-            # (2B)、rw fp32 (4B 可选)。
-            img_b = 2 if str(dc.cache_dtype) == "int16" else 4
-            bytes_per_img = sample_voxels * img_b
-            bytes_per_lbl = sample_voxels * 2
-            bytes_per_rw = sample_voxels * 4 if has_rw_runtime else 0
-            per_vol_bytes = bytes_per_img + bytes_per_lbl + bytes_per_rw
-            n_train_vols = len(train_idx)
-            cap = int(dc.cache_max_volumes)
-            # cap=0 为无上限 → 最坏情况缓存全部。
-            eff_cap = cap if cap > 0 else n_train_vols
-            eff_cap = min(eff_cap, n_train_vols)
-            workers = max(dc.num_workers, 1)
-            total_gb = per_vol_bytes * eff_cap * workers / (1024 ** 3)
-            logger.info(
-                "Volume cache estimate: ~%.2f MiB per volume "
-                "(image %s + label int16%s, bbox-cropped); effective "
-                "cap=%d, num_workers=%d => up to ~%.2f GiB RAM (all "
-                "workers, caches only; transient decode peaks add "
-                "~%.2f MiB/worker).",
-                per_vol_bytes / (1024 ** 2),
-                "int16" if img_b == 2 else "fp32",
-                " + region_weight fp32" if bytes_per_rw else "",
-                eff_cap, workers, total_gb,
-                sample_voxels * 4 / (1024 ** 2))
-            if cap == 0 and n_train_vols * workers >= 16:
-                # 在 8 GiB 预算下建议一个合适的 cap。
-                budget_gb = 8.0
-                rec = max(
-                    1,
-                    int(budget_gb * (1024 ** 3)
-                        / max(per_vol_bytes, 1) / workers))
-                logger.warning(
-                    "cache_max_volumes=0 (unbounded) with %d volumes and "
-                    "%d workers is the likely OOM culprit on large "
-                    "datasets. Consider setting "
-                    "`data.cache_max_volumes: %d` (≈%.1f GiB budget) "
-                    "or `data.cache_mode: \"none\"` to rely on the OS "
-                    "page cache (shared across workers).",
-                    n_train_vols, workers, rec, budget_gb)
-        except Exception as exc:  # pragma: no cover — 仅诊断
-            logger.debug("Could not estimate volume cache size: %s", exc)
+    train_loader, val_loader = assemble_train_val_loaders(
+        train_ds, val_ds, cfg, rank=rank, world_size=world_size,
+        log_prefix="gentask")
+    log_volume_cache_estimate(
+        cfg, train_ds,
+        n_train_vols=len(train_idx),
+        num_workers=resolve_dataloader_workers(cfg, world_size),
+        world_size=world_size,
+        open_npz=_open_npz)
 
     return train_loader, val_loader

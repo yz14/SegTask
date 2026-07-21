@@ -18,18 +18,22 @@ encoder 权重可无缝迁移）；分类专属设置集中在 YAML 顶层 ``cls
 
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
-
-import yaml
+from typing import Dict, List, Tuple, Union
 
 from taskcore.config.core import (
     Config as SegConfig,
     ConfigError,
-    _dataclass_from_dict,
+)
+from taskcore.config.registry import (
+    TaskSectionSpec,
+    apply_task_overrides,
+    load_task_config,
+    register_task_section,
+    save_task_config as save_task_config_registry,
+    validate_core_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -290,81 +294,42 @@ def resolve_num_classes(cls: ClsConfig, cfg: SegConfig) -> int:
 
 
 # ---------------------------------------------------------------------------
-# YAML I/O + overrides（与 ssltask.config 同构）
+# YAML I/O + overrides（收敛到 taskcore.config.registry）
 # ---------------------------------------------------------------------------
+register_task_section(TaskSectionSpec(
+    name="cls",
+    task_cls=ClsConfig,
+    validate_task=validate_cls,
+))
+
+
 def load_config(path: Union[str, Path]) -> Tuple[SegConfig, ClsConfig]:
     """加载 clstask YAML，返回 ``(cfg, cls)``。"""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
-    cls_raw = dict(raw.pop("cls", {}) or {})
-    cfg = _dataclass_from_dict(SegConfig, raw)
-    cfg.sync()
-    cfg.validate()
-    cls = _dataclass_from_dict(ClsConfig, cls_raw)
-    validate_cls(cls, cfg)
-    return cfg, cls
+    return load_task_config(path, "cls")
 
 
 def save_config(cfg: SegConfig, cls: ClsConfig, path: Union[str, Path]) -> None:
     """把 ``(cfg, cls)`` 落盘为单个 YAML。"""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    blob = asdict(cfg)
-    blob["cls"] = asdict(cls)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(blob, f, default_flow_style=False, sort_keys=False,
-                  allow_unicode=True)
-
-
-def _coerce(old: Any, val: str) -> Any:
-    if old is None:
-        # 默认值为 None 的 Optional 字段无既有类型可依，按 YAML 语义解析
-        # （list/bool/数值/字符串均可）。
-        return yaml.safe_load(val)
-    if isinstance(old, bool):
-        return val.lower() in ("true", "1", "yes")
-    if isinstance(old, int):
-        return int(val)
-    if isinstance(old, float):
-        return float(val)
-    if isinstance(old, list):
-        return json.loads(val)
-    return val
-
-
-def _set_dotted(obj: Any, dotted: str, val: str) -> None:
-    parts = dotted.split(".")
-    for p in parts[:-1]:
-        obj = getattr(obj, p)
-    attr = parts[-1]
-    old = getattr(obj, attr)
-    new = _coerce(old, val)
-    setattr(obj, attr, new)
-    logger.info("Override: %s = %s -> %s", dotted, old, new)
+    save_task_config_registry(cfg, cls, path, "cls")
 
 
 def apply_overrides(cfg: SegConfig, cls: ClsConfig,
                     overrides: List[str]) -> None:
     """点记法 override；``cls.*`` 路由到 ``cls``，其余路由到 ``cfg``。
 
-    调用方应在其后自行 ``cfg.sync(); cfg.validate(); validate_cls(cls, cfg)``。
+    调用方应在其后自行 ``cfg.sync(); validate_core(cfg); validate_cls(cls, cfg)``。
     """
-    for ov in overrides:
-        if "=" not in ov:
-            continue
-        key, val = ov.split("=", 1)
-        if key.startswith("cls."):
-            _set_dotted(cls, key[len("cls."):], val)
-        else:
-            _set_dotted(cfg, key, val)
+    apply_task_overrides(cfg, cls, overrides, "cls")
+
+
+def validate_core(cfg: SegConfig) -> None:
+    """校验 core Config（跳过 cls 不消费的 seg 专属 loss/predict 段）。"""
+    validate_core_config(cfg, "cls")
 
 
 __all__ = [
     "ClsConfig", "SegConfig", "ConfigError",
     "BACKBONES", "GRANULARITIES", "LABEL_SOURCES",
-    "validate_cls", "resolve_num_classes",
+    "validate_cls", "resolve_num_classes", "validate_core",
     "load_config", "save_config", "apply_overrides",
 ]

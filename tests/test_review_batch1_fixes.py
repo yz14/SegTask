@@ -59,24 +59,42 @@ def test_soft_cldice_loss_stays_finite_with_zero_smooth():
 # P1-03: scheduler/EMA 仅在 optimizer 真正更新后推进
 # ---------------------------------------------------------------------------
 def test_scheduler_and_ema_gated_on_effective_optimizer_step():
-    from segtask_v1.trainer.trainer import Trainer
+    from taskcore.engine.base_trainer import BaseTrainer
 
-    src = inspect.getsource(Trainer._train_epoch)
+    # 门控语义收敛到 BaseTrainer._optimizer_step_boundary（五任务共用）。
+    src = inspect.getsource(BaseTrainer._optimizer_step_boundary)
 
-    # 非有限 guard 的 skip 分支（continue 之前）不得推 scheduler。
-    skip_branch = src.split("if skip_optim_step:")[1].split("continue")[0]
-    assert "scheduler.step()" not in skip_branch
+    # 默认路径：非有限 skip 分支在 always_step_scheduler 之外不得推 scheduler。
+    # （ssl 经 always_step_scheduler=True 显式开边界时钟，不在此断言范围。）
+    skip_branch = src.split("if skip_optim_step:")[1].split(
+        "return OptimStepResult")[0]
+    # skip 分支内仅允许 always_step_scheduler 门控下的 scheduler.step
+    assert "if always_step_scheduler:" in skip_branch
+    # 去掉该门控块后，不应再有无条件 scheduler.step
+    skip_wo_ssl = skip_branch.split("if always_step_scheduler:")[0]
+    assert "scheduler.step()" not in skip_wo_ssl
     assert "ema.update" not in skip_branch
 
-    # GradScaler 路径：scheduler.step 与 ema.update 均在 not scaler_skipped 门控内。
+    # GradScaler 成功路径：scheduler.step 与 ema.update 均在 not scaler_skipped 门控内。
     m = re.search(
         r"if not scaler_skipped:\s*\n"
         r"\s*self\.scheduler\.step\(\)\s*\n"
         r"\s*if self\.ema is not None:\s*\n"
         r"\s*self\.ema\.update", src)
     assert m is not None, "scheduler/EMA must be gated on 'not scaler_skipped'"
-    # 门控外不应再有无条件的 per-step scheduler.step()。
-    assert src.count("self.scheduler.step()") == 1
+
+
+def test_gen_trainer_logs_unscaled_loss():
+    """gen 记录的 loss 必须是 _step_loss 原始值（loss_scaled 仅供 backward）。
+
+    回归：pending 里若再乘 eff_accum，accum_steps>1 时 loss_meter/history
+    会被放大 accum 倍。
+    """
+    from gentask.trainer.gen_trainer import GenerationTrainer
+
+    src = inspect.getsource(GenerationTrainer._train_epoch)
+    assert "pending.append((step, loss.detach(), hr.shape[0]))" in src
+    assert "* eff_accum" not in src.split("backward()")[1]
 
 
 # ---------------------------------------------------------------------------

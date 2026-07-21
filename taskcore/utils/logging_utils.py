@@ -5,7 +5,8 @@
 - 颜色仅作用于控制台 handler；文件 handler 始终输出纯文本，避免 ``train.log``
   里混入 ANSI 转义符导致编辑器乱码。
 - 模块类别由 logger 名（``logging.getLogger(__name__)`` 产生，形如
-  ``segtask_v1.trainer.trainer``）的子包前缀推断，无需各模块改动。
+  ``segtask_v1.trainer.trainer`` / ``clstask.trainer.cls_trainer``）去掉已知
+  任务顶包后的首段子包推断，无需各模块改动。
 - 颜色启用条件遵循业界惯例：输出为 TTY 且未设置 ``NO_COLOR`` 环境变量；
   非 TTY（重定向/管道）自动退化为纯文本。Windows 下经 ``colorama`` 处理 ANSI。
 - ``train.py`` / ``predict.py`` / ``make_data.py`` 统一调用本模块的
@@ -53,19 +54,29 @@ _LEVEL_COLORS = {
     logging.CRITICAL: Back.RED + Fore.WHITE + Style.BRIGHT,
 }
 
-_TOP_PACKAGE = "segtask_v1"
+# 已知任务顶包：去掉后取下一段作模块类别（data/models/trainer/…）。
+# 未在集合内的 logger（如第三方库）仍返回首段，再回退默认白色。
+_TASK_TOP_PACKAGES = frozenset({
+    "segtask_v1", "clstask", "dettask", "gentask", "ssltask", "taskcore",
+})
 
 
 def _module_category(logger_name: str) -> str:
     """从 logger 名推断模块类别（首段子包名）。
 
     示例：``segtask_v1.trainer.pipelines.slab25d`` -> ``trainer``；
-    ``segtask_v1.config`` -> ``config``；``segtask_v1`` -> ``segtask_v1``。
+    ``clstask.trainer.cls_trainer`` -> ``trainer``；
+    ``gentask.config`` -> ``config``；``segtask_v1`` -> ``segtask_v1``。
     """
     parts = logger_name.split(".")
-    if parts and parts[0] == _TOP_PACKAGE:
-        return parts[1] if len(parts) > 1 else _TOP_PACKAGE
-    return parts[0] if parts else logger_name
+    if not parts:
+        return logger_name
+    if parts[0] in _TASK_TOP_PACKAGES:
+        return parts[1] if len(parts) > 1 else parts[0]
+    # 兼容未知顶包：若第二段已是已知模块类别，直接用它上色。
+    if len(parts) > 1 and parts[1] in _MODULE_COLORS:
+        return parts[1]
+    return parts[0]
 
 
 def _supports_color(stream) -> bool:

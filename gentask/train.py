@@ -13,11 +13,10 @@ import argparse
 import logging
 from pathlib import Path
 
-import yaml
-
 import torch
 import torch.multiprocessing as mp
 
+from taskcore.config.task_io import apply_dotted_overrides
 from taskcore.engine.dist_utils import get_rank, get_world_size, is_main_process
 from taskcore.engine.launch import (
     find_free_port, finalize_ddp_worker, init_ddp_worker,
@@ -39,32 +38,7 @@ def setup_logging(output_dir: str, level: str = "INFO") -> None:
 
 def apply_overrides(cfg, overrides: list) -> None:
     """应用点记法 override。示例：--override train.epochs=50 model.backbone=convnext。"""
-    for ov in overrides:
-        if "=" not in ov:
-            continue
-        key, val = ov.split("=", 1)
-        parts = key.split(".")
-        obj = cfg
-        for p in parts[:-1]:
-            obj = getattr(obj, p)
-        attr = parts[-1]
-        old_val = getattr(obj, attr)
-        # 转为原类型；默认值为 None 的 Optional 字段按 YAML 语义解析。
-        if old_val is None:
-            new_val = yaml.safe_load(val)
-        elif isinstance(old_val, bool):
-            new_val = val.lower() in ("true", "1", "yes")
-        elif isinstance(old_val, int):
-            new_val = int(val)
-        elif isinstance(old_val, float):
-            new_val = float(val)
-        elif isinstance(old_val, list):
-            import json
-            new_val = json.loads(val)
-        else:
-            new_val = val
-        setattr(obj, attr, new_val)
-        logging.getLogger(__name__).info("Override: %s = %s → %s", key, old_val, new_val)
+    apply_dotted_overrides(cfg, overrides)
 
 
 def _build_and_fit(cfg, device: torch.device):

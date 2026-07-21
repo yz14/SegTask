@@ -35,6 +35,7 @@ from taskcore.data.dataset import (
     preprocess_image,
     resize_3d,
 )
+from taskcore.data.patch_extract import extract_patch_by_mode
 
 logger = logging.getLogger(__name__)
 
@@ -427,17 +428,18 @@ class LabeledPatchDataset(Dataset):
                 f"probe expects 3D volume (D,H,W); got {img.shape} in {path!r}.")
         pD, pH, pW = self.patch
         if self.zaxis:
-            # 与 SegDataset3D(2_5d/z_axis) 一致：z 抽 pD 片（edge-pad），H/W 整片
-            # resize；label 用最近邻（is_label=True）保持整数取值。
             z = self._pick_z(idx, path, img.shape[0])
-            img_patch = resize_3d(
-                extract_z_patch_padded(img, z, pD), pD, pH, pW, is_label=False)
-            lbl_patch = resize_3d(
-                extract_z_patch_padded(lbl, z, pD), pD, pH, pW, is_label=True)
+            center = (z, 0, 0)
+            img_patch = extract_patch_by_mode(
+                img, "z_axis", center, self.patch, is_label=False)
+            lbl_patch = extract_patch_by_mode(
+                lbl, "z_axis", center, self.patch, is_label=True)
         else:
             center = self._pick_center(idx, path, img.shape)
-            img_patch = _extract_cubic_patch(img, center, self.patch)
-            lbl_patch = _extract_cubic_patch(lbl, center, self.patch)
+            img_patch = extract_patch_by_mode(
+                img, "cubic", center, self.patch, is_label=False)
+            lbl_patch = extract_patch_by_mode(
+                lbl, "cubic", center, self.patch, is_label=True)
         img_t = torch.from_numpy(img_patch.astype(np.float32, copy=False))
         lbl_t = torch.from_numpy(lbl_patch.astype(np.float32, copy=False))
         # 统一返回 3D (1,pD,pH,pW)；2.5D 折叠由探针在送模型前完成。

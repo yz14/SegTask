@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 
-from .config import apply_overrides, load_config, validate_ssl
+from .config import apply_overrides, load_config, validate_ssl, validate_core
 from .eval.pipeline import run_eval_pipeline
 
 
@@ -43,7 +43,7 @@ def main() -> dict:
     if args.override:
         apply_overrides(cfg, ssl, args.override)
         cfg.sync()
-        cfg.validate()
+        validate_core(cfg)
         validate_ssl(ssl, cfg)
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))

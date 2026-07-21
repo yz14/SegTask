@@ -41,13 +41,23 @@ from scipy import ndimage
 from torch.utils.data import Dataset
 
 from taskcore.data.dataset import (
-    VolumeCache,
-    _halton,
     _open_npz,
     extract_z_patch_padded,
     load_npz_image,
     load_npz_label,
     resize_3d,
+)
+from taskcore.data.patch_dataset_base import IndexScheme, NpzPatchDatasetBase
+from taskcore.data.patch_extract import extract_patch_by_mode
+from taskcore.data.patch_ops import (
+    extract_cubic_patch_with_origin,
+    safe_center_range,
+)
+from taskcore.data.sampling import (
+    clip_center_to_ranges,
+    halton_center,
+    uniform_center,
+    z_grid_center,
 )
 
 from ..targets import crop_boxes, flip_boxes, scale_boxes, slice_boxes_to_2d
@@ -118,43 +128,7 @@ def load_volume_boxes(npz_path: str, fg_values: Sequence[float],
     return img, boxes, labels
 
 
-def _extract_cubic_patch(vol: np.ndarray, center: Tuple[int, int, int],
-                         patch: Tuple[int, int, int]
-                         ) -> Tuple[np.ndarray, Tuple[int, int, int]]:
-    """以 center 为中心抽 patch；越界 edge 复制填充（同 segtask cubic）。
-    返回 (patch, 逐轴左边界 lo)（lo 可为负，供 ``crop_boxes`` 平移联动）。"""
-    slices, pads, los = [], [], []
-    for dim, c, p in zip(vol.shape, center, patch):
-        lo = c - p // 2
-        hi = lo + p
-        pads.append((max(-lo, 0), max(hi - dim, 0)))
-        slices.append(slice(max(lo, 0), min(hi, dim)))
-        los.append(lo)
-    out = vol[tuple(slices)]
-    if any(a or b for a, b in pads):
-        out = np.pad(out, pads, mode="edge")
-    return out, (los[0], los[1], los[2])
-
-
-def _safe_center_range(
-    shape: Tuple[int, ...], patch: Tuple[int, ...],
-) -> List[Tuple[int, int]]:
-    """逐轴返中心点 (lo, hi) 半开区间（供 randint/clip），使 patch 尽量在界内；
-    轴 size < patch 时退为体积中心（接受边界填充）。口径同
-    ``SegDataset3DCubic._safe_center_range``。"""
-    out = []
-    for size, p in zip(shape, patch):
-        half = p // 2
-        lo, hi = half, size - (p - half)
-        if hi <= lo:
-            mid = size // 2
-            out.append((mid, mid + 1))
-        else:
-            out.append((lo, hi))
-    return out
-
-
-class DetPatchDataset(Dataset):
+class DetPatchDataset(NpzPatchDatasetBase):
     """检测 patch 数据集（patch 抽取口径由 ``patch_mode`` 决定，3D 或 2.5D
     折叠由 ``spatial_dims`` 决定）。
 
@@ -186,48 +160,25 @@ class DetPatchDataset(Dataset):
         val_grid_coverage  : bool = False,
         cache_enabled      : bool = False,
         cache_max_volumes  : int = 0):
-        self.paths = list(npz_paths)
-        if not self.paths:
-            raise ValueError("DetPatchDataset got empty npz_paths.")
-        self.patch = tuple(int(s) for s in patch_size)
-        if len(self.patch) != 3:
-            raise ValueError(f"patch_size must be [D, H, W]; got {patch_size}.")
-        self.mode = str(patch_mode).lower()
-        if self.mode not in ("whole", "z_axis", "cubic", "2_5d"):
-            raise ValueError(f"bad patch_mode: {patch_mode!r}")
-        if spatial_dims not in (2, 3):
-            raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}.")
-        self.spatial_dims = int(spatial_dims)
-        self.fold_2_5d = self.spatial_dims == 2
+        super().__init__(
+            npz_paths, patch_size, patch_mode, samples_per_volume,
+            spatial_dims, is_train, seed, val_grid_coverage,
+            intensity_min, intensity_max, normalize, global_mean, global_std,
+            fg_oversample_ratio, cache_enabled, cache_max_volumes,
+            index_scheme=IndexScheme.INTERLEAVED,
+            dataset_name="DetPatchDataset",
+        )
         self.fg_values = [float(v) for v in (fg_values or [1.0])]
         self.allow_mask = bool(boxes_from_mask_ok)
         self.min_box_voxels = int(min_box_voxels)
-        self.intensity_min = float(intensity_min)
-        self.intensity_max = float(intensity_max)
-        self.normalize = str(normalize)
-        self.global_mean = float(global_mean)
-        self.global_std = float(global_std)
-        self.spv = max(int(samples_per_volume), 1)
-        self.is_train = bool(is_train)
-        self.fg_ratio = (float(fg_oversample_ratio)
-                         if self.mode != "whole" else 0.0)
         self.min_vis = float(min_visibility)
-        self.seed = int(seed)
         self.flip_prob = float(aug_flip_prob) if self.is_train else 0.0
         self.flip_axes = [int(a) for a in aug_flip_axes]
         if any(a not in (0, 1, 2) for a in self.flip_axes):
             raise ValueError(
                 f"aug_flip_axes must be spatial axes in (0,1,2); "
                 f"got {aug_flip_axes}.")
-        self.val_grid_coverage = bool(val_grid_coverage) and not self.is_train
-        # 逐卷框真值缓存（mask 连通域派生较贵；samples_per_volume > 1 时复用）。
         self._box_cache: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-        # 逐 worker LRU 缓存预处理后的卷（复用 segtask VolumeCache：pickle 到
-        # worker 时清空），避免 samples_per_volume>1 时同卷重复 IO/预处理。
-        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
-        # 逐 worker 训练采样 RNG（惰性创建，口径同 segtask dataset._rng）。
-        self._rng_cache: Optional[np.random.Generator] = None
-        self._rng_wid  : Optional[int] = None
         logger.info(
             "DetPatchDataset(%s): %d volumes x %d samples, mode=%s, "
             "patch=%s, spatial_dims=%d (%s)%s",
@@ -236,39 +187,14 @@ class DetPatchDataset(Dataset):
             "2.5D folded" if self.fold_2_5d else "3D",
             ", val_grid_coverage" if self.val_grid_coverage else "")
 
-    def __len__(self) -> int:
-        return len(self.paths) * self.spv
-
-    def _rng(self) -> np.random.Generator:
-        """逐 worker 训练 RNG（以 PyTorch 逐 worker 基种子创建，可复现且
-        跨 worker 不重复；主进程用 ``torch.initial_seed()``）。"""
-        info = torch.utils.data.get_worker_info()
-        wid = -1 if info is None else info.id
-        if self._rng_cache is None or self._rng_wid != wid:
-            seed = torch.initial_seed() if info is None else info.seed
-            self._rng_cache = np.random.default_rng(seed % (2 ** 63))
-            self._rng_wid = wid
-        return self._rng_cache
-
-    # ------------------------------------------------------------------
     def _load(self, path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """→ (预处理后 image, boxes3d, labels)；image/框均逐 worker 缓存。"""
-        img = self._img_cache.get(path)
         cached = self._box_cache.get(path)
         if cached is None:
             cached = load_boxes(path, self.fg_values, self.allow_mask,
                                 self.min_box_voxels)
             self._box_cache[path] = cached
-        if img is None:
-            # 读取走 seg 的 memmap 零拷贝快路径（页缓存跨 worker 共享；
-            # 压缩 npz 自动回退 zipfile 路径，返回值逐位一致）。
-            img = load_npz_image(
-                path, self.intensity_min, self.intensity_max,
-                self.normalize, self.global_mean, self.global_std)
-            if img.ndim != 3:
-                raise ValueError(f"expected 3D volume (D,H,W); got "
-                                 f"{img.shape} in {path!r}.")
-            self._img_cache.put(path, img)
+        img = self._load_image_cached(path)
         boxes_np, labels_np = cached
         return img, boxes_np, labels_np
 
@@ -280,7 +206,7 @@ class DetPatchDataset(Dataset):
         """z 模式中心 z：val 覆盖 → 等距 bin 中心；训练 fg 命中 → 某 gt 框
         z 中心；否则均匀采样。"""
         if cov_j is not None:
-            return min(int((cov_j + 0.5) * D_vol / self.spv), D_vol - 1)
+            return z_grid_center(cov_j, self.spv, D_vol)
         if (self.is_train and boxes.shape[0] > 0
                 and rng.random() < self.fg_ratio):
             b = boxes[int(rng.integers(boxes.shape[0]))]
@@ -292,20 +218,15 @@ class DetPatchDataset(Dataset):
                        cov_j: Optional[int]) -> Tuple[int, int, int]:
         """cubic 模式中心 (d,h,w)：val 覆盖 → Halton(2,3,5) 铺满安全中心域；
         训练 fg 命中 → 某 gt 框中心夹取到安全范围；否则安全域内均匀采样。"""
-        ranges = _safe_center_range(shape, self.patch)
+        ranges = safe_center_range(shape, self.patch)
         if cov_j is not None:
-            fracs = [_halton(cov_j + 1, b) for b in (2, 3, 5)]
-            return tuple(
-                lo + min(int(f * (hi - lo)), hi - lo - 1)
-                for f, (lo, hi) in zip(fracs, ranges))
+            return halton_center(cov_j, ranges)
         if (self.is_train and boxes.shape[0] > 0
                 and rng.random() < self.fg_ratio):
             b = boxes[int(rng.integers(boxes.shape[0]))]
-            center = [(b[i] + b[i + 3]) / 2 for i in range(3)]
-            return tuple(
-                int(np.clip(round(c), lo, hi - 1))
-                for c, (lo, hi) in zip(center, ranges))
-        return tuple(int(rng.integers(lo, hi)) for lo, hi in ranges)
+            center = tuple(round((b[i] + b[i + 3]) / 2) for i in range(3))
+            return clip_center_to_ranges(center, ranges)
+        return uniform_center(rng, ranges)
 
     # ------------------------------------------------------------------
     # patch 抽取（image + boxes 同一几何）
@@ -319,16 +240,17 @@ class DetPatchDataset(Dataset):
         pD, pH, pW = self.patch
         D, H, W = img.shape
         if self.mode == "whole":
-            patch = resize_3d(img, pD, pH, pW)
+            center = (0, 0, 0)
+            patch = extract_patch_by_mode(img, self.mode, center, self.patch)
             boxes = scale_boxes(boxes3d, (pD / D, pH / H, pW / W))
             return patch, boxes, labels
         if self.mode == "cubic":
             center = self._sample_center(rng, img.shape, boxes_np, cov_j)
-            patch, lo = _extract_cubic_patch(img, center, self.patch)
+            patch, lo = extract_cubic_patch_with_origin(img, center, self.patch)
             boxes, labels = crop_boxes(boxes3d, labels, lo, self.patch,
                                        self.min_vis)
             return patch, boxes, labels
-        # z_axis / 2_5d：z 轴 edge-padded 抽取 + 面内 resize。
+        # z_axis / 2_5d：先在 (pD,H,W) 联动 crop，再面内 resize（框几何依赖此顺序）。
         zc = self._sample_z(rng, D, boxes_np, cov_j)
         patch = extract_z_patch_padded(img, zc, pD)
         z_lo = zc - pD // 2
@@ -350,14 +272,9 @@ class DetPatchDataset(Dataset):
         return np.ascontiguousarray(patch), boxes3d
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        vol_idx = idx % len(self.paths)
+        vol_idx = self._vol_idx(idx)
         img, boxes_np, labels_np = self._load(self.paths[vol_idx])
-        if self.is_train:
-            rng = self._rng()
-            cov_j = None
-        else:
-            rng = np.random.default_rng(self.seed * 1_000_003 + idx)
-            cov_j = idx // len(self.paths) if self.val_grid_coverage else None
+        rng, cov_j = self._item_rng_and_cov(idx)
 
         boxes3d = torch.from_numpy(boxes_np.astype(np.float32, copy=False))
         labels = torch.from_numpy(labels_np)

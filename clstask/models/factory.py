@@ -3,7 +3,7 @@
 四模板：
 
 * ResNet / ConvNeXt —— ``cls.backbone='encoder'``，复用
-  ``segtask_v1.models.factory.build_model(cfg).encoder``（具体由
+  ``taskcore.models.factory.build_backbone(cfg)``（具体由
   ``cfg.model.backbone`` 决定）。与 SSL 预训练**同一构建路径**，参数同名同形，
   ``cls.pretrained_ckpt`` 可 strict=False 直接命中 ``encoder.*``。
 * DenseNet —— :class:`clstask.models.densenet.DenseNetEncoder`（2D/3D）。
@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from taskcore.config.core import Config as SegConfig
-from taskcore.models.factory import build_model as build_seg_model
+from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import (
     extract_model_state_dict,
     strip_common_prefixes,
@@ -43,7 +43,7 @@ def _build_encoder(cfg: SegConfig, cls: ClsConfig) -> Tuple[nn.Module, int]:
     sd = int(cfg.model.spatial_dims)
     in_ch = int(cfg.model.in_channels)
     if cls.backbone == "encoder":
-        encoder = build_seg_model(cfg).encoder
+        encoder = build_backbone(cfg)
         return encoder, int(cfg.model.encoder_channels[-1])
     if cls.backbone == "densenet":
         encoder = DenseNetEncoder(

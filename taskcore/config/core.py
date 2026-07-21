@@ -6,7 +6,7 @@ import logging
 import re
 from dataclasses import dataclass, field, fields, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
@@ -1326,15 +1326,22 @@ class Config:
         if not mc.decoder_blocks_per_stage:
             mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
 
-    def validate(self) -> None:
-        """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。"""
+    def validate(self, *, skip: "Optional[Set[str]]" = None) -> None:
+        """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。
+
+        * ``skip`` — 跳过指定 section 校验器名（如组合式任务略过 seg 专属
+          ``loss`` / ``predict``）。
+        """
+        skip = skip or set()
         self._validate_model()
         self._validate_augment()
-        self._validate_loss()
+        if "loss" not in skip:
+            self._validate_loss()
         self._validate_data()
         self._validate_2_5d()
         self._validate_train()
-        self._validate_predict()
+        if "predict" not in skip:
+            self._validate_predict()
         self._validate_monitor()
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",

@@ -50,20 +50,25 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 
 from taskcore.data.dataset import (
     VolumeCache,
     _group_fg_coords_by_class,
     _group_fg_slices_by_class,
-    _halton,
     _open_npz,
     derive_volume_targets,
-    extract_z_patch_padded,
     load_npz_image,
     load_npz_label,
     load_npz_label_counts,
-    resize_3d,
+)
+from taskcore.data.patch_dataset_base import IndexScheme, NpzPatchDatasetBase
+from taskcore.data.patch_extract import extract_patch_by_mode, resolve_patch_center
+from taskcore.data.patch_ops import safe_center_range
+from taskcore.data.sampling import (
+    clip_center_to_ranges,
+    halton_center,
+    uniform_center,
+    z_grid_center,
 )
 
 logger = logging.getLogger(__name__)
@@ -158,44 +163,11 @@ def match_table_to_paths(npz_paths: Sequence[str],
 
 
 # ---------------------------------------------------------------------------
-# patch 抽取（与 segtask 口径一致）
+# patch 抽取（与 segtask 口径一致 —— 见 taskcore.data.patch_ops）
 # ---------------------------------------------------------------------------
-def _extract_cubic_patch(vol: np.ndarray, center: Tuple[int, int, int],
-                         patch: Tuple[int, int, int]) -> np.ndarray:
-    """以 center 为中心抽 patch；越界 edge 复制填充（同 segtask cubic）。"""
-    slices, pads = [], []
-    for dim, c, p in zip(vol.shape, center, patch):
-        lo = c - p // 2
-        hi = lo + p
-        pad_lo = max(-lo, 0)
-        pad_hi = max(hi - dim, 0)
-        slices.append(slice(max(lo, 0), min(hi, dim)))
-        pads.append((pad_lo, pad_hi))
-    out = vol[tuple(slices)]
-    if any(a or b for a, b in pads):
-        out = np.pad(out, pads, mode="edge")
-    return out
 
 
-def _safe_center_range(
-    shape: Tuple[int, ...], patch: Tuple[int, ...],
-) -> List[Tuple[int, int]]:
-    """逐轴返中心点 (lo, hi) 半开区间（供 randint/clip），使 patch 尽量在界内；
-    轴 size < patch 时退为体积中心（接受边界填充）。口径同
-    ``SegDataset3DCubic._safe_center_range``。"""
-    out = []
-    for size, p in zip(shape, patch):
-        half = p // 2
-        lo, hi = half, size - (p - half)
-        if hi <= lo:
-            mid = size // 2
-            out.append((mid, mid + 1))
-        else:
-            out.append((lo, hi))
-    return out
-
-
-class ClsPatchDataset(Dataset):
+class ClsPatchDataset(NpzPatchDatasetBase):
     """分类 patch 数据集（patch 抽取口径由 ``patch_mode`` 决定，3D 或 2.5D
     折叠由 ``spatial_dims`` 决定）。
 
@@ -229,17 +201,14 @@ class ClsPatchDataset(Dataset):
         val_grid_coverage   : bool = False,
         cache_enabled       : bool = False,
         cache_max_volumes   : int = 0):
-        self.paths = list(npz_paths)
-        if not self.paths:
-            raise ValueError("ClsPatchDataset got empty npz_paths.")
-        self.patch = tuple(int(s) for s in patch_size)
-        if len(self.patch) != 3:
-            raise ValueError(f"patch_size must be [D, H, W]; got {patch_size}.")
-        self.mode = str(patch_mode).lower()
-        if self.mode not in ("whole", "z_axis", "cubic", "2_5d"):
-            raise ValueError(f"bad patch_mode: {patch_mode!r}")
-        if spatial_dims not in (2, 3):
-            raise ValueError(f"spatial_dims must be 2 or 3; got {spatial_dims}.")
+        super().__init__(
+            npz_paths, patch_size, patch_mode, samples_per_volume,
+            spatial_dims, is_train, seed, val_grid_coverage,
+            intensity_min, intensity_max, normalize, global_mean, global_std,
+            fg_oversample_ratio, cache_enabled, cache_max_volumes,
+            index_scheme=IndexScheme.BLOCKED,
+            dataset_name="ClsPatchDataset",
+        )
         if label_granularity not in ("volume", "slice"):
             raise ValueError(f"bad label_granularity: {label_granularity!r}")
         if label_source not in ("mask", "table"):
@@ -249,8 +218,6 @@ class ClsPatchDataset(Dataset):
                 raise ValueError(
                     "label_source='table' requires table_targets aligned with "
                     "npz_paths.")
-        self.spatial_dims = int(spatial_dims)
-        self.fold_2_5d = self.spatial_dims == 2
         self.num_classes = int(num_classes)
         self.granularity = str(label_granularity)
         self.source = str(label_source)
@@ -261,26 +228,9 @@ class ClsPatchDataset(Dataset):
             raise ValueError(
                 f"mask label source: len(fg_values)={len(self.fg_values)} "
                 f"must equal num_classes={self.num_classes}.")
-        self.intensity_min = float(intensity_min)
-        self.intensity_max = float(intensity_max)
-        self.normalize = str(normalize)
-        self.global_mean = float(global_mean)
-        self.global_std = float(global_std)
-        self.spv = max(int(samples_per_volume), 1)
-        self.is_train = bool(is_train)
-        self.fg_ratio = (float(fg_oversample_ratio)
-                         if self.mode != "whole" else 0.0)
-        self.seed = int(seed)
         self.gpu_augment = bool(gpu_augment) and self.is_train
-        self.val_grid_coverage = bool(val_grid_coverage) and not self.is_train
         self._needs_label = self.source == "mask"
-        # 逐 worker LRU 缓存（复用 segtask VolumeCache：pickle 到 worker 时清空），
-        # 缓预处理后的卷，避免 samples_per_volume>1 时同卷重复 IO/预处理。
-        self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
-        # 逐 worker 训练采样 RNG（惰性创建，口径同 segtask dataset._rng）。
-        self._rng_cache: Optional[np.random.Generator] = None
-        self._rng_wid  : Optional[int] = None
 
         # 前景索引（仅训练 + fg_ratio>0）：读 make_data 预计算的 npz 键；
         # 缺键的旧 npz 标 None，__getitem__ 惰性回退全分辨率计算。
@@ -361,51 +311,25 @@ class ClsPatchDataset(Dataset):
         self._fg_fallback[vol_idx] = groups
         return groups
 
-    def __len__(self) -> int:
-        return len(self.paths) * self.spv
-
-    def _rng(self) -> np.random.Generator:
-        """逐 worker 训练 RNG（以 PyTorch 逐 worker 基种子创建，可复现且
-        跨 worker 不重复；主进程用 ``torch.initial_seed()``）。"""
-        info = torch.utils.data.get_worker_info()
-        wid = -1 if info is None else info.id
-        if self._rng_cache is None or self._rng_wid != wid:
-            seed = torch.initial_seed() if info is None else info.seed
-            self._rng_cache = np.random.default_rng(seed % (2 ** 63))
-            self._rng_wid = wid
-        return self._rng_cache
-
-    # ------------------------------------------------------------------
     def _load(self, path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        img = self._img_cache.get(path)
-        lbl = self._lbl_cache.get(path) if self._needs_label else None
-        if img is not None and (lbl is not None or not self._needs_label):
+        img = self._load_image_cached(path)
+        if not self._needs_label:
+            return img, None
+        lbl = self._lbl_cache.get(path)
+        if lbl is not None:
             return img, lbl
-        # 键存在性先行校验（只解析 zip 目录，不解码数据），报错信息明确。
         with _open_npz(path) as f:
             keys = list(f.files)
-        if "image" not in keys:
-            raise KeyError(f"npz {path!r} has no 'image' key (keys={keys}).")
-        if self._needs_label and "label" not in keys:
+        if "label" not in keys:
             raise KeyError(
                 f"npz {path!r} has no 'label' key required by "
                 f"label_source='mask' / fg oversampling fallback "
                 f"(keys={keys}).")
-        # 读取走 seg 的 memmap 零拷贝快路径（页缓存跨 worker 共享；压缩
-        # npz 自动回退 zipfile 路径，返回值逐位一致）。
-        img = load_npz_image(
-            path, self.intensity_min, self.intensity_max, self.normalize,
-            self.global_mean, self.global_std)
-        lbl = np.asarray(load_npz_label(path)) if self._needs_label else None
-        if img.ndim != 3:
-            raise ValueError(f"expected 3D volume (D,H,W); got {img.shape} "
-                             f"in {path!r}.")
-        if lbl is not None and lbl.shape != img.shape:
+        lbl = np.asarray(load_npz_label(path))
+        if lbl.shape != img.shape:
             raise ValueError(f"image/label shape mismatch in {path!r}: "
                              f"{img.shape} vs {lbl.shape}.")
-        self._img_cache.put(path, img)
-        if lbl is not None:
-            self._lbl_cache.put(path, lbl)
+        self._lbl_cache.put(path, lbl)
         return img, lbl
 
     # ------------------------------------------------------------------
@@ -417,7 +341,7 @@ class ClsPatchDataset(Dataset):
         """z 模式中心 z：val 覆盖 → 等距 bin 中心；训练 fg 命中 → 先均匀选类
         再选该类前景切片；否则均匀采样（口径同 ``SegDataset3D._sample_z``）。"""
         if cov_j is not None:
-            return min(int((cov_j + 0.5) * D_vol / self.spv), D_vol - 1)
+            return z_grid_center(cov_j, self.spv, D_vol)
         if (self.is_train and self.fg_ratio > 0
                 and rng.random() < self.fg_ratio):
             groups = self._fg_groups(vol_idx, lbl)
@@ -433,37 +357,26 @@ class ClsPatchDataset(Dataset):
         """cubic 模式中心 (d,h,w)：val 覆盖 → Halton(2,3,5) 铺满安全中心域；
         训练 fg 命中 → 先均匀选类再选点并夹匯到安全范围；否则安全域内均匀
         采样（口径同 ``SegDataset3DCubic._sample_center``）。"""
-        ranges = _safe_center_range(shape, self.patch)
+        ranges = safe_center_range(shape, self.patch)
         if cov_j is not None:
-            fracs = [_halton(cov_j + 1, b) for b in (2, 3, 5)]
-            return tuple(
-                lo + min(int(f * (hi - lo)), hi - lo - 1)
-                for f, (lo, hi) in zip(fracs, ranges))
+            return halton_center(cov_j, ranges)
         if (self.is_train and self.fg_ratio > 0
                 and rng.random() < self.fg_ratio):
             groups = self._fg_groups(vol_idx, lbl)
             if groups:
                 coords = groups[int(rng.integers(len(groups)))]
                 c = coords[int(rng.integers(len(coords)))]
-                return tuple(
-                    int(np.clip(int(x), lo, hi - 1))
-                    for x, (lo, hi) in zip(c, ranges))
-        return tuple(int(rng.integers(lo, hi)) for lo, hi in ranges)
+                return clip_center_to_ranges(c, ranges)
+        return uniform_center(rng, ranges)
 
     # ------------------------------------------------------------------
     # patch 抽取（image / label 同一几何）
     # ------------------------------------------------------------------
     def _extract(self, vol: np.ndarray, center: Tuple[int, int, int],
                  is_label: bool) -> np.ndarray:
-        """按 patch_mode 抽取严格 (pD,pH,pW) patch（label 用 nearest resize）。"""
-        pD, pH, pW = self.patch
-        if self.mode == "whole":
-            return resize_3d(vol, pD, pH, pW, is_label=is_label)
-        if self.mode == "cubic":
-            return _extract_cubic_patch(vol, center, self.patch)
-        # z_axis / 2_5d：z 轴 edge-padded 抽取 + 面内 resize。
-        p = extract_z_patch_padded(vol, center[0], pD)
-        return resize_3d(p, pD, pH, pW, is_label=is_label)
+        """按 patch_mode 抽取严格 (pD,pH,pW) patch。"""
+        return extract_patch_by_mode(
+            vol, self.mode, center, self.patch, is_label=is_label)
 
     def _target_from_mask(self, lbl_patch: np.ndarray) -> torch.Tensor:
         """mask 弱标签：volume → (K,)；slice → (K, D)。"""
@@ -478,23 +391,16 @@ class ClsPatchDataset(Dataset):
         return torch.from_numpy(t)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 同卷样本索引连续（idx // spv），顺序遍历时逐 worker LRU 缓存可命中。
-        vol_idx = idx // self.spv
+        vol_idx = self._vol_idx(idx)
         img, lbl = self._load(self.paths[vol_idx])
-        if self.is_train:
-            rng = self._rng()
-        else:
-            # 验证：中心由 (seed, idx) 确定性派生，epoch 间可复现。
-            rng = np.random.default_rng(self.seed * 1_000_003 + idx)
-        # 网格覆盖：卷内第 j 个样本（j = idx % spv）取确定性网格位置。
-        cov_j = (idx % self.spv) if self.val_grid_coverage else None
-        if self.mode == "z_axis" or self.mode == "2_5d":
-            z = self._sample_z(rng, img.shape[0], vol_idx, lbl, cov_j)
-            center = (z, 0, 0)
-        elif self.mode == "cubic":
-            center = self._sample_center(rng, img.shape, vol_idx, lbl, cov_j)
-        else:  # whole
-            center = (0, 0, 0)
+        rng, cov_j = self._item_rng_and_cov(idx)
+        center = resolve_patch_center(
+            self.mode,
+            sample_z=lambda: self._sample_z(
+                rng, img.shape[0], vol_idx, lbl, cov_j),
+            sample_center=lambda: self._sample_center(
+                rng, img.shape, vol_idx, lbl, cov_j),
+        )
         img_patch = self._extract(img, center, is_label=False)
         img_t = torch.from_numpy(
             np.ascontiguousarray(img_patch, dtype=np.float32))

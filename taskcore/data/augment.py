@@ -1,14 +1,21 @@
-"""GPU 3D 分割数据增强。空间变换（flip/affine/elastic/grid-dropout）逐样本独立；强度变换仅作用于 image。weight_map 同步受空间变换，插值由 AugConfig.wmap_interp_mode 控制。
+"""GPU 3D 数据增强（分割 / 生成 / 分类共用）。
 
-同步点约束：选样 Bernoulli 掩码与逐样本标量参数（角度/scale/sigma/zoom 等）均在
-CPU 上采样（``_bernoulli_mask``），再异步搬到设备；避免 ``mask.any()`` /
-``mask.sum().item()`` / ``mask.nonzero()`` 对 CUDA RNG 结果的隐式 device→host
-同步打断流水（一个 step 可累计 8–10 次）。元素级张量运算仍全部在 GPU 上。"""
+空间变换（flip/affine/elastic/grid-dropout）逐样本独立，并同步作用于
+**伴随张量**（:class:`Companion`）：label / weight_map / cond 等声明插值模式
+与越界填充后，由同一份 warp 消化（MONAI / TorchIO 式）。
+
+强度变换仅作用于 image。``weight_map`` 插值由 ``AugConfig.wmap_interp_mode`` 控制。
+
+同步点约束：选样 Bernoulli 掩码与逐样本标量参数均在 CPU 上采样
+（``_bernoulli_mask``），再异步搬到设备；避免对 CUDA RNG 结果的隐式
+device→host 同步打断流水。
+"""
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -24,9 +31,25 @@ def _bernoulli_mask(
     return torch.rand(n, generator=gen) < prob
 
 
+@dataclass
+class Companion:
+    """随 image 同空间变换的伴随张量。
+
+    * ``mode``：``grid_sample`` 插值（label=nearest，image/cond=bilinear）
+    * ``oob_fill``：仿射/弹性越界体素填充；``None`` 表示不覆盖（保留 border）
+    """
+
+    tensor: torch.Tensor
+    mode: str = "bilinear"
+    oob_fill: Optional[float] = None
+
+
 class GPUAugmentor:
-    """GPU 3D 增强管道。max_scale 为输入多分辨率最大 scale，用于缩小 elastic_deform_alpha，使最大物理通道位移 ≤ alpha 体素。
-    label_fill 为背景 label 值（label_values[0]），供 affine/elastic 越界区域填充。"""
+    """GPU 3D 增强管道。
+
+    ``max_scale`` 缩小 elastic_deform_alpha，使最大物理通道位移 ≤ alpha 体素。
+    ``label_fill`` 为 label 越界填充（通常 = ``label_values[0]``）。
+    """
 
     def __init__(self, cfg: AugConfig, max_scale: float = 1.0,
                  label_fill: float = 0.0,
@@ -48,7 +71,7 @@ class GPUAugmentor:
         self._gen_dev: Optional[torch.Generator] = None
         if self._seed is not None:
             self._gen_cpu = torch.Generator().manual_seed(self._seed)
-        # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。仅 affine/elastic 动 wmap。
+        # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。
         wmode = cfg.wmap_interp_mode
         if wmode not in ("nearest", "bilinear"):
             raise ValueError(
@@ -68,20 +91,20 @@ class GPUAugmentor:
             self._gen_dev.manual_seed(self._seed + 1)
         return self._gen_dev
 
-    def __call__(
-        self, image: torch.Tensor, label: torch.Tensor, weight_map: Optional[torch.Tensor] = None
-        ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """对 batch 应用增强；返回 (image, label, weight_map)。"""
+    def apply(
+        self,
+        image: torch.Tensor,
+        companions: Optional[Sequence[Companion]] = None,
+    ) -> Tuple[torch.Tensor, List[Companion]]:
+        """对 ``image`` + companions 施加完整增强管线。"""
+        comps: List[Companion] = list(companions or [])
         if not self.enabled:
-            return image, label, weight_map
+            return image, comps
 
-        # 克隆输入，避免原地修改污染调用方持有的张量；inplace=True（显存快路径）
-        # 时跳过——调用方声明输入张量可被消费（见 AugConfig.inplace 契约）。
         if not self.inplace:
             image = image.clone()
-            label = label.clone()
-            if weight_map is not None:
-                weight_map = weight_map.clone()
+            comps = [
+                Companion(c.tensor.clone(), c.mode, c.oob_fill) for c in comps]
 
         c = self.cfg
         gen_cpu = self._gen_cpu
@@ -94,35 +117,29 @@ class GPUAugmentor:
             clamp_lo = image.amin(dim=reduce_dims, keepdim=True)
             clamp_hi = image.amax(dim=reduce_dims, keepdim=True)
 
-        # Spatial: flip / (affine+elastic 融合单次 warp) / grid-dropout
-        image, label, weight_map = _random_flip(
-            image, label, c.random_flip_prob, c.random_flip_axes,
-            weight_map=weight_map, gen_cpu=gen_cpu)
-        # 按 max_scale 缩小 alpha。
+        image, comps = _random_flip_companions(
+            image, c.random_flip_prob, c.random_flip_axes,
+            companions=comps, gen_cpu=gen_cpu)
         effective_alpha = c.elastic_deform_alpha / self.max_scale
-        image, label, weight_map = _random_affine_elastic(
-            image, label,
+        image, comps = _random_affine_elastic_companions(
+            image,
             affine_prob=c.random_affine_prob,
             rotate_range=c.random_rotate_range,
             scale_range=c.random_scale_range,
             elastic_prob=c.elastic_deform_prob,
             sigma=c.elastic_deform_sigma,
             alpha=effective_alpha,
-            weight_map=weight_map,
-            wmap_mode=self.wmap_interp_mode,
+            companions=comps,
             translate_range=c.random_translate_range,
             rotate_range_per_axis=c.random_rotate_range_per_axis,
             aspect_correct=c.random_affine_aspect_correct,
-            label_fill=self.label_fill,
             gen_cpu=gen_cpu, gen_dev=gen_dev)
-        image, label, weight_map = _grid_dropout(
-            image, label, c.grid_dropout_prob, c.grid_dropout_ratio,
-            c.grid_dropout_holes, weight_map=weight_map,
+        image, comps = _grid_dropout_companions(
+            image, c.grid_dropout_prob, c.grid_dropout_ratio,
+            c.grid_dropout_holes, companions=comps,
             gen_cpu=gen_cpu, gen_dev=gen_dev)
 
-        # Intensity (image only)。全部强度增强后夹回增强前范围（clamp_lo/hi
-        # 在所有增强前采集）；这是比 nnU-Net 更激进的取舍，可关掉
-        # intensity_clamp。
+        # Intensity (image only)。全部强度增强后夹回增强前范围。
         image = _random_brightness(
             image, c.random_brightness_prob, c.random_brightness_range,
             gen_cpu=gen_cpu)
@@ -143,27 +160,58 @@ class GPUAugmentor:
         if c.intensity_clamp:
             image = torch.maximum(torch.minimum(image, clamp_hi), clamp_lo)
 
-        return image, label, weight_map
+        return image, comps
+
+    def __call__(
+        self, image: torch.Tensor, label: torch.Tensor,
+        weight_map: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """分割/分类入口：``(image, label[, weight_map])`` → 同结构。"""
+        comps: List[Companion] = [
+            Companion(label, mode="nearest", oob_fill=self.label_fill)]
+        if weight_map is not None:
+            comps.append(Companion(
+                weight_map, mode=self.wmap_interp_mode, oob_fill=1.0))
+        image, comps = self.apply(image, comps)
+        label_out = comps[0].tensor
+        wmap_out = comps[1].tensor if len(comps) > 1 else None
+        return image, label_out, wmap_out
 
 
 # 空间增强（逐样本独立）。
+def _random_flip_companions(
+    image: torch.Tensor,
+    prob: float, axes: list,
+    companions: Optional[Sequence[Companion]] = None,
+    gen_cpu: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, List[Companion]]:
+    """逐样本随机翻转；image 与全部 companions 同步。"""
+    comps = list(companions or [])
+    B = image.shape[0]
+    for axis in axes:
+        mask = _bernoulli_mask(B, prob, gen_cpu)
+        if mask.any():
+            idx = mask.nonzero(as_tuple=True)[0].to(image.device)
+            image[idx] = torch.flip(image[idx], [axis])
+            for c in comps:
+                c.tensor[idx] = torch.flip(c.tensor[idx], [axis])
+    return image, comps
+
+
 def _random_flip(
     image: torch.Tensor, label: torch.Tensor,
     prob: float, axes: list,
     weight_map: Optional[torch.Tensor] = None,
     gen_cpu: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本随机翻转；每轴独立采样。"""
-    B = image.shape[0]
-    for axis in axes:
-        mask = _bernoulli_mask(B, prob, gen_cpu)  # (B,) bool，CPU
-        if mask.any():
-            idx        = mask.nonzero(as_tuple=True)[0].to(image.device)
-            image[idx] = torch.flip(image[idx], [axis])  # axis indexes into (B,C,D,H,W)
-            label[idx] = torch.flip(label[idx], [axis])
-            if weight_map is not None:
-                weight_map[idx] = torch.flip(weight_map[idx], [axis])
-    return image, label, weight_map
+    """逐样本随机翻转（分割旧签名包装）。"""
+    comps: List[Companion] = [Companion(label, "nearest", None)]
+    if weight_map is not None:
+        comps.append(Companion(weight_map, "nearest", None))
+    image, comps = _random_flip_companions(
+        image, prob, axes, companions=comps, gen_cpu=gen_cpu)
+    wmap = comps[1].tensor if len(comps) > 1 else None
+    return image, comps[0].tensor, wmap
 
 
 def _build_rotation_matrices(
@@ -236,57 +284,46 @@ def _elastic_grid_disp(
     return rearrange(disp, 'b c d h w -> b d h w c')
 
 
-def _random_affine_elastic(
-    image: torch.Tensor, label: torch.Tensor,
+def _random_affine_elastic_companions(
+    image: torch.Tensor,
     affine_prob: float, rotate_range: list, scale_range: list,
     elastic_prob: float, sigma: float, alpha: float,
-    weight_map: Optional[torch.Tensor] = None,
-    wmap_mode: str = "nearest",
+    companions: Optional[Sequence[Companion]] = None,
     translate_range: Optional[list] = None,
     rotate_range_per_axis: Optional[list] = None,
     aspect_correct: bool = False,
-    label_fill: float = 0.0,
     gen_cpu: Optional[torch.Generator] = None,
     gen_dev: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """仿射与弹性形变融合为单次 grid_sample。
+) -> Tuple[torch.Tensor, List[Companion]]:
+    """仿射与弹性形变融合为单次 grid_sample；companions 共享同一 warp。
 
     两路选中掩码仍逐样本独立采样；对同时选中的样本，合成采样网格
-    G(x) = Θ(x + d(x)) = affine_grid + M·d（M 为 Θ 的 3×3 线性部分），与
-    “先 affine 后 elastic 两次重采样”的采样位置一致，但只插值一次：
-    省一轮 grid_sample，且避免双重插值叠加模糊。
+    G(x) = Θ(x + d(x)) = affine_grid + M·d（M 为 Θ 的 3×3 线性部分）。
 
-    仿射：欧拉旋转 + 各同性缩放 + 可选平移；rotate_range_per_axis 为 3 对
-    [lo,hi]（度），轴序 (x,y,z)=(W,H,D)，None 时三轴共用 rotate_range；
-    aspect_correct=True 时在 voxel-count 各向同性坐标里旋转（R←A⁻¹RA，
-    A=diag(W,H,D)），不代替真实 spacing 校正；translate_range 为归一化
-    坐标 [-1,1]。弹性：sigma 控平滑度（常 4–9），alpha 控位移幅度体素
-    （常 3–12，近似标称）。image 的 grid_sample 用 padding_mode='border'；
-    采样点落在体外（归一化坐标绝对值 > 1）的体素，label 填背景常数
-    ``label_fill``（= label_values[0]）、weight_map 填语义中性值 1，避免
-    border 复制把边缘前景/权重沿越界区域外推产生非真实监督。"""
+    image 用 padding_mode='border'；companion 的 ``oob_fill`` 非 None 时，
+    越界体素覆写为该常数（label→背景、seg wmap→1.0；gen wmap/cond 为 None）。
+    """
+    comps = list(companions or [])
     B, _, D, H, W = image.shape
     device = image.device
 
-    # 选样与标量参数全部 CPU 采样（零同步），仅参数张量异步搬设备。
     mask_a = _bernoulli_mask(B, affine_prob, gen_cpu)
     mask_e = _bernoulli_mask(B, elastic_prob, gen_cpu)
     mask = mask_a | mask_e
     if not mask.any():
-        return image, label, weight_map
+        return image, comps
 
     idx_cpu = mask.nonzero(as_tuple=True)[0]
     idx = idx_cpu.to(device)
     n = idx_cpu.shape[0]
-    sel_a = mask_a[idx_cpu]  # (n,) 选中样本内的 affine 子集（CPU）
+    sel_a = mask_a[idx_cpu]
     sel_e = mask_e[idx_cpu]
 
-    # 逐样本 3x4 仿射；未选 affine 的样本用单位阵。
     theta = torch.eye(3, 4, device=device).unsqueeze(0).repeat(n, 1, 1)
     na = int(sel_a.sum())
     if na:
         if rotate_range_per_axis is not None:
-            angles = torch.empty(na, 3)  # (na, 3) for x,y,z
+            angles = torch.empty(na, 3)
             for ax in range(3):
                 lo = math.radians(rotate_range_per_axis[ax][0])
                 hi = math.radians(rotate_range_per_axis[ax][1])
@@ -308,7 +345,6 @@ def _random_affine_elastic(
 
         aspect = None
         if aspect_correct:
-            # affine_grid 坐标轴序 (x,y,z)=(W,H,D)；只用比例，公共尺度无影响。
             aspect = torch.tensor(
                 [float(W), float(H), float(D)],
                 device=device, dtype=torch.float32)
@@ -321,55 +357,82 @@ def _random_affine_elastic(
     if ne:
         sel_e_dev = sel_e.to(device)
         disp = _elastic_grid_disp(ne, D, H, W, sigma, alpha, device, gen_dev)
-        # G(x)=Θ(x+d)=Θx + M·d；d 与 M 均为 (x,y,z) 轴序。
-        m = theta[sel_e_dev][:, :, :3]  # (ne,3,3)
+        m = theta[sel_e_dev][:, :, :3]
         grid[sel_e_dev] = grid[sel_e_dev] + torch.einsum(
             'n r c, n d h w c -> n d h w r', m, disp)
 
-    # 越界采样点：归一化坐标任一轴绝对值 > 1 即落在体外。
     oob = (grid.abs() > 1.0).any(dim=-1)  # (n, D, H, W)
 
     image[idx] = F.grid_sample(
-        image[idx], grid, mode="bilinear", padding_mode="border", align_corners=False)
-    lbl = F.grid_sample(
-        label[idx], grid, mode="nearest", padding_mode="border", align_corners=False)
-    lbl[oob.unsqueeze(1).expand_as(lbl)] = label_fill
-    label[idx] = lbl
-    if weight_map is not None:
-        wm = F.grid_sample(
-            weight_map[idx], grid, mode=wmap_mode,
+        image[idx], grid, mode="bilinear", padding_mode="border",
+        align_corners=False)
+    for c in comps:
+        warped = F.grid_sample(
+            c.tensor[idx], grid, mode=c.mode,
             padding_mode="border", align_corners=False)
-        wm[oob.unsqueeze(1).expand_as(wm)] = 1.0
-        weight_map[idx] = wm
+        if c.oob_fill is not None:
+            warped[oob.unsqueeze(1).expand_as(warped)] = c.oob_fill
+        c.tensor[idx] = warped
 
-    return image, label, weight_map
+    return image, comps
 
 
-def _grid_dropout(
+def _random_affine_elastic(
     image: torch.Tensor, label: torch.Tensor,
-    prob: float, ratio: float, num_holes: int,
+    affine_prob: float, rotate_range: list, scale_range: list,
+    elastic_prob: float, sigma: float, alpha: float,
     weight_map: Optional[torch.Tensor] = None,
+    wmap_mode: str = "nearest",
+    translate_range: Optional[list] = None,
+    rotate_range_per_axis: Optional[list] = None,
+    aspect_correct: bool = False,
+    label_fill: float = 0.0,
     gen_cpu: Optional[torch.Generator] = None,
     gen_dev: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """随机零掩 num_holes 个矩形区域。label/weight_map 不被掩。"""
+    """仿射+弹性（分割旧签名包装）：label nearest+oob_fill，wmap 填 1.0。"""
+    comps: List[Companion] = [
+        Companion(label, mode="nearest", oob_fill=float(label_fill))]
+    if weight_map is not None:
+        comps.append(Companion(
+            weight_map, mode=wmap_mode, oob_fill=1.0))
+    image, comps = _random_affine_elastic_companions(
+        image,
+        affine_prob=affine_prob, rotate_range=rotate_range,
+        scale_range=scale_range, elastic_prob=elastic_prob,
+        sigma=sigma, alpha=alpha, companions=comps,
+        translate_range=translate_range,
+        rotate_range_per_axis=rotate_range_per_axis,
+        aspect_correct=aspect_correct,
+        gen_cpu=gen_cpu, gen_dev=gen_dev)
+    wmap = comps[1].tensor if len(comps) > 1 else None
+    return image, comps[0].tensor, wmap
+
+
+def _grid_dropout_companions(
+    image: torch.Tensor,
+    prob: float, ratio: float, num_holes: int,
+    companions: Optional[Sequence[Companion]] = None,
+    gen_cpu: Optional[torch.Generator] = None,
+    gen_dev: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, List[Companion]]:
+    """随机零掩 num_holes 个矩形区域；仅 image，companions 原样返回。"""
+    comps = list(companions or [])
     if prob <= 0 or ratio <= 0:
-        return image, label, weight_map
+        return image, comps
 
     B, _, D, H, W = image.shape
     device = image.device
 
-    selected = _bernoulli_mask(B, prob, gen_cpu)  # (B,) bool，CPU
+    selected = _bernoulli_mask(B, prob, gen_cpu)
     if not selected.any():
-        return image, label, weight_map
+        return image, comps
 
     frac = (ratio / max(num_holes, 1)) ** (1.0 / 3.0)
-    # 逐轴夹到轴长：frac>1（ratio 大 / holes 少）时洞不得超过该轴，否则索引越界。
     hd = min(D, max(1, int(D * frac)))
     hh = min(H, max(1, int(H * frac)))
     hw = min(W, max(1, int(W * frac)))
 
-    # 逐样本 hole 左上角；合法起点为 0..axis-hole（randint 上界不含，故 +1）。
     d0 = torch.randint(0, D - hd + 1, (B, num_holes), device=device,
                        generator=gen_dev)
     h0 = torch.randint(0, H - hh + 1, (B, num_holes), device=device,
@@ -393,10 +456,27 @@ def _grid_dropout(
             ws[:, None, None, :],
         ] = 0
 
-    # effective = selected ? hole_mask : 1。
     gate = rearrange(selected.to(device), 'b -> b 1 1 1 1').to(image.dtype)
     effective = hole_mask * gate + (1.0 - gate)
-    return image * effective, label, weight_map
+    return image * effective, comps
+
+
+def _grid_dropout(
+    image: torch.Tensor, label: torch.Tensor,
+    prob: float, ratio: float, num_holes: int,
+    weight_map: Optional[torch.Tensor] = None,
+    gen_cpu: Optional[torch.Generator] = None,
+    gen_dev: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """随机零掩（分割旧签名包装）；label/weight_map 不被掩。"""
+    comps: List[Companion] = [Companion(label, "nearest", None)]
+    if weight_map is not None:
+        comps.append(Companion(weight_map, "nearest", None))
+    image, comps = _grid_dropout_companions(
+        image, prob, ratio, num_holes, companions=comps,
+        gen_cpu=gen_cpu, gen_dev=gen_dev)
+    wmap = comps[1].tensor if len(comps) > 1 else None
+    return image, comps[0].tensor, wmap
 
 
 # 强度增强（逐样本独立）。

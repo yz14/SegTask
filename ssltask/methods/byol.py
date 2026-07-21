@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from taskcore.models.factory import build_model
+from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import unwrap_compile
 
 from ..data.multicrop import MultiCropGenerator
@@ -81,8 +81,8 @@ class BYOLMethod(SSLMethod):
         proj_dim = int(self.ssl.byol_proj_dim)
         hidden_dim = int(self.ssl.dino_hidden_dim)
         pred_hidden_dim = int(self.ssl.byol_pred_hidden_dim)
-        enc_online = build_model(self.cfg).encoder
-        enc_target = build_model(self.cfg).encoder
+        enc_online = build_backbone(self.cfg)
+        enc_target = build_backbone(self.cfg)
         enc_target.load_state_dict(enc_online.state_dict())   # 目标初始 = 在线
         projector_online = DINOHead(
             in_dim=int(self.cfg.model.encoder_channels[-1]),

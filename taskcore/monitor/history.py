@@ -309,11 +309,17 @@ class MetricsLogger:
 
     # -- best computation ----------------------------------------------
     def _compute_best(self) -> Optional[Dict[str, Any]]:
-        """据 ``save_best_metric`` / mode 从已记录的验证指标里选 best epoch。"""
+        """据 ``save_best_metric`` / mode 从已记录指标里选 best epoch。
+
+        优先读 ``val``；若该 epoch 的 val 无此键（如 SSL 把 ``probe_dice`` /
+        ``loss`` 写在 train），则回退读 ``train``，避免 best_card 恒空。
+        """
         best_rec: Optional[EpochRecord] = None
         best_val: Optional[float] = None
         for rec in self._records.values():
             v = rec.val.get(self.save_best_metric)
+            if v is None:
+                v = rec.train.get(self.save_best_metric)
             if v is None:
                 continue
             if best_val is None or (

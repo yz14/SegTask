@@ -314,20 +314,20 @@ def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
     return _auto_anisotropic_strides(spatial_sizes, num_down)
 
 
-def build_model(cfg: Config):
-    """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
-    （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
-    arch = str(cfg.model.arch).lower()
-    if arch == "adm":
-        from .adm_unet import build_adm_seg_model
-        return build_adm_seg_model(cfg)
-    if arch == "edm2":
-        from .edm2_unet import build_edm2_seg_model
-        return build_edm2_seg_model(cfg)
-    if arch != "unet":
-        raise ValueError(
-            f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
+def _build_unet_encoder_decoder(
+    cfg: Config,
+    *,
+    attn_gate_target: str = "skips",
+):
+    """构造 UNet 家族 ``(encoder, decoder)``，不含分割头 / deep-sup / aux。
 
+    cls / det / ssl 骨干装配与 ``build_model`` 共用此路径，保证
+    ``encoder.*`` / ``decoder.*`` 同名同形；任务头由各任务自行挂载。
+    """
+    if str(cfg.model.arch).lower() != "unet":
+        raise ValueError(
+            f"_build_unet_encoder_decoder requires model.arch=='unet'; "
+            f"got {cfg.model.arch!r}.")
     mc           = cfg.model
     enc_channels = list(mc.encoder_channels)
     num_fg       = cfg.num_fg_classes
@@ -491,6 +491,7 @@ def build_model(cfg: Config):
             upsample_mode=mc.upsample_mode,
             skip_attention=mc.skip_attention,
             attn_gate_norm=attn_gate_norm,
+            attn_gate_target=attn_gate_target,
             spatial_dims=spatial_dims,
             upsample_norm_act=mc.upsample_norm_act,
             norm_type=mc.norm_type,
@@ -512,6 +513,73 @@ def build_model(cfg: Config):
             norm_groups        = mc.norm_groups,
             activation         = mc.activation,
             grad_checkpointing = mc.grad_checkpointing)
+
+    return encoder, decoder
+
+
+def build_backbone(
+    cfg: Config,
+    *,
+    with_decoder: bool = False,
+    attn_gate_target: str = "skips",
+):
+    """骨干专用入口：只建 encoder（及可选 decoder），不建任务头。
+
+    * ``with_decoder=False``（默认）→ 返回 ``encoder``（cls / DINO / BYOL…）
+    * ``with_decoder=True`` → 返回 ``(encoder, decoder)``（det / SSL 重建）
+
+    仅支持 ``model.arch=='unet'``；adm/edm2 请继续用 ``build_model``。
+    Encoder ``forward`` 返回逐级特征列表；末级通道 =
+    ``cfg.model.encoder_channels[-1]``；Decoder 暴露 ``out_channels``
+    （深→浅）。
+    """
+    encoder, decoder = _build_unet_encoder_decoder(
+        cfg, attn_gate_target=attn_gate_target)
+    if with_decoder:
+        return encoder, decoder
+    return encoder
+
+
+def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
+    """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
+    （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
+    arch = str(cfg.model.arch).lower()
+    if arch == "adm":
+        from .adm_unet import build_adm_seg_model
+        return build_adm_seg_model(cfg)
+    if arch == "edm2":
+        from .edm2_unet import build_edm2_seg_model
+        return build_edm2_seg_model(cfg)
+    if arch != "unet":
+        raise ValueError(
+            f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
+
+    encoder, decoder = _build_unet_encoder_decoder(
+        cfg, attn_gate_target=attn_gate_target)
+    mc = cfg.model
+    topo = build_topology(cfg)
+    spatial_dims = topo.spatial_dims
+    out_classes = topo.out_classes
+    num_fg = cfg.num_fg_classes
+    enc_channels = list(mc.encoder_channels)
+    n_levels = len(enc_channels)
+    enc_counts = _resolve_blocks_per_stage(
+        mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
+    if mc.decoder_type == "unet":
+        expected_dec_calls = n_levels - 1
+    elif mc.decoder_type == "unetpp":
+        expected_dec_calls = n_levels * (n_levels - 1) // 2
+    else:
+        expected_dec_calls = 0
+    if mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
+        dec_counts = _resolve_blocks_per_stage(
+            mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
+    elif mc.decoder_blocks_per_stage:
+        dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
+    else:
+        dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)
+    num_stem_fusion_views = topo.num_stem_fusion_views
+    aux_head_out_channels = topo.aux_head_out_channels
 
     # aux 门控统一由 topology 决定（已合并 ``aux_seg_supervision and n_views>1``）。
     aux_seg_supervision       = topo.aux_seg_active
