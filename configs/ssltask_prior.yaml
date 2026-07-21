@@ -51,31 +51,31 @@ augment:
 
 
 model:
-  backbone: "resnet"
-  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_channels        : [64, 64, 128, 256, 512]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   decoder_blocks_per_stage: [2, 2, 2, 2]
-  block_type: "basic"
+  dropout                 : 0.0
 
-  norm_type  : "instance"
-  norm_groups: 8
-  activation : "leakyrelu"
-  dropout    : 0.0
+  deep_supervision        : false
+  aux_seg_supervision     : false
 
-  attention_type: "none"
-  skip_attention: true
+  stem_mode               : "conv3"
 
-  deep_supervision   : false
-  aux_seg_supervision: false
-  aux_topo_head      : false
+  unet:
+    backbone       : "resnet"
+    block_type     : "basic"
 
-  stem_mode      : "conv3"
-  decoder_type   : "unet"
-  downsample_mode: "conv"
-  upsample_mode  : "trilinear"
-  skip_mode      : "cat"
+    norm_type      : "instance"
+    norm_groups    : 8
+    activation     : "leakyrelu"
 
-
+    attention_type : "none"
+    skip_attention : true
+    aux_topo_head  : false
+    decoder_type   : "unet"
+    downsample_mode: "conv"
+    upsample_mode  : "trilinear"
+    skip_mode      : "cat"
 train:
   epochs: 200
 

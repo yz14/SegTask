@@ -243,7 +243,9 @@ class DetTrainer(BaseTrainer):
                     grad_clip_norm=self.grad_clip_norm)
                 group_has_nonfinite = False
                 grad_norm_val = result.grad_norm
-                if result.skipped_nonfinite:
+                skipped_nf = result.skipped_nonfinite
+                result.acknowledge()
+                if skipped_nf:
                     continue
                 opt_steps += 1
                 if grad_norm_val is not None and math.isfinite(grad_norm_val):

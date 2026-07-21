@@ -554,7 +554,7 @@ def _loss_node_detail(cfg: Config) -> Dict[str, object]:
         detail["aux_seg_supervision"] = True
         if getattr(lc, "aux_supervision_weights", None):
             detail["aux_supervision_weights"] = list(lc.aux_supervision_weights)
-    if getattr(cfg.model, "aux_topo_head", False):
+    if cfg.model.unet.aux_topo_head:
         detail["aux_topo_head"] = True
         detail["aux_topo_weight"] = _fmt_num(getattr(lc, "aux_topo_weight", 0.0))
     return detail

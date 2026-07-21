@@ -219,10 +219,15 @@ def load_base_values(rel_path: str) -> Dict[str, Dict[str, Any]]:
     """读取模板 YAML，经 Config 规整后回传 {section: {field: value}} 全量值。
 
     经 load→sync 确保派生量与默认补齐，便于前端按 manifest 取所需字段。
+    model 段展平回旧扁平字段名（与表单 schema 口径一致，见 launcher.schema）。
     """
+    from taskcore.config.model_migration import flatten_model_dict
+
     path = (REPO_ROOT / rel_path).resolve()
     # 安全：限制只能读 configs/ 内文件。
     if CONFIG_DIR.resolve() not in path.parents:
         raise ValueError("base config must live under configs/.")
     cfg = _config.load_config(path)
-    return _dc.asdict(cfg)
+    blob = _dc.asdict(cfg)
+    blob["model"] = flatten_model_dict(blob["model"])
+    return blob

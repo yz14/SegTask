@@ -232,3 +232,242 @@ def test_per_class_thresholds_apply_to_matching_class():
     assert labels[0, 0, 1] == 1
     assert labels[0, 1, 0] == 2
     assert labels[1, 1, 1] == 0
+
+
+def test_train_validators_run_when_predict_skipped():
+    """S1-1 回归：train.ema_device / swa_start_ratio 校验必须位于
+    _validate_train——组合式任务（cls/det/ssl）以 skip={'loss','predict'}
+    校验时同样要拦下非法值，不得随 _validate_predict 一起被跳过。"""
+    import pytest
+    from taskcore.config.core import Config, ConfigError
+
+    cfg = Config()
+    cfg.train.ema_device = "gpu"
+    cfg.sync()
+    with pytest.raises(ConfigError, match="ema_device"):
+        cfg.validate(skip={"loss", "predict"})
+
+    cfg = Config()
+    cfg.train.swa_enabled = True
+    cfg.train.swa_start_ratio = 1.5
+    cfg.sync()
+    with pytest.raises(ConfigError, match="swa_start_ratio"):
+        cfg.validate(skip={"loss", "predict"})
+
+    # 合法默认值在 skip 路径上仍应通过。
+    cfg = Config()
+    cfg.sync()
+    cfg.validate(skip={"loss", "predict"})
+
+
+def test_validate_data_rejects_invalid_enums_and_ranges():
+    """S1-3 回归：_validate_data 须 fail-fast 拦下非法 normalize/cache_mode
+    等枚举与区间（normalize 静默走错分支会破坏训推一致性契约 C8）。"""
+    import pytest
+    from taskcore.config.core import Config, ConfigError
+
+    bad = [
+        ("normalize", "znorm"),
+        ("cache_mode", "disk"),
+        ("val_ratio", 0.0),
+        ("foreground_oversample_ratio", 1.5),
+        ("samples_per_volume", 0),
+        ("batch_size", 0),
+        ("num_workers", -1),
+    ]
+    for field, value in bad:
+        cfg = Config()
+        setattr(cfg.data, field, value)
+        cfg.sync()
+        with pytest.raises(ConfigError, match=field):
+            cfg.validate(skip={"loss", "predict"})
+
+    # 合法边界值放行。
+    cfg = Config()
+    cfg.data.normalize = "zscore"
+    cfg.data.cache_mode = "none"
+    cfg.data.foreground_oversample_ratio = 1.0
+    cfg.data.samples_per_volume = 1
+    cfg.data.batch_size = 1
+    cfg.data.num_workers = 0
+    cfg.sync()
+    cfg.validate()
+
+
+def test_resenc_preset_accepts_lowercase():
+    """S1-2 回归：validate 与 sync 对 resenc_preset 大小写口径一致。"""
+    from taskcore.config.core import Config
+
+    cfg = Config()
+    cfg.model.resenc_preset = "m"
+    cfg.sync()
+    cfg.validate()
+    assert cfg.model.encoder_blocks_per_stage  # sync 已展开模板
+    assert cfg.model.decoder_blocks_per_stage
+
+
+def test_segdataset_defaults_align_with_config():
+    """S2-4 回归：直接构造 Dataset 的 intensity_max / z_boundary_mode
+    默认与 Config.data 一致，避免绕过 Config 时踩坑。"""
+    import inspect
+    from taskcore.config.core import Config
+    from taskcore.data.dataset import (
+        SegDataset3D, SegDataset3DCubic, SegDataset3DWhole,
+    )
+
+    cfg = Config()
+    for cls in (SegDataset3D, SegDataset3DCubic, SegDataset3DWhole):
+        params = inspect.signature(cls.__init__).parameters
+        assert float(params["intensity_max"].default) == float(cfg.data.intensity_max)
+    assert (inspect.signature(SegDataset3D.__init__).parameters["z_boundary_mode"].default
+            == cfg.data.z_boundary_mode)
+
+
+def test_all_task_trainers_use_shared_optimizer_boundary_contract():
+    """D3 守门：五任务训练循环必须走公共优化边界并处理非有限跳步；
+    尾批累积算法只允许由 BaseTrainer 提供，避免任务侧复制后漂移。"""
+    import ast
+    import inspect
+    import textwrap
+
+    from clstask.trainer.cls_trainer import ClsTrainer
+    from dettask.trainer.det_trainer import DetTrainer
+    from gentask.trainer.gen_trainer import GenerationTrainer
+    from segtask_v1.trainer.trainer import Trainer
+    from ssltask.trainer.ssl_trainer import SSLTrainer
+    from taskcore.engine.base_trainer import BaseTrainer
+
+    trainers = (Trainer, GenerationTrainer, ClsTrainer, DetTrainer, SSLTrainer)
+    for trainer_cls in trainers:
+        assert issubclass(trainer_cls, BaseTrainer)
+        assert "_effective_accum" not in trainer_cls.__dict__, (
+            f"{trainer_cls.__name__} must inherit BaseTrainer._effective_accum "
+            "instead of copying the shared accumulation contract")
+
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(trainer_cls._train_epoch)))
+        called_helpers = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        read_attributes = {
+            node.attr for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+        }
+        assert "_optimizer_step_boundary" in called_helpers, (
+            f"{trainer_cls.__name__}._train_epoch bypasses the shared "
+            "optimizer-step boundary")
+        assert "acknowledge" in called_helpers, (
+            f"{trainer_cls.__name__}._train_epoch must call "
+            "OptimStepResult.acknowledge() after handling the boundary result")
+        assert "skipped_nonfinite" in read_attributes, (
+            f"{trainer_cls.__name__}._train_epoch does not handle "
+            "OptimStepResult.skipped_nonfinite")
+
+
+def test_adm_edm2_warn_on_ignored_non_default_model_fields():
+    """D1 回归：arch='adm'|'edm2' 装配时对被忽略且非默认的通用 model 字段
+    发汇总 warning；默认配置零告警；对侧扩散家族专属组同样计入。"""
+    from taskcore.config.core import Config
+    from taskcore.models.arch_compat import warn_ignored_model_fields
+
+    # 默认配置：无漂移、无告警。
+    cfg = Config()
+    assert warn_ignored_model_fields(cfg.model, "adm") == []
+    assert warn_ignored_model_fields(cfg.model, "edm2") == []
+
+    # 通用 UNet 旋钮漂移：两种 arch 都要报。
+    cfg = Config()
+    cfg.model.backbone = "convnext"
+    cfg.model.attention_type = "se"
+    cfg.model.upsample_mode = "trilinear"
+    drifted = warn_ignored_model_fields(cfg.model, "adm")
+    assert set(drifted) == {"backbone", "attention_type", "upsample_mode"}
+
+    # 对侧家族专属组：adm 下设 edm2_* 应报，反之亦然。
+    cfg = Config()
+    cfg.model.edm2_channels_per_head = 128
+    assert warn_ignored_model_fields(cfg.model, "adm") == ["edm2_channels_per_head"]
+    assert warn_ignored_model_fields(cfg.model, "edm2") == []
+
+    cfg = Config()
+    cfg.model.adm_num_heads = 8
+    assert warn_ignored_model_fields(cfg.model, "edm2") == ["adm_num_heads"]
+    assert warn_ignored_model_fields(cfg.model, "adm") == []
+
+    # 被消费字段（dropout / stem_fusion_mode / deep_supervision 等）不报。
+    cfg = Config()
+    cfg.model.dropout = 0.1
+    cfg.model.stem_fusion_mode = "shared_stem"
+    cfg.model.deep_supervision = True
+    assert warn_ignored_model_fields(cfg.model, "adm") == []
+    assert warn_ignored_model_fields(cfg.model, "edm2") == []
+
+
+def test_optim_step_result_flag_invariants_and_ack_gate():
+    """D3 第二阶段：结果标志互斥 + 未 acknowledge 不得再次进入边界。"""
+    import pytest
+    import torch
+    from taskcore.engine.base_trainer import BaseTrainer, OptimStepResult
+    from taskcore.engine.optim import WarmupScheduler
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        OptimStepResult(
+            stepped=False, skipped_nonfinite=True,
+            scaler_skipped=True, grad_norm=None)
+    with pytest.raises(ValueError, match="incompatible"):
+        OptimStepResult(
+            stepped=True, skipped_nonfinite=True,
+            scaler_skipped=False, grad_norm=None)
+
+    class _Tiny(BaseTrainer):
+        pass
+
+    t = _Tiny.__new__(_Tiny)
+    t.model = torch.nn.Linear(2, 1)
+    t.optimizer = torch.optim.SGD(t.model.parameters(), lr=0.1)
+    t.scheduler = WarmupScheduler(
+        t.optimizer, scheduler=None, warmup_steps=0,
+        warmup_lr=0.1, base_lr=0.1)
+    t.ema = None
+    t._scaler_active = False
+    # Null scaler path：bf16/fp32 走 all_reduce_flag_any；单卡恒等于本地标志。
+    class _NullScaler:
+        def step(self, opt):
+            opt.step()
+
+        def update(self):
+            return None
+
+        def get_scale(self):
+            return 1.0
+
+        def unscale_(self, opt):
+            return None
+
+    t.scaler = _NullScaler()
+    t.cfg = type("C", (), {"train": type("T", (), {"grad_clip_norm": 0.0})()})()
+    t.device = torch.device("cpu")
+
+    r1 = t._optimizer_step_boundary(
+        group_has_nonfinite=False, epoch=0, step=0, total_steps=1)
+    assert r1.stepped and not r1.skipped_nonfinite
+    with pytest.raises(RuntimeError, match="not acknowledged"):
+        t._optimizer_step_boundary(
+            group_has_nonfinite=False, epoch=0, step=0, total_steps=1)
+    r1.acknowledge()
+
+    r2 = t._optimizer_step_boundary(
+        group_has_nonfinite=True, epoch=0, step=0, total_steps=1)
+    assert r2.skipped_nonfinite and not r2.stepped
+    assert t.scheduler.current_step == 1  # 默认路径跳步不推 scheduler
+    r2.acknowledge()
+
+    r3 = t._optimizer_step_boundary(
+        group_has_nonfinite=True, epoch=0, step=0, total_steps=1,
+        always_step_scheduler=True)
+    assert r3.skipped_nonfinite and not r3.stepped
+    assert t.scheduler.current_step == 2  # SSL 路径跳步仍推进
+    r3.acknowledge()

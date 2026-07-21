@@ -81,32 +81,13 @@ augment:
 model:
   # —— 必须与下游 vessel yaml 的 model 段逐项一致，否则 strict=False 静默丢权重 ——
   arch                    : "unet"
-  backbone                : "resnet"
   encoder_channels        : [64, 128, 256, 512, 512]
   blocks_per_level        : 2
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   decoder_blocks_per_stage: [2, 2, 2, 2]
-  block_type              : "basic"
-
-  norm_type               : "batch"
-  norm_groups             : 8
-  activation              : "leakyrelu"
   dropout                 : 0.0
-  drop_path_rate          : 0.0
 
   stem_mode               : "dual"
-  decoder_type            : "unet"
-  downsample_mode         : "conv"
-  downsample_strides      : []
-  anisotropic_pooling     : false
-  upsample_mode           : "trilinear"
-  upsample_norm_act       : true
-  skip_mode               : "cat"
-
-  attention_type          : "se"
-  se_reduction            : 16
-  skip_attention          : false
-  attn_gate_norm          : "batch"
 
   # 监督头在 SSL 阶段被丢弃（仅预训练 encoder/decoder），不影响 encoder/decoder
   # 几何与权重命名。aux_seg_supervision 在单视图（n_views==1）下被 Config 校验
@@ -116,32 +97,53 @@ model:
   aux_head_mode           : "conv"
 
   stem_fusion_mode        : "multi_stem_proj"
-  lift_2_5d_to_3d         : false
 
   grad_checkpointing      : true
-  grad_ckpt_encoder_stages: []
 
-  multirf_enabled       : true
-  multirf_dilations     : [1, 2, 3]
-  multirf_mode          : "split"
-  multirf_fusion        : "concat_proj"
-  multirf_axes          : "hw"
-  multirf_encoder_stages: [0, 1, 1, 1, 1]
-  multirf_decoder_stages: [1, 1, 1, 0]
-  multirf_branch_norm_act: true
+  unet:
+    backbone                : "resnet"
+    block_type              : "basic"
 
-  selfattn_enabled       : true
-  selfattn_type          : "softmax"
-  selfattn_num_heads     : 4
-  selfattn_head_dim      : -1
-  selfattn_zero_init     : true
-  selfattn_rope          : false
-  selfattn_ffn           : false
-  selfattn_ffn_ratio     : 4.0
-  selfattn_encoder_stages: [0, 0, linear, softmax, softmax]
-  selfattn_decoder_stages: [softmax, linear, 0, 0]
+    norm_type               : "batch"
+    norm_groups             : 8
+    activation              : "leakyrelu"
+    drop_path_rate          : 0.0
+    decoder_type            : "unet"
+    downsample_mode         : "conv"
+    downsample_strides      : []
+    anisotropic_pooling     : false
+    upsample_mode           : "trilinear"
+    upsample_norm_act       : true
+    skip_mode               : "cat"
 
+    attention_type          : "se"
+    se_reduction            : 16
+    skip_attention          : false
+    attn_gate_norm          : "batch"
+    lift_2_5d_to_3d         : false
+    grad_ckpt_encoder_stages: []
+    multirf:
 
+      enabled        : true
+      dilations      : [1, 2, 3]
+      mode           : "split"
+      fusion         : "concat_proj"
+      axes           : "hw"
+      encoder_stages : [0, 1, 1, 1, 1]
+      decoder_stages : [1, 1, 1, 0]
+      branch_norm_act: true
+    selfattn:
+
+      enabled       : true
+      type          : "softmax"
+      num_heads     : 4
+      head_dim      : -1
+      zero_init     : true
+      rope          : false
+      ffn           : false
+      ffn_ratio     : 4.0
+      encoder_stages: [0, 0, linear, softmax, softmax]
+      decoder_stages: [softmax, linear, 0, 0]
 train:
   # —— 省显存/提速开关一览（均已在 SSL trainer 实现，见 ssl_trainer.py / pretrain.py）——
   #   省显存：grad_checkpointing(model 段) + zero_redundancy_optimizer + bf16 AMP

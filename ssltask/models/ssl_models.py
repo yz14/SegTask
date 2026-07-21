@@ -197,8 +197,8 @@ def build_ssl_mim_model(cfg, head_dim: int = 0) -> SSLMIMModel:
     head = LightPixelHead(
         in_ch=enc_last, out_ch=out_ch, hidden=hidden,
         spatial_dims=spatial_dims,
-        norm_type=cfg.model.norm_type, norm_groups=cfg.model.norm_groups,
-        activation=cfg.model.activation)
+        norm_type=cfg.model.unet.norm_type, norm_groups=cfg.model.unet.norm_groups,
+        activation=cfg.model.unet.activation)
     model = SSLMIMModel(
         encoder=encoder, head=head, in_channels=out_ch,
         spatial_dims=spatial_dims)

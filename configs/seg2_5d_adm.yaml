@@ -88,34 +88,35 @@ augment:
 
 # MODEL — ADM U-Net
 model:
-  arch: "adm"
+  arch                    : "adm"
 
-  encoder_channels: [32, 64, 128, 256, 256]
+  encoder_channels        : [32, 64, 128, 256, 256]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   # ADM/EDM2 忽略此字段 (decoder 块数由 encoder skip-stack 固定: nb_k+1); 仅警告不一致
   decoder_blocks_per_stage: [2, 2, 2, 2]
 
-  stem_mode: "conv7"
-  stem_fusion_mode: "multi_stem_proj"     # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
+  stem_mode               : "conv7"
+  stem_fusion_mode        : "multi_stem_proj"  # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
 
-  deep_supervision: false
-  aux_seg_supervision: true
-  aux_head_mode: "linear"
+  deep_supervision        : false
+  aux_seg_supervision     : true
+  aux_head_mode           : "linear"
 
-  dropout: 0.0                          # 复用为 ResBlock dropout (论文默认 0.0)
+  dropout                 : 0.0  # 复用为 ResBlock dropout (论文默认 0.0)
 
-  # 默认最深两级 (5 stages → [3,4]); 论文 256² 输入对应 attention_resolutions=[16,8]
-  adm_attention_levels: [3, 4]
-  adm_num_heads: 4
-  adm_num_head_channels: -1
+  adm:
 
-  # 可选线性 attention (lucidrains; O(N) vs softmax O(N²)), 推荐用在浅高分辨率级。
-  # 与 adm_attention_levels 独立加成; 推荐: [] | [0,1] | [0,1,2,3] + adm_attention_levels=[4]
-  adm_linear_attention_levels: []
-  adm_linear_attention_num_heads: 4
-  adm_linear_attention_head_dim: 32     # 64 增容 (cost ∝ head_dim²·N)
+    # 默认最深两级 (5 stages → [3,4]); 论文 256² 输入对应 attention_resolutions=[16,8]
+    attention_levels : [3, 4]
+    num_heads        : 4
+    num_head_channels: -1
+    linear_attention:
 
-
+      # 可选线性 attention (lucidrains; O(N) vs softmax O(N²)), 推荐用在浅高分辨率级。
+      # 与 adm_attention_levels 独立加成; 推荐: [] | [0,1] | [0,1,2,3] + adm_attention_levels=[4]
+      levels   : []
+      num_heads: 4
+      head_dim : 32  # 64 增容 (cost ∝ head_dim²·N)
 # LOSS / TRAIN / PREDICT — 同 seg2_5d.yaml
 loss:
   name: "dice_focal"

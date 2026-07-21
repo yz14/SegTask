@@ -408,11 +408,11 @@ def build_spark_decoder(cfg, encoder: nn.Module, dim_div: int = 4,
         spatial_dims      = spatial_dims,
         dim_div           = int(dim_div),
         min_dim           = int(min_dim),
-        upsample_mode     = cfg.model.upsample_mode,
+        upsample_mode     = cfg.model.unet.upsample_mode,
         downsample_strides= getattr(encoder, "downsample_strides", None),
-        norm_type         = cfg.model.norm_type,
-        norm_groups       = cfg.model.norm_groups,
-        activation        = cfg.model.activation)
+        norm_type         = cfg.model.unet.norm_type,
+        norm_groups       = cfg.model.unet.norm_groups,
+        activation        = cfg.model.unet.activation)
 
 
 def build_ssl_spark_model(cfg, dim_div: int = 4, min_dim: int = 16,

@@ -1,9 +1,10 @@
-"""Checkpoint 工具：state_dict 解析、前缀剥离、compile 包装拆解。
+"""Checkpoint 工具：state_dict 解析、前缀剥离、compile 包装拆解、原子写盘。
 
-主流程方法（``_build_state_dict`` / ``_save_checkpoint`` / ``_load_checkpoint``
-/ ``_load_pretrain``）保留在 ``Trainer`` 类上，便于现有测试通过
-``inspect.getsource(Trainer._build_state_dict)`` 校验关键 token；本模块仅承载
-完全静态的辅助函数。
+公共保存/恢复主流程已下沉到 ``BaseTrainer``（``_save_best`` / ``_save_latest``
+/ ``_restore_train_state`` / ``_load_pretrain_weights``）。各任务 Trainer 仍保留
+薄封装（如 ``_build_state_dict`` / ``_save_checkpoint`` / ``_load_checkpoint``），
+便于现有测试通过 ``inspect.getsource`` 校验关键 token；本模块仅承载完全静态
+的辅助函数。
 """
 
 from __future__ import annotations

@@ -48,18 +48,18 @@ def _build_sisr_backbone(cfg: Config):
         out_channels = topo.out_classes,
         factors      = factors,
         arch         = str(mc.arch).lower(),
-        channels     = mc.sisr_channels,
-        num_blocks   = mc.sisr_num_blocks,
-        num_groups   = mc.sisr_num_groups,
-        res_scale    = mc.sisr_res_scale,
-        activation   = mc.activation,
-        se_reduction = mc.se_reduction,
+        channels     = mc.sisr.channels,
+        num_blocks   = mc.sisr.num_blocks,
+        num_groups   = mc.sisr.num_groups,
+        res_scale    = mc.sisr.res_scale,
+        activation   = mc.unet.activation,
+        se_reduction = mc.unet.se_reduction,
         spatial_dims = topo.spatial_dims)
     logger.info(
         "Built SISRNet [%s]: total=%.2fM, channels=%d, blocks=%d, groups=%d, "
         "factors=%s, in_ch=%d, out_ch=%d, spatial_dims=%d",
-        mc.arch, model.param_count()["total"] / 1e6, mc.sisr_channels,
-        mc.sisr_num_blocks, mc.sisr_num_groups, factors,
+        mc.arch, model.param_count()["total"] / 1e6, mc.sisr.channels,
+        mc.sisr.num_blocks, mc.sisr.num_groups, factors,
         mc.in_channels, topo.out_classes, topo.spatial_dims)
     return model
 

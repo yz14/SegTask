@@ -51,9 +51,18 @@ logger = logging.getLogger(__name__)
 
 
 class OptimStepResult:
-    """``_optimizer_step_boundary`` 的返回值。"""
+    """``_optimizer_step_boundary`` 的返回值。
 
-    __slots__ = ("stepped", "skipped_nonfinite", "scaler_skipped", "grad_norm")
+    调用方必须在下次进入边界前调用 :meth:`acknowledge`（读完
+    ``skipped_nonfinite`` / ``stepped`` 等字段后即可）。这是 D3 护栏：
+    强制「看见结果」，但**不**强制 ``continue``——SSL 跳步后仍推进
+    method 时钟，与其它任务语义不同。
+    """
+
+    __slots__ = (
+        "stepped", "skipped_nonfinite", "scaler_skipped", "grad_norm",
+        "_acknowledged",
+    )
 
     def __init__(
         self,
@@ -63,10 +72,28 @@ class OptimStepResult:
         scaler_skipped: bool,
         grad_norm: "float | None",
     ) -> None:
+        if skipped_nonfinite and scaler_skipped:
+            raise ValueError(
+                "OptimStepResult: skipped_nonfinite and scaler_skipped "
+                "are mutually exclusive")
+        if stepped and (skipped_nonfinite or scaler_skipped):
+            raise ValueError(
+                "OptimStepResult: stepped=True is incompatible with "
+                f"skipped_nonfinite={skipped_nonfinite} "
+                f"scaler_skipped={scaler_skipped}")
         self.stepped = stepped
         self.skipped_nonfinite = skipped_nonfinite
         self.scaler_skipped = scaler_skipped
         self.grad_norm = grad_norm
+        self._acknowledged = False
+
+    @property
+    def acknowledged(self) -> bool:
+        return self._acknowledged
+
+    def acknowledge(self) -> None:
+        """标记本结果已被调用方处理（下次边界入口会校验）。"""
+        self._acknowledged = True
 
 
 # ---------------------------------------------------------------------------
@@ -302,14 +329,28 @@ class BaseTrainer:
           scheduler（方法时钟 / LR 与 global_step 对齐），EMA 仍仅在真正更新时推进。
         * ``before_step`` 在确定不因非有限跳步之后、``scaler.step`` 之前调用。
 
-        调用方负责清零 ``group_has_nonfinite``、健康计数与 ``continue``。
+        调用方负责清零 ``group_has_nonfinite``、健康计数，并在处理完返回值后
+        调用 ``result.acknowledge()``（下次进入本方法前必须完成）。是否
+        ``continue`` 由任务自定：seg/cls/det/gen 通常 continue；ssl 跳步后
+        仍推进 ``_global_step`` / ``on_after_step``。
         """
+        prev = getattr(self, "_unacked_optim_result", None)
+        if prev is not None and not prev.acknowledged:
+            raise RuntimeError(
+                "Previous OptimStepResult was not acknowledged before the "
+                "next _optimizer_step_boundary call. After reading "
+                "skipped_nonfinite/stepped/scaler_skipped, call "
+                "result.acknowledge(). (SSL may continue the loop after a "
+                "skip; other tasks typically continue — both must ack.)")
+
         if parameters is None:
             parameters = self.model.parameters()
         if grad_clip_norm is None:
             grad_clip_norm = float(self.cfg.train.grad_clip_norm)
         if ema_module is None:
             ema_module = unwrap_compile(self.model)
+
+        sched_before = int(self.scheduler.current_step)
 
         grad_norm_val = self._boundary_grad_norm(
             parameters, grad_clip_norm=grad_clip_norm)
@@ -341,9 +382,13 @@ class BaseTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             if always_step_scheduler:
                 self.scheduler.step()
-            return OptimStepResult(
+            result = OptimStepResult(
                 stepped=False, skipped_nonfinite=True,
                 scaler_skipped=False, grad_norm=grad_norm_val)
+            self._check_boundary_scheduler_clock(
+                sched_before, result, always_step_scheduler)
+            self._unacked_optim_result = result
+            return result
 
         if before_step is not None:
             before_step()
@@ -372,11 +417,43 @@ class BaseTrainer:
                     "step %d/%d (inf/NaN grads); EMA/method state "
                     "not advanced.", epoch + 1, step + 1, total_steps)
 
-        return OptimStepResult(
+        result = OptimStepResult(
             stepped=not scaler_skipped,
             skipped_nonfinite=False,
             scaler_skipped=bool(scaler_skipped),
             grad_norm=grad_norm_val)
+        self._check_boundary_scheduler_clock(
+            sched_before, result, always_step_scheduler)
+        self._unacked_optim_result = result
+        return result
+
+    def _check_boundary_scheduler_clock(
+        self,
+        sched_before: int,
+        result: OptimStepResult,
+        always_step_scheduler: bool,
+    ) -> None:
+        """边界内 scheduler 推进次数必须与时钟语义一致（D3 运行时护栏）。"""
+        advanced = int(self.scheduler.current_step) - int(sched_before)
+        if always_step_scheduler:
+            # SSL：每次边界恰好推进 1（无论是否真正更新权重）。
+            if advanced != 1:
+                raise RuntimeError(
+                    "always_step_scheduler=True requires exactly one "
+                    f"scheduler.step per boundary; advanced={advanced} "
+                    f"(stepped={result.stepped}, "
+                    f"skipped_nonfinite={result.skipped_nonfinite}, "
+                    f"scaler_skipped={result.scaler_skipped})")
+            return
+        # 默认：仅真正更新权重时推进。
+        expected = 1 if result.stepped else 0
+        if advanced != expected:
+            raise RuntimeError(
+                "scheduler clock drift at optimizer boundary: "
+                f"advanced={advanced}, expected={expected} "
+                f"(stepped={result.stepped}, "
+                f"skipped_nonfinite={result.skipped_nonfinite}, "
+                f"scaler_skipped={result.scaler_skipped})")
 
     # ------------------------------------------------------------------
     # Model-health helpers (轻量；仅 rank0 监测启用时调用)

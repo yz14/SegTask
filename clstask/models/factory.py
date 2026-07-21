@@ -4,7 +4,7 @@
 
 * ResNet / ConvNeXt —— ``cls.backbone='encoder'``，复用
   ``taskcore.models.factory.build_backbone(cfg)``（具体由
-  ``cfg.model.backbone`` 决定）。与 SSL 预训练**同一构建路径**，参数同名同形，
+  ``cfg.model.unet.backbone`` 决定）。与 SSL 预训练**同一构建路径**，参数同名同形，
   ``cls.pretrained_ckpt`` 可 strict=False 直接命中 ``encoder.*``。
 * DenseNet —— :class:`clstask.models.densenet.DenseNetEncoder`（2D/3D）。
 * ViT —— :class:`clstask.models.vit.ViTEncoder`（2D/3D）。
@@ -52,9 +52,9 @@ def _build_encoder(cfg: SegConfig, cls: ClsConfig) -> Tuple[nn.Module, int]:
             block_layers=list(cls.densenet_block_layers),
             compression=cls.densenet_compression,
             stem_channels=cls.densenet_stem_channels,
-            norm_type=cfg.model.norm_type,
-            norm_groups=cfg.model.norm_groups,
-            activation=cfg.model.activation,
+            norm_type=cfg.model.unet.norm_type,
+            norm_groups=cfg.model.unet.norm_groups,
+            activation=cfg.model.unet.activation,
             spatial_dims=sd,
             grad_checkpointing=cfg.model.grad_checkpointing)
         return encoder, encoder.out_channels_list[-1]

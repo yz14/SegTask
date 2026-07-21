@@ -648,6 +648,9 @@ class EDM2SegModel(nn.Module):
 def build_edm2_seg_model(cfg) -> EDM2SegModel:
     """从 Config 构造 EDM2SegModel。读取 EDM2 专有：edm2_attention_levels（默认 [L-1]）、edm2_channels_per_head(64)、edm2_res_balance/attn_balance(0.3)、edm2_concat_balance(0.5)、edm2_clip_act(256.0)。复用 model.dropout 为 Block dropout。"""
     mc = cfg.model
+    # 非默认的通用 UNet 旋钮在 EDM2 下被忽略：统一汇总告警（D1）。
+    from .arch_compat import warn_ignored_model_fields
+    warn_ignored_model_fields(mc, "edm2")
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
@@ -683,7 +686,7 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
 
     # 显式空列表 [] = 不加注意力（保持历史默认行为）；传 None 才会用默认。
     attn_levels = _resolve_attn_levels(
-        n_levels, mc.edm2_attention_levels)
+        n_levels, mc.edm2.attention_levels)
 
     # EDM2 stem 固定为 MP conv3，头固定为 _MPSegHead；非默认配置被忽略时显式告警。
     if mc.stem_mode != "conv3":
@@ -734,12 +737,12 @@ def build_edm2_seg_model(cfg) -> EDM2SegModel:
         encoder_blocks_per_stage=enc_bps,
         decoder_blocks_per_stage=dec_bps_full,
         attention_levels=attn_levels,
-        channels_per_head=int(mc.edm2_channels_per_head),
+        channels_per_head=int(mc.edm2.channels_per_head),
         dropout=float(mc.dropout),
-        res_balance=float(mc.edm2_res_balance),
-        attn_balance=float(mc.edm2_attn_balance),
-        concat_balance=float(mc.edm2_concat_balance),
-        clip_act=float(mc.edm2_clip_act),
+        res_balance=float(mc.edm2.res_balance),
+        attn_balance=float(mc.edm2.attn_balance),
+        concat_balance=float(mc.edm2.concat_balance),
+        clip_act=float(mc.edm2.clip_act),
         num_fg_classes=out_classes,
         deep_supervision=bool(mc.deep_supervision),
         aux_seg_supervision=aux_seg,
@@ -890,25 +893,27 @@ def build_edm2_diffusion_unet(
     cfg, in_channels: int, out_channels: int) -> EDM2DiffusionUNet:
     """从 Config 构造 EDM2 扩散 backbone（2.5D）。``in/out_channels`` 已折叠 D。"""
     mc = cfg.model
+    from .arch_compat import warn_ignored_model_fields
+    warn_ignored_model_fields(mc, "edm2")
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     enc_bps = list(mc.encoder_blocks_per_stage) or [int(mc.blocks_per_level)] * n_levels
     if len(enc_bps) != n_levels:
         raise ValueError(
             f"encoder_blocks_per_stage length {len(enc_bps)} != {n_levels}")
-    attn_levels = _resolve_attn_levels(n_levels, mc.edm2_attention_levels)
+    attn_levels = _resolve_attn_levels(n_levels, mc.edm2.attention_levels)
     model = EDM2DiffusionUNet(
         in_channels=in_channels,
         out_channels=out_channels,
         encoder_channels=enc_channels,
         encoder_blocks_per_stage=enc_bps,
         attention_levels=attn_levels,
-        channels_per_head=int(mc.edm2_channels_per_head),
+        channels_per_head=int(mc.edm2.channels_per_head),
         dropout=float(mc.dropout),
-        res_balance=float(mc.edm2_res_balance),
-        attn_balance=float(mc.edm2_attn_balance),
-        concat_balance=float(mc.edm2_concat_balance),
-        clip_act=float(mc.edm2_clip_act),
+        res_balance=float(mc.edm2.res_balance),
+        attn_balance=float(mc.edm2.attn_balance),
+        concat_balance=float(mc.edm2.concat_balance),
+        clip_act=float(mc.edm2.clip_act),
         grad_checkpointing=bool(mc.grad_checkpointing))
     logger.info(
         "Built EDM2DiffusionUNet: total=%.2fM, channels=%s, enc_blocks=%s, "

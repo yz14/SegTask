@@ -41,32 +41,32 @@ augment:
 
 
 model:
-  backbone: "resnet"
-  encoder_channels: [64, 64, 128, 256, 512]
+  encoder_channels        : [64, 64, 128, 256, 512]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   decoder_blocks_per_stage: [2, 2, 2, 2]
-  block_type: "basic"
-
-  norm_type  : "instance"
-  norm_groups: 8
-  activation : "leakyrelu"
-  dropout    : 0.0
-
-  attention_type: "none"
-  skip_attention: true
+  dropout                 : 0.0
 
   # 以下头在 SSL 阶段被丢弃（仅预训练 encoder）；列出以便与下游对齐。
-  deep_supervision   : false
-  aux_seg_supervision: false
-  aux_topo_head      : false
+  deep_supervision        : false
+  aux_seg_supervision     : false
 
-  stem_mode      : "conv3"
-  decoder_type   : "unet"
-  downsample_mode: "conv"
-  upsample_mode  : "trilinear"
-  skip_mode      : "cat"
+  stem_mode               : "conv3"
 
+  unet:
+    backbone       : "resnet"
+    block_type     : "basic"
 
+    norm_type      : "instance"
+    norm_groups    : 8
+    activation     : "leakyrelu"
+
+    attention_type : "none"
+    skip_attention : true
+    aux_topo_head  : false
+    decoder_type   : "unet"
+    downsample_mode: "conv"
+    upsample_mode  : "trilinear"
+    skip_mode      : "cat"
 # 优化器/调度器/AMP/output_dir/epochs/lr 由 SSL 复用 segtask train.*。
 train:
   epochs: 300

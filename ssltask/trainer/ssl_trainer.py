@@ -546,16 +546,6 @@ class SSLTrainer(BaseTrainer):
             out["best_probe"] = self.best_probe
         return out
 
-    @staticmethod
-    def _effective_accum(step: int, total_steps: int, accum: int) -> int:
-        """尾批 micro-batch 数不满 ``accum`` 时，用真实尾长作分母，
-        以免最后一组 micro-batch 因被除以 ``accum`` 而权重偏小。"""
-        if accum <= 1:
-            return 1
-        remainder = total_steps % accum
-        partial_start = total_steps - remainder
-        return remainder if (remainder > 0 and step >= partial_start) else accum
-
     def _sync_grads(self) -> None:
         """DDP：accum 边界对全部梯度做均值 all-reduce。
 
@@ -709,10 +699,13 @@ class SSLTrainer(BaseTrainer):
                 group_has_nonfinite = False
                 stepped = result.stepped
                 grad_norm_val = result.grad_norm
-                if result.skipped_nonfinite:
+                skipped_nf = result.skipped_nonfinite
+                scaler_skipped = result.scaler_skipped
+                result.acknowledge()
+                if skipped_nf:
                     if health_on:
                         opt_steps += 1
-                elif result.scaler_skipped:
+                elif scaler_skipped:
                     nonfinite_steps += 1
                 else:
                     opt_steps += 1

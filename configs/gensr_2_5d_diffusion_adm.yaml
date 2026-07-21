@@ -36,16 +36,16 @@ data:
   cache_max_volumes: 2
 
 model:
-  arch: "adm"
-  encoder_channels: [32, 64, 128, 256]
+  arch                    : "adm"
+  encoder_channels        : [32, 64, 128, 256]
   encoder_blocks_per_stage: [2, 2, 2, 2]
-  stem_mode: "conv7"
-  dropout: 0.0
-  adm_attention_levels: [3]
-  adm_num_heads: 4
-  adm_num_head_channels: -1
+  stem_mode               : "conv7"
+  dropout                 : 0.0
 
-
+  adm:
+    attention_levels : [3]
+    num_heads        : 4
+    num_head_channels: -1
 task:
   type: "generation"
   algorithm: "diffusion"

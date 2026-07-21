@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field, fields, asdict
+from dataclasses import MISSING, dataclass, field, fields, asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
+
+from .model_migration import install_flat_model_compat, route_legacy_model_dict
 
 logger = logging.getLogger(__name__)
 
@@ -280,39 +282,105 @@ class AugConfig:
 # Model configuration
 # ---------------------------------------------------------------------------
 @dataclass
-class ModelConfig:
-    """模型架构设置。
+class MedNeXtConfig:
+    """MedNeXt 模块（Roy et al., MICCAI 2023；仅 unet.backbone=='mednext'）。
 
-    字段分组与 configs/seg*.yaml 一一对应：架构与规模 → 归一化/激活/正则 →
-    拓扑 → 注意力 → 监督头 → 2.5D 专属 → 显存 → 各 backbone/模块专属组。
+    残差倒瓶颈块：dwconv(k³, groups=C) → 通道级 GroupNorm → 1×1 扩张(×R) → GELU →
+    1×1 压缩 → +残差。块内 norm/act 固定为通道级 GroupNorm + GELU（类似 convnext 固定
+    LN+GELU）；unet 段的 norm_type/activation/dropout 对 mednext 块内无效（仅作用于
+    stem / 上下采样 / decoder skip 投影 / 头）。
+    档位 A：重采样复用通用 Downsample/Upsample（downsample_mode/upsample_mode 仍生效，
+    且与 anisotropic_pooling 兼容，区别于 ConvNeXt LN-first 下采样）；MedNeXt 原生重采样
+    残差块 + UpKern 为后续档位 B。
     """
 
-    # ---- 架构与规模 ----
-    # 架构族。示例："unet"（本项目 UNet，读下面 backbone/block/norm 等）、"adm"（ADM U-Net，仅 2.5D，读 adm_*）。
-    # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2_*）。
-    arch: str = "unet"
+    # 扩张比 R（MedNeXt 用 2/3/4/8；ConvNeXt 固定 4）。
+    expand_ratio: int = 4
+    # 深度卷积核大小（MedNeXt 用 3 或 5；ConvNeXt 固定 7）。
+    kernel_size: int = 3
+    # 训练时大核 + 多个空洞分支并行，推理时折叠为单一大核 depthwise conv，
+    # 零额外推理开销。
+    dilated_reparam: bool = False
+    # 可选显式分支核大小 / dilation 覆盖；空列表=使用默认分支集。
+    dilated_reparam_kernel_sizes: List[int] = field(default_factory=list)
+    dilated_reparam_dilations: List[int] = field(default_factory=list)
+
+
+@dataclass
+class MultiRFConfig:
+    """多感受野（空洞卷积多分支融合）MultiRF（仅 unet.backbone=='resnet'）。
+
+    把选定 stage 的标准 ResNet 块替换为「多膨胀率并行分支 → 融合」的残差块，
+    在同一分辨率下同时获得多个感受野（类 ASPP/Res2Net）。默认全关，逐位兼容现状。
+    """
+
+    # 多感受野（空洞卷积多分支融合）总开关；仅 backbone=='resnet'。
+    enabled: bool = False
+    # 各并行分支的膨胀率，必须含 1（守门支路，抗网格效应/保细管）。建议 HDC 互质组如 [1,2,3]。
+    dilations: List[int] = field(default_factory=lambda: [1, 2, 3])
+    # 通道处理："split"（各分支均分 out_ch，≈等成本，推荐）| "parallel"（各分支全宽 out_ch，≈N×成本）。
+    mode: str = "split"
+    # 分支融合："concat_proj"（concat→1×1，推荐）| "sum"（逐元素相加，需 parallel）| "se"（concat→SE→1×1）。
+    fusion: str = "concat_proj"
+    # 膨胀作用轴（仅 3D 有区别）："all" D/H/W 都膨胀；"hw" 只在 H/W 膨胀、z 恒 dilation=1（各向异性数据推荐）。
+    # 2.5D（spatial_dims=2）下 z 已折进通道，自动等价 "hw"。
+    axes: str = "hw"
+    # 编码器逐 stage 开关（0/1）。长度须 == len(encoder_channels)。空=该侧全关。
+    encoder_stages: List[int] = field(default_factory=list)
+    # 解码器逐 level 开关（0/1）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
+    decoder_stages: List[int] = field(default_factory=list)
+    # ASPP 风格 per-branch norm+act：每条膨胀卷积分支在 concat/相加融合「之前」各自接
+    # norm+act，使各感受野分支成为独立的非线性特征提取器（默认关、向后兼容）。
+    # 注：split 模式下分支通道=out_ch//n_branches，与 norm_type='group' 组合时 norm_groups
+    # 须能整除分支通道，否则 MultiRFBlock 显式报错（不自适配，由用户改 ch 或换 norm）。
+    branch_norm_act: bool = False
+
+
+@dataclass
+class SelfAttentionConfig:
+    """内容寻址自注意力（仅 unet.backbone=='resnet' + arch=='unet'）。
+
+    在选定 stage 末尾追加一个自注意力残差块（拍平空间轴 → 多头 QKV → 残差），
+    2.5D/3D 通用。提供真正的全局 token 交互（区别于 SE/ECA/CBAM/Coord 的
+    通道/轴向重标定）。默认全关。
+    """
+
+    # 内容寻址自注意力总开关；仅 backbone=='resnet' + arch=='unet'。
+    enabled: bool = False
+    # 全局默认类型（逐 level 写 1 时沿用此值）：'softmax' 标准多头自注意力 O(N²)（全保真，放最深/
+    # 瓶颈层）；'linear' O(N) 线性注意力（放次深层）。
+    type: str = "softmax"
+    # 头数（head_dim==-1 时使用）。
+    num_heads: int = 4
+    # !=-1 时 num_heads = channels // head_dim（覆盖 num_heads）。
+    head_dim: int = -1
+    # 输出投影 zero-init：训练初始注意力分支输出≈0、整块为恒等残差，几乎不扰动已调好的基线（强烈建议 true）。
+    zero_init: bool = True
+    # RoPE（参数无关）仅作用于 softmax self-attn；默认关，开后按 2D/3D 位置做旋转编码。
+    rope: bool = False
+    # 额外 FFN：GEGLU + zero-init 输出投影；默认关，开后为注意力后再接一层残差 MLP。
+    ffn: bool = False
+    ffn_ratio: float = 4.0
+    # Window/Grid 注意力块大小；默认 7 保持不启用时无影响，启用时用于浅层大分辨率 token 分块。
+    window_size: int = 7
+    grid_size: int = 7
+    # 编码器逐 stage 开关（可逐层指定类型）。长度须 == len(encoder_channels)。空=该侧全关。
+    # 每个元素：0/'none'=该层关；'softmax'=标准 QKV；'linear'=线性 QKV；1=沿用全局 type。
+    encoder_stages: List = field(default_factory=list)
+    # 解码器逐 level 开关（同上取值）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
+    decoder_stages: List = field(default_factory=list)
+
+
+@dataclass
+class UNetConfig:
+    """本项目 UNet 专属旋钮（仅 arch=='unet' 消费；ADM/EDM2 按论文固定结构）。
+
+    字段分组：backbone/块 → 归一化/激活/正则 → 拓扑 → 注意力 → 拓扑辅助头 →
+    2.5D lift → 显存 → ConvNeXt 专属 → mednext/multirf/selfattn 模块子段。
+    """
 
     # Backbone："resnet" | "convnext" | "mednext"。
     backbone: str = "resnet"
-
-    # 注：spatial_dims（2/3）与 in_channels 是由 patch_mode/multi_res_scales 等
-    # 决定的"几何派生量"，不再作为可写字段/YAML 接口暴露（避免设了却被 sync 静默
-    # 重写的困惑）。它们由 sync() 经 build_topology 算出，并以只读 property 暴露
-    # （见类末尾），读 cfg.model.in_channels / spatial_dims 不变。
-
-    # 每级 encoder 通道数，决定深度。例：[32, 64, 128, 256, 512] = 5 级。
-    encoder_channels: List[int] = field(
-        default_factory=lambda: [32, 64, 128, 256, 512])
-
-    # 每级 block 数默认值（仅在 encoder/decoder_blocks_per_stage 都为空时使用）。
-    blocks_per_level: int = 2
-
-    # 逐级 block 数（nnU-Net ResEncUNet 风格）。非空时长度须与网络深度匹配。
-    encoder_blocks_per_stage: List[int] = field(default_factory=list)
-    decoder_blocks_per_stage: List[int] = field(default_factory=list)
-
-    # nnU-Net ResEnc 预设："none" | "S" | "M" | "L" | "XL"。非 none 且 *_blocks_per_stage 为空时 sync() 自填。
-    resenc_preset: str = "none"
 
     # 残差块变体（仅 resnet）。示例："basic" 标准 ResNet；"r2plus1d" (1,3,3)+(3,1,1) 分解卷积（需 spatial_dims=3）。
     # 还有 "preact" / "bottleneck"。
@@ -326,15 +394,10 @@ class ModelConfig:
     # 激活："relu" | "leakyrelu" | "gelu" | "swish"。
     activation: str = "leakyrelu"
 
-    dropout: float = 0.0
-
     # stochastic depth（ResNet / ConvNeXt / MedNeXt 共用；默认 0 = 恒等，无行为变化）。
     drop_path_rate: float = 0.0
 
-    # ---- 拓扑：stem / decoder / 上下采样 / skip ----
-    # Stem / patch-embed："conv3" | "conv7" | "dual" | "patch2" | "patch4"。patchN 降 N 倍分辨率（UNet3D 主输出加上采样）。
-    stem_mode: str = "conv3"
-
+    # ---- 拓扑：decoder / 上下采样 / skip ----
     # Decoder 拓扑："unet" 对称（默认）；"unetpp" 嵌套稠密；"unet3p" 全尺度 skip。
     decoder_type: str = "unet"
 
@@ -381,17 +444,7 @@ class ModelConfig:
     skip_attention: bool = False
     attn_gate_norm: str = "auto"
 
-    # ---- 监督头 ----
-    # 深度监督：多 decoder 级输出预测。
-    deep_supervision: bool = False
-
-    # 多 FOV 辅助分割监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，辅助 view k 输出 (B, num_fg*D, H, W)。
-    # 损失权重见 loss.aux_supervision_weights（空则默认 0.5^k）。单视图/3D 不生效。
-    aux_seg_supervision: bool = False
-
-    # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
-    aux_head_mode: str = "linear"
-
+    # ---- 拓扑辅助头 ----
     # 中心线/距离场辅助头（拓扑感知多任务监督，仅 arch=='unet'）。与多 FOV aux_seg_supervision 相互独立，
     # 可同时开启。该头与主分割头同形（out_channels 相同、读最高分辨率 decoder 特征），仅训练期前向，
     # eval 不输出（零推理开销）。target 由 label 即时派生：见 aux_topo_target。
@@ -402,23 +455,11 @@ class ModelConfig:
     aux_topo_head_mode: str = "conv"
 
     # ---- 2.5D 专属 ----
-    # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
-    # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
-    stem_fusion_mode: str = "multi_stem_proj"
-
     # Plan A 2.5D → 3D 提升（配合 block_type="r2plus1d"）。True 时 trainer 不折叠 D，模型输出 (B, num_fg, D, H, W)。
     # 与 data.keep_native_view_depth 互斥，仅在 2.5D 生效。
     lift_2_5d_to_3d: bool = False
 
     # ---- 显存 ----
-    # 梯度检查点（gradient checkpointing）：以约 +20~33% 算力换取激活显存大幅下降，可放大
-    # 3D patch/batch（利于气道/血管等需大上下文的细结构）或更深更宽的 backbone。覆盖 encoder
-    # 各 stage 与 decoder（unet/unetpp/unet3p）各节点，以及 ADM/EDM2（含扩散 backbone）的
-    # 逐块（ResBlock/Attention/Block）包装；stem/上下采样/头不包裹（开销小）。
-    # 反向重算前向 → 数值/收敛与关闭时一致（use_reentrant=False + preserve_rng_state 保
-    # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
-    # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。
-    grad_checkpointing: bool = False
     # 逐 encoder stage 检查点掩码（0/1）；空=沿用 grad_checkpointing 对所有 stage 生效（现状）；
     # 非空长度须==len(encoder_channels)，仅对为 1 的 stage 做检查点；仅在 grad_checkpointing=True 时生效。
     # 深层低分辨率 stage 可置 0，省重算开销。
@@ -431,105 +472,135 @@ class ModelConfig:
     convnext_layer_scale_init: float = 1e-6  # <=0 禁用
     convnext_downsample_lnfirst: bool = True  # False 为通用 Downsample（消融用）
 
-    # ---- MedNeXt（Roy et al., MICCAI 2023；仅 backbone=='mednext'） ----
-    # 残差倒瓶颈块：dwconv(k³, groups=C) → 通道级 GroupNorm → 1×1 扩张(×R) → GELU →
-    # 1×1 压缩 → +残差。块内 norm/act 固定为通道级 GroupNorm + GELU（类似 convnext 固定
-    # LN+GELU）；上面的 norm_type/activation/dropout 对 mednext 块内无效（仅作用于
-    # stem / 上下采样 / decoder skip 投影 / 头）。
-    # 档位 A：重采样复用通用 Downsample/Upsample（downsample_mode/upsample_mode 仍生效，
-    # 且与 anisotropic_pooling 兼容，区别于 ConvNeXt LN-first 下采样）；MedNeXt 原生重采样
-    # 残差块 + UpKern 为后续档位 B。
-    # 扩张比 R（MedNeXt 用 2/3/4/8；ConvNeXt 固定 4）。
-    mednext_expand_ratio: int = 4
-    # 深度卷积核大小（MedNeXt 用 3 或 5；ConvNeXt 固定 7）。
-    mednext_kernel_size: int = 3
-    # 仅对 backbone=='mednext' 有效：训练时大核 + 多个空洞分支并行，
-    # 推理时折叠为单一大核 depthwise conv，零额外推理开销。
-    mednext_dilated_reparam: bool = False
-    # 可选显式分支核大小 / dilation 覆盖；空列表=使用默认分支集。
-    mednext_dilated_reparam_kernel_sizes: List[int] = field(default_factory=list)
-    mednext_dilated_reparam_dilations: List[int] = field(default_factory=list)
+    # ---- 模块子段 ----
+    mednext : MedNeXtConfig       = field(default_factory=MedNeXtConfig)
+    multirf : MultiRFConfig       = field(default_factory=MultiRFConfig)
+    selfattn: SelfAttentionConfig = field(default_factory=SelfAttentionConfig)
 
-    # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone=='resnet'） ----
-    # 把选定 stage 的标准 ResNet 块替换为「多膨胀率并行分支 → 融合」的残差块，
-    # 在同一分辨率下同时获得多个感受野（类 ASPP/Res2Net）。默认全关，逐位兼容现状。
-    multirf_enabled: bool = False
-    # 各并行分支的膨胀率，必须含 1（守门支路，抗网格效应/保细管）。建议 HDC 互质组如 [1,2,3]。
-    multirf_dilations: List[int] = field(default_factory=lambda: [1, 2, 3])
-    # 通道处理："split"（各分支均分 out_ch，≈等成本，推荐）| "parallel"（各分支全宽 out_ch，≈N×成本）。
-    multirf_mode: str = "split"
-    # 分支融合："concat_proj"（concat→1×1，推荐）| "sum"（逐元素相加，需 parallel）| "se"（concat→SE→1×1）。
-    multirf_fusion: str = "concat_proj"
-    # 膨胀作用轴（仅 3D 有区别）："all" D/H/W 都膨胀；"hw" 只在 H/W 膨胀、z 恒 dilation=1（各向异性数据推荐）。
-    # 2.5D（spatial_dims=2）下 z 已折进通道，自动等价 "hw"。
-    multirf_axes: str = "hw"
-    # 编码器逐 stage 开关（0/1）。长度须 == len(encoder_channels)。空=该侧全关。
-    multirf_encoder_stages: List[int] = field(default_factory=list)
-    # 解码器逐 level 开关（0/1）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
-    multirf_decoder_stages: List[int] = field(default_factory=list)
-    # ASPP 风格 per-branch norm+act：每条膨胀卷积分支在 concat/相加融合「之前」各自接
-    # norm+act，使各感受野分支成为独立的非线性特征提取器（默认关、向后兼容）。
-    # 注：split 模式下分支通道=out_ch//n_branches，与 norm_type='group' 组合时 norm_groups
-    # 须能整除分支通道，否则 MultiRFBlock 显式报错（不自适配，由用户改 ch 或换 norm）。
-    multirf_branch_norm_act: bool = False
 
-    # ---- 内容寻址自注意力 SelfAttention（仅 backbone=='resnet' + arch=='unet'） ----
-    # 在选定 stage 末尾追加一个自注意力残差块（拍平空间轴 → 多头 QKV → 残差），2.5D/3D 通用。
-    # 提供真正的全局 token 交互（区别于 SE/ECA/CBAM/Coord 的通道/轴向重标定）。默认全关。
-    selfattn_enabled: bool = False
-    # 全局默认类型（逐 level 写 1 时沿用此值）：'softmax' 标准多头自注意力 O(N²)（全保真，放最深/
-    # 瓶颈层）；'linear' O(N) 线性注意力（放次深层）。
-    selfattn_type: str = "softmax"
-    # 头数（selfattn_head_dim==-1 时使用）。
-    selfattn_num_heads: int = 4
-    # !=-1 时 num_heads = channels // head_dim（覆盖 selfattn_num_heads）。
-    selfattn_head_dim: int = -1
-    # 输出投影 zero-init：训练初始注意力分支输出≈0、整块为恒等残差，几乎不扰动已调好的基线（强烈建议 true）。
-    selfattn_zero_init: bool = True
-    # RoPE（参数无关）仅作用于 softmax self-attn；默认关，开后按 2D/3D 位置做旋转编码。
-    selfattn_rope: bool = False
-    # 额外 FFN：GEGLU + zero-init 输出投影；默认关，开后为注意力后再接一层残差 MLP。
-    selfattn_ffn: bool = False
-    selfattn_ffn_ratio: float = 4.0
-    # Window/Grid 注意力块大小；默认 7 保持不启用时无影响，启用时用于浅层大分辨率 token 分块。
-    selfattn_window_size: int = 7
-    selfattn_grid_size: int = 7
-    # 编码器逐 stage 开关（可逐层指定类型）。长度须 == len(encoder_channels)。空=该侧全关。
-    # 每个元素：0/'none'=该层关；'softmax'=标准 QKV；'linear'=线性 QKV；1=沿用全局 selfattn_type。
-    selfattn_encoder_stages: List = field(default_factory=list)
-    # 解码器逐 level 开关（同上取值）。长度须 == len(encoder_channels)-1。空=该侧全关。仅 decoder_type=='unet' 支持。
-    selfattn_decoder_stages: List = field(default_factory=list)
+@dataclass
+class ADMLinearAttentionConfig:
+    """ADM 可选 LinearAttention（lucidrains 风格）。
 
-    # ---- ADM 专用（arch=="adm"） ----
+    在指定级追加 Residual(PreNorm(LinearAttention))；O(N) 复杂度，可与
+    adm.attention_levels 叠加。
+    """
+
+    # 追加 LinearAttention 的级索引；空=不追加（默认）。
+    levels: List[int] = field(default_factory=list)
+    # 头数。
+    num_heads: int = 4
+    # 每头维度。
+    head_dim: int = 32
+
+
+@dataclass
+class ADMConfig:
+    """ADM U-Net 专属（arch=="adm"，仅 2.5D）。"""
+
     # 带多头自注意力的级索引（0=顶，L-1=bottleneck）。空列表 [] = 不加注意力（默认）；
     # 传 None 才会用"最深两级"默认（见 models.adm_unet._resolve_attention_levels）。
-    adm_attention_levels: List[int] = field(default_factory=list)
+    attention_levels: List[int] = field(default_factory=list)
 
-    # 头数：仅在 adm_num_head_channels==-1 时使用。
-    adm_num_heads: int = 4
+    # 头数：仅在 num_head_channels==-1 时使用。
+    num_heads: int = 4
     # !=-1 时 num_heads = channels // num_head_channels。
-    adm_num_head_channels: int = -1
+    num_head_channels: int = -1
 
-    # ---- LinearAttention（lucidrains 风格，可选） ----
-    # 在指定级追加 Residual(PreNorm(LinearAttention))；O(N) 复杂度，可与 adm_attention_levels 叠加。
-    adm_linear_attention_levels: List[int] = field(default_factory=list)
-    adm_linear_attention_num_heads: int = 4
-    adm_linear_attention_head_dim: int = 32
+    # LinearAttention 子段。
+    linear_attention: ADMLinearAttentionConfig = field(
+        default_factory=ADMLinearAttentionConfig)
 
-    # ---- EDM2 专用（arch=="edm2"） ----
+
+@dataclass
+class EDM2Config:
+    """EDM2 U-Net 专属（arch=="edm2"，仅 2.5D）。"""
+
     # 带自注意力的级索引。空=默认仅 bottleneck。
-    edm2_attention_levels: List[int] = field(default_factory=list)
+    attention_levels: List[int] = field(default_factory=list)
 
     # heads = out_ch // channels_per_head。
-    edm2_channels_per_head: int = 64
+    channels_per_head: int = 64
 
     # MP 残差/注意力/skip-cat 平衡系数（论文 Eq. 88 / 103）。
-    edm2_res_balance: float = 0.3
-    edm2_attn_balance: float = 0.3
-    edm2_concat_balance: float = 0.5
+    res_balance: float = 0.3
+    attn_balance: float = 0.3
+    concat_balance: float = 0.5
 
     # 输出激活裁剪（论文 6.4）；<=0 禁用。
-    edm2_clip_act: float = 256.0
+    clip_act: float = 256.0
+
+
+@dataclass
+class ModelConfig:
+    """模型架构设置（D2：公共字段 + 按 arch 嵌套的 unet/adm/edm2 子段）。
+
+    顶层只保留三 arch 共同消费的字段；arch 专属旋钮位于 ``unet.*`` /
+    ``adm.*`` / ``edm2.*``。旧扁平路径（YAML 键 / ``--override`` /
+    Python 属性 ``cfg.model.backbone`` 等）由
+    :mod:`taskcore.config.model_migration` 的兼容层继续支持（读写等价、
+    落盘统一新嵌套格式）。
+    """
+
+    # ---- 架构与规模（三 arch 公共） ----
+    # 架构族。示例："unet"（本项目 UNet，读 unet.* 子段）、"adm"（ADM U-Net，仅 2.5D，读 adm.*）。
+    # 还有 "edm2"（EDM2 U-Net，仅 2.5D，读 edm2.*）。
+    arch: str = "unet"
+
+    # 注：spatial_dims（2/3）与 in_channels 是由 patch_mode/multi_res_scales 等
+    # 决定的"几何派生量"，不再作为可写字段/YAML 接口暴露（避免设了却被 sync 静默
+    # 重写的困惑）。它们由 sync() 经 build_topology 算出，并以只读 property 暴露
+    # （见类末尾），读 cfg.model.in_channels / spatial_dims 不变。
+
+    # 每级 encoder 通道数，决定深度。例：[32, 64, 128, 256, 512] = 5 级。
+    encoder_channels: List[int] = field(
+        default_factory=lambda: [32, 64, 128, 256, 512])
+
+    # 每级 block 数默认值（仅在 encoder/decoder_blocks_per_stage 都为空时使用）。
+    blocks_per_level: int = 2
+
+    # 逐级 block 数（nnU-Net ResEncUNet 风格）。非空时长度须与网络深度匹配。
+    encoder_blocks_per_stage: List[int] = field(default_factory=list)
+    decoder_blocks_per_stage: List[int] = field(default_factory=list)
+
+    # nnU-Net ResEnc 预设："none" | "S" | "M" | "L" | "XL"。非 none 且 *_blocks_per_stage 为空时 sync() 自填。
+    resenc_preset: str = "none"
+
+    dropout: float = 0.0
+
+    # ---- stem（三 arch 公共） ----
+    # Stem / patch-embed："conv3" | "conv7" | "dual" | "patch2" | "patch4"。patchN 降 N 倍分辨率（UNet3D 主输出加上采样）。
+    stem_mode: str = "conv3"
+
+    # 多 FOV 上下文融合（仅 2.5D + n_views>1）。示例："shared_stem"（全部过同一 stem）、"multi_stem_proj"（Plan A，逐视图 stem→cat→1×1）。
+    # 还有 "hierarchical"（Plan C，aux k 注入 encoder 第 k 级）。3D 模式下忽略。
+    stem_fusion_mode: str = "multi_stem_proj"
+
+    # ---- 监督头（三 arch 公共） ----
+    # 深度监督：多 decoder 级输出预测。
+    deep_supervision: bool = False
+
+    # 多 FOV 辅助分割监督（仅 2.5D + len(multi_res_scales)>1 生效）。主头预 view 0，辅助 view k 输出 (B, num_fg*D, H, W)。
+    # 损失权重见 loss.aux_supervision_weights（空则默认 0.5^k）。单视图/3D 不生效。
+    aux_seg_supervision: bool = False
+
+    # 辅助头拓扑："linear" 单 Conv1×1（Plan A 推荐）；"conv" ConvNormAct(3×3)→Conv1×1（Plan C 推荐）。
+    aux_head_mode: str = "linear"
+
+    # ---- 显存（三 arch 公共） ----
+    # 梯度检查点（gradient checkpointing）：以约 +20~33% 算力换取激活显存大幅下降，可放大
+    # 3D patch/batch（利于气道/血管等需大上下文的细结构）或更深更宽的 backbone。覆盖 encoder
+    # 各 stage 与 decoder（unet/unetpp/unet3p）各节点，以及 ADM/EDM2（含扩散 backbone）的
+    # 逐块（ResBlock/Attention/Block）包装；stem/上下采样/头不包裹（开销小）。
+    # 反向重算前向 → 数值/收敛与关闭时一致（use_reentrant=False + preserve_rng_state 保
+    # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
+    # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。
+    grad_checkpointing: bool = False
+
+    # ---- arch 专属嵌套段 ----
+    unet: UNetConfig  = field(default_factory=UNetConfig)
+    adm : ADMConfig   = field(default_factory=ADMConfig)
+    edm2: EDM2Config  = field(default_factory=EDM2Config)
 
     # ---- 几何派生只读量（不暴露写接口；由 Config.sync() 经 build_topology 写入）----
     # 用私有 backing 字段承载，sync() 前读到的是安全默认值（3D / 单通道）。
@@ -546,6 +617,11 @@ class ModelConfig:
     def in_channels(self) -> int:
         """模型输入通道数（2.5D 多 FOV 为 n_views*D 等，见 build_topology）。"""
         return self._in_channels
+
+
+# 旧扁平接口兼容层：转发 property（cfg.model.backbone ↔ cfg.model.unet.backbone
+# 读写等价）、扁平 kwargs 构造、老 checkpoint pickle 状态迁移。
+install_flat_model_compat(ModelConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,33 +1431,33 @@ class Config:
             f"Invalid model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
         if arch == "unet":
             _require(
-                self.model.backbone in ("resnet", "convnext", "mednext"),
-                f"Invalid backbone: {self.model.backbone}")
+                self.model.unet.backbone in ("resnet", "convnext", "mednext"),
+                f"Invalid backbone: {self.model.unet.backbone}")
             _require(
-                self.model.norm_type in ("batch", "instance", "group"),
-                f"Invalid norm: {self.model.norm_type}")
+                self.model.unet.norm_type in ("batch", "instance", "group"),
+                f"Invalid norm: {self.model.unet.norm_type}")
             _require(
-                self.model.activation in (
+                self.model.unet.activation in (
                 "relu", "leakyrelu", "gelu", "swish",
             ),
-                f"Invalid activation: {self.model.activation}")
+                f"Invalid activation: {self.model.unet.activation}")
             _require(
-                self.model.attn_gate_norm in ("auto", "batch", "instance", "group"),
-                f"Invalid attn_gate_norm: {self.model.attn_gate_norm}")
+                self.model.unet.attn_gate_norm in ("auto", "batch", "instance", "group"),
+                f"Invalid attn_gate_norm: {self.model.unet.attn_gate_norm}")
             _require(
-                self.model.downsample_mode in (
+                self.model.unet.downsample_mode in (
                 "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
             ),
-                f"Invalid downsample_mode: {self.model.downsample_mode}")
+                f"Invalid downsample_mode: {self.model.unet.downsample_mode}")
             _require(
-                self.model.upsample_mode in (
+                self.model.unet.upsample_mode in (
                 "transpose", "trilinear", "nearest", "pixelshuffle",
                 "carafe", "dysample",
             ),
-                f"Invalid upsample_mode: {self.model.upsample_mode}")
+                f"Invalid upsample_mode: {self.model.unet.upsample_mode}")
             _require(
-                self.model.skip_mode in ("cat", "add"),
-                f"Invalid skip_mode: {self.model.skip_mode}")
+                self.model.unet.skip_mode in ("cat", "add"),
+                f"Invalid skip_mode: {self.model.unet.skip_mode}")
         else:
             # ADM / EDM2 仅支持 2.5D + Plan A（shared_stem / multi_stem_proj）。
             _require(
@@ -1413,18 +1489,18 @@ class Config:
         ),
             f"Invalid aux_head_mode: {self.model.aux_head_mode!r}")
         # 中心线/距离场辅助头校验。
-        if self.model.aux_topo_head:
+        if self.model.unet.aux_topo_head:
             _require(
                 arch == "unet",
                 "aux_topo_head=True is only supported with model.arch=='unet'; "
                 f"got arch={arch!r}.")
             _require(
-                self.model.aux_topo_target in ("centerline", "distance"),
-                f"Invalid aux_topo_target: {self.model.aux_topo_target!r}. "
+                self.model.unet.aux_topo_target in ("centerline", "distance"),
+                f"Invalid aux_topo_target: {self.model.unet.aux_topo_target!r}. "
                 "Valid: 'centerline' | 'distance'.")
             _require(
-                self.model.aux_topo_head_mode in ("linear", "conv"),
-                f"Invalid aux_topo_head_mode: {self.model.aux_topo_head_mode!r}")
+                self.model.unet.aux_topo_head_mode in ("linear", "conv"),
+                f"Invalid aux_topo_head_mode: {self.model.unet.aux_topo_head_mode!r}")
             _require(
                 self.loss.aux_topo_weight >= 0.0,
                 f"loss.aux_topo_weight must be >= 0; got {self.loss.aux_topo_weight}.")
@@ -1439,46 +1515,48 @@ class Config:
         # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
             _require(
-                self.model.attention_type in (
+                self.model.unet.attention_type in (
                 "none", "se", "eca", "cbam", "coord", "lka", "msca",
             ),
-                f"Invalid attention_type: {self.model.attention_type}")
+                f"Invalid attention_type: {self.model.unet.attention_type}")
             _require(
-                self.model.decoder_type in ("unet", "unetpp", "unet3p"),
-                f"Invalid decoder_type: {self.model.decoder_type}")
+                self.model.unet.decoder_type in ("unet", "unetpp", "unet3p"),
+                f"Invalid decoder_type: {self.model.unet.decoder_type}")
             _require(
-                self.model.unet3p_cat_channels > 0,
+                self.model.unet.unet3p_cat_channels > 0,
                 "unet3p_cat_channels must be > 0")
             _require(
-                self.model.block_type in (
+                self.model.unet.block_type in (
                 "basic", "preact", "bottleneck", "r2plus1d"),
-                f"Invalid block_type: {self.model.block_type}")
+                f"Invalid block_type: {self.model.unet.block_type}")
             # r2plus1d 需 D 为真空间轴；2.5D 下 D 在通道轴，拒绝。
-            if self.model.block_type == "r2plus1d":
+            if self.model.unet.block_type == "r2plus1d":
                 _require(
                     self.model.spatial_dims == 3,
                     "model.block_type='r2plus1d' requires spatial_dims=3; "
                     "incompatible with 2.5D (D folded into channel axis). "
                     "Use patch_mode='z_axis' for Plan A on z-slab data.")
+            # 与 sync()._apply_resenc_preset 的 .lower() 查表口径一致（大小写不敏感）。
             _require(
-                self.model.resenc_preset in ("none", "S", "M", "L", "XL"),
+                str(self.model.resenc_preset or "none").lower()
+                in ("none", "s", "m", "l", "xl"),
                 f"Invalid resenc_preset: {self.model.resenc_preset}")
             # MedNeXt 块超参（仅 backbone=='mednext' 生效；默认值对其他 backbone 无害）。
             _require(
-                self.model.mednext_kernel_size in (3, 5, 7),
-                f"Invalid mednext_kernel_size: {self.model.mednext_kernel_size}; "
+                self.model.unet.mednext.kernel_size in (3, 5, 7),
+                f"Invalid mednext_kernel_size: {self.model.unet.mednext.kernel_size}; "
                 "valid: 3 | 5 | 7.")
             _require(
-                self.model.mednext_expand_ratio >= 1,
+                self.model.unet.mednext.expand_ratio >= 1,
                 f"mednext_expand_ratio must be >= 1; got "
-                f"{self.model.mednext_expand_ratio}.")
-            if self.model.mednext_dilated_reparam:
+                f"{self.model.unet.mednext.expand_ratio}.")
+            if self.model.unet.mednext.dilated_reparam:
                 _require(
-                    self.model.backbone == "mednext",
+                    self.model.unet.backbone == "mednext",
                     "model.mednext_dilated_reparam=True requires "
                     "backbone='mednext'.")
-                bk = list(self.model.mednext_dilated_reparam_kernel_sizes)
-                bd = list(self.model.mednext_dilated_reparam_dilations)
+                bk = list(self.model.unet.mednext.dilated_reparam_kernel_sizes)
+                bd = list(self.model.unet.mednext.dilated_reparam_dilations)
                 if bk or bd:
                     _require(
                         bk and bd and len(bk) == len(bd),
@@ -1501,10 +1579,10 @@ class Config:
                             f"be odd; got kernel={k}, dilation={d}, "
                             f"effective={eff}.")
                         _require(
-                            eff <= self.model.mednext_kernel_size,
+                            eff <= self.model.unet.mednext.kernel_size,
                             f"mednext_dilated_reparam effective kernel "
                             f"{eff} exceeds mednext_kernel_size="
-                            f"{self.model.mednext_kernel_size}.")
+                            f"{self.model.unet.mednext.kernel_size}.")
         # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
         ebps = self.model.encoder_blocks_per_stage
@@ -1525,7 +1603,7 @@ class Config:
             _require(
                 all(b >= 1 for b in dbps),
                 "decoder_blocks_per_stage entries must all be >= 1")
-        ckpt_mask = list(self.model.grad_ckpt_encoder_stages)
+        ckpt_mask = list(self.model.unet.grad_ckpt_encoder_stages)
         if ckpt_mask:
             _require(
                 len(ckpt_mask) == n_levels,
@@ -1539,7 +1617,7 @@ class Config:
                     "model.grad_ckpt_encoder_stages 已配置但 model.grad_checkpointing=False，"
                     "该掩码将被忽略。")
         # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
-        sds = self.model.downsample_strides
+        sds = self.model.unet.downsample_strides
         if sds:
             sd_dim = int(self.model.spatial_dims)
             _require(
@@ -1555,10 +1633,10 @@ class Config:
                     all(int(v) in (1, 2) for v in s),
                     f"downsample_strides values must be 1 or 2; got {list(s)}")
         # MultiRF（多感受野空洞分支）校验。默认关闭时完全跳过，逐位兼容现状。
-        if self.model.multirf_enabled:
+        if self.model.unet.multirf.enabled:
             self._validate_multirf(n_levels)
         # SelfAttention（内容寻址自注意力）校验。默认关闭时完全跳过。
-        if self.model.selfattn_enabled:
+        if self.model.unet.selfattn.enabled:
             self._validate_selfattn(n_levels)
 
     #: softmax 自注意力 O(N²)，token 数超过此阈值时直接报错（防 3D 高分辨率层误 OOM）。
@@ -1579,7 +1657,7 @@ class Config:
                            "patch2": 2, "patch4": 4}
         s0 = stem_stride_map.get(mc.stem_mode, 1)
         factor = [s0] * len(axes)
-        ds = list(mc.downsample_strides) if mc.downsample_strides else []
+        ds = list(mc.unet.downsample_strides) if mc.unet.downsample_strides else []
         for lvl in range(stage_idx):
             if lvl < len(ds):
                 st = ds[lvl]
@@ -1600,31 +1678,31 @@ class Config:
             str(mc.arch).lower() == "unet",
             "model.selfattn_enabled=True is only supported for model.arch='unet'.")
         _require(
-            mc.backbone == "resnet",
+            mc.unet.backbone == "resnet",
             f"model.selfattn_enabled=True requires backbone='resnet'; "
-            f"got {mc.backbone!r}.")
+            f"got {mc.unet.backbone!r}.")
         _require(
-            mc.selfattn_type in ("softmax", "linear", "window", "grid"),
-            f"Invalid model.selfattn_type: {mc.selfattn_type!r}; "
+            mc.unet.selfattn.type in ("softmax", "linear", "window", "grid"),
+            f"Invalid model.selfattn_type: {mc.unet.selfattn.type!r}; "
             "expected 'softmax', 'linear', 'window' or 'grid'.")
         _require(
-            int(mc.selfattn_num_heads) >= 1,
-            f"model.selfattn_num_heads must be >= 1; got {mc.selfattn_num_heads}.")
-        hd = int(mc.selfattn_head_dim)
+            int(mc.unet.selfattn.num_heads) >= 1,
+            f"model.selfattn_num_heads must be >= 1; got {mc.unet.selfattn.num_heads}.")
+        hd = int(mc.unet.selfattn.head_dim)
         _require(
             hd == -1 or hd >= 1,
             f"model.selfattn_head_dim must be -1 or >= 1; got {hd}.")
         _require(
-            float(mc.selfattn_ffn_ratio) > 0.0,
-            f"model.selfattn_ffn_ratio must be > 0; got {mc.selfattn_ffn_ratio}.")
+            float(mc.unet.selfattn.ffn_ratio) > 0.0,
+            f"model.selfattn_ffn_ratio must be > 0; got {mc.unet.selfattn.ffn_ratio}.")
         _require(
-            int(mc.selfattn_window_size) >= 1,
-            f"model.selfattn_window_size must be >= 1; got {mc.selfattn_window_size}.")
+            int(mc.unet.selfattn.window_size) >= 1,
+            f"model.selfattn_window_size must be >= 1; got {mc.unet.selfattn.window_size}.")
         _require(
-            int(mc.selfattn_grid_size) >= 1,
-            f"model.selfattn_grid_size must be >= 1; got {mc.selfattn_grid_size}.")
-        enc_st = list(mc.selfattn_encoder_stages)
-        dec_st = list(mc.selfattn_decoder_stages)
+            int(mc.unet.selfattn.grid_size) >= 1,
+            f"model.selfattn_grid_size must be >= 1; got {mc.unet.selfattn.grid_size}.")
+        enc_st = list(mc.unet.selfattn.encoder_stages)
+        dec_st = list(mc.unet.selfattn.decoder_stages)
         if enc_st:
             _require(
                 len(enc_st) == n_levels,
@@ -1636,14 +1714,14 @@ class Config:
                 f"model.selfattn_decoder_stages must have {n_levels - 1} entries "
                 f"(= len(encoder_channels) - 1); got {len(dec_st)}.")
         # 逐 level 解析为类型（None=该层关）；非法取值在 resolve_selfattn_stage 内报错。
-        enc_types = [resolve_selfattn_stage(v, mc.selfattn_type) for v in enc_st]
-        dec_types = [resolve_selfattn_stage(v, mc.selfattn_type) for v in dec_st]
+        enc_types = [resolve_selfattn_stage(v, mc.unet.selfattn.type) for v in enc_st]
+        dec_types = [resolve_selfattn_stage(v, mc.unet.selfattn.type) for v in dec_st]
         # decoder 侧只有 unet 支持。
         if any(t is not None for t in dec_types):
             _require(
-                mc.decoder_type == "unet",
+                mc.unet.decoder_type == "unet",
                 f"model.selfattn_decoder_stages is only supported for "
-                f"decoder_type='unet'; got {mc.decoder_type!r}.")
+                f"decoder_type='unet'; got {mc.unet.decoder_type!r}.")
         chans = [int(c) for c in mc.encoder_channels]
         # (索引, 类型, 通道) 三元组：编码器用 stage 索引；解码器 level j（深→浅）通道=encoder_channels[n-2-j]。
         active_enc = [(i, t, chans[i]) for i, t in enumerate(enc_types) if t]
@@ -1658,8 +1736,8 @@ class Config:
                     f"stage's channels; offending channels={ch}.")
             else:
                 _require(
-                    ch % int(mc.selfattn_num_heads) == 0,
-                    f"model.selfattn_num_heads={mc.selfattn_num_heads} must divide "
+                    ch % int(mc.unet.selfattn.num_heads) == 0,
+                    f"model.selfattn_num_heads={mc.unet.selfattn.num_heads} must divide "
                     f"every selected stage's channels; offending channels={ch}.")
         # softmax O(N²) 护栏：仅对解析为 'softmax' 的层生效；linear 层豁免。
         cap = self._SELFATTN_MAX_SOFTMAX_TOKENS
@@ -1694,10 +1772,10 @@ class Config:
             str(self.model.arch).lower() == "unet",
             "model.multirf_enabled=True is only supported for model.arch='unet'.")
         _require(
-            mc.backbone == "resnet",
+            mc.unet.backbone == "resnet",
             f"model.multirf_enabled=True requires backbone='resnet'; "
-            f"got {mc.backbone!r}.")
-        dils = list(mc.multirf_dilations)
+            f"got {mc.unet.backbone!r}.")
+        dils = list(mc.unet.multirf.dilations)
         _require(
             len(dils) >= 1 and all(int(d) >= 1 for d in dils),
             f"model.multirf_dilations must be non-empty positive ints; got {dils}.")
@@ -1706,33 +1784,33 @@ class Config:
             f"model.multirf_dilations must contain 1 (the anti-gridding "
             f"identity branch); got {dils}.")
         _require(
-            mc.multirf_mode in ("split", "parallel"),
-            f"Invalid model.multirf_mode: {mc.multirf_mode!r}; "
+            mc.unet.multirf.mode in ("split", "parallel"),
+            f"Invalid model.multirf_mode: {mc.unet.multirf.mode!r}; "
             "expected 'split' or 'parallel'.")
         _require(
-            mc.multirf_fusion in ("concat_proj", "sum", "se"),
-            f"Invalid model.multirf_fusion: {mc.multirf_fusion!r}; "
+            mc.unet.multirf.fusion in ("concat_proj", "sum", "se"),
+            f"Invalid model.multirf_fusion: {mc.unet.multirf.fusion!r}; "
             "expected 'concat_proj' | 'sum' | 'se'.")
         _require(
-            mc.multirf_axes in ("all", "hw"),
-            f"Invalid model.multirf_axes: {mc.multirf_axes!r}; "
+            mc.unet.multirf.axes in ("all", "hw"),
+            f"Invalid model.multirf_axes: {mc.unet.multirf.axes!r}; "
             "expected 'all' or 'hw'.")
         # sum 融合要求各分支通道相同 → 仅 parallel 模式可用。
-        if mc.multirf_fusion == "sum":
+        if mc.unet.multirf.fusion == "sum":
             _require(
-                mc.multirf_mode == "parallel",
+                mc.unet.multirf.mode == "parallel",
                 "model.multirf_fusion='sum' requires multirf_mode='parallel' "
                 "(branches must share channel count to sum).")
         # split 模式下每分支至少 1 通道：最小 stage 通道数须 >= 分支数。
-        if mc.multirf_mode == "split":
+        if mc.unet.multirf.mode == "split":
             min_ch = min(int(c) for c in mc.encoder_channels)
             _require(
                 min_ch >= len(dils),
                 f"model.multirf_mode='split' needs every stage channel >= "
                 f"number of branches ({len(dils)}); smallest encoder_channels="
                 f"{min_ch}. Reduce dilations or use mode='parallel'.")
-        enc_st = list(mc.multirf_encoder_stages)
-        dec_st = list(mc.multirf_decoder_stages)
+        enc_st = list(mc.unet.multirf.encoder_stages)
+        dec_st = list(mc.unet.multirf.decoder_stages)
         if enc_st:
             _require(
                 len(enc_st) == n_levels,
@@ -1751,9 +1829,9 @@ class Config:
                 f"model.multirf_decoder_stages values must be 0 or 1; got {dec_st}.")
             if any(int(v) == 1 for v in dec_st):
                 _require(
-                    mc.decoder_type == "unet",
+                    mc.unet.decoder_type == "unet",
                     f"model.multirf_decoder_stages is only supported for "
-                    f"decoder_type='unet'; got {mc.decoder_type!r}.")
+                    f"decoder_type='unet'; got {mc.unet.decoder_type!r}.")
         if not (any(int(v) == 1 for v in enc_st)
                 or any(int(v) == 1 for v in dec_st)):
             logger.warning(
@@ -1920,6 +1998,36 @@ class Config:
             self.data.cache_dtype in ("fp32", "int16"),
             f"Invalid data.cache_dtype: {self.data.cache_dtype!r}; "
             "expected 'fp32' or 'int16'.")
+        # 枚举/区间兜底（fail-fast）：normalize 非法会让下游静默走错归一化
+        # 分支（直接违反训推一致性契约 C8）；cache_mode 非法会被消费点
+        # `== "memory"` 静默当作 none。
+        _require(
+            self.data.normalize in ("minmax", "zscore"),
+            f"Invalid data.normalize: {self.data.normalize!r}; "
+            "expected 'minmax' or 'zscore'.")
+        _require(
+            self.data.cache_mode in ("none", "memory"),
+            f"Invalid data.cache_mode: {self.data.cache_mode!r}; "
+            "expected 'none' or 'memory'.")
+        # val_ratio=0 并不产生"无验证集"（split 侧钳到至少 1 个 val 样本），
+        # 语义上无效，直接拒绝。
+        _require(
+            0.0 < float(self.data.val_ratio) < 1.0,
+            f"data.val_ratio must be in (0, 1); got {self.data.val_ratio}.")
+        _require(
+            0.0 <= float(self.data.foreground_oversample_ratio) <= 1.0,
+            f"data.foreground_oversample_ratio must be in [0, 1]; "
+            f"got {self.data.foreground_oversample_ratio}.")
+        _require(
+            int(self.data.samples_per_volume) >= 1,
+            f"data.samples_per_volume must be >= 1; "
+            f"got {self.data.samples_per_volume}.")
+        _require(
+            int(self.data.batch_size) >= 1,
+            f"data.batch_size must be >= 1; got {self.data.batch_size}.")
+        _require(
+            int(self.data.num_workers) >= 0,
+            f"data.num_workers must be >= 0; got {self.data.num_workers}.")
         if self.data.patch_mode == "whole":
             # whole 模式下多分辨率无物理意义。
             _require(
@@ -2005,7 +2113,7 @@ class Config:
                 "2.5D mode requires multi_res_scales[0]==1.0 (view 0 = prediction target); "
                 f"got {self.data.multi_res_scales}.")
             n_views = len(self.data.multi_res_scales)
-            lift = bool(self.model.lift_2_5d_to_3d)
+            lift = bool(self.model.unet.lift_2_5d_to_3d)
             if lift:
                 # ADM/EDM2 硬编码为折叠-D 的 2D 布局，与 lift 的真 3D 布局互斥。
                 _require(
@@ -2159,11 +2267,11 @@ class Config:
                 "train.prefetch_to_gpu=True but data.pin_memory=False: "
                 "H2D copies from pageable memory are synchronous, so the "
                 "prefetch overlap has no effect. Enable data.pin_memory.")
-        if self.train.pretrain_upkern and self.model.backbone != "mednext":
+        if self.train.pretrain_upkern and self.model.unet.backbone != "mednext":
             logger.warning(
                 "train.pretrain_upkern=True only affects backbone='mednext'; "
                 "current backbone=%r, so UpKern remap will be ignored.",
-                self.model.backbone)
+                self.model.unet.backbone)
         # 多卡 DDP 选卡列表：物理卡号、非负、互不重复。
         gpus = list(self.train.gpus)
         _require(
@@ -2173,6 +2281,21 @@ class Config:
         _require(
             len(gpus) == len(set(gpus)),
             f"train.gpus must not contain duplicate GPU indices; got {gpus}.")
+        # EMA / SWA / ZeRO：由 BaseTrainer 对所有任务生效，须在 _validate_train
+        # 内校验（组合式任务 cls/det/ssl 会 skip _validate_predict，不能放那边）。
+        _require(
+            str(self.train.ema_device) in ("", "cpu"),
+            f"train.ema_device must be '' (follow model) or 'cpu'; "
+            f"got {self.train.ema_device!r}.")
+        if self.train.swa_enabled:
+            _require(
+                0.0 < float(self.train.swa_start_ratio) < 1.0,
+                f"train.swa_start_ratio must be in (0, 1); "
+                f"got {self.train.swa_start_ratio}")
+        if self.train.zero_redundancy_optimizer and len(gpus) < 2:
+            logger.warning(
+                "train.zero_redundancy_optimizer=True 但未启用多卡 DDP（需 "
+                "len(train.gpus) >= 2）；单卡下无分片收益，将回退普通优化器。")
 
     def _validate_predict(self) -> None:
         """predict.* 阈值 / 累加器 / z 交错 / AdaBN 校验。"""
@@ -2214,19 +2337,6 @@ class Config:
             str(self.predict.vol_dtype) in ("fp32", "fp16"),
             f"predict.vol_dtype must be 'fp32' or 'fp16'; "
             f"got {self.predict.vol_dtype!r}.")
-        _require(
-            str(self.train.ema_device) in ("", "cpu"),
-            f"train.ema_device must be '' (follow model) or 'cpu'; "
-            f"got {self.train.ema_device!r}.")
-        if self.train.swa_enabled:
-            _require(
-                0.0 < float(self.train.swa_start_ratio) < 1.0,
-                f"train.swa_start_ratio must be in (0, 1); "
-                f"got {self.train.swa_start_ratio}")
-        if self.train.zero_redundancy_optimizer and len(self.train.gpus) < 2:
-            logger.warning(
-                "train.zero_redundancy_optimizer=True 但未启用多卡 DDP（需 "
-                "len(train.gpus) >= 2）；单卡下无分片收益，将回退普通优化器。")
         # z 轴交错推理检查（仅启用时）。
         if self.predict.z_interleave_enabled:
             _require(
@@ -2269,11 +2379,11 @@ class Config:
                 f"predict.adabn_sample_ratio must be in (0, 1]; "
                 f"got {self.predict.adabn_sample_ratio}.")
             # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
-            if self.model.norm_type != "batch":
+            if self.model.unet.norm_type != "batch":
                 logger.warning(
                     "predict.adabn_enabled=True but model.norm_type=%r != "
                     "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
-                    self.model.norm_type)
+                    self.model.unet.norm_type)
 
     def _validate_monitor(self) -> None:
         """monitor.* 训练监测仪表盘校验（仅 monitor.enabled 时生效）。"""
@@ -2352,16 +2462,39 @@ _REMOVED_KEYS: Dict[type, Dict[str, str]] = {
 }
 
 
-def _dataclass_from_dict(cls, d: Dict[str, Any]):
-    """Recursively construct a dataclass from a dict.
+def _nested_dataclass_type(f) -> "Optional[type]":
+    """字段声明为嵌套 dataclass 时返回其类型，否则 None。
 
-    旧别名（``_FIELD_ALIASES``）、曾经可写但现已派生的字段
-    （``_DEPRECATED_DERIVED_KEYS``）以及未知字段现在都直接抛
-    ``ConfigError``，并给出迁移提示。
+    项目约定嵌套段一律写作 ``field(default_factory=SubConfig)``，因此从
+    default_factory 判定（避免解析 ``from __future__ import annotations``
+    下的字符串注解）。
+    """
+    factory = f.default_factory
+    if factory is not MISSING and isinstance(factory, type) \
+            and is_dataclass(factory):
+        return factory
+    return None
+
+
+def _dataclass_from_dict(cls, d: Dict[str, Any]):
+    """Recursively construct a dataclass from a dict（任意深度嵌套）。
+
+    * ``model`` 段的旧扁平键（``backbone`` / ``adm_num_heads`` 等）先经
+      :func:`route_legacy_model_dict` 路由进嵌套子段（D2 兼容层）；
+      新旧路径同时设置同一字段抛 ``ConfigError``；
+    * 旧别名（``_FIELD_ALIASES``）、曾经可写但现已派生的字段
+      （``_DEPRECATED_DERIVED_KEYS``）以及未知字段直接抛 ``ConfigError``，
+      并给出迁移提示。
     """
     if not isinstance(d, dict):
         return d
-    field_names = {f.name for f in fields(cls)}
+    if isinstance(cls, type) and issubclass(cls, ModelConfig):
+        d, moved = route_legacy_model_dict(d, error_cls=ConfigError)
+        if moved:
+            logger.info(
+                "model 段旧扁平键已自动迁移到嵌套路径（建议更新 YAML）：%s",
+                ", ".join(f"{k} -> {p}" for k, p in sorted(moved.items())))
+    dc_fields = {f.name: f for f in fields(cls)}
     aliases = _FIELD_ALIASES.get(cls, {})
     derived = _DEPRECATED_DERIVED_KEYS.get(cls, {})
     removed = _REMOVED_KEYS.get(cls, {})
@@ -2385,11 +2518,12 @@ def _dataclass_from_dict(cls, d: Dict[str, Any]):
             raise ConfigError(
                 f"Config key '{k}' is removed from {cls.__name__}; use "
                 f"'{new_key}' instead.")
-        if k not in field_names:
+        if k not in dc_fields:
             raise ConfigError(
                 f"Unknown config key '{k}' in {cls.__name__}.")
-        if k in _SUB_CONFIGS and isinstance(v, dict):
-            v = _dataclass_from_dict(_SUB_CONFIGS[k], v)
+        sub_cls = _nested_dataclass_type(dc_fields[k])
+        if sub_cls is not None and isinstance(v, dict):
+            v = _dataclass_from_dict(sub_cls, v)
         kwargs[k] = v
     return cls(**kwargs)
 

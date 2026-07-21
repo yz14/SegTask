@@ -753,6 +753,9 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
     adm_attention_levels (默认 [L-2, L-1])、adm_num_heads(4)、adm_num_head_channels(-1)。
     model.dropout 复用为 ADM ResBlock dropout。。"""
     mc = cfg.model
+    # 非默认的通用 UNet 旋钮在 ADM 下被忽略：统一汇总告警（D1）。
+    from .arch_compat import warn_ignored_model_fields
+    warn_ignored_model_fields(mc, "adm")
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     num_fg = cfg.num_fg_classes
@@ -789,18 +792,18 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
 
     # 显式空列表 [] = 不加注意力（保持历史默认行为）；传 None 才会用"最深两级"默认。
     attn_levels = _resolve_attention_levels(
-        n_levels, mc.adm_attention_levels)
+        n_levels, mc.adm.attention_levels)
 
     # 可选 lucidrains 式线性注意（默认关）。
-    raw_lin = mc.adm_linear_attention_levels or []
+    raw_lin = mc.adm.linear_attention.levels or []
     lin_attn_levels: List[int] = sorted({int(v) for v in raw_lin})
     for v in lin_attn_levels:
         if v < 0 or v >= n_levels:
             raise ValueError(
                 f"adm_linear_attention_levels entry {v} out of range "
                 f"[0, {n_levels - 1}]")
-    lin_num_heads = int(mc.adm_linear_attention_num_heads)
-    lin_head_dim = int(mc.adm_linear_attention_head_dim)
+    lin_num_heads = int(mc.adm.linear_attention.num_heads)
+    lin_head_dim = int(mc.adm.linear_attention.head_dim)
 
     # 仅支持 shared_stem / multi_stem_proj；hierarchical 需 mid-encoder 注入。
     if mc.stem_fusion_mode == "hierarchical":
@@ -867,8 +870,8 @@ def build_adm_seg_model(cfg) -> ADMSegModel:
         encoder_blocks_per_stage=enc_bps,
         decoder_blocks_per_stage=dec_bps_full,
         attention_levels=attn_levels,
-        num_heads=int(mc.adm_num_heads),
-        num_head_channels=int(mc.adm_num_head_channels),
+        num_heads=int(mc.adm.num_heads),
+        num_head_channels=int(mc.adm.num_head_channels),
         dropout=float(mc.dropout),
         linear_attention_levels=lin_attn_levels,
         linear_attention_num_heads=lin_num_heads,
@@ -1020,21 +1023,23 @@ def build_adm_diffusion_unet(
     cfg, in_channels: int, out_channels: int) -> ADMDiffusionUNet:
     """从 Config 构造 ADM 扩散 backbone（2.5D）。``in/out_channels`` 已折叠 D。"""
     mc = cfg.model
+    from .arch_compat import warn_ignored_model_fields
+    warn_ignored_model_fields(mc, "adm")
     enc_channels = list(mc.encoder_channels)
     n_levels = len(enc_channels)
     enc_bps = list(mc.encoder_blocks_per_stage) or [int(mc.blocks_per_level)] * n_levels
     if len(enc_bps) != n_levels:
         raise ValueError(
             f"encoder_blocks_per_stage length {len(enc_bps)} != {n_levels}")
-    attn_levels = _resolve_attention_levels(n_levels, mc.adm_attention_levels)
+    attn_levels = _resolve_attention_levels(n_levels, mc.adm.attention_levels)
     model = ADMDiffusionUNet(
         in_channels=in_channels,
         out_channels=out_channels,
         encoder_channels=enc_channels,
         encoder_blocks_per_stage=enc_bps,
         attention_levels=attn_levels,
-        num_heads=int(mc.adm_num_heads),
-        num_head_channels=int(mc.adm_num_head_channels),
+        num_heads=int(mc.adm.num_heads),
+        num_head_channels=int(mc.adm.num_head_channels),
         dropout=float(mc.dropout),
         grad_checkpointing=bool(mc.grad_checkpointing))
     logger.info(

@@ -66,14 +66,16 @@ def test_scheduler_and_ema_gated_on_effective_optimizer_step():
 
     # 默认路径：非有限 skip 分支在 always_step_scheduler 之外不得推 scheduler。
     # （ssl 经 always_step_scheduler=True 显式开边界时钟，不在此断言范围。）
+    # skip 分支以 `if skip_optim_step:` 起，成功路径以 `if before_step` 起。
     skip_branch = src.split("if skip_optim_step:")[1].split(
-        "return OptimStepResult")[0]
+        "if before_step is not None:")[0]
     # skip 分支内仅允许 always_step_scheduler 门控下的 scheduler.step
     assert "if always_step_scheduler:" in skip_branch
     # 去掉该门控块后，不应再有无条件 scheduler.step
     skip_wo_ssl = skip_branch.split("if always_step_scheduler:")[0]
     assert "scheduler.step()" not in skip_wo_ssl
     assert "ema.update" not in skip_branch
+    assert "skipped_nonfinite=True" in skip_branch
 
     # GradScaler 成功路径：scheduler.step 与 ema.update 均在 not scaler_skipped 门控内。
     m = re.search(

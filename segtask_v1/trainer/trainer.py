@@ -540,8 +540,10 @@ class Trainer(BaseTrainer):
                     before_step=_before_step)
                 group_has_nonfinite = False
                 grad_norm_val = result.grad_norm
+                skipped_nf = result.skipped_nonfinite
+                result.acknowledge()
 
-                if result.skipped_nonfinite:
+                if skipped_nf:
                     if self._health_monitor:
                         opt_steps += 1
                     continue

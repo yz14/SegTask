@@ -823,7 +823,8 @@ class SegDataset3D(SegDatasetNpzBase):
         aug_oversample_ratio       : float = 1.0,
         multi_res_scales           : Optional[List[float]] = None,
         intensity_min              : float = -1024.0,
-        intensity_max              : float = 3071.0,
+        # 默认与 Config.data.intensity_max 对齐；经 specs/Config 路径时仍以 Config 为准。
+        intensity_max              : float = 1024.0,
         normalize                  : str = "minmax",
         global_mean                : float = 0.0,
         global_std                 : float = 1.0,
@@ -834,7 +835,8 @@ class SegDataset3D(SegDatasetNpzBase):
         cache_max_volumes          : int = 0,
         cache_int16                : bool = False,
         region_weights             : Optional[List[float]] = None,
-        z_boundary_mode            : str = "stretch",
+        # 默认与 Config.data.z_boundary_mode 对齐（"stretch" 已废弃，训练侧恒走 edge-pad）。
+        z_boundary_mode            : str = "edge_pad",
         npz_paths                  : Optional[List[str]] = None,
         val_grid_coverage          : bool = False):
 
@@ -1056,7 +1058,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         aug_oversample_ratio       : float = 1.0,
         multi_res_scales           : Optional[List[float]] = None,
         intensity_min              : float = -1024.0,
-        intensity_max              : float = 3071.0,
+        # 默认与 Config.data.intensity_max 对齐；经 specs/Config 路径时仍以 Config 为准。
+        intensity_max              : float = 1024.0,
         normalize                  : str = "minmax",
         global_mean                : float = 0.0,
         global_std                 : float = 1.0,
@@ -1252,7 +1255,8 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         patch_size          : Tuple[int, int, int] = (64, 128, 128),
         aug_oversample_ratio: float = 1.0,
         intensity_min       : float = -1024.0,
-        intensity_max       : float = 3071.0,
+        # 默认与 Config.data.intensity_max 对齐；经 specs/Config 路径时仍以 Config 为准。
+        intensity_max       : float = 1024.0,
         normalize           : str = "minmax",
         global_mean         : float = 0.0,
         global_std          : float = 1.0,

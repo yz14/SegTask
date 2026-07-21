@@ -93,7 +93,7 @@ def build_topology(cfg: "Config") -> ModelTopology:
     cond_in_channels = len(cond_dirs) * (D if pm == "2_5d" else 1)
 
     is_2_5d        = pm == "2_5d"
-    lift           = bool(mc.lift_2_5d_to_3d) and is_2_5d
+    lift           = bool(mc.unet.lift_2_5d_to_3d) and is_2_5d
     native_d       = (bool(dc.keep_native_view_depth)
                       and is_2_5d and n_views > 1)  # 2.5D多分辨率输入保持原尺寸
     # keep_native_multi_res：3D 多 FOV 懒加载——dataset 只发一份最大 FOV cube，

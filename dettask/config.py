@@ -161,7 +161,7 @@ def validate_det(det: DetConfig, cfg: SegConfig) -> None:
              "dettask currently supports single-FOV input "
              f"(data.multi_res_scales == [1.0]); got {scales}.")
     if pm == "2_5d":
-        _require(not bool(cfg.model.lift_2_5d_to_3d),
+        _require(not bool(cfg.model.unet.lift_2_5d_to_3d),
                  "dettask 2.5D uses plain slab folding (2D boxes + stitching); "
                  "model.lift_2_5d_to_3d is not supported.")
 

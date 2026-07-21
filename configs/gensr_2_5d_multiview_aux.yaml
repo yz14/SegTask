@@ -42,13 +42,14 @@ data:
   cache_max_volumes: 2
 
 model:
-  arch: "unet"
-  backbone: "resnet"
-  encoder_channels: [32, 64, 128, 256]
+  arch                    : "unet"
+  encoder_channels        : [32, 64, 128, 256]
   encoder_blocks_per_stage: [2, 2, 2, 2]
-  decoder_type: "unet"
-  aux_seg_supervision: true
+  aux_seg_supervision     : true
 
+  unet:
+    backbone    : "resnet"
+    decoder_type: "unet"
 loss:
   # 辅助视图损失权重；空列表则按 0.5^k 自动回退。
   aux_recon_weights: [1.0]

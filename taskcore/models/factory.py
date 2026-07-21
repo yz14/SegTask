@@ -79,8 +79,8 @@ def _make_resnet_stage_builder(
     """
     mc = cfg.model
     spatial_dims = mc.spatial_dims
-    attention_type = mc.attention_type
-    dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
+    attention_type = mc.unet.attention_type
+    dp_rates = _make_drop_path_rates(counts, mc.unet.drop_path_rate)
     mask = list(multirf_mask) if multirf_mask else []
     sa_types = list(selfattn_types) if selfattn_types else []
 
@@ -91,29 +91,29 @@ def _make_resnet_stage_builder(
             return MultiRFStage(
                 in_ch, out_ch,
                 num_blocks     = num_blocks,
-                dilations      = list(mc.multirf_dilations),
-                mode           = mc.multirf_mode,
-                fusion         = mc.multirf_fusion,
-                axes           = mc.multirf_axes,
-                norm_type      = mc.norm_type,
-                norm_groups    = mc.norm_groups,
-                activation     = mc.activation,
+                dilations      = list(mc.unet.multirf.dilations),
+                mode           = mc.unet.multirf.mode,
+                fusion         = mc.unet.multirf.fusion,
+                axes           = mc.unet.multirf.axes,
+                norm_type      = mc.unet.norm_type,
+                norm_groups    = mc.unet.norm_groups,
+                activation     = mc.unet.activation,
                 dropout        = mc.dropout,
-                se_reduction   = mc.se_reduction,
+                se_reduction   = mc.unet.se_reduction,
                 attention_type = attention_type,
                 drop_path_rates = dp_rates[start:start + num_blocks],
                 spatial_dims   = spatial_dims,
-                branch_norm_act = mc.multirf_branch_norm_act)
+                branch_norm_act = mc.unet.multirf.branch_norm_act)
         return ResNetStage(
             in_ch, out_ch,
             num_blocks     = num_blocks,
-            norm_type      = mc.norm_type,
-            norm_groups    = mc.norm_groups,
-            activation     = mc.activation,
+            norm_type      = mc.unet.norm_type,
+            norm_groups    = mc.unet.norm_groups,
+            activation     = mc.unet.activation,
             dropout        = mc.dropout,
-            se_reduction   = mc.se_reduction,
+            se_reduction   = mc.unet.se_reduction,
             attention_type = attention_type,
-            block_type     = mc.block_type,
+            block_type     = mc.unet.block_type,
             spatial_dims   = spatial_dims,
             drop_path_rates = dp_rates[start:start + num_blocks])
 
@@ -126,15 +126,15 @@ def _make_resnet_stage_builder(
             return nn.Sequential(stage, SelfAttentionBlock(
                 out_ch,
                 attn_type    = sa_type,
-                num_heads    = mc.selfattn_num_heads,
-                head_dim     = mc.selfattn_head_dim,
-                norm_groups  = mc.norm_groups,
-                zero_init    = mc.selfattn_zero_init,
-                use_rope     = mc.selfattn_rope,
-                use_ffn      = mc.selfattn_ffn,
-                ffn_ratio    = mc.selfattn_ffn_ratio,
-                window_size  = mc.selfattn_window_size,
-                grid_size    = mc.selfattn_grid_size,
+                num_heads    = mc.unet.selfattn.num_heads,
+                head_dim     = mc.unet.selfattn.head_dim,
+                norm_groups  = mc.unet.norm_groups,
+                zero_init    = mc.unet.selfattn.zero_init,
+                use_rope     = mc.unet.selfattn.rope,
+                use_ffn      = mc.unet.selfattn.ffn,
+                ffn_ratio    = mc.unet.selfattn.ffn_ratio,
+                window_size  = mc.unet.selfattn.window_size,
+                grid_size    = mc.unet.selfattn.grid_size,
                 spatial_dims = spatial_dims))
         return stage
 
@@ -146,10 +146,10 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
     mc = cfg.model
     spatial_dims = mc.spatial_dims
     non_default = []
-    if mc.norm_type != "instance":
-        non_default.append(f"norm_type={mc.norm_type!r}")
-    if mc.activation != "leakyrelu":
-        non_default.append(f"activation={mc.activation!r}")
+    if mc.unet.norm_type != "instance":
+        non_default.append(f"norm_type={mc.unet.norm_type!r}")
+    if mc.unet.activation != "leakyrelu":
+        non_default.append(f"activation={mc.unet.activation!r}")
     if mc.dropout and mc.dropout > 0.0:
         non_default.append(f"dropout={mc.dropout}")
     if non_default:
@@ -159,8 +159,8 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             "ConvNeXt blocks: %s. (They still apply to the stem/decoder "
             "skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
-    dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
-    ls_init      = float(mc.convnext_layer_scale_init)  # <=0 禁用
+    dp_rates = _make_drop_path_rates(counts, mc.unet.drop_path_rate)
+    ls_init      = float(mc.unet.convnext_layer_scale_init)  # <=0 禁用
 
     def factory(
         in_ch: int, out_ch: int, num_blocks: int, stage_idx: int
@@ -172,11 +172,11 @@ def _make_convnext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulSta
             in_ch, out_ch,
             num_blocks             = num_blocks,
             drop_path_rates        = rates,
-            attention_type         = mc.attention_type,
-            use_grn                = mc.grn_enabled,
+            attention_type         = mc.unet.attention_type,
+            use_grn                = mc.unet.grn_enabled,
             spatial_dims           = spatial_dims,
             layer_scale_init_value = ls_init,
-            attn_reduction         = mc.se_reduction)
+            attn_reduction         = mc.unet.se_reduction)
 
     return _StatefulStageBuilder(factory, counts)
 
@@ -201,10 +201,10 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
     mc = cfg.model
     spatial_dims = mc.spatial_dims
     non_default = []
-    if mc.norm_type != "group":
-        non_default.append(f"norm_type={mc.norm_type}")
-    if mc.activation != "gelu":
-        non_default.append(f"activation={mc.activation}")
+    if mc.unet.norm_type != "group":
+        non_default.append(f"norm_type={mc.unet.norm_type}")
+    if mc.unet.activation != "gelu":
+        non_default.append(f"activation={mc.unet.activation}")
     if mc.dropout and mc.dropout > 0:
         non_default.append(f"dropout={mc.dropout}")
     if non_default:
@@ -214,7 +214,7 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
             "IGNORED inside MedNeXt blocks: %s. (They still apply to the "
             "stem/decoder skip projections built in Encoder/Decoder.)",
             ", ".join(non_default))
-    dp_rates = _make_drop_path_rates(counts, mc.drop_path_rate)
+    dp_rates = _make_drop_path_rates(counts, mc.unet.drop_path_rate)
 
     def factory(
         in_ch: int, out_ch: int, num_blocks: int, stage_idx: int
@@ -225,18 +225,18 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
         return MedNeXtStage(
             in_ch, out_ch,
             num_blocks     = num_blocks,
-            expand_ratio   = mc.mednext_expand_ratio,
-            kernel_size    = mc.mednext_kernel_size,
+            expand_ratio   = mc.unet.mednext.expand_ratio,
+            kernel_size    = mc.unet.mednext.kernel_size,
             drop_path_rates = rates,
-            attention_type = mc.attention_type,
-            use_grn        = mc.grn_enabled,
+            attention_type = mc.unet.attention_type,
+            use_grn        = mc.unet.grn_enabled,
             spatial_dims   = spatial_dims,
-            attn_reduction = mc.se_reduction,
-            dilated_reparam = mc.mednext_dilated_reparam,
+            attn_reduction = mc.unet.se_reduction,
+            dilated_reparam = mc.unet.mednext.dilated_reparam,
             dilated_reparam_branch_kernel_sizes = (
-                mc.mednext_dilated_reparam_kernel_sizes or None),
+                mc.unet.mednext.dilated_reparam_kernel_sizes or None),
             dilated_reparam_branch_dilations = (
-                mc.mednext_dilated_reparam_dilations or None))
+                mc.unet.mednext.dilated_reparam_dilations or None))
 
     return _StatefulStageBuilder(factory, counts)
 
@@ -299,11 +299,11 @@ def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
     if num_down <= 0:
         return None
 
-    explicit = list(mc.downsample_strides or [])
+    explicit = list(mc.unet.downsample_strides or [])
     if explicit:
         return [tuple(int(x) for x in s) for s in explicit]
 
-    if not bool(mc.anisotropic_pooling):
+    if not bool(mc.unet.anisotropic_pooling):
         return None  # 各向同性默认：Downsample/Upsample 用 stride=2
 
     # 自动推导：基于 patch 的"模型空间轴"尺寸（2.5D 的 D 折进通道，不计）。
@@ -343,14 +343,14 @@ def _build_unet_encoder_decoder(
     enc_counts = _resolve_blocks_per_stage(  # 确认enc各stage通道
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
 
-    if   mc.decoder_type == "unet":
+    if   mc.unet.decoder_type == "unet":
         expected_dec_calls = n_levels - 1
-    elif mc.decoder_type == "unetpp":
+    elif mc.unet.decoder_type == "unetpp":
         expected_dec_calls = n_levels * (n_levels - 1) // 2
     else:  # unet3p: no stage_builder calls
         expected_dec_calls = 0
 
-    if   mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
+    if   mc.decoder_blocks_per_stage and mc.unet.decoder_type == "unet":
         dec_counts = _resolve_blocks_per_stage(  # 确认dec各stage通道
             mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
     elif mc.decoder_blocks_per_stage:  # UNet++：首项广播到所有嵌套节点
@@ -363,55 +363,55 @@ def _build_unet_encoder_decoder(
     # decoder mask 对齐 decoder level 顺序（深→浅，见 Decoder 构造），仅 unet decoder。
     enc_mrf_mask: List[bool] = []
     dec_mrf_mask: List[bool] = []
-    if mc.multirf_enabled:
-        enc_mrf_mask = [bool(int(v)) for v in mc.multirf_encoder_stages]
+    if mc.unet.multirf.enabled:
+        enc_mrf_mask = [bool(int(v)) for v in mc.unet.multirf.encoder_stages]
         # decoder 侧 MultiRF 仅 unet decoder 有 mask 通路；unetpp/unet3p 未接。
-        if mc.decoder_type == "unet":
-            dec_mrf_mask = [bool(int(v)) for v in mc.multirf_decoder_stages]
+        if mc.unet.decoder_type == "unet":
+            dec_mrf_mask = [bool(int(v)) for v in mc.unet.multirf.decoder_stages]
 
     # SelfAttention 逐 stage 类型（默认空 = 全关，逐位兼容历史）。对齐顺序同 MultiRF；
     # 每层解析为 'softmax'/'linear'/None，支持同一网络不同层用不同注意力。
     enc_sa_types: List = []
     dec_sa_types: List = []
-    if mc.selfattn_enabled:
-        enc_sa_types = [resolve_selfattn_stage(v, mc.selfattn_type)
-                        for v in mc.selfattn_encoder_stages]
-        if mc.decoder_type == "unet":
-            dec_sa_types = [resolve_selfattn_stage(v, mc.selfattn_type)
-                            for v in mc.selfattn_decoder_stages]
+    if mc.unet.selfattn.enabled:
+        enc_sa_types = [resolve_selfattn_stage(v, mc.unet.selfattn.type)
+                        for v in mc.unet.selfattn.encoder_stages]
+        if mc.unet.decoder_type == "unet":
+            dec_sa_types = [resolve_selfattn_stage(v, mc.unet.selfattn.type)
+                            for v in mc.unet.selfattn.decoder_stages]
 
     # enc/dec 分别构建以使计数独立。
     downsample_builder = None
-    if   mc.backbone == "resnet":
+    if   mc.unet.backbone == "resnet":
         enc_builder = _make_resnet_stage_builder(
             cfg, enc_counts, enc_mrf_mask, enc_sa_types)
         dec_builder = _make_resnet_stage_builder(
             cfg, dec_counts, dec_mrf_mask, dec_sa_types)
-        if mc.multirf_enabled and (any(enc_mrf_mask) or any(dec_mrf_mask)):
+        if mc.unet.multirf.enabled and (any(enc_mrf_mask) or any(dec_mrf_mask)):
             logger.info(
                 "MultiRF ENABLED: dilations=%s, mode=%s, fusion=%s, axes=%s, "
                 "enc_stages=%s, dec_stages=%s",
-                list(mc.multirf_dilations), mc.multirf_mode, mc.multirf_fusion,
-                mc.multirf_axes,
+                list(mc.unet.multirf.dilations), mc.unet.multirf.mode, mc.unet.multirf.fusion,
+                mc.unet.multirf.axes,
                 [int(b) for b in enc_mrf_mask], [int(b) for b in dec_mrf_mask])
-        if mc.selfattn_enabled and (any(enc_sa_types) or any(dec_sa_types)):
+        if mc.unet.selfattn.enabled and (any(enc_sa_types) or any(dec_sa_types)):
             logger.info(
                 "SelfAttention ENABLED: default_type=%s, num_heads=%s, "
                 "head_dim=%s, zero_init=%s, enc_types=%s, dec_types=%s",
-                mc.selfattn_type, mc.selfattn_num_heads, mc.selfattn_head_dim,
-                mc.selfattn_zero_init, enc_sa_types, dec_sa_types)
-    elif mc.backbone == "convnext":
+                mc.unet.selfattn.type, mc.unet.selfattn.num_heads, mc.unet.selfattn.head_dim,
+                mc.unet.selfattn.zero_init, enc_sa_types, dec_sa_types)
+    elif mc.unet.backbone == "convnext":
         enc_builder = _make_convnext_stage_builder(cfg, enc_counts)
         dec_builder = _make_convnext_stage_builder(cfg, dec_counts)
         # LN-first 下采样；置 False 回退通用 Downsample（消融实验）。
-        if bool(mc.convnext_downsample_lnfirst):
+        if bool(mc.unet.convnext_downsample_lnfirst):
             downsample_builder = _make_convnext_downsample_builder(cfg)
-    elif mc.backbone == "mednext":
+    elif mc.unet.backbone == "mednext":
         # 档位 A：MedNeXt 残差倒瓶颈块 + 通用 Downsample/Upsample（无自定义 downsample_builder）。
         enc_builder = _make_mednext_stage_builder(cfg, enc_counts)
         dec_builder = _make_mednext_stage_builder(cfg, dec_counts)
     else:
-        raise ValueError(f"Unknown backbone: {mc.backbone}")
+        raise ValueError(f"Unknown backbone: {mc.unet.backbone}")
 
     # 各向异性下采样 stride 调度（None = 各向同性，沿用历史行为）。
     ds_strides = compute_downsample_strides(cfg, spatial_dims, n_levels)
@@ -424,10 +424,10 @@ def _build_unet_encoder_decoder(
                 "LN-first downsample. Set model.convnext_downsample_lnfirst="
                 "false to use the generic Downsample, or disable "
                 "anisotropic_pooling/downsample_strides.")
-        if mc.decoder_type != "unet":
+        if mc.unet.decoder_type != "unet":
             raise ValueError(
                 f"Anisotropic downsampling currently supports only "
-                f"decoder_type='unet'; got {mc.decoder_type!r}. "
+                f"decoder_type='unet'; got {mc.unet.decoder_type!r}. "
                 f"(unetpp/unet3p decoders use isotropic ×2 up/down.)")
         if mc.stem_fusion_mode == "hierarchical" and num_stem_fusion_views > 1:
             # hierarchical aux-stem 注入尺寸假定各级各向同性 ×2 下采；
@@ -438,14 +438,14 @@ def _build_unet_encoder_decoder(
                 "assume isotropic x2 encoder downsampling. Use "
                 "'shared_stem'/'multi_stem_proj', or disable "
                 "anisotropic_pooling/downsample_strides.")
-        if mc.downsample_mode not in _ANISO_DOWN_MODES:
+        if mc.unet.downsample_mode not in _ANISO_DOWN_MODES:
             raise ValueError(
                 f"Anisotropic downsampling requires downsample_mode in "
-                f"{_ANISO_DOWN_MODES}; got {mc.downsample_mode!r}.")
-        if mc.upsample_mode not in _ANISO_UP_MODES:
+                f"{_ANISO_DOWN_MODES}; got {mc.unet.downsample_mode!r}.")
+        if mc.unet.upsample_mode not in _ANISO_UP_MODES:
             raise ValueError(
                 f"Anisotropic downsampling requires upsample_mode in "
-                f"{_ANISO_UP_MODES}; got {mc.upsample_mode!r}.")
+                f"{_ANISO_UP_MODES}; got {mc.unet.upsample_mode!r}.")
         logger.info("Anisotropic downsample strides (per level): %s", ds_strides)
 
     # Build encoder
@@ -453,10 +453,10 @@ def _build_unet_encoder_decoder(
         in_channels           = topo.in_channels,
         stage_channels        = enc_channels,
         stage_builder         = enc_builder,
-        norm_type             = mc.norm_type,
-        norm_groups           = mc.norm_groups,
-        activation            = mc.activation,
-        downsample_mode       = mc.downsample_mode,
+        norm_type             = mc.unet.norm_type,
+        norm_groups           = mc.unet.norm_groups,
+        activation            = mc.unet.activation,
+        downsample_mode       = mc.unet.downsample_mode,
         stem_mode             = mc.stem_mode,
         spatial_dims          = spatial_dims,
         num_stem_fusion_views = num_stem_fusion_views,
@@ -466,52 +466,52 @@ def _build_unet_encoder_decoder(
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides,
         grad_checkpointing    = mc.grad_checkpointing,
-        grad_ckpt_stages      = mc.grad_ckpt_encoder_stages)
+        grad_ckpt_stages      = mc.unet.grad_ckpt_encoder_stages)
 
     # attn_gate_norm='auto' 跟随全局 norm_type（避免小 batch 3D 下门控 BN 统计噪）。
-    attn_gate_norm = (mc.norm_type if mc.attn_gate_norm == "auto"
-                      else mc.attn_gate_norm)
+    attn_gate_norm = (mc.unet.norm_type if mc.unet.attn_gate_norm == "auto"
+                      else mc.unet.attn_gate_norm)
 
     # decoder: unet | unetpp | unet3p
-    if   mc.decoder_type == "unet3p":
+    if   mc.unet.decoder_type == "unet3p":
         decoder = UNet3PDecoder(
             encoder_channels=enc_channels,
-            cat_channels=mc.unet3p_cat_channels,
-            norm_type=mc.norm_type,
-            norm_groups=mc.norm_groups,
-            activation=mc.activation,
-            skip_attention=mc.skip_attention,
+            cat_channels=mc.unet.unet3p_cat_channels,
+            norm_type=mc.unet.norm_type,
+            norm_groups=mc.unet.norm_groups,
+            activation=mc.unet.activation,
+            skip_attention=mc.unet.skip_attention,
             attn_gate_norm=attn_gate_norm,
             spatial_dims=spatial_dims,
             grad_checkpointing=mc.grad_checkpointing)
-    elif mc.decoder_type == "unetpp":
+    elif mc.unet.decoder_type == "unetpp":
         decoder = UNetPPDecoder(
             encoder_channels=enc_channels,
             stage_builder=dec_builder,
-            upsample_mode=mc.upsample_mode,
-            skip_attention=mc.skip_attention,
+            upsample_mode=mc.unet.upsample_mode,
+            skip_attention=mc.unet.skip_attention,
             attn_gate_norm=attn_gate_norm,
             attn_gate_target=attn_gate_target,
             spatial_dims=spatial_dims,
-            upsample_norm_act=mc.upsample_norm_act,
-            norm_type=mc.norm_type,
-            norm_groups=mc.norm_groups,
-            activation=mc.activation,
+            upsample_norm_act=mc.unet.upsample_norm_act,
+            norm_type=mc.unet.norm_type,
+            norm_groups=mc.unet.norm_groups,
+            activation=mc.unet.activation,
             grad_checkpointing=mc.grad_checkpointing)
     else:
         decoder = Decoder(
             encoder_channels   = enc_channels,
             stage_builder      = dec_builder,
-            upsample_mode      = mc.upsample_mode,
-            skip_mode          = mc.skip_mode,
-            skip_attention     = mc.skip_attention,
+            upsample_mode      = mc.unet.upsample_mode,
+            skip_mode          = mc.unet.skip_mode,
+            skip_attention     = mc.unet.skip_attention,
             attn_gate_norm     = attn_gate_norm,
             spatial_dims       = spatial_dims,
             downsample_strides = ds_strides,
-            upsample_norm_act  = mc.upsample_norm_act,
-            norm_type          = mc.norm_type,
-            norm_groups        = mc.norm_groups,
-            activation         = mc.activation,
+            upsample_norm_act  = mc.unet.upsample_norm_act,
+            norm_type          = mc.unet.norm_type,
+            norm_groups        = mc.unet.norm_groups,
+            activation         = mc.unet.activation,
             grad_checkpointing = mc.grad_checkpointing)
 
     return encoder, decoder
@@ -565,13 +565,13 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
     n_levels = len(enc_channels)
     enc_counts = _resolve_blocks_per_stage(
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
-    if mc.decoder_type == "unet":
+    if mc.unet.decoder_type == "unet":
         expected_dec_calls = n_levels - 1
-    elif mc.decoder_type == "unetpp":
+    elif mc.unet.decoder_type == "unetpp":
         expected_dec_calls = n_levels * (n_levels - 1) // 2
     else:
         expected_dec_calls = 0
-    if mc.decoder_blocks_per_stage and mc.decoder_type == "unet":
+    if mc.decoder_blocks_per_stage and mc.unet.decoder_type == "unet":
         dec_counts = _resolve_blocks_per_stage(
             mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
     elif mc.decoder_blocks_per_stage:
@@ -594,11 +594,11 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
         aux_seg_supervision   = aux_seg_supervision,
         aux_head_mode         = mc.aux_head_mode,
         aux_head_out_channels = aux_head_out_channels_arg,
-        aux_topo_head         = mc.aux_topo_head,
-        aux_topo_head_mode    = mc.aux_topo_head_mode,
-        norm_type             = mc.norm_type,
-        norm_groups           = mc.norm_groups,
-        activation            = mc.activation)
+        aux_topo_head         = mc.unet.aux_topo_head,
+        aux_topo_head_mode    = mc.unet.aux_topo_head_mode,
+        norm_type             = mc.unet.norm_type,
+        norm_groups           = mc.unet.norm_groups,
+        activation            = mc.unet.activation)
 
     pc = model.param_count()
     logger.info(
@@ -608,7 +608,7 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
         "stem=%s(stride=%d, n_views=%d, fusion=%s), "
         "down=%s, up=%s, skip=%s, attn=%s, skip_attn=%s, "
         "ds=%s, aux_seg=%s(n_aux_heads=%d, mode=%s), grad_ckpt=%s",
-        mc.backbone, mc.block_type, mc.decoder_type, mc.resenc_preset,
+        mc.unet.backbone, mc.unet.block_type, mc.unet.decoder_type, mc.resenc_preset,
         pc["encoder"] / 1e6, pc["decoder"] / 1e6, pc["total"] / 1e6,
         enc_channels,
         enc_counts, dec_counts,
@@ -616,8 +616,8 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
         topo.num_res_groups if topo.num_res_groups > 0 else 1,
         mc.stem_mode, encoder.stem_stride,
         num_stem_fusion_views, mc.stem_fusion_mode,
-        mc.downsample_mode, mc.upsample_mode, mc.skip_mode,
-        mc.attention_type, mc.skip_attention,
+        mc.unet.downsample_mode, mc.unet.upsample_mode, mc.unet.skip_mode,
+        mc.unet.attention_type, mc.unet.skip_attention,
         mc.deep_supervision, aux_seg_supervision, len(model.aux_heads),
         mc.aux_head_mode, mc.grad_checkpointing)
 

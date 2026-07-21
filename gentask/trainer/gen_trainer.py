@@ -341,7 +341,9 @@ class GenerationTrainer(BaseTrainer):
                     epoch=epoch, step=step, total_steps=total)
                 group_has_nonfinite = False
                 grad_norm_val = result.grad_norm
-                if result.skipped_nonfinite:
+                skipped_nf = result.skipped_nonfinite
+                result.acknowledge()
+                if skipped_nf:
                     if self._health_monitor:
                         opt_steps += 1
                     continue

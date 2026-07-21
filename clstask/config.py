@@ -39,7 +39,7 @@ from taskcore.config.registry import (
 logger = logging.getLogger(__name__)
 
 #: 支持的 backbone。'encoder' 复用 segtask Encoder（ResNet / ConvNeXt 由
-#: ``cfg.model.backbone`` 决定），SSL 预训练权重可直接迁移；densenet / vit 为
+#: ``cfg.model.unet.backbone`` 决定），SSL 预训练权重可直接迁移；densenet / vit 为
 #: clstask 自有实现（2D/3D 通用），无法吃 CNN Encoder 的 SSL 权重。
 BACKBONES = ("encoder", "densenet", "vit")
 GRANULARITIES = ("volume", "slice")
@@ -79,7 +79,7 @@ class ClsConfig:
     num_classes: int = 0
 
     # ---- Backbone -----------------------------------------------------
-    # 'encoder'（复用 segtask Encoder；ResNet/ConvNeXt 由 cfg.model.backbone 决定）
+    # 'encoder'（复用 segtask Encoder；ResNet/ConvNeXt 由 cfg.model.unet.backbone 决定）
     # | 'densenet' | 'vit'。四模板 = resnet / convnext（经 encoder）+ densenet + vit。
     backbone: str = "encoder"
 
@@ -185,7 +185,7 @@ def validate_cls(cls: ClsConfig, cfg: SegConfig) -> None:
                  "clstask 2.5D currently supports single-FOV only "
                  "(data.multi_res_scales == [1.0]), matching the image-only "
                  f"SSL pretraining geometry; got {scales}.")
-        _require(not bool(cfg.model.lift_2_5d_to_3d),
+        _require(not bool(cfg.model.unet.lift_2_5d_to_3d),
                  "cls does not support model.lift_2_5d_to_3d yet; use plain "
                  "2.5D folding (spatial_dims=2) or a 3D patch_mode.")
     else:

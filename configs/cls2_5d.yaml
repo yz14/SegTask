@@ -36,14 +36,15 @@ augment:
                            # image+label 联合增强后派生 target；参数见 segtask augment 段）
 
 model:
-  backbone: "resnet"
-  encoder_channels: [32, 64, 128, 256]
+  encoder_channels        : [32, 64, 128, 256]
   encoder_blocks_per_stage: [2, 2, 2, 2]
-  block_type: "basic"
-  norm_type  : "instance"
-  activation : "leakyrelu"
-  stem_mode      : "conv3"
+  stem_mode               : "conv3"
 
+  unet:
+    backbone  : "resnet"
+    block_type: "basic"
+    norm_type : "instance"
+    activation: "leakyrelu"
 train:
   epochs: 50
   optimizer   : "adamw"

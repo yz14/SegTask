@@ -68,12 +68,12 @@ def build_pipeline(cfg: Config, base_loss) -> ViewPipeline:
     pipeline = cls(cfg, base_loss)
 
     # 中心线/距离场辅助头损失：与具体 pipeline 无关，统一注入（compute_loss 内各加一项）。
-    if cfg.model.aux_topo_head:
+    if cfg.model.unet.aux_topo_head:
         pipeline.aux_topo_loss_fn = build_aux_topo_loss(cfg.model, cfg.loss)
         pipeline.aux_topo_weight = float(cfg.loss.aux_topo_weight)
         logger.info(
             "Aux topo head: ENABLED (target=%s, loss=%s, iter=%d, weight=%.3f)",
-            cfg.model.aux_topo_target, pipeline.aux_topo_loss_fn.loss_name,
+            cfg.model.unet.aux_topo_target, pipeline.aux_topo_loss_fn.loss_name,
             cfg.loss.aux_topo_iter, pipeline.aux_topo_weight)
     return pipeline
 

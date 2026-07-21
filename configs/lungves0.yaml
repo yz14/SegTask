@@ -74,54 +74,55 @@ augment:
 
 
 model:
-  backbone: "resnet"
-  encoder_channels: [64, 128, 256, 512, 512]
+  encoder_channels        : [64, 128, 256, 512, 512]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   decoder_blocks_per_stage: [2, 2, 2, 2]
-  block_type: "basic"
+  dropout                 : 0.0
 
-  lift_2_5d_to_3d: false
+  deep_supervision        : true
 
-  norm_type  : "batch"            # 'instance' | 'batch' | 'group'
-  norm_groups: 8
-  activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
-  dropout    : 0.0
-  attention_type: "none"
-  skip_attention: false
+  stem_mode               : "dual"
 
-  deep_supervision: true
+  stem_fusion_mode        : "multi_stem_proj"
 
-  stem_mode    : "dual"
+  aux_seg_supervision     : true
 
-  stem_fusion_mode: "multi_stem_proj"
+  aux_head_mode           : "conv"
 
-  aux_seg_supervision: true
+  unet:
+    backbone         : "resnet"
+    block_type       : "basic"
 
-  aux_head_mode: "conv"
+    lift_2_5d_to_3d  : false
 
-  drop_path_rate : 0.0
+    norm_type        : "batch"  # 'instance' | 'batch' | 'group'
+    norm_groups      : 8
+    activation       : "leakyrelu"  # 'leakyrelu' | 'gelu' | 'relu'
+    attention_type   : "none"
+    skip_attention   : false
 
-  decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
-  downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
-  upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
-  upsample_norm_act: true
-  skip_mode      : "cat"          # 'cat' | 'add'
+    drop_path_rate   : 0.0
 
-  drop_path_rate : 0.0
+    decoder_type     : "unet"  # 'unet' | 'unetpp' | 'unet3p'
+    downsample_mode  : "conv"  # 'conv' (学习) | 'maxpool'
+    upsample_mode    : "trilinear"  # 'transpose' (学习) | 'trilinear'
+    upsample_norm_act: true
+    skip_mode        : "cat"  # 'cat' | 'add'
 
-  # ---- 多感受野（空洞卷积多分支融合）MultiRF 示例 ----
-  # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合、
-  # axes=hw 只在 H/W 膨胀（肺 CT z 各向异性）。先验证有效再往更多 stage / 解码器铺开。
-  multirf_enabled       : true
-  multirf_dilations     : [1, 2, 3]        # 必须含 1（守门支路）
-  multirf_mode          : "split"          # 'split'(≈等成本) | 'parallel'(≈N×)
-  multirf_fusion        : "concat_proj"    # 'concat_proj' | 'sum'(需 parallel) | 'se'
-  multirf_axes          : "hw"             # 'hw'(保 z, 推荐) | 'all'
-  multirf_encoder_stages: [0, 1, 1, 1, 1]  # 编码器逐 stage；浅→深，末位=bottleneck
-  multirf_decoder_stages: [1, 1, 1, 0]     # 解码器逐 level；深→浅
-  multirf_branch_norm_act: true
+    drop_path_rate   : 0.0
+    multirf:
 
-
+      # ---- 多感受野（空洞卷积多分支融合）MultiRF 示例 ----
+      # 推荐起点：只在编码器深层+瓶颈开（高 ROI、低网格风险），split 等成本、concat_proj 融合、
+      # axes=hw 只在 H/W 膨胀（肺 CT z 各向异性）。先验证有效再往更多 stage / 解码器铺开。
+      enabled        : true
+      dilations      : [1, 2, 3]  # 必须含 1（守门支路）
+      mode           : "split"  # 'split'(≈等成本) | 'parallel'(≈N×)
+      fusion         : "concat_proj"  # 'concat_proj' | 'sum'(需 parallel) | 'se'
+      axes           : "hw"  # 'hw'(保 z, 推荐) | 'all'
+      encoder_stages : [0, 1, 1, 1, 1]  # 编码器逐 stage；浅→深，末位=bottleneck
+      decoder_stages : [1, 1, 1, 0]  # 解码器逐 level；深→浅
+      branch_norm_act: true
 loss:
   name: "dice_focal"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
   compound_weights: [1.0, 1.0]

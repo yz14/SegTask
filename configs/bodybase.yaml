@@ -73,39 +73,39 @@ augment:
 
 
 model:
-  backbone: "resnet"
-  encoder_channels: [64, 128, 256, 512, 512]
+  encoder_channels        : [64, 128, 256, 512, 512]
   encoder_blocks_per_stage: [2, 2, 2, 2, 2]
   decoder_blocks_per_stage: [2, 2, 2, 2]
-  block_type: "basic"
+  dropout                 : 0.0
 
-  lift_2_5d_to_3d: false
+  deep_supervision        : true
 
-  norm_type  : "batch"         # 'instance' | 'batch' | 'group'
-  norm_groups: 8
-  activation : "leakyrelu"        # 'leakyrelu' | 'gelu' | 'relu'
-  dropout    : 0.0
-  attention_type: "none"
-  skip_attention: false
+  stem_mode               : "dual"
 
-  deep_supervision: true
+  stem_fusion_mode        : "multi_stem_proj"
 
-  stem_mode    : "dual"
+  aux_seg_supervision     : true
 
-  stem_fusion_mode: "multi_stem_proj"
+  aux_head_mode           : "conv"
 
-  aux_seg_supervision: true
+  unet:
+    backbone       : "resnet"
+    block_type     : "basic"
 
-  aux_head_mode: "conv"
+    lift_2_5d_to_3d: false
 
-  decoder_type   : "unet"         # 'unet' | 'unetpp' | 'unet3p'
-  downsample_mode: "conv"         # 'conv' (学习) | 'maxpool'
-  upsample_mode  : "trilinear"    # 'transpose' (学习) | 'trilinear'
-  skip_mode      : "cat"          # 'cat' | 'add'
+    norm_type      : "batch"  # 'instance' | 'batch' | 'group'
+    norm_groups    : 8
+    activation     : "leakyrelu"  # 'leakyrelu' | 'gelu' | 'relu'
+    attention_type : "none"
+    skip_attention : false
 
-  drop_path_rate : 0.0
+    decoder_type   : "unet"  # 'unet' | 'unetpp' | 'unet3p'
+    downsample_mode: "conv"  # 'conv' (学习) | 'maxpool'
+    upsample_mode  : "trilinear"  # 'transpose' (学习) | 'trilinear'
+    skip_mode      : "cat"  # 'cat' | 'add'
 
-
+    drop_path_rate : 0.0
 loss:
   name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
   compound_weights: [1.0, 1.0]

@@ -2,7 +2,7 @@
 
 设计（与 ssltask / clstask 同构）：核心段（data/model/loss/train/predict/aug）
 直接子类化 ``taskcore.config`` 的同名 dataclass——公共字段/语义只有一份真相源；
-生成任务专有字段（cond_* 条件卷、sisr_* 经典超分、val_full_volume 整卷验证、
+生成任务专有字段（cond_* 条件卷、model.sisr 经典超分、val_full_volume 整卷验证、
 滑窗复原 predict 字段等）在子类中追加；生成侧默认值不同的字段（保守增强
 概率、predict.batch_size 等）在子类中显式覆盖，行为与迁移前逐位一致。
 
@@ -20,6 +20,10 @@ from taskcore.config.core import (  # noqa: F401  (re-export: io.py/validation.p
     _require,
 )
 from taskcore.config import core as _core
+from taskcore.config.model_migration import (
+    SISR_FIELD_MAP,
+    install_flat_model_compat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,18 +53,34 @@ class DataConfig(_core.DataConfig):
 # Model configuration
 # ---------------------------------------------------------------------------
 @dataclass
+class SISRConfig:
+    """经典 SISR 专用（arch in ("edsr","rcan")，post-upsampling）。"""
+
+    # 特征通道数（EDSR baseline 64）。
+    channels: int = 64
+    # EDSR 残差块数 / RCAN 每组 RCAB 数（EDSR baseline 16，RCAN 论文 20）。
+    num_blocks: int = 16
+    # RCAN 残差组数（EDSR 忽略；RCAN 论文 10）。
+    num_groups: int = 10
+    # EDSR 块残差缩放（大模型建议 0.1 稳定训练；RCAN 忽略）。
+    res_scale: float = 1.0
+
+
+@dataclass
 class ModelConfig(_core.ModelConfig):
     """模型架构设置（核心段 + 生成任务扩展）。"""
 
-    # ---- 经典 SISR 专用（arch in ("edsr","rcan")，post-upsampling） ----
-    # 特征通道数（EDSR baseline 64）。
-    sisr_channels: int = 64
-    # EDSR 残差块数 / RCAN 每组 RCAB 数（EDSR baseline 16，RCAN 论文 20）。
-    sisr_num_blocks: int = 16
-    # RCAN 残差组数（EDSR 忽略；RCAN 论文 10）。
-    sisr_num_groups: int = 10
-    # EDSR 块残差缩放（大模型建议 0.1 稳定训练；RCAN 忽略）。
-    sisr_res_scale: float = 1.0
+    # ---- 经典 SISR 嵌套段（arch in ("edsr","rcan")） ----
+    sisr: SISRConfig = field(default_factory=SISRConfig)
+
+
+# @dataclass 重新生成了子类 __init__，须在子类上重装旧扁平接口兼容层
+# （含 sisr_* → sisr.* 转发；嵌套段补齐含 sisr）。
+install_flat_model_compat(
+    ModelConfig,
+    extra_flat_to_nested=SISR_FIELD_MAP,
+    nested_sections=("unet", "adm", "edm2", "sisr"),
+)
 
 
 # ---------------------------------------------------------------------------

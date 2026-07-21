@@ -41,13 +41,13 @@ data:
   cache_max_volumes: 2
 
 model:
-  arch: "unet"
-  backbone: "resnet"
-  encoder_channels: [32, 64, 128, 256]
+  arch                    : "unet"
+  encoder_channels        : [32, 64, 128, 256]
   encoder_blocks_per_stage: [2, 2, 2, 2]
-  decoder_type: "unet"
 
-
+  unet:
+    backbone    : "resnet"
+    decoder_type: "unet"
 # ---- 生成任务设置 ----
 task:
   type: "generation"

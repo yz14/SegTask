@@ -9,7 +9,11 @@ from typing import Any, Dict, Union
 
 import yaml
 
-from taskcore.config.core import MonitorConfig
+from taskcore.config.core import MonitorConfig, _nested_dataclass_type
+from taskcore.config.model_migration import (
+    SISR_FIELD_MAP,
+    route_legacy_model_dict,
+)
 
 from .dataclasses import (
     AugConfig, ConfigError, DataConfig, LossConfig, ModelConfig, PredictConfig,
@@ -71,7 +75,15 @@ def _dataclass_from_dict(cls, d: Dict[str, Any]):
     """
     if not isinstance(d, dict):
         return d
-    field_names = {f.name for f in fields(cls)}
+    if isinstance(cls, type) and issubclass(cls, ModelConfig):
+        # D2 兼容层：旧扁平 model 键路由进嵌套子段（与 taskcore 同口径）。
+        d, moved = route_legacy_model_dict(
+            d, error_cls=ConfigError, extra_flat_to_nested=SISR_FIELD_MAP)
+        if moved:
+            logger.info(
+                "model 段旧扁平键已自动迁移到嵌套路径（建议更新 YAML）：%s",
+                ", ".join(f"{k} -> {p}" for k, p in sorted(moved.items())))
+    dc_fields = {f.name: f for f in fields(cls)}
     aliases = _FIELD_ALIASES.get(cls, {})
     derived = _DEPRECATED_DERIVED_KEYS.get(cls, {})
     removed = _REMOVED_KEYS.get(cls, {})
@@ -95,11 +107,14 @@ def _dataclass_from_dict(cls, d: Dict[str, Any]):
             raise ConfigError(
                 f"Config key '{k}' is removed from {cls.__name__}; use "
                 f"'{new_key}' instead.")
-        if k not in field_names:
+        if k not in dc_fields:
             raise ConfigError(
                 f"Unknown config key '{k}' in {cls.__name__}.")
-        if k in _SUB_CONFIGS and isinstance(v, dict):
-            v = _dataclass_from_dict(_SUB_CONFIGS[k], v)
+        sub_cls = _nested_dataclass_type(dc_fields[k])
+        if sub_cls is None and k in _SUB_CONFIGS:
+            sub_cls = _SUB_CONFIGS[k]
+        if sub_cls is not None and isinstance(v, dict):
+            v = _dataclass_from_dict(sub_cls, v)
         kwargs[k] = v
     return cls(**kwargs)
 

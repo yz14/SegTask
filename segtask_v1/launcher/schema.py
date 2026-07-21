@@ -138,24 +138,70 @@ def _find_inline_hash(line: str) -> int:
     return -1
 
 
+def _field_meta(name: str, default: Any, tooltip: str) -> Dict[str, Any]:
+    py_type = type(default).__name__
+    return {
+        "name": name,
+        "default": default,
+        "py_type": py_type,
+        "control": _control_for(default, py_type),
+        "tooltip": tooltip,
+    }
+
+
+def _model_fields_meta(cls: type) -> Dict[str, Dict[str, Any]]:
+    """model 段：表单继续按旧扁平字段名呈现（D2 嵌套结构的平面视图）。
+
+    公共字段直读 ModelConfig；arch 专属字段沿迁移映射解析到嵌套子段
+    （UNetConfig / ADMConfig / EDM2Config / 模块子段），default 与 tooltip
+    取自子段 dataclass —— 单一真相源不变。构造/校验侧的
+    ``build_config`` 经 ``_dataclass_from_dict`` 的旧键路由接受扁平值。
+    """
+    from taskcore.config.model_migration import FLAT_TO_NESTED
+
+    fields_meta: Dict[str, Dict[str, Any]] = {}
+    comments = _extract_comments(cls)
+    nested_names = {"unet", "adm", "edm2"}
+    for f in _dc.fields(cls):
+        if f.name in nested_names:
+            continue
+        fields_meta[f.name] = _field_meta(
+            f.name, _field_default(f), comments.get(f.name, ""))
+
+    comment_cache: Dict[type, Dict[str, str]] = {}
+    for flat, path in FLAT_TO_NESTED.items():
+        parts = path.split(".")
+        cur_cls: type = cls
+        leaf_field = None
+        for p in parts:
+            fmap = {f.name: f for f in _dc.fields(cur_cls)}
+            leaf_field = fmap[p]
+            sub = leaf_field.default_factory  # type: ignore[union-attr]
+            if p != parts[-1]:
+                cur_cls = sub  # 中间段必为嵌套 dataclass 的 default_factory。
+        if cur_cls not in comment_cache:
+            comment_cache[cur_cls] = _extract_comments(cur_cls)
+        fields_meta[flat] = _field_meta(
+            flat, _field_default(leaf_field),
+            comment_cache[cur_cls].get(parts[-1], ""))
+    return fields_meta
+
+
 def build_field_schema() -> Dict[str, Dict[str, Dict[str, Any]]]:
     """返回 {section: {field: {name, default, py_type, control, tooltip}}}。
 
     覆盖 config 的全部 section/field；per-mode 过滤与 enum 由 manifest 负责。
+    model 段按旧扁平字段名呈现（见 :func:`_model_fields_meta`）。
     """
     schema: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for section, cls in _SUB_CONFIGS.items():
+        if section == "model":
+            schema[section] = _model_fields_meta(cls)
+            continue
         comments = _extract_comments(cls)
         fields_meta: Dict[str, Dict[str, Any]] = {}
         for f in _dc.fields(cls):
-            default = _field_default(f)
-            py_type = type(default).__name__
-            fields_meta[f.name] = {
-                "name": f.name,
-                "default": default,
-                "py_type": py_type,
-                "control": _control_for(default, py_type),
-                "tooltip": comments.get(f.name, ""),
-            }
+            fields_meta[f.name] = _field_meta(
+                f.name, _field_default(f), comments.get(f.name, ""))
         schema[section] = fields_meta
     return schema

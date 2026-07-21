@@ -97,40 +97,40 @@ augment:
 
 # MODEL — ResNet + R(2+1)D + lift。spatial_dims/in_channels 由 sync() 自动设
 model:
-  backbone: "resnet"                   # r2plus1d 仅在 resnet 注册
 
   # 显存紧可降到 [24,48,96,192,192]
-  encoder_channels: [32, 64, 128, 256, 256]
-  encoder_blocks_per_stage: [2, 2, 3, 3, 3]   # ResEnc-S 风格
+  encoder_channels        : [32, 64, 128, 256, 256]
+  encoder_blocks_per_stage: [2, 2, 3, 3, 3]  # ResEnc-S 风格
   decoder_blocks_per_stage: [2, 2, 2, 2]
+  dropout                 : 0.0
 
-  block_type: "r2plus1d"               # (1,3,3) 空间 + (3,1,1) z; 每 block 做 z conv
-  lift_2_5d_to_3d: true                # 跳过 squeeze, 走 3D UNet + MultiResLoss(1)
+  deep_supervision        : false
 
-  norm_type  : "instance"
-  norm_groups: 8
-  activation : "leakyrelu"
-  dropout    : 0.0
+  stem_mode               : "conv3"
+  stem_fusion_mode        : "shared_stem"  # lift 下字段被忽略 (仅 2D-folded 生效)
 
-  # r2plus1d 已在每 stage 引入 z conv, 不再叠加 SE (避免通道加权"挑掉" z 上下文)
-  skip_attention: false
+  aux_seg_supervision     : false  # 本轮跑 lift 主路径基线; 收敛后可开
+  aux_head_mode           : "linear"
 
-  deep_supervision: false
+  unet:
+    backbone       : "resnet"  # r2plus1d 仅在 resnet 注册
 
-  stem_mode    : "conv3"
-  stem_fusion_mode: "shared_stem"        # lift 下字段被忽略 (仅 2D-folded 生效)
+    block_type     : "r2plus1d"  # (1,3,3) 空间 + (3,1,1) z; 每 block 做 z conv
+    lift_2_5d_to_3d: true  # 跳过 squeeze, 走 3D UNet + MultiResLoss(1)
 
-  aux_seg_supervision: false           # 本轮跑 lift 主路径基线; 收敛后可开
-  aux_head_mode: "linear"
+    norm_type      : "instance"
+    norm_groups    : 8
+    activation     : "leakyrelu"
 
-  decoder_type   : "unet"
-  downsample_mode: "conv"
-  upsample_mode  : "trilinear"
-  skip_mode      : "cat"
+    # r2plus1d 已在每 stage 引入 z conv, 不再叠加 SE (避免通道加权"挑掉" z 上下文)
+    skip_attention : false
 
-  drop_path_rate: 0.0
+    decoder_type   : "unet"
+    downsample_mode: "conv"
+    upsample_mode  : "trilinear"
+    skip_mode      : "cat"
 
-
+    drop_path_rate : 0.0
 # LOSS — lift 下自动绕过 SliceChannelLoss
 loss:
   name: "dice_focal"

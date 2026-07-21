@@ -590,9 +590,10 @@ def main() -> int:
     cfg = load_config(args.config)
     logger.info("Config loaded from %s", args.config)
     if args.override:
-        # 复用 train.py override 语义；懒导入保持 make_data 轻量。
-        from ..train import apply_overrides
-        apply_overrides(cfg, args.override)
+        # 复用任务侧点记法 override 语义（sections=None 即单段 Config 路由）；
+        # 懒导入保持 make_data 轻量。
+        from ..config.task_io import apply_dotted_overrides
+        apply_dotted_overrides(cfg, args.override)
         cfg.sync()
         cfg.validate()
 

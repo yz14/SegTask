@@ -73,8 +73,8 @@ def build_jepa_predictor(cfg, channels: int, hidden: int, depth: int
     pred = JEPAPredictor(
         channels=int(channels), hidden=h, depth=int(depth),
         spatial_dims=int(cfg.model.spatial_dims),
-        norm_type=cfg.model.norm_type, norm_groups=cfg.model.norm_groups,
-        activation=cfg.model.activation)
+        norm_type=cfg.model.unet.norm_type, norm_groups=cfg.model.unet.norm_groups,
+        activation=cfg.model.unet.activation)
     n = sum(p.numel() for p in pred.parameters())
     logger.info("Built JEPAPredictor: channels=%d, hidden=%d, depth=%d, "
                 "params=%.3fM.", channels, h, depth, n / 1e6)

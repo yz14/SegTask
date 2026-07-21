@@ -201,7 +201,7 @@ class Config:
                 "('adm','edm2') (paper-faithful \u03c3/timestep conditioning); "
                 f"got {self.model.arch!r}.")
             _require(
-                not self.model.lift_2_5d_to_3d,
+                not self.model.unet.lift_2_5d_to_3d,
                 "task.algorithm='diffusion' is 2.5D-only (ADM/EDM2 nets are 2D); "
                 "incompatible with model.lift_2_5d_to_3d=True.")
             _require(
@@ -257,7 +257,7 @@ class Config:
             f"model.arch={arch!r} does not support multi-view "
             f"(data.multi_res_scales); use a single view.")
         _require(
-            not self.model.lift_2_5d_to_3d,
+            not self.model.unet.lift_2_5d_to_3d,
             f"model.arch={arch!r} does not support lift_2_5d_to_3d.")
         _require(
             not self.model.deep_supervision,
@@ -269,9 +269,9 @@ class Config:
             "images live on the HR grid while the net input is the true LR "
             "grid.")
         _require(
-            self.model.sisr_channels > 0 and self.model.sisr_num_blocks > 0
-            and self.model.sisr_num_groups > 0,
-            "sisr_channels/sisr_num_blocks/sisr_num_groups must be > 0.")
+            self.model.sisr.channels > 0 and self.model.sisr.num_blocks > 0
+            and self.model.sisr.num_groups > 0,
+            "sisr.channels/sisr.num_blocks/sisr.num_groups must be > 0.")
         # 模型空间轴 patch 尺寸须能被逐轴倍率整除（LR = patch/scale 为整）。
         sdims = 2 if self.data.patch_mode == "2_5d" else 3
         per_axis = list(self.task.sr_scale_per_axis)
@@ -297,30 +297,30 @@ class Config:
             self._validate_sisr_arch(arch)
         elif arch == "unet":
             _require(
-                self.model.backbone in ("resnet", "convnext"),
-                f"Invalid backbone: {self.model.backbone}")
+                self.model.unet.backbone in ("resnet", "convnext"),
+                f"Invalid backbone: {self.model.unet.backbone}")
             _require(
-                self.model.norm_type in ("batch", "instance", "group"),
-                f"Invalid norm: {self.model.norm_type}")
+                self.model.unet.norm_type in ("batch", "instance", "group"),
+                f"Invalid norm: {self.model.unet.norm_type}")
             _require(
-                self.model.activation in (
+                self.model.unet.activation in (
                 "relu", "leakyrelu", "gelu", "swish",
             ),
-                f"Invalid activation: {self.model.activation}")
+                f"Invalid activation: {self.model.unet.activation}")
             _require(
-                self.model.downsample_mode in (
+                self.model.unet.downsample_mode in (
                 "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
             ),
-                f"Invalid downsample_mode: {self.model.downsample_mode}")
+                f"Invalid downsample_mode: {self.model.unet.downsample_mode}")
             _require(
-                self.model.upsample_mode in (
+                self.model.unet.upsample_mode in (
                 "transpose", "trilinear", "nearest", "pixelshuffle",
                 "carafe", "dysample",
             ),
-                f"Invalid upsample_mode: {self.model.upsample_mode}")
+                f"Invalid upsample_mode: {self.model.unet.upsample_mode}")
             _require(
-                self.model.skip_mode in ("cat", "add"),
-                f"Invalid skip_mode: {self.model.skip_mode}")
+                self.model.unet.skip_mode in ("cat", "add"),
+                f"Invalid skip_mode: {self.model.unet.skip_mode}")
         else:
             # ADM / EDM2 仅支持 2.5D + Plan A（shared_stem / multi_stem_proj）。
             _require(
@@ -354,22 +354,22 @@ class Config:
         # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
             _require(
-                self.model.attention_type in (
+                self.model.unet.attention_type in (
                 "none", "se", "eca", "cbam", "coord",
             ),
-                f"Invalid attention_type: {self.model.attention_type}")
+                f"Invalid attention_type: {self.model.unet.attention_type}")
             _require(
-                self.model.decoder_type in ("unet", "unetpp", "unet3p"),
-                f"Invalid decoder_type: {self.model.decoder_type}")
+                self.model.unet.decoder_type in ("unet", "unetpp", "unet3p"),
+                f"Invalid decoder_type: {self.model.unet.decoder_type}")
             _require(
-                self.model.unet3p_cat_channels > 0,
+                self.model.unet.unet3p_cat_channels > 0,
                 "unet3p_cat_channels must be > 0")
             _require(
-                self.model.block_type in (
+                self.model.unet.block_type in (
                 "basic", "preact", "bottleneck", "r2plus1d"),
-                f"Invalid block_type: {self.model.block_type}")
+                f"Invalid block_type: {self.model.unet.block_type}")
             # r2plus1d 需 D 为真空间轴；2.5D 下 D 在通道轴，拒绝。
-            if self.model.block_type == "r2plus1d":
+            if self.model.unet.block_type == "r2plus1d":
                 _require(
                     self.model.spatial_dims == 3,
                     "model.block_type='r2plus1d' requires spatial_dims=3; "
@@ -399,7 +399,7 @@ class Config:
                 all(b >= 1 for b in dbps),
                 "decoder_blocks_per_stage entries must all be >= 1")
         # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
-        sds = self.model.downsample_strides
+        sds = self.model.unet.downsample_strides
         if sds:
             sd_dim = int(self.model.spatial_dims)
             _require(
@@ -495,7 +495,7 @@ class Config:
                 "2.5D mode requires multi_res_scales[0]==1.0 (view 0 = prediction target); "
                 f"got {self.data.multi_res_scales}.")
             n_views = len(self.data.multi_res_scales)
-            lift = bool(self.model.lift_2_5d_to_3d)
+            lift = bool(self.model.unet.lift_2_5d_to_3d)
             if lift:
                 _require(
                     self.model.spatial_dims == 3,

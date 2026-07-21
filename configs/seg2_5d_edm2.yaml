@@ -83,32 +83,32 @@ augment:
 
 # MODEL — EDM2 U-Net
 model:
-  arch: "edm2"
+  arch                    : "edm2"
 
   # 与 seg2_5d 宽度一致 (mults [1,2,4,8,8], base=32); EDM2 论文 256² 典型 [1,2,3,4]
-  encoder_channels: [32, 64, 128, 256, 256]
-  encoder_blocks_per_stage: [3, 3, 3, 3, 3]   # 论文默认 num_blocks=3
+  encoder_channels        : [32, 64, 128, 256, 256]
+  encoder_blocks_per_stage: [3, 3, 3, 3, 3]  # 论文默认 num_blocks=3
   # EDM2 忽略 (decoder 块数由 skip-stack 固定: nb_k+1)
   decoder_blocks_per_stage: [3, 3, 3, 3]
 
-  stem_mode: "conv3"                    # EDM2 忽略 (使用 3×3 MPConv stem)
-  stem_fusion_mode: "multi_stem_proj"     # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
+  stem_mode               : "conv3"  # EDM2 忽略 (使用 3×3 MPConv stem)
+  stem_fusion_mode        : "multi_stem_proj"  # 'shared_stem' | 'multi_stem_proj' (不支持 hierarchical)
 
-  deep_supervision: false
-  aux_seg_supervision: true
-  aux_head_mode: "linear"
+  deep_supervision        : false
+  aux_seg_supervision     : true
+  aux_head_mode           : "linear"
 
-  dropout: 0.0                          # 复用为 Block mid-residual dropout
+  dropout                 : 0.0  # 复用为 Block mid-residual dropout
 
-  # EDM2 专属; 默认仅最深一级。[3,4] = 同时二、最深两级 (额外容量时)
-  edm2_attention_levels: [4]
-  edm2_channels_per_head: 64
-  edm2_res_balance: 0.3
-  edm2_attn_balance: 0.3
-  edm2_concat_balance: 0.5
-  edm2_clip_act: 256.0
+  edm2:
 
-
+    # EDM2 专属; 默认仅最深一级。[3,4] = 同时二、最深两级 (额外容量时)
+    attention_levels : [4]
+    channels_per_head: 64
+    res_balance      : 0.3
+    attn_balance     : 0.3
+    concat_balance   : 0.5
+    clip_act         : 256.0
 loss:
   name: "dice_focal"
   compound_weights: [1.0, 1.0]

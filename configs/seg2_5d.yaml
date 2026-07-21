@@ -111,92 +111,96 @@ augment:
 
 model:
   # ---- 架构与规模 ----
-  arch                    : "unet"                    # 网络架构族；'unet' | 'adm'/'edm2'=扩散式 U-Net（仅 2.5D，读 adm_*/edm2_*）
-  backbone                : "resnet"                  # 编码器 block 风格；'resnet' | 'convnext' | 'mednext'
-  encoder_channels        : [32, 64, 128, 256, 256]   # 每级编码器通道数；长度=级数（网络深度）
-  blocks_per_level        : 2                         # 每级默认 block 数；仅 *_blocks_per_stage 为空时使用
-  encoder_blocks_per_stage: [2, 2, 2, 2, 2]           # 逐级 encoder block 数；空=推导；非空长度须 = len(encoder_channels)
-  decoder_blocks_per_stage: [2, 2, 2, 2]              # 逐级 decoder block 数；空=推导；非空长度须 = len(encoder_channels)-1
-  resenc_preset           : "none"                    # nnU-Net 预设（*_blocks_per_stage 为空时自动填）；'none'=不用 | 'S' | 'M' | 'L' | 'XL'
-  block_type              : "basic"                   # 仅 backbone='resnet'；残差块变体；'basic'=标准 | 'preact'=预激活（深网） | 'bottleneck'=瓶颈（ResEnc-XL） | 'r2plus1d'=(1,3,3)+(3,1,1) 分解（需 3D）
-
-  # ---- 归一化 / 激活 / 正则 ----
-  norm_type               : "batch"                   # 归一化层类型；'batch' | 'instance' | 'group'
-  norm_groups             : 8                         # 仅 norm_type='group'；组数（须整除通道数）
-  activation              : "leakyrelu"               # 激活函数；'relu' | 'leakyrelu' | 'gelu' | 'swish'
-  dropout                 : 0.0                       # dropout 比例；0=禁用
-  drop_path_rate          : 0.0                       # stochastic depth：训练时按此比例随机丢残差分支；0=禁用
+  arch                    : "unet"  # 网络架构族；'unet' | 'adm'/'edm2'=扩散式 U-Net（仅 2.5D，读 adm_*/edm2_*）
+  encoder_channels        : [32, 64, 128, 256, 256]  # 每级编码器通道数；长度=级数（网络深度）
+  blocks_per_level        : 2  # 每级默认 block 数；仅 *_blocks_per_stage 为空时使用
+  encoder_blocks_per_stage: [2, 2, 2, 2, 2]  # 逐级 encoder block 数；空=推导；非空长度须 = len(encoder_channels)
+  decoder_blocks_per_stage: [2, 2, 2, 2]  # 逐级 decoder block 数；空=推导；非空长度须 = len(encoder_channels)-1
+  resenc_preset           : "none"  # nnU-Net 预设（*_blocks_per_stage 为空时自动填）；'none'=不用 | 'S' | 'M' | 'L' | 'XL'
+  dropout                 : 0.0  # dropout 比例；0=禁用
 
   # ---- 拓扑：stem / decoder / 上下采样 / skip ----
-  stem_mode               : "dual"                    # 入口 stem；'conv3' | 'conv7' | 'dual'=双支 | 'patch2'/'patch4'=patch-embed 降 2/4 倍（主输出补插值上采）
-  decoder_type            : "unet"                    # decoder 拓扑；'unet'=对称 | 'unetpp'=嵌套稠密 | 'unet3p'=全尺度 skip
-  unet3p_cat_channels     : 64                        # 仅 decoder_type='unet3p'；各聚合分支通道数
-  downsample_mode         : "conv"                    # 下采样方式；'conv' | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
-  downsample_strides      : []                        # 显式逐级下采样 stride，非空覆盖自动推导；长度=级数-1，每项长=spatial_dims，值∈{1,2}
-  anisotropic_pooling     : false                     # 按 patch_size 自动推导逐级 per-axis stride，薄轴少降采；2.5D 下仅作用于 H/W（通常无实质变化）
-  upsample_mode           : "trilinear"               # 上采样方式；'transpose' | 'trilinear' | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
-  upsample_norm_act       : true                      # 仅 upsample_mode∈{trilinear,nearest}；插值+conv 之后再接 norm+act，使插值支路成为非线性变换
-  skip_mode               : "cat"                     # skip 融合方式；'cat'=拼接 | 'add'=相加
-
-  # ---- 注意力（块内 / skip 门控） ----
-  attention_type          : "none"                    # 块内注意力；'none'=无 | 'se'=通道重标定 | 'eca' | 'cbam' | 'coord' | 'lka'=大核注意力（感受野≈21³） | 'msca'=多尺度条形核（适合细长结构）
-  se_reduction            : 16                        # 仅 attention_type='se'；SE 通道压缩比
-  skip_attention          : false                     # skip 连接上加 AttentionGate3D（用深层特征门控 skip 特征）
-  attn_gate_norm          : "batch"                   # 仅 skip_attention=true；门控内归一化；'auto'=跟随 norm_type | 'batch' | 'instance' | 'group'
+  stem_mode               : "dual"  # 入口 stem；'conv3' | 'conv7' | 'dual'=双支 | 'patch2'/'patch4'=patch-embed 降 2/4 倍（主输出补插值上采）
 
   # ---- 监督头 ----
-  deep_supervision        : true                      # 多个 decoder 级都输出预测并计损失（逐级权重见 loss.deep_supervision_weights）
-  aux_seg_supervision     : true                      # 仅 2.5D + 多 FOV；开启后辅助 view 各配一个分割头做辅助监督（权重见 loss.aux_supervision_weights）
-  aux_head_mode           : "conv"                    # 仅 aux_seg_supervision=true；aux-seg 头结构；'linear'=单 1×1 | 'conv'=3×3+1×1
-  aux_topo_head           : false                     # 仅 arch='unet'；开启后加中心线/距离场辅助头（拓扑监督，仅训练期前向，零推理开销）
-  aux_topo_target         : "centerline"              # 仅 aux_topo_head=true；辅助目标；'centerline'=软骨架（保拓扑） | 'distance'=到边界距离场
-  aux_topo_head_mode      : "conv"                    # 仅 aux_topo_head=true；头结构；'linear'=单 1×1 | 'conv'=3×3+1×1（细结构推荐）
+  deep_supervision        : true  # 多个 decoder 级都输出预测并计损失（逐级权重见 loss.deep_supervision_weights）
+  aux_seg_supervision     : true  # 仅 2.5D + 多 FOV；开启后辅助 view 各配一个分割头做辅助监督（权重见 loss.aux_supervision_weights）
+  aux_head_mode           : "conv"  # 仅 aux_seg_supervision=true；aux-seg 头结构；'linear'=单 1×1 | 'conv'=3×3+1×1
 
   # ---- 2.5D 专属 ----
-  stem_fusion_mode        : "multi_stem_proj"         # 仅 2.5D + 多 FOV；视图融合方式；'shared_stem'=全部过同一 stem | 'multi_stem_proj'=逐视图 stem→cat→1×1 | 'hierarchical'=view k 注入 encoder 第 k 级
-  lift_2_5d_to_3d         : false                     # 仅 2.5D；trainer 不折叠 D、模型输出真 3D (B,num_fg,D,H,W)（配 block_type='r2plus1d'）；与 keep_native_view_depth 互斥
+  stem_fusion_mode        : "multi_stem_proj"  # 仅 2.5D + 多 FOV；视图融合方式；'shared_stem'=全部过同一 stem | 'multi_stem_proj'=逐视图 stem→cat→1×1 | 'hierarchical'=view k 注入 encoder 第 k 级
 
   # ---- 显存 ----
-  grad_checkpointing      : false                     # encoder/decoder 各 stage 反向重算激活，约 +20~33% 算力换激活显存大降（数值/收敛与关闭一致）
-  grad_ckpt_encoder_stages: []                        # 仅 grad_checkpointing=true；逐 encoder stage 0/1 掩码；空=全部 stage 检查点；深层低分辨率 stage 可置 0 省重算
+  grad_checkpointing      : false  # encoder/decoder 各 stage 反向重算激活，约 +20~33% 算力换激活显存大降（数值/收敛与关闭一致）
 
-  # ---- ConvNeXt / MedNeXt 专属 ----
-  grn_enabled             : false                     # 仅 backbone='convnext'/'mednext'；开启后块内加 GRN（零初始化，初始近恒等）
+  unet:
+    backbone                : "resnet"  # 编码器 block 风格；'resnet' | 'convnext' | 'mednext'
+    block_type              : "basic"  # 仅 backbone='resnet'；残差块变体；'basic'=标准 | 'preact'=预激活（深网） | 'bottleneck'=瓶颈（ResEnc-XL） | 'r2plus1d'=(1,3,3)+(3,1,1) 分解（需 3D）
 
-  # ---- ConvNeXt 专属（把 backbone = "convnext" 才生效） ----
-  # convnext_layer_scale_init  : 1.0e-6   # 层缩放初值；<=0 禁用
-  # convnext_downsample_lnfirst: true     # 开启后：下采样前先 LN（ConvNeXt 原版）；关=通用 Downsample（消融用）
+    # ---- 归一化 / 激活 / 正则 ----
+    norm_type               : "batch"  # 归一化层类型；'batch' | 'instance' | 'group'
+    norm_groups             : 8  # 仅 norm_type='group'；组数（须整除通道数）
+    activation              : "leakyrelu"  # 激活函数；'relu' | 'leakyrelu' | 'gelu' | 'swish'
+    drop_path_rate          : 0.0  # stochastic depth：训练时按此比例随机丢残差分支；0=禁用
+    decoder_type            : "unet"  # decoder 拓扑；'unet'=对称 | 'unetpp'=嵌套稠密 | 'unet3p'=全尺度 skip
+    unet3p_cat_channels     : 64  # 仅 decoder_type='unet3p'；各聚合分支通道数
+    downsample_mode         : "conv"  # 下采样方式；'conv' | 'maxpool' | 'avgpool' | 'blurpool' | 'pixelunshuffle'
+    downsample_strides      : []  # 显式逐级下采样 stride，非空覆盖自动推导；长度=级数-1，每项长=spatial_dims，值∈{1,2}
+    anisotropic_pooling     : false  # 按 patch_size 自动推导逐级 per-axis stride，薄轴少降采；2.5D 下仅作用于 H/W（通常无实质变化）
+    upsample_mode           : "trilinear"  # 上采样方式；'transpose' | 'trilinear' | 'nearest' | 'pixelshuffle' | 'carafe' | 'dysample'
+    upsample_norm_act       : true  # 仅 upsample_mode∈{trilinear,nearest}；插值+conv 之后再接 norm+act，使插值支路成为非线性变换
+    skip_mode               : "cat"  # skip 融合方式；'cat'=拼接 | 'add'=相加
 
-  # ---- MedNeXt 专属（把 backbone = "mednext" 才生效） ----
-  # mednext_expand_ratio                : 4      # 倒瓶颈扩张比 R（MedNeXt 用 2/3/4/8）
-  # mednext_kernel_size                 : 3      # 深度卷积核大小（3 或 5）
-  # mednext_dilated_reparam             : false  # 开启后：训练大核+多空洞分支并行，推理折叠为单核（零额外推理开销）
-  # mednext_dilated_reparam_kernel_sizes: []     # 显式分支核大小覆盖；空=默认分支集
-  # mednext_dilated_reparam_dilations   : []     # 显式分支 dilation 覆盖；空=默认分支集
+    # ---- 注意力（块内 / skip 门控） ----
+    attention_type          : "none"  # 块内注意力；'none'=无 | 'se'=通道重标定 | 'eca' | 'cbam' | 'coord' | 'lka'=大核注意力（感受野≈21³） | 'msca'=多尺度条形核（适合细长结构）
+    se_reduction            : 16  # 仅 attention_type='se'；SE 通道压缩比
+    skip_attention          : false  # skip 连接上加 AttentionGate3D（用深层特征门控 skip 特征）
+    attn_gate_norm          : "batch"  # 仅 skip_attention=true；门控内归一化；'auto'=跟随 norm_type | 'batch' | 'instance' | 'group'
+    aux_topo_head           : false  # 仅 arch='unet'；开启后加中心线/距离场辅助头（拓扑监督，仅训练期前向，零推理开销）
+    aux_topo_target         : "centerline"  # 仅 aux_topo_head=true；辅助目标；'centerline'=软骨架（保拓扑） | 'distance'=到边界距离场
+    aux_topo_head_mode      : "conv"  # 仅 aux_topo_head=true；头结构；'linear'=单 1×1 | 'conv'=3×3+1×1（细结构推荐）
+    lift_2_5d_to_3d         : false  # 仅 2.5D；trainer 不折叠 D、模型输出真 3D (B,num_fg,D,H,W)（配 block_type='r2plus1d'）；与 keep_native_view_depth 互斥
+    grad_ckpt_encoder_stages: []  # 仅 grad_checkpointing=true；逐 encoder stage 0/1 掩码；空=全部 stage 检查点；深层低分辨率 stage 可置 0 省重算
 
-  # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone='resnet'） ----
-  multirf_enabled        : true              # 选定 stage 的残差块换成「多膨胀率并行分支→融合」块，同分辨率获多感受野（类 ASPP）
-  multirf_dilations      : [1, 2, 3]         # 各分支膨胀率；必须含 1（守门支路，抗网格效应/保细管）
-  multirf_mode           : "split"           # 分支通道分配；'split'=各分支均分通道（≈等成本） | 'parallel'=各分支全宽（≈N× 成本）
-  multirf_fusion         : "concat_proj"     # 分支融合；'concat_proj'=concat→1×1 | 'sum'=逐元素相加（需 parallel） | 'se'=concat→SE→1×1
-  multirf_axes           : "hw"              # 膨胀作用轴；'hw'=仅 H/W（2.5D 下恒等价此项） | 'all'=D/H/W 全膨胀
-  multirf_encoder_stages : [0, 0, 1, 1, 1]   # 编码器逐 stage 0/1 开关；长度须 = len(encoder_channels)；空=该侧全关
-  multirf_decoder_stages : [0, 0, 0, 0]      # 解码器逐 level 0/1 开关；长度须 = len(encoder_channels)-1；空=全关；仅 decoder_type='unet'
-  multirf_branch_norm_act: true              # 各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除
+    # ---- ConvNeXt / MedNeXt 专属 ----
+    grn_enabled             : false  # 仅 backbone='convnext'/'mednext'；开启后块内加 GRN（零初始化，初始近恒等）
+    multirf:
 
-  # ---- 自注意力（仅 backbone='resnet' 且 arch='unet'）：选定 stage 末尾追加自注意力残差块，全局 token 交互 ----
-  selfattn_enabled       : true       # 按下方 stages 列表在指定层追加自注意力块
-  selfattn_type          : "softmax"   # 全局默认注意力类型（逐层写 1 时沿用）；'softmax'=标准 O(N²)（放最深层） | 'linear'=O(N)（次深层） | 'window'=窗口内局部 | 'grid'=跨窗格稀疏
-  selfattn_num_heads     : 4           # 头数；仅 selfattn_head_dim=-1 时使用
-  selfattn_head_dim      : -1          # 每头维度；-1=自动（用 num_heads）；否则 heads = channels // head_dim
-  selfattn_zero_init     : true        # 输出投影零初始化，初始为恒等残差、几乎不扰动已调好的基线（强烈建议开）
-  selfattn_rope          : false       # softmax 注意力加 RoPE 旋转位置编码
-  selfattn_ffn           : false       # 注意力后再接一层 GEGLU FFN 残差
-  selfattn_ffn_ratio     : 4.0         # 仅 selfattn_ffn=true；FFN 扩张比
-  selfattn_window_size   : 7           # 仅 type='window'；窗口边长
-  selfattn_grid_size     : 7           # 仅 type='grid'；网格数
-  selfattn_encoder_stages: [0, 0, linear, linear, softmax]          # 编码器逐 stage 开关；0/'none'=关 | 1=用全局 type | 'softmax'/'linear'/'window'/'grid'=逐层指定；非空长度须 = len(encoder_channels)
-  selfattn_decoder_stages: [softmax, linear, 0, 0]          # 解码器逐 level 开关（取值同上）；非空长度须 = len(encoder_channels)-1；仅 decoder_type='unet'
+      # ---- ConvNeXt 专属（把 backbone = "convnext" 才生效） ----
+      # convnext_layer_scale_init  : 1.0e-6   # 层缩放初值；<=0 禁用
+      # convnext_downsample_lnfirst: true     # 开启后：下采样前先 LN（ConvNeXt 原版）；关=通用 Downsample（消融用）
+
+      # ---- MedNeXt 专属（把 backbone = "mednext" 才生效） ----
+      # mednext_expand_ratio                : 4      # 倒瓶颈扩张比 R（MedNeXt 用 2/3/4/8）
+      # mednext_kernel_size                 : 3      # 深度卷积核大小（3 或 5）
+      # mednext_dilated_reparam             : false  # 开启后：训练大核+多空洞分支并行，推理折叠为单核（零额外推理开销）
+      # mednext_dilated_reparam_kernel_sizes: []     # 显式分支核大小覆盖；空=默认分支集
+      # mednext_dilated_reparam_dilations   : []     # 显式分支 dilation 覆盖；空=默认分支集
+
+      # ---- 多感受野（空洞卷积多分支融合）MultiRF（仅 backbone='resnet'） ----
+      enabled        : true  # 选定 stage 的残差块换成「多膨胀率并行分支→融合」块，同分辨率获多感受野（类 ASPP）
+      dilations      : [1, 2, 3]  # 各分支膨胀率；必须含 1（守门支路，抗网格效应/保细管）
+      mode           : "split"  # 分支通道分配；'split'=各分支均分通道（≈等成本） | 'parallel'=各分支全宽（≈N× 成本）
+      fusion         : "concat_proj"  # 分支融合；'concat_proj'=concat→1×1 | 'sum'=逐元素相加（需 parallel） | 'se'=concat→SE→1×1
+      axes           : "hw"  # 膨胀作用轴；'hw'=仅 H/W（2.5D 下恒等价此项） | 'all'=D/H/W 全膨胀
+      encoder_stages : [0, 0, 1, 1, 1]  # 编码器逐 stage 0/1 开关；长度须 = len(encoder_channels)；空=该侧全关
+      decoder_stages : [0, 0, 0, 0]  # 解码器逐 level 0/1 开关；长度须 = len(encoder_channels)-1；空=全关；仅 decoder_type='unet'
+      branch_norm_act: true  # 各分支融合前各自接 norm+act（ASPP 风格）；split+group 时分支通道须能被 norm_groups 整除
+    selfattn:
+
+      # ---- 自注意力（仅 backbone='resnet' 且 arch='unet'）：选定 stage 末尾追加自注意力残差块，全局 token 交互 ----
+      enabled       : true  # 按下方 stages 列表在指定层追加自注意力块
+      type          : "softmax"  # 全局默认注意力类型（逐层写 1 时沿用）；'softmax'=标准 O(N²)（放最深层） | 'linear'=O(N)（次深层） | 'window'=窗口内局部 | 'grid'=跨窗格稀疏
+      num_heads     : 4  # 头数；仅 selfattn_head_dim=-1 时使用
+      head_dim      : -1  # 每头维度；-1=自动（用 num_heads）；否则 heads = channels // head_dim
+      zero_init     : true  # 输出投影零初始化，初始为恒等残差、几乎不扰动已调好的基线（强烈建议开）
+      rope          : false  # softmax 注意力加 RoPE 旋转位置编码
+      ffn           : false  # 注意力后再接一层 GEGLU FFN 残差
+      ffn_ratio     : 4.0  # 仅 selfattn_ffn=true；FFN 扩张比
+      window_size   : 7  # 仅 type='window'；窗口边长
+      grid_size     : 7  # 仅 type='grid'；网格数
+      encoder_stages: [0, 0, linear, linear, softmax]  # 编码器逐 stage 开关；0/'none'=关 | 1=用全局 type | 'softmax'/'linear'/'window'/'grid'=逐层指定；非空长度须 = len(encoder_channels)
+      decoder_stages: [softmax, linear, 0, 0]  # 解码器逐 level 开关（取值同上）；非空长度须 = len(encoder_channels)-1；仅 decoder_type='unet'
 
   # 仅 2.5D 且 arch 改为 "adm" / "edm2" 才生效。
   # adm_attention_levels          : []     # 带多头自注意力的级索引（0=顶层）；空=默认最深两级
@@ -211,7 +215,6 @@ model:
   # edm2_attn_balance             : 0.3    # MP 注意力平衡系数
   # edm2_concat_balance           : 0.5    # MP skip-cat 平衡系数
   # edm2_clip_act                 : 256.0  # 输出激活裁剪；<=0 禁用
-
 loss:
   name                    : "dice_focal"              # 损失函数；单项 'dice'|'bce'|'focal'|'tversky'|'gdl'|'focal_tversky'|'lovasz'|'cldice'，或下划线复合如 'dice_bce'/'dice_focal'
   compound_weights        : [1.0, 1.0]                # 仅复合损失；两项权重 [loss1_w, loss2_w]
