@@ -414,9 +414,11 @@ def _iter_flat_model_reads(pkg_root: Path):
             if not (isinstance(node, ast.Attribute) and node.attr in flat):
                 continue
             recv = node.value
+            model_names = {"mc", "mcfg", "model_cfg", "model_config"}
             is_model_recv = (
-                (isinstance(recv, ast.Name) and recv.id == "mc")
-                or (isinstance(recv, ast.Attribute) and recv.attr == "model"))
+                (isinstance(recv, ast.Name) and recv.id in model_names)
+                or (isinstance(recv, ast.Attribute)
+                    and recv.attr in model_names | {"model"}))
             if is_model_recv:
                 yield py, node.lineno, node.attr
 

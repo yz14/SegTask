@@ -132,7 +132,7 @@ def build_aux_topo_loss(
     model_cfg: ModelConfig, loss_cfg: LossConfig) -> AuxTopoLoss:
     """由 config 构建 ``AuxTopoLoss``。"""
     return AuxTopoLoss(
-        target = model_cfg.aux_topo_target,
+        target = model_cfg.unet.aux_topo_target,
         loss   = loss_cfg.aux_topo_loss,
         iter_  = loss_cfg.aux_topo_iter,
     )
