@@ -17,7 +17,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from taskcore.models.blocks import _CONV, ConvNormAct
+from taskcore.models.blocks import get_conv, ConvNormAct
 from taskcore.models.factory import build_backbone
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ class JEPAPredictor(nn.Module):
                 activation=activation, spatial_dims=int(spatial_dims)))
             c_in = int(hidden)
         self.body = nn.Sequential(*layers)
-        self.out = _CONV[int(spatial_dims)](int(hidden), int(channels),
+        self.out = get_conv(int(spatial_dims))(int(hidden), int(channels),
                                             kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

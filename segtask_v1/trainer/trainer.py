@@ -58,6 +58,7 @@ from .pipelines import (
 from .validation import build_val_evaluator
 from taskcore.engine.base_trainer import (  # noqa: F401  (_reseed_rank_rng re-export供旧路径)
     BaseTrainer,
+    reseed_rank_rng,
     _reseed_rank_rng,
 )
 
@@ -782,7 +783,7 @@ class Trainer(BaseTrainer):
         # 公共段（model/EMA/optim/sched/scaler/SWA/best/RNG）见 BaseTrainer。
         self.start_epoch = self._restore_train_state(ckpt)
         if self._is_dist and self._rank > 0:
-            _reseed_rank_rng(
+            reseed_rank_rng(
                 self.cfg.train.seed, self._rank, self.start_epoch,
                 self.cfg.train.deterministic)
 

@@ -31,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from taskcore.models.blocks import (
-    _CONV, INTERP_SMOOTH, ConvNormAct, Upsample)
+    get_conv, INTERP_SMOOTH, ConvNormAct, Upsample)
 from taskcore.models.factory import build_backbone
 
 from ..data.masking import densify, downsample_mask_to
@@ -285,7 +285,7 @@ class SparkLightDecoder(nn.Module):
                 activation=activation))
             prev = out_ch
 
-        self.out_conv = _CONV[self.spatial_dims](prev, int(out_channels),
+        self.out_conv = get_conv(self.spatial_dims)(prev, int(out_channels),
                                                  kernel_size=1)
 
     def forward(
@@ -374,7 +374,7 @@ class SSLSparkSegDecModel(nn.Module):
         for p in self.mask_embed:
             nn.init.normal_(p, std=0.02)
         # 重建头：真解码器最高分辨率输出 → in_channels（下游丢弃）。
-        self.recon_head = _CONV[self.spatial_dims](
+        self.recon_head = get_conv(self.spatial_dims)(
             int(decoder.out_channels[-1]), int(in_channels), kernel_size=1)
 
     def forward(self, x: torch.Tensor, mask_full: torch.Tensor) -> torch.Tensor:

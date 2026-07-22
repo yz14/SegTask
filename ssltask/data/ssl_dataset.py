@@ -7,7 +7,7 @@ segtask ``SegDataset3D``（``patch_mode=2_5d/z_axis``）逐字一致：仅沿 z 
 （越界 edge-pad），面内 H/W **整片 resize** 到 (pH,pW)（不裁窗），返回
 ``{"image": (1, eD, pH, pW)}``。
 
-底层 IO / 预处理 / 抽取（``_open_npz`` / ``preprocess_image`` /
+底层 IO / 预处理 / 抽取（``open_npz`` / ``preprocess_image`` /
 ``extract_z_patch_padded`` / ``resize_3d``）直接复用 ``segtask_v1.data.dataset``，
 不另造轮子。
 """
@@ -29,8 +29,8 @@ from taskcore.engine.dist_utils import (
 
 from taskcore.data.dataset import (
     VolumeCache,
-    _extract_cubic_patch,
-    _open_npz,
+    extract_cubic_patch,
+    open_npz,
     extract_z_patch_padded,
     preprocess_image,
     resize_3d,
@@ -74,7 +74,7 @@ def read_npz_spacing(path: str) -> Optional[Tuple[float, float, float]]:
     体素间距为 ``target_spacing``。无 meta / 字段缺失 / 非法值返 None（调用方
     退化为体素单位）。"""
     try:
-        with _open_npz(path) as f:
+        with open_npz(path) as f:
             if "meta" not in f.files:
                 return None
             meta = f["meta"].item()
@@ -200,7 +200,7 @@ class ImageOnlyPatchDataset(Dataset):
         cached = self._img_cache.get(path)
         if cached is not None:
             return cached
-        with _open_npz(path) as f:
+        with open_npz(path) as f:
             if "image" not in f.files:
                 raise KeyError(
                     f"npz {path!r} has no 'image' key (keys={list(f.files)}).")
@@ -249,13 +249,13 @@ class ImageOnlyPatchDataset(Dataset):
             # cubic：三轴裁窗（越界 edge-pad）；z 轴含过采样余量。
             center = tuple(_rand_center(d, p)
                            for d, p in zip(vol.shape, self.extract_size))
-            patch = _extract_cubic_patch(vol, center, self.extract_size)
+            patch = extract_cubic_patch(vol, center, self.extract_size)
             if self._biased():
                 best_fg = self._fg_fraction(patch)
                 for _ in range(self.sample_max_tries - 1):
                     c = tuple(_rand_center(d, p)
                               for d, p in zip(vol.shape, self.extract_size))
-                    cand = _extract_cubic_patch(vol, c, self.extract_size)
+                    cand = extract_cubic_patch(vol, c, self.extract_size)
                     fg = self._fg_fraction(cand)
                     if fg > best_fg:
                         best_fg, patch = fg, cand
@@ -350,7 +350,7 @@ class LabeledPatchDataset(Dataset):
         lbl = self._lbl_cache.get(path)
         if img is not None and lbl is not None and path in self._cls_cache:
             return img, lbl, self._cls_cache[path]
-        with _open_npz(path) as f:
+        with open_npz(path) as f:
             if "image" not in f.files or "label" not in f.files:
                 raise KeyError(
                     f"probe npz {path!r} must have both 'image' and 'label' "
@@ -382,7 +382,7 @@ class LabeledPatchDataset(Dataset):
             return self._fg_cache[path]
         coords: Optional[np.ndarray] = None
         try:
-            with _open_npz(path) as f:
+            with open_npz(path) as f:
                 if "fg_coords" in f.files:
                     arr = np.asarray(f["fg_coords"])
                     if arr.ndim == 2 and arr.shape[1] == 3 and arr.shape[0] > 0:

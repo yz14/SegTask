@@ -99,13 +99,16 @@ class OptimStepResult:
 # ---------------------------------------------------------------------------
 # RNG helper
 # ---------------------------------------------------------------------------
-def _reseed_rank_rng(seed: int, rank: int, epoch: int, deterministic: bool) -> None:
+def reseed_rank_rng(seed: int, rank: int, epoch: int, deterministic: bool) -> None:
     """按 rank/epoch 重新分流 RNG。rank0 保持原流不动。"""
     if int(rank) <= 0:
         return
     # resume 后 rank>0 重新分流，避免所有 DDP rank 退化成 rank0 的随机流。
     mix = int(seed) + int(epoch) * 100003 + int(rank)
     seed_everything(mix, deterministic)
+
+
+_reseed_rank_rng = reseed_rank_rng  # 旧名别名，兼容存量引用
 
 
 # ---------------------------------------------------------------------------
@@ -1024,4 +1027,4 @@ class BaseTrainer:
             out["update_ratio"] = update_ratio
 
 
-__all__ = ["BaseTrainer", "OptimStepResult", "_reseed_rank_rng"]
+__all__ = ["BaseTrainer", "OptimStepResult", "reseed_rank_rng", "_reseed_rank_rng"]

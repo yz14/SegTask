@@ -55,7 +55,7 @@ from taskcore.data.dataset import (
     VolumeCache,
     _group_fg_coords_by_class,
     _group_fg_slices_by_class,
-    _open_npz,
+    open_npz,
     derive_volume_targets,
     load_npz_image,
     load_npz_label,
@@ -261,7 +261,7 @@ class ClsPatchDataset(NpzPatchDatasetBase):
         key = "fg_coords" if want_coords else "fg_slices"
         n_missing = 0
         for path in self.paths:
-            with _open_npz(path) as f:
+            with open_npz(path) as f:
                 if key not in f.files:
                     self._fg_index.append(None)
                     n_missing += 1
@@ -318,7 +318,7 @@ class ClsPatchDataset(NpzPatchDatasetBase):
         lbl = self._lbl_cache.get(path)
         if lbl is not None:
             return img, lbl
-        with _open_npz(path) as f:
+        with open_npz(path) as f:
             keys = list(f.files)
         if "label" not in keys:
             raise KeyError(

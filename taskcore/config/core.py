@@ -1293,7 +1293,7 @@ class Config:
         """同步跨子配置的对应字段。
 
         所有"模型几何派生量"（``in_channels`` / ``spatial_dims``）由
-        ``segtask_v1.models.topology.build_topology(self)`` 一次性算出，写入
+        ``taskcore.models.topology.build_topology(self)`` 一次性算出，写入
         ``ModelConfig`` 的私有 backing 字段（对外是只读 property）。本方法仅保留
         "非派生"职责（``num_classes`` 推断、``z_boundary_mode`` 自动升级、resenc
         preset、save_best 预设）。
@@ -2462,7 +2462,7 @@ _REMOVED_KEYS: Dict[type, Dict[str, str]] = {
 }
 
 
-def _nested_dataclass_type(f) -> "Optional[type]":
+def nested_dataclass_type(f) -> "Optional[type]":
     """字段声明为嵌套 dataclass 时返回其类型，否则 None。
 
     项目约定嵌套段一律写作 ``field(default_factory=SubConfig)``，因此从
@@ -2474,6 +2474,9 @@ def _nested_dataclass_type(f) -> "Optional[type]":
             and is_dataclass(factory):
         return factory
     return None
+
+
+_nested_dataclass_type = nested_dataclass_type  # 旧名别名，兼容存量引用
 
 
 def _dataclass_from_dict(cls, d: Dict[str, Any]):

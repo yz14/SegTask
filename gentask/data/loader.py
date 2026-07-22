@@ -12,7 +12,7 @@ import numpy as np
 
 from ..config import Config
 from .dataset import load_nifti, load_npz_label_for_split
-from taskcore.data.dataset import _open_npz, load_npz_label_counts
+from taskcore.data.dataset import open_npz, load_npz_label_counts
 from .specs import DatasetCommonCfg, SplitPaths, build_data_spec
 # 公共纯函数工具从 taskcore.data.loader 复用（与迁移前逐字符一致）。
 from taskcore.data.loader import (  # noqa: F401  (re-export，保持旧 import 路径可用)
@@ -175,6 +175,6 @@ def build_dataloaders(
         n_train_vols=len(train_idx),
         num_workers=resolve_dataloader_workers(cfg, world_size),
         world_size=world_size,
-        open_npz=_open_npz)
+        open_npz=open_npz)
 
     return train_loader, val_loader

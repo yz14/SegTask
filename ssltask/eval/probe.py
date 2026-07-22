@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from taskcore.models.blocks import _CONV, INTERP_SMOOTH
+from taskcore.models.blocks import get_conv, INTERP_SMOOTH
 from taskcore.models.factory import build_backbone
 from taskcore.engine.checkpoint import strip_common_prefixes
 from taskcore.utils.common import compute_dice_per_class
@@ -94,7 +94,7 @@ class _MultiScaleLinearHead(nn.Module):
         self.spatial_dims = int(spatial_dims)
         self.mode = INTERP_SMOOTH[self.spatial_dims]
         self.heads = nn.ModuleList(
-            [_CONV[self.spatial_dims](int(c), int(out_channels), kernel_size=1)
+            [get_conv(self.spatial_dims)(int(c), int(out_channels), kernel_size=1)
              for c in enc_channels])
 
     def forward(self, feats: List[torch.Tensor], target_spatial) -> torch.Tensor:
@@ -121,7 +121,7 @@ class _UNetProbeHead(nn.Module):
         super().__init__()
         self.spatial_dims = int(spatial_dims)
         self.mode = INTERP_SMOOTH[self.spatial_dims]
-        conv = _CONV[self.spatial_dims]
+        conv = get_conv(self.spatial_dims)
         w = int(width)
         self.lateral = nn.ModuleList(
             [conv(int(c), w, kernel_size=1) for c in enc_channels])

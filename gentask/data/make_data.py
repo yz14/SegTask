@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from ..config import Config, load_config
-from taskcore.data.make_data import _check_physical_geometry
+from taskcore.data.make_data import check_physical_geometry
 
 from .dataset import (
     BBox,
@@ -110,7 +110,7 @@ def prepare_one(
 
     # 0. 物理几何校验：label/bbox/rw/cond 必须与 image 共 spacing/origin/direction
     #    （shape 相等不蕴含共坐标系；只读头，成本可忽略）。
-    _check_physical_geometry(
+    check_physical_geometry(
         pid, image_path,
         [("label", label_path), ("bbox", bbox_path), ("rw", rw_path)]
         + [(f"cond{i}", c) for i, c in enumerate(cond_paths or [])])

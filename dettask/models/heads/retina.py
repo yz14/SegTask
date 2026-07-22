@@ -12,7 +12,7 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from taskcore.models.blocks import _CONV
+from taskcore.models.blocks import get_conv
 
 from ...config import DetConfig
 from ...losses.det_loss import box_reg_loss, sigmoid_focal_loss
@@ -40,7 +40,7 @@ class RetinaHead(nn.Module):
         self.dim = int(spatial_dims)
         self.K = int(num_classes)
         self.det = det
-        conv = _CONV[self.dim]
+        conv = get_conv(self.dim)
         ratios = list(det.anchor_ratios)
         scales = list(det.anchor_scales)
         z_scales = list(det.anchor_z_scales) if self.dim == 3 else [1.0]

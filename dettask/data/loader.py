@@ -8,7 +8,7 @@ from typing import List, Tuple
 import numpy as np
 
 from taskcore.config.core import Config as SegConfig
-from taskcore.data.dataset import _open_npz, derive_volume_targets
+from taskcore.data.dataset import open_npz, derive_volume_targets
 from taskcore.data.loader import (
     assemble_train_val_loaders,
     discover_npz_recursive as discover_npz,
@@ -31,7 +31,7 @@ def _det_split_keys(paths: List[str], fg_values: List[float]) -> List[str]:
     keys: List[str] = [""] * len(paths)
     mask_pos: List[int] = []
     for i, p in enumerate(paths):
-        with _open_npz(p) as f:
+        with open_npz(p) as f:
             if "boxes" in f.files:
                 cls = np.asarray(f["boxes"], np.float32).reshape(-1, 7)[:, 6]
                 present = sorted(set(int(c) for c in cls))

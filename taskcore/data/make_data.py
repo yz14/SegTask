@@ -114,7 +114,7 @@ _GEOM_ORIGIN_ATOL    = 1e-2
 _GEOM_DIRECTION_ATOL = 1e-3
 
 
-def _check_physical_geometry(
+def check_physical_geometry(
     pid: str,
     image_path: str,
     others: List[Tuple[str, Optional[str]]]) -> None:
@@ -137,6 +137,9 @@ def _check_physical_geometry(
                     f"geometrically wrong; resample/co-register {role} onto "
                     f"the image grid first (paths: image={image_path}, "
                     f"{role}={path}).")
+
+
+_check_physical_geometry = check_physical_geometry  # 旧名别名，兼容存量引用
 
 
 def _bbox_from_mask_path(bbox_path: Optional[str]) -> Optional[BBox]:

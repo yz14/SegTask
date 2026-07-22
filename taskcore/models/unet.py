@@ -18,11 +18,12 @@ from .stem import HierarchicalStems, build_context_stem, build_stem
 logger = logging.getLogger(__name__)
 
 
-def _resize_logits(x: torch.Tensor, size, spatial_dims: int) -> torch.Tensor:
+def resize_logits(x: torch.Tensor, size, spatial_dims: int) -> torch.Tensor:
     """把 logits 插值到目标空间尺寸（bilinear/trilinear）。半精度先转 fp32 再插值，
     兼顾后端支持与确定性（与 blocks.Upsample 的插值路径一致）。"""
     if x.shape[2:] == size:
         return x
+
     orig_dtype = x.dtype
     if orig_dtype in (torch.bfloat16, torch.float16):
         x = x.float()
@@ -31,6 +32,9 @@ def _resize_logits(x: torch.Tensor, size, spatial_dims: int) -> torch.Tensor:
     if x.dtype != orig_dtype:
         x = x.to(orig_dtype)
     return x
+
+
+_resize_logits = resize_logits  # 旧名别名，兼容存量引用
 
 
 class Encoder(nn.Module):

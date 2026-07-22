@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from taskcore.models.blocks import _CONV
+from taskcore.models.blocks import get_conv
 
 from ...config import DetConfig
 from ...losses.det_loss import box_reg_loss, sigmoid_focal_loss
@@ -38,7 +38,7 @@ class FCOSHead(nn.Module):
         self.dim = int(spatial_dims)
         self.K = int(num_classes)
         self.det = det
-        conv = _CONV[self.dim]
+        conv = get_conv(self.dim)
         self.cls_tower = _tower(conv, in_channels)
         self.reg_tower = _tower(conv, in_channels)
         self.cls_logits = conv(in_channels, self.K, kernel_size=3, padding=1)

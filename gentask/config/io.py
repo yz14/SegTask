@@ -9,7 +9,7 @@ from typing import Any, Dict, Union
 
 import yaml
 
-from taskcore.config.core import MonitorConfig, _nested_dataclass_type
+from taskcore.config.core import MonitorConfig, nested_dataclass_type
 from taskcore.config.model_migration import (
     SISR_FIELD_MAP,
     route_legacy_model_dict,
@@ -110,7 +110,7 @@ def _dataclass_from_dict(cls, d: Dict[str, Any]):
         if k not in dc_fields:
             raise ConfigError(
                 f"Unknown config key '{k}' in {cls.__name__}.")
-        sub_cls = _nested_dataclass_type(dc_fields[k])
+        sub_cls = nested_dataclass_type(dc_fields[k])
         if sub_cls is None and k in _SUB_CONFIGS:
             sub_cls = _SUB_CONFIGS[k]
         if sub_cls is not None and isinstance(v, dict):

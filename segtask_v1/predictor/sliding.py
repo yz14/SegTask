@@ -413,7 +413,7 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     continue
 
                 # 填短尾窗口到 (pD,pH,pW)：居中 edge-pad（默认复制边界，归一化后
-                # 0 不是空气），与训练侧 _extract_cubic_patch / keep_native
+                # 0 不是空气），与训练侧 extract_cubic_patch / keep_native
                 # builder 的居中几何一致。
                 pb_d = pb_h = pb_w = 0
                 if ad < pD or ah < pH or aw < pW:

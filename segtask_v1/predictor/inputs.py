@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from taskcore.data.dataset import _extract_cubic_patch, extract_z_patch_padded, resize_3d
+from taskcore.data.dataset import extract_cubic_patch, extract_z_patch_padded, resize_3d
 
 logger = logging.getLogger(__name__)
 
@@ -282,7 +282,7 @@ def build_cubic_batch_cpu_multi_res(
             sD = int(round(pD * scale))
             sH = int(round(pH * scale))
             sW = int(round(pW * scale))
-            patch_s = _extract_cubic_patch(vol, center, (sD, sH, sW))
+            patch_s = extract_cubic_patch(vol, center, (sD, sH, sW))
             patch_s = resize_3d(patch_s, pD, pH, pW, is_label=False)
             channels.append(patch_s)
         batch_list.append(np.stack(channels, axis=0))

@@ -19,9 +19,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from taskcore.models.blocks import _CONV, INTERP_SMOOTH, ConvNormAct
+from taskcore.models.blocks import get_conv, INTERP_SMOOTH, ConvNormAct
 from taskcore.models.factory import build_backbone
-from taskcore.models.unet import SegmentationHead, _resize_logits
+from taskcore.models.unet import SegmentationHead, resize_logits
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ class SSLReconModel(nn.Module):
         dec_features = self.decoder(enc_features)
         out = self.recon_head(dec_features[-1])
         if self.stem_stride > 1:
-            out = _resize_logits(out, x.shape[2:], self.spatial_dims)
+            out = resize_logits(out, x.shape[2:], self.spatial_dims)
         if out.shape[2:] != x.shape[2:]:
             raise RuntimeError(
                 f"SSL recon output size mismatch: got {tuple(out.shape[2:])}, "
@@ -119,12 +119,12 @@ class LightPixelHead(nn.Module):
         super().__init__()
         self.spatial_dims = int(spatial_dims)
         self.mode = INTERP_SMOOTH[self.spatial_dims]
-        self.proj = _CONV[self.spatial_dims](in_ch, hidden, kernel_size=1)
+        self.proj = get_conv(self.spatial_dims)(in_ch, hidden, kernel_size=1)
         self.refine = ConvNormAct(
             hidden, hidden, kernel_size=3, stride=1, padding=1,
             norm_type=norm_type, norm_groups=norm_groups,
             activation=activation, spatial_dims=self.spatial_dims)
-        self.out = _CONV[self.spatial_dims](hidden, out_ch, kernel_size=1)
+        self.out = get_conv(self.spatial_dims)(hidden, out_ch, kernel_size=1)
 
     def forward(self, feat: torch.Tensor, target_spatial) -> torch.Tensor:
         x = self.proj(feat)

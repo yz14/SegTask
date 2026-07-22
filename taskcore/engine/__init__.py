@@ -16,4 +16,5 @@ from . import (  # noqa: F401
     optim, prefetch, views,
 )
 from .base_predictor import BasePredictor  # noqa: F401
-from .base_trainer import BaseTrainer, OptimStepResult, _reseed_rank_rng  # noqa: F401
+from .base_trainer import (  # noqa: F401
+    BaseTrainer, OptimStepResult, reseed_rank_rng, _reseed_rank_rng)

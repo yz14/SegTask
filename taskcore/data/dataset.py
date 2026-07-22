@@ -21,8 +21,7 @@ import torch
 from scipy.ndimage import zoom
 from torch.utils.data import Dataset
 
-from .patch_ops import extract_cubic_patch as _extract_cubic_patch
-from .patch_ops import safe_center_range
+from .patch_ops import extract_cubic_patch, safe_center_range
 from .sampling import (
     VAL_SAMPLING_SEED as _VAL_SAMPLING_SEED,
     WorkerNumpyRng,
@@ -34,6 +33,8 @@ from .sampling import (
 )
 
 logger = logging.getLogger(__name__)
+
+_extract_cubic_patch = extract_cubic_patch  # 旧名别名，兼容存量引用
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +244,12 @@ def load_nifti_cropped(
 # numpy 对 .npz 忽略 mmap_mode，逐 worker 为 owned ndarray；OS page cache 跨 worker 共享。
 
 
-def _open_npz(path: str) -> "np.lib.npyio.NpzFile":
+def open_npz(path: str) -> "np.lib.npyio.NpzFile":
     """打开 npz（仅解析 zip 目录）。allow_pickle=True 供 meta dict 反序列。"""
     return np.load(path, allow_pickle=True)
+
+
+_open_npz = open_npz  # 旧名别名，兼容存量引用
 
 
 def _open_npy_member_mmap(path: str, name: str) -> Optional[np.memmap]:

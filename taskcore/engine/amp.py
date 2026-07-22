@@ -34,7 +34,8 @@ _AMP_DTYPES = {
 # sigmoid(50) ≈ 1.0，不影响正常训练（|x|≪20）行为。
 # 备忘：bf16/fp32 不会溢出 ±inf，无条件 clamp 属保守设计——正常训练不触发，
 # 越界 logit 梯度置 0 无害，故不按 amp_dtype 分支。
-_LOGIT_CLAMP: float = 50.0
+LOGIT_CLAMP: float = 50.0
+_LOGIT_CLAMP = LOGIT_CLAMP  # 旧名别名，兼容存量引用
 
 
 def GradScaler(device: str = "cuda", **kwargs):  # noqa: N802
@@ -98,6 +99,7 @@ def compute_loss_fp32(
 
 __all__ = [
     "_AMP_DTYPES",
+    "LOGIT_CLAMP",
     "_LOGIT_CLAMP",
     "GradScaler",
     "autocast",

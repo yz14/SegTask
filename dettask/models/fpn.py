@@ -12,7 +12,7 @@ from typing import List, Sequence
 import torch
 import torch.nn as nn
 
-from taskcore.models.blocks import _CONV
+from taskcore.models.blocks import get_conv
 
 __all__ = ["FPNAdapter"]
 
@@ -26,7 +26,7 @@ class FPNAdapter(nn.Module):
     def __init__(self, decoder_channels: Sequence[int], fpn_channels: int,
                  levels: Sequence[int], spatial_dims: int):
         super().__init__()
-        conv = _CONV[spatial_dims]
+        conv = get_conv(spatial_dims)
         self.levels = list(levels)
         self.laterals = nn.ModuleList(
             conv(decoder_channels[i], fpn_channels, kernel_size=1)

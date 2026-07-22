@@ -17,7 +17,7 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-from taskcore.models.blocks import _CONV
+from taskcore.models.blocks import get_conv
 from taskcore.models.factory import build_backbone
 
 
@@ -45,7 +45,7 @@ class DenseProjector(nn.Module):
     def __init__(self, in_ch: int, hidden_ch: int, out_ch: int,
                  spatial_dims: int = 3):
         super().__init__()
-        conv = _CONV[int(spatial_dims)]
+        conv = get_conv(int(spatial_dims))
         self.net = nn.Sequential(
             conv(int(in_ch), int(hidden_ch), kernel_size=1),
             nn.ReLU(inplace=True),

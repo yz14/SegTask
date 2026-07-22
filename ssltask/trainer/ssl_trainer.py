@@ -36,7 +36,7 @@ from taskcore.engine.optim import (
 from taskcore.engine.prefetch import CudaPrefetcher
 from taskcore.engine.views import fold_depth_to_channels
 from taskcore.utils.common import AverageMeter, Timer
-from taskcore.engine.base_trainer import BaseTrainer, _reseed_rank_rng
+from taskcore.engine.base_trainer import BaseTrainer, reseed_rank_rng
 
 from ..methods.base import SSLMethod
 
@@ -436,7 +436,7 @@ class SSLTrainer(BaseTrainer):
                 logger.warning("Failed to restore RNG state: %s", e)
         # ckpt 的 RNG 快照来自 rank0；rank>0 重新分流，避免各 rank 退化同流。
         if self._is_dist and self._rank > 0:
-            _reseed_rank_rng(
+            reseed_rank_rng(
                 self.cfg.train.seed, self._rank, self.start_epoch,
                 self.cfg.train.deterministic)
         logger.info(

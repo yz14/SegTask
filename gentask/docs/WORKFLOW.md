@@ -92,7 +92,7 @@ x_cat = cat([噪声图(预条件缩放), LR 条件图], dim=1)，c_noise 标量�
 | 技巧 | 说明 |
 |---|---|
 | 混合精度 AMP | `use_amp` / `amp_dtype` + GradScaler；损失 fp32 |
-| EMA | `use_ema`；验证与 best 保存均用 EMA shadow |
+| EMA | `use_ema`；验证与 best 保存均用 EMA shadow（best 的 `model_state_dict` 存 EMA、在线权重另存 `model_online_state_dict`，槽位同 seg/cls/det） |
 | 非有限守护 | loss 非有限不 backward、整个 accum 组丢弃；unscale 后梯度范数非有限跳过 optimizer step；仅有效步更新 EMA |
 | fused AdamW / wd 分组 | `adamw_fused`（默认 true，仅 CUDA 生效）；norm/bias 参数免 weight decay（口径同 seg） |
 | 梯度累积 / 裁剪 | `grad_accum_steps` / `grad_clip_norm` |

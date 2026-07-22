@@ -518,16 +518,33 @@ class GenerationTrainer(BaseTrainer):
                 "vol_psnr_lr": base_m.avg}
 
     def _save_best(self, epoch: int) -> None:
+        """best checkpoint（EMA 为主，槽位与 seg/cls/det 对齐）：启用 EMA 时
+        ``model_state_dict`` 存 EMA 权重（与选模/部署一致），在线权重另存
+        ``model_online_state_dict``。"""
         if not self._is_main:   # DDP：落盘仅 rank0
             return
         bare = unwrap_compile(self.model)
+        if self.ema is not None:
+            online_sd = {k: v.detach().cpu().clone()
+                         for k, v in bare.state_dict().items()}
+            self.ema.apply_shadow(bare)
+            try:
+                primary_sd = {k: v.detach().cpu().clone()
+                              for k, v in bare.state_dict().items()}
+            finally:
+                self.ema.restore(bare)
+        else:
+            online_sd = None
+            primary_sd = bare.state_dict()
         state = {
             "epoch": epoch,
-            "model_state_dict": bare.state_dict(),
+            "model_state_dict": primary_sd,
             "best_metric": self.best_metric,
             "best_epoch": self.best_epoch,
             "config": self.cfg,
         }
+        if online_sd is not None:
+            state["model_online_state_dict"] = online_sd
         if self.ema is not None:
             state["ema_state_dict"] = self.ema.state_dict()
         path = self.output_dir / "best_model.pth"

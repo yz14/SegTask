@@ -41,7 +41,7 @@ from scipy import ndimage
 from torch.utils.data import Dataset
 
 from taskcore.data.dataset import (
-    _open_npz,
+    open_npz,
     extract_z_patch_padded,
     load_npz_image,
     load_npz_label,
@@ -99,7 +99,7 @@ def load_boxes(npz_path: str, fg_values: Sequence[float],
 
     'boxes' 键（小数组）优先；否则由 label mask 连通域派生（label 走
     seg 的 memmap 零拷贝快路径，压缩 npz 自动回退）。不读 image。"""
-    with _open_npz(npz_path) as f:
+    with open_npz(npz_path) as f:
         keys = list(f.files)
         if "boxes" in keys:
             raw = np.asarray(f["boxes"], np.float32).reshape(-1, 7)
@@ -116,7 +116,7 @@ def load_volume_boxes(npz_path: str, fg_values: Sequence[float],
                       allow_mask: bool, min_voxels: int
                       ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """读 npz → (原始 image, boxes3d (N,6), labels (N,))。"""
-    with _open_npz(npz_path) as f:
+    with open_npz(npz_path) as f:
         if "image" not in f.files:
             raise KeyError(f"npz {npz_path!r} has no 'image' key "
                            f"(keys={list(f.files)}).")

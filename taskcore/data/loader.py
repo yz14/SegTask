@@ -818,14 +818,14 @@ def log_volume_cache_estimate(
     """内存缓存足迹估计（仅诊断；失败不影响训练）。
 
     ``train_ds`` 需暴露 ``_npz_paths``；``open_npz`` 缺省用 taskcore 的
-    ``_open_npz``（gen fork 可传入自身实现）。
+    ``open_npz``（gen fork 可传入自身实现）。
     """
     dc = cfg.data
     if str(dc.cache_mode) != "memory":
         return
     try:
         if open_npz is None:
-            from .dataset import _open_npz as open_npz
+            from .dataset import open_npz
         npz_paths_train = train_ds._npz_paths
         _f = open_npz(npz_paths_train[0])
         sample_voxels = int(np.prod(_f["image"].shape))

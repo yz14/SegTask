@@ -35,7 +35,7 @@ import torch.nn as nn
 
 from taskcore.config.core import Config as SegConfig
 from taskcore.data.augment import GPUAugmentor
-from taskcore.engine.amp import _LOGIT_CLAMP, autocast
+from taskcore.engine.amp import LOGIT_CLAMP, autocast
 from taskcore.engine.checkpoint import AsyncCheckpointSaver
 from taskcore.engine.dist_utils import all_gather_objects
 from taskcore.engine.prefetch import CudaPrefetcher
@@ -172,7 +172,7 @@ class ClsTrainer(BaseTrainer):
     def _loss_fp32(self, logits: torch.Tensor,
                    target: torch.Tensor) -> torch.Tensor:
         """autocast 外 fp32 损失（logit clamp 防 fp16 溢出）。"""
-        logits = logits.float().clamp(-_LOGIT_CLAMP, _LOGIT_CLAMP)
+        logits = logits.float().clamp(-LOGIT_CLAMP, LOGIT_CLAMP)
         with torch.autocast(device_type=self.device.type, enabled=False):
             return self.loss_fn(logits, target)
 
