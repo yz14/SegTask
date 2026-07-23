@@ -1,14 +1,14 @@
 """ssltask 配置系统。
 
-设计：**复用 ``segtask_v1.config.Config``** 作为 data/model/train/... 的载体（即与下游
+设计：**复用 ``taskcore.config.core.Config``** 作为 data/model/train/... 的载体（即与下游
 分割/分类共用同一份骨干配置真相源，满足 ``SSL.md`` §0.1“所有方案严格同一骨干”），
 仅新增 SSL 专有的 :class:`SSLConfig`。``load_config`` 返回 ``(cfg, ssl)`` 二元组：
 
-* ``cfg``  —— ``segtask_v1.config.Config``，喂给 ``build_model`` / 数据管线 / 优化器；
+* ``cfg``  —— ``taskcore.config.core.Config``，喂给 ``build_backbone`` / 数据管线 / 优化器；
 * ``ssl``  —— 本模块 :class:`SSLConfig`，承载方法选择与各方法超参。
 
 这样既不重复 ``Config.sync/validate`` 的复杂派生/校验逻辑，也让 ssltask 与下游天然
-共享骨干几何。YAML 中 ``ssl:`` 段被本模块单独解析，其余段交给 segtask 构造。
+共享骨干几何。YAML 中 ``ssl:`` 段被本模块单独解析，其余段交给 taskcore 构造。
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ class SSLConfig:
     """自监督预训练专有配置。
 
     骨干 / 优化器 / 调度器 / AMP / EMA / 输出目录 / epochs / lr / 数据预处理全部读
-    ``segtask_v1.config.Config``（``cfg.model`` / ``cfg.train`` / ``cfg.data``）；此处只放
+    ``taskcore.config.core.Config``（``cfg.model`` / ``cfg.train`` / ``cfg.data``）；此处只放
     SSL 目标本身相关的项。
     """
 
@@ -281,7 +281,7 @@ class SSLConfig:
     probe_head: str = "linear"
     probe_head_width: int = 16          # "unet" 头的统一通道宽度
 
-    # --- 在线分类探针（SSL.md §0.4；encoder + GAP + MLP 头；frozen/finetune）---
+    # --- 离线分类探针（evaluate 路径；encoder + GAP + MLP；frozen/finetune）---
     cls_probe_iters: int = 100
     cls_probe_lr: float = 1.0e-2
     cls_probe_hidden_dim: int = 128

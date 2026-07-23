@@ -10,10 +10,10 @@
 ## 0. 共享主干
 
 ```
-配置加载（segtask Config + ClsConfig）→ npz 发现 → train/val 划分
+配置加载（taskcore Config + ClsConfig）→ npz 发现 → train/val 划分
  → Dataset 抽 patch + 标签派生 → GPU 增强（augment.enabled，可选）
  → mixup/cutmix（可选）
- → encoder（4 模板）+ 池化 + cls_head → BCE/CE/Focal（fp32）
+ → encoder（`cls.backbone`：encoder / densenet / vit）+ 池化 + cls_head → BCE/CE/Focal（fp32）
  → backward（非有限 loss/梯度跳组）→ optimizer/scheduler → EMA
  → 验证（patch 级 AUC/F1/acc + 卷级 MIL vol_auc/vol_f1/vol_acc 选模）
  → 推理：整卷铺格 → patch 前向 → MIL 聚合 → 卷级/逐 slice 概率
@@ -52,7 +52,7 @@ npz 读取（image；mask 标签源 / 前景过采样时再读 label；
    （越界 edge pad）+ 面内 resize 到 patch H/W；cubic 安全中心域三轴裁剪）
  → 标签派生（mask any() / table 继承卷标签）→ 2.5D 折叠（D→通道）
 （augment.enabled=true 时：训练集输出未折叠 (1,D,H,W) image[+label]，
-  由 trainer 在 GPU 上用 segtask GPUAugmentor 联合增强后派生 target 再折叠）
+  由 trainer 在 GPU 上用 taskcore GPUAugmentor 联合增强后派生 target 再折叠）
 
 【Trainer，GPU】
 mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际裁剪体积回算）
@@ -69,14 +69,14 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 
 | backbone | 说明 |
 |---|---|
-| `encoder`（resnet/convnext） | 复用 `segtask_v1.models.factory.build_model(cfg).encoder`，与 SSL 同一构建路径 → `pretrained_ckpt` strict=False 直接命中 `encoder.*` |
+| `encoder`（resnet/convnext） | `taskcore.models.factory.build_backbone(cfg)`，与 SSL 同一构建路径 → `cls.pretrained_ckpt` strict=False 直接命中 `encoder.*` |
 | `densenet` | DenseNet-BC（2D/3D），逐 stage 特征，instance norm + leakyrelu |
 | `vit` | 标准 ViT（patch-embed → Pre-LN block ×N），单尺度特征图，mean-token 池化 |
 
 分类头：volume 粒度全空间池化 → MLP → (B,K)；slice 粒度 → (B,K,D)
 （2.5D：头输出 K×D 再 reshape；3D：池化 H/W 保 z → 逐深度共享 MLP → z 线性插值回 D）。
 
-### 损失（`cls.loss`）
+### 损失（`cls.loss_type`）
 
 | 损失 | 适用 | 说明 |
 |---|---|---|
@@ -86,14 +86,14 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 
 ---
 
-## 2. 通用训练技巧（复用 segtask `train.*`）
+## 2. 通用训练技巧（复用 `train.*`）
 
 | 技巧 | 说明 |
 |---|---|
-| 混合精度 AMP | `use_amp` / `amp_dtype`（auto/bf16/fp16 + GradScaler）；损失 fp32 + logit clamp |
-| EMA | `use_ema` / `ema_warmup` / `ema_device`；验证与 best 保存均用 EMA shadow（best 的 model_state_dict 即 EMA） |
-| GPU 增强 | `augment.enabled`（复用 segtask GPUAugmentor，image+label 联合增强后派生 target） |
-| warmup + scheduler | `warmup_epochs` / `scheduler`，按优化步推进（accum 尾组按真实尾长归一）；warmup 段保持 encoder/head 差分 lr 倍率（_GroupWarmupScheduler）；plateau 方向与 `cls.save_best_metric` 不一致时显式报错 |
+| 混合精度 AMP | `train.use_amp` / `train.amp_dtype`（auto/bf16/fp16 + GradScaler）；损失 fp32 + logit clamp |
+| EMA | `train.use_ema` / `train.ema_warmup` / `train.ema_device`；验证与 best 保存均用 EMA shadow（best 的 model_state_dict 即 EMA） |
+| GPU 增强 | `augment.enabled`（复用 taskcore GPUAugmentor，image+label 联合增强后派生 target） |
+| warmup + scheduler | `train.warmup_epochs` / `train.scheduler`，按优化步推进（accum 尾组按真实尾长归一）；warmup 段保持 encoder/head 差分 lr 倍率（`GroupWarmupScheduler`）；plateau 方向与 `cls.save_best_metric` 不一致时显式报错 |
 | fused AdamW | CUDA 上自动启用 fused 实现（含差分 lr 分组分支） |
 | 续训 / 落盘 | 每 epoch 原子写 latest_model.pth（模型+optimizer/scheduler/scaler/EMA）；`train.resume` 完整恢复；history.json 逐 epoch 落盘 |
 | 早停 | `train.early_stopping`：连续 N 个 epoch 无提升即止 |

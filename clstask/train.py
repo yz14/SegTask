@@ -1,6 +1,6 @@
 """分类训练 CLI 入口。
 
-示例：``python -m clstask.train --config configs/cls3d.yaml``。
+示例：``python -m clstask.train --config configs/cls3d_cubic.yaml``。
 
 复用 SSL/分割编码器时：``--override cls.pretrained_ckpt=<ssl_best.pt>``——
 只取 ``encoder.*`` 权重（strict=False），几何须与预训练一致

@@ -123,31 +123,45 @@ model:
       encoder_stages : [0, 1, 1, 1, 1]  # 编码器逐 stage；浅→深，末位=bottleneck
       decoder_stages : [1, 1, 1, 0]  # 解码器逐 level；深→浅
       branch_norm_act: true
-loss:
-  name: "dice_focal"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
-  compound_weights: [1.0, 1.0]
+seg:
+  loss:
+    name: "dice_focal"            # Dice + Soft clDice（Shit+ CVPR'21）：保拓扑/连通，细血管断裂更敏感
+    compound_weights: [1.0, 1.0]
 
-  class_weights : [1.0]       # 长度 = 前景类数 (不含 bg)
-  region_weights: [1.0, 5.0]  # 按 label_values 全长 (含 bg)
+    class_weights : [1.0]       # 长度 = 前景类数 (不含 bg)
+    region_weights: [1.0, 5.0]  # 按 label_values 全长 (含 bg)
 
-  dice_smooth : 1.0e-5
-  dice_squared: false
-  batch_dice  : true             # 全 batch 汇总 TP/分母（nnU-Net Dice）：稀疏前景下梯度更稳
+    dice_smooth : 1.0e-5
+    dice_squared: false
+    batch_dice  : true             # 全 batch 汇总 TP/分母（nnU-Net Dice）：稀疏前景下梯度更稳
 
-  cldice_iter  : 3               # 2D 软骨架迭代（Shit+ 推荐 2D 用 3）
-  cldice_smooth: 1.0
+    cldice_iter  : 3               # 2D 软骨架迭代（Shit+ 推荐 2D 用 3）
+    cldice_smooth: 1.0
 
-  focal_alpha: 0.5
-  focal_gamma: 2.0
+    focal_alpha: 0.5
+    focal_gamma: 2.0
 
-  tversky_alpha: 0.3
-  tversky_beta : 0.7
+    tversky_alpha: 0.3
+    tversky_beta : 0.7
 
-  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+    deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
-  slice_loss_reduction: "per_volume"
+    slice_loss_reduction: "per_volume"
 
-  aux_supervision_weights: [0.5, 0.5]
+    aux_supervision_weights: [0.5, 0.5]
+
+
+  predict:
+    z_interleave_enabled   : false
+    z_interleave_thresholds: [0.8, 1.2, 1.6, 2.0]
+    z_interleave_factors   : [5, 4, 3, 2, 1]
+    z_overlap : 0.5
+    blend_mode: "gaussian"          # 'gaussian' | 'constant'
+    batch_size: 2
+    tta_flip  : true
+    threshold : 0.5
+    output_dir: ""
+    save_probabilities: false
 
 
 train:
@@ -202,19 +216,6 @@ train:
   pretrain: ""
   pretrain_strict: false
   pretrain_load_ema: false
-
-predict:
-  z_interleave_enabled   : false
-  z_interleave_thresholds: [0.8, 1.2, 1.6, 2.0]
-  z_interleave_factors   : [5, 4, 3, 2, 1]
-  z_overlap : 0.5
-  blend_mode: "gaussian"          # 'gaussian' | 'constant'
-  batch_size: 2
-  tta_flip  : true
-  threshold : 0.5
-  output_dir: ""
-  save_probabilities: false
-
 
 vis:
   enabled          : false                 # 设 true 即生成 HTML

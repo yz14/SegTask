@@ -1,4 +1,4 @@
-"""Unit tests for ``segtask_v1.data.specs``.
+"""Unit tests for ``taskcore.data.specs``.
 
 CPU-only, 不读盘、不构造真 dataset（用 monkeypatch 拦截 dataset class）。覆盖：
 

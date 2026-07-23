@@ -34,7 +34,7 @@ class Config:
         """同步跨子配置的对应字段。
 
         所有"模型几何派生量"（``in_channels`` / ``spatial_dims``）由
-        ``gentask.models.topology.build_topology(self)`` 一次性算出，写入
+        ``taskcore.models.topology.build_topology(self)`` 一次性算出，写入
         ``ModelConfig`` 的私有 backing 字段（对外是只读 property）。本方法仅保留
         "非派生"职责（``num_classes`` 推断、``z_boundary_mode`` 自动升级、resenc
         preset）。

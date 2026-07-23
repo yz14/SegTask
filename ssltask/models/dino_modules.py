@@ -5,7 +5,7 @@ DINO 把 image-only 自监督建模为"学生网络匹配 EMA 教师网络的软
 输出 ``out_dim`` 个原型上的 logits。学生看全部裁剪、教师只看 global 裁剪，损失为
 教师（centering+sharpening 后）与学生分布的交叉熵（见 ``methods/dino.py``）。
 
-骨干复用：``DINONet.encoder`` 取自 ``segtask_v1.models.factory.build_backbone(cfg)``
+骨干复用：``DINONet.encoder`` 取自 ``taskcore.models.factory.build_backbone(cfg)``
 （保证与下游逐参数同名同形）；DINO 不预训练解码器，故下游 ``train.pretrain``
 （strict=False）仅命中 ``encoder.*``、``decoder.*``/``seg_head.*`` 保持随机。``DINOHead``
 与 student/teacher 前缀在导出时被丢弃（见 ``DINOMethod.export_backbone_state_dict``）。

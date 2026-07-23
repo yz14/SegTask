@@ -1,4 +1,4 @@
-"""在线分类探针（SSL.md §0.4）。
+"""离线分类探针（经 ssltask.evaluate；不接入 SSLTrainer）。
 
 动机：为后续 P6 评测管线提供一个与分割探针同构的表征读数：
 ``encoder → 全局平均池化 → 小 MLP 头``，并支持两种模式：
@@ -91,7 +91,7 @@ class _ClsHead(nn.Module):
 
 
 class ClsProbe:
-    """在线分类探针：encoder + GAP + MLP 头。"""
+    """离线分类探针：encoder + GAP + MLP 头。"""
 
     def __init__(self, cfg, ssl, device: torch.device,
                  finetune: Optional[bool] = None):

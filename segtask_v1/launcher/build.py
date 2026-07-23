@@ -1,12 +1,13 @@
 """把 ``schema``（字段元信息）与 ``manifest``（per-mode 有效参数）拼装成前端载荷，
-并实现表单值 → 运行 YAML 的构建与校验（全程复用 ``segtask_v1.config``）。
+并实现表单值 → 运行 YAML 的构建与校验（经 ``seg_config`` / ``SegBundle``，
+公共段真相源为 ``taskcore.config``）。
 
 对外函数：
 
 * ``build_payload(mode)``   —— 渲染表单所需的完整 JSON（分组、控件、tooltip、
                               enum、depends_on、默认值、predict CLI 运行参数）。
-* ``build_config(values)``  —— 由表单值字典构造 ``Config``（含 ``sync()``）。
-* ``validate_values(...)``  —— 复用 ``Config.validate()`` 给出友好错误。
+* ``build_config(values)``  —— 由表单值字典构造 ``SegBundle``（含 ``sync()``）。
+* ``validate_values(...)``  —— 复用 bundle ``validate()`` 给出友好错误。
 * ``values_to_yaml(...)``   —— 生成运行 YAML 文本（不落盘，供预览）。
 * ``write_run_yaml(...)``   —— 落盘到 ``configs/_runs/<时间戳>_<task>.yaml``。
 * ``list_base_configs()``   —— 列出 ``configs/*.yaml`` 供"载入模板"。

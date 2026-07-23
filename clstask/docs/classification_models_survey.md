@@ -3,27 +3,27 @@
 仿 `dettask/docs/detection_models_survey.md` / `gentask/docs/generative_models_survey.md`：
 梳理四大分类骨干的原理、医学 3D 场景适配与本工程的实现取舍。
 
-## 1. ResNet（`cls.backbone: encoder` + `model.backbone: resnet`）
+## 1. ResNet（`cls.backbone: encoder` + `model.unet.backbone: resnet`）
 
 * **原理**（He et al., CVPR 2016）：残差捷径使深网络可优化；分类范式为
   「stage 递降分辨率 → 全局池化 → 线性头」。
 * **医学地位**：3D ResNet 系（Med3D、MedicalNet 等）长期是体数据分类的
   默认基线；与分割 encoder 同构意味着**同一权重可在分割/SSL/分类间无缝
-  流转**——这是本工程把 ResNet 模板直接落在 `segtask_v1` Encoder 上
+  流转**——这是本工程把 ResNet 模板直接落在 `taskcore` Encoder 上
   （而非另写一份）的核心理由。
-* **实现取舍**：复用 `build_seg_model(cfg).encoder`，几何（2.5D 折叠 /
+* **实现取舍**：复用 `taskcore.models.factory.build_backbone(cfg)`，几何（2.5D 折叠 /
   3D）与通道数由 topology 单一真相源派生；SSL `encoder.*` strict=False
   全量命中；`cls.encoder_lr_mult` / `freeze_encoder` 支持微调与
   linear-probe 两种迁移协议。
 
-## 2. ConvNeXt（`cls.backbone: encoder` + `model.backbone: convnext`）
+## 2. ConvNeXt（`cls.backbone: encoder` + `model.unet.backbone: convnext`）
 
 * **原理**（Liu et al., CVPR 2022）：以 ViT 的宏观设计（大核深度卷积、
   LN、GELU、倒瓶颈、layer scale）现代化 ResNet，纯卷积达到 ViT 精度。
 * **医学价值**：MedNeXt（Roy et al., MICCAI 2023）验证了该家族在医学
   3D 上的有效性；卷积归纳偏置在小数据集上通常优于 ViT。
-* **实现取舍**：与 ResNet 同一构建路径（`model.backbone: convnext`，
-  含 GRN / layer-scale / stochastic-depth 等 segtask 已有开关），
+* **实现取舍**：与 ResNet 同一构建路径（`model.unet.backbone: convnext`，
+  含 GRN / layer-scale / stochastic-depth 等 taskcore 已有开关），
   分类侧零新增代码——模板差异完全收敛在 `cfg.model`，SSL 迁移同样成立。
 
 ## 3. DenseNet-BC（`cls.backbone: densenet`）
@@ -33,7 +33,7 @@
   CNN 之一（胸片、结节良恶性等）。
 * **实现取舍**：`clstask/models/densenet.py` 以 `spatial_dims` 参数化
   2D/3D 同一实现；growth-rate / block-layers / compression 可配；
-  norm/act 跟随 `cfg.model`（GroupNorm 友好小 batch）。与 segtask
+  norm/act 跟随 `cfg.model`（GroupNorm 友好小 batch）。与 taskcore
   Encoder 拓扑不同，故 SSL 迁移不适用（README 已标注）。
 
 ## 4. ViT（`cls.backbone: vit`）
@@ -64,7 +64,7 @@
 
 * 几何双轨：四模板全部由 `spatial_dims` 参数化，2.5D（slab 折叠进
   通道，`(B, D, H, W)`）与 3D（`(B, 1, D, H, W)`）同一代码路径，由
-  `segtask_v1.models.topology.build_topology` 单一真相源派生；
+  `taskcore.models.topology.build_topology` 单一真相源派生；
 * 标签双粒度：`volume`（(B, K)）与 `slice`（(B, K, D)）两种头
   （`clstask/models/classifier.py`），mask 弱标签 / csv-json 标签表
   两种来源；

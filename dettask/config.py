@@ -1,6 +1,6 @@
-"""dettask 配置：复用 ``segtask_v1.config.Config`` + 独立 ``DetConfig``。
+"""dettask 配置：复用 ``taskcore.config.core.Config`` + 独立 ``DetConfig``。
 
-与 clstask 同构：``cfg``（segtask Config）承载 data/model/train 基建与几何派生
+与 clstask 同构：``cfg``（taskcore Config）承载 data/model/train 基建与几何派生
 （``patch_mode`` × ``build_topology`` → ``spatial_dims`` / ``in_channels``），
 检测专属设置集中在 YAML 顶层 ``det:`` 段。
 

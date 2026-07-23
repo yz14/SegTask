@@ -4,7 +4,7 @@ VICRegL（Bardes et al., NeurIPS 2022）= VICReg 全局项（invariance/variance
 covariance）+ 稠密局部项（位置/特征匹配位点对上的同套 VIC 损失）。孪生结构
 （两视图共享同一套权重，无 EMA 教师/负样本队列）。
 
-骨干与其它方法一致：``segtask_v1.models.factory.build_backbone(cfg)``
+骨干与其它方法一致：``taskcore.models.factory.build_backbone(cfg)``
 （同名同形 → 下游 ``train.pretrain`` strict=False 仅命中 ``encoder.*``；
 投影头为 SSL 专用，导出时丢弃）。小 batch 3D 场景不用 BatchNorm（与
 ``DINOHead`` 的取舍一致），全局头用 LayerNorm、稠密头无归一化。

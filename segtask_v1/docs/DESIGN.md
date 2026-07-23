@@ -2,20 +2,35 @@
 
 本文档整理 `segtask_v1` 的架构约定、数据流、训练与推理时序、扩展方式和关键契约。README 负责导航，本文件负责把实现背后的设计原则和跨文件关系讲清楚。
 
+## 0. 与 taskcore 的边界（2026-07 起）
+
+公共基建已下沉到顶层包 `taskcore`：
+
+| 职责 | 真相源 | 本包 |
+|---|---|---|
+| 公共配置段 / 校验 / YAML I/O | `taskcore.config.*` | `seg_config.py` → `SegBundle`（`seg:` 的 loss/predict） |
+| 几何派生 | `taskcore.models.topology.build_topology` | `models/topology.py` 为 shim |
+| Dataset / loader / make_data / augment | `taskcore.data.*` | `data/*` 为 shim（CLI 入口保留） |
+| 骨干工厂 | `taskcore.models.factory` | `models/*` 多为 shim |
+| AMP / optim / checkpoint / AdaBN 统计 | `taskcore.engine.*` | trainer/predictor 内对应 shim |
+| 分割损失、滑窗、ViewPipeline、launcher、可视化 | — | **本包真实实现** |
+
+下文若仍写本地 `config.py` / `data/` / `models/` 路径，现行树中多为兼容 shim；新代码请直连上表左列或 `seg_config`。
+
 ## 1. 总体架构
 
 `segtask_v1` 的核心思想是把「几何」与「实现」分开：
 
 - **几何** 由配置决定，包括 `patch_mode`、`multi_res_scales`、`keep_native_view_depth`、`lift_2_5d_to_3d`、`spacing_normalization` 等。
-- **实现** 由 `data/`、`models/`、`losses/`、`trainer/`、`predictor/` 这些子模块承接。
-- **真相源** 集中在 `config.py` 与 `models/topology.py`，避免同一组派生字段在多个地方重复推导。
+- **实现**：损失 / trainer pipelines / predictor / launcher / visualization 在本包；数据与骨干在 `taskcore`。
+- **真相源**：`segtask_v1.seg_config` + `taskcore.models.topology`，避免派生字段多处重复推导。
 
 ### 1.1 训练时数据流
 
 ```text
 train.py
-  └── load_config / override / sync / validate
-        └── data.loader.build_dataloaders(cfg)
+  └── seg_config.load_config / override / sync / validate  → SegBundle
+        └── taskcore.data.loader.build_dataloaders(cfg)
               ├── discover_samples / exclude / match bbox / match rw
               ├── split train / val
               └── build_data_spec(cfg)
@@ -39,8 +54,8 @@ train.py
 
 ```text
 predict.py
-  └── load_config / override / sync / validate
-        └── build_model(cfg)
+  └── seg_config.load_config / override / sync / validate  → SegBundle
+        └── taskcore.models.factory.build_model(cfg)
               └── Predictor(model, cfg)
                     ├── 读取 checkpoint
                     ├── 读取图像 / bbox
@@ -71,7 +86,7 @@ predict.py
 
 ### 2.3 `ModelTopology`
 
-`models/topology.py` 负责推导训练几何与通道布局相关的派生量：
+`taskcore.models.topology.build_topology` 负责推导训练几何与通道布局相关的派生量：
 
 - 输入通道数
 - 输出类别数
@@ -79,7 +94,7 @@ predict.py
 - 视图数与每视图深度
 - aux 头是否激活
 
-这一层是单一真相源。`config.py`、`factory.py`、`trainer/pipelines/factory.py` 和 `Predictor` 都应该从这里读取结果，而不是各自重复计算。
+这一层是单一真相源。`seg_config` / `taskcore.config`、`taskcore.models.factory`、`trainer/pipelines/factory.py` 和 `Predictor` 都应该从这里读取结果，而不是各自重复计算。
 
 ## 3. 文件命名与数据契约
 
@@ -98,7 +113,7 @@ predict.py
 
 ### 3.2 npz 烘焙
 
-`make_data.py` 把 NIfTI 预处理成 npz，主要目的是减少训练期的 gzip 解压与随机 IO 开销。npz 路径通常包含：
+`make_data`（`taskcore.data.make_data`，CLI：`python -m segtask_v1.data.make_data --out ...`）把 NIfTI 预处理成 npz，主要目的是减少训练期的 gzip 解压与随机 IO 开销。npz 路径通常包含：
 
 - `image`
 - `label`
@@ -199,49 +214,49 @@ visualization 关注静态结构图：数据流图、模型流图和预测流图
 
 ### 7.1 模块职责边界
 
-- `data/` 负责样本读写与几何抽取。
-- `models/` 负责骨干、解码器和拓扑装配。
-- `losses/` 负责目标函数。
-- `trainer/` 负责优化、验证与 checkpoint。
-- `predictor/` 负责推理、融合与写出。
-- `launcher/`、`monitor/`、`visualization/` 负责工程可用性工具。
+- `taskcore.data` 负责样本读写与几何抽取（本包 `data/*` 多为兼容 shim）。
+- `taskcore.models` 负责骨干、解码器和拓扑装配（本包 `models/*` 多为兼容 shim）。
+- `losses/` 负责分割目标函数（本包真实实现）。
+- `trainer/` 负责优化编排、验证与 ViewPipeline；工程件直连 `taskcore.engine`。
+- `predictor/` 负责推理、融合与写出（AdaBN 统计在 `taskcore.engine.bn_stats`）。
+- `launcher/`、`monitor/`（shim→`taskcore.monitor`）、`visualization/` 负责工程可用性工具。
 
 ### 7.2 扩展原则
 
 新增功能时优先遵守这几条：
 
-1. 几何派生优先放到 topology。
-2. 新 patch 模式优先在 data / pipeline / predictor 三处同步。
-3. 新骨干优先在 models/factory 统一装配。
-4. 新损失优先在 losses 建立单独类，再由工厂暴露。
+1. 几何派生优先放到 `taskcore.models.topology`。
+2. 新 patch 模式优先在 `taskcore.data` / pipeline / predictor 三处同步。
+3. 新骨干优先在 `taskcore.models.factory` 统一装配。
+4. 新损失优先在 `losses` 建立单独类，再由工厂暴露；配置字段进 `SegTaskConfig`。
 5. 训练、推理和可视化工具要尽量保持松耦合。
 
 ## 8. 扩展指南
 
 ### 8.1 新增损失
 
-在 `losses/losses.py` 加入新类，并在 `build_loss` 中注册名称。若该损失依赖特定配置字段，再同步更新 `config.py` 的校验逻辑与示例配置。
+在 `losses/losses.py` 加入新类，并在 `build_loss` 中注册名称。若该损失依赖特定配置字段，再同步更新 `taskcore.config.seg_task.SegTaskConfig`（及必要时 core）的校验逻辑与示例配置。
 
 ### 8.2 新增 backbone
 
-在 `models/` 增加新模块，实现对应 stage / block，再在 `factory.py` 装配。若 backbone 影响输入通道、残差块数量或 stage 结构，尽量让 topology 先推导相关派生量。
+在 `taskcore/models/` 增加新模块，实现对应 stage / block，再在 `taskcore.models.factory` 装配。若 backbone 影响输入通道、残差块数量或 stage 结构，尽量让 topology 先推导相关派生量。
 
 ### 8.3 新增 patch 模式
 
 新增 patch 模式时，至少需要同步修改：
 
-- `data/`：新增 Dataset 或抽样逻辑
-- `models/topology.py`：补齐派生量
+- `taskcore.data`：新增 Dataset 或抽样逻辑
+- `taskcore.models.topology`：补齐派生量
 - `trainer/pipelines/`：新增监督策略
 - `predictor/`：新增窗口构造与滑窗入口
 
 ### 8.4 新增多视图或上下文融合策略
 
-多视图策略优先放在 `models/stem.py` 和 `trainer/views.py` 里管理，避免在主训练循环里硬编码分支。
+多视图策略优先放在 `taskcore.models.stem` 和 `taskcore.engine.views`（本包 `trainer/views.py` 为 shim）里管理，避免在主训练循环里硬编码分支。
 
 ### 8.5 改命名或路径约定
 
-所有和命名、配对、路径规则相关的逻辑，优先集中在 `data/loader.py` 与 `data/make_data.py`，不要在各个下游文件里重复写判断。
+所有和命名、配对、路径规则相关的逻辑，优先集中在 `taskcore.data.loader` 与 `taskcore.data.make_data`，不要在各个下游文件里重复写判断。
 
 ## 9. 参考用法
 
@@ -255,7 +270,7 @@ python -m segtask_v1.train --config configs/test_e2e.yaml
 python -m segtask_v1.predict --config configs/seg2_5d.yaml
 
 # npz 预打包
-python -m segtask_v1.data.make_data --config configs/seg2_5d.yaml --out-dir /path/to/npz --workers 8
+python -m segtask_v1.data.make_data --config configs/seg2_5d.yaml --out /path/to/npz --workers 8
 
 # launcher / monitor
 python -m segtask_v1.launcher

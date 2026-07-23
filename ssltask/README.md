@@ -11,7 +11,7 @@ ssltask/
 ├── README.md  # 本文件
 ├── __init__.py  # 包入口与注册表
 ├── __main__.py  # python -m ssltask 入口
-├── config.py  # 复用分割配置并叠加 SSLConfig
+├── config.py  # taskcore Config + 顶层 ssl:（SSLConfig）
 ├── pretrain.py  # 自监督预训练 CLI
 ├── evaluate.py  # 离线 few-shot 评测 CLI
 ├── data/  # 数据子系统
@@ -25,10 +25,10 @@ ssltask/
 │   └── WORKFLOW.md  # 端到端预训练/评测流程
 ├── eval/  # 评测子系统
 │   ├── __init__.py  # 评测包入口
-│   ├── cls_probe.py  # 在线分类探针
+│   ├── cls_probe.py  # 离线分类探针（evaluate）
 │   ├── metrics.py  # AUC / F1 / HD95 指标
 │   ├── pipeline.py  # 离线评测 pipeline
-│   ├── probe.py  # 在线分割探针
+│   ├── probe.py  # 在线分割探针（训练期选模）
 │   └── split.py  # 组级（患者级）train/val 划分
 ├── methods/  # SSL 方法注册与实现
 │   ├── __init__.py  # 方法注册表 / build_method
@@ -63,9 +63,9 @@ ssltask/
 - **共骨干迁移**：ssltask 的主要价值是产出可迁移 encoder；分割、分类、检测都可以直接复用这份权重。
 - **方法注册表**：不同 SSL 方法通过统一的注册入口装配，训练循环尽量保持方法无关。
 - **数据视图**：image-only npz、多裁剪、masking、corruption、vesselness 都是围绕视图构造展开的。
-- **评测探针**：在线 probe 与离线 few-shot 评测并存，既看表示可分性，也看下游迁移效果。
+- **评测探针**：训练期在线 SegProbe 与离线 few-shot / ClsProbe 评测并存，既看表示可分性，也看下游迁移效果。
 - **方法家族**：重建、对比、自蒸馏、掩码建模和先验回归几类方法都在同一仓库内对齐实现。
-- **配置入口**：所有方法都从 `configs/ssltask_*.yaml` 进入，和主线分割配置保持一致的数据与几何约束。
+- **配置入口**：所有方法都从 `configs/ssltask_*.yaml` 进入；公共段为 `taskcore` Config，方法段为 `ssl:`。
 
 ## 用法
 

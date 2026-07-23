@@ -215,41 +215,80 @@ model:
   # edm2_attn_balance             : 0.3    # MP 注意力平衡系数
   # edm2_concat_balance           : 0.5    # MP skip-cat 平衡系数
   # edm2_clip_act                 : 256.0  # 输出激活裁剪；<=0 禁用
-loss:
-  name                    : "dice_focal"              # 损失函数；单项 'dice'|'bce'|'focal'|'tversky'|'gdl'|'focal_tversky'|'lovasz'|'cldice'，或下划线复合如 'dice_bce'/'dice_focal'
-  compound_weights        : [1.0, 1.0]                # 仅复合损失；两项权重 [loss1_w, loss2_w]
-  class_weights           : [1.0]                     # 逐前景类损失权重；长度=前景类数；空=均匀
-  region_weights          : [0.0, 4.0]                # 按 label 取值的空间权重（含 bg，最终权重=配置值+1）；空=禁用；data.region_weight_dir 优先
-  slice_loss_reduction    : "per_volume"              # 仅 2.5D；Dice 系聚合方式；'per_slice'=逐 slice 独立（空 slice 零梯度） | 'per_volume'=整体积聚合（推荐）
-  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]   # 仅 model.deep_supervision=true；逐级权重（高→低分辨率）
-  aux_supervision_weights : []                        # 仅 2.5D + aux_seg_supervision=true；辅助头权重，长度 = n_views-1；空=自动 0.5^k
+seg:
+  loss:
+    name                    : "dice_focal"              # 损失函数；单项 'dice'|'bce'|'focal'|'tversky'|'gdl'|'focal_tversky'|'lovasz'|'cldice'，或下划线复合如 'dice_bce'/'dice_focal'
+    compound_weights        : [1.0, 1.0]                # 仅复合损失；两项权重 [loss1_w, loss2_w]
+    class_weights           : [1.0]                     # 逐前景类损失权重；长度=前景类数；空=均匀
+    region_weights          : [0.0, 4.0]                # 按 label 取值的空间权重（含 bg，最终权重=配置值+1）；空=禁用；data.region_weight_dir 优先
+    slice_loss_reduction    : "per_volume"              # 仅 2.5D；Dice 系聚合方式；'per_slice'=逐 slice 独立（空 slice 零梯度） | 'per_volume'=整体积聚合（推荐）
+    deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]   # 仅 model.deep_supervision=true；逐级权重（高→低分辨率）
+    aux_supervision_weights : []                        # 仅 2.5D + aux_seg_supervision=true；辅助头权重，长度 = n_views-1；空=自动 0.5^k
   
-  aux_topo_weight         : 0.3                       # 仅 model.aux_topo_head=true；辅助拓扑损失权重（总损失 += w * topo_loss）
-  aux_topo_iter           : 3                         # 仅 model.aux_topo_head=true；软骨架/距离场迭代步数（2D 用 3，3D 取 3~10）
-  aux_topo_loss           : "auto"                    # 仅 model.aux_topo_head=true；'auto'=centerline→soft-dice、distance→smooth_l1 | 'dice' | 'bce' | 'smooth_l1' | 'mse'
+    aux_topo_weight         : 0.3                       # 仅 model.aux_topo_head=true；辅助拓扑损失权重（总损失 += w * topo_loss）
+    aux_topo_iter           : 3                         # 仅 model.aux_topo_head=true；软骨架/距离场迭代步数（2D 用 3，3D 取 3~10）
+    aux_topo_loss           : "auto"                    # 仅 model.aux_topo_head=true；'auto'=centerline→soft-dice、distance→smooth_l1 | 'dice' | 'bce' | 'smooth_l1' | 'mse'
 
-  dice_smooth             : 1.0e-5                    # Dice 平滑项，防 0/0
-  dice_squared            : false                     # Dice 分母用概率平方和（Dice² 变体）
+    dice_smooth             : 1.0e-5                    # Dice 平滑项，防 0/0
+    dice_squared            : false                     # Dice 分母用概率平方和（Dice² 变体）
 
-  focal_alpha             : 0.5                       # 仅含 'focal'；正类权重
-  focal_gamma             : 2.0                       # 仅含 'focal'；难样本聚焦指数
+    focal_alpha             : 0.5                       # 仅含 'focal'；正类权重
+    focal_gamma             : 2.0                       # 仅含 'focal'；难样本聚焦指数
 
-  tversky_alpha           : 0.3                       # 仅含 'tversky'；FP 权重
-  tversky_beta            : 0.7                       # 仅含 'tversky'；FN 权重
+    tversky_alpha           : 0.3                       # 仅含 'tversky'；FP 权重
+    tversky_beta            : 0.7                       # 仅含 'tversky'；FN 权重
 
-  gdl_weight_type         : "square"                  # 仅含 'gdl'；体积加权；'square'=1/体积²（论文） | 'simple'=1/体积 | 'uniform'=等权
-  gdl_w_max               : 100000.0                  # 仅含 'gdl'；体积倒数权重上限（防小类爆权）
+    gdl_weight_type         : "square"                  # 仅含 'gdl'；体积加权；'square'=1/体积²（论文） | 'simple'=1/体积 | 'uniform'=等权
+    gdl_w_max               : 100000.0                  # 仅含 'gdl'；体积倒数权重上限（防小类爆权）
 
-  focal_tversky_gamma     : 1.3333333333333333        # 仅含 'focal_tversky'；(1-TI)^gamma 的 gamma（>=1）
+    focal_tversky_gamma     : 1.3333333333333333        # 仅含 'focal_tversky'；(1-TI)^gamma 的 gamma（>=1）
 
-  lovasz_per_sample       : true                      # 仅含 'lovasz'；开=逐 (B,C) 排序取均；关=批级排序（小 patch 更平滑）
+    lovasz_per_sample       : true                      # 仅含 'lovasz'；开=逐 (B,C) 排序取均；关=批级排序（小 patch 更平滑）
 
-  cldice_iter             : 3                         # 仅含 'cldice'；软骨架化迭代次数（2D 用 3，3D 取 3~10）
-  cldice_smooth           : 1.0                       # 仅含 'cldice'；平滑项
+    cldice_iter             : 3                         # 仅含 'cldice'；软骨架化迭代次数（2D 用 3，3D 取 3~10）
+    cldice_smooth           : 1.0                       # 仅含 'cldice'；平滑项
 
-  batch_dice              : true                      # 全 batch+空间汇总 TP/分母后一次除；关=逐样本（空 GT 类 Dice≈1 稀释梯度）
-  ignore_empty            : false                     # 仅 batch_dice=false；开启后无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误
+    batch_dice              : true                      # 全 batch+空间汇总 TP/分母后一次除；关=逐样本（空 GT 类 Dice≈1 稀释梯度）
+    ignore_empty            : false                     # 仅 batch_dice=false；开启后无 GT 的类从 dice 均值排除，避免空类≈1 掩盖错误
 
+
+  predict:
+    # ---- 滑窗核心 ----
+    z_overlap              : 0.5             # 相邻滑窗重叠比（0~0.95）；越大越平滑越慢
+    blend_mode             : "gaussian"      # 重叠区融合权重；'gaussian'=中心高边缘低（推荐） | 'average'=等权平均
+    batch_size             : 4               # 滑窗推理每次前向的窗口数
+
+    # ---- TTA 与阈值 ----
+    tta_flip               : false           # 翻转 TTA，各翻转变体预测取平均（2.5D 翻 H/W 共 4× 前向）
+    tta_batch_size         : 1               # 仅 tta_flip=true；每次前向合并的 flip 变体数（显存≈batch_size×此值）；null=退化为 batch_size
+    threshold              : 0.5             # sigmoid 二值化阈值；标量全类共享或逐前景类列表（小结构类宜偏低）；前景最大概率<阈值 → 背景
+
+    # ---- 精度 / 显存 ----
+    acc_dtype              : "fp32"          # 滑窗概率累加器精度；'fp32' | 'fp16'=大卷×多类显存减半（blend 归一后精度足够）
+    vol_dtype              : "fp32"          # GPU 常驻整卷张量存储精度；'fp32' | 'fp16'=常驻显存减半（取窗时升回 fp32，仅存储量化 ~1e-3 级）
+    accumulate_on_cpu      : false           # 概率累加器放 CPU（大卷 OOM 逃生门；每 batch 多一次 GPU→CPU 拷贝，用速度换显存）
+
+    # ---- 提速开关 ----
+    cudnn_benchmark        : false           # 独立 CLI 推理开 cudnn.benchmark，首 batch 自动选优卷积算法（滑窗形状固定最适合）
+    use_inference_mode     : false           # 前向用 inference_mode 替代 no_grad，免 autograd 簿记（数值等价纯提速；AdaBN 估计期自动回退）
+    channels_last          : false           # 推理侧 channels_last 内存排布（数值等价，Ampere+ 可能提速，需 benchmark）
+    skip_empty_windows     : false           # 滑窗跳过纯背景窗（归一化后窗内 max<=阈值 → 不前向，概率保持 0；空气窗预测本应≈0，差异可忽略）
+    skip_empty_threshold   : 0.0             # 仅 skip_empty_windows=true；跳窗判据（minmax 归一化下 0.0=整窗钳底空气，判据保守；zscore 需自行调阈）
+
+    # ---- AdaBN 域适应 ----
+    adabn_enabled          : true            # 仅 model.norm_type='batch'；推理时用目标域数据重估 BN 统计（对抗域漂移，无需标签不重训）
+    adabn_mode             : "global"        # AdaBN 统计来源；'global'=先用 N 卷预热一次全程复用 | 'per_volume'=每卷各自重估再冻结预测
+    adabn_num_volumes      : 8               # 仅 adabn_mode='global'；预热用的目标域卷数
+    adabn_sample_ratio     : 1.0             # BN 估计期滑窗抽样比 (0,1]；<1 只跑部分窗估 BN 统计（如 0.25 把 per_volume 额外成本从 2× 降到 ≈1.25×）；1.0=全窗估计
+
+    # ---- 2.5D 专属：z 交错 ----
+    z_interleave_enabled   : true            # 仅 2.5D；按 z 交错拆 k 个子体独立推理再缝回（加宽 z 感受野；k 按物理 z 间距查下表）
+    z_interleave_thresholds: [1.0, 1.5, 3]   # 仅 z_interleave_enabled=true；z 间距分档阈值（mm，升序）
+    z_interleave_factors   : [4, 3, 2, 1]    # 仅 z_interleave_enabled=true；各档 k 值，长度 = len(thresholds)+1（末位为兜底档）
+
+    # ---- 输出 ----
+    output_dir             : ""              # 预测结果输出目录
+    save_probabilities     : false           # 除二值 mask 外另存概率图
 
 train:
   # ---- 基本 ----
@@ -339,44 +378,6 @@ train:
   pretrain_load_ema            : false            # ckpt 含 EMA shadow 时优先取 shadow 作初始权重
   pretrain_upkern              : false            # 仅 backbone='mednext'；预训练深度卷积权重按当前 kernel_size 做 UpKern 插值迁移（k=3→5 等）
   reparam_deploy               : false            # 仅 backbone='mednext'；推理加载权重时先把可重参数化深度卷积折叠为单核 deploy 形态
-
-predict:
-  # ---- 滑窗核心 ----
-  z_overlap              : 0.5             # 相邻滑窗重叠比（0~0.95）；越大越平滑越慢
-  blend_mode             : "gaussian"      # 重叠区融合权重；'gaussian'=中心高边缘低（推荐） | 'average'=等权平均
-  batch_size             : 4               # 滑窗推理每次前向的窗口数
-
-  # ---- TTA 与阈值 ----
-  tta_flip               : false           # 翻转 TTA，各翻转变体预测取平均（2.5D 翻 H/W 共 4× 前向）
-  tta_batch_size         : 1               # 仅 tta_flip=true；每次前向合并的 flip 变体数（显存≈batch_size×此值）；null=退化为 batch_size
-  threshold              : 0.5             # sigmoid 二值化阈值；标量全类共享或逐前景类列表（小结构类宜偏低）；前景最大概率<阈值 → 背景
-
-  # ---- 精度 / 显存 ----
-  acc_dtype              : "fp32"          # 滑窗概率累加器精度；'fp32' | 'fp16'=大卷×多类显存减半（blend 归一后精度足够）
-  vol_dtype              : "fp32"          # GPU 常驻整卷张量存储精度；'fp32' | 'fp16'=常驻显存减半（取窗时升回 fp32，仅存储量化 ~1e-3 级）
-  accumulate_on_cpu      : false           # 概率累加器放 CPU（大卷 OOM 逃生门；每 batch 多一次 GPU→CPU 拷贝，用速度换显存）
-
-  # ---- 提速开关 ----
-  cudnn_benchmark        : false           # 独立 CLI 推理开 cudnn.benchmark，首 batch 自动选优卷积算法（滑窗形状固定最适合）
-  use_inference_mode     : false           # 前向用 inference_mode 替代 no_grad，免 autograd 簿记（数值等价纯提速；AdaBN 估计期自动回退）
-  channels_last          : false           # 推理侧 channels_last 内存排布（数值等价，Ampere+ 可能提速，需 benchmark）
-  skip_empty_windows     : false           # 滑窗跳过纯背景窗（归一化后窗内 max<=阈值 → 不前向，概率保持 0；空气窗预测本应≈0，差异可忽略）
-  skip_empty_threshold   : 0.0             # 仅 skip_empty_windows=true；跳窗判据（minmax 归一化下 0.0=整窗钳底空气，判据保守；zscore 需自行调阈）
-
-  # ---- AdaBN 域适应 ----
-  adabn_enabled          : true            # 仅 model.norm_type='batch'；推理时用目标域数据重估 BN 统计（对抗域漂移，无需标签不重训）
-  adabn_mode             : "global"        # AdaBN 统计来源；'global'=先用 N 卷预热一次全程复用 | 'per_volume'=每卷各自重估再冻结预测
-  adabn_num_volumes      : 8               # 仅 adabn_mode='global'；预热用的目标域卷数
-  adabn_sample_ratio     : 1.0             # BN 估计期滑窗抽样比 (0,1]；<1 只跑部分窗估 BN 统计（如 0.25 把 per_volume 额外成本从 2× 降到 ≈1.25×）；1.0=全窗估计
-
-  # ---- 2.5D 专属：z 交错 ----
-  z_interleave_enabled   : true            # 仅 2.5D；按 z 交错拆 k 个子体独立推理再缝回（加宽 z 感受野；k 按物理 z 间距查下表）
-  z_interleave_thresholds: [1.0, 1.5, 3]   # 仅 z_interleave_enabled=true；z 间距分档阈值（mm，升序）
-  z_interleave_factors   : [4, 3, 2, 1]    # 仅 z_interleave_enabled=true；各档 k 值，长度 = len(thresholds)+1（末位为兜底档）
-
-  # ---- 输出 ----
-  output_dir             : ""              # 预测结果输出目录
-  save_probabilities     : false           # 除二值 mask 外另存概率图
 
 vis:
   enabled          : true                           # 训练启动时导出自包含 HTML（数据流/模型流/预测流三视图，CPU dummy 生成）；关=零开销

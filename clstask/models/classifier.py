@@ -1,7 +1,7 @@
 """分类模型：encoder（任意 backbone）+ 池化 + ``cls_head``。
 
 命名约定：backbone 一律挂在 ``self.encoder``、任务头挂在 ``self.cls_head``——
-与 segtask（``encoder``/``seg_head``）、ssltask 探针一致，保证 SSL/分割
+与 segtask_v1（``encoder``/``seg_head``）、ssltask 探针一致，保证 SSL/分割
 checkpoint 的 ``encoder.*`` 权重可 strict=False 直接命中。
 
 输出（logits）：

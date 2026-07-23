@@ -66,7 +66,7 @@ Faster R-CNN 压假阳 → DETR 追端到端上限。
 
 ## 6. 与本仓库设计的对应关系
 
-* 金字塔来源：`segtask_v1` Encoder+Decoder（Retina U-Net 思路），
+* 金字塔来源：`taskcore` Encoder+Decoder（Retina U-Net 思路），
   `FPNAdapter` 仅做通道对齐——SSL 预训练 encoder/decoder 全量可迁移；
 * 双几何：全部头由 `spatial_dims` 参数化；2.5D 逐 slab 2D 框 + 推理跨层
   拼接（`stitch_link_iou`/`stitch_min_span` 是小病灶召回的关键权衡，

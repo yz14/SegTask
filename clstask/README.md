@@ -43,10 +43,10 @@ clstask/
 ## 关键概念
 
 - **双几何**：`patch_mode` 沿用分割仓库的语义。3D 使用 `(B, 1, D, H, W)`，2.5D 把 slab 深度折进通道，使用 `(B, D, H, W)` 形式。
-- **四个 backbone 模板**：`resnet`、`convnext`、`densenet`、`vit` 四条路线覆盖常见分类实验，其中前两者可直接复用 SSL 预训练 encoder。
+- **三种 `cls.backbone`**：`encoder`（经 `model.unet.backbone` 选 ResNet/ConvNeXt，可接 SSL）、`densenet`、`vit`。
 - **标签契约**：支持 `mask` 派生弱标签与 `table` 显式标签表两种来源；`volume` 和 `slice` 粒度的输出形状不同，配置需要和数据源对齐。
 - **损失与增强**：支持 BCE、focal、CE、label smoothing、class weights，以及仅在卷级分类上启用的 mixup / cutmix。
-- **SSL 迁移**：`pretrained_ckpt` 只加载 encoder 相关权重，几何或 backbone 不一致时直接报错，不做静默降级。
+- **SSL 迁移**：`cls.pretrained_ckpt` 只加载 encoder 相关权重，几何或 backbone 不一致时直接报错，不做静默降级。
 - **推理聚合**：推理时先做 patch 级预测（抽取几何与训练一致，可选 autocast 与 `cls.tta_flips` 翻转 TTA），再按几何与 `agg_mode` 聚合成卷级结果；slice 粒度还会保留逐层输出。
 - **训练工程**：每 epoch 原子写 latest_model.pth，`train.resume` 完整续训，history.json 逐 epoch 落盘，`train.early_stopping` 早停；warmup 段保持差分学习率倍率；`model.grad_checkpointing` 四条 backbone 全支持（算力换显存）；`train.gpus` 配多卡即启用 DDP（mp.spawn 每卡一进程，验证指标跨卡聚齐全集计算，落盘仅 rank0），单卡/CPU 路径零变化。
 

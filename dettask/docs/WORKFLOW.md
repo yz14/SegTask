@@ -10,7 +10,7 @@
 ## 0. 共享主干
 
 ```
-配置加载（segtask Config + DetConfig）→ npz 发现 → train/val 划分（默认按
+配置加载（taskcore Config + DetConfig）→ npz 发现 → train/val 划分（默认按
 逐卷类存在集合分层，`det.stratify_split`；关闭回退纯随机）
  → Dataset 抽 patch + 框真值联动（变长框 det_collate 保持 list）
  → DetectorModel：encoder → decoder 金字塔 → FPNAdapter → 检测头（4 模板）
@@ -29,7 +29,7 @@
 ### 框真值契约（只存 3D 一份）
 
 - npz `boxes` 键 (N, 7)=[z1,y1,x1,z2,y2,x2,cls] 优先；
-- 否则由分割 mask 连通域派生（`det.boxes_from_mask`，逐前景类，`min_box_voxels` 按连通域真实体素数滤噪点，逐卷缓存）；
+- 否则由分割 mask 连通域派生（`det.boxes_from_mask`，逐前景类，`det.min_box_voxels` 按连通域真实体素数滤噪点，逐卷缓存）；
 - patch 裁剪/resize/翻转时框全程同步联动（crop_boxes 平移裁剪 → scale_boxes 随 resize 缩放 → flip_boxes 随翻转镜像 → 过滤可见比例 < min_visibility 的框）；
 - 2.5D 折叠时由 3D 框对 slab 切片自动派生 2D 框。
 
@@ -88,7 +88,7 @@ RPN（anchor + objectness）→ proposal（解码 + NMS，pre/post topk）
 
 ---
 
-## 2. 通用训练技巧（复用 segtask `train.*`）
+## 2. 通用训练技巧（复用 `train.*`）
 
 | 技巧 | 说明 |
 |---|---|
@@ -107,7 +107,7 @@ RPN（anchor + objectness）→ proposal（解码 + NMS，pre/post topk）
 | 微调策略 | `det.encoder_lr_mult` 差分学习率（复用 clstask 分组实现）；`det.freeze_encoder` |
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建，反向重算激活、算力换显存；eval/no_grad 零开销 |
 | DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler、验证集按 batch 块不相交分片；验证时预测/真值跨卡聚齐后算全集 mAP（不做卡间平均）；checkpoint/history 仅 rank0 落盘；单卡/CPU 路径零变化 |
-| 选模 | `det.save_best_metric`：map / loss（mAP@`eval_iou_thresh`，默认 0.1 医学小目标口径） |
+| 选模 | `det.save_best_metric`：map / loss（mAP@`det.eval_iou_thresh`，默认 0.1 医学小目标口径） |
 
 ---
 

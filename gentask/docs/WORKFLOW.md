@@ -3,18 +3,19 @@
 > 入口：`python -m gentask.train --config configs/gensr_2_5d_regression.yaml | gensr_2_5d_diffusion_adm.yaml`；
 > 推理：`python -m gentask.predict --config ... --ckpt ...`。
 > YAML `task.type='generation'` 启用生成任务（当前退化仅超分 `superres`），`task.algorithm` 选两类范式：
-> **regression**（前馈回归复原）与 **diffusion**（条件扩散采样）。数据/几何/优化基建与分割同构，
-> 输入输出几何、通道布局和视图关系统一由 `models.topology` 推导（唯一真相源）。
+> **regression**（前馈回归复原）与 **diffusion**（条件扩散采样）。数据/几何/优化基建与分割同构；
+> 配置为 taskcore 子类扩展（io/validation/make_data 委托 core）。几何与通道由
+> `taskcore.models.topology.build_topology` 推导（唯一真相源）。
 
 ---
 
 ## 0. 共享主干
 
 ```
-配置加载（task/data/model/train/predict dataclass + 校验）→ npz 发现（make_data 预烘包）
+配置加载（task/data/model/train/predict + 校验）→ npz 发现（make_data → taskcore.prepare_one）
  → Dataset 抽 max-FOV cube → GPU 同步 3D 增强（生成变体）→ Pipeline 中心裁剪/视图拆分
  → 模型 forward(hr)（内部在线退化 HR → LR 条件图，GPU、batch 级）→ 回归/扩散损失 → backward → EMA
- → 验证（degrade → restore → PSNR/SSIM 选模）
+ → 验证（degrade → restore → PSNR/SSIM 选模；_save_best 走 BaseTrainer）
  → 推理：NIfTI 整卷 → 滑窗 restore → 反归一化写出 *_sr.nii.gz
 ```
 
@@ -28,8 +29,8 @@
 ### 数据契约
 
 - 训练只读 npz（`data.npz_dir` 必设；空目录且 `npz_auto_build=true` 时内联调 `make_data.prepare_dataset` 从 NIfTI 烘焙）；
-- `make_data`：bbox 裁剪 + 预计算 fg 索引 → `<pid>.npz`，多 worker mmap 共享 OS page cache；
-- 可选逐样本条件卷（`data.cond_dirs`，如 mask/预分割）：独立强度窗归一化，随 image 同步空间变换；
+- `make_data`：委托 core（bbox + spacing/fg/meta skip）→ `<pid>.npz`；可选 `cond_dirs` 配对；
+- 可选逐样本条件卷（`data.cond_dirs`）：独立强度窗归一化，随 image 同步空间变换；`in_channels` 含 cond；
 - 无 label 参与训练：干净 HR 图自身即重建目标。
 
 ---

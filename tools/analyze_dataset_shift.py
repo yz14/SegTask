@@ -7,7 +7,7 @@
 patch_D 张切片，面内只 resize 到 patch_H×patch_W。因此模型学到的是训练集的"解剖体素尺度"。
 推理集若 spacing / FOV / 强度单位不同，进模型前的实际解剖尺度与强度分布就会偏移，导致假阳。
 
-本脚本复用 segtask_v1 的 preprocess_image / resize_3d，模拟"进模型前"的有效尺度，量化两集差异。
+本脚本复用 taskcore.data.dataset 的 preprocess_image / resize_3d（或本地等价实现），模拟"进模型前"的有效尺度，量化两集差异。
 
 用法::
 

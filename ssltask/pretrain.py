@@ -2,9 +2,9 @@
 
 示例：``python -m ssltask.pretrain --config configs/ssltask_genesis.yaml``。
 
-独立 task：用与下游同构的骨干（``segtask_v1.models.factory.build_model`` 的 enc/dec）
+独立 task：用与下游同构的骨干（``taskcore.models.factory.build_backbone(..., with_decoder=True)``）
 在**无标注** image patch 上做自监督预训练，产出 ``<output_dir>/ssl_best.pt``。随后下游
-分割/分类训练用 ``--override train.pretrain=<该路径>`` 即可经已有的非严格加载衔接
+分割/分类训练用 ``train.pretrain`` / ``cls.pretrained_ckpt`` / ``det.pretrained_ckpt`` 即可经非严格加载衔接
 （enc(+dec) 命中、任务头随机）。
 """
 

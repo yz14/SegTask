@@ -1,11 +1,11 @@
-"""clstask 配置：复用 ``segtask_v1.config.Config`` + 独立 ``ClsConfig``。
+"""clstask 配置：复用 ``taskcore.config.core.Config`` + 独立 ``ClsConfig``。
 
-设计（与 ssltask 同构）：**复用 ``segtask_v1.config.Config``** 作为
+设计（与 ssltask 同构）：**复用 ``taskcore.config.core.Config``** 作为
 data/model/train/... 的载体（几何派生：``patch_mode`` × ``build_topology`` →
 ``spatial_dims`` / ``in_channels``，与下游分割/SSL 逐位一致，保证 SSL 预训练
 encoder 权重可无缝迁移）；分类专属设置集中在 YAML 顶层 ``cls:`` 段：
 
-* ``cfg`` —— ``segtask_v1.config.Config``，喂给数据管线 / encoder 工厂 / 优化器；
+* ``cfg`` —— ``taskcore.config.core.Config``，喂给数据管线 / encoder 工厂 / 优化器；
 * ``cls`` —— :class:`ClsConfig`，仅分类任务读它。
 
 几何支持（与分割同一套 patch_mode 语义）：
@@ -38,7 +38,7 @@ from taskcore.config.registry import (
 
 logger = logging.getLogger(__name__)
 
-#: 支持的 backbone。'encoder' 复用 segtask Encoder（ResNet / ConvNeXt 由
+#: 支持的 backbone。'encoder' 复用 taskcore Encoder（ResNet / ConvNeXt 由
 #: ``cfg.model.unet.backbone`` 决定），SSL 预训练权重可直接迁移；densenet / vit 为
 #: clstask 自有实现（2D/3D 通用），无法吃 CNN Encoder 的 SSL 权重。
 BACKBONES = ("encoder", "densenet", "vit")
@@ -54,7 +54,7 @@ class ClsConfig:
     """分类任务专属设置（YAML 顶层 ``cls:`` 段）。
 
     与训练/数据基建有关的字段（batch/lr/epochs/patch_mode/...）一律沿用
-    ``segtask_v1.config.Config``（``cfg.model`` / ``cfg.train`` / ``cfg.data``）；
+    ``taskcore.config.core.Config``（``cfg.model`` / ``cfg.train`` / ``cfg.data``）；
     此处只放分类语义相关字段。
     """
 
@@ -79,7 +79,7 @@ class ClsConfig:
     num_classes: int = 0
 
     # ---- Backbone -----------------------------------------------------
-    # 'encoder'（复用 segtask Encoder；ResNet/ConvNeXt 由 cfg.model.unet.backbone 决定）
+    # 'encoder'（复用 taskcore Encoder；ResNet/ConvNeXt 由 cfg.model.unet.backbone 决定）
     # | 'densenet' | 'vit'。四模板 = resnet / convnext（经 encoder）+ densenet + vit。
     backbone: str = "encoder"
 

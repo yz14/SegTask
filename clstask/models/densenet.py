@@ -2,7 +2,7 @@
 
 DenseNet（Huang et al., CVPR 2017 best paper）是医学影像分类最常用的 CNN 之一
 （低参数量 + 特征复用 + 隐式深监督）。本实现为 BC 变体（bottleneck +
-compression），接口与 segtask ``Encoder`` 对齐：``forward(x) -> List[feat]``
+compression），接口与 taskcore ``Encoder`` 对齐：``forward(x) -> List[feat]``
 （逐 stage 特征，最后一项为最深特征），供统一的分类头使用。
 
 归一化/激活默认 instance + leakyrelu，与仓库 3D 小 batch 惯例一致（经典

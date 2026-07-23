@@ -2,11 +2,11 @@
 
 Vision Transformer（Dosovitskiy et al., ICLR 2021）标准实现：patch-embed
 （Conv stride=patch）→ 可学习位置编码 → Pre-LN Transformer block ×N →
-末 LN。接口与 segtask ``Encoder`` 对齐：``forward(x) -> List[feat]``，把
+末 LN。接口与 taskcore ``Encoder`` 对齐：``forward(x) -> List[feat]``，把
 token 序列 reshape 回特征图 ``(B, C, *grid)``（仅单尺度，list 长度 1），供
 统一的池化分类头使用（等价于 mean-token 池化，无 [CLS]）。
 
-drop-path 复用 segtask ``blocks.DropPath``。
+drop-path 复用 taskcore.models.blocks.DropPath。
 """
 
 from __future__ import annotations

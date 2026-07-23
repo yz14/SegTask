@@ -1,7 +1,7 @@
 """分类 patch 数据集：npz 卷 → (image patch, 分类 target)。
 
-复用 segtask 的 npz IO / 预处理（``preprocess_image`` / ``resize_3d`` /
-``extract_z_patch_padded``），patch 抽取口径与 segtask 各 patch_mode 逐位一致
+复用 taskcore 的 npz IO / 预处理（``preprocess_image`` / ``resize_3d`` /
+``extract_z_patch_padded``），patch 抽取口径与分割各 patch_mode 逐位一致
 （保证 SSL / 分割预训练 encoder 看到的输入分布一致）：
 
 * ``patch_mode='cubic'``  —— 3 轴随机中心 cube，越界 edge 复制（同

@@ -132,28 +132,40 @@ model:
 
     drop_path_rate : 0.0
 # LOSS — lift 下自动绕过 SliceChannelLoss
-loss:
-  name: "dice_focal"
-  compound_weights: [1.0, 1.0]
+seg:
+  loss:
+    name: "dice_focal"
+    compound_weights: [1.0, 1.0]
 
-  class_weights: [1.0, 1.0]
-  region_weights: [1.0, 4.0, 2.0]
+    class_weights: [1.0, 1.0]
+    region_weights: [1.0, 4.0, 2.0]
 
-  dice_smooth : 1.0e-5
-  dice_squared: false
+    dice_smooth : 1.0e-5
+    dice_squared: false
 
-  focal_alpha: 0.5
-  focal_gamma: 2.0
+    focal_alpha: 0.5
+    focal_gamma: 2.0
 
-  tversky_alpha: 0.3
-  tversky_beta : 0.7
+    tversky_alpha: 0.3
+    tversky_beta : 0.7
 
-  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+    deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
-  slice_loss_reduction: "per_volume"   # lift 下被忽略 (不走 SliceChannelLoss)
-  aux_supervision_weights: []
+    slice_loss_reduction: "per_volume"   # lift 下被忽略 (不走 SliceChannelLoss)
+    aux_supervision_weights: []
 
 
+  predict:
+    z_interleave_enabled: true
+    z_interleave_thresholds: [1.0, 1.5]
+    z_interleave_factors: [3, 2, 1]
+    z_overlap : 0.5
+    blend_mode: "gaussian"
+    batch_size: 4
+    tta_flip  : false
+    threshold : 0.5
+    output_dir: "predictions"
+    save_probabilities: false
 train:
   epochs: 100
 
@@ -198,14 +210,3 @@ train:
 
 
 # PREDICT — predictor 检测 lift_2_5d_to_3d 自动走 rank-5 + (B,num_fg,D,H,W) 输出
-predict:
-  z_interleave_enabled: true
-  z_interleave_thresholds: [1.0, 1.5]
-  z_interleave_factors: [3, 2, 1]
-  z_overlap : 0.5
-  blend_mode: "gaussian"
-  batch_size: 4
-  tta_flip  : false
-  threshold : 0.5
-  output_dir: "predictions"
-  save_probabilities: false

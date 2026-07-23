@@ -1,11 +1,12 @@
-"""任务段注册表（P2a）：组合式任务（cls / det / ssl）统一装配入口。
+"""任务段注册表：组合式任务（cls / det / ssl）统一装配入口。
 
 各任务在 ``config.py`` 模块 import 时注册 :class:`TaskSectionSpec`；
 ``load_task_config`` / ``save_task_config`` / ``apply_task_overrides``
 按段名查表，避免各任务重复样板 I/O。
 
-完整 P2a 后续：loss/predict 下沉 seg 任务段、gen 消 fork——本模块先
-收敛「核心 Config + 顶层任务段」的注册与 I/O 契约。
+契约：「核心 Config + 顶层任务段」。``seg:`` 的 loss/predict 经
+:class:`~taskcore.config.seg_task.SegTaskConfig` / :class:`~taskcore.config.seg_bundle.SegBundle`
+装配；gen 为 core 子类扩展（非平行 fork）。
 """
 
 from __future__ import annotations

@@ -2,10 +2,10 @@
 
 只负责 optimizer / scheduler / AMP / EMA / ckpt / 日志；"破坏→损失"全部交给
 :class:`ssltask.methods.base.SSLMethod`。优化器/调度器/AMP/EMA/输出目录/epochs/lr
-复用 segtask ``train.*`` 配置与工具（不另造轮子）。
+复用 taskcore ``train.*`` 配置与工具（不另造轮子）。
 
 产出 ckpt 的 ``model_state_dict`` 由 ``method.export_backbone_state_dict()`` 给出，键与
-``segtask_v1.models.factory.build_model`` 同名 → 下游 ``train.pretrain`` 非严格加载衔接。
+``taskcore.models.factory`` 同名 → 下游 ``train.pretrain`` / ``cls|det.pretrained_ckpt`` 非严格加载。
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class SSLTrainer(BaseTrainer):
         # 识别 sampler / batch_sampler）。
         self._setup_train_sampler()
 
-        # --- Optimizer + scheduler (复用 segtask train.*) ---
+        # --- Optimizer + scheduler (复用 taskcore train.*) ---
         # 关键：scheduler / warmup 只在“梯度累积边界”(= 一次 optimizer.step)推进，
         # 故其时钟必须用 **optimizer-step** 计数，而非 micro-batch 计数。否则
         # grad_accum_steps=k 时整段 schedule 只会走完约 1/k，warmup 被拉长 ~k 倍。
@@ -118,7 +118,7 @@ class SSLTrainer(BaseTrainer):
         self._setup_ema()
 
         # --- 通用增强（仅重建类方法，见 SSLMethod.trainer_augment）-----------
-        # 复用 segtask GPUAugmentor（cfg.augment 控制）：在 corruption/mask 之前
+        # 复用 taskcore GPUAugmentor（cfg.augment 控制）：在 corruption/mask 之前
         # 对 batch 图像做空间/强度增强，增强后图即新的自洽重建样本。SSL 为
         # 单 FOV（multi_res_scales==[1.0]），max_scale=1。
         # dataset 现统一输出 3D (B,1,D,H,W)（含 2.5D），因此 GPUAugmentor 的 3D

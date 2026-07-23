@@ -1,7 +1,9 @@
 # ssltask 自监督预训练流程总览
 
 > 入口：`python -m ssltask.pretrain --config configs/ssltask_<method>.yaml`；
-> 产出 `ssl_best.pt`，下游用 `train.pretrain=<路径>` 非严格加载衔接（enc(+dec) 命中，任务头随机）。
+> 产出 `ssl_best.pt`；下游衔接：
+> - 分割：`train.pretrain=<路径>`（strict=False）
+> - 分类/检测：优先 `cls.pretrained_ckpt` / `det.pretrained_ckpt`（亦可走 `train.pretrain`）
 > 训练循环对方法完全无感：数据/优化/AMP/EMA/ckpt 通用，"破坏→损失"全部封装在 `SSLMethod` 插件内。
 
 ---
@@ -9,12 +11,12 @@
 ## 0. 共享主干
 
 ```
-配置加载（复用 segtask 配置 + SSLConfig 叠加）→ npz 发现（image-only，无 train/val 划分）
+配置加载（taskcore Config + SSLConfig 叠加）→ npz 发现（image-only，无 train/val 划分）
  → Dataset 抽 patch（无标签，随机中心）
  → GPU 同步 3D 增强（仅重建类方法）→ z 中心裁剪 → 2.5D 折叠
  → method.compute_loss（差异点：破坏/掩码/多视图构造 + 目标）
  → backward → 梯度累积/裁剪 → optimizer/scheduler → EMA
- → 在线探针（表征质量选模）→ checkpoint（导出可迁移 encoder）
+ → 在线 SegProbe（表征质量选模）→ checkpoint（导出可迁移 encoder）
 ```
 
 ### 方法一页对比（`ssl.method`）
@@ -41,10 +43,10 @@
 ```
 【Dataset，CPU worker → (B, 1, eD, pH, pW)】
 npz 读取（仅读 image 键，image-only；不读 label/前景索引；worker 级 LRU 缓存）
- → 预处理（img 归一化，与下游 segtask 同参）
+ → 预处理（img 归一化，与下游分割同参）
  → 随机采样中心（2_5d/z_axis：随机 z；cubic：三轴随机；whole 不支持）
  → 抽 patch（z 含 oversample 余量，越界 edge-pad；
-   2_5d/z_axis：H/W 保持全尺寸整面 resize 到 (pH, pW)，不裁窗，与 segtask 同口径）
+   2_5d/z_axis：H/W 保持全尺寸整面 resize 到 (pH, pW)，不裁窗，与分割同口径）
 
 【Trainer，GPU】
 GPU 同步 3D 增强（仅 trainer_augment=True 的重建类；增强后图即新的自洽重建样本）
@@ -90,8 +92,9 @@ dino      multi-crop（global×2 + local×6，scale 按体积占比；翻转 + �
 dino_gram 上者 + Gram anchoring：进度 ≥ start_frac 后，学生 global 裁剪的密集特征
            Gram 矩阵逼近"早期 EMA 教师快照"；快照首次生效时锚定、
            每 dino_gram_refresh_steps 步刷新；L = L_DINO + λ·L_gram
-ibot      上者（DINO 全局项）+ iBOT 掩码密集项：新 global 裁剪按 ibot_mask_ratio 掩码
-           （mask-token 稠密输入）→ 被遮位点学生密集特征 vs 教师（看完整图）
+ibot      上者（DINO 全局项）+ iBOT 掩码密集项：复用 DINO 的 global 裁剪
+           （不再额外多裁剪），按 ibot_mask_ratio 掩码（mask-token 稠密输入）
+           → 被遮位点学生密集特征 vs 教师（看完整图）
            在原型上的逐位点交叉熵（独立/共享头）；L = L_DINO + λ·L_iBOT
 sparkdino 双分支共享学生 encoder：DINO 分支（同 dino）+ SparK 分支在原始整图上重建（同 spark）
            L = L_SparK + μ·L_DINO
@@ -110,7 +113,7 @@ jepa      EMA 目标编码器编码完整图 → 上下文编码器看遮后输�
 
 ---
 
-## 3. 通用训练技巧（复用 segtask `train.*` 配置）
+## 3. 通用训练技巧（复用 `train.*` 配置）
 
 | 技巧 | 说明 |
 |---|---|
@@ -126,7 +129,7 @@ jepa      EMA 目标编码器编码完整图 → 上下文编码器看遮后输�
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建即生效；SSL 特有 wrapper（投影头/predictor 等）激活占用小，刻意不包检查点 |
 | checkpoint | 原子写（临时文件 + os.replace）+ sha256 状态指纹；`save_async` 后台线程写盘；仅 rank0 落盘 |
 | resume | 全状态：method（含 teacher/queue/center buffer）+ optimizer/scheduler/scaler/EMA + RNG；指纹校验、方法名校验；rank>0 重新分流 RNG |
-| 监控 | 复用 segtask monitor：jsonl + HTML 仪表盘 + 梯度/权重健康指标（失败隔离不阻断训练） |
+| 监控 | 复用 taskcore.monitor：jsonl + HTML 仪表盘 + 梯度/权重健康指标（失败隔离不阻断训练） |
 
 ---
 
@@ -140,7 +143,7 @@ jepa      EMA 目标编码器编码完整图 → 上下文编码器看遮后输�
 ```
 
 - 探针数据组级（患者级）train/val 划分：同组绝不跨集；验证 patch 确定性 + 前景感知。
-- 在线分类探针（cls probe）：encoder + 全局池化 + MLP，多标签"每类是否出现"。
+- **离线**分类探针（ClsProbe）：encoder + 全局池化 + MLP，多标签「每类是否出现」；仅 `python -m ssltask.evaluate` 路径使用，**不**接入 `SSLTrainer` 训练环。
 - 离线 P6 评测（`python -m ssltask.evaluate`）：嵌套 few-shot 子集（大 shots 包含小 shots）
   + frozen / finetune 双读数 + from-scratch（B2）同路径基线，横向对比多份 SSL 权重。
 
@@ -149,9 +152,11 @@ jepa      EMA 目标编码器编码完整图 → 上下文编码器看遮后输�
 ## 5. 下游迁移
 
 ```
-ssl_best.pt（EMA 优先导出）/ ssl_last.pt / ssl_resume.pt（全状态续训）
- → model_state_dict 键与 segtask build_model 逐参数同名（encoder.* / decoder.*）
- → 下游 train.pretrain=<路径>（strict=False）：enc(+dec) 命中、任务头随机
+ssl_best.pt / ssl_last.pt（backbone 导出；若启用 EMA 则已 apply_shadow 烘焙进 model_state_dict）
+ssl_resume.pt（全状态续训，含 method/optim/EMA）
+ → model_state_dict 键与 taskcore build_backbone / build_model 同名（encoder.* / decoder.*）
+ → 分割：train.pretrain=<路径>（strict=False）
+ → 分类/检测：cls.pretrained_ckpt / det.pretrained_ckpt（或 train.pretrain）
 ```
 
 **一致性契约**：patch_size / patch_mode / 归一化参数须与下游任务一致（探针 encoder

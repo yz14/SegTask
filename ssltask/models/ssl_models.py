@@ -1,7 +1,7 @@
-"""自监督重建模型 + 构造器（复用 segtask_v1 骨干）。
+"""自监督重建模型 + 构造器（复用 taskcore 骨干）。
 
-``SSLReconModel`` = 与分割同构的 UNet 编/解码器（由 ``segtask_v1.models.factory.
-build_model`` 构建后复用其 ``encoder`` / ``decoder`` 子模块）+ 一个**独立命名**的重建头
+``SSLReconModel`` = 与分割同构的 UNet 编/解码器（由 ``taskcore.models.factory.
+build_backbone(..., with_decoder=True)`` 构建后复用其 ``encoder`` / ``decoder`` 子模块）+ 一个**独立命名**的重建头
 ``recon_head``（out_channels = 模型输入通道数）。
 
 关键设计：重建头名为 ``recon_head``（而非分割的 ``seg_head``），因此 SSL ckpt 与分割
@@ -43,7 +43,7 @@ class SSLReconModel(nn.Module):
         self.out_channels = int(out_channels)
         self.spatial_dims = int(spatial_dims)
         # patchN stem：decoder 最高分辨率 = 输入/stem_stride，forward 插值上采补回
-        # 输入分辨率（与 segtask UNet 主头同策略）。
+        # 输入分辨率（与 taskcore UNet 主头同策略）。
         self.stem_stride = int(encoder.stem_stride)
         self.recon_head = SegmentationHead(
             decoder.out_channels[-1], self.out_channels,
@@ -73,7 +73,7 @@ class SSLReconModel(nn.Module):
 def build_ssl_recon_model(cfg) -> SSLReconModel:
     """构造与分割同构的 SSL 重建模型。
 
-    复用 ``segtask_v1.models.factory.build_model`` 保证编/解码器与下游逐参数同名
+    复用 ``taskcore.models.factory.build_backbone(..., with_decoder=True)`` 保证编/解码器与下游逐参数同名
     同形 → SSL ckpt 可经下游已有的 ``train.pretrain`` 非严格加载干净衔接。
     分割头/深监督/aux 头在此被丢弃（仅取 encoder/decoder），不参与 SSL。
     """
@@ -136,7 +136,7 @@ class LightPixelHead(nn.Module):
 
 
 class SSLMIMModel(nn.Module):
-    """SimMIM 模型：复用 segtask 编码器 + ``LightPixelHead`` + 可学习 ``mask_token``。
+    """SimMIM 模型：复用 taskcore 编码器 + ``LightPixelHead`` + 可学习 ``mask_token``。
 
     forward(x): 被遮输入 (B, C, *spatial) → 重建 (B, C, *spatial)。掩码施加（用
     ``mask_token`` 替换被遮单元）由方法在 ``compute_loss`` 内完成；本模型只前向。

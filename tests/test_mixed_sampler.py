@@ -1,4 +1,4 @@
-"""Unit tests for ``segtask_v1.data.mixed_sampler`` + 双批混合配置校验。
+"""Unit tests for ``taskcore.data.mixed_sampler`` + 双批混合配置校验。
 
 CPU-only、不读盘。覆盖：
 

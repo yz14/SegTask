@@ -15,7 +15,7 @@ SparK 的 CNN 原生掩码图像建模。本实现遵守 ``TODO`` 决策 D4「�
 densify（被遮位点填入逐尺度可学习 ``mask_embed``），再逐级三线性上采样 + 融合同尺度
 encoder 横向特征，最终输出单通道重建。
 
-交接契约：``encoder`` 取自 ``segtask_v1.models.factory.build_backbone(cfg)``（逐
+交接契约：``encoder`` 取自 ``taskcore.models.factory.build_backbone(cfg)``（逐
 参数同名同形）；解码器命名为 ``spark_decoder.*``、嵌入为 ``spark_decoder.mask_embed.*``，
 **绝不复用** ``decoder.*``/``seg_head.*`` 前缀 → 下游 ``train.pretrain``（strict=False）
 仅命中 ``encoder.*``，其余作 unexpected 干净丢弃（MIM 不预训练解码器）。
@@ -147,7 +147,7 @@ def spark_encode(encoder: nn.Module, x: torch.Tensor, mask_full: torch.Tensor
 
     参数
     ----
-    encoder   : ``segtask_v1`` 的 :class:`Encoder`（非 hierarchical stem）。
+    encoder   : ``taskcore`` 的 :class:`Encoder`（非 hierarchical stem）。
     x         : (B, C, *spatial) 干净输入。
     mask_full : (B, 1, *spatial) {0,1} 全分辨率掩码（1=被遮）。
 
@@ -309,7 +309,7 @@ class SparkLightDecoder(nn.Module):
 
 
 class SSLSparkModel(nn.Module):
-    """SparK 模型：复用 ``segtask`` encoder + :class:`SparkLightDecoder`。
+    """SparK 模型：复用 ``taskcore`` encoder + :class:`SparkLightDecoder`。
 
     forward(x, mask_full): 干净输入 (B,C,*spatial) + 掩码 (B,1,*spatial) → 重建
     (B,C,*spatial)。掩码-稠密等价编码 + 层次解码（densify 后逐级上采样）。下游仅迁移

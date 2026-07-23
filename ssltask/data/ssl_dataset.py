@@ -3,12 +3,12 @@
 SSL 的价值来源是**大规模无标注**语料，故数据通路与分割的"标签耦合"管线解耦：
 本数据集只读 npz 的 ``image`` 键（``make_ssl_data`` 产出的 image-only npz，或任何含
 ``image`` 的既有 npz 皆可），**不读** label / fg_coords / fg_slices。抽取几何与
-segtask ``SegDataset3D``（``patch_mode=2_5d/z_axis``）逐字一致：仅沿 z 抽片
+taskcore ``SegDataset3D``（``patch_mode=2_5d/z_axis``）逐字一致：仅沿 z 抽片
 （越界 edge-pad），面内 H/W **整片 resize** 到 (pH,pW)（不裁窗），返回
 ``{"image": (1, eD, pH, pW)}``。
 
 底层 IO / 预处理 / 抽取（``open_npz`` / ``preprocess_image`` /
-``extract_z_patch_padded`` / ``resize_3d``）直接复用 ``segtask_v1.data.dataset``，
+``extract_z_patch_padded`` / ``resize_3d``）直接复用 ``taskcore.data.dataset``，
 不另造轮子。
 """
 
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_zaxis_mode(patch_mode: str) -> bool:
-    """与 segtask specs 同口径：2_5d/z_axis → z 抽片 + H/W 整片 resize；
+    """与 taskcore data specs 同口径：2_5d/z_axis → z 抽片 + H/W 整片 resize；
     cubic → 三轴立方体裁窗；其余（whole 等）SSL 不支持。"""
     pm = str(patch_mode).lower()
     if pm in ("2_5d", "z_axis"):
@@ -119,11 +119,11 @@ class ImageOnlyPatchDataset(Dataset):
 
     每个 epoch 的样本数 = ``len(paths) * samples_per_volume``；``__getitem__`` 内随机
     选体 + 随机 z 中心抽 z-cube（edge-pad），H/W 整片 resize 到 (pH,pW)，与
-    segtask ``SegDataset3D``（``patch_mode=2_5d/z_axis``）同口径。
+    taskcore ``SegDataset3D``（``patch_mode=2_5d/z_axis``）同口径。
 
     输出**统一为 3D** ``{"image": (1, pD, pH, pW)} fp32``（含 2.5D）：2.5D 的
     "深度 D 折进通道"改由 trainer 在**数据增强之后、送模型之前**统一折叠（与
-    segtask 的 ``squeeze_2_5d`` 送模型前口径一致），从而 3D ``GPUAugmentor`` 也
+    分割主线的 ``squeeze_2_5d`` 送模型前口径一致），从而 3D ``GPUAugmentor`` 也
     能作用于 2.5D 样本；不再在 dataset 层提前折叠。
     """
 
@@ -155,7 +155,7 @@ class ImageOnlyPatchDataset(Dataset):
                 f"patch_size must be 3D (D,H,W) for SSL image-only dataset; "
                 f"got {patch_size}.")
         # 仅 z 轴过采样：多抽 round(pD*ratio) 片，供增强后由 trainer 沿 z 中心裁回
-        # pD（与 segtask aug_oversample_ratio 口径一致，规避 flip/affine 边界伪影）。
+        # pD（与 taskcore/seg ``aug_oversample_ratio`` 口径一致，规避 flip/affine 边界伪影）。
         # 无标注、纯几何余量，不涉及前景。ratio==1.0 时 extract==patch（无余量）。
         self.oversample = float(aug_oversample_ratio)
         if self.oversample < 1.0:
@@ -183,7 +183,7 @@ class ImageOnlyPatchDataset(Dataset):
         self.sample_fg_ratio = float(sample_fg_ratio)
         self.sample_fg_thresh = float(sample_fg_thresh)
         self.sample_max_tries = max(int(sample_max_tries), 1)
-        # 逐 worker LRU 缓存（复用 segtask VolumeCache：pickle 到 worker 时清空），
+        # 逐 worker LRU 缓存（复用 taskcore VolumeCache：pickle 到 worker 时清空），
         # 避免 samples_per_volume>1 时每个 patch 都重新解压全卷。
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         logger.info(
@@ -230,7 +230,7 @@ class ImageOnlyPatchDataset(Dataset):
         _, pH, pW = self.patch
         eD = self.extract_size[0]
         if self.zaxis:
-            # 与 segtask SegDataset3D(2_5d/z_axis) 抽取口径一致：仅沿 z 抽 eD 片
+            # 与 taskcore SegDataset3D(2_5d/z_axis) 抽取口径一致：仅沿 z 抽 eD 片
             # （eD>=pD 含过采样余量，越界 edge-pad），面内 H/W 整片 resize 到
             # (pH,pW)（不裁窗，与下游 encoder 看到的空间尺度一致）。
             patch = extract_z_patch_padded(
@@ -261,7 +261,7 @@ class ImageOnlyPatchDataset(Dataset):
                         best_fg, patch = fg, cand
         t = torch.from_numpy(patch.astype(np.float32, copy=False))
         # 统一返回 3D (1,eD,pH,pW)；trainer 在增强后沿 z 中心裁回 pD，再（2.5D）
-        # 把深度折进通道（见 ssl_trainer._center_crop_z / _fold_batch），与 segtask 一致。
+        # 把深度折进通道（见 ssl_trainer._center_crop_z / _fold_batch），与分割主线一致。
         t = t.unsqueeze(0)                                            # (1,eD,pH,pW)
         return {"image": t}
 
@@ -270,7 +270,7 @@ class LabeledPatchDataset(Dataset):
     """从含 ``image`` + ``label`` 键的 npz 抽**配对** patch，供 §0.5 在线探针。
 
     与 :class:`ImageOnlyPatchDataset` 共用 IO/预处理与抽取几何（z 抽片 edge-pad +
-    H/W 整片 resize，同 segtask ``SegDataset3D``），额外读 ``label`` 并以 *同一 z
+    H/W 整片 resize，同 taskcore ``SegDataset3D``），额外读 ``label`` 并以 *同一 z
     中心* 抽取对齐的 label patch（resize 用最近邻 ``is_label=True`` 保整数取值）。
     label 为原始取值，前景二值化在探针侧按 ``label_values`` 完成。仅用于轻量评测，
     不进 SSL 训练主路径。
@@ -475,7 +475,7 @@ def build_ssl_dataloader(cfg, ssl=None) -> DataLoader:
 
     依据 ``cfg.model.spatial_dims`` 自动选 3D / 2.5D 折叠输出。2.5D（折叠 D 进通道）
     仅支持单 FOV：要求 ``in_channels == patch_size[0]``（即 ``multi_res_scales==[1.0]``）；
-    多 FOV 2.5D 需要数据增强级的多分辨率裁剪（segtask ``split_views_native_d``），
+    多 FOV 2.5D 需要数据增强级的多分辨率裁剪（``taskcore.engine.views.split_views_native_d``），
     暂不在 image-only SSL 通路内支持。
     """
     dc = cfg.data

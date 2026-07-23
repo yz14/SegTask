@@ -1,4 +1,4 @@
-"""检测训练器（复用 segtask 训练基建：optim / warmup / AMP / EMA）。
+"""检测训练器（复用 taskcore 训练基建：optim / warmup / AMP / EMA）。
 
 * 训练：patch + 变长框 → ``DetectorModel`` 损失 dict → 求和反传；
   head 内部损失已在 fp32 计算（focal / GIoU 数值敏感）。空间增强（flip）

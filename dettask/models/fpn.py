@@ -1,4 +1,4 @@
-"""FPN 适配层：segtask Decoder 金字塔 → 通道对齐的检测特征金字塔。
+"""FPN 适配层：taskcore Decoder 金字塔 → 通道对齐的检测特征金字塔。
 
 分割 ``Decoder`` 输出 ``[dec_low_res, ..., dec_high_res]`` 天然就是特征金字塔
 （Plan §3.2「Retina U-Net」思路）；本模块仅做 1×1 通道对齐 + 3×3 平滑，

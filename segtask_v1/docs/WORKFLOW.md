@@ -4,6 +4,8 @@
 
 四方案共用一条主干，差异只在两处：**① Dataset 怎么抽样本；② Pipeline 怎么把样本变成模型输入**。
 
+配置经 `segtask_v1.seg_config` 加载为 `SegBundle`。YAML 中 `loss`/`predict` 写在 **`seg:`** 段（仓库示例已迁入）；旧式顶层 `loss`/`predict` 仍经 `hoist_legacy_seg_sections` 兼容，与 `seg.*` 同设会报错。运行期仍可用 `cfg.loss` / `cfg.predict`（下表配置键同此口径）。
+
 ```
 配置加载/校验 → 样本发现 + train/val 划分（可分层/按组）→ npz 自动烘焙(可选)
  → Dataset 抽样本（差异点①）
@@ -130,7 +132,8 @@ GPU 同步 3D 增强（空间变换 img/lbl/wmap 同步；强度变换仅 img）
 视图拆分（各 scale 同中心裁 + z resize 回 D → (B,n_views,D,H,W)；单分辨率透传）
  → 折叠 2D（(B,n_views,D,H,W) → (B,n_views·D,H,W)；lbl 取 view 0）
 
-【Pipeline：Slab2_5DNativeDPipeline → (B, ΣD_k, H, W)】keep_native_view_depth=true
+【Pipeline：Slab2_5DNativeDPipeline → (B, ΣD_k, H, W)】
+keep_native_view_depth=true（校验还要求 model.aux_seg_supervision=True）
 视图拆分（各 scale 同中心裁，保留原生 D_k 不 resize）
  → 折叠 2D（逐视图沿通道拼接 → (B,ΣD_k,H,W)；主 lbl 取 view 0，
    aux lbl 逐视图保原生 D_k 供 aux head 监督）
@@ -183,7 +186,7 @@ checkpoint 加载 → NIfTI 读取
 | 技巧 | 配置键 | 说明 |
 |---|---|---|
 | 优化器 | `train.optimizer` | adam / adamw / sgd(+nesterov) |
-| 调度器 + warmup | `train.scheduler` / `warmup_epochs` | cosine / warm_restarts / poly / step / plateau / one_cycle |
+| 调度器 + warmup | `train.scheduler` / `warmup_epochs` | cosine / cosine_warm_restarts / poly / step / plateau / one_cycle |
 | 梯度累积 | `train.grad_accum_steps` | 等效 batch = batch_size × 此值 |
 | 梯度裁剪 | `train.grad_clip_norm` | 全局范数裁剪；非有限 loss/grad 自动跳步保护 |
 | EMA | `train.use_ema` / `ema_decay` / `ema_warmup` | 权重指数滑动平均，验证/选模用 shadow |

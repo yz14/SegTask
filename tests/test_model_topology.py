@@ -1,4 +1,4 @@
-"""Unit tests for ``segtask_v1.models.topology``.
+"""Unit tests for ``taskcore.models.topology``.
 
 CPU-only / 不构造真模型，仅校验派生字段。覆盖：
 

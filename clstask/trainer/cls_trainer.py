@@ -1,4 +1,4 @@
-"""分类训练器（复用 segtask 训练基建：optim / warmup / AMP / EMA / GPU 增强）。
+"""分类训练器（复用 taskcore 训练基建：optim / warmup / AMP / EMA / GPU 增强）。
 
 与 ``gentask.GenerationTrainer`` 同构的独立精简训练器：
 
@@ -120,7 +120,7 @@ class ClsTrainer(BaseTrainer):
         self._setup_ddp()
         self._setup_train_sampler()
 
-        # GPU 增强（复用 segtask GPUAugmentor）：在未折叠的 (B,1,D,H,W) 上
+        # GPU 增强（复用 taskcore GPUAugmentor）：在未折叠的 (B,1,D,H,W) 上
         # 对 image+label 联合施加，增强后派生分类 target 再折叠（见
         # ClsPatchDataset 的 gpu_augment 模式）。
         # 逐 rank 分流的独立增强 RNG（与 seg trainer 同构）；_prepare_batch 传入

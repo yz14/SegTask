@@ -7,7 +7,7 @@ scheduler / AMP / EMA / ckpt / 日志，方法负责目标本身。新增方法 
 在 ``ssltask.methods`` 注册表登记，零改训练循环。
 
 约定的不变量（保证 SSL→下游交接）：``export_backbone_state_dict`` 返回的 state_dict
-的键必须与 ``segtask_v1.models.factory.build_model`` 逐参数同名（``encoder.*`` /
+的键必须与 ``taskcore.models.factory.build_model`` / ``build_backbone`` 逐参数同名（``encoder.*`` /
 ``decoder.*`` / 方法附加头），下游 ``train.pretrain``（strict=False）即可命中 enc(+dec)。
 """
 
@@ -77,7 +77,7 @@ class SSLMethod(ABC):
     #: 注册键（与 ``SSLConfig.method`` / ``ssltask.config.METHODS`` 对齐）。
     name: str = ""
 
-    #: 是否接受 trainer 级通用增强（segtask ``GPUAugmentor``，由 ``cfg.augment``
+    #: 是否接受 trainer 级通用增强（taskcore ``GPUAugmentor``，由 ``cfg.augment``
     #: 控制）。重建类方法（破坏/掩码→重建，输入与目标同源）置 True——增强后的
     #: 图即新的自洽样本；视图类方法（dino/byol/moco/jepa）自带多视图增广管道，
     #: 置 False 以免与其视图变换叠加改变方法语义。

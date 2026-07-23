@@ -62,9 +62,9 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 - D2 迁移契约集中在 `model_migration.py`：扁平↔嵌套双向映射 + 新旧同设 fail-fast（`route_legacy_model_dict`, `model_migration.py:214-257`），无静默优先级。
 - 跨段一致性预警到位：`prefetch_to_gpu` 需 `pin_memory`（`core.py:2264-2269`）、`zscore` 下增强绝对幅值提示（`core.py:1906-1926`）、平移边缘复制带超出 oversample 余量提示（`core.py:1859-1875`）等。
 
-**（2）一致性欠账 / 可优化（非阻断，建议 TODO 3 收敛）**
-- **[中] gen fork 重复 `_dataclass_from_dict`**：`gentask/config/io.py:69-142` 与 `core.py:2482-2553` 近乎逐字重复（含 `_FIELD_ALIASES`/`_DEPRECATED_DERIVED_KEYS`/`_REMOVED_KEYS`/`load_config`/`save_config`）。**且两份已经出现行为分叉**：core 的 `_dataclass_from_dict` 不用 `_SUB_CONFIGS` 兜底（该常量仅被 `segtask_v1/launcher/schema.py:30` 外部消费），gen 版加了 `if sub_cls is None and k in _SUB_CONFIGS` 兜底（`io.py:114-115`）。这正是"双轨 fork"的实际维护成本：core 若新增一条 `_REMOVED_KEYS`，gen 不会自动获得。建议把 core `_dataclass_from_dict` 泛化出 `extra_flat_to_nested` 与 `sub_configs` 两个参数后供 gen 直接复用（可消 ~100 行重复，属低风险高价值重构）。
-- **[中] P2a 债：`loss`/`predict` 段仍以 seg 形常驻 core `Config`**：组合式任务（cls/det/ssl）靠 `skip_core_validators=("loss","predict")`（`registry.py:30, 84-88`）跳过校验绕开，但这两段仍随 core 序列化/存在于对象上，属"存在但对该任务无意义"的状态。README 已承认为 P2a 后续。建议方向：把 seg 专属的 loss/predict 下沉为 seg 的任务段（与 cls/det/ssl 对称），core 只保留真正五任务共享的字段。
+**（2）一致性欠账 / 可优化（非阻断；历史记录——已由 TODO 3 R1/R2/R7 关闭）**
+- ~~**[中] gen fork 重复 `_dataclass_from_dict`**~~ → **✅ R1**：core `DataclassLoadContext` + gen `io` 委托。
+- ~~**[中] P2a：`loss`/`predict` 常驻 core**~~ → **✅ R2**：`SegTaskConfig` / `SegBundle` / `seg:`。
 - **[低] `coerce_override_value` 类型分支不一致**：~~`old is None` 走 `yaml.safe_load`、`list` 走 `json.loads`~~ → **✅ 已修（2026-07-22）**：list 统一 `yaml.safe_load`。
 - **[低] `apply_dotted_overrides` 静默忽略非法项**：~~无 `=` 的 override 被 `continue` 直接吞掉~~ → **✅ 已修（2026-07-22）**：非空且无 `=` 项发 warning。
 - **[低] `coerce_override_value` bool 静默 False**：~~非真值串一律判 False~~ → **✅ 已修（2026-07-22）**：非法 bool 串抛 `ValueError`。
@@ -72,7 +72,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 **（3）2026 SOTA 对标（借思路，不建议迁移）**
 - 当前手写 override（`coerce_override_value`/`set_dotted_attr`）本质是 OmegaConf dotlist 的迷你实现；集中式 `validate()` 是 pydantic v2 校验的手写版。考虑到"范围克制"、现有系统成熟且测试完备、迁移会改变错误语义与依赖重量，**不建议迁移到 Hydra/OmegaConf 或 pydantic**。仅记录：若未来需要配置组合(config groups)/多组网格实验(multirun sweep)，OmegaConf structured configs + `from_dotlist` 是业界标准迁移目标；届时可先只替换 override 层（低风险切入点）。
 
-**结论**：配置层质量高，无需在 TODO 1 内改动。真正值得做的两项（gen fork 去重、loss/predict 下沉）本质是 TODO 3「抽离通用框架」的一部分，留待 TODO 3 统一处理；本轮仅记录证据与方向。下一步 Step B（`models/` 模型层）。
+**结论**：配置层质量高。~~两项欠账（gen fork、loss/predict 下沉）~~ 已在 TODO 3 关闭。下一步 Step B（`models/` 模型层）。
 
 ### Step B · `taskcore/models/` 模型层审查（2026-07-22）
 
@@ -134,7 +134,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 - **[低·已修] `surface_dice_batch_stats` 用裸 assert 校验 rank**（`metrics.py`）：**✅ 已修（2026-07-22）** → `ValueError`。
 - **[低] `compute_dice_per_class` batch 全空类返 0**（`metrics.py:40-42`）：该 0 进 mean 会拉低均值（nnU-Net 惯例是空类不计入）。调用方多用 pooled 版（`dice_batch_stats`）不受影响，仅提醒勿把该函数用于含"常空类"的选模路径。
 - **[低] MetricsLogger 每 epoch 全量重写 jsonl+summary 且各 fsync 一次**（`history.py:341-353`）：数千 epoch 时 O(n) 重写；体量小无实际问题，若未来接 step 级记录需改追加+定期压实。
-- **[低] `seed_everything` 顺带改全局 TF32/benchmark**（`utils/common.py:300-311`）：deterministic=False 分支强制开 benchmark/TF32，属"设种子"函数的隐藏副作用。行为合理，建议 TODO 3 抽框架时拆成显式 `configure_backends()`。
+- **[低] `seed_everything` 顺带改全局 TF32/benchmark**（`utils/common.py:300-311`）：deterministic=False 分支强制开 benchmark/TF32，属"设种子"函数的隐藏副作用。行为合理；已归档至 TODO 3 关闭后的独立 backlog（`configure_backends` 拆分）。
 - **[低·微优化] ModelEMA CPU offload 每步整流 `synchronize()`**（`common.py:120-121`）：整流同步会等该流全部工作完成，比 `torch.cuda.Event` 只等 D2H 拷贝粗。收益取决于 update 时点流上负载，属可选微优化。
 
 **全局串联核查（只列风险项）**：
@@ -157,7 +157,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 | 接近生产 EDM2（3-view、128²、seg 通道宽度） | ✅ | peak ~693 MB |
 | 显存摸底（EDM2 seg 通道宽，仅模型前反向） | ✅ | bs=4, patch 256² → ~2.1 GB；`seg2_5d_edm2.yaml` 配置在 16G 卡上模型侧余量充足 |
 
-- **仍开放、不归 TODO 1（建议 TODO 3 或按需）**：bf16 非有限守护同步开销优化；NSD bbox 裁剪加速；gen fork 去重；loss/predict 下沉；扩散 SDPA；ADM linear-attn zero-init；plateau 未调 `step_epoch` 告警；data/model 侧残留 `assert` 等。
+- **仍开放、不归 TODO 1（已归档独立 backlog / 随 TODO 3 关闭）**：bf16 非有限守护同步开销；NSD bbox 裁剪加速；~~gen fork 去重~~✅；~~loss/predict 下沉~~✅；扩散 SDPA；ADM linear-attn zero-init；plateau `step_epoch` 告警等。
 - **记录项、无需行动**：Mamba backbone、Hydra/pydantic 迁移、fg_slices 口径、IndexScheme.BLOCKED LRU、one_cycle 时钟欠步等。
 
 **→ TODO 1 可结项。下一步建议 TODO 2（分割项目审查）。**
@@ -205,7 +205,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 - cls/det/ssl registry 配置 I/O；`_COMPOSITE_SKIP_CORE=()`（R2）
 - 增强核心 `Companion` 在 core；gen 薄封装是契约胶水
 - checkpoint 统一 `BaseTrainer._save_best` + `extract_model_state_dict`
-- shim 仅保留 4 个声明入口（`segtask_v1/config.py`、`data/make_data.py`、`monitor`×2）
+- shim：**声明式入口**收敛为 4 个（`segtask_v1/config.py`、`data/make_data.py`、`monitor`×2）；seg/gen 包内仍有大量文件级 re-export shim，新代码直连 `taskcore`
 - **R7**：gen `data`/`augment` 全委托、`2_5d` 委托几何段（`check_channel_layout=False`，因 gen in_channels 含 cond）；stem/stage 共享 `section_validators.py`；model arch allowlist 故意分叉（gen: edsr/rcan；core: mednext/…）
 
 ---
@@ -222,7 +222,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 
 4. ~~checkpoint 统一~~ → R4
 5. ~~augment GPU 等价~~ → R5
-6. ~~shim 清理~~ → R6（余 4）
+6. ~~shim 清理~~ → R6（声明入口余 4；文件级 re-export 仍保留兼容）
 7. ~~data 路径 `assert`~~ → R7：`dataset.py`/`loader.py` 改异常；**模型/prefetch 内断言**保留为内部不变量（见 backlog）
 8. TTA 键名 / one_cycle 欠步 / memory 估计近似 → **维持记录，不改**
 
@@ -278,7 +278,7 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 | **R3** | gen make_data → core | ✅ |
 | **R4** | checkpoint → `_save_best` | ✅ |
 | **R5** | augment GPU 固定 seed | ✅ |
-| **R6** | shim 清理（余 4） | ✅ |
+| **R6** | shim 清理（声明入口余 4） | ✅ |
 | **R7** | validation 委托 + hoist fail-fast + specs/assert | ✅ |
 
 **→ R7 已完成（2026-07-23）**：gen validation `data`/`augment` 全委托 `CoreConfig`；`2_5d` 委托几何段且 `check_channel_layout=False`（gen `in_channels` 含 cond，不可套用 seg 的 `D*n_views`）；`section_validators` 共享 stem/stage；`hoist_legacy_seg_sections` 新旧并存 fail-fast；`DatasetCommonCfg.from_cfg` 用 `Any`+`getattr(loss)`；data 路径 assert→异常。回归：`tests/test_todo3_r7_close.py`。

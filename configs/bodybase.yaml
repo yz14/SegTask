@@ -106,28 +106,44 @@ model:
     skip_mode      : "cat"  # 'cat' | 'add'
 
     drop_path_rate : 0.0
-loss:
-  name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
-  compound_weights: [1.0, 1.0]
+seg:
+  loss:
+    name: "dice_focal"             # 'dice' | 'dice_ce' | 'dice_focal' | 'dice_focal_tversky' | ...
+    compound_weights: [1.0, 1.0]
 
-  class_weights : [1.0]       # 长度 = 前景类数 (不含 bg)
-  region_weights: [1.0, 5.0]  # 按 label_values 全长 (含 bg)
+    class_weights : [1.0]       # 长度 = 前景类数 (不含 bg)
+    region_weights: [1.0, 5.0]  # 按 label_values 全长 (含 bg)
 
-  dice_smooth : 1.0e-5
-  dice_squared: false
+    dice_smooth : 1.0e-5
+    dice_squared: false
 
-  focal_alpha: 0.5
-  focal_gamma: 2.0
+    focal_alpha: 0.5
+    focal_gamma: 2.0
 
-  tversky_alpha: 0.3
-  tversky_beta : 0.7
+    tversky_alpha: 0.3
+    tversky_beta : 0.7
 
-  deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
+    deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]
 
-  slice_loss_reduction: "per_volume"
+    slice_loss_reduction: "per_volume"
 
-  aux_supervision_weights: [0.5, 0.5]
+    aux_supervision_weights: [0.5, 0.5]
 
+
+  predict:
+    z_interleave_enabled   : true
+    z_interleave_thresholds: [0.8, 1.2, 1.6, 2.0]
+    z_interleave_factors   : [5, 4, 3, 2, 1]
+    adabn_enabled    : false
+    adabn_mode       : "per_volume"  # "global | per_volume"
+    adabn_num_volumes: 8         # global 模式预热卷数
+    z_overlap : 0.5
+    blend_mode: "gaussian"          # 'gaussian' | 'constant'
+    batch_size: 4
+    tta_flip  : false
+    threshold : 0.6
+    output_dir: ""
+    save_probabilities: false
 
 train:
   epochs: 200
@@ -175,17 +191,3 @@ train:
   pretrain_strict: false
   pretrain_load_ema: false
 
-predict:
-  z_interleave_enabled   : true
-  z_interleave_thresholds: [0.8, 1.2, 1.6, 2.0]
-  z_interleave_factors   : [5, 4, 3, 2, 1]
-  adabn_enabled    : false
-  adabn_mode       : "per_volume"  # "global | per_volume"
-  adabn_num_volumes: 8         # global 模式预热卷数
-  z_overlap : 0.5
-  blend_mode: "gaussian"          # 'gaussian' | 'constant'
-  batch_size: 4
-  tta_flip  : false
-  threshold : 0.6
-  output_dir: ""
-  save_probabilities: false
