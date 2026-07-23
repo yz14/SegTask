@@ -46,6 +46,8 @@ from taskcore.config.core import (  # noqa: E402
     Config, DataConfig, ModelConfig, LossConfig, TrainConfig, AugConfig,
     PredictConfig,
 )
+from taskcore.config.seg_bundle import SegBundle, merge_seg_bundle  # noqa: E402
+from taskcore.config.seg_task import SegTaskConfig  # noqa: E402
 from taskcore.data.dataset import SegDataset3D  # noqa: E402
 from segtask_v1.losses.losses import SliceChannelLoss, build_loss  # noqa: E402
 from taskcore.models.factory import build_model  # noqa: E402
@@ -67,29 +69,33 @@ def _make_cfg(
     aux_head_mode: str = "linear",
     encoder_channels=(16, 32, 64, 128),
 ):
-    cfg = Config(
-        data=DataConfig(
-            image_dir="dummy", label_dir="dummy",
-            label_values=[0, 1, 2], num_classes=3,
-            patch_size=list(patch_size),
-            patch_mode=patch_mode,
-            multi_res_scales=list(multi_res_scales),
-            keep_native_view_depth=keep_native_view_depth,
-            z_boundary_mode=z_boundary_mode,
+    cfg = merge_seg_bundle(
+        Config(
+            data=DataConfig(
+                image_dir="dummy", label_dir="dummy",
+                label_values=[0, 1, 2], num_classes=3,
+                patch_size=list(patch_size),
+                patch_mode=patch_mode,
+                multi_res_scales=list(multi_res_scales),
+                keep_native_view_depth=keep_native_view_depth,
+                z_boundary_mode=z_boundary_mode,
+            ),
+            augment=AugConfig(enabled=False),
+            model=ModelConfig(
+                encoder_channels=list(encoder_channels),
+                blocks_per_level=1,
+                stem_fusion_mode=stem_fusion_mode,
+                aux_seg_supervision=aux_seg_supervision,
+                aux_head_mode=aux_head_mode,
+                stem_mode="conv3",
+                decoder_type="unet",
+            ),
+            train=TrainConfig(epochs=1, output_dir=str(ROOT / "outputs" / "tmp")),
         ),
-        augment=AugConfig(enabled=False),
-        model=ModelConfig(
-            encoder_channels=list(encoder_channels),
-            blocks_per_level=1,
-            stem_fusion_mode=stem_fusion_mode,
-            aux_seg_supervision=aux_seg_supervision,
-            aux_head_mode=aux_head_mode,
-            stem_mode="conv3",
-            decoder_type="unet",
+        SegTaskConfig(
+            loss=LossConfig(name="dice_bce", slice_loss_reduction="per_volume"),
+            predict=PredictConfig(),
         ),
-        loss=LossConfig(name="dice_bce", slice_loss_reduction="per_volume"),
-        train=TrainConfig(epochs=1, output_dir=str(ROOT / "outputs" / "tmp")),
-        predict=PredictConfig(),
     )
     cfg.sync()
     return cfg

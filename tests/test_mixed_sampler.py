@@ -157,6 +157,15 @@ def test_source_tagged_forwards_attributes():
     assert tagged.some_attr == [1, 2, 3]
 
 
+def test_source_tagged_pickle_roundtrip():
+    import pickle
+    tagged = SourceTaggedDataset(_DictDataset(3, "gold"), SOURCE_PRIMARY)
+    restored = pickle.loads(pickle.dumps(tagged))
+    assert len(restored) == 3
+    assert int(restored[1]["source"]) == SOURCE_PRIMARY
+    assert restored[1]["marker"] == "gold"
+
+
 # ---------------------------------------------------------------------------
 # Config validation
 # ---------------------------------------------------------------------------

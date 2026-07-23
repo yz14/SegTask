@@ -39,9 +39,82 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.6"
+_TOOL_VERSION = "make_data/1.8"  # 1.8: spacing_zyx=stored spacing; skip checks label_values/fg_subsample
 
-# 同 SegDataset3DCubic._build_index 上限；可由 CLI 覆盖。
+# skip 幂等时要求 on-disk meta 至少具备这些键（旧包缺键则触发重生成）。
+_REQUIRED_SKIP_META_KEYS = (
+    "label_counts",
+    "image_shape",
+    "fg_per_class",
+)
+
+# 同 _GEOM_SPACING_ATOL：target_spacing 比对容差 (mm)。
+_META_SPACING_ATOL = 1e-3
+
+def _read_npz_meta(path: Path) -> Optional[dict]:
+    """只读 npz 内 ``meta`` 对象（不解码 image/label），供 skip 前快速比对。"""
+    try:
+        with np.load(path, allow_pickle=True) as zf:
+            if "meta" not in zf.files:
+                return None
+            raw = zf["meta"]
+            return dict(raw.item()) if hasattr(raw, "item") else dict(raw)
+    except Exception as exc:
+        logger.warning("Cannot read meta from %s: %s", path, exc)
+        return None
+
+
+def _npz_meta_allows_skip(
+    meta: Optional[dict],
+    *,
+    spacing_normalization: bool,
+    target_spacing: Optional[List[float]],
+    label_values: Optional[List[int]] = None,
+    fg_subsample: Optional[int] = None,
+) -> tuple[bool, str]:
+    """判断既有 npz 是否可与当前打包参数幂等 skip。"""
+    if meta is None:
+        return False, "missing or unreadable meta"
+    for key in _REQUIRED_SKIP_META_KEYS:
+        if key not in meta:
+            return False, f"missing meta key {key!r} (stale package)"
+    on_disk_norm = bool(meta.get("spacing_normalized", False))
+    if on_disk_norm != bool(spacing_normalization):
+        return False, (
+            f"spacing_normalized mismatch: on-disk={on_disk_norm} "
+            f"!= requested={spacing_normalization}")
+    if spacing_normalization:
+        on_disk_ts = meta.get("target_spacing")
+        req_ts = ([float(s) for s in target_spacing]
+                  if target_spacing is not None else None)
+        if on_disk_ts is None and req_ts is None:
+            pass
+        elif on_disk_ts is None or req_ts is None:
+            return False, (
+                f"target_spacing mismatch: on-disk={on_disk_ts} "
+                f"!= requested={req_ts}")
+        elif (len(on_disk_ts) != len(req_ts)
+              or not np.allclose(on_disk_ts, req_ts,
+                                 rtol=0.0, atol=_META_SPACING_ATOL)):
+            return False, (
+                f"target_spacing mismatch: on-disk={on_disk_ts} "
+                f"!= requested={req_ts}")
+    if label_values is not None:
+        on_disk_lv = meta.get("label_values")
+        req_lv = [int(v) for v in label_values]
+        if on_disk_lv is None or [int(v) for v in on_disk_lv] != req_lv:
+            return False, (
+                f"label_values mismatch: on-disk={on_disk_lv} "
+                f"!= requested={req_lv}")
+    if fg_subsample is not None and "fg_subsample" in meta:
+        on_disk_fg = int(meta["fg_subsample"])
+        if on_disk_fg != int(fg_subsample):
+            return False, (
+                f"fg_subsample mismatch: on-disk={on_disk_fg} "
+                f"!= requested={int(fg_subsample)}")
+    return True, ""
+
+
 _DEFAULT_FG_SUBSAMPLE = 50_000
 
 
@@ -162,23 +235,42 @@ def prepare_one(
     compress: bool = False,
     overwrite: bool = False,
     spacing_normalization: bool = False,
-    target_spacing: Optional[List[float]] = None) -> Dict[str, object]:
+    target_spacing: Optional[List[float]] = None,
+    cond_paths: Optional[List[str]] = None) -> Dict[str, object]:
     """为单样本生成 npz 包；默认幂等（除非 overwrite）。返状态 dict (pid/status/size/耗时/...)。
-    spacing_normalization=True 且 target_spacing 非空时把 image/label/rw 从原生 spacing
-    重采样到 target_spacing（numpy 轴序 (D,H,W) mm）后再落盘。"""
+    spacing_normalization=True 且 target_spacing 非空时把 image/label/rw/cond 从原生 spacing
+    重采样到 target_spacing（numpy 轴序 (D,H,W) mm）后再落盘。
+    ``cond_paths`` 为可选条件体路径列表（生成任务）；与 image 同 bbox 裁剪后按 channel stack。
+    """
     out_p = Path(out_path)
+    expect_cond = bool(cond_paths)
     if out_p.is_file() and not overwrite:
-        return {"pid": pid, "status": "skipped",
-                "size_bytes": out_p.stat().st_size, "elapsed_s": 0.0}
+        meta = _read_npz_meta(out_p)
+        ok, reason = _npz_meta_allows_skip(
+            meta,
+            spacing_normalization=spacing_normalization,
+            target_spacing=target_spacing,
+            label_values=label_values,
+            fg_subsample=fg_subsample)
+        if ok and expect_cond and not bool((meta or {}).get("has_cond")):
+            ok, reason = False, "missing cond (stale package)"
+        if ok:
+            return {"pid": pid, "status": "skipped",
+                    "size_bytes": out_p.stat().st_size, "elapsed_s": 0.0}
+        logger.warning(
+            "pid=%s: existing npz at %s does not match current packing "
+            "parameters (%s); regenerating.",
+            pid, out_p, reason)
 
     t0 = time.perf_counter()
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
-    # 0. 物理几何校验：label/bbox/rw 必须与 image 共 spacing/origin/direction
-    #    （shape 相等不蒴含共坐标系；只读头，成本可忽略）。
+    # 0. 物理几何校验：label/bbox/rw/cond 必须与 image 共 spacing/origin/direction
+    #    （shape 相等不蕴含共坐标系；只读头，成本可忽略）。
     _check_physical_geometry(
         pid, image_path,
-        [("label", label_path), ("bbox", bbox_path), ("rw", rw_path)])
+        [("label", label_path), ("bbox", bbox_path), ("rw", rw_path)]
+        + [(f"cond{i}", c) for i, c in enumerate(cond_paths or [])])
 
     # 1. mask → bbox（无/空为 None）。
     bbox = _bbox_from_mask_path(bbox_path)
@@ -216,6 +308,19 @@ def prepare_one(
                 "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
                 pid, rw_min, rw_max, is_integer_valued)
 
+    # 4b. 条件体：与 image 1:1 对齐、同 bbox 裁剪；按 channel stack。
+    cond: Optional[np.ndarray] = None
+    if cond_paths:
+        cond_vols: List[np.ndarray] = []
+        for cpath in cond_paths:
+            cvol = load_nifti_cropped(cpath, bbox=bbox, dtype=np.float32)
+            if cvol.shape != image.shape:
+                raise ValueError(
+                    f"cond shape {cvol.shape} != image shape {image.shape} "
+                    f"for pid={pid} (cond={cpath})")
+            cond_vols.append(cvol)
+        cond = np.stack(cond_vols, axis=0).astype(np.float32, copy=False)
+
     # 4.5 物理 spacing 归一化（可选）：把 bbox-裁剪后的体积重采样到 target_spacing。
     #     在 fg 索引/shape 记录之前做，保证下游全部落在归一化坐标系。
     #     orig_spacing 无论归一化与否都记录（make_data≥1.6），使未归一化 npz 也
@@ -230,6 +335,12 @@ def prepare_one(
         if rw is not None:
             # rw 为离散权重，用近邻保值。
             rw = resample_to_spacing(rw, src, tgt, is_label=True)
+        if cond is not None:
+            # cond 按通道独立重采样（连续值，用线性插值）。
+            cond = np.stack(
+                [resample_to_spacing(cond[c], src, tgt, is_label=False)
+                 for c in range(cond.shape[0])],
+                axis=0).astype(np.float32, copy=False)
         spacing_normalized = True
 
     # 5. 裁剪坐标系下的前景索引（逐类，供类均衡前景采样）。
@@ -250,9 +361,11 @@ def prepare_one(
         "src_label"   : str(label_path),
         "src_bbox"    : str(bbox_path) if bbox_path else "",
         "src_rw"      : str(rw_path) if rw_path else "",
+        "src_cond"    : list(map(str, cond_paths)) if cond_paths else [],
         "bbox"        : (list(map(list, bbox)) if bbox is not None else None),
         "label_values": list(map(int, label_values)),
         "has_rw"      : rw is not None,
+        "has_cond"    : cond is not None,
         "rw_shift"    : 1.0,
         "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
         "image_dtype" : str(image.dtype),
@@ -260,9 +373,15 @@ def prepare_one(
         "fg_per_class": True,   # fg_coords 逐类 cap；含 *_cls 类对齐数组
         "label_counts": label_counts,  # {label_value: voxel_count}，精确不抑采（make_data≥1.3）
         "spacing_normalized": spacing_normalized,
-        "orig_spacing" : orig_spacing,   # [sz,sy,sx] mm 或 None（未归一化）
+        "orig_spacing" : orig_spacing,   # 原生头 spacing [sz,sy,sx] mm
+        # 落盘体素物理 spacing：归一化后为 target，否则等于 orig。
+        # gen 历史键 spacing_zyx 取此值（勿再恒等于 orig，避免归一化后错位）。
+        "spacing_zyx"  : ([float(s) for s in target_spacing]
+                          if spacing_normalized and target_spacing is not None
+                          else orig_spacing),
         "target_spacing": ([float(s) for s in target_spacing]
                            if spacing_normalized else None),
+        "fg_subsample": int(fg_subsample),
         "made_at"     : datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
@@ -281,6 +400,8 @@ def prepare_one(
         "meta"     : meta_arr}
     if rw is not None:
         payload["rw"] = rw
+    if cond is not None:
+        payload["cond"] = cond
     with open(tmp_path, "wb") as fh:
         save_fn(fh, **payload)
     # Windows：rename 前目标不能存在。
@@ -554,7 +675,7 @@ def _short_exc(exc: BaseException, max_len: int = 200) -> str:
 
 def _setup_logging(level: str = "INFO") -> None:
     # 复用集中式日志配置；out_dir=None 表示只配控制台（彩色），不写文件。
-    from ..logging_utils import setup_logging
+    from ..utils.logging_utils import setup_logging
     setup_logging(output_dir=None, level=level)
 
 

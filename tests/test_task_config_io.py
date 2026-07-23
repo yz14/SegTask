@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,23 @@ def test_coerce_typed_fields():
     assert coerce_override_value(1.5, "2.5") == 2.5
     assert coerce_override_value([1, 2], "[3, 4]") == [3, 4]
     assert coerce_override_value("x", "y") == "y"
+
+
+def test_coerce_bool_rejects_invalid():
+    with pytest.raises(ValueError, match="Invalid bool"):
+        coerce_override_value(True, "Ture")
+
+
+def test_coerce_list_accepts_yaml_syntax():
+    assert coerce_override_value([1], "[a, b]") == ["a", "b"]
+
+
+def test_apply_dotted_overrides_warns_on_missing_equals(caplog):
+    cfg = Config()
+    with caplog.at_level(logging.WARNING):
+        apply_dotted_overrides(cfg, ["train.epochs:4"])
+    assert cfg.train.epochs != 4
+    assert any("without '='" in r.message for r in caplog.records)
 
 
 def test_apply_dotted_overrides_routes_task_section():
@@ -133,9 +151,10 @@ def test_clstask_apply_overrides_optional_spacing(tmp_path: Path):
 def test_task_registry_lists_composite_tasks():
     import clstask.config  # noqa: F401
     import dettask.config  # noqa: F401
+    import segtask_v1.seg_config  # noqa: F401
     import ssltask.config  # noqa: F401
 
-    assert registered_task_sections() == ("cls", "det", "ssl")
+    assert registered_task_sections() == ("cls", "det", "seg", "ssl")
 
 
 def test_load_task_config_via_registry(tmp_path: Path):
@@ -194,11 +213,12 @@ def test_register_task_section_rejects_duplicate():
         reg_mod._REGISTRY.update(saved)
 
 
-def test_composite_task_skips_seg_loss_predict_validate():
+def test_composite_task_core_validate_independent_of_seg():
     import clstask.config  # noqa: F401
     from clstask.config import validate_cls
 
     from taskcore.config.core import Config, ConfigError
+    from taskcore.config.seg_task import SegTaskConfig, validate_seg_task
 
     cfg = Config()
     cfg.data.patch_mode = "cubic"
@@ -210,11 +230,12 @@ def test_composite_task_skips_seg_loss_predict_validate():
     cfg.model.encoder_channels = [8, 16, 32]
     cfg.model.blocks_per_level = 1
     cfg.model.stem_mode = "conv3"
-    cfg.loss.name = "not_a_seg_loss"
     cfg.sync()
+    cfg.validate()
 
+    seg = SegTaskConfig()
+    seg.loss.name = "not_a_seg_loss"
     with pytest.raises(ConfigError, match="Invalid loss"):
-        cfg.validate()
+        validate_seg_task(seg, cfg)
 
-    cfg.validate(skip={"loss", "predict"})
     validate_cls(clstask.config.ClsConfig(), cfg)

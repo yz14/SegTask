@@ -164,8 +164,10 @@ def discover_samples(
 ) -> Tuple[List[str], List[str]]:
     """按基名配对 image/label（首个匹配胜出）。后缀接受单个或候选序列。按基名排序返回。"""
     img_dir, lbl_dir = Path(image_dir), Path(label_dir)
-    assert img_dir.is_dir(), f"Image dir not found: {img_dir}"
-    assert lbl_dir.is_dir(), f"Label dir not found: {lbl_dir}"
+    if not img_dir.is_dir():
+        raise FileNotFoundError(f"Image dir not found: {img_dir}")
+    if not lbl_dir.is_dir():
+        raise FileNotFoundError(f"Label dir not found: {lbl_dir}")
 
     image_suffixes = _normalize_suffixes(image_suffix)
     label_suffixes = _normalize_suffixes(label_suffix)
@@ -227,7 +229,8 @@ def _match_per_sample_paths(
     kind: str) -> List[str]:
     """严格 1:1 按基名匹配；任意缺失报错。供 match_bbox_paths / match_region_weight_paths 复用；kind 仅为日志标签。"""
     sdir = Path(src_dir)
-    assert sdir.is_dir(), f"{kind} dir not found: {sdir}"
+    if not sdir.is_dir():
+        raise FileNotFoundError(f"{kind} dir not found: {sdir}")
 
     image_suffixes = _normalize_suffixes(image_suffix)
     out_suffixes   = _normalize_suffixes(out_suffix)
@@ -279,7 +282,8 @@ def match_bbox_paths_lenient(
     bbox_suffix: SuffixSpec) -> Tuple[List[str], List[str]]:
     """宽容 bbox 匹配（推理专用）：无 bbox 的样本被丢弃并警告。返回 1:1 对齐的 (image, bbox) 路径。"""
     sdir = Path(bbox_dir)
-    assert sdir.is_dir(), f"BBox dir not found: {sdir}"
+    if not sdir.is_dir():
+        raise FileNotFoundError(f"BBox dir not found: {sdir}")
 
     image_suffixes = _normalize_suffixes(image_suffix)
     out_suffixes = _normalize_suffixes(bbox_suffix)
@@ -451,7 +455,9 @@ def grouped_train_val_split(
     train_idx = [i for i, g in enumerate(gids) if g not in val_groups]
     val_idx = [i for i, g in enumerate(gids) if g in val_groups]
     # 患者级隔离不变量：train/val 组集合必须互斥。
-    assert not ({gids[i] for i in train_idx} & {gids[i] for i in val_idx})
+    if {gids[i] for i in train_idx} & {gids[i] for i in val_idx}:
+        raise RuntimeError(
+            "grouped_train_val_split invariant broken: train/val groups overlap")
     logger.info(
         "Split (group-aware, regex=%r): %d train / %d val samples from "
         "%d / %d groups (%d groups total).",
@@ -557,7 +563,8 @@ def discover_npz_samples(
     npz_dir: str, npz_suffix: str = ".npz") -> List[str]:
     """列出 npz_dir 下的 make_data npz 包；忽略 '_' / '.' 附件。"""
     d = Path(npz_dir)
-    assert d.is_dir(), f"NPZ dir not found: {d}"
+    if not d.is_dir():
+        raise FileNotFoundError(f"NPZ dir not found: {d}")
     paths = sorted(
         p for p in d.glob(f"*{npz_suffix}")
         if not p.name.startswith(("_", ".")))

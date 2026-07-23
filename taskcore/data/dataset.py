@@ -680,11 +680,17 @@ class SegDatasetNpzBase(Dataset):
         region_weights      : Optional[List[float]],
         val_grid_coverage   : bool = False):
         super().__init__()
-        assert len(image_paths) == len(label_paths)
-        assert npz_paths is not None and len(npz_paths) == len(image_paths), (
-            f"{type(self).__name__} requires npz_paths (training is npz-only).")
-        assert aug_oversample_ratio >= 1.0, (
-            f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
+        if len(image_paths) != len(label_paths):
+            raise ValueError(
+                f"image_paths/label_paths length mismatch: "
+                f"{len(image_paths)} vs {len(label_paths)}")
+        if npz_paths is None or len(npz_paths) != len(image_paths):
+            raise ValueError(
+                f"{type(self).__name__} requires npz_paths "
+                f"(training is npz-only; len must match image_paths).")
+        if aug_oversample_ratio < 1.0:
+            raise ValueError(
+                f"aug_oversample_ratio must be >= 1.0, got {aug_oversample_ratio}")
 
         self.image_paths        = image_paths
         self.label_paths        = label_paths
@@ -873,11 +879,13 @@ class SegDataset3D(SegDatasetNpzBase):
         self.extract_size = (int(round(pD * self.oversample)), pH, pW)
         # 多分辨率 z FOV：multi_res_scales=[1.0] 单分辨率；len>1 时 view 0 必为 1.0
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
-        assert all(s >= 1.0 for s in self.multi_res_scales), (
-            f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
-        assert self.multi_res_scales[0] == 1.0, (
-            "multi_res_scales[0] must be 1.0 (canonical view); got "
-            f"{self.multi_res_scales}")
+        if not all(s >= 1.0 for s in self.multi_res_scales):
+            raise ValueError(
+                f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
+        if self.multi_res_scales[0] != 1.0:
+            raise ValueError(
+                "multi_res_scales[0] must be 1.0 (canonical view); got "
+                f"{self.multi_res_scales}")
         self._max_scale = float(max(self.multi_res_scales))
         self.fg_ratio = foreground_oversample_ratio
 
@@ -1099,11 +1107,13 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
         self.multi_res_scales = list(multi_res_scales) if multi_res_scales else [1.0]
-        assert all(s >= 1.0 for s in self.multi_res_scales), (
-            f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
-        assert self.multi_res_scales[0] == 1.0, (
-            "multi_res_scales[0] must be 1.0 (canonical view); got "
-            f"{self.multi_res_scales}")
+        if not all(s >= 1.0 for s in self.multi_res_scales):
+            raise ValueError(
+                f"All multi_res_scales must be >= 1.0, got {self.multi_res_scales}")
+        if self.multi_res_scales[0] != 1.0:
+            raise ValueError(
+                "multi_res_scales[0] must be 1.0 (canonical view); got "
+                f"{self.multi_res_scales}")
         # 最大 scale 决定 cube 抽取尺寸
         self._max_scale = float(max(self.multi_res_scales))
         self.fg_ratio   = foreground_oversample_ratio

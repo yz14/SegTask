@@ -121,7 +121,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(MANAGER.stop())
                 return
             self._json({"error": "not found"}, 404)
-        except build._config.ConfigError as e:  # 校验类错误友好回传。
+        except build._core_config.ConfigError as e:  # 校验类错误友好回传。
             self._json({"ok": False, "error": str(e)}, 200)
         except Exception as e:  # noqa: BLE001
             self._json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 200)

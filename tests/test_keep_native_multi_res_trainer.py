@@ -42,6 +42,8 @@ from taskcore.config.core import (  # noqa: E402
     Config, DataConfig, ModelConfig, LossConfig, TrainConfig, AugConfig,
     PredictConfig,
 )
+from taskcore.config.seg_bundle import merge_seg_bundle  # noqa: E402
+from taskcore.config.seg_task import SegTaskConfig  # noqa: E402
 from taskcore.data.dataset import (  # noqa: E402
     SegDataset3D, SegDataset3DCubic, _extract_cubic_patch,
     extract_z_patch_padded, preprocess_image, resize_3d,
@@ -59,24 +61,28 @@ def _make_cfg(
     keep_native_multi_res: bool = True,
     patch_size=(8, 16, 16),
 ):
-    cfg = Config(
-        data=DataConfig(
-            image_dir="dummy", label_dir="dummy",
-            label_values=[0, 1, 2], num_classes=3,
-            patch_size=list(patch_size),
-            patch_mode=patch_mode,
-            multi_res_scales=list(multi_res_scales),
-            keep_native_multi_res=keep_native_multi_res,
+    cfg = merge_seg_bundle(
+        Config(
+            data=DataConfig(
+                image_dir="dummy", label_dir="dummy",
+                label_values=[0, 1, 2], num_classes=3,
+                patch_size=list(patch_size),
+                patch_mode=patch_mode,
+                multi_res_scales=list(multi_res_scales),
+                keep_native_multi_res=keep_native_multi_res,
+            ),
+            augment=AugConfig(enabled=False),
+            model=ModelConfig(
+                encoder_channels=[16, 32, 64, 128],
+                blocks_per_level=1,
+                decoder_type="unet",
+            ),
+            train=TrainConfig(epochs=1, output_dir=str(ROOT / "outputs" / "tmp")),
         ),
-        augment=AugConfig(enabled=False),
-        model=ModelConfig(
-            encoder_channels=[16, 32, 64, 128],
-            blocks_per_level=1,
-            decoder_type="unet",
+        SegTaskConfig(
+            loss=LossConfig(name="dice_bce"),
+            predict=PredictConfig(),
         ),
-        loss=LossConfig(name="dice_bce"),
-        train=TrainConfig(epochs=1, output_dir=str(ROOT / "outputs" / "tmp")),
-        predict=PredictConfig(),
     )
     cfg.sync()
     cfg.validate()

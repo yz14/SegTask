@@ -382,21 +382,20 @@ def test_per_volume_gradient_flow_compound_dice_bce():
 # 8. Config validation rejects invalid reduction
 # ---------------------------------------------------------------------------
 def test_config_validate_rejects_invalid_reduction():
-    from taskcore.config.core import Config
-    cfg = Config()
+    import pytest
+    from taskcore.config.core import ConfigError
+    from taskcore.config.seg_bundle import make_test_config
+
+    cfg = make_test_config()
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2
     cfg.data.patch_mode = "2_5d"
     cfg.data.patch_size = [12, 32, 32]
     cfg.loss.slice_loss_reduction = "bogus"
     cfg.sync()
-    try:
+    with pytest.raises(ConfigError, match="slice_loss_reduction"):
         cfg.validate()
-    except AssertionError as e:
-        assert "slice_loss_reduction" in str(e)
-        _ok("Config.validate rejects invalid slice_loss_reduction")
-        return
-    raise AssertionError("validate should have rejected 'bogus' reduction")
+    _ok("Config.validate rejects invalid slice_loss_reduction")
 
 
 # ---------------------------------------------------------------------------

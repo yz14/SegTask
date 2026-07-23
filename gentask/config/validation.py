@@ -332,25 +332,12 @@ class Config:
             ),
                 f"model.arch={arch!r} only supports stem_fusion_mode in "
                 f"('shared_stem','multi_stem_proj'); got {self.model.stem_fusion_mode!r}.")
-        _require(
-            self.model.spatial_dims in (2, 3),
-            f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)")
-        # 下面三项适用于所有 arch（ADM/EDM2 也读取）。
-        _require(
-            self.model.stem_mode in (
-            "conv3", "conv7", "dual", "patch2", "patch4",
-        ),
-            f"Invalid stem_mode: {self.model.stem_mode}")
-        _require(
-            self.model.stem_fusion_mode in (
-            "shared_stem", "multi_stem_proj", "hierarchical",
-        ),
-            f"Invalid stem_fusion_mode: {self.model.stem_fusion_mode!r}")
-        _require(
-            self.model.aux_head_mode in (
-            "linear", "conv",
-        ),
-            f"Invalid aux_head_mode: {self.model.aux_head_mode!r}")
+        # stem / stage 长度与 core 共享（arch allowlist 故意分叉：gen 多 edsr/rcan）。
+        from taskcore.config.section_validators import (
+            validate_encoder_decoder_stage_lengths,
+            validate_stem_modes,
+        )
+        validate_stem_modes(self)
         # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
             _require(
@@ -378,42 +365,7 @@ class Config:
             _require(
                 self.model.resenc_preset in ("none", "S", "M", "L", "XL"),
                 f"Invalid resenc_preset: {self.model.resenc_preset}")
-        # 逐级 block 数长度需与 encoder 深度对齐。
-        n_levels = len(self.model.encoder_channels)
-        ebps = self.model.encoder_blocks_per_stage
-        dbps = self.model.decoder_blocks_per_stage
-        if ebps:
-            _require(
-                len(ebps) == n_levels,
-                f"encoder_blocks_per_stage must have {n_levels} entries "
-                f"(= len(encoder_channels)); got {len(ebps)}")
-            _require(
-                all(b >= 1 for b in ebps),
-                "encoder_blocks_per_stage entries must all be >= 1")
-        if dbps:
-            _require(
-                len(dbps) == n_levels - 1,
-                f"decoder_blocks_per_stage must have {n_levels - 1} entries "
-                f"(= len(encoder_channels) - 1); got {len(dbps)}")
-            _require(
-                all(b >= 1 for b in dbps),
-                "decoder_blocks_per_stage entries must all be >= 1")
-        # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
-        sds = self.model.unet.downsample_strides
-        if sds:
-            sd_dim = int(self.model.spatial_dims)
-            _require(
-                len(sds) == n_levels - 1,
-                f"downsample_strides must have {n_levels - 1} entries "
-                f"(= len(encoder_channels) - 1); got {len(sds)}")
-            for s in sds:
-                _require(
-                    len(s) == sd_dim,
-                    f"each downsample_strides entry must have "
-                    f"spatial_dims={sd_dim} values; got {list(s)}")
-                _require(
-                    all(int(v) in (1, 2) for v in s),
-                    f"downsample_strides values must be 1 or 2; got {list(s)}")
+        validate_encoder_decoder_stage_lengths(self)
 
     def _validate_loss(self) -> None:
         """loss.* 校验。"""
@@ -425,182 +377,26 @@ class Config:
             f"Invalid aux_recon_weights: {self.loss.aux_recon_weights}")
 
     def _validate_data(self) -> None:
-        """data.* patch/multi-res/keep_native 校验。"""
-        _require(
-            len(self.data.patch_size) == 3,
-            "patch_size must be [D, H, W]")
-        _require(
-            self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"),
-            f"Invalid patch_mode: {self.data.patch_mode}")
-        _require(
-            self.data.z_boundary_mode in ("stretch", "edge_pad"),
-            f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
-            "expected 'stretch' or 'edge_pad'.")
-        if self.data.patch_mode == "whole":
-            _require(
-                len(self.data.multi_res_scales) == 1 and self.data.multi_res_scales[0] == 1.0,
-                f"whole-volume mode requires multi_res_scales=[1.0]; got {self.data.multi_res_scales}.")
-        if self.data.keep_native_view_depth:
-            _require(
-                self.data.patch_mode == "2_5d",
-                f"data.keep_native_view_depth=True requires patch_mode='2_5d'; got {self.data.patch_mode!r}.")
-            _require(
-                len(self.data.multi_res_scales) > 1,
-                "data.keep_native_view_depth=True requires len(multi_res_scales) > 1; "
-                f"got {self.data.multi_res_scales}.")
-        if self.data.keep_native_multi_res:
-            _require(
-                self.data.patch_mode in ("z_axis", "cubic"),
-                "data.keep_native_multi_res=True requires patch_mode in "
-                "('z_axis','cubic'); got " + repr(self.data.patch_mode) + ". Use "
-                "data.keep_native_view_depth for the 2.5D analogue.")
-            _require(
-                len(self.data.multi_res_scales) > 1,
-                "data.keep_native_multi_res=True requires len(multi_res_scales) > 1; "
-                f"got {self.data.multi_res_scales}.")
-            _require(
-                float(self.data.multi_res_scales[0]) == 1.0,
-                "data.keep_native_multi_res=True requires multi_res_scales[0]==1.0; "
-                f"got {self.data.multi_res_scales}.")
-            _require(
-                not self.data.keep_native_view_depth,
-                "keep_native_multi_res and keep_native_view_depth are mutually exclusive (3D vs 2.5D analogues).")
-            if self.data.patch_mode == "z_axis":
-                _require(
-                    self.data.z_boundary_mode == "edge_pad",
-                    "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
-                    f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
-        _require(
-            self.data.aug_oversample_ratio >= 1.0,
-            "aug_oversample_ratio must be >= 1.0")
-        _require(
-            len(self.data.multi_res_scales) >= 1,
-            "multi_res_scales must have at least one scale (e.g. [1.0])")
-        _require(
-            all(s >= 1.0 for s in self.data.multi_res_scales),
-            "All multi_res_scales must be >= 1.0")
+        """data.* patch/multi-res/keep_native 校验。
+
+        委托 ``taskcore`` 同名实现（duck-typed），再追加 gen 专属 ``cond_*``。
+        """
+        from taskcore.config.core import Config as _CoreConfig
+        _CoreConfig._validate_data(self)
         if self.data.cond_dirs:
             _require(
                 self.data.cond_normalize in ("minmax", "zscore"),
                 f"Invalid data.cond_normalize: {self.data.cond_normalize!r}")
 
     def _validate_2_5d(self) -> None:
-        """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。"""
-        if self.data.patch_mode == "2_5d":
-            _require(
-                len(self.data.multi_res_scales) >= 1,
-                "2.5D mode requires at least one entry in multi_res_scales.")
-            _require(
-                self.data.multi_res_scales[0] == 1.0,
-                "2.5D mode requires multi_res_scales[0]==1.0 (view 0 = prediction target); "
-                f"got {self.data.multi_res_scales}.")
-            n_views = len(self.data.multi_res_scales)
-            lift = bool(self.model.unet.lift_2_5d_to_3d)
-            if lift:
-                _require(
-                    self.model.spatial_dims == 3,
-                    "lift_2_5d_to_3d=True requires model.spatial_dims=3 (auto-set by sync()).")
-                _require(
-                    self.model.in_channels == n_views,
-                    f"lift_2_5d_to_3d=True requires in_channels == n_views ({n_views}); "
-                    f"got {self.model.in_channels}.")
-                _require(
-                    not self.data.keep_native_view_depth,
-                    "lift_2_5d_to_3d and keep_native_view_depth are mutually exclusive.")
-                n_levels = len(self.model.encoder_channels)
-                D = int(self.data.patch_size[0])
-                req = 1 << (n_levels - 1)
-                if D < req or D % req != 0:
-                    raise ConfigError(
-                        f"lift_2_5d_to_3d=True with {n_levels} encoder stages requires "
-                        f"patch_size[0] (D={D}) divisible by 2**(n_levels-1)={req}. "
-                        f"Increase D to a multiple of {req}, or reduce len(encoder_channels).")
-            else:
-                _require(
-                    self.model.spatial_dims == 2,
-                    "2.5D mode requires model.spatial_dims=2 (auto-set by sync()). "
-                    "For Plan A 3D lift, set model.lift_2_5d_to_3d=True.")
-            if (not lift) and self.data.keep_native_view_depth and n_views > 1:
-                depths = self.per_view_depths
-                _require(
-                    len(depths) == n_views,
-                    f"per_view_depths length must equal n_views ({n_views}); got {len(depths)}.")
-                _require(
-                    depths[0] == self.data.patch_size[0],
-                    f"per_view_depths[0] must equal patch_size[0]={self.data.patch_size[0]}; got {depths[0]}.")
-                from taskcore.models.topology import build_topology
-                _require(
-                    build_topology(self).in_ch_per_view_list is not None,
-                    "keep_native_view_depth=True requires in_ch_per_view_list "
-                    "(derived by build_topology).")
-            if self.model.aux_seg_supervision:
-                _require(
-                    n_views > 1,
-                    "aux_seg_supervision=True requires n_views > 1; got 1.")
-                if self.model.stem_fusion_mode == "hierarchical":
-                    n_levels = len(self.model.encoder_channels)
-                    _require(
-                        n_views < n_levels,
-                        f"aux_seg_supervision + hierarchical requires n_views < n_levels; "
-                        f"got n_views={n_views}, n_levels={n_levels}.")
+        """2.5D 几何不变式 —— 委托 core，跳过 seg 通道布局（gen 含 cond 扩展）。"""
+        from taskcore.config.core import Config as _CoreConfig
+        _CoreConfig._validate_2_5d(self, check_channel_layout=False)
 
     def _validate_augment(self) -> None:
-        """augment.* 校验：概率界、区间合法性、插值模式与翻转轴。"""
-        a = self.augment
-        probs = {
-            "random_flip_prob": a.random_flip_prob,
-            "random_affine_prob": a.random_affine_prob,
-            "elastic_deform_prob": a.elastic_deform_prob,
-            "grid_dropout_prob": a.grid_dropout_prob,
-            "random_brightness_prob": a.random_brightness_prob,
-            "random_contrast_prob": a.random_contrast_prob,
-            "random_gamma_prob": a.random_gamma_prob,
-            "gaussian_noise_prob": a.gaussian_noise_prob,
-            "gaussian_blur_prob": a.gaussian_blur_prob,
-            "simulate_lowres_prob": a.simulate_lowres_prob,
-        }
-        for name, p in probs.items():
-            _require(0.0 <= float(p) <= 1.0,
-                     f"augment.{name} must be in [0,1]; got {p}.")
-        ranges = {
-            "random_rotate_range": a.random_rotate_range,
-            "random_scale_range": a.random_scale_range,
-            "random_translate_range": a.random_translate_range,
-            "random_brightness_range": a.random_brightness_range,
-            "random_contrast_range": a.random_contrast_range,
-            "random_gamma_range": a.random_gamma_range,
-            "gaussian_blur_sigma": a.gaussian_blur_sigma,
-            "simulate_lowres_zoom": a.simulate_lowres_zoom,
-        }
-        for name, r in ranges.items():
-            _require(
-                len(r) == 2 and float(r[0]) <= float(r[1]),
-                f"augment.{name} must be [lo, hi] with lo <= hi; got {r}.")
-        if a.random_rotate_range_per_axis is not None:
-            _require(
-                len(a.random_rotate_range_per_axis) == 3
-                and all(len(rr) == 2 and float(rr[0]) <= float(rr[1])
-                        for rr in a.random_rotate_range_per_axis),
-                "augment.random_rotate_range_per_axis must be 3 pairs of "
-                f"[lo, hi]; got {a.random_rotate_range_per_axis}.")
-        _require(
-            a.wmap_interp_mode in ("nearest", "bilinear"),
-            f"Invalid augment.wmap_interp_mode: {a.wmap_interp_mode!r}; "
-            "expected 'nearest' or 'bilinear'.")
-        _require(
-            all(int(ax) in (2, 3, 4) for ax in a.random_flip_axes),
-            f"augment.random_flip_axes entries must be in (2,3,4) "
-            f"(axes of (B,C,D,H,W)); got {a.random_flip_axes}.")
-        _require(a.elastic_deform_sigma > 0.0,
-                 "augment.elastic_deform_sigma must be > 0.")
-        _require(a.elastic_deform_alpha >= 0.0,
-                 "augment.elastic_deform_alpha must be >= 0.")
-        _require(0.0 <= a.grid_dropout_ratio <= 1.0,
-                 "augment.grid_dropout_ratio must be in [0,1].")
-        _require(a.grid_dropout_holes >= 1,
-                 "augment.grid_dropout_holes must be >= 1.")
-        _require(a.gaussian_noise_std >= 0.0,
-                 "augment.gaussian_noise_std must be >= 0.")
+        """augment.* —— 与 core 单一真相源对齐。"""
+        from taskcore.config.core import Config as _CoreConfig
+        _CoreConfig._validate_augment(self)
 
     def _validate_train(self) -> None:
         """train.* 优化器/调度器校验。"""

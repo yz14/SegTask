@@ -62,12 +62,19 @@ def load_npz_cond(path: str) -> Optional[np.ndarray]:
 
 
 def load_npz_spacing(path: str) -> Optional[Tuple[float, float, float]]:
-    """返 npz meta 中烘焙的 (sz, sy, sx) spacing（mm）；旧包无该字段返 None。"""
+    """返 npz meta 中烘焙的 (sz, sy, sx) spacing（mm）；旧包无该字段返 None。
+
+    优先读 ``spacing_zyx``（落盘体素物理 spacing：make_data≥1.8 在归一化后
+    为 ``target_spacing``，否则等于原生头 spacing）；无则回退 ``orig_spacing``
+    （始终为原生头 spacing，供旧包 / 溯源）。
+    """
     with _open_npz(path) as f:
         if "meta" not in f.files:
             return None
         meta = f["meta"].item()
-    sp = meta.get("spacing_zyx") if isinstance(meta, dict) else None
+    if not isinstance(meta, dict):
+        return None
+    sp = meta.get("spacing_zyx") or meta.get("orig_spacing")
     if not sp or len(sp) != 3:
         return None
     return (float(sp[0]), float(sp[1]), float(sp[2]))

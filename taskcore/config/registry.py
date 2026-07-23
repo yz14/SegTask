@@ -26,8 +26,8 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 ValidateFn = Callable[[Any, Config], None]
 
-# 组合式任务不消费 core 里的 seg 专属段；加载/重验时跳过对应校验器。
-_COMPOSITE_SKIP_CORE = ("loss", "predict")
+# 组合式任务 core 不再含 seg 专属 loss/predict 段（P2a 已下沉 seg 任务段）。
+_COMPOSITE_SKIP_CORE: Tuple[str, ...] = ()
 
 _REGISTRY: Dict[str, "TaskSectionSpec"] = {}
 

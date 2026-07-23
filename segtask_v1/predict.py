@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from taskcore.config.core import load_config
+from .seg_config import load_config
 from taskcore.data.loader import match_bbox_paths_lenient
 from .predictor import run_inference
 from .train import apply_overrides, setup_logging

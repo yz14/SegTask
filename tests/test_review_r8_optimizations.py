@@ -61,25 +61,29 @@ def test_adabn_keep_window_subsamples_deterministically():
 
 
 def test_adabn_sample_ratio_default_and_validation():
-    cfg = Config()
+    from taskcore.config.core import ConfigError
+    from taskcore.config.seg_bundle import make_test_config
+
+    cfg = make_test_config()
     assert cfg.predict.adabn_sample_ratio == 1.0
 
-    cfg = Config()
+    cfg = make_test_config()
     cfg.predict.adabn_enabled = True
     cfg.predict.adabn_sample_ratio = 0.25
     cfg.validate()  # 合法值不报错
 
     for bad in (0.0, -0.5, 1.5):
-        cfg = Config()
+        cfg = make_test_config()
         cfg.predict.adabn_enabled = True
         cfg.predict.adabn_sample_ratio = bad
-        with pytest.raises(ValueError):
+        with pytest.raises(ConfigError):
             cfg.validate()
 
 
 def test_adabn_sample_ratio_ignored_when_disabled():
+    from taskcore.config.seg_bundle import make_test_config
     # adabn_enabled=False 时不校验该字段（与现有 adabn 校验分支一致）。
-    cfg = Config()
+    cfg = make_test_config()
     cfg.predict.adabn_sample_ratio = 1.5
     cfg.validate()
 

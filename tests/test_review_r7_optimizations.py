@@ -80,7 +80,8 @@ def test_metric_accumulator_metrics_unchanged_vs_reference():
 # 2) predict.hw_overlap
 # ---------------------------------------------------------------------------
 def _cubic_cfg(**pred_over):
-    cfg = Config()
+    from taskcore.config.seg_bundle import make_test_config
+    cfg = make_test_config()
     cfg.data.patch_mode = "cubic"
     cfg.data.patch_size = [32, 64, 64]
     for k, v in pred_over.items():

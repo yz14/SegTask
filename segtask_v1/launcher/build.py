@@ -23,7 +23,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from .. import config as _config
+from .. import config as _core_config
+from .. import seg_config as _seg_config
+from taskcore.config.core import dataclass_from_dict
+from taskcore.config.seg_bundle import SegBundle, merge_seg_bundle
+from taskcore.config.seg_task import SegTaskConfig
 from . import manifest as _manifest
 from .schema import build_field_schema
 
@@ -111,24 +115,38 @@ def _all_defaults(schema: Dict[str, Dict[str, Dict[str, Any]]]) -> Dict[str, Dic
 # ---------------------------------------------------------------------------
 # 表单值 → Config / YAML
 # ---------------------------------------------------------------------------
-def build_config(values: Dict[str, Dict[str, Any]]) -> "_config.Config":
-    """由 {section: {field: value}} 构造 Config（复用 config 的 from_dict + sync）。
+_SEG_SECTIONS = frozenset({"loss", "predict"})
 
-    缺省 section/field 自动使用 dataclass 默认值；派生只读键被 from_dict 忽略。
-    """
-    cfg = _config._dataclass_from_dict(_config.Config, values)
-    cfg.sync()
-    return cfg
+
+def _split_seg_values(
+    values: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    core_vals = dict(values)
+    seg_vals: Dict[str, Dict[str, Any]] = {}
+    for key in _SEG_SECTIONS:
+        if key in core_vals:
+            seg_vals[key] = core_vals.pop(key)
+    return core_vals, seg_vals
+
+
+def build_config(values: Dict[str, Dict[str, Any]]) -> SegBundle:
+    """由 {section: {field: value}} 构造 SegBundle（core + seg 段，含 sync）。"""
+    core_vals, seg_vals = _split_seg_values(values)
+    core = dataclass_from_dict(_core_config.Config, core_vals)
+    seg = dataclass_from_dict(SegTaskConfig, seg_vals)
+    bundle = merge_seg_bundle(core, seg)
+    bundle.sync()
+    return bundle
 
 
 def validate_values(
     values: Dict[str, Dict[str, Any]],
 ) -> Tuple[bool, str]:
-    """返回 (ok, message)。复用 Config.validate()，捕获 ConfigError 为友好文本。"""
+    """返回 (ok, message)。复用 SegBundle.validate()，捕获 ConfigError 为友好文本。"""
     try:
         cfg = build_config(values)
         cfg.validate()
-    except _config.ConfigError as e:
+    except _core_config.ConfigError as e:
         return False, str(e)
     except Exception as e:  # noqa: BLE001  其它构造期异常也回传，避免 500。
         return False, f"{type(e).__name__}: {e}"
@@ -139,7 +157,7 @@ def values_to_yaml(values: Dict[str, Dict[str, Any]]) -> str:
     """生成运行 YAML 文本（经 sync()，含派生量回写后的快照）。"""
     cfg = build_config(values)
     buf = io.StringIO()
-    yaml.dump(_dc.asdict(cfg), buf, default_flow_style=False,
+    yaml.dump(cfg.asdict(), buf, default_flow_style=False,
               sort_keys=False, allow_unicode=True)
     return buf.getvalue()
 
@@ -171,7 +189,7 @@ def write_run_yaml(values: Dict[str, Dict[str, Any]], task: str) -> Path:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = RUN_DIR / f"{ts}_{task}.yaml"
-    _config.save_config(cfg, path)
+    _seg_config.save_config(cfg, path)
     return path
 
 
@@ -227,7 +245,11 @@ def load_base_values(rel_path: str) -> Dict[str, Dict[str, Any]]:
     # 安全：限制只能读 configs/ 内文件。
     if CONFIG_DIR.resolve() not in path.parents:
         raise ValueError("base config must live under configs/.")
-    cfg = _config.load_config(path)
-    blob = _dc.asdict(cfg)
+    cfg = _seg_config.load_config(path)
+    blob = cfg.asdict()
+    seg_blob = blob.pop("seg", {}) or {}
+    for key in _SEG_SECTIONS:
+        if key in seg_blob:
+            blob[key] = seg_blob[key]
     blob["model"] = flatten_model_dict(blob["model"])
     return blob

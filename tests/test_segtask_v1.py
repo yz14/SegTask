@@ -40,7 +40,7 @@ def _write_seg_npz(path, img, lbl):
 # ---------------------------------------------------------------------------
 class TestConfig:
     def test_load_config(self):
-        from taskcore.config.core import load_config
+        from segtask_v1.seg_config import load_config
         cfg = load_config("configs/seg3d.yaml")
         assert cfg.data.patch_size == [16, 128, 128]
         assert cfg.model.backbone == "resnet"
@@ -64,7 +64,7 @@ class TestConfig:
             cfg.validate()
 
     def test_new_config_fields(self):
-        from taskcore.config.core import load_config
+        from segtask_v1.seg_config import load_config
         cfg = load_config("configs/seg3d.yaml")
         assert cfg.train.grad_accum_steps == 1
         assert cfg.train.compile_mode == "none"

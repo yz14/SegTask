@@ -108,6 +108,8 @@ class GenerationTrainer(BaseTrainer):
                             if tc.save_async and self._is_main else None)
         # 选模指标：PSNR 越大越好；启用整卷验证时改用整卷 PSNR（M13）。
         self._setup_best_tracking(mode="max")
+        self.best_key = "psnr"
+        self._ckpt_task_label = "generation"
         # SWA 尾段权重平均（opt-in，公用工程件，见 BaseTrainer）。
         self._setup_swa()
         self.val_full_volume = bool(tc.val_full_volume)
@@ -517,48 +519,6 @@ class GenerationTrainer(BaseTrainer):
         return {"vol_psnr": psnr_m.avg, "vol_ssim": ssim_m.avg,
                 "vol_psnr_lr": base_m.avg}
 
-    def _save_best(self, epoch: int) -> None:
-        """best checkpoint（EMA 为主，槽位与 seg/cls/det 对齐）：启用 EMA 时
-        ``model_state_dict`` 存 EMA 权重（与选模/部署一致），在线权重另存
-        ``model_online_state_dict``。"""
-        if not self._is_main:   # DDP：落盘仅 rank0
-            return
-        bare = unwrap_compile(self.model)
-        if self.ema is not None:
-            online_sd = {k: v.detach().cpu().clone()
-                         for k, v in bare.state_dict().items()}
-            self.ema.apply_shadow(bare)
-            try:
-                primary_sd = {k: v.detach().cpu().clone()
-                              for k, v in bare.state_dict().items()}
-            finally:
-                self.ema.restore(bare)
-        else:
-            online_sd = None
-            primary_sd = bare.state_dict()
-        state = {
-            "epoch": epoch,
-            "model_state_dict": primary_sd,
-            "best_metric": self.best_metric,
-            "best_epoch": self.best_epoch,
-            "config": self.cfg,
-        }
-        if online_sd is not None:
-            state["model_online_state_dict"] = online_sd
-        if self.ema is not None:
-            state["ema_state_dict"] = self.ema.state_dict()
-        path = self.output_dir / "best_model.pth"
-        if self._ckpt_saver is not None:
-            self._ckpt_saver.submit(
-                state_to_cpu(state), path,
-                on_done=lambda e=epoch: logger.info(
-                    "Best generation model saved (PSNR=%.3f) @ epoch %d",
-                    self.best_metric, e + 1))
-        else:
-            atomic_torch_save(state, path)
-            logger.info("Best generation model saved (PSNR=%.3f) @ epoch %d",
-                        self.best_metric, epoch + 1)
-
     # ------------------------------------------------------------------
     # 断点续训（M14）：last_checkpoint 保存完整训练状态
     # ------------------------------------------------------------------
@@ -672,7 +632,8 @@ class GenerationTrainer(BaseTrainer):
                     is_best = True
                     self.best_metric = select
                     self.best_epoch = epoch
-                    self._save_best(epoch)
+                    # 与 BaseTrainer 对齐：metrics[best_key] 用于日志；选模值注入 psnr。
+                    self._save_best(epoch, {**val, "psnr": float(select)})
                 last = {**tr, **val}
             else:
                 logger.info("Epoch %d/%d: train_loss=%.4f (val skipped, "

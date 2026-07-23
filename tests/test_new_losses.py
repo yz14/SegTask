@@ -347,6 +347,7 @@ class TestConfigValidation:
          "dice_cldice", "dice_focal_tversky", "dice_lovasz",
          "bce_lovasz", "gdl_bce", "gdl_focal", "focal_plus_tversky"])
     def test_new_names_accepted(self, name):
+        from taskcore.config.core import Config
         cfg = Config()
         cfg.loss.name = name
         cfg.data.label_values = [0, 1, 2]
@@ -355,30 +356,33 @@ class TestConfigValidation:
         cfg.validate()  # must not raise
 
     def test_invalid_gdl_weight_type_raises(self):
+        from taskcore.config.core import Config, ConfigError
         cfg = Config()
         cfg.loss.gdl_weight_type = "bogus"
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
         cfg.sync()
-        with pytest.raises(AssertionError):
+        with pytest.raises(ConfigError):
             cfg.validate()
 
     def test_invalid_focal_tversky_gamma_raises(self):
+        from taskcore.config.core import Config, ConfigError
         cfg = Config()
         cfg.loss.focal_tversky_gamma = 0.0
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
         cfg.sync()
-        with pytest.raises(AssertionError):
+        with pytest.raises(ConfigError):
             cfg.validate()
 
     def test_invalid_cldice_iter_raises(self):
+        from taskcore.config.core import Config, ConfigError
         cfg = Config()
         cfg.loss.cldice_iter = 0
         cfg.data.label_values = [0, 1]
         cfg.data.num_classes = 2
         cfg.sync()
-        with pytest.raises(AssertionError):
+        with pytest.raises(ConfigError):
             cfg.validate()
 
 

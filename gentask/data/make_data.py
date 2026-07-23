@@ -1,12 +1,16 @@
-"""逐样本 npz 预烘包（image+label+可选 rw+fg 索引）。将 bbox 裁剪后的体积输出为 <out_dir>/<pid>.npz，训练时 mmap 多 worker 共享 OS page cache。默认 np.savez 不压缩（供共享）；--compress 使用 savez_compressed。CLI：`python -m gentask.data.make_data --config <yaml> --out <dir> [--workers N]`。已存在不覆盖（除非 --overwrite）；失败写 <out_dir>/_failures.txt（与 data.exclude_list 兼容）。"""
+"""逐样本 npz 预烘包（生成任务）：委托 ``taskcore.data.make_data.prepare_one``。
+
+与分割差异仅在样本发现：可选 ``cond_dirs`` 条件体配对。spacing 归一化、
+逐类 fg 索引、meta skip 校验与 core 口径一致。
+
+CLI：`python -m gentask.data.make_data --config <yaml> --out <dir> [--workers N]`。
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
-import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -14,19 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-
 from ..config import Config, load_config
-from taskcore.data.make_data import check_physical_geometry
-
-from .dataset import (
-    BBox,
-    compute_bbox_from_volume,
-    load_nifti,
-    load_nifti_cropped,
-    load_region_weight_volume,
-    read_nifti_spacing_zyx,
+from taskcore.data.make_data import (
+    _DEFAULT_FG_SUBSAMPLE,
+    _TOOL_VERSION,
+    _resolve_target_spacing,
+    prepare_one,
 )
+
 from .loader import (
     _filter_by_exclude,
     _load_exclude_pids,
@@ -40,12 +39,6 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.1"  # 1.1: meta.label_counts + 物理几何校验
-
-# 同 Volume3DCubic._build_index 上限；可由 CLI 覆盖。
-_DEFAULT_FG_SUBSAMPLE = 50_000
-
-
 def _stem(path: str, suffix) -> str:
     """返回去后缀的文件名；suffix 可为 str 或候选列表。"""
     name = Path(path).name
@@ -56,197 +49,25 @@ def _stem(path: str, suffix) -> str:
     return Path(name).stem
 
 
-def _compute_fg_indices(
-    label: np.ndarray,
-    bg_val: int,
-    fg_subsample: int,
-    seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
-    """计算 fg_slices (z 索引) 与 fg_coords（下采样到 fg_subsample）。镜像 Volume3D[Cubic]._build_index (seed=42)，避免运行时重扫。"""
-    if label.size == 0:
-        return (np.zeros((0,), dtype=np.int32),
-                np.zeros((0, 3), dtype=np.int32))
-    label_int = label.astype(np.int32, copy=False)
-    fg_mask = label_int != int(bg_val)
-    if not fg_mask.any():
-        return (np.zeros((0,), dtype=np.int32),
-                np.zeros((0, 3), dtype=np.int32))
-    fg_slices = np.where(np.any(fg_mask, axis=(1, 2)))[0].astype(np.int32)
-    coords    = np.argwhere(fg_mask).astype(np.int32)
-    if fg_subsample > 0 and len(coords) > fg_subsample:
-        rng = np.random.RandomState(seed)
-        idx = rng.choice(len(coords), fg_subsample, replace=False)
-        coords = coords[idx]
-    return fg_slices, coords
-
-
-def _bbox_from_mask_path(bbox_path: Optional[str]) -> Optional[BBox]:
-    """读 mask→compute_bbox_from_volume；路径为空或 mask 空返 None。"""
-    if not bbox_path:
-        return None
-    mask = load_nifti(bbox_path, dtype=np.int16)
-    return compute_bbox_from_volume(mask)
-
-
-def prepare_one(
-    pid: str,
-    image_path: str,
-    label_path: str,
-    bbox_path: Optional[str],
-    rw_path: Optional[str],
-    cond_paths: Optional[List[str]],
-    out_path: str,
-    label_values: List[int],
-    fg_subsample: int = _DEFAULT_FG_SUBSAMPLE,
-    compress: bool = False,
-    overwrite: bool = False) -> Dict[str, object]:
-    """为单样本生成 npz 包；默认幂等（除非 overwrite）。返状态 dict (pid/status/size/耗时/...)。"""
-    out_p = Path(out_path)
-    if out_p.is_file() and not overwrite:
-        return {"pid": pid, "status": "skipped",
-                "size_bytes": out_p.stat().st_size, "elapsed_s": 0.0}
-
-    t0 = time.perf_counter()
-    out_p.parent.mkdir(parents=True, exist_ok=True)
-
-    # 0. 物理几何校验：label/bbox/rw/cond 必须与 image 共 spacing/origin/direction
-    #    （shape 相等不蕴含共坐标系；只读头，成本可忽略）。
-    check_physical_geometry(
-        pid, image_path,
-        [("label", label_path), ("bbox", bbox_path), ("rw", rw_path)]
-        + [(f"cond{i}", c) for i, c in enumerate(cond_paths or [])])
-
-    # 1. mask → bbox（无/空为 None）。
-    bbox = _bbox_from_mask_path(bbox_path)
-
-    # 2-3. 读 image (raw HU int16) 与 label (int16)，按 bbox 裁剪。
-    # 体素 spacing 由头信息读出并烘进 meta（M7，供 spacing-aware 退化）。
-    spacing_zyx = read_nifti_spacing_zyx(image_path)
-    image = load_nifti_cropped(image_path, bbox=bbox, dtype=np.int16)
-    label = load_nifti_cropped(label_path, bbox=bbox, dtype=np.int16)
-
-    if image.shape != label.shape:
-        raise ValueError(
-            f"image shape {image.shape} != label shape {label.shape} for "
-            f"pid={pid} (image={image_path}, label={label_path})")
-
-    # 4. 区域权重（+1 偏移）：整数且 int16 范围内存 int16，否则 fp32（runtime 始终返 fp32）。
-    rw: Optional[np.ndarray] = None
-    rw_dtype_stored = None
-    if rw_path:
-        rw = load_region_weight_volume(rw_path, bbox=bbox)
-        if rw.shape != image.shape:
-            raise ValueError(
-                f"region_weight shape {rw.shape} != image shape {image.shape} "
-                f"for pid={pid} (rw={rw_path})")
-        rw_min = float(rw.min())
-        rw_max = float(rw.max())
-        is_integer_valued = np.all(rw == np.round(rw))
-        fits_int16 = (rw_min >= np.iinfo(np.int16).min
-                      and rw_max <= np.iinfo(np.int16).max)
-        if is_integer_valued and fits_int16:
-            rw = rw.astype(np.int16, copy=False)
-            rw_dtype_stored = "int16"
-        else:
-            rw_dtype_stored = "float32"
-            logger.warning(
-                "pid=%s rw has non-integer or out-of-int16 values "
-                "(min=%.3f, max=%.3f, integer_valued=%s) — storing as float32.",
-                pid, rw_min, rw_max, is_integer_valued)
-
-    # 4b. 条件体：与 image 1:1 对齐、同 bbox 裁剪；按 channel stack。
-    cond: Optional[np.ndarray] = None
-    if cond_paths:
-        cond_vols: List[np.ndarray] = []
-        for cpath in cond_paths:
-            cvol = load_nifti_cropped(cpath, bbox=bbox, dtype=np.float32)
-            if cvol.shape != image.shape:
-                raise ValueError(
-                    f"cond shape {cvol.shape} != image shape {image.shape} "
-                    f"for pid={pid} (cond={cpath})")
-            cond_vols.append(cvol)
-        cond = np.stack(cond_vols, axis=0).astype(np.float32, copy=False)
-
-    # 5. 裁剪坐标系下的前景索引。
-    bg_val = int(label_values[0])
-    fg_slices, fg_coords = _compute_fg_indices(label, bg_val, fg_subsample)
-
-    # 5.5 逐值精确体素计数（落盘 label 同坐标系）：供 loader 直接从 meta 读取
-    #     label_values / 分层划分统计，免去启动期全量解码 label。
-    uniq_vals, uniq_counts = np.unique(
-        label.astype(np.int32, copy=False), return_counts=True)
-    label_counts = {int(v): int(c) for v, c in zip(uniq_vals, uniq_counts)}
-
-    # 6. 谱系 meta（自描述）。
-    meta = {
-        "pid"         : pid,
-        "src_image"   : str(image_path),
-        "src_label"   : str(label_path),
-        "src_bbox"    : str(bbox_path) if bbox_path else "",
-        "src_rw"      : str(rw_path) if rw_path else "",
-        "src_cond"    : list(map(str, cond_paths)) if cond_paths else [],
-        "bbox"        : (list(map(list, bbox)) if bbox is not None else None),
-        "label_values": list(map(int, label_values)),
-        "label_counts": label_counts,
-        "spacing_zyx" : [float(s) for s in spacing_zyx],
-        "has_rw"      : rw is not None,
-        "has_cond"    : cond is not None,
-        "rw_shift"    : 1.0,
-        "rw_dtype"    : rw_dtype_stored,    # int16 / float32 / None
-        "image_dtype" : str(image.dtype),
-        "made_at"     : datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "tool_version": _TOOL_VERSION}
-    meta_arr = np.array(meta, dtype=object)
-
-    # 7. 原子写（tmp + rename）；传文件句柄避免 np.savez 自动追加 .npz。
-    tmp_path = out_p.with_name(out_p.name + ".tmp")
-    save_fn  = np.savez_compressed if compress else np.savez
-    payload  = {
-        "image"    : image,
-        "label"    : label,
-        "fg_slices": fg_slices,
-        "fg_coords": fg_coords,
-        "meta"     : meta_arr}
-    if rw is not None:
-        payload["rw"] = rw
-    if cond is not None:
-        payload["cond"] = cond
-    with open(tmp_path, "wb") as fh:
-        save_fn(fh, **payload)
-    # Windows：rename 前目标不能存在。
-    if out_p.exists():
-        out_p.unlink()
-    tmp_path.rename(out_p)
-
-    elapsed = time.perf_counter() - t0
-    return {
-        "pid"         : pid,
-        "status"      : "written",
-        "size_bytes"  : out_p.stat().st_size,
-        "elapsed_s"   : elapsed,
-        "shape"       : tuple(image.shape),
-        "n_fg_slices" : int(fg_slices.size),
-        "n_fg_coords" : int(fg_coords.shape[0])}
-
-
 def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
-    """通过 loader helpers 发现/配对 image/label/bbox/rw 路径；遵守 exclude_list。"""
+    """通过 loader helpers 发现/配对 image/label/bbox/rw/cond 路径；遵守 exclude_list。"""
     dc = cfg.data
 
-    image_paths, label_paths = discover_samples(  # 配对
+    image_paths, label_paths = discover_samples(
         dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
 
     exclude_pids = _load_exclude_pids(dc.exclude_list)
-    image_paths, label_paths, _ = _filter_by_exclude(  # 过滤
+    image_paths, label_paths, _ = _filter_by_exclude(
         image_paths, label_paths, dc.image_suffix, exclude_pids)
 
     bbox_paths_all: Optional[List[str]] = None
     if dc.bbox_dir:
-        bbox_paths_all = match_bbox_paths(  # 匹配bbox(严格1:1)
+        bbox_paths_all = match_bbox_paths(
             image_paths, dc.bbox_dir, dc.image_suffix, dc.bbox_suffix)
 
     rw_paths_all: Optional[List[str]] = None
     if dc.region_weight_dir:
-        rw_paths_all = match_region_weight_paths(  # 匹配region weight(严格1:1)
+        rw_paths_all = match_region_weight_paths(
             image_paths, dc.region_weight_dir, dc.image_suffix,
             dc.region_weight_suffix)
 
@@ -265,7 +86,8 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
             "label": lbl,
             "bbox" : bbox_paths_all[i] if bbox_paths_all else None,
             "rw"   : rw_paths_all[i] if rw_paths_all else None,
-            "cond" : [paths[i] for paths in cond_paths_all] if cond_paths_all else None})
+            "cond" : ([paths[i] for paths in cond_paths_all]
+                      if cond_paths_all else None)})
     return samples
 
 
@@ -288,12 +110,11 @@ def prepare_dataset(
     compress    : bool = False,
     overwrite   : bool = False,
     limit       : int = 0) -> Dict[str, int]:
-    """为 cfg.data 下的所有样本生成 npz。
-    compress 使用 savez_compressed；limit>0 仅处理前 N 个。返 counters {written, skipped, failed, total}。"""
+    """为 cfg.data 下的所有样本生成 npz（含可选 cond；spacing/fg/meta 走 core）。"""
     out_p = Path(out_dir)
     out_p.mkdir(parents=True, exist_ok=True)
 
-    samples = _build_sample_table(cfg)  # 配对路径
+    samples = _build_sample_table(cfg)
     if limit and limit > 0:
         samples = samples[:limit]
         logger.info("--limit %d: processing only the first %d samples.",
@@ -302,6 +123,14 @@ def prepare_dataset(
     label_values = _resolve_label_values(cfg, samples)
     logger.info("Using label_values=%s (bg=%d)", label_values, label_values[0])
 
+    spacing_norm = bool(getattr(cfg.data, "spacing_normalization", False))
+    target_spacing = (
+        _resolve_target_spacing(cfg, samples) if spacing_norm else None)
+    if spacing_norm:
+        logger.info(
+            "spacing_normalization=True: resampling every volume to "
+            "target_spacing=%s mm (numpy axis order (D,H,W)).", target_spacing)
+
     tasks: List[Tuple[Dict[str, Optional[str]], str]] = []
     for s in samples:
         out_path = str(out_p / f"{s['pid']}.npz")
@@ -309,7 +138,7 @@ def prepare_dataset(
 
     n_total  = len(tasks)
     counters = {"written": 0, "skipped": 0, "failed": 0, "total": n_total}
-    failures : List[Tuple[str, str]] = []   # (pid, err)
+    failures : List[Tuple[str, str]] = []
     timings  : List[float] = []
     sizes    : List[int] = []
 
@@ -330,12 +159,13 @@ def prepare_dataset(
             label_values = label_values,
             fg_subsample = fg_subsample,
             compress     = compress,
-            overwrite    = overwrite)
+            overwrite    = overwrite,
+            spacing_normalization = spacing_norm,
+            target_spacing = target_spacing)
 
     t0 = time.perf_counter()
 
     if workers <= 0:
-        # 内联：全 traceback、无 pickle，便于调试
         for i, (s, out_path) in enumerate(tasks):
             try:
                 res = prepare_one(**_kwargs(s, out_path))
@@ -346,7 +176,6 @@ def prepare_dataset(
                 failures.append((s["pid"], _short_exc(exc)))
                 logger.exception("FAILED pid=%s: %s", s["pid"], exc)
     else:
-        # 进程池（Windows spawn；SimpleITK 逐 worker 导入一次）
         with ProcessPoolExecutor(max_workers=workers) as pool:
             future_to_pid = {
                 pool.submit(prepare_one, **_kwargs(s, out_path)): s["pid"]
@@ -362,7 +191,6 @@ def prepare_dataset(
                     failures.append((pid, _short_exc(exc)))
                     logger.error("FAILED pid=%s: %s", pid, exc)
 
-    # 汇总报告
     elapsed     = time.perf_counter() - t0
     total_bytes = sum(sizes)
     total_gb    = total_bytes / (1024 ** 3)
@@ -373,9 +201,9 @@ def prepare_dataset(
         "mean compute: %.2fs).",
         elapsed, counters["written"], counters["skipped"],
         counters["failed"], counters["total"], total_gb,
-        (total_bytes / max(len(sizes), 1)) / (1024 ** 2) if sizes else 0.0, mean_s)
+        (total_bytes / max(len(sizes), 1)) / (1024 ** 2) if sizes else 0.0,
+        mean_s)
 
-    # _failures.txt 与 data.exclude_list 兼容；成功时清除陈旧文件。
     fail_path = out_p / "_failures.txt"
     if not failures and fail_path.is_file():
         fail_path.unlink()
@@ -391,7 +219,6 @@ def prepare_dataset(
             "either re-run with --overwrite for the affected files OR add "
             "them to data.exclude_list.", len(failures), fail_path)
 
-    # 供下游追溯的 manifest。
     manifest = {
         "tool_version": _TOOL_VERSION,
         "made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -403,6 +230,9 @@ def prepare_dataset(
             "cond_dirs": list(cfg.data.cond_dirs),
         },
         "label_values": label_values,
+        "spacing_normalization": spacing_norm,
+        "target_spacing": ([float(s) for s in target_spacing]
+                           if target_spacing is not None else None),
         "n_total": counters["total"],
         "n_written": counters["written"],
         "n_skipped": counters["skipped"],
@@ -421,7 +251,6 @@ def _record(
     counters: Dict[str, int],
     timings: List[float],
     sizes: List[int]) -> None:
-    """内联/池两路共用的计数。"""
     status = res.get("status", "written")
     counters[status] = counters.get(status, 0) + 1
     timings.append(float(res.get("elapsed_s", 0.0)))
@@ -430,7 +259,6 @@ def _record(
 
 def _log_progress(
     done: int, total: int, res: Dict[str, object], t0: float) -> None:
-    """逐样本/批次进度日志。"""
     if done == 1 or done == total or done % 10 == 0:
         elapsed = time.perf_counter() - t0
         rate = done / max(elapsed, 1e-6)
@@ -447,69 +275,52 @@ def _log_progress(
 
 
 def _short_exc(exc: BaseException, max_len: int = 200) -> str:
-    """单行限长的异常概要，写入 failures 文件。"""
-    msg = f"{type(exc).__name__}: {exc}".replace("\n", " | ").replace("\t", " ")
-    return msg[:max_len]
+    msg = f"{type(exc).__name__}: {exc}"
+    return msg if len(msg) <= max_len else msg[: max_len - 3] + "..."
 
 
 def _setup_logging(level: str = "INFO") -> None:
-    # 复用集中式日志配置；out_dir=None 表示只配控制台（彩色），不写文件。
     from taskcore.utils.logging_utils import setup_logging
-    setup_logging(output_dir=None, level=level)
+    setup_logging(output_dir=None, level=level, log_filename=None)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pre-compute per-sample npz packages "
-                    "(image+label+rw+fg-index, bbox-cropped).")
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to YAML config (same one used by train.py).")
-    parser.add_argument("--override", nargs="*", default=[],
-                        help="Config overrides (key=value, dot notation), "
-                             "e.g. --override data.image_dir=F:/x data.label_values=[0,1].")
-    parser.add_argument("--out", type=str, required=True,
-                        help="Output directory for the npz packages.")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="Parallel worker processes (0 = inline). "
-                             "Each worker peaks at ~1 cropped sample's "
-                             "RAM; tune to host memory.")
+        description="gentask make_data: bake per-sample npz (delegates to "
+                    "taskcore; supports cond_dirs).")
+    parser.add_argument("--config", required=True, help="YAML config path")
+    parser.add_argument("--out", required=True, help="Output npz directory")
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--fg-subsample", type=int,
-                        default=_DEFAULT_FG_SUBSAMPLE,
-                        help="Max stored 3D fg coords per sample "
-                             "(matches Volume3DCubic._build_index).")
-    parser.add_argument("--compress", action="store_true",
-                        help="Use np.savez_compressed (smaller disk, "
-                             "but no shared OS page cache and slower load).")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Re-write existing npz files.")
-    parser.add_argument("--limit", type=int, default=0,
-                        help="Process only the first N samples "
-                             "(smoke-test; 0=all).")
-    parser.add_argument("--log-level", type=str, default="INFO")
+                        default=_DEFAULT_FG_SUBSAMPLE)
+    parser.add_argument("--compress", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--override", nargs="*", default=[])
+    parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
     _setup_logging(args.log_level)
-
     cfg = load_config(args.config)
-    logger.info("Config loaded from %s", args.config)
     if args.override:
-        # 复用 train.py override 语义；懒导入保持 make_data 轻量。
         from ..train import apply_overrides
         apply_overrides(cfg, args.override)
         cfg.sync()
         cfg.validate()
 
-    counters = prepare_dataset(
-        cfg=cfg,
-        out_dir=args.out,
-        workers=args.workers,
-        fg_subsample=args.fg_subsample,
-        compress=args.compress,
-        overwrite=args.overwrite,
-        limit=args.limit,
-    )
-    return 0 if counters["failed"] == 0 else 1
+    try:
+        counters = prepare_dataset(
+            cfg, args.out,
+            workers=args.workers,
+            fg_subsample=args.fg_subsample,
+            compress=args.compress,
+            overwrite=args.overwrite,
+            limit=args.limit)
+    except Exception:
+        logger.error("make_data aborted:\n%s", traceback.format_exc())
+        return 2
+    return 1 if counters.get("failed", 0) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

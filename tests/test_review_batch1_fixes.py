@@ -175,7 +175,7 @@ def test_async_checkpoint_saver_uses_atomic_write():
 # P3-01: Grid Dropout 起点上界
 # ---------------------------------------------------------------------------
 def test_grid_dropout_hole_start_reaches_last_valid_position():
-    from segtask_v1.data import augment as aug
+    from taskcore.data import augment as aug
 
     D = H = W = 8
     image = torch.ones(1, 1, D, H, W)

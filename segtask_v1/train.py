@@ -21,8 +21,8 @@ warnings.filterwarnings(
 import torch
 import torch.multiprocessing as mp
 
-from taskcore.config.core import Config, load_config, save_config
-from taskcore.config.task_io import apply_dotted_overrides
+from taskcore.config.seg_bundle import SegBundle
+from .seg_config import load_config, save_config, apply_overrides as apply_seg_overrides
 from taskcore.engine.launch import (
     find_free_port, finalize_ddp_worker, init_ddp_worker,
     maybe_enable_expandable_segments,
@@ -40,12 +40,13 @@ def setup_logging(output_dir: str, level: str = "INFO") -> None:
     _setup_logging(output_dir=output_dir, level=level, log_filename="train.log")
 
 
-def apply_overrides(cfg, overrides: list) -> None:
+def apply_overrides(cfg: SegBundle, overrides: list) -> None:
     """应用点记法 override。示例：--override train.epochs=50 model.backbone=convnext。"""
-    apply_dotted_overrides(cfg, overrides)
+    if overrides:
+        apply_seg_overrides(cfg, overrides)
 
 
-def _build_and_fit(cfg: Config, device: torch.device):
+def _build_and_fit(cfg: SegBundle, device: torch.device):
     """单进程内的"建数据/模型 → 训练"主体；单卡与各 DDP rank 共用。
 
     rank / world_size 取自已初始化的 process group（单进程为 0 / 1）。落盘类副作用
@@ -83,7 +84,7 @@ def _build_and_fit(cfg: Config, device: torch.device):
 def _train_worker(
     local_rank: int,
     gpus: list,
-    cfg: Config,
+    cfg: SegBundle,
     log_level: str,
     master_port: int,
 ) -> None:

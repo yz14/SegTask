@@ -278,7 +278,9 @@ def surface_dice_batch_stats(
                 else (torch.sigmoid(pred) > threshold).float())
     target_f = target.float()
     ndim = pred_bin.ndim - 2
-    assert ndim in (2, 3), f"surface_dice expects 2D/3D spatial, got rank {pred_bin.ndim}"
+    if ndim not in (2, 3):
+        raise ValueError(
+            f"surface_dice expects 2D/3D spatial, got rank {pred_bin.ndim}")
 
     if tolerance_mm > 0.0 and spacing is not None:
         return _nsd_stats_spacing_aware(

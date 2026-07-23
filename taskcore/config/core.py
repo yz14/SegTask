@@ -1283,9 +1283,7 @@ class Config:
     data   : DataConfig    = field(default_factory=DataConfig)
     augment: AugConfig     = field(default_factory=AugConfig)
     model  : ModelConfig   = field(default_factory=ModelConfig)
-    loss   : LossConfig    = field(default_factory=LossConfig)
     train  : TrainConfig   = field(default_factory=TrainConfig)
-    predict: PredictConfig = field(default_factory=PredictConfig)
     vis    : VisConfig     = field(default_factory=VisConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
 
@@ -1411,13 +1409,9 @@ class Config:
         skip = skip or set()
         self._validate_model()
         self._validate_augment()
-        if "loss" not in skip:
-            self._validate_loss()
         self._validate_data()
         self._validate_2_5d()
         self._validate_train()
-        if "predict" not in skip:
-            self._validate_predict()
         self._validate_monitor()
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
@@ -1469,25 +1463,11 @@ class Config:
             ),
                 f"model.arch={arch!r} only supports stem_fusion_mode in "
                 f"('shared_stem','multi_stem_proj'); got {self.model.stem_fusion_mode!r}.")
-        _require(
-            self.model.spatial_dims in (2, 3),
-            f"Invalid spatial_dims: {self.model.spatial_dims} (must be 2 or 3)")
-        # 下面三项适用于所有 arch（ADM/EDM2 也读取）。
-        _require(
-            self.model.stem_mode in (
-            "conv3", "conv7", "dual", "patch2", "patch4",
-        ),
-            f"Invalid stem_mode: {self.model.stem_mode}")
-        _require(
-            self.model.stem_fusion_mode in (
-            "shared_stem", "multi_stem_proj", "hierarchical",
-        ),
-            f"Invalid stem_fusion_mode: {self.model.stem_fusion_mode!r}")
-        _require(
-            self.model.aux_head_mode in (
-            "linear", "conv",
-        ),
-            f"Invalid aux_head_mode: {self.model.aux_head_mode!r}")
+        from .section_validators import (
+            validate_encoder_decoder_stage_lengths,
+            validate_stem_modes,
+        )
+        validate_stem_modes(self)
         # 中心线/距离场辅助头校验。
         if self.model.unet.aux_topo_head:
             _require(
@@ -1501,17 +1481,6 @@ class Config:
             _require(
                 self.model.unet.aux_topo_head_mode in ("linear", "conv"),
                 f"Invalid aux_topo_head_mode: {self.model.unet.aux_topo_head_mode!r}")
-            _require(
-                self.loss.aux_topo_weight >= 0.0,
-                f"loss.aux_topo_weight must be >= 0; got {self.loss.aux_topo_weight}.")
-            _require(
-                self.loss.aux_topo_iter >= 1,
-                f"loss.aux_topo_iter must be >= 1; got {self.loss.aux_topo_iter}.")
-            _require(
-                self.loss.aux_topo_loss in (
-                "auto", "dice", "bce", "smooth_l1", "mse"),
-                f"Invalid loss.aux_topo_loss: {self.loss.aux_topo_loss!r}. "
-                "Valid: 'auto' | 'dice' | 'bce' | 'smooth_l1' | 'mse'.")
         # 仅 arch=='unet' 使用以下 backbone/block/decoder/r2plus1d/ResEnc/注意力选项。
         if arch == "unet":
             _require(
@@ -1583,26 +1552,8 @@ class Config:
                             f"mednext_dilated_reparam effective kernel "
                             f"{eff} exceeds mednext_kernel_size="
                             f"{self.model.unet.mednext.kernel_size}.")
-        # 逐级 block 数长度需与 encoder 深度对齐。
         n_levels = len(self.model.encoder_channels)
-        ebps = self.model.encoder_blocks_per_stage
-        dbps = self.model.decoder_blocks_per_stage
-        if ebps:
-            _require(
-                len(ebps) == n_levels,
-                f"encoder_blocks_per_stage must have {n_levels} entries "
-                f"(= len(encoder_channels)); got {len(ebps)}")
-            _require(
-                all(b >= 1 for b in ebps),
-                "encoder_blocks_per_stage entries must all be >= 1")
-        if dbps:
-            _require(
-                len(dbps) == n_levels - 1,
-                f"decoder_blocks_per_stage must have {n_levels - 1} entries "
-                f"(= len(encoder_channels) - 1); got {len(dbps)}")
-            _require(
-                all(b >= 1 for b in dbps),
-                "decoder_blocks_per_stage entries must all be >= 1")
+        validate_encoder_decoder_stage_lengths(self)
         ckpt_mask = list(self.model.unet.grad_ckpt_encoder_stages)
         if ckpt_mask:
             _require(
@@ -1616,22 +1567,6 @@ class Config:
                 logger.warning(
                     "model.grad_ckpt_encoder_stages 已配置但 model.grad_checkpointing=False，"
                     "该掩码将被忽略。")
-        # 显式各向异性下采样 stride 校验（自动模式 anisotropic_pooling 无需在此校验）。
-        sds = self.model.unet.downsample_strides
-        if sds:
-            sd_dim = int(self.model.spatial_dims)
-            _require(
-                len(sds) == n_levels - 1,
-                f"downsample_strides must have {n_levels - 1} entries "
-                f"(= len(encoder_channels) - 1); got {len(sds)}")
-            for s in sds:
-                _require(
-                    len(s) == sd_dim,
-                    f"each downsample_strides entry must have "
-                    f"spatial_dims={sd_dim} values; got {list(s)}")
-                _require(
-                    all(int(v) in (1, 2) for v in s),
-                    f"downsample_strides values must be 1 or 2; got {list(s)}")
         # MultiRF（多感受野空洞分支）校验。默认关闭时完全跳过，逐位兼容现状。
         if self.model.unet.multirf.enabled:
             self._validate_multirf(n_levels)
@@ -1925,57 +1860,6 @@ class Config:
                     "为单位改配（如 brightness ±0.3~0.5、noise std 0.1）。",
                     "、".join(hints))
 
-    def _validate_loss(self) -> None:
-        """loss.* 名称与参数校验。"""
-        _require(
-            self.loss.name in (
-            # 单损失
-            "dice", "bce", "focal", "tversky",
-            "gdl", "focal_tversky", "lovasz", "cldice",
-            # 复合损失
-            "dice_bce", "dice_focal", "dice_tversky",
-            "focal_plus_tversky", "dice_cldice", "dice_focal_tversky",
-            "dice_lovasz", "bce_lovasz",
-            "gdl_bce", "gdl_focal",
-        ),
-            f"Invalid loss: {self.loss.name}")
-        _require(
-            self.loss.gdl_weight_type in ("square", "simple", "uniform"),
-            f"Invalid gdl_weight_type: {self.loss.gdl_weight_type}")
-        _require(
-            self.loss.focal_tversky_gamma > 0,
-            f"focal_tversky_gamma must be > 0, got {self.loss.focal_tversky_gamma}")
-        _require(
-            self.loss.cldice_iter >= 1,
-            f"cldice_iter must be >= 1, got {self.loss.cldice_iter}")
-        _require(
-            self.loss.slice_loss_reduction in ("per_slice", "per_volume"),
-            f"Invalid slice_loss_reduction: {self.loss.slice_loss_reduction!r}; "
-            "expected 'per_slice' or 'per_volume'.")
-        # 深监督权重预校验：forward 返回 n_levels-1 个预测（main + DS 头），
-        # 长度不符会在首个训练 step 才由 DeepSupervisionLoss 报错，这里提前警示。
-        # （只警告不硬错：默认权重表按典型 5 级配置给出，小模型可能沿用默认。）
-        if self.model.deep_supervision:
-            _require(
-                bool(self.loss.deep_supervision_weights),
-                "model.deep_supervision=True requires non-empty "
-                "loss.deep_supervision_weights：否则 pipeline 不会包装 "
-                "DeepSupervisionLoss，而模型 forward 返回 list，首个训练 "
-                "step 才会报错。")
-        if self.model.deep_supervision and self.loss.deep_supervision_weights:
-            ds_w = self.loss.deep_supervision_weights
-            expected = len(self.model.encoder_channels) - 1
-            if len(ds_w) != expected:
-                logger.warning(
-                    "loss.deep_supervision_weights 长度 %d 与深监督预测数 %d "
-                    "(= len(model.encoder_channels) - 1，main + DS 头) 不符；"
-                    "首个训练 step 将由 DeepSupervisionLoss 报错。weights=%s。",
-                    len(ds_w), expected, ds_w)
-            _require(
-                all(float(w) >= 0.0 for w in ds_w) and sum(ds_w) > 0,
-                f"loss.deep_supervision_weights must be non-negative with a "
-                f"positive sum; got {ds_w}.")
-
     def _validate_data(self) -> None:
         """data.* patch/multi-res/keep_native 校验。"""
         _require(
@@ -2101,8 +1985,13 @@ class Config:
                 f"batch_size ({self.data.batch_size}) must be divisible by "
                 f"sum(mix_ratio) ({sum(mr)}) for integer per-batch counts.")
 
-    def _validate_2_5d(self) -> None:
-        """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。"""
+    def _validate_2_5d(self, *, check_channel_layout: bool = True) -> None:
+        """2.5D 专属不变式（折叠通道 / lift / Plan A·C / aux 监督）。
+
+        ``check_channel_layout``：分割任务校验 ``in_channels == D*n_views``
+        （或 keep_native 的 sum(D_k)）及 ``aux_seg_supervision`` 强制项。
+        生成任务通道含 cond 等扩展，应传 ``False`` 后由任务侧自管。
+        """
         if self.data.patch_mode == "2_5d":
             # 2.5D 不变式重检（防手改后陈旧配置）。
             _require(
@@ -2125,10 +2014,11 @@ class Config:
                 _require(
                     self.model.spatial_dims == 3,
                     "lift_2_5d_to_3d=True requires model.spatial_dims=3 (auto-set by sync()).")
-                _require(
-                    self.model.in_channels == n_views,
-                    f"lift_2_5d_to_3d=True requires in_channels == n_views ({n_views}); "
-                    f"got {self.model.in_channels}.")
+                if check_channel_layout:
+                    _require(
+                        self.model.in_channels == n_views,
+                        f"lift_2_5d_to_3d=True requires in_channels == n_views ({n_views}); "
+                        f"got {self.model.in_channels}.")
                 _require(
                     not self.data.keep_native_view_depth,
                     "lift_2_5d_to_3d and keep_native_view_depth are mutually exclusive.")
@@ -2146,29 +2036,49 @@ class Config:
                     self.model.spatial_dims == 2,
                     "2.5D mode requires model.spatial_dims=2 (auto-set by sync()). "
                     "For Plan A 3D lift, set model.lift_2_5d_to_3d=True.")
-            if (not lift) and self.data.keep_native_view_depth and n_views > 1:
+            if check_channel_layout:
+                if (not lift) and self.data.keep_native_view_depth and n_views > 1:
+                    depths = self.per_view_depths
+                    expected_in = int(sum(depths))
+                    _require(
+                        self.model.in_channels == expected_in,
+                        f"2.5D + keep_native_view_depth=True requires in_channels == sum(D_k) = "
+                        f"sum({depths}) = {expected_in}; got {self.model.in_channels}.")
+                    _require(
+                        self.data.z_boundary_mode == "edge_pad",
+                        f"keep_native_view_depth=True requires z_boundary_mode='edge_pad'; "
+                        f"got {self.data.z_boundary_mode!r}.")
+                    # 辅视图提供额外输入却无监督信号不合理。
+                    _require(
+                        self.model.aux_seg_supervision,
+                        "keep_native_view_depth=True requires model.aux_seg_supervision=True "
+                        "(each native-depth view k drives an aux head).")
+                elif not lift:
+                    expected_in = int(self.data.patch_size[0]) * n_views
+                    _require(
+                        self.model.in_channels == expected_in,
+                        f"2.5D requires in_channels == patch_size[0] * n_views = "
+                        f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
+                        f"got {self.model.in_channels}.")
+            elif (not lift) and self.data.keep_native_view_depth and n_views > 1:
+                # 生成任务：仅校验 native-depth 几何契约，不强制 seg aux 通道布局。
                 depths = self.per_view_depths
-                expected_in = int(sum(depths))
                 _require(
-                    self.model.in_channels == expected_in,
-                    f"2.5D + keep_native_view_depth=True requires in_channels == sum(D_k) = "
-                    f"sum({depths}) = {expected_in}; got {self.model.in_channels}.")
+                    len(depths) == n_views,
+                    f"per_view_depths length must equal n_views ({n_views}); got {len(depths)}.")
+                _require(
+                    depths[0] == self.data.patch_size[0],
+                    f"per_view_depths[0] must equal patch_size[0]={self.data.patch_size[0]}; "
+                    f"got {depths[0]}.")
                 _require(
                     self.data.z_boundary_mode == "edge_pad",
                     f"keep_native_view_depth=True requires z_boundary_mode='edge_pad'; "
                     f"got {self.data.z_boundary_mode!r}.")
-                # 辅视图提供额外输入却无监督信号不合理。
+                from ..models.topology import build_topology
                 _require(
-                    self.model.aux_seg_supervision,
-                    "keep_native_view_depth=True requires model.aux_seg_supervision=True "
-                    "(each native-depth view k drives an aux head).")
-            elif not lift:
-                expected_in = int(self.data.patch_size[0]) * n_views
-                _require(
-                    self.model.in_channels == expected_in,
-                    f"2.5D requires in_channels == patch_size[0] * n_views = "
-                    f"{self.data.patch_size[0]} * {n_views} = {expected_in}; "
-                    f"got {self.model.in_channels}.")
+                    build_topology(self).in_ch_per_view_list is not None,
+                    "keep_native_view_depth=True requires in_ch_per_view_list "
+                    "(derived by build_topology).")
             # Plan C：aux view k 注入 encoder 第 k 级。
             if self.model.stem_fusion_mode == "hierarchical" and n_views > 1:
                 n_stages = len(self.model.encoder_channels)
@@ -2192,14 +2102,6 @@ class Config:
                 _require(
                     n_views > 1,
                     "aux_seg_supervision=True requires n_views > 1; got 1.")
-                aw = list(self.loss.aux_supervision_weights)
-                if aw:
-                    _require(
-                        len(aw) == n_views - 1,
-                        f"aux_supervision_weights length must = n_views-1 ({n_views-1}); got {aw}.")
-                    _require(
-                        all(w >= 0 for w in aw),
-                        f"aux_supervision_weights must be non-negative; got {aw}.")
                 # Plan C 需 n_views < n_levels，使每 aux 头走不同 decoder 特征。
                 if self.model.stem_fusion_mode == "hierarchical":
                     n_levels = len(self.model.encoder_channels)
@@ -2281,8 +2183,7 @@ class Config:
         _require(
             len(gpus) == len(set(gpus)),
             f"train.gpus must not contain duplicate GPU indices; got {gpus}.")
-        # EMA / SWA / ZeRO：由 BaseTrainer 对所有任务生效，须在 _validate_train
-        # 内校验（组合式任务 cls/det/ssl 会 skip _validate_predict，不能放那边）。
+        # EMA / SWA / ZeRO：由 BaseTrainer 对所有任务生效。
         _require(
             str(self.train.ema_device) in ("", "cpu"),
             f"train.ema_device must be '' (follow model) or 'cpu'; "
@@ -2296,94 +2197,6 @@ class Config:
             logger.warning(
                 "train.zero_redundancy_optimizer=True 但未启用多卡 DDP（需 "
                 "len(train.gpus) >= 2）；单卡下无分片收益，将回退普通优化器。")
-
-    def _validate_predict(self) -> None:
-        """predict.* 阈值 / 累加器 / z 交错 / AdaBN 校验。"""
-        # 阈值：标量或逐前景类列表，均须在 [0,1]；列表长度与 num_fg 的匹配在
-        # Predictor 初始化时检查（label_values 可能到数据扫描后才确定）。
-        thr_cfg = self.predict.threshold
-        if isinstance(thr_cfg, (list, tuple)):
-            _require(
-                len(thr_cfg) > 0,
-                "predict.threshold list must be non-empty.")
-            _require(
-                all(0.0 <= float(t) <= 1.0 for t in thr_cfg),
-                f"predict.threshold entries must be in [0,1]; got {thr_cfg}.")
-        else:
-            _require(
-                0.0 <= float(thr_cfg) <= 1.0,
-                f"predict.threshold must be in [0,1]; got {thr_cfg}.")
-        _require(
-            0.0 <= float(self.predict.z_overlap) < 1.0,
-            f"predict.z_overlap must be in [0, 1); got {self.predict.z_overlap}.")
-        if self.predict.hw_overlap is not None:
-            _require(
-                0.0 <= float(self.predict.hw_overlap) < 1.0,
-                f"predict.hw_overlap must be in [0, 1); "
-                f"got {self.predict.hw_overlap}.")
-            if self.data.patch_mode != "cubic":
-                logger.warning(
-                    "predict.hw_overlap is only used by patch_mode='cubic'; "
-                    "current patch_mode=%r ignores it.", self.data.patch_mode)
-        _require(
-            self.predict.blend_mode in ("gaussian", "average"),
-            f"predict.blend_mode must be 'gaussian' or 'average'; "
-            f"got {self.predict.blend_mode!r}.")
-        _require(
-            str(self.predict.acc_dtype) in ("fp32", "fp16"),
-            f"predict.acc_dtype must be 'fp32' or 'fp16'; "
-            f"got {self.predict.acc_dtype!r}.")
-        _require(
-            str(self.predict.vol_dtype) in ("fp32", "fp16"),
-            f"predict.vol_dtype must be 'fp32' or 'fp16'; "
-            f"got {self.predict.vol_dtype!r}.")
-        # z 轴交错推理检查（仅启用时）。
-        if self.predict.z_interleave_enabled:
-            _require(
-                self.data.patch_mode == "2_5d",
-                f"predict.z_interleave_enabled=True requires patch_mode='2_5d'; "
-                f"got {self.data.patch_mode!r}.")
-            thr = self.predict.z_interleave_thresholds
-            fac = self.predict.z_interleave_factors
-            _require(
-                len(fac) == len(thr) + 1,
-                f"z_interleave_factors length must = len(thresholds)+1; "
-                f"got thresholds={thr}, factors={fac}.")
-            _require(
-                all(t > 0 for t in thr),
-                f"z_interleave_thresholds must all > 0; got {thr}.")
-            _require(
-                thr == sorted(thr),
-                f"z_interleave_thresholds must be ascending; got {thr}.")
-            _require(
-                all(int(f) >= 1 for f in fac),
-                f"z_interleave_factors must all >= 1; got {fac}.")
-            # stretch 会拉伸短子流、冲淡交错收益，仅警告。
-            if self.data.z_boundary_mode != "edge_pad":
-                logger.warning(
-                    "z_interleave_enabled=True with z_boundary_mode=%r: "
-                    "short sub-streams will be stretched along z. Prefer 'edge_pad'.",
-                    self.data.z_boundary_mode)
-        # 测试时自适应 BatchNorm 检查（仅启用时）。
-        if self.predict.adabn_enabled:
-            _require(
-                self.predict.adabn_mode in ("global", "per_volume"),
-                f"predict.adabn_mode must be 'global' or 'per_volume'; "
-                f"got {self.predict.adabn_mode!r}.")
-            _require(
-                int(self.predict.adabn_num_volumes) >= 1,
-                f"predict.adabn_num_volumes must be >= 1; "
-                f"got {self.predict.adabn_num_volumes}.")
-            _require(
-                0.0 < float(self.predict.adabn_sample_ratio) <= 1.0,
-                f"predict.adabn_sample_ratio must be in (0, 1]; "
-                f"got {self.predict.adabn_sample_ratio}.")
-            # AdaBN 只对 BatchNorm 有意义；其余归一化层会使其成为 no-op，仅警告。
-            if self.model.unet.norm_type != "batch":
-                logger.warning(
-                    "predict.adabn_enabled=True but model.norm_type=%r != "
-                    "'batch'; AdaBN will be a no-op (no BatchNorm to adapt).",
-                    self.model.unet.norm_type)
 
     def _validate_monitor(self) -> None:
         """monitor.* 训练监测仪表盘校验（仅 monitor.enabled 时生效）。"""
@@ -2420,9 +2233,7 @@ _SUB_CONFIGS = {
     "data": DataConfig,
     "augment": AugConfig,
     "model": ModelConfig,
-    "loss": LossConfig,
     "train": TrainConfig,
-    "predict": PredictConfig,
     "vis": VisConfig,
     "monitor": MonitorConfig,
 }
@@ -2479,65 +2290,124 @@ def nested_dataclass_type(f) -> "Optional[type]":
 _nested_dataclass_type = nested_dataclass_type  # 旧名别名，兼容存量引用
 
 
-def _dataclass_from_dict(cls, d: Dict[str, Any]):
+@dataclass(frozen=True)
+class DataclassLoadContext:
+    """``dataclass_from_dict`` 的可选加载上下文（供 gen 等 fork 消重）。"""
+
+    sub_configs: Optional[Dict[str, type]] = None
+    field_aliases: Optional[Dict[type, Dict[str, str]]] = None
+    deprecated_derived_keys: Optional[Dict[type, Dict[str, str]]] = None
+    removed_keys: Optional[Dict[type, Dict[str, str]]] = None
+    model_route_extra_flat_to_nested: Optional[Dict[str, str]] = None
+    model_config_cls: type = ModelConfig
+    error_cls: type = ConfigError
+
+
+def _lookup_type_map(type_map: Dict[type, Dict[str, str]], cls) -> Dict[str, str]:
+    """沿 MRO 查找类型映射（gen 子类 dataclass 复用 core 父类条目）。"""
+    for c in getattr(cls, "__mro__", (cls,)):
+        if c in type_map:
+            return type_map[c]
+    return {}
+
+
+def dataclass_from_dict(
+    cls,
+    d: Dict[str, Any],
+    ctx: Optional[DataclassLoadContext] = None,
+):
     """Recursively construct a dataclass from a dict（任意深度嵌套）。
 
-    * ``model`` 段的旧扁平键（``backbone`` / ``adm_num_heads`` 等）先经
-      :func:`route_legacy_model_dict` 路由进嵌套子段（D2 兼容层）；
-      新旧路径同时设置同一字段抛 ``ConfigError``；
-    * 旧别名（``_FIELD_ALIASES``）、曾经可写但现已派生的字段
-      （``_DEPRECATED_DERIVED_KEYS``）以及未知字段直接抛 ``ConfigError``，
-      并给出迁移提示。
+    * ``model`` 段的旧扁平键先经 :func:`route_legacy_model_dict` 路由；
+    * 旧别名 / 派生只读字段 / 未知字段抛 ``ConfigError``（或 ``ctx.error_cls``）；
+    * ``ctx.sub_configs`` 在 ``nested_dataclass_type`` 无法解析时作段名兜底
+      （gen 的 ``task`` 段等）。
     """
     if not isinstance(d, dict):
         return d
-    if isinstance(cls, type) and issubclass(cls, ModelConfig):
-        d, moved = route_legacy_model_dict(d, error_cls=ConfigError)
+
+    err = ctx.error_cls if ctx is not None else ConfigError
+    model_cls = ctx.model_config_cls if ctx is not None else ModelConfig
+    sub_configs = (
+        ctx.sub_configs if ctx is not None and ctx.sub_configs is not None
+        else _SUB_CONFIGS)
+    aliases_map = (
+        ctx.field_aliases if ctx is not None and ctx.field_aliases is not None
+        else _FIELD_ALIASES)
+    derived_map = (
+        ctx.deprecated_derived_keys
+        if ctx is not None and ctx.deprecated_derived_keys is not None
+        else _DEPRECATED_DERIVED_KEYS)
+    removed_map = (
+        ctx.removed_keys if ctx is not None and ctx.removed_keys is not None
+        else _REMOVED_KEYS)
+    extra_flat = (
+        ctx.model_route_extra_flat_to_nested if ctx is not None else None)
+
+    if isinstance(cls, type) and issubclass(cls, model_cls):
+        d, moved = route_legacy_model_dict(
+            d, error_cls=err, extra_flat_to_nested=extra_flat)
         if moved:
             logger.info(
                 "model 段旧扁平键已自动迁移到嵌套路径（建议更新 YAML）：%s",
                 ", ".join(f"{k} -> {p}" for k, p in sorted(moved.items())))
+
     dc_fields = {f.name: f for f in fields(cls)}
-    aliases = _FIELD_ALIASES.get(cls, {})
-    derived = _DEPRECATED_DERIVED_KEYS.get(cls, {})
-    removed = _REMOVED_KEYS.get(cls, {})
+    aliases = _lookup_type_map(aliases_map, cls)
+    derived = _lookup_type_map(derived_map, cls)
+    removed = _lookup_type_map(removed_map, cls)
     kwargs = {}
     for k, v in d.items():
         if k in removed:
-            raise ConfigError(
+            raise err(
                 f"Config key '{k}' is removed from {cls.__name__}; use "
                 f"{removed[k]} instead.")
         if k in derived:
-            raise ConfigError(
+            raise err(
                 f"Config key '{k}' is removed from {cls.__name__}; it is now "
                 f"auto-derived from '{derived[k]}' and must not be set in YAML.")
         if k in aliases:
             new_key = aliases[k]
             if new_key in d:
-                raise ConfigError(
+                raise err(
                     f"{cls.__name__}: both deprecated '{k}' and its "
                     f"replacement '{new_key}' are set; remove '{k}' and keep "
                     f"'{new_key}'.")
-            raise ConfigError(
+            raise err(
                 f"Config key '{k}' is removed from {cls.__name__}; use "
                 f"'{new_key}' instead.")
         if k not in dc_fields:
-            raise ConfigError(
+            raise err(
                 f"Unknown config key '{k}' in {cls.__name__}.")
-        sub_cls = _nested_dataclass_type(dc_fields[k])
+        sub_cls = nested_dataclass_type(dc_fields[k])
+        if sub_cls is None and k in sub_configs:
+            sub_cls = sub_configs[k]
         if sub_cls is not None and isinstance(v, dict):
-            v = _dataclass_from_dict(sub_cls, v)
+            v = dataclass_from_dict(sub_cls, v, ctx)
         kwargs[k] = v
     return cls(**kwargs)
 
 
+def _dataclass_from_dict(cls, d: Dict[str, Any]):
+    """Seg 默认上下文加载（``load_config`` / ``task_io`` 使用）。"""
+    return dataclass_from_dict(cls, d)
+
+
 def load_config(path: Union[str, Path]) -> Config:
-    """Load configuration from a YAML file."""
+    """Load core configuration from a YAML file (不含 seg 专属 loss/predict 段)。"""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    from .seg_task import hoist_legacy_seg_sections
+    hoist_legacy_seg_sections(raw)
+    if "seg" in raw:
+        logger.warning(
+            "core.load_config(%s) discards top-level 'seg' (loss/predict); "
+            "use segtask_v1.seg_config.load_config for segmentation configs.",
+            path)
+        raw.pop("seg", None)
     cfg = _dataclass_from_dict(Config, raw)
     cfg.sync()
     cfg.validate()

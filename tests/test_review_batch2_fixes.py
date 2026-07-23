@@ -260,3 +260,47 @@ def test_prepare_one_fails_fast_on_geometry_mismatch():
                 pid="p0", image_path=img, label_path=lbl,
                 bbox_path=None, rw_path=None,
                 out_path=str(root / "p0.npz"), label_values=[0, 1])
+
+
+def test_prepare_one_skips_when_meta_matches():
+    from taskcore.data.make_data import prepare_one
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        image_dir, label_dir = _make_pair_dirs(root, n=1)
+        img = str(next(image_dir.glob("*.nii.gz")))
+        lbl = str(next(label_dir.glob("*.nii.gz")))
+        out = str(root / "p0.npz")
+        first = prepare_one(
+            pid="p0", image_path=img, label_path=lbl,
+            bbox_path=None, rw_path=None,
+            out_path=out, label_values=[0, 1])
+        assert first["status"] == "written"
+        second = prepare_one(
+            pid="p0", image_path=img, label_path=lbl,
+            bbox_path=None, rw_path=None,
+            out_path=out, label_values=[0, 1])
+        assert second["status"] == "skipped"
+
+
+def test_prepare_one_regenerates_on_stale_meta():
+    from taskcore.data.make_data import prepare_one
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        image_dir, label_dir = _make_pair_dirs(root, n=1)
+        img = str(next(image_dir.glob("*.nii.gz")))
+        lbl = str(next(label_dir.glob("*.nii.gz")))
+        out = str(root / "p0.npz")
+        prepare_one(
+            pid="p0", image_path=img, label_path=lbl,
+            bbox_path=None, rw_path=None,
+            out_path=out, label_values=[0, 1],
+            spacing_normalization=True,
+            target_spacing=[2.0, 1.0, 1.0])
+        # 同路径但不同 target_spacing → 不得 skip，应重生成。
+        res = prepare_one(
+            pid="p0", image_path=img, label_path=lbl,
+            bbox_path=None, rw_path=None,
+            out_path=out, label_values=[0, 1],
+            spacing_normalization=True,
+            target_spacing=[1.0, 1.0, 1.0])
+        assert res["status"] == "written"

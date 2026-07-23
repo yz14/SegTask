@@ -151,6 +151,8 @@ class Trainer(BaseTrainer):
         # --- Tracking --------------------------------------------------
         self.num_fg = cfg.num_fg_classes
         self._setup_best_tracking(mode=tc.save_best_mode)  # "max" or "min"
+        self.best_key = tc.save_best_metric
+        self._ckpt_task_label = "seg"
 
         # --- Validation / model-selection evaluator -------------------
         # medium（随机 patch 指标）/ high（整卷滑窗指标）由 val_metric_mode 决定；
@@ -300,7 +302,9 @@ class Trainer(BaseTrainer):
                     self.best_epoch  = epoch
                     self.has_best    = True
                     self.patience_counter = 0
-                    self._save_checkpoint(epoch, is_best=True)
+                    # best 走 BaseTrainer（EMA-primary 槽位与 cls/det/gen 对齐）；
+                    # 周期 checkpoint 仍用本类 _save_checkpoint（keep-last-k）。
+                    self._save_best(epoch, val_metrics)
                     best_metrics = val_metrics
                     logger.info(
                         "★ New best: %s=%.4f at epoch %d",
@@ -723,6 +727,16 @@ class Trainer(BaseTrainer):
         return state
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
+        """周期 / 续训 checkpoint（非 best）。
+
+        ``is_best=True`` 已弃用：选模落盘请走 ``BaseTrainer._save_best``。
+        保留参数仅为兼容旧调用；真 best 路径不再进入本方法。
+        """
+        if is_best:
+            # 防御：若仍有旧调用，转发到公共 best 路径。
+            metrics = {self.best_key: float(self.best_metric)}
+            self._save_best(epoch, metrics)
+            return
         # ZeRO 优化器状态分片在各 rank：保存前需全 rank 集合式 consolidate 到
         # rank0（必须在 rank 早退之前调用，否则集合通信挂死）。
         if hasattr(self.optimizer, "consolidate_state_dict"):
@@ -730,31 +744,20 @@ class Trainer(BaseTrainer):
         # 多卡下仅 rank0 落盘，避免多进程写同一文件互相覆盖 / 损坏。
         if not self._is_main:
             return
-        state = self._build_state_dict(ema_as_primary=is_best)
+        state = self._build_state_dict(ema_as_primary=False)
         state["epoch"] = epoch
 
-        if is_best:
-            path = self.output_dir / "best_model.pth"
-            if self._ckpt_saver is not None:
-                self._ckpt_saver.submit(
-                    state_to_cpu(state), path,
-                    on_done=lambda p=path: logger.info(
-                        "Best model saved: %s", p))
-            else:
-                atomic_torch_save(state, path)
-                logger.info("Best model saved: %s", path)
-        else:
-            path = self.output_dir / f"checkpoint_epoch_{epoch + 1}.pth"
-            if self._ckpt_saver is not None:
-                # 清理在写完后的后台回调里做，保证 keep-last-k 计数含本次。
-                def _on_done(p=path):
-                    logger.debug("Checkpoint saved: %s", p)
-                    self._prune_old_checkpoints()
-                self._ckpt_saver.submit(state_to_cpu(state), path, _on_done)
-            else:
-                atomic_torch_save(state, path)
-                logger.debug("Checkpoint saved: %s", path)
+        path = self.output_dir / f"checkpoint_epoch_{epoch + 1}.pth"
+        if self._ckpt_saver is not None:
+            # 清理在写完后的后台回调里做，保证 keep-last-k 计数含本次。
+            def _on_done(p=path):
+                logger.debug("Checkpoint saved: %s", p)
                 self._prune_old_checkpoints()
+            self._ckpt_saver.submit(state_to_cpu(state), path, _on_done)
+        else:
+            atomic_torch_save(state, path)
+            logger.debug("Checkpoint saved: %s", path)
+            self._prune_old_checkpoints()
 
     def _prune_old_checkpoints(self) -> None:
         """周期 checkpoint 的 keep-last-k 保留：仅留最近 ``save_keep_last`` 个

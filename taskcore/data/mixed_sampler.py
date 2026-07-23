@@ -58,7 +58,14 @@ class SourceTaggedDataset(Dataset):
     # 暴露底层属性（如 _npz_paths），便于 loader 的缓存足迹估计等复用。
     def __getattr__(self, name: str):  # pragma: no cover - 仅转发
         # __getattr__ 仅在常规查找失败时触发，避免与 self.base/source_id 冲突。
-        return getattr(self.__dict__["base"], name)
+        # unpickle 时 __dict__ 尚未填充，须抛 AttributeError（非 KeyError），
+        # 否则 DataLoader worker（Windows spawn）无法反序列化。
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        base = self.__dict__.get("base")
+        if base is None:
+            raise AttributeError(name)
+        return getattr(base, name)
 
 
 def resolve_per_batch_counts(

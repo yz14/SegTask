@@ -24,9 +24,9 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from segtask_v1.config import Config as SegConfig
-from segtask_v1.models.factory import build_model
-from segtask_v1.trainer.checkpoint import strip_common_prefixes
+from taskcore.config.core import Config as SegConfig
+from taskcore.models.factory import build_model
+from taskcore.engine.checkpoint import strip_common_prefixes
 
 from ssltask.config import SSLConfig, validate_ssl
 from ssltask.data.corruptions import GenesisCorruptor
@@ -75,7 +75,7 @@ from ssltask.models.spark_modules import _MaskedInstanceNormMixin, _SparkVisHold
 from ssltask.trainer import SSLTrainer
 
 try:
-    from segtask_v1.config import ConfigError
+    from taskcore.config.core import ConfigError
 except Exception:  # pragma: no cover
     ConfigError = Exception
 

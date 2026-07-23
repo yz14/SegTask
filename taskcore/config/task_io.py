@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
@@ -24,6 +23,9 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 PathLike = Union[str, Path]
 
+_BOOL_TRUE = frozenset({"true", "1", "yes"})
+_BOOL_FALSE = frozenset({"false", "0", "no"})
+
 
 def coerce_override_value(old: Any, val: str) -> Any:
     """按既有字段类型把字符串 override 值转回原类型。
@@ -34,13 +36,23 @@ def coerce_override_value(old: Any, val: str) -> Any:
     if old is None:
         return yaml.safe_load(val)
     if isinstance(old, bool):
-        return val.lower() in ("true", "1", "yes")
+        low = val.lower()
+        if low in _BOOL_TRUE:
+            return True
+        if low in _BOOL_FALSE:
+            return False
+        raise ValueError(
+            f"Invalid bool override {val!r}; use true/false/1/0/yes/no")
     if isinstance(old, int):
         return int(val)
     if isinstance(old, float):
         return float(val)
     if isinstance(old, list):
-        return json.loads(val)
+        parsed = yaml.safe_load(val)
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"List override must parse to a list, got {type(parsed).__name__}")
+        return parsed
     return val
 
 
@@ -76,6 +88,10 @@ def apply_dotted_overrides(
 
     for ov in overrides:
         if "=" not in ov:
+            if ov.strip():
+                logger.warning(
+                    "Ignoring override without '=': %r "
+                    "(expected dotted.path=value)", ov)
             continue
         key, val = ov.split("=", 1)
         routed = False

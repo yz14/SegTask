@@ -22,11 +22,10 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from torch.utils.data import Dataset
 
-from ..config import Config
 from .dataset import SegDataset3D, SegDataset3DCubic, SegDataset3DWhole
 
 logger = logging.getLogger(__name__)
@@ -57,8 +56,16 @@ class DatasetCommonCfg:
     region_weights: Optional[List[float]]
 
     @classmethod
-    def from_cfg(cls, cfg: Config) -> "DatasetCommonCfg":
+    def from_cfg(cls, cfg: Any) -> "DatasetCommonCfg":
+        """从运行期 cfg 构建（``SegBundle`` / 带 ``.loss`` 的视图）。
+
+        ``region_weights`` 取自 ``cfg.loss.region_weights``（seg 任务段）；
+        纯 core ``Config`` 无 ``loss`` 时为 ``None``。生成任务请用
+        ``gentask.data.specs.DatasetCommonCfg.from_cfg``（权重挂在 ``data``）。
+        """
         dc = cfg.data
+        loss = getattr(cfg, "loss", None)
+        rw = getattr(loss, "region_weights", None) if loss is not None else None
         return cls(
             label_values      = list(dc.label_values),
             patch_size        = tuple(int(x) for x in dc.patch_size),
@@ -70,8 +77,7 @@ class DatasetCommonCfg:
             cache_enabled     = (str(dc.cache_mode) == "memory"),
             cache_max_volumes = int(dc.cache_max_volumes),
             cache_int16       = (str(dc.cache_dtype) == "int16"),
-            region_weights    = (list(cfg.loss.region_weights)
-                                 if cfg.loss.region_weights else None))
+            region_weights    = list(rw) if rw else None)
 
     def to_kwargs(self) -> dict:
         """直接展开为 dataset ``__init__`` 的 kwargs（含子类扩展字段）。"""

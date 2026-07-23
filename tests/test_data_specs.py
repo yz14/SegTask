@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from taskcore.config.core import Config
-from segtask_v1.data import specs as specs_mod
+from taskcore.data import specs as specs_mod
 from taskcore.data.specs import (
     CubicSpec, DatasetCommonCfg, SplitPaths, WholeSpec, ZCubeSpec,
     build_data_spec,
