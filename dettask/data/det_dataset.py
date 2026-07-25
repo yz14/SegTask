@@ -219,7 +219,7 @@ class DetPatchDataset(NpzPatchDatasetBase):
             b = boxes[int(rng.integers(boxes.shape[0]))]
             z = int(round((b[0] + b[3]) / 2))
             if self.z_sampling_mode == "legacy":
-                return z
+                return int(np.clip(z, 0, D_vol - 1))
             lo, hi = safe_z_center_range(D_vol, d_patch)
             return int(np.clip(z, lo, hi - 1))
         if self.z_sampling_mode == "legacy":

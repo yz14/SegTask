@@ -1060,3 +1060,19 @@ TODO 1 修复核验（2026-07-25，对批 1–4 修复逐条比对新旧代码 +
 ──────────────────────────────────────────────────────────────
 
 
+
+批 6 进展记录（2026-07-25；det legacy clip、三任务逐位回归与文档口径）
+
+一、已修复
+- H2/P4：det 的 `z_sampling_mode=legacy` 前景框中心恢复批 1 之前的 `np.clip(z, 0, D_vol - 1)` 语义；仅影响显式 legacy，safe 路径和默认随机流不变。
+- H2：补充 seg/cls/det 三任务 ordinary、foreground、validation 三条 legacy 分支的固定 seed reference 对照，并检查调用后的 RNG 消耗顺序一致；同时覆盖 safe 分支与当前实现的结果对照。
+- B：文档明确 `model.init_strategy` 对 ADM/EDM2 的 non-legacy 拒绝仅属于 taskcore 通用分割 `Config` / `factory.build_model` 路径，不泛化到仓库所有 ADM/EDM2 构建入口。
+
+二、测试
+- 批 6 定向测试：24 passed。
+- 全量测试：1543 passed / 6 skipped / 11 failed；相对批 5 的 1541 passed / 6 skipped / 11 failed，新增通过项来自批 6 测试，无新增失败。
+- 11 个失败仍为 `tests/test_model_flow.py` 在本机缺少 `torchlens` 的既有失败。
+
+三、兼容性说明
+- det legacy clip 修复不改变默认 `data.z_sampling_mode=safe` 的数值、采样分布或随机流。
+- geometry validator 与 init_strategy 实现保持不变。

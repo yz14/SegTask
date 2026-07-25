@@ -221,6 +221,10 @@ checkpoint 加载 → NIfTI 读取
 | 选模标准 | `train.save_best_criterion` (+`save_best_preset`) | loss / dice / iou / mcc / min_dice / dice+surface_dice / balanced；`loss` 口径定案为 `val_base_loss`（仅主任务损失，不含深监督/aux/正则等随日程变化的附加项，跨配置可比） |
 | 监控 | `monitor.*` | jsonl + HTML 仪表盘 + 梯度/权重健康指标 |
 
+`model.init_strategy` 的 ADM/EDM2 拒绝规则仅适用于 taskcore 通用分割
+`Config` / `factory.build_model` 路径；不代表仓库内所有 ADM/EDM2 构建入口
+都使用这条 generic initializer 规则。
+
 ---
 
 ## 6. 通用推理技巧

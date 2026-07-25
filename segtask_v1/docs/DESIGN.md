@@ -30,6 +30,9 @@
   `train.pretrain_allow_geometry_mismatch`、`train.pretrain_upkern` 及
   `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches`
   的具体开关说明以 WORKFLOW 配置表为准。
+- `model.init_strategy` 在 ADM/EDM2 下的 non-legacy 拒绝仅属于 taskcore
+  通用分割 `Config` / `factory.build_model` 契约；其他任务的专用构建入口
+  不应被概括为同一条 generic initializer 规则。
 - **实现**：损失 / trainer pipelines / predictor / launcher / visualization 在本包；数据与骨干在 `taskcore`。
 - **真相源**：`segtask_v1.seg_config` + `taskcore.models.topology`，避免派生字段多处重复推导。
 
