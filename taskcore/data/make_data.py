@@ -71,6 +71,8 @@ def _npz_meta_allows_skip(
     target_spacing: Optional[List[float]],
     label_values: Optional[List[int]] = None,
     fg_subsample: Optional[int] = None,
+    expect_rw: bool = False,
+    expect_bbox: bool = False,
 ) -> tuple[bool, str]:
     """判断既有 npz 是否可与当前打包参数幂等 skip。"""
     if meta is None:
@@ -112,6 +114,12 @@ def _npz_meta_allows_skip(
             return False, (
                 f"fg_subsample mismatch: on-disk={on_disk_fg} "
                 f"!= requested={int(fg_subsample)}")
+    # 与 has_cond 同构：事后打开 region_weight_dir / bbox_dir 时不得静默
+    # 复用无 rw / 未裁剪的旧包。
+    if expect_rw and not bool(meta.get("has_rw")):
+        return False, "missing rw (stale package; region_weight_dir now set)"
+    if expect_bbox and not bool(meta.get("src_bbox")):
+        return False, "missing bbox (stale package; bbox_dir now set)"
     return True, ""
 
 
@@ -244,6 +252,8 @@ def prepare_one(
     """
     out_p = Path(out_path)
     expect_cond = bool(cond_paths)
+    expect_rw = bool(rw_path)
+    expect_bbox = bool(bbox_path)
     if out_p.is_file() and not overwrite:
         meta = _read_npz_meta(out_p)
         ok, reason = _npz_meta_allows_skip(
@@ -251,7 +261,9 @@ def prepare_one(
             spacing_normalization=spacing_normalization,
             target_spacing=target_spacing,
             label_values=label_values,
-            fg_subsample=fg_subsample)
+            fg_subsample=fg_subsample,
+            expect_rw=expect_rw,
+            expect_bbox=expect_bbox)
         if ok and expect_cond and not bool((meta or {}).get("has_cond")):
             ok, reason = False, "missing cond (stale package)"
         if ok:
@@ -326,6 +338,8 @@ def prepare_one(
     #     orig_spacing 无论归一化与否都记录（make_data≥1.6），使未归一化 npz 也
     #     携带物理 z spacing（整卷验证的 z-interleave 因子选择与部署一致）。
     src = read_nifti_spacing(image_path)  # (sz, sy, sx) mm
+    _, origin, direction = read_nifti_geometry(image_path)
+    pre_resample_shape = [int(s) for s in image.shape]
     orig_spacing: Optional[List[float]] = [float(s) for s in src]
     spacing_normalized = False
     if spacing_normalization and target_spacing is not None:
@@ -342,6 +356,9 @@ def prepare_one(
                  for c in range(cond.shape[0])],
                 axis=0).astype(np.float32, copy=False)
         spacing_normalized = True
+    achieved_spacing = [
+        float(src[i]) * float(pre_resample_shape[i]) / float(image.shape[i])
+        for i in range(3)]
 
     # 5. 裁剪坐标系下的前景索引（逐类，供类均衡前景采样）。
     (fg_slices, fg_coords, fg_coords_cls,
@@ -374,6 +391,10 @@ def prepare_one(
         "label_counts": label_counts,  # {label_value: voxel_count}，精确不抑采（make_data≥1.3）
         "spacing_normalized": spacing_normalized,
         "orig_spacing" : orig_spacing,   # 原生头 spacing [sz,sy,sx] mm
+        "pre_resample_shape": pre_resample_shape,
+        "achieved_spacing": achieved_spacing,
+        "origin"      : [float(v) for v in origin],
+        "direction"   : [float(v) for v in direction],
         # 落盘体素物理 spacing：归一化后为 target，否则等于 orig。
         # gen 历史键 spacing_zyx 取此值（勿再恒等于 orig，避免归一化后错位）。
         "spacing_zyx"  : ([float(s) for s in target_spacing]
@@ -386,8 +407,9 @@ def prepare_one(
         "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
 
-    # 7. 原子写（tmp + rename）；传文件句柄避免 np.savez 自动追加 .npz。
-    tmp_path = out_p.with_name(out_p.name + ".tmp")
+    # 7. 原子写（tmp + os.replace）；传文件句柄避免 np.savez 自动追加 .npz。
+    # tmp 名带 pid，避免 DDP 多 rank / 多 worker 并发写同一 *.npz.tmp 交错损坏。
+    tmp_path = out_p.with_name(f"{out_p.name}.{os.getpid()}.tmp")
     save_fn  = np.savez_compressed if compress else np.savez
     payload  = {
         "image"    : image,
@@ -402,12 +424,19 @@ def prepare_one(
         payload["rw"] = rw
     if cond is not None:
         payload["cond"] = cond
-    with open(tmp_path, "wb") as fh:
-        save_fn(fh, **payload)
-    # Windows：rename 前目标不能存在。
-    if out_p.exists():
-        out_p.unlink()
-    tmp_path.rename(out_p)
+    try:
+        with open(tmp_path, "wb") as fh:
+            save_fn(fh, **payload)
+        # 原子覆盖：os.replace 在 Windows 上走 MoveFileEx(REPLACE_EXISTING)，
+        # 无需先 unlink（unlink→rename 窗口内崩溃会丢目标文件）。
+        os.replace(tmp_path, out_p)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
     elapsed = time.perf_counter() - t0
     return {
@@ -425,7 +454,8 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
     dc = cfg.data
 
     image_paths, label_paths = discover_samples(  # 配对
-        dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
+        dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix,
+        allow_unpaired=bool(dc.allow_unpaired))
 
     exclude_pids = _load_exclude_pids(dc.exclude_list)
     image_paths, label_paths, _ = _filter_by_exclude(  # 过滤

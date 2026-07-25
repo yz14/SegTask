@@ -42,6 +42,17 @@ class Config:
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
 
+        # 与 taskcore Config.sync 对齐：stretch 已废弃，训练侧恒走 edge-pad，
+        # 仅推理生效会在薄卷上造成训推几何 desync。
+        if self.data.z_boundary_mode == "stretch":
+            logger.warning(
+                "data.z_boundary_mode='stretch' is deprecated: training-side "
+                "extraction always uses edge-pad geometry, so stretch would "
+                "only take effect at inference and desync train/infer "
+                "geometry for volumes thinner than the patch depth. "
+                "Auto-upgraded to 'edge_pad'.")
+            self.data.z_boundary_mode = "edge_pad"
+
         # z_boundary_mode 自动升级（lazy multi-res 隐式要求 edge_pad）—— 此为
         # *data 侧* 副作用，不属 ModelTopology 范畴。
         n_views = max(len(self.data.multi_res_scales), 1)
@@ -362,8 +373,10 @@ class Config:
                     "model.block_type='r2plus1d' requires spatial_dims=3; "
                     "incompatible with 2.5D (D folded into channel axis). "
                     "Use patch_mode='z_axis' for Plan A on z-slab data.")
+            # 与 sync()._apply_resenc_preset / core 校验一致：大小写不敏感。
             _require(
-                self.model.resenc_preset in ("none", "S", "M", "L", "XL"),
+                str(self.model.resenc_preset or "none").lower()
+                in ("none", "s", "m", "l", "xl"),
                 f"Invalid resenc_preset: {self.model.resenc_preset}")
         validate_encoder_decoder_stage_lengths(self)
 

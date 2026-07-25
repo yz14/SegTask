@@ -24,6 +24,7 @@ from taskcore.engine.checkpoint import (
     extract_model_state_dict,
     strip_common_prefixes,
 )
+from taskcore.models.pretrain import load_pretrained_modules
 
 from ..config import ClsConfig, resolve_num_classes
 from .classifier import (
@@ -95,31 +96,22 @@ def load_pretrained_encoder(model: Classifier, ckpt_path: str) -> None:
     命中率打日志（TODO.md 可验证性要求）；若一条都没命中直接报错——
     说明几何/backbone 与预训练不一致，静默跳过会掩盖配置错误。
     """
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    full_sd, source = extract_model_state_dict(ckpt, prefer_ema=False)
-    sd = strip_common_prefixes(full_sd)
-    logger.info("pretrained_ckpt state_dict source: %s", source)
-    enc_sd = {k[len("encoder."):]: v for k, v in sd.items()
-              if k.startswith("encoder.")}
-    if not enc_sd:
+    result = load_pretrained_modules(
+        {"encoder": model.encoder}, ckpt_path,
+        zero_match_error=(
+            f"pretrained_ckpt {ckpt_path!r}: 0 encoder tensors matched. "
+            "Geometry (patch_mode/spatial_dims/in_channels) or backbone "
+            "differs from the pretraining config."),
+        raise_on_zero=False)
+    if not result.prefix_has_keys["encoder."]:
         raise KeyError(
             f"pretrained_ckpt {ckpt_path!r} has no 'encoder.*' keys; "
             "expected an ssltask/segtask checkpoint.")
-    own = model.encoder.state_dict()
-    matched = {k: v for k, v in enc_sd.items()
-               if k in own and own[k].shape == v.shape}
-    missing = [k for k in own if k not in matched]
-    skipped = [k for k in enc_sd if k not in matched]
-    if not matched:
+    if result.total_matched == 0:
         raise RuntimeError(
-            f"pretrained_ckpt {ckpt_path!r}: 0/{len(own)} encoder tensors "
-            "matched. Geometry (patch_mode/spatial_dims/in_channels) or "
-            "backbone differs from the pretraining config.")
-    model.encoder.load_state_dict(matched, strict=False)
-    logger.info(
-        "Pretrained encoder loaded from %s: matched %d/%d tensors "
-        "(%d own-missing, %d ckpt-skipped).",
-        ckpt_path, len(matched), len(own), len(missing), len(skipped))
+            f"pretrained_ckpt {ckpt_path!r}: 0 encoder tensors matched. "
+            "Geometry (patch_mode/spatial_dims/in_channels) or backbone "
+            "differs from the pretraining config.")
 
 
 def build_classifier(cfg: SegConfig, cls: ClsConfig) -> Classifier:

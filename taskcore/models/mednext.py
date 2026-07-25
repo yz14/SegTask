@@ -263,7 +263,9 @@ def reparameterize_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def upkern_remap_state_dict(src_sd: dict, target_model: nn.Module) -> dict:
+def upkern_remap_state_dict(
+    src_sd: dict, target_model: nn.Module,
+    normalize_spatial: bool = False) -> dict:
     """把小核 MedNeXt checkpoint 的深度卷积权重插值到目标大核。
 
     仅处理与目标参数同名、同 rank、同通道形状的 depthwise-conv-like 权重：
@@ -324,6 +326,10 @@ def upkern_remap_state_dict(src_sd: dict, target_model: nn.Module) -> dict:
         work = work.reshape(work.shape[0] * work.shape[1], 1, *work.shape[2:])
         work = F.interpolate(work, size=spatial, mode=mode, align_corners=True)
         work = work.reshape(*tgt_tensor.shape).to(dtype=src_tensor.dtype)
+        if normalize_spatial:
+            denom = work.sum(
+                dim=tuple(range(2, work.ndim)), keepdim=True)
+            work = work / denom.abs().clamp_min(1e-8)
         return work
 
     src_prefixes = {"plain": set(), "reparam": set()}

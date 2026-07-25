@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 ValidateFn = Callable[[Any, Config], None]
+RawPreprocessFn = Callable[[dict], dict]
 
 # 组合式任务 core 不再含 seg 专属 loss/predict 段（P2a 已下沉 seg 任务段）。
 _COMPOSITE_SKIP_CORE: Tuple[str, ...] = ()
@@ -42,6 +43,7 @@ class TaskSectionSpec:
     validate_task: ValidateFn
     core_cls: Type[Config] = Config
     skip_core_validators: Tuple[str, ...] = _COMPOSITE_SKIP_CORE
+    preprocess_raw: RawPreprocessFn | None = None
 
 
 def register_task_section(spec: TaskSectionSpec) -> None:
@@ -79,6 +81,7 @@ def load_task_config(path, section: str) -> Tuple[Config, Any]:
         validate_task=spec.validate_task,
         core_cls=spec.core_cls,
         skip_core_validators=spec.skip_core_validators,
+        preprocess_raw=spec.preprocess_raw,
     )
 
 

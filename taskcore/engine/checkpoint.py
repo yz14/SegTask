@@ -154,13 +154,18 @@ def relocate_optimizer_state(optimizer: torch.optim.Optimizer) -> int:
 
 
 def state_to_cpu(obj):
-    """递归把嵌套 state 里的张量深拷贝到 CPU（``detach().clone().cpu()``）。
+    """递归把嵌套 state 里的张量深拷贝到 CPU。
 
     异步保存前必须做：state_dict 中的张量与在线参数共享存储，训练继续推进会
-    原地改写；拷贝后后台线程持有的快照与训练解耦。RNG 快照走 ``bytes`` 打包，
-    避免破坏 ``torch.set_rng_state`` 所需的 uint8 语义。"""
+    原地改写；拷贝后后台线程持有的快照与训练解耦。CUDA 张量直接同步复制到
+    CPU，避免先在 GPU 上 ``clone`` 再搬运造成显存尖峰。RNG 快照走
+    ``bytes`` 打包，避免破坏 ``torch.set_rng_state`` 所需的 uint8 语义。"""
     if isinstance(obj, torch.Tensor):
-        return obj.detach().clone().cpu()
+        if obj.device.type == "cuda":
+            return obj.detach().to(device="cpu")
+        if obj.device.type != "cpu":
+            return obj.detach().cpu()
+        return obj.detach().clone()
     if isinstance(obj, dict):
         if _looks_like_rng_state(obj):
             return pack_rng_state_for_save(obj)

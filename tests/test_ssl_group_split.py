@@ -60,6 +60,17 @@ def test_group_split_single_group_allowed_reuses():
     assert set(train) == set(val) == set(paths)
 
 
+def test_group_split_unmatched_regex_falls_back_to_stem(caplog):
+    paths = ["/d/P001_a.npz", "/d/unrelated.npz", "/d/P002_a.npz"]
+    with caplog.at_level("WARNING"):
+        train, val = group_split(
+            paths, val_ratio=0.34, seed=0, group_regex=r"(P\d+)")
+    assert train and val
+    assert set(train).isdisjoint(set(val))
+    assert "/d/unrelated.npz" in set(train) | set(val)
+    assert "falling back to filename stem" in caplog.text
+
+
 def test_group_split_train_always_nonempty():
     # 2 groups, tiny val_ratio still yields >=1 val and >=1 train group.
     paths = ["/d/A.npz", "/d/B.npz"]

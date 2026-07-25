@@ -36,6 +36,11 @@ SegTask/
 
 - `data.patch_mode` 四模式全仓统一口径：`z_axis`（z 滑块 + H/W 面内整体 resize）、`2_5d`（同 z_axis 抽取，D 折进通道驱动 2D 模型）、`cubic`（三轴滑块）、`whole`（整体 resize）；seg/cls/det/gen 四模式全支持且抽取口径逐位一致（保证预训练 encoder 输入分布一致）；ssl 支持除 `whole` 外的三种（有意不支持，见 ssltask 文档）。
 - 2.5D 折叠时机契约：默认 dataset 发未折叠 3D，GPU 增强后、**送模型前**才折叠。例外：det 恒在 dataset 折叠（框几何联动）；cls 在关闭 GPU 增强时也在 dataset 折叠。各任务细节见各自 WORKFLOW。
+- 数据划分公共优先级：`data.group_id_regex` 非空时按组隔离，其次按任务配置分层，最后回退随机；空 regex 保持各任务原有分支。
+- 批 1–3 的可选数值开关默认保持旧行为：`augment.elastic_field_mode=legacy`、
+  `augment.elastic_normalize_displacement=false`、`data.split_rounding_mode=legacy`、
+  `data.split_manifest_path=""`、`data.resize_antialias=false`、
+  `train.pretrain_upkern_normalize=false`、`model.init_strategy=legacy`。
 
 ## 子项目 README
 

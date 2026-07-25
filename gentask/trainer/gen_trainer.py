@@ -524,6 +524,9 @@ class GenerationTrainer(BaseTrainer):
     # ------------------------------------------------------------------
     def _save_checkpoint(self, epoch: int) -> None:
         """周期保存可续训 checkpoint（模型 + optimizer/scheduler/scaler/EMA）。"""
+        # ZeRO：consolidate 必须在 rank 早退之前（与 BaseTrainer._save_latest 同口径）。
+        if hasattr(self.optimizer, "consolidate_state_dict"):
+            self.optimizer.consolidate_state_dict(to=0)
         if not self._is_main:   # DDP：落盘仅 rank0
             return
         bare = unwrap_compile(self.model)

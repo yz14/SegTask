@@ -31,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from taskcore.models.blocks import (
-    get_conv, INTERP_SMOOTH, ConvNormAct, Upsample)
+    get_conv, INTERP_SMOOTH, ConvNormAct, Upsample, checkpoint_if)
 from taskcore.models.factory import build_backbone
 
 from ..data.masking import densify, downsample_mask_to
@@ -173,12 +173,19 @@ def spark_encode(encoder: nn.Module, x: torch.Tensor, mask_full: torch.Tensor
         vis = downsample_mask_to(vis_full, x.shape[2:])
         x = x * vis
 
+        # 与 Encoder.forward 同口径：逐 stage 尊重 grad checkpoint 掩码
+        # （此前直接 stage(x) 导致 SSL 预训练时检查点静默失效）。
+        stage_ckpt = getattr(encoder, "_stage_ckpt", None)
+        if stage_ckpt is None:
+            use_ckpt = bool(getattr(encoder, "grad_checkpointing", False))
+            stage_ckpt = [use_ckpt] * len(encoder.stages)
+
         features: List[torch.Tensor] = []
         visibles: List[torch.Tensor] = []
         for i, stage in enumerate(encoder.stages):
             if i > 0:
                 x = encoder.downsamples[i - 1](x)
-            x = stage(x)
+            x = checkpoint_if(bool(stage_ckpt[i]), stage, x)
             vis = downsample_mask_to(vis_full, x.shape[2:])  # 该尺度可见掩码
             x = x * vis                                      # 重新置空被遮位点
             features.append(x)

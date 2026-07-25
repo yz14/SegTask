@@ -11,7 +11,7 @@
 ## 0. 共享主干
 
 ```
-配置加载（taskcore Config + SSLConfig 叠加）→ npz 发现（image-only，无 train/val 划分）
+配置加载（taskcore Config + SSLConfig 叠加）→ npz 发现（image-only，无预训练 train/val 划分）；probe/offline eval 的留出划分通过公共 group-aware 入口保持患者级隔离，单组调试语义仍由 SSL 参数控制。
  → Dataset 抽 patch（无标签，随机中心）
  → GPU 同步 3D 增强（仅重建类方法）→ z 中心裁剪 → 2.5D 折叠
  → method.compute_loss（差异点：破坏/掩码/多视图构造 + 目标）
@@ -127,6 +127,8 @@ jepa      EMA 目标编码器编码完整图 → 上下文编码器看遮后输�
 | ZeRO-1 | 优化器状态分片；保存前集合式 consolidate 到 rank0 |
 | torch.compile / channels_last | `compile_mode` / `channels_last`（2.5D 折叠后转 4D 排布） |
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建即生效；SSL 特有 wrapper（投影头/predictor 等）激活占用小，刻意不包检查点 |
+| 扩展检查点范围 | `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches`：默认关闭，额外覆盖 stem/downsample 与 decoder 分支 |
+| 公共可选策略 | `data.resize_antialias`、`model.init_strategy`：默认 false/`legacy`；其余批 3 数值开关见 taskcore/seg WORKFLOW，关闭时保持旧路径 |
 | checkpoint | 原子写（临时文件 + os.replace）+ sha256 状态指纹；`save_async` 后台线程写盘；仅 rank0 落盘 |
 | resume | 全状态：method（含 teacher/queue/center buffer）+ optimizer/scheduler/scaler/EMA + RNG；指纹校验、方法名校验；rank>0 重新分流 RNG |
 | 监控 | 复用 taskcore.monitor：jsonl + HTML 仪表盘 + 梯度/权重健康指标（失败隔离不阻断训练） |

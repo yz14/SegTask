@@ -13,10 +13,7 @@ import torch.nn as nn
 
 from taskcore.config.core import Config as SegConfig
 from taskcore.models.factory import build_backbone
-from taskcore.engine.checkpoint import (
-    extract_model_state_dict,
-    strip_common_prefixes,
-)
+from taskcore.models.pretrain import load_pretrained_modules
 
 from ..config import DetConfig, resolve_num_classes
 from .detector import DetectorModel
@@ -39,28 +36,12 @@ _HEADS = {
 def load_pretrained_backbone(model: DetectorModel, ckpt_path: str) -> None:
     """SSL/分割 ckpt → ``encoder.*``（重建式亦命中 ``decoder.*``），
     strict=False + 命中统计；0 命中报错（几何不一致不静默）。"""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    full_sd, source = extract_model_state_dict(ckpt, prefer_ema=False)
-    sd = strip_common_prefixes(full_sd)
-    logger.info("pretrained_ckpt state_dict source: %s", source)
-    total_matched = 0
-    for prefix, mod in (("encoder.", model.encoder),
-                        ("decoder.", model.decoder)):
-        sub = {k[len(prefix):]: v for k, v in sd.items()
-               if k.startswith(prefix)}
-        own = mod.state_dict()
-        matched = {k: v for k, v in sub.items()
-                   if k in own and own[k].shape == v.shape}
-        if matched:
-            mod.load_state_dict(matched, strict=False)
-        logger.info("Pretrained %s* matched %d/%d tensors from %s.",
-                    prefix, len(matched), len(own), ckpt_path)
-        total_matched += len(matched)
-    if total_matched == 0:
-        raise RuntimeError(
+    load_pretrained_modules(
+        {"encoder": model.encoder, "decoder": model.decoder}, ckpt_path,
+        zero_match_error=(
             f"pretrained_ckpt {ckpt_path!r}: 0 encoder/decoder tensors "
             "matched. Geometry (patch_mode/spatial_dims/in_channels) or "
-            "backbone differs from the pretraining config.")
+            "backbone differs from the pretraining config."))
 
 
 def build_detector(cfg: SegConfig, det: DetConfig) -> DetectorModel:

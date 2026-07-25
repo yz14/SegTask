@@ -30,7 +30,7 @@ from segtask_v1.trainer.pipelines import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _base_cfg(patch_size=(4, 16, 16)):
+def _base_cfg(patch_mode="z_axis", patch_size=(16, 16, 16)):
     cfg = Config()
     cfg.data.label_values = [0, 1, 2]
     cfg.data.num_classes = 3
@@ -38,6 +38,7 @@ def _base_cfg(patch_size=(4, 16, 16)):
     cfg.data.batch_size = 1
     cfg.model.deep_supervision = False
     cfg.loss.deep_supervision_weights = []
+    cfg.data.patch_mode = patch_mode
     cfg.sync()
     cfg.validate()
     return cfg
@@ -56,7 +57,7 @@ class TestFactoryDispatch:
 
     @pytest.mark.parametrize("patch_mode", ["whole", "z_axis", "cubic"])
     def test_3d_single_res(self, patch_mode):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode=patch_mode)
         cfg.data.patch_mode = patch_mode
         cfg.data.multi_res_scales = [1.0]
         cfg.sync(); cfg.validate()
@@ -65,7 +66,8 @@ class TestFactoryDispatch:
         assert p.n_views == 1 and p.num_res_groups == 1 and p.n_aux_views == 0
 
     def test_3d_native_multi_res(self):
-        cfg = _base_cfg(patch_size=(8, 16, 16))
+        # z-axis 3D fixtures must satisfy the default encoder geometry.
+        cfg = _base_cfg(patch_mode="z_axis", patch_size=(16, 16, 16))
         cfg.data.patch_mode = "z_axis"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.data.keep_native_multi_res = True
@@ -75,7 +77,7 @@ class TestFactoryDispatch:
         assert p.n_views == 2 and p.num_res_groups == 2
 
     def test_2_5d_folded_no_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0]
         cfg.sync(); cfg.validate()
@@ -84,7 +86,7 @@ class TestFactoryDispatch:
         assert p.num_res_groups == 1 and p.slab_depth == 4
 
     def test_2_5d_folded_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
@@ -94,7 +96,7 @@ class TestFactoryDispatch:
         assert p.n_aux_views == 1 and len(p.aux_weights) == 1
 
     def test_2_5d_native_d_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.data.keep_native_view_depth = True
@@ -106,7 +108,7 @@ class TestFactoryDispatch:
         assert p.per_view_depths == cfg.per_view_depths
 
     def test_lift_no_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0]
         cfg.model.lift_2_5d_to_3d = True
@@ -117,7 +119,7 @@ class TestFactoryDispatch:
         assert p.num_res_groups == 1
 
     def test_lift_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.lift_2_5d_to_3d = True
@@ -134,8 +136,8 @@ class TestFactoryDispatch:
 # ===========================================================================
 class TestPrepareBatch:
     def test_vanilla3d_pass_through(self):
-        cfg = _base_cfg()
-        cfg.data.patch_mode = "whole"; cfg.data.multi_res_scales = [1.0]
+        cfg = _base_cfg(patch_mode="whole")
+        cfg.data.multi_res_scales = [1.0]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
         D, H, W = 4, 16, 16
@@ -147,7 +149,7 @@ class TestPrepareBatch:
         assert sup.aux_labels is None and sup.label_all_views is None
 
     def test_slab_2_5d_squeeze(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -159,7 +161,7 @@ class TestPrepareBatch:
         assert sup.label_main.shape == (B, D, H, W)
 
     def test_slab_2_5d_aux_keeps_label_views(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"
         cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
@@ -176,7 +178,7 @@ class TestPrepareBatch:
         assert sup.label_all_views.shape == (B, 2, D, H, W)
 
     def test_lift_keeps_rank5_image(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0]
         cfg.model.lift_2_5d_to_3d = True
         cfg.model.encoder_channels = [32, 64]
@@ -197,7 +199,7 @@ class TestComputeLossEquivalence:
     """``pipeline.compute_loss`` 必须与"main + Σ w_k * aux"逐字节等价。"""
 
     def test_vanilla3d(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="whole")
         cfg.data.patch_mode = "whole"; cfg.data.multi_res_scales = [1.0]
         cfg.sync(); cfg.validate()
         p = build_pipeline(cfg, build_loss(cfg.loss))
@@ -210,7 +212,7 @@ class TestComputeLossEquivalence:
         assert (l_p - l_h).abs().max() < TOL
 
     def test_slab_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
         cfg.sync(); cfg.validate()
@@ -229,7 +231,7 @@ class TestComputeLossEquivalence:
         assert (l_p - l_h).abs().max() < TOL
 
     def test_lift_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.lift_2_5d_to_3d = True
         cfg.model.aux_seg_supervision = True
@@ -250,7 +252,7 @@ class TestComputeLossEquivalence:
         assert (l_p - l_h).abs().max() < TOL
 
     def test_native_d_aux(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.data.keep_native_view_depth = True
         cfg.model.aux_seg_supervision = True
@@ -277,7 +279,7 @@ class TestComputeLossEquivalence:
 # ===========================================================================
 class TestBackward:
     def test_lift_aux_grads_both_heads(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.lift_2_5d_to_3d = True
         cfg.model.aux_seg_supervision = True
@@ -303,7 +305,7 @@ class TestBackward:
 # ===========================================================================
 class TestBreakdown:
     def test_aux_breakdown_keys(self):
-        cfg = _base_cfg()
+        cfg = _base_cfg(patch_mode="2_5d", patch_size=(4, 16, 16))
         cfg.data.patch_mode = "2_5d"; cfg.data.multi_res_scales = [1.0, 2.0]
         cfg.model.aux_seg_supervision = True
         cfg.sync(); cfg.validate()

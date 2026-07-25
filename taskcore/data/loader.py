@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import logging
 import os
 import re
@@ -161,8 +162,14 @@ def discover_samples(
     image_dir: str, label_dir: str,
     image_suffix: SuffixSpec = ".nii.gz",
     label_suffix: SuffixSpec = ".nii.gz",
+    *,
+    allow_unpaired: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """按基名配对 image/label（首个匹配胜出）。后缀接受单个或候选序列。按基名排序返回。"""
+    """按基名配对 image/label（首个匹配胜出）。后缀接受单个或候选序列。按基名排序返回。
+
+    ``allow_unpaired=False``（默认）：任一 image 无匹配 label 即 ``FileNotFoundError``，
+    与 bbox/rw 强配对口径一致。``True`` 时降级为 warning + 丢弃缺配对样本。
+    """
     img_dir, lbl_dir = Path(image_dir), Path(label_dir)
     if not img_dir.is_dir():
         raise FileNotFoundError(f"Image dir not found: {img_dir}")
@@ -208,11 +215,17 @@ def discover_samples(
         head = ", ".join(missing_bases[:5])
         more = f" ... (+{len(missing_bases) - 5} more)" \
             if len(missing_bases) > 5 else ""
-        logger.warning(
-            "discover_samples: %d/%d image bases have no matching label "
-            "under %s for any of %s; dropping them. Missing bases: %s%s",
-            len(missing_bases), len(img_by_base), lbl_dir,
-            label_suffixes, head, more)
+        detail = (
+            f"discover_samples: {len(missing_bases)}/{len(img_by_base)} "
+            f"image bases have no matching label under {lbl_dir} for any of "
+            f"{label_suffixes}. Missing bases: {head}{more}")
+        if allow_unpaired:
+            logger.warning("%s; dropping them (data.allow_unpaired=True).",
+                           detail)
+        else:
+            raise FileNotFoundError(
+                f"{detail}. Set data.allow_unpaired: true to drop unpaired "
+                f"images with a warning instead.")
 
     logger.info(
         "Found %d matched image-label pairs (image_suffixes=%s, "
@@ -402,12 +415,64 @@ def detect_label_values(
     return result
 
 
-def train_val_split(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
+def finalize_from_data(
+    cfg: Config,
+    label_values: Sequence[int],
+    *,
+    per_sample_counts: Optional[List[Dict[int, int]]] = None,
+) -> Tuple[Config, Optional[List[Dict[int, int]]]]:
+    """显式把数据探测结果写入配置并同步派生字段。
+
+    数据 loader 只能通过本函数提交 ``label_values`` / ``num_classes``；
+    这样配置生命周期不再依赖某个 loader 是否恰好被先调用。返回值保留
+    逐样本计数，供后续分层划分复用。
+    """
+    values = [int(v) for v in label_values]
+    if not values:
+        raise ValueError("finalize_from_data requires at least one label value.")
+    cfg.data.label_values = values
+    cfg.data.num_classes = len(values)
+    cfg.sync()
+    return cfg, per_sample_counts
+
+
+def _half_up_count(n: int, val_ratio: float) -> int:
+    return int(np.floor(float(n) * float(val_ratio) + 0.5))
+
+
+def _random_split_val_count(
+    n: int, val_ratio: float, rounding_mode: str) -> int:
+    """随机 split：legacy 截断后 clamp 到 [1, n-1]。"""
+    if n <= 1:
+        return 0
+    raw = (int(n * val_ratio) if rounding_mode == "legacy"
+           else _half_up_count(n, val_ratio))
+    return min(max(raw, 1), n - 1)
+
+
+def _stratified_split_val_count(
+    n: int, val_ratio: float, rounding_mode: str) -> int:
+    """分层成员：legacy round()，至少 1，再限制不能整层进 val。"""
+    raw = (int(round(n * val_ratio)) if rounding_mode == "legacy"
+           else _half_up_count(n, val_ratio))
+    return min(max(raw, 1), n - 1)
+
+
+def _fallback_split_val_count(
+    n: int, val_ratio: float, rounding_mode: str) -> int:
+    """空 label fallback：legacy round()，不做上下界修正。"""
+    return (int(round(n * val_ratio)) if rounding_mode == "legacy"
+            else _half_up_count(n, val_ratio))
+
+
+def train_val_split(
+    n: int, val_ratio: float, seed: int, rounding_mode: str = "legacy"
+) -> Tuple[List[int], List[int]]:
     """随机（非分层）按索引划分 train/val。"""
     rng = np.random.RandomState(seed)
     indices = rng.permutation(n).tolist()
     # 至少留 1 个训练样本（n==1 或 val_ratio 过大时防止 train 集为空）。
-    n_val = min(max(1, int(n * val_ratio)), n - 1) if n > 1 else 0
+    n_val = _random_split_val_count(n, val_ratio, rounding_mode)
     if n_val == 0:
         logger.warning(
             "train_val_split: only %d sample(s); validation set is empty.", n)
@@ -466,6 +531,27 @@ def grouped_train_val_split(
     return train_idx, val_idx
 
 
+def group_aware_train_val_split(
+    paths: Sequence[str],
+    val_ratio: float,
+    seed: int,
+    group_id_regex: str = "",
+    stratified_keys: Optional[Sequence[str]] = None,
+) -> Tuple[List[int], List[int]]:
+    """按 group → stratified → random 的顺序选择 train/val 划分。
+
+    ``group_id_regex`` 为空时不改变各任务原有的分层/随机分支；非空时
+    患者（或其他业务组）隔离优先，分层参数仅作为无 group 配置时的回退。
+    """
+    if group_id_regex:
+        return grouped_train_val_split(
+            paths, group_id_regex, val_ratio, seed)
+    if stratified_keys is not None:
+        return stratified_split_by_key(
+            stratified_keys, val_ratio, seed)
+    return train_val_split(len(paths), val_ratio, seed)
+
+
 def _volume_primary_class(
     label_path: str, label_values: List[int],
     label_loader_fn=None) -> int:
@@ -489,6 +575,7 @@ def stratified_train_val_split(
     use_foreground_only: bool = True,
     label_loader_fn=None,
     per_sample_counts: Optional[List[Dict[int, int]]] = None,
+    rounding_mode: str = "legacy",
 ) -> Tuple[List[int], List[int]]:
     """按主前景标签分层划分；退化时回退随机。use_foreground_only=True 时忽略背景频率。
 
@@ -529,7 +616,8 @@ def stratified_train_val_split(
         if len(members) < 2:
             train_idx.extend(members)
             continue
-        n_val_k = max(1, int(round(len(members) * val_ratio)))
+        n_val_k = _stratified_split_val_count(
+            len(members), val_ratio, rounding_mode)
         # 避免整层都进 val。
         n_val_k = min(n_val_k, len(members) - 1)
         val_idx.extend(members[:n_val_k])
@@ -537,7 +625,8 @@ def stratified_train_val_split(
 
     # 空 label 体同 val_ratio 划分（不分层）。
     rng.shuffle(fallback)
-    n_val_f = int(round(len(fallback) * val_ratio))
+    n_val_f = _fallback_split_val_count(
+        len(fallback), val_ratio, rounding_mode)
     val_idx.extend(fallback[:n_val_f])
     train_idx.extend(fallback[n_val_f:])
 
@@ -620,12 +709,16 @@ def stratified_split_by_key(keys: Sequence[str], val_ratio: float,
 
 
 def _resolve_npz_paths(
-    cfg: Config, npz_dir: str, *, allow_auto_build: bool) -> List[str]:
+    cfg: Config, npz_dir: str, *, allow_auto_build: bool,
+    rank: int = 0, world_size: int = 1) -> List[str]:
     """扫描 ``npz_dir``（必要且允许时内联自建）+ exclude 过滤，返回 npz 路径列表。
 
     ``allow_auto_build=True``（主源）时，目录缺失/空且 ``data.npz_auto_build`` 为真，
     则从 cfg 的 NIfTI 目录调 ``make_data.prepare_dataset`` 生成；副源恒为 False
     （cfg 仅描述一套 NIfTI 输入，副源必须事先用 make_data 离线生成）。
+
+    DDP（``world_size > 1``）下仅 rank0 执行 auto-build，随后 ``dist.barrier()``，
+    避免多 rank 交错写同一 pid 包导致损坏且被 skip 永久固化。
     """
     dc         = cfg.data
     npz_suffix = dc.npz_suffix
@@ -647,28 +740,59 @@ def _resolve_npz_paths(
                 f"`python -m taskcore.data.make_data --config "
                 f"<yaml> --out {npz_dir}` first, or set "
                 f"data.npz_auto_build: true to build inline.")
-        logger.info(
-            "data.npz_dir=%s is empty/missing — auto-building via "
-            "make_data.prepare_dataset (workers=%d). One-time cost; ",
-            npz_dir, max(dc.num_workers, 1))
-        from .make_data import prepare_dataset
-        counters = prepare_dataset(
-            cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
-        logger.info(
-            "Auto-build complete: written=%d, skipped=%d, failed=%d / total=%d.",
-            counters["written"], counters["skipped"],
-            counters["failed"], counters["total"])
-        if counters["failed"] > 0:
-            logger.warning(
-                "make_data reported %d failed sample(s). Inspect "
-                "%s/_failures.txt; affected pids will be missing from the "
-                "training set.", counters["failed"], npz_dir)
-        if counters["written"] + counters["skipped"] == 0:
-            raise RuntimeError(
-                f"Auto-build produced 0 valid npz packages under "
-                f"{npz_dir}. Check input image_dir / label_dir paths "
-                f"and the make_data error log.")
-
+        build_error: Optional[str] = None
+        if int(rank) == 0:
+            try:
+                logger.info(
+                    "data.npz_dir=%s is empty/missing — auto-building via "
+                    "make_data.prepare_dataset (workers=%d). One-time cost; ",
+                    npz_dir, max(dc.num_workers, 1))
+                from .make_data import prepare_dataset
+                counters = prepare_dataset(
+                    cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
+                logger.info(
+                    "Auto-build complete: written=%d, skipped=%d, failed=%d / total=%d.",
+                    counters["written"], counters["skipped"],
+                    counters["failed"], counters["total"])
+                if counters["failed"] > 0:
+                    logger.warning(
+                        "make_data reported %d failed sample(s). Inspect "
+                        "%s/_failures.txt; affected pids will be missing from the "
+                        "training set.", counters["failed"], npz_dir)
+                if counters["written"] + counters["skipped"] == 0:
+                    build_error = (
+                        f"Auto-build produced 0 valid npz packages under "
+                        f"{npz_dir}. Check input image_dir / label_dir paths "
+                        f"and the make_data error log.")
+            except Exception as exc:
+                build_error = f"{type(exc).__name__}: {exc}"
+        if int(world_size) > 1:
+            import torch
+            import torch.distributed as dist
+            if not (dist.is_available() and dist.is_initialized()):
+                raise RuntimeError(
+                    "npz auto-build with world_size>1 requires an initialized "
+                    "torch.distributed process group (rank0 builds, peers barrier).")
+            # 1=ok, 0=fail — rank0 失败时仍 barrier，避免 peer 永久挂死。
+            flag = torch.tensor(
+                [0 if build_error else 1], dtype=torch.int32,
+                device="cuda" if torch.cuda.is_available() else "cpu")
+            dist.broadcast(flag, src=0)
+            dist.barrier()
+            if int(flag.item()) == 0:
+                raise RuntimeError(
+                    build_error or
+                    f"npz auto-build failed on rank0 (reported to rank {rank}).")
+            if int(rank) != 0:
+                npz_present = npz_p.is_dir() and any(
+                    x for x in npz_p.glob(f"*{npz_suffix}")
+                    if not x.name.startswith(("_", ".")))
+                if not npz_present:
+                    raise RuntimeError(
+                        f"npz auto-build on rank0 finished but {npz_dir!r} "
+                        f"is still empty/missing on rank {rank}.")
+        elif build_error:
+            raise RuntimeError(build_error)
     paths        = discover_npz_samples(npz_dir, npz_suffix)
     exclude_pids = _load_exclude_pids(dc.exclude_list)
     kept, _, keep_idx = _filter_by_exclude(
@@ -841,27 +965,44 @@ def log_volume_cache_estimate(
         bytes_per_img = sample_voxels * img_b
         bytes_per_lbl = sample_voxels * 2
         bytes_per_rw = sample_voxels * 4 if has_rw_runtime else 0
+        index_bytes = 0
+        seen = set()
+        for name in ("_vol_fg_slices", "_vol_fg_coords",
+                     "_vol_fg_slices_by_cls", "_vol_fg_coords_by_cls"):
+            for value in getattr(train_ds, name, ()):
+                values = value if isinstance(value, (list, tuple)) else (value,)
+                for array in values:
+                    if hasattr(array, "nbytes") and id(array) not in seen:
+                        seen.add(id(array))
+                        index_bytes += int(array.nbytes)
         per_vol_bytes = bytes_per_img + bytes_per_lbl + bytes_per_rw
         cap = int(dc.cache_max_volumes)
         eff_cap = cap if cap > 0 else n_train_vols
         eff_cap = min(eff_cap, n_train_vols)
         workers = max(int(num_workers), 1)
-        total_gb = per_vol_bytes * eff_cap * workers / (1024 ** 3)
+        total_gb = (
+            per_vol_bytes * eff_cap + index_bytes) * workers / (1024 ** 3)
         agg_note = (
             "" if world_size <= 1 else
             " [per rank; x%d ranks => ~%.2f GiB machine-wide aggregate]"
             % (world_size, total_gb * world_size))
         logger.info(
-            "Volume cache estimate: ~%.2f MiB per volume "
-            "(image %s + label int16%s, bbox-cropped); effective "
-            "cap=%d, num_workers=%d => up to ~%.2f GiB RAM (all "
-            "workers, caches only; transient decode peaks add "
-            "~%.2f MiB/worker)%s.",
+            "Volume cache estimate: ~%.2f MiB per volume across image/"
+            "label/weight caches (image %s + label int16%s, bbox-cropped); "
+            "cap=%d volume(s) per cache, num_workers=%d => up to ~%.2f GiB "
+            "RAM (all "
+            "workers, caches + foreground indices; transient decode "
+            "peaks add ~%.2f MiB/worker)%s.",
             per_vol_bytes / (1024 ** 2),
             "int16" if img_b == 2 else "fp32",
             " + region_weight fp32" if bytes_per_rw else "",
             eff_cap, workers, total_gb,
             sample_voxels * 4 / (1024 ** 2), agg_note)
+        if index_bytes:
+            logger.info(
+                "Foreground index footprint: %.2f MiB (shared per dataset "
+                "process; not multiplied by cache_max_volumes).",
+                index_bytes / (1024 ** 2))
         agg_workers = workers * max(world_size, 1)
         if cap == 0 and n_train_vols * agg_workers >= 16:
             budget_gb = 8.0
@@ -933,13 +1074,15 @@ def build_dataloaders(
         "NIfTI fields image_dir/label_dir/bbox_dir/region_weight_dir are "
         "consumed only by make_data when the npz cache must be built.",
         npz_dir, npz_suffix)
-    primary_paths = _resolve_npz_paths(cfg, npz_dir, allow_auto_build=True)
+    primary_paths = _resolve_npz_paths(
+        cfg, npz_dir, allow_auto_build=True, rank=rank, world_size=world_size)
 
     use_mixed       = bool(dc.npz_dir_secondary)
     secondary_paths : List[str] = []
     if use_mixed:
         secondary_paths = _resolve_npz_paths(
-            cfg, dc.npz_dir_secondary, allow_auto_build=False)
+            cfg, dc.npz_dir_secondary, allow_auto_build=False,
+            rank=rank, world_size=world_size)
         logger.info(
             "Secondary (coarse) training source: %d npz package(s) under %s "
             "(train-only; validation always uses gold only).",
@@ -952,21 +1095,21 @@ def build_dataloaders(
     # 时走快路，启动期不解码任何 label 卷。
     per_sample_counts: Optional[List[Dict[int, int]]] = None
     if not dc.label_values:
-        dc.label_values, per_sample_counts = detect_label_values(
+        detected_values, per_sample_counts = detect_label_values(
             primary_paths, label_loader_fn=label_loader_fn,
             return_primaries=True, label_counts_fn=load_npz_label_counts)
         if secondary_paths:
             sec_values = detect_label_values(
                 secondary_paths, label_loader_fn=label_loader_fn,
                 label_counts_fn=load_npz_label_counts)
-            merged = sorted(set(dc.label_values) | set(sec_values))
-            if merged != list(dc.label_values):
+            merged = sorted(set(detected_values) | set(sec_values))
+            if merged != list(detected_values):
                 logger.info(
                     "Label values extended by secondary source: %s -> %s",
-                    dc.label_values, merged)
-                dc.label_values = merged
-        dc.num_classes = len(dc.label_values)
-        cfg.sync()
+                    detected_values, merged)
+            detected_values = merged
+        finalize_from_data(
+            cfg, detected_values, per_sample_counts=per_sample_counts)
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
@@ -990,12 +1133,24 @@ def build_dataloaders(
         train_idx, val_idx = stratified_train_val_split(
             primary_paths, dc.label_values, dc.val_ratio, dc.split_seed,
             label_loader_fn=label_loader_fn,
-            per_sample_counts=per_sample_counts)
+            per_sample_counts=per_sample_counts,
+            rounding_mode=dc.split_rounding_mode)
     else:
         train_idx, val_idx = train_val_split(
-            len(primary_paths), dc.val_ratio, dc.split_seed)
+            len(primary_paths), dc.val_ratio, dc.split_seed,
+            rounding_mode=dc.split_rounding_mode)
         logger.info("Split (random): %d train, %d val",
                     len(train_idx), len(val_idx))
+    if dc.split_manifest_path:
+        manifest_path = Path(dc.split_manifest_path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps({
+            "seed": int(dc.split_seed),
+            "val_ratio": float(dc.val_ratio),
+            "rounding_mode": str(dc.split_rounding_mode),
+            "train": [primary_paths[i] for i in train_idx],
+            "val": [primary_paths[i] for i in val_idx],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 模式无关的公共构造参数 + 单 split 路径包装。
     common_cfg          = DatasetCommonCfg.from_cfg(cfg)
@@ -1009,6 +1164,11 @@ def build_dataloaders(
     primary_train_ds = spec.make_split(
         primary_train_paths, is_train=True, common=common_cfg)
     val_ds = spec.make_split(val_paths, is_train=False, common=common_cfg)
+
+    # drop_last=True 下不足一个 batch 会静默零批次；与 assemble_train_val_loaders
+    # 对齐，装配前显式拦截（混采由 MixedBatchSampler 自带等长守卫）。
+    if not use_mixed:
+        ensure_train_batch_capacity(primary_train_ds, int(dc.batch_size))
 
     # persistent_workers / prefetch_factor 仅 num_workers>0 时有效。
     loader_kwargs: Dict[str, object] = {}

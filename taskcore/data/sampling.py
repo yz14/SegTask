@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -17,6 +18,8 @@ AxisRange = Tuple[int, int]
 
 # 验证集确定性采样的固定基种子（与样本序号组合派生逐样本 RNG）。
 VAL_SAMPLING_SEED = 0x5EED_2024
+# DataLoader worker 进程各自持有该集合，单个 worker 内只告警一次。
+_THIN_Z_WARNED: set = set()
 
 
 def halton(i: int, base: int) -> float:
@@ -88,6 +91,32 @@ def z_grid_center(j: int, samples_per_volume: int, D_vol: int) -> int:
     """z 轴 val 网格：第 j 个样本取 bin 中心 z。"""
     spv = max(int(samples_per_volume), 1)
     return min(int((j + 0.5) * D_vol / spv), D_vol - 1)
+
+
+def safe_z_center_range(D_vol: int, D_patch: int) -> Tuple[int, int]:
+    """返回避免大面积 edge padding 的 z 中心半开区间。"""
+    D_vol, D_patch = int(D_vol), int(D_patch)
+    if D_vol < D_patch:
+        if "thin_volume" not in _THIN_Z_WARNED:
+            logging.getLogger(__name__).warning(
+                "z volume depth D=%d is smaller than patch depth=%d; "
+                "using centered edge-padded z sampling.", D_vol, D_patch)
+            _THIN_Z_WARNED.add("thin_volume")
+        center = D_vol // 2
+        return center, center + 1
+    half = D_patch // 2
+    return half, D_vol - (D_patch - half) + 1
+
+
+def safe_z_grid_center(
+    j: int, samples_per_volume: int, D_vol: int, D_patch: int
+) -> int:
+    """在安全 z 中心域内进行等距 bin 铺点。"""
+    lo, hi = safe_z_center_range(D_vol, D_patch)
+    if hi <= lo + 1:
+        return lo
+    spv = max(int(samples_per_volume), 1)
+    return min(lo + int((j + 0.5) * (hi - lo) / spv), hi - 1)
 
 
 def halton_center(

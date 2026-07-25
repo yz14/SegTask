@@ -133,10 +133,8 @@ class GPUAugmentor:
             translate_range=c.random_translate_range,
             rotate_range_per_axis=c.random_rotate_range_per_axis,
             aspect_correct=c.random_affine_aspect_correct,
-            gen_cpu=gen_cpu, gen_dev=gen_dev)
-        image, comps = _grid_dropout_companions(
-            image, c.grid_dropout_prob, c.grid_dropout_ratio,
-            c.grid_dropout_holes, companions=comps,
+            elastic_field_mode=c.elastic_field_mode,
+            elastic_normalize_displacement=c.elastic_normalize_displacement,
             gen_cpu=gen_cpu, gen_dev=gen_dev)
 
         # Intensity (image only)。全部强度增强后夹回增强前范围。
@@ -159,6 +157,13 @@ class GPUAugmentor:
             gen_cpu=gen_cpu)
         if c.intensity_clamp:
             image = torch.maximum(torch.minimum(image, clamp_hi), clamp_lo)
+
+        # grid_dropout 必须在 clamp 之后：否则洞被置 0 后会被 clamp 抬回
+        # clamp_lo（软组织窗 / zscore 下常见），dropout 静默失效。
+        image, comps = _grid_dropout_companions(
+            image, c.grid_dropout_prob, c.grid_dropout_ratio,
+            c.grid_dropout_holes, companions=comps,
+            gen_cpu=gen_cpu, gen_dev=gen_dev)
 
         return image, comps
 
@@ -267,13 +272,33 @@ def _build_rotation_matrices(
 def _elastic_grid_disp(
     n: int, D: int, H: int, W: int,
     sigma: float, alpha: float, device: torch.device,
-    gen_dev: Optional[torch.Generator] = None) -> torch.Tensor:
+    gen_dev: Optional[torch.Generator] = None,
+    field_mode: str = "legacy",
+    normalize_displacement: bool = False) -> torch.Tensor:
     """采样 n 个弹性位移场，返 (n,D,H,W,3) 归一化 grid 坐标位移（轴序 W,H,D）。"""
     cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
     cW = max(int(round(W / sigma)), 4)
     disp = torch.randn(n, 3, cD, cH, cW, device=device, generator=gen_dev)
     disp = F.interpolate(disp, size=(D, H, W), mode="trilinear", align_corners=False)
+    if field_mode == "gaussian":
+        radius = max(1, int(round(sigma)))
+        coords = torch.arange(
+            -radius, radius + 1, device=device, dtype=disp.dtype)
+        kernel = torch.exp(-0.5 * (coords / max(float(sigma), 1e-6)) ** 2)
+        kernel = kernel / kernel.sum()
+        kd = kernel.view(1, 1, -1, 1, 1)
+        kh = kernel.view(1, 1, 1, -1, 1)
+        kw = kernel.view(1, 1, 1, 1, -1)
+        disp = F.conv3d(disp, kd.expand(3, 1, -1, 1, 1),
+                        padding=(radius, 0, 0), groups=3)
+        disp = F.conv3d(disp, kw.expand(3, 1, 1, 1, -1),
+                        padding=(0, 0, radius), groups=3)
+        disp = F.conv3d(disp, kh.expand(3, 1, 1, -1, 1),
+                        padding=(0, radius, 0), groups=3)
+    if normalize_displacement:
+        rms = disp.square().mean(dim=(1, 2, 3, 4), keepdim=True).sqrt()
+        disp = disp / rms.clamp_min(torch.finfo(disp.dtype).eps)
 
     # 体素位移→归一化 grid 坐标（1 voxel = 2/N）；permute 后通道 (0,1,2) 对应 grid 轴 (W,H,D)。
     voxel_to_grid = rearrange(
@@ -294,6 +319,8 @@ def _random_affine_elastic_companions(
     aspect_correct: bool = False,
     gen_cpu: Optional[torch.Generator] = None,
     gen_dev: Optional[torch.Generator] = None,
+    elastic_field_mode: str = "legacy",
+    elastic_normalize_displacement: bool = False,
 ) -> Tuple[torch.Tensor, List[Companion]]:
     """仿射与弹性形变融合为单次 grid_sample；companions 共享同一 warp。
 
@@ -356,7 +383,10 @@ def _random_affine_elastic_companions(
     ne = int(sel_e.sum())
     if ne:
         sel_e_dev = sel_e.to(device)
-        disp = _elastic_grid_disp(ne, D, H, W, sigma, alpha, device, gen_dev)
+        disp = _elastic_grid_disp(
+            ne, D, H, W, sigma, alpha, device, gen_dev,
+            field_mode=elastic_field_mode,
+            normalize_displacement=elastic_normalize_displacement)
         m = theta[sel_e_dev][:, :, :3]
         grid[sel_e_dev] = grid[sel_e_dev] + torch.einsum(
             'n r c, n d h w c -> n d h w r', m, disp)
@@ -389,6 +419,8 @@ def _random_affine_elastic(
     label_fill: float = 0.0,
     gen_cpu: Optional[torch.Generator] = None,
     gen_dev: Optional[torch.Generator] = None,
+    elastic_field_mode: str = "legacy",
+    elastic_normalize_displacement: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """仿射+弹性（分割旧签名包装）：label nearest+oob_fill，wmap 填 1.0。"""
     comps: List[Companion] = [
@@ -404,6 +436,8 @@ def _random_affine_elastic(
         translate_range=translate_range,
         rotate_range_per_axis=rotate_range_per_axis,
         aspect_correct=aspect_correct,
+        elastic_field_mode=elastic_field_mode,
+        elastic_normalize_displacement=elastic_normalize_displacement,
         gen_cpu=gen_cpu, gen_dev=gen_dev)
     wmap = comps[1].tensor if len(comps) > 1 else None
     return image, comps[0].tensor, wmap
@@ -440,25 +474,23 @@ def _grid_dropout_companions(
     w0 = torch.randint(0, W - hw + 1, (B, num_holes), device=device,
                        generator=gen_dev)
 
-    hole_mask = torch.ones(B, 1, D, H, W, device=device, dtype=image.dtype)
+    out = image.clone()
     d_off = torch.arange(hd, device=device)
     h_off = torch.arange(hh, device=device)
     w_off = torch.arange(hw, device=device)
+    selected_dev = selected.to(device)
+    b_selected = selected_dev.nonzero(as_tuple=True)[0]
     for k in range(num_holes):
-        ds = d0[:, k, None] + d_off[None, :]
-        hs = h0[:, k, None] + h_off[None, :]
-        ws = w0[:, k, None] + w_off[None, :]
-        b_idx = torch.arange(B, device=device)
-        hole_mask[
-            b_idx[:, None, None, None], :,
+        ds = d0[b_selected, k, None] + d_off[None, :]
+        hs = h0[b_selected, k, None] + h_off[None, :]
+        ws = w0[b_selected, k, None] + w_off[None, :]
+        out[
+            b_selected[:, None, None, None], :,
             ds[:, :, None, None],
             hs[:, None, :, None],
             ws[:, None, None, :],
         ] = 0
-
-    gate = rearrange(selected.to(device), 'b -> b 1 1 1 1').to(image.dtype)
-    effective = hole_mask * gate + (1.0 - gate)
-    return image * effective, comps
+    return out, comps
 
 
 def _grid_dropout(

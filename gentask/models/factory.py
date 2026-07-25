@@ -84,4 +84,7 @@ def build_backbone(cfg: Config):
             f"Unknown model.arch: {arch!r}. "
             f"Valid: 'unet' | 'adm' | 'edm2' | 'edsr' | 'rcan'.")
     # 生成/超分 UNet 主线：UNet++ 门控上采样分支（分割主线为门控 skips）。
-    return build_taskcore_model(cfg, attn_gate_target="upsample")
+    target = (
+        "upsample" if str(cfg.model.unet.decoder_type).lower() == "unetpp"
+        else "skips")
+    return build_taskcore_model(cfg, attn_gate_target=target)

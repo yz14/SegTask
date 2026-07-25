@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
+import types
+from dataclasses import fields, is_dataclass
+from typing import get_args, get_origin, get_type_hints
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type, TypeVar, Union
 
 import yaml
 
-from .core import Config, _dataclass_from_dict
+from .core import Config, ConfigError, _dataclass_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +30,34 @@ _BOOL_TRUE = frozenset({"true", "1", "yes"})
 _BOOL_FALSE = frozenset({"false", "0", "no"})
 
 
-def coerce_override_value(old: Any, val: str) -> Any:
-    """按既有字段类型把字符串 override 值转回原类型。
+def coerce_override_value(old: Any, val: str, declared_type: Any = None) -> Any:
+    """按字段声明类型把字符串 override 值转回原类型。
 
     ``old is None``（Optional 字段默认值）时按 YAML 语义解析，使
     ``--override data.target_spacing=[1,1,1]`` 等可正确写入。
     """
-    if old is None:
-        return yaml.safe_load(val)
-    if isinstance(old, bool):
+    typ = declared_type
+    if typ is None:
+        typ = type(old) if old is not None else Any
+    parsed = yaml.safe_load(val)
+    origin = get_origin(typ)
+    args = get_args(typ)
+    if origin in (Union, types.UnionType):
+        non_none = [a for a in args if a is not type(None)]
+        if isinstance(parsed, list):
+            list_types = [a for a in non_none if get_origin(a) in (list, List)]
+            typ = list_types[0] if list_types else (non_none[0] if non_none else Any)
+        else:
+            typ = non_none[0] if non_none else Any
+        origin, args = get_origin(typ), get_args(typ)
+    if typ is Any or typ is object:
+        return parsed
+    if origin in (list, List):
+        if not isinstance(parsed, list):
+            raise ConfigError(f"Override value {val!r} must be a list")
+        item_type = args[0] if args else Any
+        return [_coerce_declared(item_type, item) for item in parsed]
+    if typ is bool:
         low = val.lower()
         if low in _BOOL_TRUE:
             return True
@@ -43,27 +65,57 @@ def coerce_override_value(old: Any, val: str) -> Any:
             return False
         raise ValueError(
             f"Invalid bool override {val!r}; use true/false/1/0/yes/no")
-    if isinstance(old, int):
-        return int(val)
-    if isinstance(old, float):
-        return float(val)
-    if isinstance(old, list):
-        parsed = yaml.safe_load(val)
-        if not isinstance(parsed, list):
-            raise ValueError(
-                f"List override must parse to a list, got {type(parsed).__name__}")
-        return parsed
-    return val
+    if typ is int:
+        return int(parsed)
+    if typ is float:
+        return float(parsed)
+    if typ is str:
+        return str(parsed)
+    return parsed
+
+
+def _coerce_declared(typ: Any, value: Any) -> Any:
+    if typ in (Any, object):
+        return value
+    origin, args = get_origin(typ), get_args(typ)
+    if origin in (Union, types.UnionType):
+        choices = [a for a in args if a is not type(None)]
+        return _coerce_declared(choices[0], value) if choices else value
+    if origin in (list, List):
+        return [_coerce_declared(args[0], v) for v in value]
+    if typ is bool:
+        if isinstance(value, bool):
+            return value
+        raise ConfigError(f"Expected bool override value, got {value!r}")
+    try:
+        return typ(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"Cannot coerce override value {value!r} to {typ}") from exc
 
 
 def set_dotted_attr(obj: Any, dotted: str, val: str) -> None:
     """沿点路径设置属性，值经 :func:`coerce_override_value` 转型。"""
     parts = dotted.split(".")
-    for p in parts[:-1]:
-        obj = getattr(obj, p)
-    attr = parts[-1]
-    old = getattr(obj, attr)
-    new = coerce_override_value(old, val)
+    try:
+        for p in parts[:-1]:
+            obj = getattr(obj, p)
+        attr = parts[-1]
+        old = getattr(obj, attr)
+    except AttributeError as exc:
+        raise ConfigError(f"Unknown override path: {dotted!r}") from exc
+    try:
+        declared = get_type_hints(type(obj)).get(attr)
+    except (NameError, TypeError):
+        declared = None
+    try:
+        new = coerce_override_value(old, val, declared)
+    except ConfigError:
+        raise
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        raise ConfigError(
+            f"Invalid override {dotted!r}={val!r}: cannot coerce to "
+            f"{declared or type(old).__name__}") from exc
     setattr(obj, attr, new)
     logger.info("Override: %s = %s -> %s", dotted, old, new)
 
@@ -112,6 +164,7 @@ def load_core_and_task_config(
     validate_task: "Callable[[T, Config], None]",
     core_cls: Type[Config] = Config,
     skip_core_validators: Sequence[str] = (),
+    preprocess_raw: Optional[Callable[[dict], dict]] = None,
 ) -> Tuple[Config, T]:
     """加载「核心 Config + 顶层任务段」YAML，返回 ``(cfg, task_cfg)``。"""
     path = Path(path)
@@ -119,6 +172,10 @@ def load_core_and_task_config(
         raise FileNotFoundError(f"Config file not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    if preprocess_raw is not None:
+        processed = preprocess_raw(raw)
+        if processed is not None:
+            raw = processed
     task_raw = dict(raw.pop(section, {}) or {})
     cfg = _dataclass_from_dict(core_cls, raw)
     cfg.sync()

@@ -254,7 +254,7 @@ def test_dataset_native_d_shape_and_geometry():
     # Force a deterministic z by stubbing _sample_z via numpy seeding +
     # subclassing.
     class _FixedZ(_SyntheticSegDataset):
-        def _sample_z(self, vol_idx, D_vol):
+        def _sample_z(self, vol_idx, D_vol, *, sample_idx=None):
             return D_vol // 2  # = 20 for our 40-deep volume
 
     # Dataset always emits the single max-FOV cube (the per-view split now
@@ -325,7 +325,7 @@ def test_dataset_native_d_aux_view_geometry():
     )
 
     class _FixedZ(_SyntheticSegDataset):
-        def _sample_z(self, vol_idx, D_vol):
+        def _sample_z(self, vol_idx, D_vol, *, sample_idx=None):
             return D_vol // 2
 
     ds_on = _FixedZ(

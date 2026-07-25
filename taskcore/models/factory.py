@@ -8,7 +8,12 @@ from typing import Callable, List
 import numpy as np
 import torch.nn as nn
 
-from ..config.core import Config, resolve_selfattn_stage
+from ..config.core import Config, ConfigError, resolve_selfattn_stage
+from ..config.geometry import (
+    auto_anisotropic_strides,
+    compute_downsample_strides,
+    stem_stride_of,
+)
 from .blocks import SelfAttentionBlock
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .mednext import MedNeXtStage
@@ -19,6 +24,31 @@ from .unet3p import UNet3PDecoder
 from .unetpp import UNetPPDecoder
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_init_strategy(model: nn.Module, strategy: str) -> nn.Module:
+    """按显式策略覆盖模型初始化；legacy 保留各模块既有初始化。"""
+    strategy = str(strategy).lower()
+    if strategy == "legacy":
+        return model
+    for module in model.modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d,
+                               nn.Linear)):
+            if strategy == "kaiming":
+                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
+            else:
+                nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d,
+                                 nn.BatchNorm3d, nn.GroupNorm,
+                                 nn.LayerNorm, nn.InstanceNorm1d,
+                                 nn.InstanceNorm2d, nn.InstanceNorm3d)):
+            if module.weight is not None:
+                nn.init.ones_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+    return model
 
 
 def _resolve_blocks_per_stage(
@@ -33,6 +63,25 @@ def _resolve_blocks_per_stage(
                 f"!= expected {n_stages}")
         return list(explicit)
     return [fallback] * n_stages
+
+
+def _decoder_call_count(decoder_type: str, n_levels: int) -> int:
+    """返回 decoder 实际构造的 stage/node 数。"""
+    dtype = str(decoder_type).lower()
+    if dtype == "unet":
+        return max(int(n_levels) - 1, 0)
+    if dtype == "unetpp":
+        return int(n_levels) * (int(n_levels) - 1) // 2
+    return 0
+
+
+def _resolve_decoder_block_counts(mc, n_levels: int) -> List[int]:
+    expected = _decoder_call_count(mc.unet.decoder_type, n_levels)
+    values = list(mc.decoder_blocks_per_stage or [])
+    if not values or len(values) == 1:
+        value = values[0] if values else mc.blocks_per_level
+        return [int(value)] * max(expected, 1)
+    return _resolve_blocks_per_stage(values, expected, mc.blocks_per_level)
 
 
 def _make_drop_path_rates(counts: List[int], drop_path_rate: float) -> List[float]:
@@ -241,77 +290,14 @@ def _make_mednext_stage_builder(cfg: Config, counts: List[int]) -> _StatefulStag
     return _StatefulStageBuilder(factory, counts)
 
 
-# 各向异性自动调度的最小特征边长（nnU-Net 默认 4）：降采样后某轴不小于此值才继续降。
-_MIN_FEATURE_SIZE = 4
-
-#: 各向异性下采样兼容的下/上采样模式（其余模式核结构要求各向同性 2）。
+# 各向异性下采样兼容的下/上采样模式（其余模式核结构要求各向同性 2）。
 _ANISO_DOWN_MODES = ("conv", "maxpool", "avgpool")
 _ANISO_UP_MODES   = ("transpose", "trilinear", "nearest")
 
 
-def _stem_stride_of(stem_mode: str) -> int:
-    """patchN stem 在进 encoder stage 前先各向同性降 N 倍；其余 stem stride=1。"""
-    if stem_mode == "patch2":
-        return 2
-    if stem_mode == "patch4":
-        return 4
-    return 1
-
-
-def _auto_anisotropic_strides(
-    spatial_sizes: List[int],
-    num_down     : int,
-    min_size     : int = _MIN_FEATURE_SIZE) -> List[tuple]:
-    """nnU-Net 式各向异性调度：逐级仅对"分辨率仍偏大"的轴降采样。
-
-    某轴本级降采样（stride 2）的条件：(a) 当前尺寸为偶数；(b) 减半后仍 >= min_size；
-    (c) 当前尺寸 > 本级最大轴尺寸的一半（即该轴分辨率落后不超过 2×）。这样各轴分辨率
-    始终保持在彼此 2× 以内，避免薄 z 轴被过早压成 1。
-    """
-    sizes = [int(s) for s in spatial_sizes]
-    nd = len(sizes)
-    schedule: List[tuple] = []
-    for _ in range(num_down):
-        ref = max(sizes)
-        stride = []
-        for ax in range(nd):
-            do_pool = (sizes[ax] % 2 == 0
-                       and sizes[ax] // 2 >= min_size
-                       and sizes[ax] * 2 > ref)  # sizes[ax] > ref/2
-            if do_pool:
-                stride.append(2)
-                sizes[ax] //= 2
-            else:
-                stride.append(1)
-        schedule.append(tuple(stride))
-    return schedule
-
-
-def compute_downsample_strides(cfg: Config, spatial_dims: int, n_levels: int):
-    """决定逐级下采样 stride。
-
-    优先级：显式 ``model.downsample_strides`` > ``model.anisotropic_pooling``
-    自动推导 > None（各向同性，沿用历史行为）。返回 ``None`` 或长度 ``n_levels-1``
-    的 per-axis stride 元组列表。
-    """
-    mc       = cfg.model
-    num_down = n_levels - 1
-    if num_down <= 0:
-        return None
-
-    explicit = list(mc.unet.downsample_strides or [])
-    if explicit:
-        return [tuple(int(x) for x in s) for s in explicit]
-
-    if not bool(mc.unet.anisotropic_pooling):
-        return None  # 各向同性默认：Downsample/Upsample 用 stride=2
-
-    # 自动推导：基于 patch 的"模型空间轴"尺寸（2.5D 的 D 折进通道，不计）。
-    patch         = [int(x) for x in cfg.data.patch_size]  # [D, H, W]
-    spatial_sizes = patch[1:] if spatial_dims == 2 else patch
-    stem_stride   = _stem_stride_of(mc.stem_mode)
-    spatial_sizes = [max(1, s // stem_stride) for s in spatial_sizes]
-    return _auto_anisotropic_strides(spatial_sizes, num_down)
+# Backward-compatible private names used by existing tests and callers.
+_stem_stride_of = stem_stride_of
+_auto_anisotropic_strides = auto_anisotropic_strides
 
 
 def _build_unet_encoder_decoder(
@@ -343,20 +329,11 @@ def _build_unet_encoder_decoder(
     enc_counts = _resolve_blocks_per_stage(  # 确认enc各stage通道
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
 
-    if   mc.unet.decoder_type == "unet":
-        expected_dec_calls = n_levels - 1
-    elif mc.unet.decoder_type == "unetpp":
-        expected_dec_calls = n_levels * (n_levels - 1) // 2
-    else:  # unet3p: no stage_builder calls
-        expected_dec_calls = 0
-
-    if   mc.decoder_blocks_per_stage and mc.unet.decoder_type == "unet":
-        dec_counts = _resolve_blocks_per_stage(  # 确认dec各stage通道
-            mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
-    elif mc.decoder_blocks_per_stage:  # UNet++：首项广播到所有嵌套节点
-        dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
-    else:
-        dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)
+    if attn_gate_target != "skips" and mc.unet.decoder_type != "unetpp":
+        raise ConfigError(
+            f"attn_gate_target={attn_gate_target!r} is unsupported for "
+            f"decoder_type={mc.unet.decoder_type!r}; only UNet++ consumes it.")
+    dec_counts = _resolve_decoder_block_counts(mc, n_levels)
 
     # MultiRF 逐 stage mask（默认空 = 全关，逐位兼容历史）。
     # encoder mask 对齐 enc stage 顺序（浅→深，末位为 bottleneck）；
@@ -466,7 +443,8 @@ def _build_unet_encoder_decoder(
         downsample_builder    = downsample_builder,
         downsample_strides    = ds_strides,
         grad_checkpointing    = mc.grad_checkpointing,
-        grad_ckpt_stages      = mc.unet.grad_ckpt_encoder_stages)
+        grad_ckpt_stages      = mc.unet.grad_ckpt_encoder_stages,
+        grad_ckpt_stem_downsample = mc.grad_ckpt_stem_downsample)
 
     # attn_gate_norm='auto' 跟随全局 norm_type（避免小 batch 3D 下门控 BN 统计噪）。
     attn_gate_norm = (mc.unet.norm_type if mc.unet.attn_gate_norm == "auto"
@@ -483,7 +461,8 @@ def _build_unet_encoder_decoder(
             skip_attention=mc.unet.skip_attention,
             attn_gate_norm=attn_gate_norm,
             spatial_dims=spatial_dims,
-            grad_checkpointing=mc.grad_checkpointing)
+            grad_checkpointing=mc.grad_checkpointing,
+            grad_ckpt_decoder_branches=mc.grad_ckpt_decoder_branches)
     elif mc.unet.decoder_type == "unetpp":
         decoder = UNetPPDecoder(
             encoder_channels=enc_channels,
@@ -497,7 +476,8 @@ def _build_unet_encoder_decoder(
             norm_type=mc.unet.norm_type,
             norm_groups=mc.unet.norm_groups,
             activation=mc.unet.activation,
-            grad_checkpointing=mc.grad_checkpointing)
+            grad_checkpointing=mc.grad_checkpointing,
+            grad_ckpt_decoder_branches=mc.grad_ckpt_decoder_branches)
     else:
         decoder = Decoder(
             encoder_channels   = enc_channels,
@@ -546,10 +526,12 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
     arch = str(cfg.model.arch).lower()
     if arch == "adm":
         from .adm_unet import build_adm_seg_model
-        return build_adm_seg_model(cfg)
+        return _apply_init_strategy(
+            build_adm_seg_model(cfg), cfg.model.init_strategy)
     if arch == "edm2":
         from .edm2_unet import build_edm2_seg_model
-        return build_edm2_seg_model(cfg)
+        return _apply_init_strategy(
+            build_edm2_seg_model(cfg), cfg.model.init_strategy)
     if arch != "unet":
         raise ValueError(
             f"Unknown model.arch: {arch!r}. Valid: 'unet' | 'adm' | 'edm2'.")
@@ -565,19 +547,7 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
     n_levels = len(enc_channels)
     enc_counts = _resolve_blocks_per_stage(
         mc.encoder_blocks_per_stage, n_levels, mc.blocks_per_level)
-    if mc.unet.decoder_type == "unet":
-        expected_dec_calls = n_levels - 1
-    elif mc.unet.decoder_type == "unetpp":
-        expected_dec_calls = n_levels * (n_levels - 1) // 2
-    else:
-        expected_dec_calls = 0
-    if mc.decoder_blocks_per_stage and mc.unet.decoder_type == "unet":
-        dec_counts = _resolve_blocks_per_stage(
-            mc.decoder_blocks_per_stage, expected_dec_calls, mc.blocks_per_level)
-    elif mc.decoder_blocks_per_stage:
-        dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
-    else:
-        dec_counts = [mc.blocks_per_level] * max(expected_dec_calls, 1)
+    dec_counts = _resolve_decoder_block_counts(mc, n_levels)
     num_stem_fusion_views = topo.num_stem_fusion_views
     aux_head_out_channels = topo.aux_head_out_channels
 
@@ -621,4 +591,4 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
         mc.deep_supervision, aux_seg_supervision, len(model.aux_heads),
         mc.aux_head_mode, mc.grad_checkpointing)
 
-    return model
+    return _apply_init_strategy(model, mc.init_strategy)

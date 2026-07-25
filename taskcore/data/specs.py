@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+import inspect
 from typing import Any, List, Optional, Tuple
 
 from torch.utils.data import Dataset
@@ -54,6 +55,7 @@ class DatasetCommonCfg:
     cache_max_volumes: int
     cache_int16: bool
     region_weights: Optional[List[float]]
+    resize_antialias: bool = False
 
     @classmethod
     def from_cfg(cls, cfg: Any) -> "DatasetCommonCfg":
@@ -77,11 +79,14 @@ class DatasetCommonCfg:
             cache_enabled     = (str(dc.cache_mode) == "memory"),
             cache_max_volumes = int(dc.cache_max_volumes),
             cache_int16       = (str(dc.cache_dtype) == "int16"),
-            region_weights    = list(rw) if rw else None)
+            region_weights    = list(rw) if rw else None,
+            resize_antialias  = bool(dc.resize_antialias))
 
     def to_kwargs(self) -> dict:
         """直接展开为 dataset ``__init__`` 的 kwargs（含子类扩展字段）。"""
-        return asdict(self)
+        values = asdict(self)
+        values.pop("resize_antialias", None)
+        return values
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,13 @@ class DatasetSpec(ABC):
         """val 不做前景过采样以避免污染验证分布。"""
         return float(self.cfg.data.foreground_oversample_ratio) if is_train else 0.0
 
+    def _resize_kwargs(self) -> dict:
+        """仅向支持该参数的 dataset 传递 CPU resize 抗混叠开关。"""
+        if "resize_antialias" in inspect.signature(
+                type(self).dataset_cls.__init__).parameters:
+            return {"resize_antialias": bool(self.cfg.data.resize_antialias)}
+        return {}
+
     def log_summary(self) -> None:
         """供 ``build_dataloaders`` 在构造 split 前打印模式概要（默认无操作）。"""
 
@@ -167,6 +179,7 @@ class WholeSpec(DatasetSpec):
             aug_oversample_ratio = self._aug_oversample(is_train),
             samples_per_volume   = (self._samples_per_volume(True)
                                     if is_train else 1),
+            **self._resize_kwargs(),
             is_train=is_train)
 
 
@@ -205,6 +218,7 @@ class ZCubeSpec(DatasetSpec):
             samples_per_volume          = self._samples_per_volume(is_train),
             is_train                    = is_train,
             z_boundary_mode             = dc.z_boundary_mode,
+            **self._resize_kwargs(),
             val_grid_coverage           = dc.val_grid_coverage)
 
 
@@ -235,6 +249,7 @@ class CubicSpec(DatasetSpec):
             foreground_oversample_ratio = self._fg_ratio(is_train),
             samples_per_volume          = self._samples_per_volume(is_train),
             is_train                    = is_train,
+            **self._resize_kwargs(),
             val_grid_coverage           = dc.val_grid_coverage)
 
 

@@ -914,8 +914,13 @@ def test_gpu_augmentor_shapes_and_sync():
     assert w.shape == wmap.shape
     assert c.shape == cond.shape
     assert torch.isfinite(out).all() and torch.isfinite(c).all()
-    # intensity_clamp：增强后不超增强前逐样本值域。
-    assert out.max() <= img.max() + 1e-5 and out.min() >= img.min() - 1e-5
+    # intensity_clamp：强度增强后夹回增强前值域；grid_dropout 在 clamp 之后
+    # 置洞为 0，故允许低于增强前 min（洞是有意为之，不应被 clamp 抬回）。
+    finite = out[out != 0]
+    if finite.numel() > 0:
+        assert finite.max() <= img.max() + 1e-5
+        assert finite.min() >= img.min() - 1e-5
+    assert (out == 0).any(), "grid_dropout_prob=1.0 must create zero holes"
     # rank-4 输入（2.5D 预打包）自动升维再还原。
     out4, _, _ = aug(torch.rand(2, 8, 16, 16))
     assert out4.shape == (2, 8, 16, 16)

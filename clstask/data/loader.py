@@ -17,6 +17,7 @@ from taskcore.config.core import Config as SegConfig
 from taskcore.data.loader import (
     assemble_train_val_loaders,
     discover_npz_recursive,
+    group_aware_train_val_split,
     stratified_split_by_key,
     train_val_split,
 )
@@ -70,10 +71,16 @@ def build_cls_dataloaders(
     if cls.label_source == "table":
         table = load_label_table(cls.label_table, num_classes, cls.multi_label)
 
-    if cls.stratify_split:
+    if dc.group_id_regex:
+        train_idx, val_idx = group_aware_train_val_split(
+            paths, dc.val_ratio, dc.split_seed,
+            group_id_regex=dc.group_id_regex)
+        logger.info("group-aware split: %d train / %d val volumes",
+                    len(train_idx), len(val_idx))
+    elif cls.stratify_split:
         keys = _split_keys(paths, cfg, cls, table, dc.npz_suffix)
-        train_idx, val_idx = stratified_split(
-            keys, dc.val_ratio, dc.split_seed)
+        train_idx, val_idx = group_aware_train_val_split(
+            paths, dc.val_ratio, dc.split_seed, stratified_keys=keys)
         n_strata = len(set(keys))
         logger.info("stratified split: %d strata over %d volumes",
                     n_strata, len(paths))

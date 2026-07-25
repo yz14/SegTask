@@ -32,7 +32,9 @@ from taskcore.data.loader import (  # noqa: F401  (re-export，保持旧 import 
 from taskcore.data.loader import (  # noqa: F401  (re-export)
     assemble_train_val_loaders,
     detect_label_values,
+    finalize_from_data,
     discover_npz_samples,
+    group_aware_train_val_split,
     log_volume_cache_estimate,
     resolve_dataloader_workers,
     train_val_split,
@@ -75,6 +77,7 @@ def build_dataloaders(
     npz_suffix = dc.npz_suffix
 
     # 缺失/空时自建 npz 缓存（一次性；部分目录被视为权威，重生请 make_data --overwrite）。
+    # DDP：仅 rank0 构建 + barrier，避免多 rank 交错写损坏包。
     npz_p       = Path(npz_dir)
     npz_present = npz_p.is_dir() and any(
         x for x in npz_p.glob(f"*{npz_suffix}") if not x.name.startswith(("_", ".")))
@@ -86,28 +89,58 @@ def build_dataloaders(
                 f"`python -m gentask.data.make_data --config "
                 f"<yaml> --out {npz_dir}` first, or set "
                 f"data.npz_auto_build: true to build inline.")
-        logger.info(
-            "data.npz_dir=%s is empty/missing — auto-building via "
-            "make_data.prepare_dataset (workers=%d). One-time cost; ",
-            npz_dir, max(dc.num_workers, 1))
-        from .make_data import prepare_dataset
-        counters = prepare_dataset(
-            cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
-        logger.info(
-            "Auto-build complete: written=%d, skipped=%d, failed=%d / total=%d.",
-            counters["written"], counters["skipped"],
-            counters["failed"], counters["total"])
-        if counters["failed"] > 0:
-            logger.warning(
-                "make_data reported %d failed sample(s). Inspect "
-                "%s/_failures.txt; affected pids will be missing from the "
-                "training set.", counters["failed"], npz_dir)
-        if counters["written"] + counters["skipped"] == 0:
-            raise RuntimeError(
-                f"Auto-build produced 0 valid npz packages under "
-                f"{npz_dir}. Check input image_dir / label_dir paths "
-                f"and the make_data error log.")
-
+        build_error: Optional[str] = None
+        if int(rank) == 0:
+            try:
+                logger.info(
+                    "data.npz_dir=%s is empty/missing — auto-building via "
+                    "make_data.prepare_dataset (workers=%d). One-time cost; ",
+                    npz_dir, max(dc.num_workers, 1))
+                from .make_data import prepare_dataset
+                counters = prepare_dataset(
+                    cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
+                logger.info(
+                    "Auto-build complete: written=%d, skipped=%d, failed=%d / total=%d.",
+                    counters["written"], counters["skipped"],
+                    counters["failed"], counters["total"])
+                if counters["failed"] > 0:
+                    logger.warning(
+                        "make_data reported %d failed sample(s). Inspect "
+                        "%s/_failures.txt; affected pids will be missing from the "
+                        "training set.", counters["failed"], npz_dir)
+                if counters["written"] + counters["skipped"] == 0:
+                    build_error = (
+                        f"Auto-build produced 0 valid npz packages under "
+                        f"{npz_dir}. Check input image_dir / label_dir paths "
+                        f"and the make_data error log.")
+            except Exception as exc:
+                build_error = f"{type(exc).__name__}: {exc}"
+        if int(world_size) > 1:
+            import torch
+            import torch.distributed as dist
+            if not (dist.is_available() and dist.is_initialized()):
+                raise RuntimeError(
+                    "npz auto-build with world_size>1 requires an initialized "
+                    "torch.distributed process group (rank0 builds, peers barrier).")
+            flag = torch.tensor(
+                [0 if build_error else 1], dtype=torch.int32,
+                device="cuda" if torch.cuda.is_available() else "cpu")
+            dist.broadcast(flag, src=0)
+            dist.barrier()
+            if int(flag.item()) == 0:
+                raise RuntimeError(
+                    build_error or
+                    f"npz auto-build failed on rank0 (reported to rank {rank}).")
+            if int(rank) != 0:
+                npz_present = npz_p.is_dir() and any(
+                    x for x in npz_p.glob(f"*{npz_suffix}")
+                    if not x.name.startswith(("_", ".")))
+                if not npz_present:
+                    raise RuntimeError(
+                        f"npz auto-build on rank0 finished but {npz_dir!r} "
+                        f"is still empty/missing on rank {rank}.")
+        elif build_error:
+            raise RuntimeError(build_error)
     logger.info(
         "Training source: npz packages under %s (suffix=%s). "
         "NIfTI fields image_dir/label_dir/bbox_dir/region_weight_dir are "
@@ -129,16 +162,22 @@ def build_dataloaders(
     if not dc.label_values:
         # npz meta 含 label_counts（make_data≥1.3）时走快路，启动期不解码 label 卷；
         # 旧包无该键自动回退全量扫描。
-        dc.label_values, per_sample_counts = detect_label_values(
+        detected_values, per_sample_counts = detect_label_values(
             label_paths, label_loader_fn=label_loader_fn,
             return_primaries=True, label_counts_fn=load_npz_label_counts)
-        dc.num_classes  = len(dc.label_values)
-        cfg.sync()
+        finalize_from_data(
+            cfg, detected_values, per_sample_counts=per_sample_counts)
     logger.info("Label values: %s, num_classes: %d, num_fg: %d",
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
     # 按主前景类分层划分（不可行时回退随机）。
-    if dc.stratified_split and dc.num_classes >= 2:
+    if dc.group_id_regex:
+        train_idx, val_idx = group_aware_train_val_split(
+            label_paths, dc.val_ratio, dc.split_seed,
+            group_id_regex=dc.group_id_regex)
+        logger.info("Split (group-aware): %d train, %d val",
+                    len(train_idx), len(val_idx))
+    elif dc.stratified_split and dc.num_classes >= 2:
         train_idx, val_idx = stratified_train_val_split(
             label_paths, dc.label_values, dc.val_ratio, dc.split_seed,
             label_loader_fn=label_loader_fn,

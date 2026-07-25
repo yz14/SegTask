@@ -109,6 +109,7 @@ register_task_section(TaskSectionSpec(
     task_cls=SegTaskConfig,
     validate_task=validate_seg_task,
     skip_core_validators=(),
+    preprocess_raw=hoist_legacy_seg_sections,
 ))
 
 

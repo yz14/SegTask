@@ -136,11 +136,25 @@ class ModelEMA:
         if not self._backup:
             # offload 模式下 backup 也落 CPU，避免验证换入期间额外占 1× 参数 GPU 显存。
             self._backup = {
-                k: (torch.empty_like(v, device=self.offload_device)
+                k: (torch.empty_like(
+                    v, device=self.offload_device,
+                    pin_memory=(self.offload_device is not None
+                                and self.offload_device.type == "cpu"
+                                and torch.cuda.is_available()
+                                and v.is_cuda))
                     if self.offload_device is not None else torch.empty_like(v))
                 for k, v in sd.items()}
+        staged = False
         for k, live in sd.items():
-            self._backup[k].copy_(live)
+            self._backup[k].copy_(
+                live, non_blocking=(self._backup[k].is_cuda is False
+                                    and live.is_cuda
+                                    and self._backup[k].is_pinned()))
+            staged = staged or (
+                live.is_cuda and self._backup[k].device.type == "cpu")
+        if staged:
+            torch.cuda.current_stream().synchronize()
+        for k, live in sd.items():
             live.copy_(self.shadow[k])
         self._swapped = True
 
@@ -150,7 +164,9 @@ class ModelEMA:
             return
         sd = model.state_dict()
         for k, live in sd.items():
-            live.copy_(self._backup[k])
+            live.copy_(self._backup[k], non_blocking=(
+                live.is_cuda and self._backup[k].device.type == "cpu"
+                and self._backup[k].is_pinned()))
         self._swapped = False
 
     def state_dict(self) -> Dict:

@@ -305,7 +305,7 @@ def test_z_axis_on_shape_and_view0_equivalence():
     common = _z_axis_common_kwargs(D, H, W)
 
     class _FixedZ(_SyntheticSegDataset3D):
-        def _sample_z(self, vol_idx, D_vol):
+        def _sample_z(self, vol_idx, D_vol, *, sample_idx=None):
             return D_vol // 2  # = 20
 
     ds_on = _FixedZ(
@@ -357,7 +357,7 @@ def test_z_axis_on_aux_view_geometric_ground_truth():
     common = _z_axis_common_kwargs(D, H, W)
 
     class _FixedZ(_SyntheticSegDataset3D):
-        def _sample_z(self, vol_idx, D_vol):
+        def _sample_z(self, vol_idx, D_vol, *, sample_idx=None):
             return D_vol // 2
 
     ds_on = _FixedZ(
@@ -404,7 +404,7 @@ def test_z_axis_on_weight_map_shape_and_geometry():
     common = _z_axis_common_kwargs(D, H, W)
 
     class _FixedZ(_SyntheticSegDataset3D):
-        def _sample_z(self, vol_idx, D_vol):
+        def _sample_z(self, vol_idx, D_vol, *, sample_idx=None):
             return D_vol // 2
 
     ds_on = _FixedZ(
@@ -462,7 +462,7 @@ def test_cubic_on_shape_and_per_view_geometry():
     fixed_center = (Dv // 2, Hv // 2, Wv // 2)
 
     class _FixedCenter(_SyntheticSegDataset3DCubic):
-        def _sample_center(self, vol_idx, D, H, W):
+        def _sample_center(self, vol_idx, D, H, W, *, sample_idx=None):
             return fixed_center
 
     ds_on = _FixedCenter(
@@ -518,7 +518,7 @@ def test_cubic_off_path_unchanged():
     fixed_center = (Dv // 2, Hv // 2, Wv // 2)
 
     class _FixedCenter(_SyntheticSegDataset3DCubic):
-        def _sample_center(self, vol_idx, D, H, W):
+        def _sample_center(self, vol_idx, D, H, W, *, sample_idx=None):
             return fixed_center
 
     ds = _FixedCenter(

@@ -10,8 +10,7 @@
 ## 0. 共享主干
 
 ```
-配置加载（taskcore Config + DetConfig）→ npz 发现 → train/val 划分（默认按
-逐卷类存在集合分层，`det.stratify_split`；关闭回退纯随机）
+配置加载（taskcore Config + DetConfig）→ npz 发现 → train/val 划分（`data.group_id_regex` 非空时优先组级隔离；否则默认按逐卷类存在集合分层，`det.stratify_split`；关闭回退纯随机）
  → Dataset 抽 patch + 框真值联动（变长框 det_collate 保持 list）
  → DetectorModel：encoder → decoder 金字塔 → FPNAdapter → 检测头（4 模板）
  → 头内 fp32 损失 dict → 求和 → backward → optimizer/scheduler → EMA
@@ -106,6 +105,8 @@ RPN（anchor + objectness）→ proposal（解码 + NMS，pre/post topk）
 | SSL/分割迁移 | `det.pretrained_ckpt`：命中 `encoder.*`（重建式 SSL 亦命中 `decoder.*`），strict=False + 命中统计，0 命中报错（几何不一致不静默） |
 | 微调策略 | `det.encoder_lr_mult` 差分学习率（复用 clstask 分组实现）；`det.freeze_encoder` |
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建，反向重算激活、算力换显存；eval/no_grad 零开销 |
+| 扩展检查点范围 | `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches`：默认关闭，额外覆盖 stem/downsample 与 decoder 分支 |
+| 公共可选策略 | `data.resize_antialias`、`model.init_strategy`：默认 false/`legacy`，分别控制 CPU 下采样预滤波和最终模型初始化策略 |
 | DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler、验证集按 batch 块不相交分片；验证时预测/真值跨卡聚齐后算全集 mAP（不做卡间平均）；checkpoint/history 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 选模 | `det.save_best_metric`：map / loss（mAP@`det.eval_iou_thresh`，默认 0.1 医学小目标口径） |
 

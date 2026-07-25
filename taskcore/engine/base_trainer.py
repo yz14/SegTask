@@ -295,12 +295,12 @@ class BaseTrainer:
             else:
                 grad_norm_val = float(gn)
         elif not self._scaler_active:
-            grad_norm_val = self._global_grad_norm()
+            grad_norm_val = self._global_grad_norm(parameters)
         elif (getattr(self, "_health_monitor", False)
               and getattr(self, "_health_grad_norm_when_no_clip", True)):
             try:
                 self.scaler.unscale_(self.optimizer)
-                grad_norm_val = self._global_grad_norm()
+                grad_norm_val = self._global_grad_norm(parameters)
             except Exception:  # 监测失败绝不打断训练
                 logger.warning(
                     "Health grad-norm computation failed; skipping.",
@@ -348,6 +348,13 @@ class BaseTrainer:
 
         if parameters is None:
             parameters = self.model.parameters()
+        if not hasattr(self, "_actual_optimizer_steps"):
+            self._actual_optimizer_steps = 0
+        train_cfg = getattr(self.cfg, "train", None)
+        self._planned_optimizer_steps = int(
+            getattr(train_cfg, "epochs", 0)
+            * math.ceil(total_steps / max(
+                int(getattr(train_cfg, "grad_accum_steps", 1)), 1)))
         if grad_clip_norm is None:
             grad_clip_norm = float(self.cfg.train.grad_clip_norm)
         if ema_module is None:
@@ -425,10 +432,22 @@ class BaseTrainer:
             skipped_nonfinite=False,
             scaler_skipped=bool(scaler_skipped),
             grad_norm=grad_norm_val)
+        if result.stepped:
+            self._actual_optimizer_steps += 1
         self._check_boundary_scheduler_clock(
             sched_before, result, always_step_scheduler)
         self._unacked_optim_result = result
         return result
+
+    def optimizer_step_observation(self) -> Dict[str, int]:
+        """返回 planned/actual 优化步数及 scheduler 时钟，供监控与诊断读取。"""
+        return {
+            "planned_optimizer_steps": int(
+                getattr(self, "_planned_optimizer_steps", 0)),
+            "actual_optimizer_steps": int(
+                getattr(self, "_actual_optimizer_steps", 0)),
+            "scheduler_steps": int(self.scheduler.current_step),
+        }
 
     def _check_boundary_scheduler_clock(
         self,
@@ -462,13 +481,16 @@ class BaseTrainer:
     # Model-health helpers (轻量；仅 rank0 监测启用时调用)
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _global_grad_norm(self) -> "float | None":
+    def _global_grad_norm(self, parameters=None) -> "float | None":
         """当前已 unscale 的全局梯度 L2 范数（遍历一次有梯度的参数）。
 
         仅在未开启 grad_clip（无现成范数可复用）且监测需要时手动调用；调用方
         负责在 AMP fp16 下先 ``scaler.unscale_``，以免量纲被 loss scale 污染。
+        ``parameters`` 缺省取 ``self.model.parameters()``；须与 clip / 跳步判据
+        使用同一参数集合（如 SSL 的 ``method.parameters()``）。
         """
-        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+        params = self.model.parameters() if parameters is None else parameters
+        grads = [p.grad for p in params if p.grad is not None]
         if not grads:
             return None
         # foreach 批量算逐张量范数后聚合，全程仅末尾一次 .item() 同步（逐参数
@@ -531,6 +553,7 @@ class BaseTrainer:
         if not self._is_main:   # DDP：落盘仅 rank0
             return
         bare = unwrap_compile(self.model)
+        primary_live_sd = None
         if self.ema is not None:
             online_sd = {k: v.detach().cpu().clone()
                          for k, v in bare.state_dict().items()}
@@ -542,10 +565,10 @@ class BaseTrainer:
                 self.ema.restore(bare)
         else:
             online_sd = None
-            primary_sd = bare.state_dict()
+            primary_sd = None
+            primary_live_sd = bare.state_dict()
         state = {
             "epoch": epoch,
-            "model_state_dict": primary_sd,
             "best_metric": self.best_metric,
             "best_epoch": self.best_epoch,
             "metrics": metrics,
@@ -559,12 +582,21 @@ class BaseTrainer:
         path = self.output_dir / "best_model.pth"
         label = self._ckpt_task_label
         if self._ckpt_saver is not None:
+            # EMA 分支的两个 state dict 已经是 detached CPU snapshot；EMA
+            # 关闭时则必须让在线 state 经过 state_to_cpu，避免后台线程持有
+            # 会继续被训练原地改写的 GPU 参数。
+            state = state_to_cpu(state)
+            state["model_state_dict"] = (
+                primary_sd if primary_sd is not None
+                else state_to_cpu(primary_live_sd))
             self._ckpt_saver.submit(
-                state_to_cpu(state), path,
+                state, path,
                 on_done=lambda e=epoch, m=metrics[self.best_key]: logger.info(
                     "Best %s model saved (%s=%.4f) @ epoch %d",
                     label, self.best_key, m, e + 1))
         else:
+            state["model_state_dict"] = (
+                primary_sd if primary_sd is not None else primary_live_sd)
             atomic_torch_save(state, path)
             logger.info("Best %s model saved (%s=%.4f) @ epoch %d",
                         label, self.best_key, metrics[self.best_key],
@@ -574,6 +606,10 @@ class BaseTrainer:
         """latest checkpoint（续训用）：在线权重 + EMA + optimizer/
         scheduler/scaler/epoch/best 状态/history 全量落盘；原子替换
         防中断写坏。"""
+        # ZeRO：状态分片在各 rank；consolidate 必须在 rank 早退之前调用，
+        # 否则 rank0 取 state_dict 崩溃 / 其它 rank 已进入下一次集合通信则挂死。
+        if hasattr(self.optimizer, "consolidate_state_dict"):
+            self.optimizer.consolidate_state_dict(to=0)
         if not self._is_main:   # DDP：落盘仅 rank0
             return
         bare = unwrap_compile(self.model)
@@ -640,7 +676,15 @@ class BaseTrainer:
                 logger.info("Restored RNG state from checkpoint.")
             except Exception as e:  # pragma: no cover
                 logger.warning("Failed to restore RNG state: %s", e)
-        return int(ckpt.get("epoch", -1)) + 1
+        start_epoch = int(ckpt.get("epoch", -1)) + 1
+        # ckpt 的 RNG 快照通常来自 rank0；rank>0 按 (seed, epoch, rank) 重分流，
+        # 避免 resume 后各卡退化成同一随机流（cls/det/gen 此前漏做）。
+        rank = int(getattr(self, "_rank", 0))
+        if getattr(self, "_is_dist", False) and rank > 0:
+            reseed_rank_rng(
+                int(self.cfg.train.seed), rank, start_epoch,
+                bool(self.cfg.train.deterministic))
+        return start_epoch
 
     def _pretrain_transform_state_dict(
         self, sd: Dict, bare: "torch.nn.Module") -> Dict:
@@ -665,6 +709,36 @@ class BaseTrainer:
         sd = strip_common_prefixes(sd)
         bare = unwrap_compile(self.model)
         sd = self._pretrain_transform_state_dict(sd, bare)
+        own = bare.state_dict()
+        matched = {
+            k: v for k, v in sd.items()
+            if k in own and getattr(v, "shape", None) == own[k].shape}
+        if not matched:
+            raise RuntimeError(
+                f"Pretrain checkpoint {path!r} matched 0 model tensors. "
+                "Check task mismatch, checkpoint key prefixes, or backbone "
+                "configuration.")
+        ckpt_cfg = ckpt.get("config")
+        allow_geometry = bool(
+            getattr(self.cfg.train, "pretrain_allow_geometry_mismatch", False))
+        if ckpt_cfg is not None and not allow_geometry:
+            current = (
+                self.cfg.data.patch_mode,
+                self.cfg.model.spatial_dims,
+                self.cfg.model.in_channels)
+            saved_data = ckpt_cfg.get("data", {})
+            saved_model = ckpt_cfg.get("model", {})
+            saved = (
+                saved_data.get("patch_mode"),
+                saved_model.get("spatial_dims"),
+                saved_model.get("in_channels"))
+            if all(v is not None for v in saved) and saved != current:
+                raise RuntimeError(
+                    "Pretrain checkpoint geometry mismatch: "
+                    f"checkpoint patch_mode/spatial_dims/in_channels={saved}, "
+                    f"current={current}. Set "
+                    "train.pretrain_allow_geometry_mismatch=true only for "
+                    "intentional cross-geometry transfer.")
         result = bare.load_state_dict(sd, strict=strict)
         missing = list(getattr(result, "missing_keys", []) or [])
         unexpected = list(getattr(result, "unexpected_keys", []) or [])

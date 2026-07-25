@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from typing import List
 
 import torch
 import torch.nn as nn
 
-import torch.nn.functional as F
-
-from .blocks import INTERP_SMOOTH, AttentionGate3D, Upsample, checkpoint_if
-
-logger = logging.getLogger(__name__)
+from .blocks import AttentionGate3D, Upsample, checkpoint_if
 
 
 class UNetPPDecoder(nn.Module):
@@ -38,13 +33,13 @@ class UNetPPDecoder(nn.Module):
         norm_groups: int = 8,
         activation: str = "leakyrelu",
         grad_checkpointing: bool = False,
+        grad_ckpt_decoder_branches: bool = False,
     ):
         super().__init__()
         n = len(encoder_channels)
         if n < 2:
             raise ValueError("UNetPPDecoder requires at least 2 encoder levels")
         self.n = n
-        self._size_mismatch_warned = False
         self.skip_attention = skip_attention
         if attn_gate_target not in ("skips", "upsample"):
             raise ValueError(
@@ -54,6 +49,7 @@ class UNetPPDecoder(nn.Module):
         self.spatial_dims = spatial_dims
         # 梯度检查点：逐节点包裹融合 block 前向，反向重算以省激活显存。
         self.grad_checkpointing = bool(grad_checkpointing)
+        self.grad_ckpt_decoder_branches = bool(grad_ckpt_decoder_branches)
 
         # 以 'i_j' 为 key 保证 ModuleDict 注册顺序确定。
         self.upsamples = nn.ModuleDict()
@@ -101,25 +97,25 @@ class UNetPPDecoder(nn.Module):
         for j in range(1, n):
             for i in range(n - j):
                 key = f"{i}_{j}"
-                up = self.upsamples[key](x[i + 1][j - 1])
+                up = checkpoint_if(
+                    self.grad_ckpt_decoder_branches,
+                    self.upsamples[key], x[i + 1][j - 1])
                 if up.shape[2:] != x[i][0].shape[2:]:
-                    if not self._size_mismatch_warned:
-                        self._size_mismatch_warned = True
-                        logger.warning(
-                            "UNet++ node %s: upsampled size %s != skip size "
-                            "%s — falling back to F.interpolate. 这通常意味着 "
-                            "patch_size 与 encoder stride 不整除，请检查配置。",
-                            key, tuple(up.shape[2:]), tuple(x[i][0].shape[2:]))
-                    up = F.interpolate(
-                        up, size=x[i][0].shape[2:],
-                        mode=INTERP_SMOOTH[self.spatial_dims],
-                        align_corners=False)
+                    raise RuntimeError(
+                        f"UNet++ node {key} size mismatch after upsample: "
+                        f"up={tuple(up.shape[2:])} vs skip="
+                        f"{tuple(x[i][0].shape[2:])}. Check patch_size and "
+                        "encoder stride divisibility.")
                 if self.skip_attention and self.attn_gate_target == "skips":
-                    gate = self.gates[key]
-                    skips = [gate(s, up) for s in x[i][:j]]
+                        gate = self.gates[key]
+                        skips = [checkpoint_if(
+                            self.grad_ckpt_decoder_branches, gate, s, up)
+                            for s in x[i][:j]]
                 else:
                     if self.skip_attention:  # 'upsample'：用 X[i,0] 门控上采样分支。
-                        up = self.gates[key](up, x[i][0])
+                        up = checkpoint_if(
+                            self.grad_ckpt_decoder_branches,
+                            self.gates[key], up, x[i][0])
                     skips = x[i][:j]
                 fused = torch.cat(skips + [up], dim=1)
                 x[i][j] = checkpoint_if(

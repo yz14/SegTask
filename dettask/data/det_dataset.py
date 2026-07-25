@@ -56,8 +56,9 @@ from taskcore.data.patch_ops import (
 from taskcore.data.sampling import (
     clip_center_to_ranges,
     halton_center,
+    safe_z_center_range,
+    safe_z_grid_center,
     uniform_center,
-    z_grid_center,
 )
 
 from ..targets import crop_boxes, flip_boxes, scale_boxes, slice_boxes_to_2d
@@ -205,13 +206,16 @@ class DetPatchDataset(NpzPatchDatasetBase):
                   boxes: np.ndarray, cov_j: Optional[int]) -> int:
         """z 模式中心 z：val 覆盖 → 等距 bin 中心；训练 fg 命中 → 某 gt 框
         z 中心；否则均匀采样。"""
+        d_patch = int(self.patch[0])
         if cov_j is not None:
-            return z_grid_center(cov_j, self.spv, D_vol)
+            return safe_z_grid_center(cov_j, self.spv, D_vol, d_patch)
         if (self.is_train and boxes.shape[0] > 0
                 and rng.random() < self.fg_ratio):
             b = boxes[int(rng.integers(boxes.shape[0]))]
-            return int(np.clip(round((b[0] + b[3]) / 2), 0, D_vol - 1))
-        return int(rng.integers(0, D_vol))
+            lo, hi = safe_z_center_range(D_vol, d_patch)
+            return int(np.clip(round((b[0] + b[3]) / 2), lo, hi - 1))
+        lo, hi = safe_z_center_range(D_vol, d_patch)
+        return int(rng.integers(lo, hi))
 
     def _sample_center(self, rng: np.random.Generator,
                        shape: Tuple[int, ...], boxes: np.ndarray,

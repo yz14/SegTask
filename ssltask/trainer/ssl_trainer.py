@@ -24,7 +24,6 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from taskcore.data.augment import GPUAugmentor
-from taskcore.engine.amp import autocast
 from taskcore.engine.checkpoint import (
     AsyncCheckpointSaver, relocate_optimizer_state, restore_rng_state,
     state_to_cpu, unwrap_compile)
@@ -558,9 +557,17 @@ class SSLTrainer(BaseTrainer):
                  if p.grad is not None]
         if not grads:
             return
-        torch._foreach_div_(grads, float(self._world_size))
-        for g in grads:
-            dist.all_reduce(g, op=dist.ReduceOp.SUM)
+        buckets = {}
+        for grad in grads:
+            buckets.setdefault((grad.device, grad.dtype), []).append(grad)
+        for bucket in buckets.values():
+            flat = torch._utils._flatten_dense_tensors(bucket)
+            flat.div_(float(self._world_size))
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            for grad, restored in zip(
+                    bucket, torch._utils._unflatten_dense_tensors(
+                        flat, bucket)):
+                grad.copy_(restored)
 
     def _reduce_meter_avg(self, meter: AverageMeter) -> float:
         """DDP：按样本数加权 all-reduce 各 rank 的 meter 均值，使 best_loss 判定与
@@ -665,9 +672,11 @@ class SSLTrainer(BaseTrainer):
             batch = self._center_crop_z(batch)
             batch = self._fold_batch(batch)
 
-            with autocast(device_type="cuda", enabled=self.use_amp,
-                          dtype=self.amp_dtype):
-                loss, logs = self.method.compute_loss(batch)
+            # C16：损失在 autocast 外计算。方法内 .float() 挡不住 autocast 对
+            # matmul/bmm 的再降精度（Gram / InfoNCE / 协方差最怕累积误差）。
+            # 整段 compute_loss 出 autocast 后损失为真 fp32；方法若需 AMP 前向
+            # 可在内部自行开局部 autocast，损失张量运算须留在外侧。
+            loss, logs = self.method.compute_loss(batch)
             # 尾批 micro-batch 数不满 accum 时用真实尾长作分母，避免尾组梯度
             # 因除以 accum 而权重偏小。
             effective_accum = self._effective_accum(step, total_steps, accum)

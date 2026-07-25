@@ -30,6 +30,7 @@ class UNet3PDecoder(nn.Module):
         attn_gate_norm: str = "batch",
         spatial_dims: int = 3,
         grad_checkpointing: bool = False,
+        grad_ckpt_decoder_branches: bool = False,
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -42,6 +43,7 @@ class UNet3PDecoder(nn.Module):
         self.spatial_dims = spatial_dims
         # 梯度检查点：逐节点包裹融合卷积前向，反向重算以省激活显存。
         self.grad_checkpointing = bool(grad_checkpointing)
+        self.grad_ckpt_decoder_branches = bool(grad_ckpt_decoder_branches)
 
         def _cna(in_ch: int, out_ch: int) -> ConvNormAct:
             return ConvNormAct(
@@ -79,6 +81,7 @@ class UNet3PDecoder(nn.Module):
         self.out_channels = [self.fused_ch] * (n - 1)
 
     def _resize_to(self, src: torch.Tensor, target_shape, mode: str) -> torch.Tensor:
+        """UNet3+ 固有的全尺度分支重采样；非法主干几何由配置期校验兜住。"""
         if src.shape[2:] == target_shape:
             return src
         if mode == "down":
@@ -111,8 +114,12 @@ class UNet3PDecoder(nn.Module):
                     src = self._resize_to(encoder_features[n - 1], tgt_shape, "up")
 
                 if self.skip_attention:
-                    src = self.gates[i][j](src, gate_signal)
-                branches.append(self.branches[i][j](src))
+                    src = checkpoint_if(
+                        self.grad_ckpt_decoder_branches,
+                        self.gates[i][j], src, gate_signal)
+                branches.append(checkpoint_if(
+                    self.grad_ckpt_decoder_branches,
+                    self.branches[i][j], src))
 
             fused = torch.cat(branches, dim=1)
             decoder_nodes[i] = checkpoint_if(

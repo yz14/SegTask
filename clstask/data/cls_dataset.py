@@ -67,8 +67,9 @@ from taskcore.data.patch_ops import safe_center_range
 from taskcore.data.sampling import (
     clip_center_to_ranges,
     halton_center,
+    safe_z_center_range,
+    safe_z_grid_center,
     uniform_center,
-    z_grid_center,
 )
 
 logger = logging.getLogger(__name__)
@@ -340,15 +341,18 @@ class ClsPatchDataset(NpzPatchDatasetBase):
                   cov_j: Optional[int]) -> int:
         """z 模式中心 z：val 覆盖 → 等距 bin 中心；训练 fg 命中 → 先均匀选类
         再选该类前景切片；否则均匀采样（口径同 ``SegDataset3D._sample_z``）。"""
+        d_patch = int(self.patch[0])
         if cov_j is not None:
-            return z_grid_center(cov_j, self.spv, D_vol)
+            return safe_z_grid_center(cov_j, self.spv, D_vol, d_patch)
         if (self.is_train and self.fg_ratio > 0
                 and rng.random() < self.fg_ratio):
             groups = self._fg_groups(vol_idx, lbl)
             if groups:
                 zs = groups[int(rng.integers(len(groups)))]
-                return int(rng.choice(zs))
-        return int(rng.integers(0, D_vol))
+                return int(np.clip(rng.choice(zs), *safe_z_center_range(
+                    D_vol, d_patch)))
+        lo, hi = safe_z_center_range(D_vol, d_patch)
+        return int(rng.integers(lo, hi))
 
     def _sample_center(self, rng: np.random.Generator,
                        shape: Tuple[int, ...], vol_idx: int,

@@ -10,7 +10,7 @@
 ## 0. 共享主干
 
 ```
-配置加载（taskcore Config + ClsConfig）→ npz 发现 → train/val 划分
+配置加载（taskcore Config + ClsConfig）→ npz 发现 → train/val 划分（`data.group_id_regex` 非空时优先组级隔离，否则保持 `cls.stratify_split` 分层/随机语义）
  → Dataset 抽 patch + 标签派生 → GPU 增强（augment.enabled，可选）
  → mixup/cutmix（可选）
  → encoder（`cls.backbone`：encoder / densenet / vit）+ 池化 + cls_head → BCE/CE/Focal（fp32）
@@ -102,6 +102,8 @@ mixup / cutmix（可选，仅 volume 粒度；标签软化，CutMix λ 按实际
 | mixup / cutmix | `cls.mixup_alpha` / `cls.cutmix_alpha`（>0 启用；同时启用每 batch 二选一；仅 volume 粒度） |
 | 前景过采样 | `data.foreground_oversample_ratio`（仅训练集；复用 npz 预计算 fg 索引，类均衡采样） |
 | 梯度检查点 | `model.grad_checkpointing`：反向重算激活、算力换显存；四模板全支持（encoder 系逐 stage（可配 `grad_ckpt_encoder_stages` 掩码）、DenseNet 逐 DenseBlock、ViT 逐 transformer Block）；eval/no_grad 零开销，数值与关闭时严格一致 |
+| 扩展检查点范围 | `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches` | 默认关闭，分别扩展 stem/downsample 与 decoder 分支覆盖 |
+| 公共可选策略 | `data.resize_antialias`、`model.init_strategy` | 默认 false/`legacy`；分别控制 CPU 下采样预滤波和最终模型初始化策略 |
 | DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler（逐 epoch set_epoch 重洗）、验证集按 batch 块不相交分片；验证指标先跨卡聚齐全集 logits/targets 再算 AUC/F1（不可分解指标不做卡间平均）；checkpoint/history/monitor 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 验证网格覆盖 | `data.val_grid_coverage`：验证 patch 改确定性网格铺点，与推理同口径 |
 | 推理 TTA / AMP | `cls.tta_flips`：翻转 TTA（3D 7 组合；2.5D 仅 H/W；slice 粒度 z 翻转输出回翻）；推理 autocast 口径同训练 |

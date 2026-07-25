@@ -12,6 +12,7 @@ from taskcore.data.dataset import open_npz, derive_volume_targets
 from taskcore.data.loader import (
     assemble_train_val_loaders,
     discover_npz_recursive as discover_npz,
+    group_aware_train_val_split,
     stratified_split_by_key as stratified_split,
     train_val_split,
 )
@@ -59,10 +60,16 @@ def build_det_dataloaders(
     paths = discover_npz(dc.npz_dir, dc.npz_suffix)
     fg_values_split = [float(v) for v in (dc.label_values[1:] if
                                           len(dc.label_values) > 1 else [1.0])]
-    if det.stratify_split:
+    if dc.group_id_regex:
+        train_idx, val_idx = group_aware_train_val_split(
+            paths, dc.val_ratio, dc.split_seed,
+            group_id_regex=dc.group_id_regex)
+        logger.info("group-aware split: %d train / %d val volumes",
+                    len(train_idx), len(val_idx))
+    elif det.stratify_split:
         keys = _det_split_keys(paths, fg_values_split)
-        train_idx, val_idx = stratified_split(
-            keys, dc.val_ratio, dc.split_seed)
+        train_idx, val_idx = group_aware_train_val_split(
+            paths, dc.val_ratio, dc.split_seed, stratified_keys=keys)
         logger.info("stratified split: %d strata over %d volumes",
                     len(set(keys)), len(paths))
     else:

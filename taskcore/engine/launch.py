@@ -38,11 +38,17 @@ logger = logging.getLogger(__name__)
 
 def find_free_port() -> int:
     """挑一个空闲 TCP 端口作 DDP rendezvous（混用机避免端口冲突）。"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    last_error = None
+    for _ in range(8):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+        except OSError as exc:
+            last_error = exc
+        finally:
+            s.close()
+    raise OSError("could not allocate a rendezvous port") from last_error
 
 
 def install_parent_death_signal() -> None:

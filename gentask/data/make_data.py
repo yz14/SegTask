@@ -54,7 +54,8 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
     dc = cfg.data
 
     image_paths, label_paths = discover_samples(
-        dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix)
+        dc.image_dir, dc.label_dir, dc.image_suffix, dc.label_suffix,
+        allow_unpaired=bool(getattr(dc, "allow_unpaired", False)))
 
     exclude_pids = _load_exclude_pids(dc.exclude_list)
     image_paths, label_paths, _ = _filter_by_exclude(

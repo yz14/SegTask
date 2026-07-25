@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import SimpleITK as sitk
 import torch
-from scipy.ndimage import zoom
+from scipy.ndimage import gaussian_filter, zoom
 from torch.utils.data import Dataset
 
 from .patch_ops import extract_cubic_patch, safe_center_range
@@ -27,9 +27,10 @@ from .sampling import (
     WorkerNumpyRng,
     halton as _halton,
     halton_center,
+    safe_z_center_range,
+    safe_z_grid_center,
     val_coverage_j_interleaved,
     val_sample_rng,
-    z_grid_center,
 )
 
 logger = logging.getLogger(__name__)
@@ -545,7 +546,9 @@ def preprocess_label(volume: np.ndarray, label_values: List[int]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Resize helpers
 # ---------------------------------------------------------------------------
-def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_label: bool = False) -> np.ndarray:
+def resize_3d(
+    arr: np.ndarray, target_d: int, target_h: int, target_w: int,
+    is_label: bool = False, anti_alias: bool = False) -> np.ndarray:
     """(D,H,W) 或 (C,D,H,W) resize：图像 order=1 线性，label order=0 近邻。"""
     if arr.ndim == 3:
         D, H, W = arr.shape
@@ -560,6 +563,10 @@ def resize_3d(arr: np.ndarray, target_d: int, target_h: int, target_w: int, is_l
     else:
         raise ValueError(f"Expected 3D or 4D array, got {arr.ndim}D")
     order = 0 if is_label else 1
+    if anti_alias and order > 0:
+        sigmas = tuple(max((1.0 / f - 1.0) * 0.5, 0.0)
+                       for f in factors)
+        arr = gaussian_filter(arr, sigmas, mode="nearest")
     # zoom 的输出形状 = round(in*factor)，可能比目标差 ±1（浮点因子累积），
     # 且默认 mode='constant' cval=0 会在边界注入 0。这里 mode='nearest'
     # 复制边界，再对形状做一次防御性校正到精确目标。
@@ -678,7 +685,8 @@ class SegDatasetNpzBase(Dataset):
         cache_max_volumes   : int,
         cache_int16         : bool,
         region_weights      : Optional[List[float]],
-        val_grid_coverage   : bool = False):
+        val_grid_coverage   : bool = False,
+        resize_antialias    : bool = False):
         super().__init__()
         if len(image_paths) != len(label_paths):
             raise ValueError(
@@ -706,6 +714,7 @@ class SegDatasetNpzBase(Dataset):
         self.is_train           = is_train
         self.region_weights     = region_weights
         self.val_grid_coverage  = bool(val_grid_coverage)
+        self.resize_antialias   = bool(resize_antialias)
 
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)
         self._lbl_cache = VolumeCache(cache_enabled, cache_max_volumes)
@@ -725,21 +734,24 @@ class SegDatasetNpzBase(Dataset):
         """逐 worker 采样 RNG（``WorkerNumpyRng`` 包装）。"""
         return self._worker_rng.get()
 
-    def _sample_rng(self) -> np.random.Generator:
+    def _sample_rng(self, sample_idx: Optional[int] = None) -> np.random.Generator:
         """patch 采样 RNG。
 
         训练用逐 worker 流式 RNG（每 epoch 不同，保采样多样性）；验证用
         当前样本序号派生的确定性 RNG，使每个 epoch 评估同一组 patch，
         save_best / early-stopping / plateau 不被采样噪声驱动。
         """
-        return val_sample_rng(self.is_train, self._worker_rng, self._sample_idx)
+        idx = self._sample_idx if sample_idx is None else int(sample_idx)
+        return val_sample_rng(self.is_train, self._worker_rng, idx)
 
-    def _val_coverage_pos(self) -> Optional[Tuple[int, int]]:
+    def _val_coverage_pos(
+        self, sample_idx: Optional[int] = None) -> Optional[Tuple[int, int]]:
         """val 确定性网格覆盖（val_grid_coverage=True）：返回当前样本在卷内的
         序号 j 与每卷样本数 S；未启用或训练态返回 None（回退随机位置）。"""
         if self.is_train or not self.val_grid_coverage:
             return None
-        j = val_coverage_j_interleaved(self._sample_idx, len(self.image_paths))
+        idx = self._sample_idx if sample_idx is None else int(sample_idx)
+        j = val_coverage_j_interleaved(idx, len(self.image_paths))
         return j, max(int(self.samples_per_volume), 1)
 
     # ------------------------------------------------------------------
@@ -845,6 +857,7 @@ class SegDataset3D(SegDatasetNpzBase):
         cache_max_volumes          : int = 0,
         cache_int16                : bool = False,
         region_weights             : Optional[List[float]] = None,
+        resize_antialias           : bool = False,
         # 默认与 Config.data.z_boundary_mode 对齐（"stretch" 已废弃，训练侧恒走 edge-pad）。
         z_boundary_mode            : str = "edge_pad",
         npz_paths                  : Optional[List[str]] = None,
@@ -868,7 +881,8 @@ class SegDataset3D(SegDatasetNpzBase):
             cache_max_volumes    = cache_max_volumes,
             cache_int16          = cache_int16,
             region_weights       = region_weights,
-            val_grid_coverage    = val_grid_coverage)
+            val_grid_coverage    = val_grid_coverage,
+            resize_antialias     = resize_antialias)
         if z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
@@ -936,7 +950,7 @@ class SegDataset3D(SegDatasetNpzBase):
         # extract_size = (eD,pH,pW)；仅 z 过采样，oversample=1 时 eD==pD，trainer 跳裁。
         eD, eH, eW = self.extract_size
 
-        z = self._sample_z(vol_idx, D_vol)
+        z = self._sample_z(vol_idx, D_vol, sample_idx=idx)
 
         # 样本区域权重文件 > 静态 region_weights 映射。
         rw_vol = (self._load_region_weight(vol_idx)
@@ -961,15 +975,19 @@ class SegDataset3D(SegDatasetNpzBase):
                 if rw_vol is not None else None)
 
         # 面内 resize 到 (eH,eW)；D 轴保持 eD_max（不重采样）。
-        img_s = resize_3d(img_s, eD_max, eH, eW, is_label=False)
-        lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True)
+        img_s = resize_3d(
+            img_s, eD_max, eH, eW, is_label=False,
+            anti_alias=self.resize_antialias)
+        lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True,
+                          anti_alias=False)
         result = {
             # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
         if rw_s is not None:
             # rw 是分级序权重（离散值），必须 nearest 避免产生伪连续值；resize_3d(is_label=True) = order=0。
-            rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True)
+            rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True,
+                             anti_alias=False)
             result["weight_map"] = torch.from_numpy(
                 rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:
@@ -989,25 +1007,32 @@ class SegDataset3D(SegDatasetNpzBase):
         )
         return result
 
-    def _sample_z(self, vol_idx: int, D_vol: int) -> int:
+    def _sample_z(
+        self, vol_idx: int, D_vol: int, *, sample_idx: Optional[int] = None) -> int:
         """采样中心 z：训练以 fg_ratio 概率从前景切片采样（npz 含逐类索引时
         先均匀选类再选该类切片，避免稀有类被大器官挤压），否则均匀采样；
         验证用逐样本确定性 RNG 均匀采样（见 _sample_rng）。"""
-        cov = self._val_coverage_pos()
+        cov = self._val_coverage_pos(sample_idx)
+        # z-axis views are resized from the same base-depth window; keep the
+        # sampling domain invariant across multi-resolution views.
+        D_patch = int(self.extract_size[0])
         if cov is not None:
             j, S = cov
-            return z_grid_center(j, S, D_vol)
+            return safe_z_grid_center(j, S, D_vol, D_patch)
         fg_slices = self._vol_fg_slices[vol_idx]
-        rng = self._sample_rng()
+        rng = self._sample_rng(sample_idx)
         if (self.is_train and self.fg_ratio > 0
             and len(fg_slices) > 0
             and rng.random() < self.fg_ratio):
             per_cls = self._vol_fg_slices_by_cls[vol_idx]
             if per_cls:
                 cls_slices = per_cls[int(rng.integers(len(per_cls)))]
-                return int(rng.choice(cls_slices))
-            return int(rng.choice(fg_slices))
-        return int(rng.integers(0, D_vol))
+                return int(np.clip(rng.choice(cls_slices), *safe_z_center_range(
+                    D_vol, D_patch)))
+            return int(np.clip(rng.choice(fg_slices), *safe_z_center_range(
+                D_vol, D_patch)))
+        lo, hi = safe_z_center_range(D_vol, D_patch)
+        return int(rng.integers(lo, hi))
 
     def _extract_z_patch_padded(
         self, img: np.ndarray, lbl: np.ndarray, z_center: int, D_patch: int
@@ -1082,6 +1107,7 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         cache_max_volumes          : int = 0,
         cache_int16                : bool = False,
         region_weights             : Optional[List[float]] = None,
+        resize_antialias           : bool = False,
         npz_paths                  : Optional[List[str]] = None,
         val_grid_coverage          : bool = False):
         super().__init__(
@@ -1102,7 +1128,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
             cache_max_volumes    = cache_max_volumes,
             cache_int16          = cache_int16,
             region_weights       = region_weights,
-            val_grid_coverage    = val_grid_coverage)
+            val_grid_coverage    = val_grid_coverage,
+            resize_antialias     = resize_antialias)
 
         self.extract_size = tuple(  # 有效抽取尺寸（增强过采样余量）
             int(round(p * self.oversample)) for p in self.patch_size)
@@ -1152,7 +1179,8 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         self._current_vol_idx = vol_idx
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
         D, H, W    = img.shape
-        center     = self._sample_center(vol_idx, D, H, W)
+        center = self._sample_center(
+            vol_idx, D, H, W, sample_idx=idx)
         eD, eH, eW = self.extract_size
 
         rw_vol = (self._load_region_weight(vol_idx)
@@ -1220,17 +1248,19 @@ class SegDataset3DCubic(SegDatasetNpzBase):
         sW = int(round(eW * self._max_scale))
         return safe_center_range((D, H, W), (sD, sH, sW))
 
-    def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
+    def _sample_center(
+        self, vol_idx: int, D: int, H: int, W: int, *,
+        sample_idx: Optional[int] = None) -> Tuple[int, int, int]:
         """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
         导致>50% 体素来自边界复制（偏移训练分布）。验证用逐样本确定性
         RNG（见 _sample_rng）。"""
         (dlo, dhi), (hlo, hhi), (wlo, whi) = self._safe_center_range(D, H, W)
-        cov = self._val_coverage_pos()
+        cov = self._val_coverage_pos(sample_idx)
         if cov is not None:
             j, _ = cov
             return halton_center(j, ((dlo, dhi), (hlo, hhi), (wlo, whi)))
         fg_coords = self._vol_fg_coords[vol_idx]
-        rng = self._sample_rng()
+        rng = self._sample_rng(sample_idx)
         if (self.is_train and self.fg_ratio > 0
                 and len(fg_coords) > 0
                 and rng.random() < self.fg_ratio):
@@ -1280,6 +1310,7 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         cache_max_volumes   : int = 0,
         cache_int16         : bool = False,
         region_weights      : Optional[List[float]] = None,
+        resize_antialias    : bool = False,
         npz_paths           : Optional[List[str]] = None):
         super().__init__(
             image_paths          = image_paths,
@@ -1298,7 +1329,8 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             cache_enabled        = cache_enabled,
             cache_max_volumes    = cache_max_volumes,
             cache_int16          = cache_int16,
-            region_weights       = region_weights)
+            region_weights       = region_weights,
+            resize_antialias     = resize_antialias)
         # 3 轴同步过采样：与 cubic 一致，给增强（旋转/弹性）留中心裁余量。
         self.extract_size = tuple(
             int(round(p * self.oversample)) for p in self.patch_size)
@@ -1317,8 +1349,11 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         # 全卷单次 3D zoom。resize 恒等（形状已匹配）时 resize_3d 直接返回
         # 入参——即 worker LRU 缓存卷本身；copy 断开别名，防下游 in-place
         # 操作污染缓存（与 cubic/z 路径 extractor 内的无条件 copy 对齐）。
-        img_r = resize_3d(img, eD, eH, eW, is_label=False)
-        lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True)
+        img_r = resize_3d(
+            img, eD, eH, eW, is_label=False,
+            anti_alias=self.resize_antialias)
+        lbl_r = resize_3d(lbl, eD, eH, eW, is_label=True,
+                          anti_alias=False)
         if img_r is img:
             img_r = img_r.copy()
         if lbl_r is lbl:
@@ -1333,7 +1368,8 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             rw_cached = self._load_region_weight(vol_idx)
             # rw 是分级权重（离散），必须 nearest 避免产生伪连续值；与 z_axis/cubic
             # 路径一致（resize_3d(is_label=True) = order=0）。
-            rw_vol = resize_3d(rw_cached, eD, eH, eW, is_label=True)
+            rw_vol = resize_3d(rw_cached, eD, eH, eW, is_label=True,
+                               anti_alias=False)
             if rw_vol is rw_cached:
                 rw_vol = rw_vol.copy()
             result["weight_map"] = torch.from_numpy(rw_vol[np.newaxis]).float()

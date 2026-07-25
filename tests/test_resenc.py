@@ -257,7 +257,7 @@ class TestConfigValidation:
         from taskcore.config.core import Config
         cfg = Config()
         cfg.model.encoder_channels = [16, 32, 64]
-        cfg.model.decoder_blocks_per_stage = [1]  # should be 2
+        cfg.model.decoder_blocks_per_stage = [1, 2, 3]  # invalid for 3 encoder levels
         with pytest.raises(AssertionError):
             cfg.validate()
 

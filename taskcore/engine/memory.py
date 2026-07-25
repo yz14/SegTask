@@ -51,13 +51,27 @@ def estimate_train_memory(
 
     # EMA shadow 只计 GPU 常驻部分（CPU offload 时不占显存）。
     ema_bytes = 0
+    ema_backup_bytes = 0
     if ema is not None:
         shadow = getattr(ema, "shadow", None)
         if shadow is not None:
             ema_bytes = sum(t.numel() * t.element_size()
                             for t in shadow.values() if t.is_cuda)
+            # apply_shadow 首次调用时会为 GPU EMA 分配一份 live backup；
+            # 将这份临时但可观测的峰值纳入预算，即使尚未发生 swap。
+            backup = getattr(ema, "_backup", None) or {}
+            if backup:
+                ema_backup_bytes = sum(
+                    t.numel() * t.element_size()
+                    for t in backup.values() if t.is_cuda)
+            elif any(t.is_cuda for t in shadow.values()):
+                ema_backup_bytes = sum(
+                    t.numel() * t.element_size()
+                    for t in model.state_dict().values()
+                    if t.is_cuda)
 
-    persistent = param_bytes + grad_bytes + optim_bytes + ema_bytes
+    persistent = (param_bytes + grad_bytes + optim_bytes + ema_bytes
+                  + ema_backup_bytes)
     return {
         "param_mib": param_bytes / MIB,
         "grad_mib": grad_bytes / MIB,
@@ -65,6 +79,7 @@ def estimate_train_memory(
         "optim_mult": optim_mult,
         "optim_name": optim_name,
         "ema_mib": ema_bytes / MIB,
+        "ema_backup_mib": ema_backup_bytes / MIB,
         "persistent_mib": persistent / MIB,
     }
 

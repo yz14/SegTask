@@ -543,10 +543,11 @@ class _ADMDecoder(nn.Module):
                 if isinstance(blk, _ResBlockBase):
                     skip = skip_stack.pop()
                     if skip.shape[2:] != x.shape[2:]:
-                        # 防御：输入空间与 encoder stride 对齐时不会触发。
-                        skip = F.interpolate(
-                            skip, size=x.shape[2:],
-                            mode="bilinear", align_corners=False)
+                        raise RuntimeError(
+                            "ADM decoder skip size mismatch: "
+                            f"skip={tuple(skip.shape[2:])} vs "
+                            f"x={tuple(x.shape[2:])}. Check patch_size and "
+                            "encoder stride divisibility.")
                     x = checkpoint_if(
                         self.grad_checkpointing, blk,
                         torch.cat([x, skip], dim=1), emb)

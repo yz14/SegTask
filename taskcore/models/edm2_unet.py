@@ -93,6 +93,7 @@ class _MPConv(nn.Module):
 
 class _Block(nn.Module):
     """EDM2 Block，去 FiLM。拓扑：resample→(可选 conv_skip + pixel_norm if enc)→conv_res0→mp_silu→conv_res1→mp_sum(主/残差)→(可选 attn)→clip。"""
+    _MAX_SDPA_TOKENS = 32768
 
     def __init__(
         self,
@@ -177,10 +178,22 @@ class _Block(nn.Module):
                 y, 'b (h d qkv) hh ww -> b h d qkv (hh ww)',
                 h=self.num_heads, qkv=3)
             q, k, v = _normalize(y, dim=2).unbind(3)
-            w_attn = torch.einsum(
-                "nhcq,nhck->nhqk", q, k / float(np.sqrt(q.shape[2]))
-            ).softmax(dim=3)
-            y = torch.einsum("nhqk,nhck->nhcq", w_attn, v)
+            tokens = int(q.shape[-1])
+            if tokens > self._MAX_SDPA_TOKENS:
+                raise ValueError(
+                    f"EDM2 attention token count {tokens} exceeds "
+                    f"limit {self._MAX_SDPA_TOKENS}. Reduce patch_size or "
+                    "move attention to a deeper level.")
+            try:
+                y = F.scaled_dot_product_attention(
+                    q.transpose(2, 3), k.transpose(2, 3), v.transpose(2, 3),
+                    dropout_p=0.0).transpose(2, 3)
+            except (NotImplementedError, RuntimeError):
+                # CPU/旧 CUDA 后端没有 SDPA 时保留原始数学路径。
+                w_attn = torch.einsum(
+                    "nhcq,nhck->nhqk", q, k / float(np.sqrt(q.shape[2]))
+                ).softmax(dim=3)
+                y = torch.einsum("nhqk,nhck->nhcq", w_attn, v)
             # (B, h, d, H*W) → (B, h*d, H, W) ≡ x.shape。
             y = rearrange(
                 y, 'b h d (hh ww) -> b (h d) hh ww',
@@ -459,9 +472,11 @@ class _EDM2Decoder(nn.Module):
             for blk in self.level_blocks[ridx]:
                 skip = skip_stack.pop()
                 if skip.shape[2:] != x.shape[2:]:
-                    skip = F.interpolate(
-                        skip, size=x.shape[2:],
-                        mode="bilinear", align_corners=False)
+                    raise RuntimeError(
+                        "EDM2 decoder skip size mismatch: "
+                        f"skip={tuple(skip.shape[2:])} vs "
+                        f"x={tuple(x.shape[2:])}. Check patch_size and "
+                        "encoder stride divisibility.")
                 x = _mp_cat(x, skip, dim=1, t=self.concat_balance)
                 x = checkpoint_if(self.grad_checkpointing, blk, x, emb)
             if level < self.n_levels - 1:

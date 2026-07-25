@@ -42,7 +42,11 @@ def extract_patch_by_mode(
     m = normalize_patch_mode(mode)
     pD, pH, pW = (int(x) for x in patch_size)
     if m == "whole":
-        return resize_3d(vol, pD, pH, pW, is_label=is_label)
+        # resize_3d 在形状已匹配时直接返回入参（可能是 worker LRU 缓存卷）。
+        # 无条件 copy，与 cubic/z 路径 extractor 内的无条件 copy 对齐，避免
+        # 下游 in-place / from_numpy 共享污染缓存。
+        out = resize_3d(vol, pD, pH, pW, is_label=is_label)
+        return out.copy() if out is vol else out
     if m == "cubic":
         return extract_cubic_patch(vol, center, (pD, pH, pW))
     # z_axis / 2_5d：仅 center[0]（z）参与；H/W 整片 resize。

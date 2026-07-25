@@ -286,7 +286,9 @@ def test_split_label_uses_nearest_interpolation():
     """Aux-view labels must be integer-preserving (nearest mode)."""
     cfg = _make_cfg(patch_mode="cubic",
                      multi_res_scales=[1.0, 2.0],
-                     patch_size=(4, 8, 8))
+                     # 3D cubic fixtures must satisfy the encoder geometry
+                     # contract; this test only exercises label splitting.
+                     patch_size=(16, 16, 16))
     stub = _make_split_stub(cfg)
     tD, tH, tW = stub.target_patch_size  # (8, 16, 16)
     # Label cube with discrete values 0/1/2.
@@ -362,7 +364,7 @@ def test_e2e_z_axis_view0_matches_off_path():
     common = _z_axis_ds_kwargs((pD, pH, pW))
 
     class _FixedZ_ON(_SyntheticSegDataset3D):
-        def _sample_z(self, vol_idx, D_vol):
+        def _sample_z(self, vol_idx, D_vol, *, sample_idx=None):
             return D_vol // 2
 
     ds_on = _FixedZ_ON(
@@ -416,7 +418,7 @@ def test_e2e_cubic_view0_matches_off_path():
     fixed_center = (Dv // 2, Hv // 2, Wv // 2)
 
     class _FC_ON(_SyntheticSegDataset3DCubic):
-        def _sample_center(self, vol_idx, D, H, W):
+        def _sample_center(self, vol_idx, D, H, W, *, sample_idx=None):
             return fixed_center
 
     ds_on = _FC_ON(

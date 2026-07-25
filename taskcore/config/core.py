@@ -89,8 +89,11 @@ class DataConfig:
     # 非空时与第一批（金标准）按 mix_ratio 在每个 train batch 内混合；
     # 副源仅用于训练，验证集始终仅取金标准。
     npz_dir_secondary: str = ""
-    # True=启动时自动调用 make_data 生成；False=要求手动预生成。
+    # True=npz 缓存缺失时启动期自动调用 make_data 生成；False=要求手动预生成。
     npz_auto_build: bool = True
+    # True=image 无配对 label 时 warning 后丢弃；False（默认）=缺配对即报错
+    # （与 bbox/rw 的 fail-fast 口径对齐，防标注目录写错时静默少训）。
+    allow_unpaired: bool = False
     # 每个 train batch 内 [金标准, 粗标] 的整数权重比；仅 npz_dir_secondary 非空时生效。
     # 要求 batch_size 能被 sum(mix_ratio) 整除、两元素均 >= 1（保证每 batch 同时含两源）。
     mix_ratio: List[int] = field(default_factory=lambda: [1, 1])
@@ -107,6 +110,8 @@ class DataConfig:
     # Patch 抽取模式。示例："z_axis"（仅 z 滑块，H/W 全尺寸）、"2_5d"（D 折叠为通道驱动 2D UNet）。
     # 其他："cubic" 3 轴中心抽取；"whole" 整体 resize。
     patch_mode: str = "z_axis"
+    # CPU resize 下采样抗混叠预滤波；默认关闭，保持 scipy zoom 旧数值。
+    resize_antialias: bool = False
 
     # 多分辨率 FOV：各 scale 同中心抽更宽 FOV，resize 后作额外输入通道。
     # 示例：[1.0] 单通道；[1.0, 1.5, 2.0] 3 通道。cubic 作用 3 轴，z_axis 仅 z 轴。
@@ -150,6 +155,10 @@ class DataConfig:
     # ---- 训/验划分 ----
     val_ratio : float = 0.2
     split_seed: int = 42
+    # split 取整：legacy 保留各 splitter 原有取整；unified 统一采用
+    # half-up，并可选将实际索引落盘供复核。默认 legacy。
+    split_rounding_mode: str = "legacy"
+    split_manifest_path: str = ""
     # 按首个前景类分层；样本太少时回退随机。
     stratified_split: bool = True
     # 患者/组级划分：对 npz 文件名（去 .npz 后缀的 stem）做 re.search，取首个
@@ -249,6 +258,11 @@ class AugConfig:
     # 位移幅度（voxel，近似标称）：位移场由粗网格 randn 上采平滑得到，
     # 方差衰减使实际典型位移小于该值；多分辨率时另除以 max_scale。
     elastic_deform_alpha: float = 7.0
+    # 弹性场采样口径：legacy 保持粗网格 randn 上采样；gaussian 使用
+    # 高斯核平滑位移场。默认 legacy，避免改变既有训练分布。
+    elastic_field_mode: str = "legacy"
+    # True 时按每样本位移 RMS 归一化后再乘 alpha；默认保留旧的绝对幅度口径。
+    elastic_normalize_displacement: bool = False
 
     # Grid dropout：随机遮挡矩形子区域。
     grid_dropout_prob : float = 0.0
@@ -464,7 +478,6 @@ class UNetConfig:
     # 非空长度须==len(encoder_channels)，仅对为 1 的 stage 做检查点；仅在 grad_checkpointing=True 时生效。
     # 深层低分辨率 stage 可置 0，省重算开销。
     grad_ckpt_encoder_stages: List[int] = field(default_factory=list)
-
     # ---- ConvNeXt / MedNeXt 专属 ----
     # ConvNeXt-V2 / MedNeXt 可选 GRN（Global Response Normalization）；gamma/beta 零初始化，
     # 默认关，开启后初始仍近似恒等。
@@ -596,6 +609,11 @@ class ModelConfig:
     # DropPath 复现）；eval/验证（no_grad）下零开销直通。默认关、逐位兼容现状。
     # 注：与 torch.compile 同时开启偶有图重编译开销，建议二者组合先小规模验证。
     grad_checkpointing: bool = False
+    # 模型统一初始化策略；legacy 不覆盖各 backbone 的既有初始化。
+    init_strategy: str = "legacy"
+    # 可选扩大范围；默认关闭以保持原有 checkpoint 覆盖逐位不变。
+    grad_ckpt_stem_downsample: bool = False
+    grad_ckpt_decoder_branches: bool = False
 
     # ---- arch 专属嵌套段 ----
     unet: UNetConfig  = field(default_factory=UNetConfig)
@@ -959,6 +977,9 @@ class TrainConfig:
     # 仅对 backbone=='mednext' 有效：将预训练 checkpoint 的深度卷积权重按当前
     # mednext_kernel_size 做 UpKern 插值迁移（k=3→k=5 等）。
     pretrain_upkern: bool = False
+    # UpKern 插值后按空间核总幅度归一化；默认关闭，保持旧迁移值。
+    pretrain_upkern_normalize: bool = False
+    pretrain_allow_geometry_mismatch: bool = False
 
     # 推理前是否将 MedNeXt 的可重参数化深度卷积折叠为 deploy 形态；默认关。
     # 开启后，io.run_inference 会在 load_state_dict 之后、device 转移之前先折叠。
@@ -1398,21 +1419,32 @@ class Config:
         if not mc.encoder_blocks_per_stage:
             mc.encoder_blocks_per_stage = enc_blocks
         if not mc.decoder_blocks_per_stage:
-            mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
+            if str(mc.unet.decoder_type).lower() == "unetpp":
+                # UNet++ has triangular nested nodes; one value is an
+                # explicit broadcast across all nodes.
+                mc.decoder_blocks_per_stage = [1]
+            else:
+                mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
 
     def validate(self, *, skip: "Optional[Set[str]]" = None) -> None:
         """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。
 
-        * ``skip`` — 跳过指定 section 校验器名（如组合式任务略过 seg 专属
-          ``loss`` / ``predict``）。
+        * ``skip`` — 跳过指定 section 校验器名（``model`` / ``augment`` /
+          ``data`` / ``2_5d`` / ``train`` / ``monitor``）。未知名（如组合式
+          任务传入的 ``loss`` / ``predict``）静默忽略，由任务层自行处理。
         """
         skip = skip or set()
-        self._validate_model()
-        self._validate_augment()
-        self._validate_data()
-        self._validate_2_5d()
-        self._validate_train()
-        self._validate_monitor()
+        validators = (
+            ("model", self._validate_model),
+            ("augment", self._validate_augment),
+            ("data", self._validate_data),
+            ("2_5d", self._validate_2_5d),
+            ("train", self._validate_train),
+            ("monitor", self._validate_monitor),
+        )
+        for name, fn in validators:
+            if name not in skip:
+                fn()
         if self.data.num_classes < 2:
             logger.warning("num_classes=%d < 2, will auto-detect from data.",
                            self.data.num_classes)
@@ -1554,6 +1586,8 @@ class Config:
                             f"{self.model.unet.mednext.kernel_size}.")
         n_levels = len(self.model.encoder_channels)
         validate_encoder_decoder_stage_lengths(self)
+        from .section_validators import validate_patch_geometry
+        validate_patch_geometry(self)
         ckpt_mask = list(self.model.unet.grad_ckpt_encoder_stages)
         if ckpt_mask:
             _require(
@@ -1823,6 +1857,19 @@ class Config:
             float(self.augment.elastic_deform_alpha) >= 0.0,
             "augment.elastic_deform_alpha must be >= 0; "
             f"got {self.augment.elastic_deform_alpha}.")
+        _require(
+            str(self.augment.elastic_field_mode).lower() in ("legacy", "gaussian"),
+            "augment.elastic_field_mode must be 'legacy' or 'gaussian'; "
+            f"got {self.augment.elastic_field_mode!r}.")
+        _require(
+            str(self.data.split_rounding_mode).lower() in ("legacy", "unified"),
+            "data.split_rounding_mode must be 'legacy' or 'unified'; "
+            f"got {self.data.split_rounding_mode!r}.")
+        _require(
+            str(self.model.init_strategy).lower()
+            in ("legacy", "kaiming", "trunc_normal"),
+            "model.init_strategy must be 'legacy', 'kaiming' or "
+            f"'trunc_normal'; got {self.model.init_strategy!r}.")
         _require(
             float(self.augment.gaussian_noise_std) >= 0.0,
             "augment.gaussian_noise_std must be >= 0; "
@@ -2456,7 +2503,7 @@ def __getattr__(name: str):
     target = _LEGACY_MODULE_ATTRS.get(name)
     if target is not None:
         logger.warning(
-            "segtask_v1.config.%s 已迁至 ssltask.config；返回向后兼容占位以反序列化"
+            "taskcore.config.core.%s 已迁至 ssltask.config；返回向后兼容占位以反序列化"
             "历史 checkpoint。请重新保存 checkpoint 以移除该历史引用。", name)
         return target
     raise AttributeError(

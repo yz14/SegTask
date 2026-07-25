@@ -132,11 +132,21 @@ def build_optimizer_with_lr_mult(
         first = next((p for p in model.parameters()), None)
         on_cuda = first is not None and first.is_cuda
         use_fused = tc.adamw_fused and torch.cuda.is_available()
+        if _zero_redundancy_enabled(cfg):
+            return _build_zero_optimizer(groups, torch.optim.AdamW,
+                                         lr=tc.lr,
+                                         fused=(use_fused and on_cuda))
         return torch.optim.AdamW(groups, lr=tc.lr,
                                  fused=(use_fused and on_cuda))
     if tc.optimizer == "adam":
+        if _zero_redundancy_enabled(cfg):
+            return _build_zero_optimizer(groups, torch.optim.Adam, lr=tc.lr)
         return torch.optim.Adam(groups, lr=tc.lr)
     if tc.optimizer == "sgd":
+        if _zero_redundancy_enabled(cfg):
+            return _build_zero_optimizer(
+                groups, torch.optim.SGD, lr=tc.lr,
+                momentum=tc.momentum, nesterov=tc.nesterov)
         return torch.optim.SGD(groups, lr=tc.lr, momentum=tc.momentum,
                                nesterov=tc.nesterov)
     raise ValueError(f"Unknown optimizer: {tc.optimizer}")

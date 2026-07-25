@@ -67,7 +67,9 @@ def test_validate_rejects_invalid_z_boundary_mode():
     cfg = Config()
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2
-    cfg.data.patch_size = [12, 32, 32]
+    # Keep the fixture within the default 5-stage encoder geometry so
+    # validation reaches the boundary-mode assertion.
+    cfg.data.patch_size = [16, 32, 32]
     cfg.data.z_boundary_mode = "bogus"
     cfg.sync()
     try:
@@ -179,8 +181,10 @@ def test_dataset_dispatch_stretch_vs_edge_pad():
 
         # Force deterministic z=1 (near top) by patching _sample_z.
         z_target = 1
-        ds_stretch._sample_z = lambda vol_idx, D_vol: z_target  # type: ignore
-        ds_edge._sample_z = lambda vol_idx, D_vol: z_target     # type: ignore
+        ds_stretch._sample_z = (  # type: ignore
+            lambda vol_idx, D_vol, *, sample_idx=None: z_target)
+        ds_edge._sample_z = (  # type: ignore
+            lambda vol_idx, D_vol, *, sample_idx=None: z_target)
 
         out_stretch = ds_stretch[0]["image"]   # (1, 12, 8, 8)
         out_edge = ds_edge[0]["image"]         # (1, 12, 8, 8)
@@ -229,7 +233,9 @@ def _build_minimal_predictor(z_boundary_mode: str, D=12, H=8, W=8,
 def test_predictor_build_z_window_gpu_stretch():
     """Stretch path: short window (4 slices) should be trilinear-resized
     to pD=12 along z (in addition to the H/W resize)."""
-    pred = _build_minimal_predictor("stretch", D=12, H=8, W=8)
+    # H/W=16 satisfies the default encoder stride contract; the 4→12 z
+    # window assertion below remains unchanged.
+    pred = _build_minimal_predictor("stretch", D=12, H=16, W=16)
     # Volume shape (4, 8, 8); intensity = z*10. z0=0, z1=4.
     vol = torch.zeros(4, 8, 8)
     for z in range(4):
@@ -239,7 +245,7 @@ def test_predictor_build_z_window_gpu_stretch():
     out = build_z_window_single_res_gpu(
         vol, 0, 4, pD=pred.patch_D, pH=pred.patch_H, pW=pred.patch_W,
         z_boundary_mode=pred.z_boundary_mode)
-    assert out.shape == (1, 12, 8, 8), out.shape
+    assert out.shape == (1, 12, 16, 16), out.shape
     z_means = out[0].mean(dim=(1, 2)).cpu().numpy()
     # Stretch: first slice ≈ 0, last ≈ 30; no 5-long constant runs.
     assert abs(z_means[0]) < 1.5
@@ -262,7 +268,9 @@ def test_predictor_build_z_window_gpu_edge_pad():
     pad_before=(pD-ad)//2 = (12-4)//2 = 4 replicas of vol[0], inner 4
     slices, then pad_after=4 replicas of vol[3].
     """
-    pred = _build_minimal_predictor("edge_pad", D=12, H=8, W=8)
+    # H/W=16 satisfies the default encoder stride contract; the 4→12 z
+    # edge-pad layout assertion below remains unchanged.
+    pred = _build_minimal_predictor("edge_pad", D=12, H=16, W=16)
     vol = torch.zeros(4, 8, 8)
     for z in range(4):
         vol[z] = float(z) * 10.0
@@ -271,7 +279,7 @@ def test_predictor_build_z_window_gpu_edge_pad():
     out = build_z_window_single_res_gpu(
         vol, 0, 4, pD=pred.patch_D, pH=pred.patch_H, pW=pred.patch_W,
         z_boundary_mode=pred.z_boundary_mode)
-    assert out.shape == (1, 12, 8, 8), out.shape
+    assert out.shape == (1, 12, 16, 16), out.shape
     z_means = out[0].mean(dim=(1, 2)).cpu().numpy()
     # Layout: [0]*4 + [0, 10, 20, 30] + [30]*4
     expected = np.array(
@@ -295,7 +303,9 @@ def test_predictor_build_z_window_cpu_scale_1_edge_pad():
 
     cfg = Config()
     cfg.data.patch_mode = "z_axis"   # multi-res allowed (not 2.5D)
-    cfg.data.patch_size = [12, 8, 8]
+    # D/H/W=16 satisfies the default encoder stride contract; the short
+    # 4-slice z edge-pad behavior remains the subject of this fixture.
+    cfg.data.patch_size = [16, 16, 16]
     cfg.data.label_values = [0, 1]
     cfg.data.num_classes = 2
     cfg.data.multi_res_scales = [1.0, 1.5]
@@ -315,18 +325,19 @@ def test_predictor_build_z_window_cpu_scale_1_edge_pad():
         vol, 0, 4, pD=predictor.patch_D, pH=predictor.patch_H,
         pW=predictor.patch_W, multi_res_scales=predictor.multi_res_scales,
         z_boundary_mode=predictor.z_boundary_mode)
-    assert out.shape == (2, 12, 8, 8), out.shape  # (C_res=2, pD=12, ...)
+    assert out.shape == (2, 16, 16, 16), out.shape  # (C_res=2, pD=16, ...)
 
     # Channel 0 (scale=1.0) under edge_pad: extract_z_patch_padded(vol,
-    # z_center=2, pD=12). half=6, lo=-4, hi=8, src_lo=0, src_hi=4,
-    # pad_before=4, pad_after=4 → [0]*4 + [0,10,20,30] + [30]*4.
+    # z_center=2, pD=16). half=8, lo=-6, hi=10, src_lo=0, src_hi=4,
+    # pad_before=6, pad_after=6 → [0]*6 + [0,10,20,30] + [30]*6.
     z_means_ch0 = out[0].mean(axis=(1, 2))
     expected_ch0 = np.array(
-        [0, 0, 0, 0, 0, 10, 20, 30, 30, 30, 30, 30], dtype=np.float32)
+        [0, 0, 0, 0, 0, 0, 0, 10, 20, 30, 30, 30, 30, 30, 30, 30],
+        dtype=np.float32)
     np.testing.assert_allclose(z_means_ch0, expected_ch0, atol=1e-5)
 
     # Channel 1 (scale=1.5) under any toggle: extract_z_patch_padded(
-    # vol, z_center=2, D_s=18) then resize_3d to 12 — depth is squeezed
+    # vol, z_center=2, D_s=24) then resize_3d to 16 — depth is squeezed
     # back; slice ordering monotonically tracks the original ramp.
     z_means_ch1 = out[1].mean(axis=(1, 2))
     assert z_means_ch1[0] >= -0.01    # near 0
@@ -458,7 +469,7 @@ def main():
     print("Improvement #2 tests — z_boundary_mode toggle")
     print("=" * 60)
     tests = [
-        test_default_z_boundary_mode_is_stretch,
+        test_default_z_boundary_mode_is_edge_pad_and_stretch_auto_upgrades,
         test_validate_rejects_invalid_z_boundary_mode,
         test_segdataset_constructor_rejects_invalid,
         test_dataset_dispatch_stretch_vs_edge_pad,

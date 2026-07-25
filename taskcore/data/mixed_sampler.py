@@ -164,6 +164,25 @@ class MixedBatchSampler(Sampler[List[int]]):
                 f"batch(es) but world_size={self.world_size}; every rank "
                 f"needs at least one batch. Add coarse data or reduce GPUs.")
 
+        gold_samples_epoch = self._num_batches_global * self.gold_per_batch
+        gold_coverage = min(gold_samples_epoch, self.n_primary) / max(
+            self.n_primary, 1)
+        if gold_coverage < 1.0:
+            logger.warning(
+                "MixedBatchSampler: coarse-bound epoch exposes only %.1f%% "
+                "of gold samples (gold=%d, consumed=%d); gold is "
+                "under-covered rather than oversampled.",
+                100.0 * gold_coverage, self.n_primary, gold_samples_epoch)
+        elif gold_samples_epoch > self.n_primary:
+            logger.info(
+                "MixedBatchSampler: coarse-bound epoch cycles gold "
+                "samples %.2fx (gold=%d, consumed=%d).",
+                gold_samples_epoch / max(self.n_primary, 1),
+                self.n_primary, gold_samples_epoch)
+        else:
+            logger.info(
+                "MixedBatchSampler: coarse-bound epoch covers all gold "
+                "samples exactly once.")
         logger.info(
             "MixedBatchSampler: gold=%d, coarse=%d samples; per-batch "
             "gold=%d + coarse=%d (batch_size=%d); %d batches/epoch "
@@ -175,8 +194,7 @@ class MixedBatchSampler(Sampler[List[int]]):
             (f"; rank {self.rank}/{self.world_size} of "
              f"{self._num_batches_global} global"
              if self.world_size > 1 else ""),
-            (self._num_batches_global * self.gold_per_batch)
-            / max(self.n_primary, 1))
+            gold_samples_epoch / max(self.n_primary, 1))
 
     def __len__(self) -> int:
         return self._num_batches

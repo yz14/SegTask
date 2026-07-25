@@ -162,7 +162,7 @@ checkpoint 加载 → NIfTI 读取
 
 对比 zaxis：数据抽取、增强、裁剪、视图拆分、滑窗几何全部相同；唯一差异：zaxis 不折叠、用 3D 模型，2.5d 折叠用 2D 模型 + 可选 z-interleave。
 
-2.5D 折叠时机契约（全仓统一，seg/ssl/cls/gen 遵守）：dataset 恒发未折叠 3D（max-FOV × `aug_oversample_ratio` 余量），GPU 3D 增强 → 裁余量/视图拆分 → **送模型前**才折叠（`squeeze_2_5d`）；唯一例外是 det（折叠需与框几何联动 `slice_boxes_to_2d`，在 dataset 层完成）。
+2.5D 折叠时机契约（全仓统一，seg/ssl/cls/gen 遵守）：dataset 恒发未折叠 3D（max-FOV × `aug_oversample_ratio` 余量），GPU 3D 增强 → 裁余量/视图拆分 → **送模型前**才折叠（`squeeze_2_5d`）；det 需与框几何联动 `slice_boxes_to_2d`，因此在 dataset 层完成。cls 在关闭 GPU 增强时也允许 dataset 侧折叠，布局与 trainer 路径一致。
 
 ---
 
@@ -177,6 +177,7 @@ checkpoint 加载 → NIfTI 读取
 | channels_last | `train.channels_last` | 内存排布优化，数值等价 |
 | GPU 预取 | `train.prefetch_to_gpu` | 独立 copy stream 提前一个 batch 上卡，H2D 与计算重叠（需 `data.pin_memory`） |
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`) | 反向重算激活，算力换显存 |
+| 扩展检查点范围 | `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches` | 默认 false；开启后额外覆盖 stem/downsample 与 decoder 分支 |
 | CUDA 碎片缓解 | `train.cuda_expandable_segments` | expandable segments allocator |
 | fused AdamW | `train.adamw_fused` | 单 kernel 更新全部参数 |
 | EMA offload | `train.ema_device: cpu` | shadow 常驻 CPU，省 1× 参数显存 |
@@ -213,6 +214,8 @@ checkpoint 加载 → NIfTI 读取
 | ZeRO-1 | `train.zero_redundancy_optimizer` | 优化器状态分片 |
 | checkpoint | `train.save_every` / `save_keep_last` / `save_async` | 周期+best+异步写盘；resume 位精确恢复（含 RNG） |
 | 预训练迁移 | `train.pretrain` (+`pretrain_strict/load_ema/upkern`) | 仅加载权重初始化 |
+| 预训练几何 | `train.pretrain_allow_geometry_mismatch` | 默认 false；仅显式开启才允许几何不一致迁移 |
+| 可选数值策略 | `augment.elastic_field_mode`、`augment.elastic_normalize_displacement`、`data.split_rounding_mode`、`data.split_manifest_path`、`data.resize_antialias`、`train.pretrain_upkern_normalize`、`model.init_strategy` | 默认分别为 `legacy`、false、`legacy`、空串、false、false、`legacy`；开启后会改变增强、划分、插值、预训练核或初始化数值 |
 | 早停 | `train.early_stopping` | 连续 N 次验证无提升即停 |
 | 验证口径 | `train.val_metric_mode` | medium=随机 patch（快）/ high=整卷滑窗（与部署同口径） |
 | 选模标准 | `train.save_best_criterion` (+`save_best_preset`) | loss / dice / iou / mcc / min_dice / dice+surface_dice / balanced；`loss` 口径定案为 `val_base_loss`（仅主任务损失，不含深监督/aux/正则等随日程变化的附加项，跨配置可比） |

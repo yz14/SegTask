@@ -304,7 +304,10 @@ def _make_cfg(patch_mode, scales, native_d, native_mr, lift, aux, ds):
     cfg = Config()
     cfg.data.label_values = [0, 1, 2]
     cfg.data.num_classes = 3
-    cfg.data.patch_size = [8 if native_mr else D, H, W]
+    # 3D whole/z-axis/cubic fixtures must satisfy encoder geometry; 2.5D
+    # folded tests retain the historical four-slice slab depth.
+    fixture_d = 4 if patch_mode == "2_5d" and not lift else 16
+    cfg.data.patch_size = [fixture_d, H, W]
     cfg.data.batch_size = 1
     cfg.data.patch_mode = patch_mode
     cfg.data.multi_res_scales = list(scales)

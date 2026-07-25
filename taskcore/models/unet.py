@@ -58,12 +58,14 @@ class Encoder(nn.Module):
         downsample_builder   : Optional[Callable[[int, int], nn.Module]] = None,
         downsample_strides   : Optional[List] = None,
         grad_checkpointing   : bool = False,
-        grad_ckpt_stages     : Optional[List[int]] = None):
+        grad_ckpt_stages     : Optional[List[int]] = None,
+        grad_ckpt_stem_downsample: bool = False):
         super().__init__()
 
         self.spatial_dims = spatial_dims
         # 梯度检查点：逐 stage 包裹前向，反向重算以省激活显存（仅训练且需梯度时生效）。
         self.grad_checkpointing = bool(grad_checkpointing)
+        self.grad_ckpt_stem_downsample = bool(grad_ckpt_stem_downsample)
         # 条件输入（生成 conditioning）：末 cond_in_channels 个通道经独立 cond stem
         # 提特征后与主 stem 输出 1×1 融合；=0 时不构建任何模块，行为与历史一致。
         self.cond_in_channels = int(cond_in_channels)
@@ -191,7 +193,8 @@ class Encoder(nn.Module):
             x         = self.stem.forward_main(chunks[0])
             aux_feats = self.stem.forward_aux(chunks)
         else:
-            x         = self.stem(x)
+            x         = checkpoint_if(
+                self.grad_ckpt_stem_downsample, self.stem, x)
             aux_feats = {}
         if cond is not None:
             cond = self.cond_stem(cond)
@@ -200,7 +203,9 @@ class Encoder(nn.Module):
         features: List[torch.Tensor] = []
         for i, stage in enumerate(self.stages):
             if i > 0:
-                x = self.downsamples[i - 1](x)
+                x = checkpoint_if(
+                    self.grad_ckpt_stem_downsample,
+                    self.downsamples[i - 1], x)
                 if i in aux_feats:
                     aux = aux_feats[i]
                     if aux.shape[2:] != x.shape[2:]:

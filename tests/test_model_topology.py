@@ -20,7 +20,7 @@ from taskcore.models.topology import ModelTopology, build_topology
 
 # ---------------------------------------------------------------------------
 def _cfg(pm="whole", scales=None, *, lift=False, native_d=False,
-         keep_native=False, aux=False, ps=(4, 16, 16), n_fg=2):
+         keep_native=False, aux=False, ps=(16, 16, 16), n_fg=2):
     """Construct a synced+validated Config with the given mode flags."""
     if scales is None:
         scales = [1.0]
@@ -34,6 +34,10 @@ def _cfg(pm="whole", scales=None, *, lift=False, native_d=False,
     c.data.keep_native_multi_res = keep_native
     c.model.lift_2_5d_to_3d = lift
     c.model.aux_seg_supervision = aux
+    if pm == "2_5d" and not lift and ps == (16, 16, 16):
+        # 2.5D folds D into channels, so retain the small slab depth used by
+        # these topology-only tests while keeping 3D fixtures legal.
+        c.data.patch_size[0] = 4
     if lift:
         # lift 要求 D 整除 2**(n_levels-1)；缩到 2 级让 D=4 通过
         c.model.encoder_channels = [32, 64]

@@ -817,7 +817,9 @@ class Trainer(BaseTrainer):
                     and src_tensor.shape[:2] == tgt_tensor.shape[:2]
                     and src_tensor.shape[2:] != tgt_tensor.shape[2:]):
                 n_upkern += 1
-        sd = upkern_remap_state_dict(sd, bare)
+        sd = upkern_remap_state_dict(
+            sd, bare,
+            normalize_spatial=bool(self.cfg.train.pretrain_upkern_normalize))
         logger.info(
             "Pretrain: applied UpKern remap to %d depthwise tensor(s).",
             n_upkern)

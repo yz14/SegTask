@@ -22,6 +22,14 @@
 `segtask_v1` 的核心思想是把「几何」与「实现」分开：
 
 - **几何** 由配置决定，包括 `patch_mode`、`multi_res_scales`、`keep_native_view_depth`、`lift_2_5d_to_3d`、`spacing_normalization` 等。
+- **数据契约**：`data.group_id_regex` 非空时五任务统一按组隔离；空值保持任务原有分层/随机划分。数据探测结果通过显式 `finalize_from_data` 进入配置，make_data metadata 同时保留历史 spacing 键与实际 spacing、原始几何字段。
+- 批 1–3 的可选数值策略默认关闭或使用 `legacy`：`augment.elastic_field_mode`、
+  `augment.elastic_normalize_displacement`、`data.split_rounding_mode`、
+  `data.split_manifest_path`、`data.resize_antialias`、
+  `train.pretrain_upkern_normalize`、`model.init_strategy`。配置期几何校验、
+  `train.pretrain_allow_geometry_mismatch`、`train.pretrain_upkern` 及
+  `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches`
+  的具体开关说明以 WORKFLOW 配置表为准。
 - **实现**：损失 / trainer pipelines / predictor / launcher / visualization 在本包；数据与骨干在 `taskcore`。
 - **真相源**：`segtask_v1.seg_config` + `taskcore.models.topology`，避免派生字段多处重复推导。
 

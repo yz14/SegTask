@@ -48,6 +48,9 @@ COMMON_FIELDS: Tuple[str, ...] = (
     "aux_seg_supervision",
     "aux_head_mode",
     "grad_checkpointing",
+    "grad_ckpt_stem_downsample",
+    "grad_ckpt_decoder_branches",
+    "init_strategy",
 )
 
 # ---------------------------------------------------------------------------
@@ -282,11 +285,31 @@ def _forwarding_property(flat_name: str, path: str) -> property:
         doc=f"[compat] 旧扁平字段，转发到 model.{path}（读写等价）。")
 
 
+def _ensure_model_geometry_backing(obj) -> None:
+    """补齐 ``_spatial_dims`` / ``_in_channels`` 私有 backing（只读 property 依赖）。
+
+    老 checkpoint pickle 绕过 ``__init__``/``__post_init__``，可能只带扁平
+    ``spatial_dims``/``in_channels`` 或二者皆无；property 是数据描述符，读
+    ``obj.spatial_dims`` 会走 ``_spatial_dims``，缺失即 ``AttributeError``。
+    """
+    if "_spatial_dims" not in obj.__dict__:
+        flat = obj.__dict__.pop("spatial_dims", 3)
+        obj.__dict__["_spatial_dims"] = int(flat) if flat is not None else 3
+    else:
+        obj.__dict__.pop("spatial_dims", None)
+    if "_in_channels" not in obj.__dict__:
+        flat = obj.__dict__.pop("in_channels", 1)
+        obj.__dict__["_in_channels"] = int(flat) if flat is not None else 1
+    else:
+        obj.__dict__.pop("in_channels", None)
+
+
 def _model_setstate_factory(mapping: Dict[str, str], nested_sections: Tuple[str, ...]):
     def _model_setstate(self, state: Dict[str, Any]) -> None:
         """老 checkpoint pickle 迁移：旧版扁平 ``ModelConfig`` 状态自动路由。"""
         if "unet" in state:  # 新版 pickle：嵌套段就绪，原样恢复。
             self.__dict__.update(state)
+            _ensure_model_geometry_backing(self)
             return
         legacy = {k: v for k, v in state.items() if k in mapping}
         for k, v in state.items():
@@ -297,6 +320,7 @@ def _model_setstate_factory(mapping: Dict[str, str], nested_sections: Tuple[str,
                 self.__dict__[f.name] = f.default_factory()  # type: ignore[misc]
         for k, v in legacy.items():
             setattr(self, k, v)
+        _ensure_model_geometry_backing(self)
         if legacy:
             logger.info(
                 "Migrated %d legacy flat ModelConfig fields from old checkpoint "

@@ -83,5 +83,11 @@ ssl 导出快照与 resume 全状态正交。历史 gen best（对齐前）prima
 ## 其它约定
 
 - 配置校验统一抛 `ConfigError`；data 路径非法配置用 `ValueError`/`FileNotFoundError`；模型构造期少量 `assert` 为内部不变量。
+- 数据层通过显式 `finalize_from_data(cfg, label_values, ...)` 提交探测结果；
+  loader 不再自行回写配置。`data.group_id_regex` 统一优先启用组级划分，
+  空值时保持任务原有分层/随机语义。
+- `make_data` metadata 保留历史 spacing 键，并额外记录
+  `achieved_spacing`、`pre_resample_shape`、`origin`、`direction`；旧 npz
+  缺少新键时由读取端沿用既有 fallback。
 - seg/gen 包内仍有兼容旧 import 的 re-export 模块（`[shim]`）；**新代码一律 `import taskcore...`**。声明式入口：`python -m segtask_v1.monitor`、`python -m segtask_v1.data.make_data`（`--out`）；`segtask_v1.config` 为旧路径→core 的 shim（新配置走 `segtask_v1.seg_config` / `SegBundle`）。
 - DDP 指标：可加混淆量 + all-reduce(SUM)；batch 内池化比值损失（如 batch_dice）在 DDP 下为近似。

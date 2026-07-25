@@ -99,11 +99,14 @@ class SSLMethod(ABC):
                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """由一个 batch（``{'image': (B,C,*spatial)}`` 等）算出 ``(loss, logs)``。
 
-        本方法在训练循环的 AMP autocast 上下文内被调用；损失内部应在 fp32 计算
-        以避免汇总误差。``logs`` 为标量字典，仅用于日志/监控；其值可为 Python
-        ``float``，**也可为未同步的 0-dim ``torch.Tensor``**（device 标量）——
-        ``SSLTrainer`` 会在日志/累积边界处对本组所有 device 标量批量 ``.tolist()``
-        一次性取回，从而免去每个 micro-step 的 host/device 同步（首选后者）。
+        由 ``SSLTrainer`` 在 **AMP autocast 外** 调用（C16：损失恒 fp32）。
+        方法若需省显存，可自行对 encoder 前向开局部 autocast，但 Gram / InfoNCE /
+        协方差等汇总运算必须留在 autocast 外（或 ``autocast(enabled=False)``），
+        因 autocast 会按 op 把 fp32 输入的 matmul 再降精度。``logs`` 为标量字典，
+        仅用于日志/监控；其值可为 Python ``float``，**也可为未同步的 0-dim
+        ``torch.Tensor``**（device 标量）—— ``SSLTrainer`` 会在日志/累积边界处
+        对本组所有 device 标量批量 ``.tolist()`` 一次性取回，从而免去每个
+        micro-step 的 host/device 同步（首选后者）。
         """
 
     @abstractmethod

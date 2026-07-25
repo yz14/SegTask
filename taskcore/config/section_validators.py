@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from .core import _require
+from .geometry import effective_patch_divisors
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +30,16 @@ def validate_encoder_decoder_stage_lengths(cfg: Any) -> None:
             all(b >= 1 for b in ebps),
             "encoder_blocks_per_stage entries must all be >= 1")
     if dbps:
+        decoder_type = str(cfg.model.unet.decoder_type).lower()
+        expected = (
+            n_levels - 1 if decoder_type == "unet"
+            else n_levels * (n_levels - 1) // 2
+            if decoder_type == "unetpp" else n_levels - 1)
         _require(
-            len(dbps) == n_levels - 1,
-            f"decoder_blocks_per_stage must have {n_levels - 1} entries "
-            f"(= len(encoder_channels) - 1); got {len(dbps)}")
+            len(dbps) in (1, expected),
+            f"decoder_blocks_per_stage for decoder_type={decoder_type!r} "
+            f"must have {expected} entries (or 1 entry for explicit broadcast); "
+            f"got {len(dbps)}")
         _require(
             all(b >= 1 for b in dbps),
             "decoder_blocks_per_stage entries must all be >= 1")
@@ -55,6 +62,32 @@ def validate_encoder_decoder_stage_lengths(cfg: Any) -> None:
             _require(
                 all(int(v) in (1, 2) for v in s),
                 f"downsample_strides values must be 1 or 2; got {list(s)}")
+
+
+def validate_patch_geometry(cfg: Any) -> None:
+    """校验 patch 能完整经过 stem 与 encoder 下采样。"""
+    mode = str(getattr(cfg.data, "patch_mode", "cubic"))
+    spatial_dims = int(getattr(cfg.model, "spatial_dims", 3))
+    n_levels = len(cfg.model.encoder_channels)
+    divisors = effective_patch_divisors(cfg, spatial_dims, n_levels)
+    patch = [int(x) for x in cfg.data.patch_size]
+    axes = patch[1:] if spatial_dims == 2 else patch
+    bad = [
+        (idx, size, divisor)
+        for idx, (size, divisor) in enumerate(zip(axes, divisors))
+        if size % divisor
+    ]
+    if bad:
+        detail = ", ".join(
+            f"axis {idx} size {size} (needs divisible by {divisor}; "
+            f"nearest legal >= value is "
+            f"{((size + divisor - 1) // divisor) * divisor})"
+            for idx, size, divisor in bad)
+        _require(
+            False,
+            f"patch_size {patch} is incompatible with {mode!r} encoder geometry: "
+            f"{detail}. Choose patch dimensions divisible by the reported "
+            "stem×downsample stride, or reduce encoder depth.")
 
 
 def validate_stem_modes(cfg: Any) -> None:

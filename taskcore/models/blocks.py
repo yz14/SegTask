@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from collections import OrderedDict
@@ -11,6 +12,7 @@ from typing import Sequence, Tuple, Type
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from einops import rearrange
 
@@ -46,6 +48,36 @@ def _check_dims(spatial_dims: int) -> int:
     return spatial_dims
 
 
+@contextlib.contextmanager
+def _freeze_bn_running_stats(module: nn.Module):
+    """重算路径：快照并在退出时恢复 BN running buffers，抵消二次更新。
+
+    首轮前向正常写入 running_mean/var；反向重算会再跑一遍 BN 前向，若不管
+    则 momentum 作用两次，违反「数值与关闭检查点时严格一致」。此处不改
+    ``track_running_stats``（否则 autograd 保存张量数变化触发 CheckpointError），
+    只在重算前后恢复 buffer。
+    """
+    saved = []
+    for m in module.modules():
+        if isinstance(m, _BatchNorm) and m.track_running_stats:
+            nbt = (m.num_batches_tracked.detach().clone()
+                   if m.num_batches_tracked is not None else None)
+            saved.append((
+                m,
+                m.running_mean.detach().clone(),
+                m.running_var.detach().clone(),
+                nbt,
+            ))
+    try:
+        yield
+    finally:
+        for m, mean, var, nbt in saved:
+            m.running_mean.copy_(mean)
+            m.running_var.copy_(var)
+            if nbt is not None and m.num_batches_tracked is not None:
+                m.num_batches_tracked.copy_(nbt)
+
+
 def checkpoint_if(enabled: bool, fn, *args):
     """可选梯度检查点：用算力换激活显存。
 
@@ -57,8 +89,16 @@ def checkpoint_if(enabled: bool, fn, *args):
     - ``use_reentrant=False``：PyTorch 推荐的非重入实现，正确处理「输入不需梯度但子模块参数
       需梯度」（如首个 encoder stage）与多输入（如 ``DecoderLevel(x, skip)``）情形。
     - ``preserve_rng_state=True``：重算时复现 DropPath/dropout 的随机掩码，使梯度无偏。
+    - ``context_fn``：重算路径冻结 BN running stats（含 mednext dilated_reparam 内部 BN），
+      避免 buffer 被 momentum 作用两次。
     """
     if enabled and torch.is_grad_enabled():
+        if isinstance(fn, nn.Module):
+            def _bn_safe_context_fn():
+                return contextlib.nullcontext(), _freeze_bn_running_stats(fn)
+            return _torch_checkpoint(
+                fn, *args, use_reentrant=False, preserve_rng_state=True,
+                context_fn=_bn_safe_context_fn)
         return _torch_checkpoint(
             fn, *args, use_reentrant=False, preserve_rng_state=True)
     return fn(*args)
