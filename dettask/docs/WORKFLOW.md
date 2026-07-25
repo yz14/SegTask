@@ -106,7 +106,7 @@ RPN（anchor + objectness）→ proposal（解码 + NMS，pre/post topk）
 | 微调策略 | `det.encoder_lr_mult` 差分学习率（复用 clstask 分组实现）；`det.freeze_encoder` |
 | 梯度检查点 | `model.grad_checkpointing` (+`grad_ckpt_encoder_stages`)：encoder/decoder 经公共 factory 构建，反向重算激活、算力换显存；eval/no_grad 零开销 |
 | 扩展检查点范围 | `model.grad_ckpt_stem_downsample` / `model.grad_ckpt_decoder_branches`：默认关闭，额外覆盖 stem/downsample 与 decoder 分支 |
-| 公共可选策略 | `data.resize_antialias`、`model.init_strategy`：默认 false/`legacy`，分别控制 CPU 下采样预滤波和最终模型初始化策略 |
+| 公共可选策略 | `data.resize_antialias`、`model.init_strategy`、`data.z_sampling_mode`：默认 false/`legacy`/`safe`；`z_sampling_mode=legacy` 复刻批 1 之前 z 采样，跨版本验证指标不可直接比较 |
 | DDP 多卡 | `train.gpus` 配≥2 张卡即启用（mp.spawn 每卡一进程，与 seg 同模式）：训练集 DistributedSampler、验证集按 batch 块不相交分片；验证时预测/真值跨卡聚齐后算全集 mAP（不做卡间平均）；checkpoint/history 仅 rank0 落盘；单卡/CPU 路径零变化 |
 | 选模 | `det.save_best_metric`：map / loss（mAP@`det.eval_iou_thresh`，默认 0.1 医学小目标口径） |
 

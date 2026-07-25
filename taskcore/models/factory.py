@@ -524,6 +524,12 @@ def build_model(cfg: Config, *, attn_gate_target: str = "skips"):
     """按 cfg.model.arch 分派：'unet' 默认 或 'adm' | 'edm2'
     （后者忽略大多数 backbone/block 选项，使用论文原保 GN+SiLU / MP）。"""
     arch = str(cfg.model.arch).lower()
+    strategy = str(cfg.model.init_strategy).lower()
+    if strategy != "legacy" and arch != "unet":
+        raise ConfigError(
+            "model.init_strategy=%r is only supported with "
+            "model.arch='unet'; ADM/EDM2 use architecture-specific "
+            "initialization contracts." % cfg.model.init_strategy)
     if arch == "adm":
         from .adm_unet import build_adm_seg_model
         return _apply_init_strategy(

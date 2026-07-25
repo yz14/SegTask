@@ -107,10 +107,10 @@ class UNetPPDecoder(nn.Module):
                         f"{tuple(x[i][0].shape[2:])}. Check patch_size and "
                         "encoder stride divisibility.")
                 if self.skip_attention and self.attn_gate_target == "skips":
-                        gate = self.gates[key]
-                        skips = [checkpoint_if(
-                            self.grad_ckpt_decoder_branches, gate, s, up)
-                            for s in x[i][:j]]
+                    gate = self.gates[key]
+                    skips = [checkpoint_if(
+                        self.grad_ckpt_decoder_branches, gate, s, up)
+                        for s in x[i][:j]]
                 else:
                     if self.skip_attention:  # 'upsample'：用 X[i,0] 门控上采样分支。
                         up = checkpoint_if(

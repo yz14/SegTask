@@ -124,6 +124,7 @@ class Volume3D(CondVolumeMixin, SegDataset3D):
         cond_global_mean           : float = 0.0,
         cond_global_std            : float = 1.0,
         z_boundary_mode            : str = "stretch",
+        z_sampling_mode            : str = "safe",
         npz_paths                  : Optional[List[str]] = None,
         val_grid_coverage          : bool = False):
         super().__init__(
@@ -146,6 +147,7 @@ class Volume3D(CondVolumeMixin, SegDataset3D):
             cache_int16                = cache_int16,
             region_weights             = region_weights,
             z_boundary_mode            = z_boundary_mode,
+            z_sampling_mode            = z_sampling_mode,
             npz_paths                  = npz_paths,
             val_grid_coverage          = val_grid_coverage,
         )

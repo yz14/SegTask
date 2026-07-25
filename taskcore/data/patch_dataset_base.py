@@ -55,6 +55,7 @@ class NpzPatchDatasetBase(Dataset):
         cache_enabled: bool,
         cache_max_volumes: int,
         *,
+        z_sampling_mode: str = "safe",
         index_scheme: str = IndexScheme.INTERLEAVED,
         dataset_name: str = "NpzPatchDatasetBase",
     ) -> None:
@@ -88,6 +89,11 @@ class NpzPatchDatasetBase(Dataset):
         self.seed = int(seed)
         self.val_grid_coverage = (
             bool(val_grid_coverage) and not self.is_train)
+        self.z_sampling_mode = str(z_sampling_mode).lower()
+        if self.z_sampling_mode not in ("safe", "legacy"):
+            raise ValueError(
+                f"z_sampling_mode must be 'safe' or 'legacy'; "
+                f"got {z_sampling_mode!r}")
         self._index_scheme = index_scheme
         self._worker_rng = WorkerNumpyRng()
         self._img_cache = VolumeCache(cache_enabled, cache_max_volumes)

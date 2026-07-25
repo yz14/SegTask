@@ -218,6 +218,7 @@ class ZCubeSpec(DatasetSpec):
             samples_per_volume          = self._samples_per_volume(is_train),
             is_train                    = is_train,
             z_boundary_mode             = dc.z_boundary_mode,
+            z_sampling_mode             = dc.z_sampling_mode,
             **self._resize_kwargs(),
             val_grid_coverage           = dc.val_grid_coverage)
 

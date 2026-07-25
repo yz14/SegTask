@@ -70,6 +70,7 @@ from taskcore.data.sampling import (
     safe_z_center_range,
     safe_z_grid_center,
     uniform_center,
+    z_grid_center,
 )
 
 logger = logging.getLogger(__name__)
@@ -200,6 +201,7 @@ class ClsPatchDataset(NpzPatchDatasetBase):
         seed                : int = 42,
         gpu_augment         : bool = False,
         val_grid_coverage   : bool = False,
+        z_sampling_mode     : str = "safe",
         cache_enabled       : bool = False,
         cache_max_volumes   : int = 0):
         super().__init__(
@@ -209,6 +211,7 @@ class ClsPatchDataset(NpzPatchDatasetBase):
             fg_oversample_ratio, cache_enabled, cache_max_volumes,
             index_scheme=IndexScheme.BLOCKED,
             dataset_name="ClsPatchDataset",
+            z_sampling_mode=z_sampling_mode,
         )
         if label_granularity not in ("volume", "slice"):
             raise ValueError(f"bad label_granularity: {label_granularity!r}")
@@ -343,14 +346,20 @@ class ClsPatchDataset(NpzPatchDatasetBase):
         再选该类前景切片；否则均匀采样（口径同 ``SegDataset3D._sample_z``）。"""
         d_patch = int(self.patch[0])
         if cov_j is not None:
+            if self.z_sampling_mode == "legacy":
+                return z_grid_center(cov_j, self.spv, D_vol)
             return safe_z_grid_center(cov_j, self.spv, D_vol, d_patch)
         if (self.is_train and self.fg_ratio > 0
                 and rng.random() < self.fg_ratio):
             groups = self._fg_groups(vol_idx, lbl)
             if groups:
                 zs = groups[int(rng.integers(len(groups)))]
-                return int(np.clip(rng.choice(zs), *safe_z_center_range(
-                    D_vol, d_patch)))
+                z = int(rng.choice(zs))
+                if self.z_sampling_mode == "legacy":
+                    return z
+                return int(np.clip(z, *safe_z_center_range(D_vol, d_patch)))
+        if self.z_sampling_mode == "legacy":
+            return int(rng.integers(0, D_vol))
         lo, hi = safe_z_center_range(D_vol, d_patch)
         return int(rng.integers(lo, hi))
 

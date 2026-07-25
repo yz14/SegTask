@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, Iterator, Optional
@@ -48,6 +49,31 @@ from .dist_utils import (
 from .optim import WarmupScheduler, build_optimizer, build_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _checkpoint_config_value(config, section: str, key: str):
+    """读取 dict/dataclass checkpoint config 字段；缺失时返回 None。"""
+    if isinstance(config, Mapping):
+        section_obj = config.get(section)
+    else:
+        section_obj = getattr(config, section, None)
+    if section_obj is None:
+        return None
+    if isinstance(section_obj, Mapping):
+        return section_obj.get(key)
+    return getattr(section_obj, key, None)
+
+
+def _checkpoint_geometry(config):
+    """提取 checkpoint 几何三元组；不完整配置不参与校验。"""
+    if config is None:
+        return None
+    saved = (
+        _checkpoint_config_value(config, "data", "patch_mode"),
+        _checkpoint_config_value(config, "model", "spatial_dims"),
+        _checkpoint_config_value(config, "model", "in_channels"),
+    )
+    return saved if all(value is not None for value in saved) else None
 
 
 class OptimStepResult:
@@ -718,7 +744,7 @@ class BaseTrainer:
                 f"Pretrain checkpoint {path!r} matched 0 model tensors. "
                 "Check task mismatch, checkpoint key prefixes, or backbone "
                 "configuration.")
-        ckpt_cfg = ckpt.get("config")
+        ckpt_cfg = ckpt.get("config") if isinstance(ckpt, Mapping) else None
         allow_geometry = bool(
             getattr(self.cfg.train, "pretrain_allow_geometry_mismatch", False))
         if ckpt_cfg is not None and not allow_geometry:
@@ -726,13 +752,8 @@ class BaseTrainer:
                 self.cfg.data.patch_mode,
                 self.cfg.model.spatial_dims,
                 self.cfg.model.in_channels)
-            saved_data = ckpt_cfg.get("data", {})
-            saved_model = ckpt_cfg.get("model", {})
-            saved = (
-                saved_data.get("patch_mode"),
-                saved_model.get("spatial_dims"),
-                saved_model.get("in_channels"))
-            if all(v is not None for v in saved) and saved != current:
+            saved = _checkpoint_geometry(ckpt_cfg)
+            if saved is not None and saved != current:
                 raise RuntimeError(
                     "Pretrain checkpoint geometry mismatch: "
                     f"checkpoint patch_mode/spatial_dims/in_channels={saved}, "

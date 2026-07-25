@@ -215,7 +215,7 @@ checkpoint 加载 → NIfTI 读取
 | checkpoint | `train.save_every` / `save_keep_last` / `save_async` | 周期+best+异步写盘；resume 位精确恢复（含 RNG） |
 | 预训练迁移 | `train.pretrain` (+`pretrain_strict/load_ema/upkern`) | 仅加载权重初始化 |
 | 预训练几何 | `train.pretrain_allow_geometry_mismatch` | 默认 false；仅显式开启才允许几何不一致迁移 |
-| 可选数值策略 | `augment.elastic_field_mode`、`augment.elastic_normalize_displacement`、`data.split_rounding_mode`、`data.split_manifest_path`、`data.resize_antialias`、`train.pretrain_upkern_normalize`、`model.init_strategy` | 默认分别为 `legacy`、false、`legacy`、空串、false、false、`legacy`；开启后会改变增强、划分、插值、预训练核或初始化数值 |
+| 可选数值策略 | `augment.elastic_field_mode`、`augment.elastic_normalize_displacement`、`data.split_rounding_mode`、`data.split_manifest_path`、`data.resize_antialias`、`train.pretrain_upkern_normalize`、`model.init_strategy`、`data.z_sampling_mode` | 默认分别为 `legacy`、false、`legacy`、空串、false、false、`legacy`、`safe`；`z_sampling_mode=legacy` 可复现批 1 之前的 z 中心与验证网格，跨版本验证指标不可直接比较 |
 | 早停 | `train.early_stopping` | 连续 N 次验证无提升即停 |
 | 验证口径 | `train.val_metric_mode` | medium=随机 patch（快）/ high=整卷滑窗（与部署同口径） |
 | 选模标准 | `train.save_best_criterion` (+`save_best_preset`) | loss / dice / iou / mcc / min_dice / dice+surface_dice / balanced；`loss` 口径定案为 `val_base_loss`（仅主任务损失，不含深监督/aux/正则等随日程变化的附加项，跨配置可比） |

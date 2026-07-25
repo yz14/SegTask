@@ -29,6 +29,7 @@ from .sampling import (
     halton_center,
     safe_z_center_range,
     safe_z_grid_center,
+    z_grid_center,
     val_coverage_j_interleaved,
     val_sample_rng,
 )
@@ -860,6 +861,7 @@ class SegDataset3D(SegDatasetNpzBase):
         resize_antialias           : bool = False,
         # 默认与 Config.data.z_boundary_mode 对齐（"stretch" 已废弃，训练侧恒走 edge-pad）。
         z_boundary_mode            : str = "edge_pad",
+        z_sampling_mode            : str = "safe",
         npz_paths                  : Optional[List[str]] = None,
         val_grid_coverage          : bool = False):
 
@@ -883,6 +885,11 @@ class SegDataset3D(SegDatasetNpzBase):
             region_weights       = region_weights,
             val_grid_coverage    = val_grid_coverage,
             resize_antialias     = resize_antialias)
+        self.z_sampling_mode = str(z_sampling_mode).lower()
+        if self.z_sampling_mode not in ("safe", "legacy"):
+            raise ValueError(
+                f"z_sampling_mode must be 'safe' or 'legacy'; "
+                f"got {z_sampling_mode!r}")
         if z_boundary_mode not in ("stretch", "edge_pad"):
             raise ValueError(
                 f"z_boundary_mode must be 'stretch' or 'edge_pad', "
@@ -1018,6 +1025,8 @@ class SegDataset3D(SegDatasetNpzBase):
         D_patch = int(self.extract_size[0])
         if cov is not None:
             j, S = cov
+            if self.z_sampling_mode == "legacy":
+                return z_grid_center(j, S, D_vol)
             return safe_z_grid_center(j, S, D_vol, D_patch)
         fg_slices = self._vol_fg_slices[vol_idx]
         rng = self._sample_rng(sample_idx)
@@ -1027,10 +1036,16 @@ class SegDataset3D(SegDatasetNpzBase):
             per_cls = self._vol_fg_slices_by_cls[vol_idx]
             if per_cls:
                 cls_slices = per_cls[int(rng.integers(len(per_cls)))]
-                return int(np.clip(rng.choice(cls_slices), *safe_z_center_range(
-                    D_vol, D_patch)))
-            return int(np.clip(rng.choice(fg_slices), *safe_z_center_range(
-                D_vol, D_patch)))
+                z = int(rng.choice(cls_slices))
+                if self.z_sampling_mode == "legacy":
+                    return z
+                return int(np.clip(z, *safe_z_center_range(D_vol, D_patch)))
+            z = int(rng.choice(fg_slices))
+            if self.z_sampling_mode == "legacy":
+                return z
+            return int(np.clip(z, *safe_z_center_range(D_vol, D_patch)))
+        if self.z_sampling_mode == "legacy":
+            return int(rng.integers(0, D_vol))
         lo, hi = safe_z_center_range(D_vol, D_patch)
         return int(rng.integers(lo, hi))
 

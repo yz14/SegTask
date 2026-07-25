@@ -322,14 +322,21 @@ def upkern_remap_state_dict(
         # 以 float32 完成插值，再回到源 dtype。
         mode = "bilinear" if src_tensor.ndim == 4 else "trilinear"
         spatial = tuple(int(s) for s in tgt_tensor.shape[2:])
+        source_sum = src_tensor.detach().to(dtype=torch.float32).sum(
+            dim=tuple(range(2, src_tensor.ndim)), keepdim=True)
         work = src_tensor.detach().to(dtype=torch.float32)
         work = work.reshape(work.shape[0] * work.shape[1], 1, *work.shape[2:])
         work = F.interpolate(work, size=spatial, mode=mode, align_corners=True)
         work = work.reshape(*tgt_tensor.shape).to(dtype=src_tensor.dtype)
         if normalize_spatial:
-            denom = work.sum(
+            denom = work.to(dtype=torch.float32).sum(
                 dim=tuple(range(2, work.ndim)), keepdim=True)
-            work = work / denom.abs().clamp_min(1e-8)
+            scale = torch.where(
+                denom.abs() >= 1e-8,
+                source_sum / denom,
+                torch.ones_like(denom))
+            work = (work.to(dtype=torch.float32) * scale).to(
+                dtype=src_tensor.dtype)
         return work
 
     src_prefixes = {"plain": set(), "reparam": set()}

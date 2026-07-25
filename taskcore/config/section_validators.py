@@ -11,7 +11,11 @@ import logging
 from typing import Any
 
 from .core import _require
-from .geometry import effective_patch_divisors
+from .geometry import (
+    compute_downsample_strides,
+    effective_patch_divisors,
+    stem_stride_of,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +73,32 @@ def validate_patch_geometry(cfg: Any) -> None:
     mode = str(getattr(cfg.data, "patch_mode", "cubic"))
     spatial_dims = int(getattr(cfg.model, "spatial_dims", 3))
     n_levels = len(cfg.model.encoder_channels)
-    divisors = effective_patch_divisors(cfg, spatial_dims, n_levels)
+    arch = str(getattr(cfg.model, "arch", "unet")).lower()
+    decoder_type = str(getattr(cfg.model.unet, "decoder_type", "unet"))
     patch = [int(x) for x in cfg.data.patch_size]
     axes = patch[1:] if spatial_dims == 2 else patch
+    if arch == "unet" and decoder_type == "unet3p":
+        strides = compute_downsample_strides(cfg, spatial_dims, n_levels)
+        if strides is None:
+            strides = [(2,) * spatial_dims] * max(n_levels - 1, 0)
+        sizes = [size // stem_stride_of(cfg.model.stem_mode) for size in axes]
+        for level, stride in enumerate(strides):
+            if any(size < int(value) for size, value in zip(sizes, stride)):
+                _require(
+                    False,
+                    f"patch_size {patch} is too small for {mode!r} "
+                    f"encoder level {level + 1}; encoder feature sizes "
+                    f"would become non-positive.")
+            sizes = [size // int(value)
+                     for size, value in zip(sizes, stride)]
+        return
+    if arch == "adm":
+        stem = stem_stride_of(cfg.model.stem_mode)
+        divisors = [stem * (2 ** max(n_levels - 1, 0))] * spatial_dims
+    elif arch == "edm2":
+        divisors = [(2 ** max(n_levels - 1, 0))] * spatial_dims
+    else:
+        divisors = effective_patch_divisors(cfg, spatial_dims, n_levels)
     bad = [
         (idx, size, divisor)
         for idx, (size, divisor) in enumerate(zip(axes, divisors))

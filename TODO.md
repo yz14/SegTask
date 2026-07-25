@@ -1014,3 +1014,49 @@ TODO 1 修复核验（2026-07-25，对批 1–4 修复逐条比对新旧代码 +
 ──────────────────────────────────────────────────────────────
 
 进展：
+
+批 5 实施进展（2026-07-26；已完成 review 并写回用户本地）
+
+一、已实现
+- P0：pretrain 几何元数据同时支持 dict 与 Config/dataclass；缺字段时跳过比较。新增自产 checkpoint 回归测试。
+- P3：整数 override 接受 `3.0`、拒绝 `3.7`；split manifest 改为 rank0-only、同目录临时文件加 `os.replace` 原子写；修正 UNet++ 缩进。
+- UpKern：可选 normalize 改为保持源核空间和；批 3 恒真断言改为独立插值 reference。
+- init_strategy：ADM/EDM2 的非 legacy 策略在配置与 factory 入口显式拒绝，保留经典 UNet 的 kaiming/trunc_normal。
+- geometry：ADM/EDM2 使用各自实际 stem/downsample 几何；UNet3P 放宽整除要求但保留 encoder 尺寸不足硬错误；经典 UNet 仍严格整除。
+- H2：新增 `data.z_sampling_mode`，默认 `safe`（保持当前行为）；`legacy` 复刻批 1 之前 seg/cls/det 的全域 z 中心与旧验证 z-grid。文档已说明跨版本验证指标不可直接比较。
+
+二、测试
+- 新增 `tests/test_todo1_batch5_fixes.py`，覆盖上述修复及三任务 z sampling 开关；gentask 兼容入口保留。
+- 定向回归：56 passed（批 1/3、配置 IO、cls/det smoke）；批 5 新测试 13 passed；
+- 全量回归：1541 passed, 11 failed, 6 skipped, 145 warnings；11 个失败仍为既有 `tests/test_model_flow.py` / torchlens 缺失相关失败，未新增失败。
+- py_compile：通过。
+
+三、状态
+- 镜像 TODO 已先同步用户最新版本，本节追加在用户审查记录之后。
+- `/home/ubuntu/seg/batch5.diff` 已由用户 review 通过；批 5 实现与 TODO 追加已写回用户本地，未 commit/push，未修改 `.git`。
+
+──────────────────────────────────────────────────────────────
+批 5 修复复核（2026-07-25，逐文件比对 + 本机全量测试）
+
+## 测试
+- 批 1/3/5 定向测试 30 项全部通过；全仓 1541 passed / 6 skipped / 11 failed——11 个失败仍为 test_model_flow.py / 本机缺 torchlens 的既有失败，与批 5 无关，数字与用户记录一致。
+
+## 逐条确认（对应上轮 8 个问题）
+1. P0 pretrain 几何校验：已修复且正确。_checkpoint_config_value/_checkpoint_geometry 同时支持 Mapping 与 dataclass（getattr 走 Config.model 只读 property 也正常）；ckpt 非 Mapping 时跳过；缺字段返回 None 不参与比较。新增自产 dataclass checkpoint 回归测试直接调 _load_pretrain_weights，覆盖了真实失效路径。✔
+2. upkern normalize：语义已改为"保持源核空间和"（source_sum/denom 缩放，denom<1e-8 回退 1），float32 中间精度处理正确；批 3 恒真断言改为独立 F.interpolate reference 并断言 sums==source_sums。✔
+3. init_strategy：配置层（_validate_model）与 factory 双重拒绝 adm/edm2 + 非 legacy，经典 UNet 保留；有参数化测试并验证 legacy 下 adm/edm2 零初始化不被覆盖。✔
+4. 几何校验边界：adm 用 stem×2^(n-1)（adm 确实消费 stem_mode，已核对 build_context_stem）、edm2 用 2^(n-1)（不吃 stem/anisotropic）、unet3p 放宽为"逐级特征尺寸不归零"检查、经典 UNet 维持严格整除；有 monkeypatch 测试证明 adm 路径不再误用 unet divisor 推导。✔
+5. H2 行为开关：新增 data.z_sampling_mode（safe|legacy），贯通 seg/cls/det/gen 四任务（patch_dataset_base、specs、各 loader 均传参），legacy 路径复刻批 1 前的全域采样与旧 z_grid_center；枚举在 config 层与 dataset 层双重校验；测试覆盖三任务。✔（默认 safe = 保持批 1 后行为，属明示决策）
+6. split manifest：rank0-only + 同目录 pid 临时文件 + os.replace 原子替换，异常时清理 tmp；有 rank!=0 不落盘 + 无残留 tmp 的测试。✔
+7. int override：接受 3.0、拒绝 3.7 与 bool（yaml "true" 解析为 bool 被显式拒绝），抛 ConfigError。✔
+8. UNet++ 缩进已修正。✔
+
+## 遗留小项（不阻塞，记录备查）
+- P4：det 的 legacy z 采样 fg 分支丢了原实现的 np.clip(z, 0, D_vol-1)——原批 1 前代码对 box 中心有全域 clip，现 legacy 直接返回 round((b0+b3)/2)。仅当 box 顶到卷 z 上界且坐标为排他上界时 z 可能等于 D_vol（越界 1），下游 edge-pad 抽取不会崩，但与"复刻旧行为"有一处极小偏差。
+- P4：z_sampling_mode 默认 safe 意味着从批 1 前版本直接升级的用户默认仍会经历采样分布/验证口径变化；文档已声明，无需改代码。
+
+## 结论
+上轮 8 个问题全部得到正确、高质量的处理；P0 修复经真实路径回归测试验证；其余修复的开关语义、原子性与测试覆盖均到位。仅剩上述两条 P4 级备查项，可不处理。
+──────────────────────────────────────────────────────────────
+
+

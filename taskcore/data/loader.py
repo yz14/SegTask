@@ -465,6 +465,39 @@ def _fallback_split_val_count(
             else _half_up_count(n, val_ratio))
 
 
+def _write_split_manifest(
+    path: Path,
+    *,
+    seed: int,
+    val_ratio: float,
+    rounding_mode: str,
+    train: Sequence[str],
+    val: Sequence[str],
+    rank: int,
+) -> None:
+    """rank0 原子写入 split manifest，避免 DDP 并发覆盖。"""
+    if int(rank) != 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({
+        "seed": int(seed),
+        "val_ratio": float(val_ratio),
+        "rounding_mode": str(rounding_mode),
+        "train": list(train),
+        "val": list(val),
+    }, ensure_ascii=False, indent=2)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def train_val_split(
     n: int, val_ratio: float, seed: int, rounding_mode: str = "legacy"
 ) -> Tuple[List[int], List[int]]:
@@ -1142,15 +1175,14 @@ def build_dataloaders(
         logger.info("Split (random): %d train, %d val",
                     len(train_idx), len(val_idx))
     if dc.split_manifest_path:
-        manifest_path = Path(dc.split_manifest_path)
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps({
-            "seed": int(dc.split_seed),
-            "val_ratio": float(dc.val_ratio),
-            "rounding_mode": str(dc.split_rounding_mode),
-            "train": [primary_paths[i] for i in train_idx],
-            "val": [primary_paths[i] for i in val_idx],
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_split_manifest(
+            Path(dc.split_manifest_path),
+            seed=dc.split_seed,
+            val_ratio=dc.val_ratio,
+            rounding_mode=dc.split_rounding_mode,
+            train=[primary_paths[i] for i in train_idx],
+            val=[primary_paths[i] for i in val_idx],
+            rank=rank)
 
     # 模式无关的公共构造参数 + 单 split 路径包装。
     common_cfg          = DatasetCommonCfg.from_cfg(cfg)

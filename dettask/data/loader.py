@@ -115,6 +115,7 @@ def build_det_dataloaders(
             aug_flip_prob=flip_prob if is_train else 0.0,
             aug_flip_axes=flip_axes,
             val_grid_coverage=dc.val_grid_coverage,
+            z_sampling_mode=dc.z_sampling_mode,
             cache_enabled=dc.cache_mode == "memory",
             cache_max_volumes=dc.cache_max_volumes)
 

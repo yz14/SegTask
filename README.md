@@ -41,6 +41,8 @@ SegTask/
   `augment.elastic_normalize_displacement=false`、`data.split_rounding_mode=legacy`、
   `data.split_manifest_path=""`、`data.resize_antialias=false`、
   `train.pretrain_upkern_normalize=false`、`model.init_strategy=legacy`。
+  z 轴采样默认 `data.z_sampling_mode=safe`；设为 `legacy` 可复现批 1
+  之前的全域训练中心与验证 z-grid，但跨版本验证指标不可直接比较。
 
 ## 子项目 README
 

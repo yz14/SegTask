@@ -66,7 +66,17 @@ def coerce_override_value(old: Any, val: str, declared_type: Any = None) -> Any:
         raise ValueError(
             f"Invalid bool override {val!r}; use true/false/1/0/yes/no")
     if typ is int:
-        return int(parsed)
+        if isinstance(parsed, bool):
+            raise ConfigError(
+                f"Expected integer override value, got {parsed!r}")
+        if isinstance(parsed, float):
+            if not parsed.is_integer():
+                raise ConfigError(
+                    f"Expected integer override value, got {parsed!r}")
+            return int(parsed)
+        if isinstance(parsed, int):
+            return parsed
+        raise ConfigError(f"Expected integer override value, got {parsed!r}")
     if typ is float:
         return float(parsed)
     if typ is str:

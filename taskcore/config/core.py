@@ -131,6 +131,9 @@ class DataConfig:
     # z 轴边界填充（z_axis/2.5D）：恒为 "edge_pad"（边缘复制）。"stretch" 已废弃，
     # sync() 会警告并自动升级为 edge_pad（训练侧从未实际使用 stretch 几何）。
     z_boundary_mode: str = "edge_pad"
+    # z 轴中心采样："safe" 避免大面积 edge padding；"legacy" 复刻批 1
+    # 之前的全域训练采样与验证 z-grid。默认 safe。
+    z_sampling_mode: str = "safe"
 
     # ---- 强度归一化 / spacing ----
     # 强度窗（CT HU）。
@@ -1495,6 +1498,12 @@ class Config:
             ),
                 f"model.arch={arch!r} only supports stem_fusion_mode in "
                 f"('shared_stem','multi_stem_proj'); got {self.model.stem_fusion_mode!r}.")
+        if str(self.model.init_strategy).lower() != "legacy":
+            _require(
+                arch == "unet",
+                "model.init_strategy is only supported with "
+                "model.arch='unet'; ADM/EDM2 use architecture-specific "
+                "initialization contracts.")
         from .section_validators import (
             validate_encoder_decoder_stage_lengths,
             validate_stem_modes,
@@ -1865,6 +1874,10 @@ class Config:
             str(self.data.split_rounding_mode).lower() in ("legacy", "unified"),
             "data.split_rounding_mode must be 'legacy' or 'unified'; "
             f"got {self.data.split_rounding_mode!r}.")
+        _require(
+            str(self.data.z_sampling_mode).lower() in ("safe", "legacy"),
+            "data.z_sampling_mode must be 'safe' or 'legacy'; "
+            f"got {self.data.z_sampling_mode!r}.")
         _require(
             str(self.model.init_strategy).lower()
             in ("legacy", "kaiming", "trunc_normal"),

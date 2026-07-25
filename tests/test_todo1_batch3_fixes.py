@@ -74,10 +74,14 @@ def test_upkern_normalization_is_opt_in():
     legacy = upkern_remap_state_dict(src, target)
     normalized = upkern_remap_state_dict(
         src, target, normalize_spatial=True)
-    assert torch.equal(legacy["dwconv.weight"], legacy["dwconv.weight"])
+    reference = torch.nn.functional.interpolate(
+        src["dwconv.weight"].reshape(2, 1, 3, 3),
+        size=(5, 5), mode="bilinear", align_corners=True)
+    assert torch.equal(legacy["dwconv.weight"], reference)
     assert not torch.equal(legacy["dwconv.weight"], normalized["dwconv.weight"])
     sums = normalized["dwconv.weight"].sum(dim=(2, 3))
-    assert torch.allclose(sums.abs(), torch.ones_like(sums.abs()))
+    source_sums = src["dwconv.weight"].sum(dim=(2, 3))
+    assert torch.allclose(sums, source_sums)
 
 
 def test_split_manifest_is_json_serializable(tmp_path):

@@ -1,0 +1,174 @@
+"""批 5 回归：checkpoint、采样开关、初始化与架构几何。"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+
+def test_framework_checkpoint_config_dataclass_is_accepted(tmp_path: Path):
+    from taskcore.config.core import Config
+    from taskcore.engine.base_trainer import BaseTrainer
+
+    cfg = Config()
+    cfg.sync()
+    model = torch.nn.Linear(2, 2)
+    path = tmp_path / "framework.pth"
+    torch.save({"state_dict": model.state_dict(), "config": cfg}, path)
+
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.cfg = cfg
+    trainer.model = model
+    trainer.device = torch.device("cpu")
+    trainer.ema = None
+    trainer._load_pretrain_weights(
+        str(path), strict=True, load_ema=False)
+
+    assert ckpt["config"].__class__ is Config
+
+
+def test_checkpoint_geometry_dict_and_missing_fields():
+    from taskcore.engine.base_trainer import _checkpoint_geometry
+
+    assert _checkpoint_geometry({
+        "data": {"patch_mode": "z_axis"},
+        "model": {"spatial_dims": 3, "in_channels": 1},
+    }) == ("z_axis", 3, 1)
+    assert _checkpoint_geometry({"data": {"patch_mode": "z_axis"}}) is None
+
+
+def test_fractional_integer_override_is_rejected():
+    from taskcore.config.core import ConfigError
+    from taskcore.config.task_io import coerce_override_value
+
+    assert coerce_override_value(1, "3.0") == 3
+    with pytest.raises(ConfigError):
+        coerce_override_value(1, "3.7")
+
+
+def test_split_manifest_rank0_atomic_writer(tmp_path: Path):
+    from taskcore.data.loader import _write_split_manifest
+
+    path = tmp_path / "nested" / "split.json"
+    _write_split_manifest(
+        path, seed=42, val_ratio=0.2, rounding_mode="legacy",
+        train=["a.npz"], val=["b.npz"], rank=1)
+    assert not path.exists()
+    _write_split_manifest(
+        path, seed=42, val_ratio=0.2, rounding_mode="legacy",
+        train=["a.npz"], val=["b.npz"], rank=0)
+    assert json.loads(path.read_text(encoding="utf-8"))["val"] == ["b.npz"]
+    assert not list(path.parent.glob("split.json.*.tmp"))
+
+
+def test_legacy_z_sampling_matches_old_helpers():
+    from taskcore.data.dataset import SegDataset3D
+    from taskcore.data.sampling import safe_z_grid_center, z_grid_center
+
+    assert z_grid_center(1, 4, 20) == 7
+    assert safe_z_grid_center(1, 4, 20, 8) != z_grid_center(1, 4, 20)
+    ds = SegDataset3D.__new__(SegDataset3D)
+    ds.is_train = False
+    ds.val_grid_coverage = True
+    ds._sample_idx = 1
+    ds.image_paths = ["x"]
+    ds.samples_per_volume = 4
+    ds.extract_size = (8, 8, 8)
+    ds.z_sampling_mode = "legacy"
+    assert ds._sample_z(0, 20) == z_grid_center(1, 4, 20)
+    ds.z_sampling_mode = "safe"
+    assert ds._sample_z(0, 20) == safe_z_grid_center(1, 4, 20, 8)
+
+
+def test_z_sampling_mode_is_shared_by_cls_and_det():
+    from clstask.data.cls_dataset import ClsPatchDataset
+    from dettask.data.det_dataset import DetPatchDataset
+
+    cls = ClsPatchDataset(
+        ["x"], [8, 8, 8], 1, patch_mode="z_axis",
+        fg_values=[1], z_sampling_mode="legacy")
+    det = DetPatchDataset(
+        ["x"], [8, 8, 8], patch_mode="z_axis",
+        z_sampling_mode="legacy")
+    rng = np.random.default_rng(0)
+    assert cls._sample_z(rng, 20, 0, None, None) == 17
+    assert det._sample_z(np.random.default_rng(0), 20,
+                         np.zeros((0, 6), np.float32), None) == 17
+
+
+@pytest.mark.parametrize("arch", ["adm", "edm2"])
+def test_nonlegacy_init_strategy_rejected_for_specialized_arch(arch):
+    from taskcore.config.core import Config, ConfigError
+
+    cfg = Config()
+    cfg.model.arch = arch
+    cfg.model.init_strategy = "kaiming"
+    cfg.data.patch_mode = "2_5d"
+    cfg.sync()
+    with pytest.raises(ConfigError, match="architecture-specific"):
+        cfg.validate()
+
+
+@pytest.mark.parametrize("arch", ["adm", "edm2"])
+def test_legacy_specialized_init_is_not_overwritten(monkeypatch, arch):
+    from taskcore.config.core import Config
+    from taskcore.models import factory
+
+    cfg = Config()
+    cfg.model.arch = arch
+    cfg.model.init_strategy = "legacy"
+    model = torch.nn.Sequential(torch.nn.Conv2d(1, 1, 1, bias=False))
+    with torch.no_grad():
+        model[0].weight.zero_()
+    module_name = ("taskcore.models.adm_unet" if arch == "adm"
+                   else "taskcore.models.edm2_unet")
+    module = __import__(module_name, fromlist=["builder"])
+    monkeypatch.setattr(
+        module,
+        "build_adm_seg_model" if arch == "adm"
+        else "build_edm2_seg_model",
+        lambda cfg: model)
+    built = factory.build_model(cfg)
+    assert built[0].weight.equal(torch.zeros_like(built[0].weight))
+
+
+def test_unet3p_accepts_nondivisible_encoder_geometry():
+    from taskcore.config.core import Config
+
+    cfg = Config()
+    cfg.data.patch_size = [15, 32, 32]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.model.unet.decoder_type = "unet3p"
+    cfg.sync()
+    cfg.validate()
+
+
+def test_classic_unet_keeps_strict_geometry_check():
+    from taskcore.config.core import Config, ConfigError
+
+    cfg = Config()
+    cfg.data.patch_size = [15, 32, 32]
+    cfg.sync()
+    with pytest.raises(ConfigError, match="nearest legal"):
+        cfg.validate()
+
+
+def test_adm_geometry_does_not_call_unet_divisor_helper(monkeypatch):
+    from taskcore.config.core import Config
+    import taskcore.config.section_validators as validators
+
+    cfg = Config()
+    cfg.model.arch = "adm"
+    cfg.data.patch_mode = "2_5d"
+    cfg.data.patch_size = [3, 16, 16]
+    cfg.model.encoder_channels = [8, 16, 32]
+    cfg.sync()
+    monkeypatch.setattr(
+        validators, "effective_patch_divisors",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError()))
+    cfg.validate()

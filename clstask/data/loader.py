@@ -127,6 +127,7 @@ def build_cls_dataloaders(
             gpu_augment=(bool(cfg.augment.enabled) and is_train),
             val_grid_coverage=(bool(dc.val_grid_coverage)
                                and not is_train),
+            z_sampling_mode=dc.z_sampling_mode,
             cache_enabled=(dc.cache_mode == "memory"),
             cache_max_volumes=dc.cache_max_volumes)
 

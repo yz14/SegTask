@@ -59,6 +59,7 @@ from taskcore.data.sampling import (
     safe_z_center_range,
     safe_z_grid_center,
     uniform_center,
+    z_grid_center,
 )
 
 from ..targets import crop_boxes, flip_boxes, scale_boxes, slice_boxes_to_2d
@@ -159,6 +160,7 @@ class DetPatchDataset(NpzPatchDatasetBase):
         aug_flip_prob      : float = 0.0,
         aug_flip_axes      : Sequence[int] = (),
         val_grid_coverage  : bool = False,
+        z_sampling_mode    : str = "safe",
         cache_enabled      : bool = False,
         cache_max_volumes  : int = 0):
         super().__init__(
@@ -168,6 +170,7 @@ class DetPatchDataset(NpzPatchDatasetBase):
             fg_oversample_ratio, cache_enabled, cache_max_volumes,
             index_scheme=IndexScheme.INTERLEAVED,
             dataset_name="DetPatchDataset",
+            z_sampling_mode=z_sampling_mode,
         )
         self.fg_values = [float(v) for v in (fg_values or [1.0])]
         self.allow_mask = bool(boxes_from_mask_ok)
@@ -208,12 +211,19 @@ class DetPatchDataset(NpzPatchDatasetBase):
         z 中心；否则均匀采样。"""
         d_patch = int(self.patch[0])
         if cov_j is not None:
+            if self.z_sampling_mode == "legacy":
+                return z_grid_center(cov_j, self.spv, D_vol)
             return safe_z_grid_center(cov_j, self.spv, D_vol, d_patch)
         if (self.is_train and boxes.shape[0] > 0
                 and rng.random() < self.fg_ratio):
             b = boxes[int(rng.integers(boxes.shape[0]))]
+            z = int(round((b[0] + b[3]) / 2))
+            if self.z_sampling_mode == "legacy":
+                return z
             lo, hi = safe_z_center_range(D_vol, d_patch)
-            return int(np.clip(round((b[0] + b[3]) / 2), lo, hi - 1))
+            return int(np.clip(z, lo, hi - 1))
+        if self.z_sampling_mode == "legacy":
+            return int(rng.integers(0, D_vol))
         lo, hi = safe_z_center_range(D_vol, d_patch)
         return int(rng.integers(lo, hi))
 
