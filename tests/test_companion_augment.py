@@ -133,14 +133,37 @@ def test_seg_apply_matches_call_api():
 
     aug2 = GPUAugmentor(cfg, label_fill=0.0, seed=99)
     comps = [
-        Companion(lbl.clone(), "nearest", 0.0),
-        Companion(wm.clone(), aug2.wmap_interp_mode, 1.0),
+        Companion(lbl.clone(), "nearest", None),
+        Companion(wm.clone(), aug2.wmap_interp_mode, 0.0),
     ]
     img2, comps = aug2.apply(img.clone(), comps)
 
     assert torch.equal(img1, img2)
     assert torch.equal(lbl1, comps[0].tensor)
     assert torch.equal(wm1, comps[1].tensor)
+
+
+def test_seg_oob_keeps_label_border_and_zeros_wmap():
+    """seg 越界语义：label 保 border 复制，wmap 置 0 精确排除。"""
+    cfg = _spatial_only_cfg(
+        random_flip_prob=0.0,
+        random_affine_prob=1.0,
+        random_rotate_range=[0.0, 0.0],
+        random_scale_range=[1.0, 1.0],
+        random_translate_range=[0.5, 0.5],
+        elastic_deform_prob=0.0,
+        grid_dropout_prob=0.0,
+    )
+    aug = GPUAugmentor(cfg, label_fill=0.0, seed=5)
+    img = torch.randn(1, 1, 8, 16, 16)
+    lbl = torch.full((1, 1, 8, 16, 16), 3.0)   # 全前景
+    wm = torch.full((1, 1, 8, 16, 16), 2.0)
+    _, lbl2, wm2 = aug(img, lbl, wm)
+    # label 不再伪造背景：仍全为 border 复制的 3
+    assert set(lbl2.unique().tolist()) == {3.0}
+    # wmap 越界区域置 0
+    assert (wm2 == 0.0).any()
+    assert set(wm2.unique().tolist()) <= {0.0, 2.0}
 
 
 def test_gen_rank4_squeeze_roundtrip():

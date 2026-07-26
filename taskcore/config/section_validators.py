@@ -13,6 +13,7 @@ from typing import Any
 from .core import _require
 from .geometry import (
     compute_downsample_strides,
+    decoder_stage_count,
     effective_patch_divisors,
     stem_stride_of,
 )
@@ -35,15 +36,21 @@ def validate_encoder_decoder_stage_lengths(cfg: Any) -> None:
             "encoder_blocks_per_stage entries must all be >= 1")
     if dbps:
         decoder_type = str(cfg.model.unet.decoder_type).lower()
-        expected = (
-            n_levels - 1 if decoder_type == "unet"
-            else n_levels * (n_levels - 1) // 2
-            if decoder_type == "unetpp" else n_levels - 1)
-        _require(
-            len(dbps) in (1, expected),
-            f"decoder_blocks_per_stage for decoder_type={decoder_type!r} "
-            f"must have {expected} entries (or 1 entry for explicit broadcast); "
-            f"got {len(dbps)}")
+        # 与 factory._decoder_call_count 同源（decoder_stage_count），避免
+        # 校验通过但 build 崩溃的口径漂移。
+        expected = decoder_stage_count(decoder_type, n_levels)
+        if expected == 0:
+            _require(
+                len(dbps) == 1,
+                f"decoder_blocks_per_stage is not consumed by "
+                f"decoder_type={decoder_type!r}; omit it or pass a single "
+                f"entry (ignored broadcast); got {len(dbps)} entries")
+        else:
+            _require(
+                len(dbps) in (1, expected),
+                f"decoder_blocks_per_stage for decoder_type={decoder_type!r} "
+                f"must have {expected} entries (or 1 entry for explicit "
+                f"broadcast); got {len(dbps)}")
         _require(
             all(b >= 1 for b in dbps),
             "decoder_blocks_per_stage entries must all be >= 1")

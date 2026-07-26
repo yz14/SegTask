@@ -50,875 +50,6 @@ gentask是生成/超分项目（基于segtask_v1改造）。
 进展：
 
 
-步骤 0：范围界定、体量摸底、契约清单、计划产出。
-仓库结构：taskcore 为五任务（seg/cls/det/gen/ssl）公共层，分 config / data / models / engine / monitor / utils / metrics。
-代码体量：taskcore 约 16k 行 / 56 个 py 文件，其中重量级文件为 core.py(2168)、blocks.py(1314)、dataset.py(1192)、loader.py(988)、base_trainer.py(938)、adm_unet.py(930)、edm2_unet.py(805)、make_data.py(652)。
-文档面：仓库级 README.md、SSL.md，README.md，以及 5 个子项目 README + WORKFLOW.md（seg 另有 DESIGN.md），共 18 个 md。
-已识别的跨层契约（后续审查的重点校验对象）：patch_mode 四模式（z_axis/2_5d/cubic/whole）五任务同语义、2.5D 折叠时机契约（默认送模型前折叠，det/cls 有例外）、checkpoint 槽位约定（extract_model_state_dict + EMA 语义）、DDP 指标可加性约定、[shim] 旧路径兼容层。
-
-步骤 1 — 文档全面通读与"设计意图基线"：读完 18 个 md，抽出全部显式契约与设计取向，形成"文档声明 vs 代码实现"核对清单。依赖：无。产出：契约核对表（后续每轮拿它对代码）。
-A. 契约核对表（27 条，按主题分组）
-A1. 几何与数据口径
-#	契约声明（出处）	待核实点（代码落点）	计划轮次
-C1	patch_mode 四模式五任务同语义，且 seg/cls/det/gen 抽取口径逐位一致 @d:\codes\work-projects\SegTask\README.md:37	dataset.py 的三模式类 vs patch_dataset_base.py/patch_extract.py/patch_ops.py（cls/det 共用基类）是否真为同一抽取实现，还是两套并行代码	步骤 4
-C2	z_axis/2_5d：H/W 整面 resize 不裁窗；cubic：安全中心域三轴裁剪 + edge-pad @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:90-95	边界 pad 模式、resize 插值算子（label 必须最近邻/保整数）、越界坐标夹取	步骤 4
-C3	2.5D 折叠时机：dataset 发未折叠 3D，送模型前折叠；det 是唯一例外（dataset 内折叠，联动 slice_boxes_to_2d） @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:165 @d:\codes\work-projects\SegTask\dettask\docs\WORKFLOW.md:152	与 cls 的"关增强时 dataset 折叠"是否真等价（见 D1）；squeeze_2_5d 是否单点实现	步骤 4
-C4	dataset 只发单分辨率 max-FOV cube，多分辨率裁剪/resize 推迟到 GPU 侧，避免二次插值 @d:\codes\work-projects\SegTask\segtask_v1\docs\DESIGN.md:51	oversample 余量计算是否覆盖 max_scale × aug_oversample_ratio；GPU 侧中心裁剪是否与 dataset 抽取同中心	步骤 4
-C5	GPU 增强：空间变换 img/lbl/wmap/cond 同步，强度变换仅 img；det 的仿射/弹性自动关闭 @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:194 @d:\codes\work-projects\SegTask\dettask\docs\WORKFLOW.md:102	augment.py Companion 张量语义、label 的插值模式、det 关闭分支是否真的零副作用	步骤 4
-C6	类均衡采样：npz 逐类 fg 索引（*_cls 键），先抽类再抽位置；旧 npz 惰性回退 @d:\codes\work-projects\SegTask\clstask\docs\WORKFLOW.md:48-50	sampling.py / make_data.py 的索引生成与消费是否同构；回退路径正确性与性能	步骤 3
-C7	验证确定性：val 中心由 (seed, idx) 派生；val_grid_coverage 走 z 等距 bin / Halton(2,3,5)，与推理同口径 @d:\codes\work-projects\SegTask\clstask\docs\WORKFLOW.md:50	Halton 实现正确性、DDP 分片下确定性是否仍成立	步骤 3
-C8	pid 强配对契约：image/label/bbox/rw/npz/exclude 同 pid，缺失即报错 @d:\codes\work-projects\SegTask\segtask_v1\docs\DESIGN.md:103-112	loader.py 的发现/配对/exclude 逻辑是否有静默跳过分支	步骤 3
-C9	make_data 同口径：spacing 归一化 + fg 索引 + meta skip + 几何校验，gen 委托 prepare_one @d:\codes\work-projects\SegTask\taskcore\README.md:54	check_physical_geometry 的严格度、spacing 逆变换信息是否完整写入 meta	步骤 3
-C10	双源混采：npz_dir_secondary + mix_ratio，val 仅金标准 @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:206	mixed_sampler.py 在 DDP + drop_last 下的比例保真与 epoch 长度定义	步骤 3
-A2. 模型与拓扑
-#	契约声明	待核实点	轮次
-C11	build_topology 是几何派生单一真相源（in_channels / num_classes / spatial_dims / n_views / per-view depth / aux 激活） @d:\codes\work-projects\SegTask\segtask_v1\docs\DESIGN.md:89-97	全仓是否仍有旁路重算（grep spatial_dims = / in_channels = 的独立推导）	步骤 5
-C12	参数命名 encoder.* / decoder.* / fpn.* / det_head.* / cls_head.* 跨任务同名同形，SSL 权重 strict=False 直接命中 @d:\codes\work-projects\SegTask\dettask\docs\WORKFLOW.md:148	factory.build_backbone 与 ssl export_backbone_state_dict 的键名一致性	步骤 5
-C13	梯度检查点：encoder 逐 stage（grad_ckpt_encoder_stages 掩码）/ decoder 逐 level / ADM·EDM2 逐块；eval 零开销、数值与关闭时严格一致 @d:\codes\work-projects\SegTask\gentask\docs\WORKFLOW.md:102	与 use_reentrant 语义、RNG（dropout/drop_path）在重算时的一致性	步骤 5
-C14	稀疏—稠密等价（SparK 路线）：满密度输入下退化为普通卷积，预训练/下游共享权重 @d:\codes\work-projects\SegTask\SSL.md:45	taskcore blocks.py 的门控/归一化是否满足该等价（norm 只在活动位点统计）	步骤 5
-C15	依赖克制：NMS/ROIAlign/可变形注意力/AUC 全部纯 PyTorch 自实现，不引 torchvision/mmdet/sklearn/monai @d:\codes\work-projects\SegTask\dettask\docs\detection_models_survey.md:74	是否存在隐性第三方依赖；自实现算子的数值/性能代价	步骤 5、7
-A3. 训练工程
-#	契约声明	待核实点	轮次
-C16	损失恒 fp32（autocast 外）+ logit clamp；AMP auto = Ampere+ 选 bf16 @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:175	amp.py 的 dtype 决策与 LOGIT_CLAMP 使用面；各任务是否真的都在 autocast 外算损失	步骤 6
-C17	优化步时钟：scheduler/warmup/global_step/方法内调度按真实 optimizer.step 边界推进，尾批按实际累积长度归一 @d:\codes\work-projects\SegTask\ssltask\docs\WORKFLOW.md:121	base_trainer.py + optim.py 的 step 计数与 accum 尾组归一实现	步骤 6
-C18	非有限守护：loss/梯度非有限丢弃整个 accum 组，不污染权重/EMA；fp16 由 GradScaler 跳步；DDP 下跳步决策 all-reduce(any) 统一 @d:\codes\work-projects\SegTask\ssltask\docs\WORKFLOW.md:122	跳步时 scheduler 是否照常推进（文档称照常）、EMA/queue/center 冻结是否完备	步骤 6
-C19	EMA：验证与 best 均用 shadow；ema_device: cpu offload；warmup @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:182,192	shadow 与 buffer（BN running stats）的处理、offload 的同步开销	步骤 6
-C20	checkpoint：原子写（temp + os.replace）+ 状态指纹；resume 位精确（含 RNG）；DDP 仅 rank0；可选异步写 @d:\codes\work-projects\SegTask\ssltask\README.md:100	checkpoint.py 的指纹算法、异步写与训练结束的竞态、RNG 恢复完整性（含 dataloader worker）	步骤 6
-C21	选模槽位：best 的 model_state_dict = EMA 权重，在线权重另存 model_online_state_dict；统一经 extract_model_state_dict 读取 @d:\codes\work-projects\SegTask\taskcore\README.md:60-66	ssl 无独立 ema_state_dict 的分支、gen 历史 ckpt 兼容路径	步骤 6
-C22	seg 选模 loss 口径定案为 val_base_loss（不含深监督/aux/正则，跨配置可比） @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:218	_save_best 的 criterion 分派与 plateau 调度方向一致性校验	步骤 6
-C23	DDP：no_sync 免非边界通信、静态图、bucket-view；ssl 不套 DDP wrapper，手动 accum 边界梯度均值 all-reduce @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:212 @d:\codes\work-projects\SegTask\ssltask\docs\WORKFLOW.md:126	BaseTrainer 如何同时承载两条 DDP 路径；静态图与梯度检查点/未用参数的兼容	步骤 6
-C24	指标 DDP：可加混淆量 + all-reduce(SUM)；batch 内池化比值损失（batch_dice）在 DDP 下为近似；不可分解指标（AUC/mAP）先聚齐全集再算 @d:\codes\work-projects\SegTask\taskcore\README.md:88	metrics.py 的可加性实现与各任务 metrics 是否重复造轮	步骤 7
-A4. 配置与迁移
-#	契约声明	待核实点	轮次
-C25	配置接入两套并存：seg/cls/det/ssl 走 register_task_section，gen 走 dataclass 子类化 + 顶层 Config 组合委托 @d:\codes\work-projects\SegTask\taskcore\README.md:45-54	两套机制的能力差与维护成本；能否收敛为一套	步骤 2、8
-C26	校验错误语义：配置一律 ConfigError，data 路径用 ValueError/FileNotFoundError，模型构造期 assert 仅内部不变量 @d:\codes\work-projects\SegTask\taskcore\README.md:85	实际抛错类型是否守约；assert 在 -O 下失效的风险点	步骤 2、5
-C27	迁移交叉校验：patch_mode/spatial_dims/in_channels 与预训练不一致直接报错、不静默降级；0 命中报错 @d:\codes\work-projects\SegTask\clstask\docs\WORKFLOW.md:146 @d:\codes\work-projects\SegTask\dettask\docs\WORKFLOW.md:106	seg 侧 train.pretrain 是否有同等强度校验（文档只说 strict=False，未提交叉校验）	步骤 2、6
-B. 纯文档层面已发现的疑点（未看代码，均待核实）
-D1 · "唯一例外"表述互斥：seg WORKFLOW 称 2.5D 折叠时机的"唯一例外是 det" @d:\codes\work-projects\SegTask\segtask_v1\docs\WORKFLOW.md:165，但 cls WORKFLOW 明确存在第二条例外——关闭增强时在 dataset 侧折叠 @d:\codes\work-projects\SegTask\clstask\docs\WORKFLOW.md:148；顶层 README 的表述才是完整的 @d:\codes\work-projects\SegTask\README.md:38。文档不一致（cls 声称两路径"等价"，需代码验证等价性是否严格成立）。
-D2 · gen 训练/推理频谱不等价（文档自认待定）：训练侧 whole/z_axis/2_5d 整卷或面内 resize 到 patch 尺寸，推理侧在原生分辨率滑窗 @d:\codes\work-projects\SegTask\gentask\docs\WORKFLOW.md:154。需核实这是否只影响 gen：seg/cls/det 的推理文档都写了"面内 resize + 反向缩放"，若属实则 gen 是独苗；若 taskcore 侧抽取代码共用，则风险可能外溢。
-D3 · BasePredictor 有意薄 → 滑窗/blend 四处重复：taskcore 只放 AMP + flip TTA @d:\codes\work-projects\SegTask\taskcore\README.md:47，而 seg/gen/det/cls 各自实现滑窗、gaussian/average blend、micro-batch、坐标还原。四份高度同构逻辑分散是架构层最可疑的一处（重复代码 + 口径漂移风险，且与 C1"逐位一致"目标冲突）。
-D4 · 指标实现分散：公共 metrics.py 之外，cls/det/ssl 各有 metrics.py（AUC/F1、mAP/FROC、AUC/F1/HD95）。ssl eval/metrics.py 与 cls metrics.py 的 AUC/F1 很可能重复实现，需核实是否可收敛。
-D5 · core.py 2168 行单文件：承载 data/augment/model/train/vis/monitor 全部段 + 校验 + 迁移上下文，与"模块化、职责分离"取向张力明显；同时它是五任务共同的改动热点（每加一个任务字段都要动它）。
-D6 · shim 债务面：seg/gen 包内大量 [shim] re-export，文档反复声明"新代码勿依赖" @d:\codes\work-projects\SegTask\taskcore\README.md:86。需量化：还有多少内部调用点走 shim、是否存在 shim → taskcore → shim 的环。
-D7 · 私有名转正的兼容层：8 组"公开名 + 旧名别名" @d:\codes\work-projects\SegTask\taskcore\README.md:72-81，属可清理债务，需核实旧名是否仍有内部引用。
-D8 · SSL.md 规格 vs 实现差异面：SSL.md 的统一骨干规格（128³、五级、总步长 16、32→320 通道、InstanceNorm/LeakyReLU）@d:\codes\work-projects\SegTask\SSL.md:15 是受控实验的前提；需核实 taskcore factory 默认配置能否精确复现该规格，否则"只变自监督目标一个变量"的实验控制不成立。
-D9 · SparK 稀疏卷积：SSL.md 明确要求 spconv/TorchSparse 稀疏前向 @d:\codes\work-projects\SegTask\SSL.md:35，而 ssltask WORKFLOW 描述的是"置零 + 逐尺度门控"的稠密模拟 @d:\codes\work-projects\SegTask\ssltask\docs\WORKFLOW.md:80。二者在感受野是否向被遮区渗透上并不等价——这是方案一/二对照实验的核心变量，需重点核实。
-D10 · 文档未覆盖面：monitor、launcher、visualization、tools/、tests/（83 项）在文档中只有一句话级描述；img_process/ 完全未提。审查时需从代码侧补齐认知。
-C. 由文档推断的高风险靶点（后续轮次优先钻透）
-抽取口径"逐位一致"是否名副其实（C1+C2+D2）：seg 的 dataset.py 与 cls/det 的 patch_dataset_base.py 双实现 → 步骤 4 头号任务。
-2.5D 折叠时机三条路径的严格等价性（C3+D1）。
-累积 × AMP × DDP × EMA × scheduler 五者交互（C17+C18+C23）：这是训练框架最容易出隐性 bug 的交叉区。
-滑窗/blend 四处重复实现的口径漂移（D3）。
-build_topology 单一真相源是否被旁路（C11）。
-SSL 受控实验前提是否成立（D8+D9）。
-
-步骤 2 — config 层：core.py、registry.py、task_io.py、seg_task.py、seg_bundle.py、section_validators.py、model_migration.py。重点：配置模型的可扩展性、校验完备性与错误语义、任务段注册机制、2168 行单文件的职责划分、与业界配置体系（Hydra/OmegaConf、pydantic v2、结构化配置 + 版本迁移）的对比取舍。依赖：步骤 1。
-一、结论摘要
-总体质量高于常见科研配置层：派生量（in_channels/spatial_dims/save_best_metric）已收敛为只读 property + build_topology 单一真相源；未知键 / 旧别名 / 新旧同设一律 fail-fast；错误文案普遍带修复建议。C25/C26 大体守约。
-主要问题不在"写得对不对"，而在"同一逻辑存在两份"：gen 走 dataclass 子类化后复制了 sync / _apply_resenc_preset / _validate_train / arch allowlist，已产生 3 处可证实的语义漂移（见 F1/F4/F9）。
-一个机制是空操作：Config.validate(skip=...) 的 skip 从未被消费（F2）。
-架构层：2464 行单文件 + seg 的 4 条加载入口 + 两套任务接入机制，是后续每加一个任务/字段的固定摩擦源。
-二、契约核对（步骤 1 挂账项）
-契约	结论	依据
-C25 两套接入并存	属实。seg/cls/det/ssl 经 register_task_section，gen 为子类化 + 顶层 Config 组合委托	@d:\codes\work-projects\SegTask\taskcore\config\registry.py:47-105、@d:\codes\work-projects\SegTask\gentask\config\validation.py:19-31
-C26 错误语义	基本守约：config 全走 ConfigError（_require），无裸 assert；ConfigError(AssertionError, ValueError) 使 -O 下不失效。两处漏点：override 强转抛裸 ValueError、未知点路径抛 AttributeError	@d:\codes\work-projects\SegTask\taskcore\config\core.py:18-31、@d:\codes\work-projects\SegTask\taskcore\config\task_io.py:44-67
-C27 迁移交叉校验	config 层无此校验（seg 侧只有 pretrain_strict / pretrain_upkern 提示）。cls/det 文档所述的 patch_mode/spatial_dims/in_channels 交叉校验若存在，只可能在 engine 侧 → 顺延步骤 6 核实	@d:\codes\work-projects\SegTask\taskcore\config\core.py:944-965,2172-2176
-D5 core.py 单文件	确认：data/aug/model(+3 嵌套 arch 段+3 模块段)/loss/train/predict/vis/monitor 全部段定义 + 全部校验器 + 迁移表 + YAML I/O + legacy pickle 兼容同处一文件	@d:\codes\work-projects\SegTask\taskcore\config\core.py:62-2464
-D7 私有名转正别名	config 层的 _nested_dataclass_type 已无任何内部引用，属可清理死别名	@d:\codes\work-projects\SegTask\taskcore\config\core.py:2290
-三、缺陷清单
-P0 —— 正确性 / 隐性行为差异
-F1 · gen 缺 stretch → edge_pad 自动升级（跨项目漂移，可导致训推几何不一致） core 在 sync() 里把废弃的 z_boundary_mode='stretch' 强制升级并告警，理由是训练侧恒走 edge-pad、只有推理侧生效 → 薄卷训推几何 desync：
-
-
-
-core.py:1305-1312
-if self.data.z_boundary_mode == "stretch":
-    logger.warning(
-        "data.z_boundary_mode='stretch' is deprecated: training-side "
-        "extraction always uses edge-pad geometry, so stretch would "
-        "only take effect at inference and desync train/infer "
-        "geometry for volumes thinner than the patch depth. "
-        "Auto-upgraded to 'edge_pad'.")
-    self.data.z_boundary_mode = "edge_pad"
-gen 的 sync() 是这段逻辑的复制品，唯独漏了这个分支（@d:\codes\work-projects\SegTask\gentask\config\validation.py:33-72）；而 gen _validate_data 委托的 core 实现仍把 'stretch' 列为合法（@d:\codes\work-projects\SegTask\taskcore\config\core.py:1877-1880），Dataset 也照单全收（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:872-875）。结论：gentask 配置写 stretch 会一路通过，core 想防的问题在 gen 上完全没防。
-
-F2 · Config.validate(skip=...) 是空操作 入参接了、skip = skip or set() 也写了，随后 6 个校验器无条件全跑，skip 再未出现：
-
-
-
-core.py:1409-1415
-skip = skip or set()
-self._validate_model()
-self._validate_augment()
-self._validate_data()
-self._validate_2_5d()
-self._validate_train()
-self._validate_monitor()
-上游 TaskSectionSpec.skip_core_validators → validate_core_config → 此处（@d:\codes\work-projects\SegTask\taskcore\config\registry.py:85-88）以及 SegBundle.validate 传的 skip | {"loss","predict"}（@d:\codes\work-projects\SegTask\taskcore\config\seg_bundle.py:52-54）全部落空。当前 _COMPOSITE_SKIP_CORE = ()，故暂无 live bug，但这是典型的"看着生效、实则静默无效"结构：任何人日后填入段名都不会被执行，且不会报错。（SegBundle 自己那段按段拆分的 seg 校验是真实生效的，不受影响。）
-
-F3 · 老 checkpoint pickle 迁移未补派生 backing 字段 spatial_dims/in_channels 现为只读 property，backing 由 __post_init__ 建立（@d:\codes\work-projects\SegTask\taskcore\config\core.py:607-619）。而 legacy pickle 分支绕过 __init__，只补 nested_sections 里的嵌套段，不补 _spatial_dims/_in_channels：
-
-
-
-model_migration.py:295-297
-for f in type(self).__dataclass_fields__.values():  # type: ignore[attr-defined]
-    if f.name not in self.__dict__ and f.name in nested_sections:
-        self.__dict__[f.name] = f.default_factory()  # type: ignore[misc]
-老 state 里的扁平 spatial_dims 键会被塞进 __dict__，但 property 是数据描述符、实例字典不生效 → 读 mc.spatial_dims 抛 AttributeError。危害受限（文档称 ckpt 内嵌 config 不被消费），但属于"兼容层自身不兼容"的隐雷。
-
-F4 · resenc_preset 大小写口径 core/gen 分叉 core 大小写不敏感、与 _apply_resenc_preset 的 .lower() 查表对齐（@d:\codes\work-projects\SegTask\taskcore\config\core.py:1509-1512）；gen 仍是严格大写白名单（@d:\codes\work-projects\SegTask\gentask\config\validation.py:365-367）。同一份 YAML 写 resenc_preset: m，seg 能跑、gen 报错。
-
-F5 · 几何整除性校验缺位 → 迟到失败 配置期只在两条窄路径上检查整除性：lift 的 D % 2**(n_levels-1)（@d:\codes\work-projects\SegTask\taskcore\config\core.py:2025-2033）与 hierarchical 融合的 H/W（@d:\codes\work-projects\SegTask\taskcore\config\core.py:2096-2099）。常规 3D / 2.5D 路径下 patch_size 与总下采样步长（stem_stride × Π downsample_strides）的整除性无校验，非法组合要等到首个 forward 才炸：
-
-
-
-unet.py:270-274
-if x.shape[2:] != skip.shape[2:]:  # 上采样后必须与 skip 同尺寸
-    raise RuntimeError(
-        f"DecoderLevel size mismatch after upsample: "
-        f"x={tuple(x.shape[2:])} vs skip={tuple(skip.shape[2:])}. "
-        f"Check input spatial dims are divisible by total encoder stride.")
-配置层已有 _est_stage_tokens 这套逐级 stride 推导能力（@d:\codes\work-projects\SegTask\taskcore\config\core.py:1580-1607），把它复用为整除性校验几乎零成本，却能把"跑完数据装配再崩"提前到秒级。
-
-P1 —— 工程与可维护性
-F6 · override 强转不能做标量→列表，且错误类型不统一 coerce_override_value 按旧值类型决定转换（@d:\codes\work-projects\SegTask\taskcore\config\task_io.py:46-56）：predict.threshold 默认 0.5（Union[float, List[float]]），--override seg.predict.threshold=[0.3,0.6] 会走 float("[0.3,0.6]") 直接崩；只有默认值为 None 的 Optional 字段（如 target_spacing）才走 YAML 解析。根因是"用运行时值推类型"而非"用声明类型推类型"。另 set_dotted_attr 对未知路径抛 AttributeError、bool/list 转换失败抛裸 ValueError，与 C26 的 ConfigError 口径不齐。
-
-F7 · seg 有 4 条加载入口，且行为不一致 seg_config.load_config（→SegBundle，做 hoist）、load_config_parts（→ 元组，做 hoist）、registry.load_task_config("seg")（→ 元组，不做 hoist）、core.load_config（丢弃 seg 段只 warning，@d:\codes\work-projects\SegTask\taskcore\config\core.py:2405-2410）。其中第三条是注册表通路却缺 hoist_legacy_seg_sections（@d:\codes\work-projects\SegTask\taskcore\config\task_io.py:120-123）：同一份旧式顶层 loss:/predict: YAML，走 seg_config 正常、走 registry 直接 Unknown config key 'loss'。
-
-F8 · sync → validate 是隐式顺序契约，且每个入口手抄四行仪式 validate 大量读派生量（如 @d:\codes\work-projects\SegTask\taskcore\config\core.py:1504），未 sync 先 validate 会拿默认 3D/1ch 去校验并给出误导性报错，无任何守卫（如 _synced 标志）。同时 8 个 CLI 各自重复 apply_overrides → sync → validate → validate_task（@d:\codes\work-projects\SegTask\clstask\train.py:98-101、@d:\codes\work-projects\SegTask\dettask\train.py:99-102、@d:\codes\work-projects\SegTask\ssltask\pretrain.py:87-90、@d:\codes\work-projects\SegTask\segtask_v1\train.py:130-132 等）——目前都写对了，但这属于"靠自觉"的一致性。
-
-F9 · gen 的校验覆盖是 core 的真子集 gen 的 ModelConfig 继承 core，因而拥有 selfattn.* / multirf.* / mednext.* / grad_ckpt_encoder_stages 全部字段，但 gen _validate_model 完全不校验这几组（@d:\codes\work-projects\SegTask\gentask\config\validation.py:289-368），core 则有近 170 行专门校验（@d:\codes\work-projects\SegTask\taskcore\config\core.py:1558-1775）。若 models/factory 是共享的（步骤 5 核实），gen 可构出未经护栏（含 softmax O(N²) token 上限）的模块。
-
-F10 · 无错误聚合、无 schema 版本、迁移表只增不减 _require 首错即抛，用户改配置只能一轮一个错；三张迁移表（_FIELD_ALIASES / _DEPRECATED_DERIVED_KEYS / _REMOVED_KEYS，@d:\codes\work-projects\SegTask\taskcore\config\core.py:2246-2273）+ FLAT_TO_NESTED（60 项）无版本号、无弃用窗口、无清理判据。另 core.__getattr__ 的告警文案写的是 segtask_v1.config.%s，而模块实为 taskcore.config.core（@d:\codes\work-projects\SegTask\taskcore\config\core.py:2459）——误导。
-
-值得肯定（不建议改动）
-派生量只读化 + _DEPRECATED_DERIVED_KEYS 硬拒绝，杜绝"设了却被 sync 静默重写"，方向正确。
-route_legacy_model_dict 对"新旧同设"一律 fail-fast、不做静默优先级（@d:\codes\work-projects\SegTask\taskcore\config\model_migration.py:251-254），与 hoist_legacy_seg_sections 范式统一。
-SegBundle.__getattr__ 对 _core/_seg 与 dunder 显式抛 AttributeError 防 unpickle 自递归（@d:\codes\work-projects\SegTask\taskcore\config\seg_bundle.py:68-78），是踩过坑的写法。
-softmax 注意力的 token 数护栏（@d:\codes\work-projects\SegTask\taskcore\config\core.py:1677-1696）：把"跑到一半 OOM"提前成配置错误，正是 F5 应当照抄的范式。
-四、架构评估
-1) 2464 行单文件（D5 确认）：职责为「段定义 × 8 + 嵌套子段 × 6 + 校验器 × 8 + 预设表 × 2 + 迁移表 × 3 + YAML I/O + legacy pickle 钩子」。它同时是五任务的公共改动热点。建议的切分（仅建议）：sections/{data,augment,model,train,predict_loss,vis_monitor}.py + validators/{model,data,train,geometry}.py + io.py + legacy.py，core.py 退化为组装与再导出（__init__ 已有 from .core import *，切分对外部 import 面零影响）。
-
-2) 两套接入机制的能力差（C25）：registry 路径只能加顶层任务段，不能给 core 段加字段；gen 因需要 data.cond_* / model.sisr 只能子类化，代价是复制了 sync/preset/train 校验。收敛可行路径：TaskSectionSpec.core_cls 本已支持自定义 core 类型（@d:\codes\work-projects\SegTask\taskcore\config\registry.py:43，目前无人使用）→ 让 gen 以 core_cls=GenConfig 走注册表，同时把 sync 的公共体（num_classes 推断 / z_boundary 升级 / topology 写回 / resenc preset）提成 section_validators 同级的共享函数，gen 只覆写差异。这一步能同时消灭 F1/F4/F9 的漂移根因。
-
-3) 扩展一个新任务的成本（步骤 8 前置观察）：新增段 ≈ 1 个 dataclass + 1 个 validate_* + 1 次注册 + 4 行 CLI 仪式，成本已经很低；真正的成本在给 core 加字段（要改 core.py 段定义 + 校验器 + 可能的迁移表 + gen 的副本）。
-
-五、2026 年视角的业界对标
-方案	能解决本层什么	代价/适配性
-pydantic v2（Rust core）	F6（声明类型驱动强转）、F10（一次性聚合全部错误 + 导出 JSON Schema 供 YAML 编辑器补全）、按 arch 的 Discriminated Union 天然表达 unet/adm/edm2/sisr 段互斥	引入重依赖；dataclass → BaseModel 迁移面大。可折中：只用 pydantic.dataclasses 装饰现有 dataclass，字段定义不动
-draccus / tyro / jsonargparse	直接替掉自研 apply_dotted_overrides：类型来自注解、支持嵌套与 list、错误统一。最小侵入、性价比最高	轻量依赖；CLI 参数面需一次性对齐
-Hydra / OmegaConf structured configs	配置组合（defaults: 复用五任务公共 base）、${} 插值（消除 sync 里的部分手工派生）、sweep/multirun	Hydra 接管入口，与自建 DDP spawn/launcher 的交互需实测；对本项目"单文件 YAML + override"习惯是较大改变
-nnU-Net v2 plans.json + dataset fingerprint	与 resenc_preset/save_best_preset 同源思想的自然延伸：由数据指纹自动派生 patch_size / 逐级 stride / 深度，根治 F5 那类人工整除性配置	需 make_data 侧指纹（已有 spacing 指纹雏形，@d:\codes\work-projects\SegTask\taskcore\config\core.py:143-145），步骤 3 联动
-配置溯源（asdict + schema_version + git sha 写入 ckpt）	根除 _LegacySSLConfig 这类"为反序列化保留占位类"的债务（@d:\codes\work-projects\SegTask\taskcore\config\core.py:2429-2447），并让 F10 的迁移表有版本锚点	需 checkpoint 层配合，步骤 6 联动
-fvcore/detectron2 LazyConfig（Python 即配置）	表达条件依赖强	可 diff/可审计性差，与本项目"YAML 单一真相 + 校验"取向冲突，不建议
-六、建议改进路线（本轮不实施）
-P0（修正确性，均为小改动）：F1 gen 补 stretch 升级（或直接把 'stretch' 从合法枚举中移除，让废弃彻底化）；F2 让 skip 真正生效或删除该参数；F4 gen 对齐大小写口径；F3 legacy __setstate__ 补 backing 字段。
-P1（防迟到失败 / 统一口径）：F5 复用 _est_stage_tokens 的 stride 推导加整除性校验；F7 把 hoist 收进 load_core_and_task_config 并砍掉冗余入口；F6 override 改由字段注解驱动 + 错误统一为 ConfigError；F8 提供 finalize(cfg, task_cfg) 单函数取代四行仪式。
-P2（架构演进）：core.py 按段/校验器拆包；gen 改走 core_cls 注册表路径并共享 sync 公共体（消灭 F9 差集）；引入 schema_version + 迁移表弃用窗口，清理死别名（_nested_dataclass_type）。
-P3（前沿）：pydantic v2 或 draccus 二选一试点（建议先 draccus，仅替换 override/CLI 层）；数据指纹自动派生几何（nnU-Net 路线）。
-七、如何验证（供后续实施轮使用）
-现有测试已覆盖迁移契约与 I/O：test_d2_migration_contract.py、test_task_config_io.py、test_r2_review_hotfixes.py。建议补的回归点：
-
-gen YAML 设 z_boundary_mode: stretch → sync() 后应为 edge_pad（F1）；
-validate(skip={"train"}) 应真正跳过（或该参数不存在）（F2）；
-patch_size=[60,128,128] + 5 级 → 应在 validate() 报错而非 forward 期 RuntimeError（F5）；
---override seg.predict.threshold=[0.3,0.6] 应成功（F6）；
-旧式顶层 loss: YAML 经 registry.load_task_config("seg") 应与 seg_config.load_config 等价（F7）。
-命令（本机环境）：D:\miniconda\envs\torch27_env\python.exe -m pytest tests/test_d2_migration_contract.py tests/test_task_config_io.py tests/test_r2_review_hotfixes.py -q
-
-步骤 3 — data 层 A（离线与装配）：make_data.py、specs.py、loader.py、mixed_sampler.py、sampling.py。重点：预处理正确性（spacing/几何/fg 采样）、划分与配对逻辑、DataLoader 装配与 IO 吞吐、混采语义、DDP 下采样一致性。
-一、结论摘要
-正确性基线不错：几何校验（spacing/origin/direction 三元组只读头 fail-fast）、逐类 fg 索引的生成↔消费确实同构、val 确定性采样在 DDP 下成立、MixedBatchSampler 的 DDP 切分与 RNG 重放逻辑是对的。这三处是最容易写错的地方，都写对了。
-主要风险集中在"离线烘焙"而非"在线装配"：npz 的幂等 skip 判据不完整、替换非原子、DDP 下自动构建无 rank 守卫且 tmp 文件名固定 —— 三者叠加可以产出"能读出 meta、但内容损坏且此后永远被 skip"的数据包。这是本层唯一的数据污染型风险。
-契约层面确认一处明确违约：C8 要求"强配对缺失即报错"，但 discover_samples 对 image↔label 缺配对是 warning + 静默丢弃。
-架构层面：装配逻辑存在四份（seg 的 build_dataloaders、公共 assemble_train_val_loaders、gentask 的复制、各自的 auto-build 段），与步骤 1 记的 D3（BasePredictor 薄→滑窗四处重复）是同型债务，且已经产生了能力漂移（零批次守卫只在其中一份里）。
-二、契约核销（步骤 1 挂账 C6–C10）
-契约	结论	依据
-C6 npz 逐类 fg 索引，先抽类再抽位置；旧 npz 惰性回退	属实且同构。生成侧逐类 argwhere + 每类独立 cap + *_cls 对齐数组；消费侧按 *_cls 分组、rng.integers(len(per_cls)) 选类后选点；缺键返 None 退回合并采样，两条模式（z / cubic）都有	生成 @d:\codes\work-projects\SegTask\taskcore\data\make_data.py:131-180；消费 @d:\codes\work-projects\SegTask\taskcore\data\dataset.py:397-417、@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:992-1009、@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1234-1247
-C7 val 中心由 (seed, idx) 派生；z 等距 bin / Halton(2,3,5)；DDP 下仍确定	成立。中心只依赖 dataset 全局 idx，ValBatchShardSampler 只改"谁算"不改"算什么"；Halton 径向反演实现正确、夹取无越界。但存在两套派生公式（见 G14）与铺点质量问题（G13）	@d:\codes\work-projects\SegTask\taskcore\data\sampling.py:60-103、@d:\codes\work-projects\SegTask\taskcore\data\loader.py:40-70、@d:\codes\work-projects\SegTask\taskcore\data\patch_dataset_base.py:106-126
-C8 pid 强配对，缺失即报错	部分违约。bbox/rw 走 _match_per_sample_paths 是 fail-fast（正确）；image↔label 是 warning + 丢弃	@d:\codes\work-projects\SegTask\taskcore\data\loader.py:195-215 vs @d:\codes\work-projects\SegTask\taskcore\data\loader.py:255-260；文档 @d:\codes\work-projects\SegTask\segtask_v1\docs\DESIGN.md:112
-C9 make_data 同口径：spacing 归一化 + fg 索引 + meta skip + 几何校验	流程齐全，严格度有缺口。几何校验只读头、三量分别设容差，写得好；但 skip 判据漏 rw/bbox 来源（G3），meta 缺逆变换必需信息（G6）	@d:\codes\work-projects\SegTask\taskcore\data\make_data.py:190-213、@d:\codes\work-projects\SegTask\taskcore\data\make_data.py:67-115、@d:\codes\work-projects\SegTask\taskcore\data\make_data.py:357-386
-C10 双源混采 mix_ratio，val 仅金标准	属实。每 batch 配额精确、val 只取主源；DDP 下各 rank 同 seed 生成同一全局序列后 strided 切分、等长，比例保真；epoch 长度 = n_secondary // coarse_per_batch // world_size（coarse-bound）。副作用见 G15/G16	@d:\codes\work-projects\SegTask\taskcore\data\mixed_sampler.py:71-91、@d:\codes\work-projects\SegTask\taskcore\data\mixed_sampler.py:197-222、@d:\codes\work-projects\SegTask\taskcore\data\loader.py:1023-1061
-三、缺陷清单
-P0 —— 数据污染 / 静默错误
-G1 · DDP 下 npz 自动构建竞态，可产出损坏包 build_dataloaders 在每个 rank 上执行，auto-build 分支没有 rank0 守卫也没有 barrier：
-
-
-
-loader.py:650-656
-logger.info(
-    "data.npz_dir=%s is empty/missing — auto-building via "
-    "make_data.prepare_dataset (workers=%d). One-time cost; ",
-    npz_dir, max(dc.num_workers, 1))
-from .make_data import prepare_dataset
-counters = prepare_dataset(
-    cfg, npz_dir, workers=max(dc.num_workers, 1), overwrite=False)
-调用点无任何同步：@d:\codes\work-projects\SegTask\segtask_v1\train.py:59-60。而临时文件名是确定性的 <pid>.npz.tmp：
-
-
-
-make_data.py:390-410
-tmp_path = out_p.with_name(out_p.name + ".tmp")
-save_fn  = np.savez_compressed if compress else np.savez
-...
-with open(tmp_path, "wb") as fh:
-    save_fn(fh, **payload)
-# Windows：rename 前目标不能存在。
-if out_p.exists():
-    out_p.unlink()
-tmp_path.rename(out_p)
-N 个 rank × 各自 workers 个进程会向同一个 tmp 路径交错写入同一 pid，然后各自 unlink + rename。最坏结果是 zip 目录区可读、meta 可解析但 image/label 数据段错乱的包 —— 而 skip 判据只看 meta 键（G3），此后每次重跑都会 skipped，错误被永久固化。gentask 是同源复制品，同样无守卫：@d:\codes\work-projects\SegTask\gentask\data\loader.py:81-95。 修复方向：auto-build 收敛为 rank0 执行 + dist.barrier()；tmp 名加 os.getpid()/uuid 后缀；失败路径清理 tmp。
-
-G2 · 替换非原子，与 C20 的"原子写"范式不一致 同上代码：unlink() 与 rename() 之间崩溃 → 目标文件消失且 tmp 也已改名失败，样本丢失。os.replace(tmp, out) 在 Windows 上走 MoveFileEx(REPLACE_EXISTING)，本身就是原子覆盖，无需先 unlink。checkpoint 层已用的正是 os.replace（步骤 1 C20），此处属于范式未统一。
-
-G3 · 幂等 skip 判据缺 rw / bbox 维度 判据只覆盖 spacing_normalized / target_spacing / label_values / fg_subsample：
-
-
-
-make_data.py:78-115
-for key in _REQUIRED_SKIP_META_KEYS:
-    if key not in meta:
-        return False, f"missing meta key {key!r} (stale package)"
-cond 有专门补丁（@d:\codes\work-projects\SegTask\taskcore\data\make_data.py:255-256），恰好说明 rw/bbox 是遗漏而非有意：用户事后配置 data.region_weight_dir 或 data.bbox_dir 再重跑 make_data，全部样本 skipped，训练静默地在"无 rw / 未裁剪"的旧包上进行，且日志一片正常。同理 src_image 的 mtime/大小不比对，源 NIfTI 就地修订后旧包永久复用。
-
-G4 · C8 违约：image↔label 缺配对静默丢弃
-
-
-
-loader.py:207-215
-if missing_bases:
-    ...
-    logger.warning(
-        "discover_samples: %d/%d image bases have no matching label "
-        "under %s for any of %s; dropping them. Missing bases: %s%s",
-label 目录后缀写错、或标注只完成了一半时，训练会以"少了 60% 样本"的状态正常启动。同一文件里 bbox/rw 的匹配是 raise FileNotFoundError（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:255-260），口径自相矛盾。建议改为默认报错 + 显式 data.allow_unpaired: true 才降级为警告。
-
-G5 · seg 主路径绕过零批次守卫 守卫函数存在并被 cls/det/gen 经 assemble_train_val_loaders 使用：
-
-
-
-loader.py:722-729
-def ensure_train_batch_capacity(train_ds, batch_size: int) -> None:
-    """``drop_last=True`` 下训练集不足一个 batch 会静默零批次，显式拦截。"""
-但 seg 自己的 build_dataloaders 三条分支全部硬编码 drop_last=True 且从不调用它（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:1062-1087）。小样本冒烟 / 大 batch 调参时会得到"训练 loss 恒为初值、epoch 秒过"的无提示空转。
-
-P1 —— 口径与工程质量
-G6 · 逆变换信息不足，npz 不自足 resample_to_spacing 的输出尺寸取整，因此实际达成 spacing ≠ 名义 target：
-
-
-
-dataset.py:168-172
-D, H, W = vol.shape
-new = []
-for n, s, t in zip((D, H, W), src_spacing, target_spacing):
-    new.append(max(1, int(round(n * float(s) / float(t)))))
-return resize_3d(vol, new[0], new[1], new[2], is_label=is_label)
-meta 记的却是名义 target（@d:\codes\work-projects\SegTask\taskcore\data\make_data.py:379-383）。薄 z 轴（如 D=24）时相对误差可达百分级，推理侧按名义 spacing 反算物理尺寸会系统性偏移。另外 meta 记了 bbox 与 orig_spacing，但没有 origin / direction，bbox=None 时也没有 resample 前的原始 shape（image_shape 是 resample 后的）→ 从 npz 单独回写原始物理空间的 NIfTI 不可行，必须回读源文件。建议补 achieved_spacing、pre_resample_shape、origin、direction。
-
-G7 · 重采样无抗混叠 resize_3d 一律 zoom(order=1/0)，无 prefilter、无面积平均（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:562-566）。下采样（0.6mm → 1.5mm 这类常见 CT 归一化）会引入混叠高频，等于给模型喂了带伪影的低分辨率图。nnU-Net 对图像用 order=3 且对各向异性轴单独处理。此项与步骤 4 的面内 resize 同源，建议合并到步骤 4 一并定案。
-
-G8 · 类均衡仅限卷内，不是全局类均衡 选类是"在该卷出现的类里均匀选"（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1237-1240），而卷的选择是 idx % n_vols 的严格均匀（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1151）。因此"只出现在 3% 卷里的稀有类"在整体上仍被稀释约 30×，逐类 cap 只解决了同卷内大器官淹没小结构的问题。meta.label_counts 已经现成，做卷级按类加权采样几乎零成本。
-
-G9 · 患者级隔离只有 seg 有 group_id_regex 仅在 taskcore loader 中被消费（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:974-982）；cls 的划分只有"分层 or 随机"两档（@d:\codes\work-projects\SegTask\clstask\data\loader.py:73-82），det/ssl/gen 同理。同一患者多卷进入 train/val 两侧会让 cls/det 的验证指标系统性乐观。这是跨任务的契约缺口，不是 seg 的实现问题。
-
-G10 · 四套划分的取整口径不一致 train_val_split 用 int(n*ratio) 下取整（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:410）、grouped_train_val_split 对组数下取整（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:449）、stratified_train_val_split 层内 round（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:532）、stratified_split_by_key 也 round（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:616）。同一 val_ratio=0.2 在不同开关下 val 规模不同，跨配置的验证指标不严格可比。
-
-G11 · 装配层四份实现 build_dataloaders（seg 专用，含 auto-build + 划分 + DDP 三分支）与 assemble_train_val_loaders（cls/det/gen 用）功能重叠但不互相调用；gentask 又复制了一整份含 auto-build 的 build_dataloaders（@d:\codes\work-projects\SegTask\gentask\data\loader.py:58-99）。G5 的守卫漂移正是这种重复的直接产物。可收敛为：resolve_sources() + split() + assemble() 三段，seg 只多一个 mixed 分支。
-
-G12 · 启动期 O(N) 扫描 + fg 索引内存未计入预算 每个 rank 都要：扫全部 npz 的 meta 探测 label_values（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:954-967）、再打开全部 npz 读 fg_coords 建索引（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1128-1145）。fg 索引常驻主进程后随 dataset pickle 复制到每个 worker：每卷每类上限 50000×3×int32 ≈ 586 KiB，1000 卷 2 类 ≈ 1.1 GiB × (1 + num_workers) 份。而缓存估算只统计 image/label/rw（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:838-849），系统性低估。建议：fg 索引改为惰性按需读（LRU），或以 _index.npz 单文件汇总一次读入并用 np.memmap 共享。
-
-G13 · Halton 铺点跨卷不去相关 halton_center(j, ...) 的 j 由 idx // n_volumes 派生（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:742），所有卷共用同一串 j → 所有卷在归一化坐标系里取的是同一组相对位置。低差异序列的优势在卷内，卷间反而完全相关；且 base=5 维在 j<5 时是线性递增的，spv 小时覆盖质量接近"斜线扫"。建议 per-volume 加偏移或 Owen scrambling（几行纯 numpy）。
-
-G14 · 两套 val 确定性派生公式
-
-
-
-sampling.py:67-74
-    if is_train:
-        return worker_rng.get()
-    return np.random.default_rng((val_seed, sample_idx))
- 
- 
-def deterministic_idx_rng(seed: int, idx: int) -> np.random.Generator:
-    """cls/det 验证：中心由 ``(seed, idx)`` 确定性派生。"""
-    return np.random.default_rng(int(seed) * 1_000_003 + int(idx))
-seg 用 SeedSequence 元组（推荐做法），cls/det 用手工乘法 hash（seed*1000003+idx 在 seed 相邻时会产生高度相关的流）。两者都满足 C7 字面，但没有理由不统一到前者。另外 cls 复用 dc.split_seed 同时作为划分种子和采样种子（@d:\codes\work-projects\SegTask\clstask\data\loader.py:119），语义混用。
-
-G15 · MixedBatchSampler 的全局重放开销随卡数线性增长 每个 rank 生成全部 _num_batches_global 个 batch（含 rng.shuffle）再丢弃 (world_size-1)/world_size（@d:\codes\work-projects\SegTask\taskcore\data\mixed_sampler.py:207-222）。逻辑正确（RNG 消费必须对齐），但可以改为"先 strided 切 sec_perm、gold 用 counter-based RNG 按 rank 直接定位"，避免主进程每 epoch 的无效工作。
-
-G16 · gold≫coarse 的反向配置无告警 epoch 长度恒由 coarse 决定，gold 循环消费。若主源远大于副源，日志仍写 Gold is cycled/oversampled ~%.2fx（@d:\codes\work-projects\SegTask\taskcore\data\mixed_sampler.py:167-179），实际比值 <1 意味着"每 epoch 只见到一部分金标准"，文案误导且无校验。
-
-G17 · data 层对 config 做就地写回 dc.label_values / dc.num_classes 在 loader 内被赋值并 cfg.sync()（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:954-969）。这与步骤 2 的 F8（sync→validate 隐式顺序契约）叠加：配置的最终形态取决于 data 层是否被调用过；resolved_config.yaml 恰好在其后保存才捕获到探测值，属于顺序巧合而非设计。建议提为显式的 finalize_from_data(cfg, paths)。
-
-四、2026 年视角的可借鉴项
-方向	可解决什么	适配性
-数据指纹 / plans（nnU-Net v2）	_resolve_target_spacing（@d:\codes\work-projects\SegTask\taskcore\data\make_data.py:467-488）已是 median spacing 指纹的雏形，扩成 dataset_fingerprint.json（spacing 分布、shape 分布、CT 强度 0.5/99.5 分位、类频）即可派生 patch_size/stride/归一化参数，直接根治步骤 2 的 F5（整除性迟到失败）与本层 G8	纯自研、零新依赖，收益/成本比最高
-分块存储（Zarr v3 + sharding / tensorstore）	现在是"整卷 npz → 整卷解码 → LRU 缓存"，随机 patch 抽取的真实读放大等于 卷体积 / patch 体积。分块存储可按 patch 邻域直读，同时消灭 G12 的 fg 索引常驻内存	需重写 dataset 读路径，属 P2/P3；但对大数据集是量级差异
-WebDataset / MosaicML Streaming（MDS）	顺序分片 + 网络盘/多机友好，解决 savez 依赖 OS page cache 在共享存储上完全失效的问题	与"随机 patch 中心"范式冲突较大，仅在切换为"离线预抽 patch"时才合适
-blosc2 / zstd 分块压缩	替掉二选一的 savez(不压缩，但大) vs savez_compressed(zlib，慢且不共享 page cache)。zstd-1 通常 3–5× 压缩且解压带宽 >1 GB/s	需引入 blosc2 或 zarr，属轻量依赖，需按第三条规则先说明必要性
-每 batch 强制前景配额（nnU-Net oversample_foreground_percent）	现在是逐样本伯努利（rng.random() < fg_ratio），batch 内前景样本数是二项分布，方差大 → 梯度噪声大。改为"batch 内前 k 个样本强制 fg"	需在 sampler 层实现，与 MixedBatchSampler 可复用同一套 batch 级配额机制
-组内分层划分（StratifiedGroupKFold 语义）	现在 group 与 stratified 是二选一且 group 直接覆盖 stratified（@d:\codes\work-projects\SegTask\taskcore\data\loader.py:974-982）。贪心版组内分层 ~30 行纯 Python，可同时满足患者隔离与类平衡	零依赖，配合 G9 一并做
-划分产物落盘（splits_final.json）	现在划分由 (paths, ratio, seed) 隐式决定，数据目录一旦增删样本，历史实验的 val 集就无声改变，实验不可比	极小改动、极高收益，建议与 G10 一起定案
-五、建议改进路线（本轮不实施）
-P0：G1 auto-build 收敛为 rank0 + barrier、tmp 名唯一化；G2 改 os.replace；G3 skip 判据补 has_rw / src_bbox / 源文件指纹；G4 image↔label 缺配对默认报错；G5 build_dataloaders 接入 ensure_train_batch_capacity。五项均为小改动。
-P1：G6 meta 补 achieved_spacing/origin/direction/pre_resample_shape；G10 统一取整口径并落盘 splits；G9 把 group_id_regex 提到公共划分入口供五任务共用；G14 统一到 SeedSequence 元组；G11 三段式收敛装配层（顺带消灭 gentask 副本）。
-P2：G12 fg 索引惰性化/共享内存；G8 卷级类加权采样；G13 Halton per-volume scramble；G7 抗混叠（与步骤 4 合并定案）。
-P3：数据指纹 → plans 自动派生几何（联动步骤 2 F5）；分块存储试点。
-六、如何验证（供后续实施轮）
-现有覆盖：test_mixed_sampler.py、test_sampling.py、test_assemble_dataloaders.py、test_review_batch4_fixes.py、test_data_pipeline_smoke.py。建议补的回归点：
-
-先建含 rw 的 npz，再以 region_weight_dir 重跑 make_data → 应重生成而非 skipped（G3）；
-两个进程并发 prepare_dataset 同一 out_dir → 产物应逐个可完整解码（G1/G2）；
-label 目录后缀故意写错 → discover_samples 应抛错而非 warning（G4）；
-len(train_ds) < batch_size 时 build_dataloaders 应报错而非返回 0 批次 loader（G5）；
-resample_to_spacing 对 D=24、s=5.0→t=1.5 的体积，meta 中记录的 spacing 应等于实际达成值（G6）。
-
-
-步骤 4 — data 层 B（在线读取与增强）：dataset.py、patch_dataset_base.py、patch_ops.py、patch_extract.py、augment.py。重点：四种 patch_mode 抽取口径逐位一致性、2.5D 折叠时机、GPU 增强正确性与伴随张量语义、随机性/可复现性、性能热点。
-一、结论摘要
-叶子层是全仓库最干净的一处分层：extract_cubic_patch / extract_z_patch_padded / resize_3d 三个原语单点维护，seg/cls/det/gen/ssl/predictor 六方共用，没有复制。步骤 1 担心的"两套并行抽取代码"不成立于算子层。
-但成立于组装层：seg 走 SegDataset3D/Cubic/Whole + specs.py 三策略，cls/det 走 NpzPatchDatasetBase + extract_patch_by_mode，两套各自维护"过采样余量 / 安全中心域 / 验证 RNG"。C1 的"逐位一致"应精确表述为抽取算子一致、采样策略与余量不一致，且已产生 1 处可致数据污染的守卫漂移（H1）。
-增强层质量高于预期：仿射与弹性融合为单次 grid_sample 且合成公式数学正确；随机性全程 CPU 采样避免 device→host 同步；Companion 伴随张量语义清晰；gentask 是 74 行薄封装而非复制。C5 全项守约。
-本层最大的工程债不是正确性而是"面内 resize"：z_axis/2_5d/whole 三模式每样本对 (eD,512,512) fp32 跑一次 scipy.zoom(order=1)，既是 dataloader 头号热点，又无抗混叠（承接步骤 3 的 G7）。
-C3/D1 定案：文档不一致属实，但三条折叠路径的代码等价性严格成立，无需修代码，只需改文档。
-二、契约核销（步骤 1 挂账 C1–C5、D1、D2）
-契约	结论	依据
-C1 四模式五任务同语义、抽取逐位一致	部分属实。算子层一致；组装层三处分叉：①过采样余量只有 seg 有；②cubic 安全中心域 seg 按 max-FOV 尺寸算、cls/det 按 patch_size 算；③val RNG 两套公式	@d:\codes\work-projects\SegTask\taskcore\data\patch_extract.py:33-50 vs @d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1213-1221、@d:\codes\work-projects\SegTask\clstask\data\cls_dataset.py:360
-C2 z/2.5D 整面 resize、cubic 三轴 edge-pad、越界夹取	属实。edge-pad 单点、label 恒 order=0、zoom(mode="nearest") 且带形状防御性校正、中心夹取有 safe_center_range 退化分支。一处自相矛盾见 H2	@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:548-573、@d:\codes\work-projects\SegTask\taskcore\data\patch_ops.py:81-89
-C3 / D1 2.5D 折叠时机、det 唯一例外	文档错、代码对。cls 两条路径产出布局逐位一致（dataset 侧 (D,H,W)→collate (B,D,H,W)；trainer 侧 (B,1,D,H,W)→fold→(B,D,H,W)）；折叠原语单点。ssl 同 cls。结论：只需改 seg WORKFLOW 的"唯一例外"表述	@d:\codes\work-projects\SegTask\clstask\data\cls_dataset.py:409-423、@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:203-205、@d:\codes\work-projects\SegTask\taskcore\engine\views.py:26-32
-C4 单分辨率 max-FOV cube，缩放推迟 GPU	属实且实现正确。augment → center_crop → split_views（逐视图中心裁 + 单次 interpolate），全程无二次插值	@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:470-477、@d:\codes\work-projects\SegTask\segtask_v1\trainer\views.py:85-95
-C5 空间变换同步伴随张量、强度仅 image、det 自动关闭	属实。det 用 dataclasses.replace 清零四个概率，各函数 prob<=0 / 掩码全 False 早退，零副作用（仅多一次 zeros_like 分配）。两处浪费见 H-补注	@d:\codes\work-projects\SegTask\dettask\trainer\det_trainer.py:51-63、@d:\codes\work-projects\SegTask\taskcore\data\augment.py:287-377
-D2 gen 训推频谱不等价是否外溢	不外溢到本层。四模式的训练几何在 dataset 侧五任务共用，gen 的训推差异源于 predictor 侧滑窗（属 D3 域），本层无风险	@d:\codes\work-projects\SegTask\gentask\data\specs.py 仅覆盖 dataset_cls
-D7 补注 私有名转正债务	本层新增一组：augment.py 的 _random_flip / _random_affine_elastic / _grid_dropout 三个旧签名包装已被 *_companions 版完全取代，疑似仅测试在用	@d:\codes\work-projects\SegTask\taskcore\data\augment.py:201-214,380-409,464-479
-另核实：z_boundary_mode='stretch' 在 dataset 侧确为死配置——构造期校验后 _getitem_max_fov 无条件走 padded 抽取，测试已把这一点固化为断言，与步骤 2 的 F1 描述吻合（@d:\codes\work-projects\SegTask\tests\test_z_boundary_mode.py:198-201）。
-
-三、缺陷清单
-P0 —— 正确性 / 静默失效
-H1 · whole 模式在 cls/det/gen 侧存在 LRU 缓存别名，守卫只存在于 seg 一份
-
-resize_3d 在形状已匹配时直接返回入参（不拷贝）：
-
-
-
-dataset.py:550-553
-if arr.ndim == 3:
-    D, H, W = arr.shape
-    if D == target_d and H == target_h and W == target_w:
-        return arr
-seg 对此有显式守卫：
-
-
-
-dataset.py:1322-1325
-if img_r is img:
-    img_r = img_r.copy()
-if lbl_r is lbl:
-    lbl_r = lbl_r.copy()
-而公共叶子 extract_patch_by_mode 的 whole 分支没有（@d:\codes\work-projects\SegTask\taskcore\data\patch_extract.py:44-45），cubic/z 两个分支则由 extractor 内部无条件 copy 兜住。cls 后续的 np.ascontiguousarray(img_patch, dtype=np.float32) 对已连续的 fp32 数组是 no-op，于是 torch.from_numpy 直接共享 worker LRU 缓存内存（@d:\codes\work-projects\SegTask\clstask\data\cls_dataset.py:404-406）。当前靠 default_collate 必然分配新存储兜住，但 cls 的 GPU 增强是 inplace=True 的就地写（@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:130-134）——一旦有人绕过 collate 或加就地预处理，缓存被污染且后续所有样本静默错误。 → 修复：whole 分支末尾无条件 copy()，与另两个分支口径统一。一行，本层性价比最高的改动。
-
-H2 · z_axis/2_5d 的 z 中心不受安全域约束，与 cubic 的取向自相矛盾
-
-cubic 明确防"过半体素来自边界复制"：
-
-
-
-dataset.py:1223-1226
-def _sample_center(self, vol_idx: int, D: int, H: int, W: int) -> Tuple[int, int, int]:
-    """采样中心 (d,h,w) 并夹匯至 _safe_center_range，以免 max-FOV cube 越界
-    导致>50% 体素来自边界复制（偏移训练分布）。验证用逐样本确定性
-    RNG（见 _sample_rng）。"""
-z 路径完全不设防：return int(rng.integers(0, D_vol))（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1010），前景切片采样也不夹取（同文件 1007-1009）。验证侧 z_grid_center 铺到 (0.5/S)*D，首尾 bin 同样严重 padded（@d:\codes\work-projects\SegTask\taskcore\data\sampling.py:87-90）。cls/det 的 z 路径复制了同一行为。薄卷（D_vol < pD，CT 常见）时整批样本都是"真实内容 + 大段复制"，训练与验证分布双双偏移，且无任何日志。
-
-H3 · intensity_clamp 会把 grid_dropout 的洞抬回去，dropout 静默失效
-
-clamp 基准在任何增强前取，dropout 把洞置 0，末尾 clamp 又把 0 抬回 clamp_lo：
-
-
-
-augment.py:160-161
-if c.intensity_clamp:
-    image = torch.maximum(torch.minimum(image, clamp_hi), clamp_lo)
-当 patch 不含空气（minmax 下 clamp_lo>0；软组织窗、zscore 归一化下都常见）时，dropout 效果被系统性削弱乃至完全抵消。默认 grid_dropout_prob=0.0（@d:\codes\work-projects\SegTask\taskcore\config\core.py:254）故当前非 live，但属"填了参数看着生效、实则无效"结构——与步骤 2 的 F2 同型。 → 修复：dropout 移到 clamp 之后，或用 clamp_lo 而非 0 作为填充值。
-
-H4 · test_z_boundary_mode.py 的 main() 引用了已改名的函数，按文件头文档的运行方式直接 NameError
-
-文件头写明 python test_z_boundary_mode.py（@d:\codes\work-projects\SegTask\tests\test_z_boundary_mode.py:28-29），而 main() 的 tests 列表里是 test_default_z_boundary_mode_is_stretch（同文件 461 行），实际定义名为 test_default_z_boundary_mode_is_edge_pad_and_stretch_auto_upgrades（同文件 49 行）。pytest 逐函数收集不受影响，所以一直没被发现。
-
-P1 —— 性能 / 口径 / 可维护性
-H5 · 面内 resize 是本层第一热点，且无抗混叠（承接 G7）
-
-z_axis 路径每个样本：先 extract_z_patch_padded 拷出 (eD, 512, 512) fp32 slab（eD=64 时约 67 MB），再 zoom(order=1) 到 (eD,128,128)（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:959-965）。有效计算量是最终 patch 的 16 倍，且 4× 下采样用双线性等同抽样，混叠严重（nnU-Net v2 对 image 用 order=3 并对各向异性轴单独处理）。cubic 模式无此问题（先裁后不 resize）——这也解释了为什么同一份配置换 patch_mode 后吞吐差异巨大。 → 三条路可选：①make_data 侧按目标面内分辨率预烘焙（最彻底，顺带消灭 G12 的读放大）；②dataset 只发 slab，面内 resize 挪到 GPU 用 F.interpolate(antialias=True)（与 C4"缩放推迟到 GPU"的既有取向完全一致，纯 torch 零新依赖）；③至少给下采样加高斯预滤波。
-
-H6 · 弹性形变不是 B-spline、也不是高斯平滑场，sigma/alpha 语义均失真
-
-_elastic_grid_disp 是"粗网格 randn + trilinear 上采"（@d:\codes\work-projects\SegTask\taskcore\data\augment.py:272-284），得到的是 C0 连续、控制点处梯度不连续的分片线性场；elastic_deform_sigma 实为"下采倍数"而非高斯 sigma。三处措辞互不匹配：配置注释写"位移平滑度"、docstring 写"B-spline 随机位移场"、代码是 D/sigma 的网格尺寸。且 randn 上采后方差衰减，实际位移远小于标称 alpha（配置注释已承认"近似标称"）→ alpha 不可跨 sigma 比较，调参不可复现。
-
-H7 · 强度增强函数的维度假设不统一
-
-_random_brightness / _random_contrast 硬编码 5D（torch.ones(B,1,1,1,1)，@d:\codes\work-projects\SegTask\taskcore\data\augment.py:493,511），而 _random_gamma 与 clamp 用 image.ndim 动态（同文件 530,541）。det 靠 unsqueeze(1) 兜住（@d:\codes\work-projects\SegTask\dettask\trainer\det_trainer.py:164），gen 靠 squeeze_back 兜住（@d:\codes\work-projects\SegTask\gentask\data\augment.py:40-46）——都是调用方替被调方补维。任何新调用方直传 rank-4 即广播报错。
-
-H8 · _grid_dropout_companions 的实现代价与整个 patch 同量级，且破坏 in-place 约定
-
-每次分配 (B,1,D,H,W) 掩码 + num_holes 次五维高级索引写入，末尾 image * effective 返回新张量（@d:\codes\work-projects\SegTask\taskcore\data\augment.py:443-461）——inplace=True 时也会多出一份 batch 显存。用 masked_fill_ 或直接对切片区间赋值可零额外分配。
-
-H9 · 同一语义两种写法：seg 用 rng.choice(fg_slices)（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:1008-1009），cls 在同一文件内混用 rng.choice（349 行）与 rng.integers（367 行）。choice 比 arr[rng.integers(len(arr))] 慢一个量级，且两者消耗的随机数不同 → 即使统一 seed 也不可比。
-
-H10 · 两套 val 确定性派生在本层的具体后果（承接 G14）：val_grid_coverage=True 时 seg（interleaved j）与 cls（blocked j）覆盖同一 bin 集合、等价；关闭时 seg 用 SeedSequence((seed,idx))、cls/det 用 seed*1000003+idx（@d:\codes\work-projects\SegTask\taskcore\data\sampling.py:60-74），同一份数据在 seg 与 cls 下的 val patch 集合完全不同 → SSL 受控实验的下游评估跨任务不可比（D8 的隐性前提再破一处）。
-
-H11 · seg dataset 把参数藏进实例属性：__getitem__ 先写 self._sample_idx = idx / self._current_vol_idx，再由 _sample_rng()、_val_coverage_pos()、_pack_extra_sample_tensors 隐式读取（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:931-933,1150-1152）。单 worker 顺序取样安全，但 cls/det 基类已收敛为显式传参 _item_rng_and_cov(idx)（@d:\codes\work-projects\SegTask\taskcore\data\patch_dataset_base.py:106-126）——seg 侧是尚未收敛的旧写法。
-
-H12 · 三个独立 VolumeCache 共用同一个容量数字：img/lbl/rw 各持一份 max_volumes 相同的 LRU（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:710-712），实际驻留是 3×N 卷，而配置只有一个数字；且三者淘汰不同步，会出现 image 命中而 label 未命中的抖动。这使步骤 3 的 G12（缓存预算低估）再放大一次。
-
-补注（C5 的两处浪费，不算缺陷但可省）：cls 的 table 源用 torch.zeros_like(img) 造假 label 走完整空间 warp（@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:200-201）——直接调 augmentor.apply(img) 即可省掉一次全尺寸 grid_sample；gen 的 cond 参与空间 warp 但不参与强度增强，若 cond 是同源低剂量/另一时相体，条件—目标的强度关系会被打散，建议提供同步开关。
-
-四、值得肯定（不建议改动）
-三层切分（patch_ops 原语 / patch_extract 按模式派发 / sampling 采样策略）是本仓库分层最干净的一处，五任务 + predictor 共用零复制。
-仿射与弹性融合为单次 grid_sample，合成公式 G(x)=Θ(x+d)=affine_grid+M·d 数学正确（@d:\codes\work-projects\SegTask\taskcore\data\augment.py:354-362）——比 MONAI 默认的两次重采样质量更好且成本更低。
-随机性工程：Bernoulli 掩码与逐样本标量一律 CPU 采样再异步搬卡，明确规避 device→host 同步；逐 rank seed + 7919*(rank+1) 分流，四个 trainer 口径完全一致。
-preprocess_image 的 owned/只读/inplace 三态处理与 _open_npy_member_mmap 的零拷贝快路径，都显式承诺并保证了"与慢路径逐位一致"（@d:\codes\work-projects\SegTask\taskcore\data\dataset.py:255-294,486-491）。
-gentask 的 augment 是 74 行薄封装而非复制——与 config 层 F1/F4/F9、data-A 层 G11 的复制病形成鲜明对比，这个模式应作为其他层收敛的范本。
-五、架构评估
-**"叶子共享、组装分叉"**是本层的准确画像。收敛路径：让 SegDataset* 也继承 NpzPatchDatasetBase，把"oversample 余量 + max_scale"作为基类可选参数（cls/det 传 1.0），采样策略全部收进 sampling.py。一次消除 H1/H2/H10/H11 四处漂移；代价是 seg dataset 签名变动、测试面较大，属 P2。
-CPU/GPU 职责线画得对，唯一没遵守的是 H5。把面内 resize 挪上卡后，这条线才真正一致，并顺带获得 antialias 与吞吐——这是本层投入产出比最高的架构级改动。
-augment.py 638 行不属于 core.py 那种堆积（一个类 + 12 个纯函数，职责单一）。真正可清的是三个已被 Companion 版取代的旧签名包装（D7 型死代码）。
-六、2026 年视角的可借鉴项
-方向	解决什么	适配性
-F.interpolate(antialias=True) / nnU-Net v2 各向异性重采样	H5-① 混叠	纯 torch，零新依赖
-GPU 侧数据管线（DALI / MONAI GPUTransform 思路）	H5-② 吞吐	已有 GPUAugmentor 基础设施，只需把 resize 挪进来
-RandAugment / TrivialAugment 式策略层	超参从 ~20 个 prob 降到 2 个；2024–2026 医学分割上多次验证不劣于手调	可与现有逐变换 prob 并存，P3 试点
-block-wise masking（MAE / SparK）	取代 grid_dropout，并与 ssltask 已有遮挡机制共用一套而非各写一份	与步骤 5 的 C14 联动
-3D Copy-Paste / CarveMix / ObjectAug	稀有类收益远大于再调 affine 幅度；与 G8 卷级类加权互补	可直接复用现成 fg_coords 索引，零依赖
-SeedSequence.spawn 全链路种子体系	统一 H10 的两套派生公式	极小改动
-七、建议改进路线（本轮不实施）
-P0（均 ≤5 行）：H1 whole 分支补 copy；H2 z 中心加安全域或至少加边
-（接上）P0：H1 whole 分支补 copy()；H2 z 中心加安全域（或加"边界复制占比"告警）；H3 dropout 与 clamp 顺序定案；H4 修 main() 死引用。
-
-P1：H5 面内 resize 上 GPU + antialias（与 G7 合并定案）；H6 弹性场改高斯平滑并把 alpha 归一为真实体素位移；H7 强度函数统一走 image.ndim；H8 dropout 就地化；H9 统一 rng.integers。
-
-P2：SegDataset* 并入 NpzPatchDatasetBase、采样策略收敛到 sampling.py（消灭 H10/H11）；三个 VolumeCache 合一并计入预算（H12，联动 G12）；清理 augment.py 三个死包装（D7）。
-
-P3：RandAugment 式策略层；3D Copy-Paste；预烘焙 patch / DALI 试点。
-
-八、如何验证（供后续实施轮）
-现有覆盖：test_z_boundary_mode.py、test_segtask_v1.py（多分辨率 max-FOV shape）、test_data_pipeline_smoke.py、test_review_batch4_fixes.py。建议补的回归点：
-
-同一 npz + 同一 center，SegDataset3DCubic（oversample=1、max_scale=1）与 ClsPatchDataset 的 image patch 应逐位相等 —— C1 目前没有任何跨任务比对测试，这是最该补的一条；
-whole 模式取样后对返回张量 in-place 写入，worker LRU 缓存不应被改变（H1）；
-D_vol=8, pD=32 时边界复制切片占比应有上界（H2）；
-grid_dropout_prob=1.0 + intensity_clamp=True + 全正强度 patch → 输出应存在等于 0 的洞（H3）；
-固定 seed 下 GPUAugmentor 两次 apply 逐位一致，且 rank0/rank1 不一致（增强 RNG 分流契约目前只有注释、无测试）。
-命令：D:\miniconda\envs\torch27_env\python.exe -m pytest tests/test_z_boundary_mode.py tests/test_data_pipeline_smoke.py tests/test_segtask_v1.py -q
-
-步骤 5 — models 层：topology.py、factory.py、stem.py、blocks.py、unet*.py、resnet.py、convnext.py、mednext.py、adm_unet.py、edm2_unet.py、arch_compat.py。重点：几何派生单一真相源是否真的唯一、构造期不变量、归一化/激活/初始化选择、显存与 channels_last/编译友好性，以及 2026 年可借鉴的架构要素。
-一、结论摘要
-C11（build_topology 单一真相源）成立，且比文档描述更彻底：全仓无一处旁路重算——Config.sync @d:\codes\work-projects\SegTask\taskcore\config\core.py:1334-1339、unet/adm/edm2 三条 build 路径 @d:\codes\work-projects\SegTask\taskcore\models\factory.py:336,560 @d:\codes\work-projects\SegTask\taskcore\models\adm_unet.py:762 @d:\codes\work-projects\SegTask\taskcore\models\edm2_unet.py:657、gen 的 SISR/扩散/pipeline/predictor 全部读 topology。这是目前审到的最干净的一条跨层契约。
-本层的系统性病灶不是"算错"，而是"同一语义、五处实现、口径各异"：五个 decoder（unet / unetpp / unet3p / adm / edm2）对"上采样后与 skip 尺寸不符"给出了 1 处硬报错 + 3 处静默 interpolate + 1 处一次性 warning 五种行为（I1）；梯度检查点的粒度也是 逐 stage / 逐 level / 只包融合卷积 / 逐块 / 完全绕过 五档（I2、I3）。
-发现 1 处会静默改变数值语义的正确性问题：BatchNorm × 梯度检查点 的 running stats 双更新（I4），在 norm_type='batch' 或 mednext.dilated_reparam=True 下必然触发，直接违反 C13 的"数值与关闭时严格一致"。
-C14/D9 定案：SSL.md 要求的稀疏前向与实现的"稠密+逐 stage 门控"不等价，且差距比文档承认的更大——门控只发生在 stage 边界，stage 内部的每一层卷积仍把被遮区当作真值 0 参与计算（I5）。同时 spark_encode 复制了 Encoder.forward 却漏掉了梯度检查点（I6）。
-C15（依赖克制）在本层完全守约：blocks/resnet/convnext/mednext/unet* 只依赖 torch + numpy + einops，无 torchvision/monai/mmcv；CARAFE/DySample/BlurPool/ICNR/UniRepLKNet 重参数化全部自实现且实现正确。
-最大的未兑现性能红利：本层已经把 SDPA、channels_last 兼容、torch.compile 友好（RoPE 显式绕 dict 缓存 @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:530-533）都做对了，却在 ADM/EDM2 的注意力里退回手写 einsum+softmax（I7），并且全网没有任何权重初始化策略（I8）。
-二、契约核销（步骤 1 挂账项）
-契约	结论	依据
-C11 build_topology 是几何派生单一真相源	完全属实。spatial_dims/in_channels 已只读化，grep 全仓无旁路推导；三 arch + 五任务 + predictor + pipeline 全部读 ModelTopology	@d:\codes\work-projects\SegTask\taskcore\models\topology.py:75-166、@d:\codes\work-projects\SegTask\taskcore\models\factory.py:336-341
-C12 encoder.*/decoder.* 跨任务同名同形，SSL strict=False 直接命中	属实但有名字冲突隐患。build_backbone 与 build_model 共用 _build_unet_encoder_decoder，键名逐参数一致；但 ADM/EDM2 也叫 encoder.*/decoder.* 而结构完全不同 → unet SSL 权重误加载进 adm 会命中同名不同形，靠 load_state_dict 的 size-mismatch 硬报错兜住（可接受），但 seg 侧缺 0 命中校验（I9）	@d:\codes\work-projects\SegTask\taskcore\models\factory.py:520-540 vs @d:\codes\work-projects\SegTask\taskcore\models\adm_unet.py:607-642
-C13 梯度检查点：逐 stage / 逐 level / ADM·EDM2 逐块；eval 零开销、数值严格一致	粒度属实，"数值严格一致"不成立。use_reentrant=False + preserve_rng_state=True 写法正确（DropPath 可复现），但 BN running stats 会被重算路径二次更新（I4）；unet3p/unetpp 的 checkpoint 只包了融合卷积、漏掉主要激活来源（I3）；stem 与 Downsample 从不包裹（I2）	@d:\codes\work-projects\SegTask\taskcore\models\blocks.py:49-64、@d:\codes\work-projects\SegTask\taskcore\models\unet.py:215、@d:\codes\work-projects\SegTask\taskcore\models\unet3p.py:115-119
-C14 稀疏—稠密等价（SparK）	满密度退化严格成立（有单测逐位断言）；稀疏侧不等价：门控只在 stage 边界，且只有 InstanceNorm 有 masked 版本，norm_type='group'/'batch'（mednext/convnext 路线）仅告警不修复（I5）	@d:\codes\work-projects\SegTask\ssltask\models\spark_modules.py:144-190,101-141、单测 @d:\codes\work-projects\SegTask\tests\test_ssltask.py:1465-1481
-C15 NMS/ROIAlign/AUC 等纯 PyTorch 自实现、不引重型库	本层完全守约，零隐性第三方依赖	import 面：torch / numpy / einops
-C26 模型构造期 assert 仅内部不变量	基本守约，两处越界：assert channels % num_head_channels == 0 是用户配置驱动的条件（-O 下失效将退化为静默错误的头数）	@d:\codes\work-projects\SegTask\taskcore\models\adm_unet.py:277-279、@d:\codes\work-projects\SegTask\taskcore\models\edm2_unet.py:113-114,211
-D8 SSL.md 统一骨干规格可否精确复现	可以，但默认值不等于规格：五级/总步长 16（stem_mode='conv3' stride=1 + 4×2）/ InstanceNorm+LeakyReLU 都是默认；通道默认 [32,64,128,256,512] 而 SSL.md 写 320 → 受控实验必须在 YAML 里显式钉死通道，否则"只变自监督目标一个变量"不成立	@d:\codes\work-projects\SegTask\taskcore\config\core.py:556-557,392-395,573
-D9 SparK 稀疏 vs 稠密模拟	确认不等价，且差距被低估（见 I5）。这是方案一/二对照实验的核心变量，结论层面需在论文/报告中如实标注为"masked-dense 近似"而非 SparK	@d:\codes\work-projects\SegTask\ssltask\models\spark_modules.py:178-186
-三、缺陷清单
-P0 —— 正确性 / 静默语义改变
-I1 · 五个 decoder 对"尺寸不整除"的处理有四种不同语义（口径分裂 + 静默降级）
-
-经典 Decoder 硬报错（这是步骤 2 F5 依赖的那道最后防线）：
-
-
-
-unet.py:270-274
-if x.shape[2:] != skip.shape[2:]:  # 上采样后必须与 skip 同尺寸
-    raise RuntimeError(
-        f"DecoderLevel size mismatch after upsample: "
-        f"x={tuple(x.shape[2:])} vs skip={tuple(skip.shape[2:])}. "
-        f"Check input spatial dims are divisible by total encoder stride.")
-而 UNet++ 只 warn 一次然后 interpolate 兜住 @d:\codes\work-projects\SegTask\taskcore\models\unetpp.py:105-116；ADM @d:\codes\work-projects\SegTask\taskcore\models\adm_unet.py:547-549 与 EDM2 @d:\codes\work-projects\SegTask\taskcore\models\edm2_unet.py:461-464 连 warn 都没有，直接 F.interpolate 静默续跑；UNet3+ 则用 adaptive_pool/interpolate 把"任意尺寸"当作正常工况 @d:\codes\work-projects\SegTask\taskcore\models\unet3p.py:81-91。后果：同一份非法 patch_size，decoder_type='unet' 秒级报错、换成 unetpp/adm/edm2 则训练全程带着一层隐性重采样跑完，且训推几何不再等价（与 D2 同型风险）。定案建议：把整除性校验上提到配置层（步骤 2 F5），五个 decoder 统一为硬报错。
-
-I2 · 梯度检查点漏掉了激活占用最大的两处：stem 与 Downsample
-
-Encoder.forward 只包裹 stage @d:\codes\work-projects\SegTask\taskcore\models\unet.py:215，而 self.stem(x) @d:\codes\work-projects\SegTask\taskcore\models\unet.py:194 与 self.downsamples[i-1](x) @d:\codes\work-projects\SegTask\taskcore\models\unet.py:203 恒不包裹。stem 输出是全网分辨率最高的特征图（(B, C0, D, H, W)，128³×32ch fp16 ≈ 128 MB/样本），conv7/dual stem 更是两层。配置注释自称"stem/上下采样/头不包裹（开销小）"@d:\codes\work-projects\SegTask\taskcore\config\core.py:594，与实际显存分布相反。
-
-I3 · unet3p/unetpp 的 checkpoint 只包了融合卷积，省下的显存很少
-
-
-
-unet3p.py:115-119
-    branches.append(self.branches[i][j](src))
- 
-fused = torch.cat(branches, dim=1)
-decoder_nodes[i] = checkpoint_if(
-    self.grad_checkpointing, self.fusions[i], fused)
-每个节点有 n 条分支卷积（n=5 时 5 条）+ 1 条融合卷积，被包住的只有第 6 条；torch.cat 产生的 n*cat_channels 大张量反而必须保留。UNet++ 同理（@d:\codes\work-projects\SegTask\taskcore\models\unetpp.py:104-126 的 upsamples[key] 与 gates[key] 在检查点之外）。用户开了 grad_checkpointing=True 会看到"显存几乎没降、速度却降了"。
-
-I4 · BatchNorm × 梯度检查点：running stats 每步被更新两次（数值语义改变）
-
-checkpoint_if 在反向时重跑前向 @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:61-63，preserve_rng_state 只还原 RNG、不还原 BN 的 running buffer。因此任何被包裹的 BN 会以 momentum 连续作用两次，running_mean/var 相对不开检查点时系统性偏移；这些 buffer 又直接决定 eval/推理输出，也会被 EMA 平滑（C19）。触发面有两条且都不需要用户主动"选 BN"：
-
-norm_type='batch' @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:145-146；
-mednext.dilated_reparam=True —— 该块内部强制使用 BN（fold 需要），与用户选的 norm 无关 @d:\codes\work-projects\SegTask\taskcore\models\mednext.py:181,189。
-这是本层唯一一处"开一个纯显存开关会改变模型数值"的地方，直接违反 C13 与配置注释 @d:\codes\work-projects\SegTask\taskcore\config\core.py:595-596。修法很小：包裹前把 BN 切到 track_running_stats 冻结，或在重算路径上禁用 buffer 更新（PyTorch 官方做法是自定义 context_fn/BatchNorm 包装）。
-
-I5 · C14/D9 定案：门控粒度是 stage 级，不是 conv 级 —— 稀疏等价名不副实
-
-
-
-spark_modules.py:178-186
-for i, stage in enumerate(encoder.stages):
-    if i > 0:
-        x = encoder.downsamples[i - 1](x)
-    x = stage(x)
-    vis = downsample_mask_to(vis_full, x.shape[2:])  # 该尺度可见掩码
-    x = x * vis                                      # 重新置空被遮位点
-一个 stage 默认含 2 个残差块 = 4~6 层卷积。子流形稀疏卷积保证每一层的可见输出都不含被遮位点的贡献；这里只在 stage 出口把被遮位点抹零，stage 内部各层的可见位点已经吸收了"被遮区=0"这一伪信号。掩码率 0.6、感受野 3³ 的情况下，第 2 层起绝大多数可见位点都被污染。单测 test_spark_encode_gates_masked_positions_to_zero 验证的是"被遮位点为零"，而稀疏等价的关键是"可见位点的值等于稀疏卷积的值"——这一条没有测试、也不成立。 配套问题：masked 归一化只覆盖 InstanceNorm @d:\codes\work-projects\SegTask\ssltask\models\spark_modules.py:95-98，换 norm_type='group'（mednext 默认）或 convnext 的 LayerNorm3d 时只发一条 warning @d:\codes\work-projects\SegTask\ssltask\models\spark_modules.py:136-140，统计污染照旧。结论：SSL 方案一在报告中应表述为 "masked-dense 近似"，若要真做方案一/二的受控对照，必须把门控下沉到块内（或引入 spconv）。
-
-I6 · spark_encode 是 Encoder.forward 的复制品，漏掉梯度检查点与 cond 分支
-
-同一段循环，Encoder.forward 走 checkpoint_if(self._stage_ckpt[i], stage, x)，spark_encode 直接 stage(x)。后果：SSL 预训练时 model.grad_checkpointing / grad_ckpt_encoder_stages 静默失效，显存与下游不可比（而 SSL 恰恰是最吃显存的一步）。同时 cond_in_channels>0 的分支也未复制（当前 ssl 无 cond，属潜在雷）。这是 G11/D3 那类"复制装配层"的病在 models 层的第三例。
-
-P1 —— 工程质量 / 口径 / 性能
-I7 · ADM/EDM2 的注意力是手写 einsum+softmax，O(N²) 显存被显式物化，且无 token 数护栏
-
-
-
-edm2_unet.py:180-183
-w_attn = torch.einsum(
-    "nhcq,nhck->nhqk", q, k / float(np.sqrt(q.shape[2]))
-).softmax(dim=3)
-taskcore 自己的 SelfAttentionBlock 早已用 SDPA @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:795-820（可走 flash/mem-efficient 后端），且配置层有 softmax token 上限护栏 @d:\codes\work-projects\SegTask\taskcore\config\core.py:1677-1696——这两项 ADM/EDM2 都没有。2.5D 下 128×128 = 16384 token，注意力矩阵单头 fp16 ≈ 512 MB，用户在 adm.attention_levels 里多写一个浅层就是必 OOM，且是运行期而非配置期失败。改成 F.scaled_dot_product_attention 是数学等价的直接替换。
-
-I8 · 全网没有权重初始化策略（只靠 PyTorch 默认）
-
-grep 全 models 包，nn.init 只出现在四处：SelfAttention 的 zero-init proj/ffn、ADM 的 zero_module、DySample 的 offset、ICNR。ResNet/ConvNeXt/MedNeXt/UNet 的所有 conv 都用 PyTorch 默认 kaiming_uniform_(a=√5)——这是众所周知的"为兼容旧 API 而保留的次优默认"，nnU-Net 明确用 He normal + negative_slope 对齐 LeakyReLU。另外残差分支末层 norm 的 gamma 零初始化（ResNet "zero-init residual"、几乎所有现代配方的标配）也没有，深 encoder（ResEnc-L/XL 预设）初期训练不稳定的成本是隐性的。ConvNeXt 侧靠 LayerScale=1e-6 部分补偿，ResNet 侧完全没有。这是本层投入最小、收益最确定的一处改动（一个 _init_weights + model.apply）。
-
-I9 · seg 侧 pretrain 缺"0 命中报错"，与 cls/det 口径相反（C27 在模型交接面的落点）
-
-det 的加载器明确写着"0 命中报错（几何不一致不静默）"@d:\codes\work-projects\SegTask\dettask\models\factory.py:39-41；而公共 BaseTrainer._load_pretrain_weights 只对 missing/unexpected 各发一条 warning 后照常训练 @d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:668-686。把一个 cls ckpt 喂给 seg（或前缀写错），日志里只有两行 warning，训练从随机初始开始且指标"看起来正常"。建议把 det 的命中统计上提到 BaseTrainer 作为公共策略。
-
-I10 · attn_gate_target 对 decoder_type='unet' 是静默 no-op
-
-build_backbone(cfg, attn_gate_target=...) 一路传到 _build_unet_encoder_decoder，但只有 UNetPPDecoder 接收该参数 @d:\codes\work-projects\SegTask\taskcore\models\factory.py:494；经典 Decoder 的构造根本没有这个入参 @d:\codes\work-projects\SegTask\taskcore\models\factory.py:502-515。gen 侧传 'upsample' 期望改变门控方向，在默认 decoder 下静默失效（门控方向仍是 skips）。与步骤 2 的 F2、步骤 4 的 H3 同型："参数接了、没人消费"。
-
-I11 · decoder_blocks_per_stage 在 UNet++ 下被静默截断为首元素广播
-
-
-
-factory.py:356-357
-elif mc.decoder_blocks_per_stage:  # UNet++：首项广播到所有嵌套节点
-    dec_counts = [mc.decoder_blocks_per_stage[0]] * max(expected_dec_calls, 1)
-用户写 [2,3,4]，实际得到 [2,2,2,...]，无任何日志。UNet 路径下同样的列表会因长度不符而 ValueError @d:\codes\work-projects\SegTask\taskcore\models\factory.py:30-33——同一字段在两个 decoder 下一个报错一个静默，口径不一。
-
-I12 · drop_path 的深度线性 ramp 在 encoder / decoder 各跑一遍
-
-_make_drop_path_rates 在 enc/dec 两个 builder 里分别调用 @d:\codes\work-projects\SegTask\taskcore\models\factory.py:83（经 386-389 各构建一次），于是 encoder 从 0 爬到 drop_path_rate、decoder 又从 0 爬一遍。标准做法（ConvNeXt/Swin/nnU-Net ResEnc）是按网络总深度单调递增。结果是 decoder 深层（低分辨率、最该正则）反而 drop_path≈0，浅层却继承了 encoder 末端的高值语义。另：np.linspace(0, r, 1) == [0.0]，即 blocks_per_level=1 且只有单 stage 的极端配置下 drop_path 恒为 0（静默）。
-
-I13 · MedNeXt UpKern 插值未做幅度归一，且 align_corners 与官方相反
-
-upkern_remap_state_dict 用 trilinear + align_corners=True 把 k=3 核插到 k=5 @d:\codes\work-projects\SegTask\taskcore\models\mednext.py:325。docstring 已诚实标注 align_corners 与官方 False 不同；但更实质的是核元素和随之膨胀约 (5/3)³ ≈ 4.6 倍（插值保幅值不保和），depthwise conv 的输出尺度会整体放大，随后的 GroupNorm 虽能吸收一阶尺度、但残差支路与 pwconv 的相对配比已变。官方实现同样不归一，属"照抄了论文的缺陷"，建议至少提供 sum 归一开关并做一次消融。
-
-I14 · 其他小口径不一致（各 ≤ 3 行）
-
-ConvNeXt 的 expand_ratio 在配置里没有出口（factory 不传，恒 4.0），而 MedNeXt 有 mednext.expand_ratio @d:\codes\work-projects\SegTask\taskcore\models\factory.py:171-179 vs 225-239。
-Upsample 的 nearest 分支也把 bf16/fp16 强制升 fp32 再插值 @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:1482-1489——最近邻是纯 gather，无精度问题，这里白白多一份全尺寸 fp32 拷贝（decoder 最高分辨率处）。
-ConvTranspose 默认 bias=True @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:1436，而全网其他 conv 一律 bias=False（后接 norm）。
-GroupNorm 组数不整除时静默折半并 warn @d:\codes\work-projects\SegTask\taskcore\models\blocks.py:150-159，而 MultiRF 的同一情形是显式报错并写了长篇理由 @d:\codes\work-projects\SegTask\taskcore\models\resnet.py:355-366。两种态度都合理，但应二选一。
-_build_unet_encoder_decoder 里 num_fg 赋值后从未使用 @d:\codes\work-projects\SegTask\taskcore\models\factory.py:333；build_model 又把 block 计数解析逻辑整段复制一遍（仅为日志）@d:\codes\work-projects\SegTask\taskcore\models\factory.py:564-580 vs 343-359，是未来漂移点。
-reparam_deploy（MedNeXt 推理期折叠）只有 seg predictor 接了 @d:\codes\work-projects\SegTask\segtask_v1\predictor\io.py:160-163，cls/det/gen/ssl 全无 → 同一骨干在别的任务上推理白白多付分支开销。属 D3 家族。
-spark_encode 里 bool(mask_full.any()) 是每步一次 device→host 同步 @d:\codes\work-projects\SegTask\ssltask\models\spark_modules.py:167，与步骤 4 认可的"增强层全程规避 D2H 同步"取向相悖。
-四、值得肯定（不建议改动）
-ModelTopology 是全仓最好的一处抽象：frozen dataclass、一次算齐、决策树集中在 30 行内、新增 patch_mode 只改一处，并且真的没有旁路。步骤 2/3/4 反复出现的"复制病"在这里被彻底根治，应作为其他层收敛的范本（与 gentask augment 的 74 行薄封装并列）。
-checkpoint_if 的三条注释把坑写全了（use_reentrant=False 为何必需、preserve_rng_state 为何必需、eval 零开销）@d:\codes\work-projects\SegTask\taskcore\models\blocks.py:49-64——除了 BN 那条（I4），这是踩过坑的写法。
-AMP 下的 fp32 统计护栏成体系：GlobalResponseNorm @blocks.py:97-102、LayerNorm3d @convnext.py:26-32、resize_logits @unet.py:27-33 三处独立实现同一范式且都注明"同 adm_unet fp32 范式"。
-各向异性下采样的构造期护栏是全仓最好的失败前置：compute_downsample_strides 的 nnU-Net 式调度（三条件：偶数 / 减半后 ≥4 / 该轴不落后 2×）@factory.py:261-287，配合 5 条兼容性 raise（blurpool/pixelshuffle/unetpp/hierarchical/mode 白名单）@factory.py:418-448——正是步骤 2 F5 应当照抄的范式。
-_StatefulStageBuilder 的单计数器设计@factory.py:44-63：显式解决"factory 闭包另设计数器 → 双计数器漂移"，并带 exhausted 报错。
-arch_compat.warn_ignored_model_fields@arch_compat.py:57-84：用"与全新实例逐字段 diff"来发现被静默忽略的旋钮，是可复用的通用手法（建议推广到 gen 的 F9 差集检测）。
-重参数化实现（DilatedReparamBlock）数学正确：conv-BN fold、dilated kernel 展开、幂等 switch_to_deploy、del 释放训练态分支，均无误。
-五、架构评估
-分层是对的，边界画在了正确的位置：blocks（原语，1502 行但全是独立小类，非 core.py 式堆积）→ resnet/convnext/mednext（block 家族）→ unet/unetpp/unet3p（拓扑）→ factory（装配）→ topology（几何真相源）。build_backbone / build_model 共用同一条装配路径，是 C12 得以成立的结构性原因。这一层不需要重构，只需要补齐口径。
-真正的架构债是"decoder 家族缺少共同基类"：五个 decoder 各自实现"上采样→对齐→融合"，于是 I1（尺寸语义）、I3（检查点粒度）、I10（门控参数）三处漂移全部长在同一根上。收敛路径成本很低：抽一个 align_or_raise(x, skip, policy) 工具 + 一个 DecoderBase.checkpoint_node() 约定，五个 decoder 各改 3~5 行，不动权重键名（对 C12 零影响）。
-grad_checkpointing 目前是"一个布尔 + 一个 encoder 掩码"，表达力不足：它需要表达的是"包哪些模块"，而现状是 encoder 有掩码、decoder 只有全局开关、stem/downsample 无接口、unet3p/unetpp 只包了一小块、SparK 路径完全绕过。建议统一为"逐模块可选的 checkpoint policy"（PyTorch 2.x 的 apply_activation_checkpointing + 一个 should_ckpt(module) -> bool 谓词），一次消灭 I2/I3/I6。
-arch 的三分（unet / adm / edm2）代价已经显现：ADM/EDM2 各自复制了 stem 装配、aux/DS 头装配、skip 对齐、attention 实现，arch_compat 的 40 条"被忽略字段"清单就是这份代价的账单。短期不建议合并（论文忠实是明确设计取向），但注意力实现（I7）与 skip 对齐（I1）应该共享——这两处与"论文忠实"无关。
-六、2026 年视角的可借鉴项
-方向	解决本层什么	适配性
-F.scaled_dot_product_attention 全覆盖（含 ADM/EDM2）	I7：O(N²) 物化 → flash/mem-efficient 后端；同时自动获得 bf16 与 nested-tensor 支持	纯 torch、数学等价、零风险，本层最高性价比
-_init_weights 策略层（He-normal + zero-init residual gamma + trunc_normal for ConvNeXt/MedNeXt）	I8	约 30 行、零依赖；建议同时把 ADM 的 zero_module 范式推广到 UNet 的 DS/aux 头（新头零初始 = 不扰动主路）
-PyTorch 2.x apply_activation_checkpointing + selective checkpointing（torch.utils.checkpoint 的 context_fn / SAC）	I2/I3/I4/I6：按模块谓词统一策略，SAC 还能"只重算便宜算子、保留 matmul 输出"，通常比全量重算快 20–40%	原生 API，与现有 checkpoint_if 可共存渐进迁移
-真稀疏路线：spconv / MinkowskiEngine（或块内门控）	I5/D9：让 SSL 方案一名副其实	引入重依赖，与"依赖克制"冲突 → 折中方案是把门控下沉到 block 内（每个 conv 后乘掩码），成本 ~10 行、无新依赖，等价性显著改善
-nnU-Net ResEnc 2024 复盘结论（"ResEnc-L + 正确的几何 > 花哨架构"）	本层已实现 ResEnc 预设、MedNeXt、UniRepLKNet 重参数化，覆盖面足够；结论是不必再加 backbone，应把预算投到 I8 的初始化与步骤 3/4 的数据几何	零成本的"不做"决策
-Primus / 3D 医学纯 Transformer（2025）与 Mamba-3D（VM-UNet 系）	当前 selfattn 是"CNN + 少量注意力块"，缺一条纯序列建模基线	P3 试点；SelfAttentionBlock 的 window/grid 分区代码可直接复用
-Mask2Former / query-based 分割头	现在只有逐体素 1×1 头；query 头对"少数大器官 + 稀有小结构"的类不平衡天然更稳，且与 det 的 head 可共享	P3；与 taskcore 的 decoder.out_channels 契约兼容
-LoRA / DoRA / adapter 式迁移	C12 现在是"全量 strict=False 迁移"，冻结只有 freeze_encoder 二值开关（det/cls）；LoRA 可在小数据下游上显著优于全量微调	需在 factory 加一层可选包装；P2
-EDM2 的 post-hoc EMA（Karras 2024 §3）	EDM2 骨干已引入，但配套的"训练后合成任意 EMA 长度"没有；这是 EDM2 论文最实用的工程贡献之一	与步骤 6 的 EMA 联动
-muP / 宽度缩放律	resenc_preset 换档时学习率靠手调；muP 可让 S→M→L→XL 共享一组超参	P3，需与 optim 层联动
-fp8 / torch.compile + max-autotune 的 3D conv 实测	框架已具备 compile 与 channels_last_3d 接口，但没有任何基线数据说明它们在本仓 3D conv 上是正收益还是负收益	建议在步骤 6 补一张实测表，而不是继续留"默认关、需 benchmark"的注释
-七、建议改进路线（本轮不实施）
-P0（修正确性，均为小改动）：I4 BN×检查点双更新（包裹前冻结 running stats）；I5 SparK 门控下沉到 block 内 + 非 InstanceNorm 时改为报错而非 warning；I6 spark_encode 复用 Encoder.forward 的检查点路径；I1 五个 decoder 统一为硬报错（配合步骤 2 F5 的配置期整除性校验）。
-P1（口径统一 / 免费性能）：I7 ADM/EDM2 换 SDPA；I8 加初始化策略层；I9 0 命中报错 上提到 BaseTrainer；I2/I3 检查点覆盖 stem/downsample/分支卷积；I10 attn_gate_target 接入经典 Decoder 或删参；I11/I12/I14 的静默降级与口径不一。
-P2（架构演进）：抽 DecoderBase（对齐策略 + 检查点节点约定）；grad_checkpointing 升级为模块谓词策略；把 reparam_deploy 提到公共 predictor 层（与 D3 一并做）；build_model 与 _build_unet_encoder_decoder 的重复计数逻辑合一。
-P3（前沿）：SAC 选择性重算实测；LoRA/DoRA 迁移通路；query-based 头 / Mamba-3D 基线；muP 缩放。
-八、如何验证（供后续实施轮）
-现有覆盖：test_selfattn.py、test_swa_lka.py、test_upkern.py、test_ssltask.py（SparK 等价性）、test_segtask_v1.py（多分辨率 shape）。建议补的回归点：
-
-norm_type='batch' + grad_checkpointing=True/False 各跑 5 步，BN running_mean 必须逐位相等（I4，本层最该补的一条）；
-满密度下 spark_encode 与 dense 前向逐位相等（已有）之外，补：掩码率 0.6 时"可见位点值 == 用真稀疏参考实现的值"——预期当前失败，作为 I5 的红灯基线；
-model.grad_checkpointing=True 下 SSL SparK 的峰值显存应低于关闭时（I6，现状预期无差异）；
-patch_size=[60,128,128] + 5 级，对 decoder_type ∈ {unet, unetpp, unet3p} 与 arch ∈ {adm, edm2} 五者都应报错（I1，现状只有 unet 报）；
-decoder_blocks_per_stage=[2,3,4] + decoder_type='unetpp' 应报错或至少 warn（I11）；
-同一 drop_path_rate 下，encoder 末块与 decoder 首块的 drop_prob 应满足全局单调（I12）；
-build_backbone(cfg, attn_gate_target='upsample') + decoder_type='unet' + skip_attention=True 应报错或生效，不得静默忽略（I10）。
-
-步骤 6 — engine 层：base_trainer.py、optim.py、amp.py、checkpoint.py、prefetch.py、dist_utils.py、launch.py、memory.py、bn_stats.py、views.py、base_predictor.py。重点：AMP/EMA/SWA/DDP 交互正确性、grad accumulation 与调度器语义、断点续训状态完整性、非有限守护、训练加速空间（torch.compile、fused optim、bf16、ZeRO、overlap、dataloader 瓶颈）。
-一、结论摘要
-这一层的正确性设计密度是全仓最高的：OptimStepResult 的 acknowledge 协议 + _check_boundary_scheduler_clock 把"scheduler 与 optimizer 时钟漂移"变成即时 RuntimeError（@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:433-459）；非有限守护按 fp16/bf16 分两条语义且 DDP 下用 all_reduce_flag_any 统一决策；pending 延迟 D2H 把每 micro-step 一次 .item() 降到日志步/边界一次，并显式分析了它与非有限守护的耦合。C17/C18 在五任务上是真守约。
-
-本层的系统性病灶与前五层相反，是"能力倒挂"：任务层副本比公共层强。ZeRO consolidate（只有 seg/ssl 有）、状态指纹（只有 ssl 有）、resume 后 rank RNG 重分流（只有 seg/ssl 有）、预训练 0 命中报错（只有 cls/det factory 有）—— 四项都停在任务层，公共 BaseTrainer 反而是能力最弱的那份。公共化时按"逐字重复"抽取、而非按"能力并集"抽取，是根因。
-
-发现 1 处会在特定配置下直接崩训练/挂死的问题：BaseTrainer._save_latest 无 ZeRO consolidate 却先按 rank 早退（J1）。
-
-C16 有一处实质违约：SSL 的损失整体在 autocast 内计算，且方法内的 .float() 对 matmul 无效（autocast 会把 fp32 输入的 matmul 重新降精度）——dino_gram 的 Gram 矩阵、jepa、moco 的 InfoNCE 全部受影响，moco 甚至没有 .float()（J2）。
-
-C27 在本层结案：不成立。ckpt 里明明存了 config，全仓却无一处读它做 patch_mode/spatial_dims/in_channels 交叉校验；cls/det 的"0 命中报错"是唯一的近似替代，且公共 pretrain 路径没有（J11）。步骤 2 顺延到本轮的挂账项到此闭合。
-
-二、契约核销（步骤 1 挂账 C16–C23 + C27）
-契约	结论	依据
-C16 损失恒 fp32（autocast 外）+ logit clamp；AMP auto = Ampere+ 选 bf16	部分违约。auto 解析正确；seg/cls 是标准范式（compute_loss_fp32 / 显式 autocast(enabled=False)+clamp）；gen 在 autocast 外算但靠 loss 内部 .float()；det 在 autocast 内算、靠各 head 逐张量 .float()；ssl 全程在 autocast 内（J2）	@d:\codes\work-projects\SegTask\taskcore\engine\amp.py:76-97、@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:173-177 vs @d:\codes\work-projects\SegTask\dettask\trainer\det_trainer.py:219-223、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:668-670
-C17 优化步时钟；尾批按实际累积长度归一	属实。steps_per_epoch=ceil(len/accum)、one_cycle 映射 pct_start 不叠加外层 warmup、_effective_accum 尾组取真实尾长；五任务口径一致	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:142-165,251-259、@d:\codes\work-projects\SegTask\taskcore\engine\optim.py:182-191
-C18 非有限守护 + DDP all-reduce(any) 统一跳步	属实且实现优雅。fp16 交 GradScaler、bf16/fp32 走 all_reduce_flag_any；跳步时 EMA 不推进、always_step_scheduler 为 ssl 单开一条时钟；护栏见 _check_boundary_scheduler_clock	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:360-431、@d:\codes\work-projects\SegTask\taskcore\engine\dist_utils.py:73-85
-C19 EMA：验证/best 用 shadow、cpu offload、warmup	属实，但 BN 语义有洞。offload 用 pinned staging + 单次流同步，数学等价；apply_shadow/restore 异常安全。缺口：浮点 buffer（BN running stats）也按 decay 平滑且无收尾重估，而 SWA 侧有（J13）	@d:\codes\work-projects\SegTask\taskcore\utils\common.py:105-154、@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:736-752
-C20 原子写 + 状态指纹 + 位精确 resume + rank0 + 异步	部分属实。原子写（os.replace）全覆盖、异步写有错误回传；指纹只有 ssl 有；"位精确"实为"epoch 边界 + 主进程 RNG 精确"，dataloader worker RNG / epoch 中途不可恢复（J12）；ZeRO 下公共 latest 保存会崩（J1）	@d:\codes\work-projects\SegTask\taskcore\engine\checkpoint.py:27-44,173-222、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:329-341
-C21 best 槽位 = EMA 权重，在线权重另存	属实。_save_best 三态清晰、extract_model_state_dict 统一读取、_restore_train_state 优先取 model_online_state_dict	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:527-571,611-616、@d:\codes\work-projects\SegTask\taskcore\engine\checkpoint.py:230-265
-C22 seg 选模用 val_base_loss	属实。_CRITERION_TO_METRIC["loss"]=("val_base_loss","min")，验证侧用裸 base_loss 经 compute_loss_fp32 单独算；plateau 方向由 save_best_mode 派生、与 criterion 同源	@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:408-411、@d:\codes\work-projects\SegTask\taskcore\engine\optim.py:171-176
-C23 DDP no_sync / 静态图 / bucket-view；ssl 手动 all-reduce	属实但缺护栏与实测。_ddp_no_sync 把 forward 也包进去（正确）；ssl 手动均值 all-reduce 数学等价但逐张量、无分桶无重叠（J10）；static_graph × no_sync × 梯度检查点三者叠加零测试（J9）	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:261-272,811-856、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:549-563
-C27 迁移交叉校验（步骤 2 顺延）	不成立。engine 无任何交叉校验；_load_pretrain_weights 连 0 命中都只 warning，与 cls/det factory 的 raise 口径相反；ckpt 内已有 config 却无人消费（J11）	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:668-686 vs @d:\codes\work-projects\SegTask\clstask\models\factory.py:113-117、@d:\codes\work-projects\SegTask\dettask\models\factory.py:59-63
-三、缺陷清单
-P0 —— 正确性 / 崩溃 / 静默语义改变
-J1 · _save_latest 缺 ZeRO consolidate，且先按 rank 早退 → 多卡 + ZeRO 必崩
-
-
-base_trainer.py:577-583
-if not self._is_main:   # DDP：落盘仅 rank0
-    return
-bare = unwrap_compile(self.model)
-state = {
-    ...
-    "optimizer_state_dict": self.optimizer.state_dict(),
-ZeroRedundancyOptimizer.state_dict() 要求先全 rank 集合式 consolidate_state_dict(to=0)，否则 rank0 抛 "Optimizer state has not been consolidated"（若其它 rank 已进入下一次集合通信，则表现为挂死）。seg 与 ssl 的自留保存函数都写了这道守卫并明确注释"必须在 rank 早退之前调用"（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:740-746、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:365-372），而公共版没有。触发路径真实存在：det 在 encoder_lr_mult==1 时走 build_optimizer（@d:\codes\work-projects\SegTask\dettask\trainer\det_trainer.py:83-87），train.zero_redundancy_optimizer=True + 多卡即命中，且 _save_latest 是每 epoch 调用的（@d:\codes\work-projects\SegTask\dettask\trainer\det_trainer.py:404、@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:494）。修法：把 consolidate 提到 _save_latest 顶部、早退之前。三行。
-
-J2 · SSL 损失在 autocast 内计算，方法内 .float() 被 autocast 击穿（C16 违约）
-
-
-ssl_trainer.py:668-670
-with autocast(device_type="cuda", enabled=self.use_amp,
-              dtype=self.amp_dtype):
-    loss, logs = self.method.compute_loss(batch)
-与其余四任务不同，ssl 从未退出 autocast。后果分两层：
-
-.float() 无效于 matmul：autocast 是按 op 决策的，输入是 fp32 也会把 matmul/bmm/linear 降回 bf16/fp16。dino_gram._gram_matrix 先 F.normalize 再 x @ x.transpose(1,2)（@d:\codes\work-projects\SegTask\ssltask\methods\dino_gram.py:98-120）、jepa 的 feat.float() 后接矩阵运算（@d:\codes\work-projects\SegTask\ssltask\methods\jepa.py:135-138）都属此类——写了 .float()、以为拿到 fp32，实际仍是低精度 matmul。Gram/协方差这类 O(N²) 求和正是 fp16 最容易累积误差的形态。
-有的方法连 .float() 都没有：moco 的 logits 拼接、除温度 0.07、F.cross_entropy（@d:\codes\work-projects\SegTask\ssltask\methods\moco.py:176-179）；vicregl 的 variance/covariance 项只对 g1/g2 做了 float，协方差矩阵仍在 autocast 下算。
-这是"靠每个方法作者自觉"的架构：新增一个方法就多一次漏 .float() 的机会。修法与其它任务对齐即可——把 compute_loss 调用移出 autocast，只把 encoder 前向留在里面（方法插件需暴露 forward_features / 或在 compute_loss 首行 with autocast(enabled=False)）。
-
-J3 · _boundary_grad_norm 忽略传入的 parameters，恒对 self.model 算范数
-
-
-base_trainer.py:297-298
-elif not self._scaler_active:
-    grad_norm_val = self._global_grad_norm()
-而 _global_grad_norm 硬编码 self.model.parameters()（@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:471），完全无视 _optimizer_step_boundary(parameters=...) 这个入参（ssl 传的是 self.method.parameters()）。当前无 live bug——SSLMethod.parameters() 直接返回 self.module.parameters() 且 SSLTrainer.self.model = method.module（@d:\codes\work-projects\SegTask\ssltask\methods\base.py:142-143、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:57），二者恒相等。但这条范数在 bf16 路径下是跳步判据的唯一来源：任何方法一旦引入 module 之外的可训练参数（可学习温度 / prompt / 独立 head），其非有限梯度将静默逃过守护，且梯度裁剪已经作用于它们（clip 用的是传入的 parameters）——两条路径对同一集合的定义不一致，是典型的埋雷。一行改动：_global_grad_norm(parameters)。
-
-J4 · cls/det/gen 的 resume 不做 rank RNG 重分流
-seg 与 ssl 在 resume 后显式调用 reseed_rank_rng（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:788-791、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:438-441），因为 ckpt 里的 rng_state 只是 rank0 的快照，而所有 rank 都从同一个文件恢复。cls 的 _try_resume 只调 _restore_train_state 就结束（@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:434-452），det/gen 同理。后果：resume 之后全部 rank 共用 rank0 的 torch/numpy/python 随机流 —— DistributedSampler 的索引切分仍不同，所以不会退化成"各卡训同一批数据"，但 dataloader worker 的 base_seed、以及一切走全局 RNG 的随机决策（fg/bg 抽取的伯努利、dropout 的 CPU 侧掩码）在各 rank 间完全相关，等效多样性下降且只在 resume 后发生，极难察觉。更好的做法：把 reseed 收进 _restore_train_state 的末尾（它已经知道 _rank 和返回的 start_epoch），一次修三个任务。
-
-P1 —— 显存 / 吞吐 / 口径
-J5 · state_to_cpu 先在 GPU 上 clone 再搬 CPU，异步保存瞬时翻倍显存
-
-
-checkpoint.py:162-163
-if isinstance(obj, torch.Tensor):
-    return obj.detach().clone().cpu()
-.clone() 在原设备分配，.cpu() 再拷一份 —— 保存瞬间 GPU 上多出一整份 model + optimizer state（Adam 是 2×参数量，latest ckpt 全都带上）。正确写法是 obj.detach().to("cpu", copy=True)：单次 D2H、零额外显存。这条与 train.save_async 的宣传语（"主循环不再被写盘阻塞"）叠加，实际效果是"用一次显存尖峰换写盘异步"，在显存吃紧场景（正是开 ema_device=cpu、梯度检查点的那批用户）容易在 checkpoint 时刻 OOM。另：_save_best 已经手工 detach().cpu().clone() 过一遍（@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:535-540），再进 state_to_cpu 又克隆一次，纯浪费。
-
-J6 · "异步 checkpoint"只异步了写盘，深拷仍在主线程
-submit 前必须 state_to_cpu（设计如此，注释也写明），于是每 epoch 一次 O(3×参数量) 的同步深拷贝仍卡在训练主循环里，异步只省掉了 torch.save 的序列化+落盘。2026 的对应答案是 torch.distributed.checkpoint.async_save 的 pinned staging（D2H 到常驻 pinned 缓冲 + 后台序列化），或退一步：latest 只存 optimizer 的 fp32 引用而不深拷（写盘期间冻结训练一小段）。至少应在文档里如实标注"异步不含深拷"。
-
-J7 · 跳步导致 scheduler 走不完 horizon，且无任何观测
-默认口径下 scaler skip / 非有限跳步都不推进 scheduler（正确的设计选择），代价是实际优化步数 < total_steps = epochs × ceil(len/accum)。cosine 到不了 eta_min、poly 末端 lr 不为 0、one_cycle 停在退火中途。目前只有 resume 时的 OneCycleLR 有漂移兜底（@d:\codes\work-projects\SegTask\taskcore\engine\optim.py:280-304），常态漂移零监测。健康指标里有 nonfinite_steps 却没有 opt_steps_actual / opt_steps_planned 与 scheduler.current_step —— 三个数进 monitor 几乎零成本（_collect_health_metrics 已经拿到 opt_steps）。
-
-J8 · CudaPrefetcher 在 yield 之前取下一个 batch，dataloader 延迟没被隐藏
-
-
-prefetch.py:83-91
-try:
-    next_cpu = next(it)          # ← 阻塞等 dataloader
-except StopIteration:
-    yield batch
-    return
-with torch.cuda.stream(stream):
-    next_gpu = self._to_device(next_cpu)
-yield batch                      # ← 消费者此时才开始 enqueue 计算
-next(it) 是同步阻塞的（等 worker 返回 + collate），而它发生在当前 batch 的计算内核被 enqueue 之前 → 这段 CPU 等待与 GPU 计算完全不重叠。预取因此只隐藏了 H2D 拷贝，没有隐藏"dataloader 慢"这个更常见的瓶颈——而步骤 3/4 已经证明本仓 dataloader 恰恰是热点（G12 启动扫描、H5 面内 resize）。把取数与拷贝挪到 yield 之后即可（yield batch → 再 next(it) → 再发起拷贝），行为等价、代码更短。流同步与 record_stream 的处理本身是正确的（这一点比多数开源实现都严谨）。另：prefetcher 只搬顶层 dict 里的 Tensor，det 的 boxes/labels 是 list-of-tensor，走 _to_device 另一条路 —— 不算错，但 det 的预取覆盖面比其它任务小，性能对比时需知道。
-
-J9 · static_graph × no_sync × 梯度检查点：三者叠加零测试、零护栏
-_setup_ddp 同时开放 ddp_static_graph / ddp_find_unused_parameters / gradient_as_bucket_view，只对前两者同开发了一条 warning（@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:836-840）。但真正微妙的是 static_graph 与梯度累积 no_sync 的交互：static_graph 在首次迭代记录反传/通信模式并在后续复用，而 accum 的非边界迭代根本不触发 reducer；再叠加梯度检查点（重算改变反传的执行顺序），三者的组合语义 PyTorch 官方也只给了"注意事项"级别的说明。本仓把三个开关都暴露给用户、默认值散落在 config，却没有一个组合被测试覆盖（tests 里无 DDP 训练用例）。这是 C23 中风险最高、可观测性最差的一格；建议至少在配置层拦截 static_graph=True 且 grad_accum_steps>1 且 grad_checkpointing=True 或补一个 2-rank gloo 小测。
-
-J10 · SSL 手动梯度同步逐张量 all-reduce，无分桶无重叠
-
-
-ssl_trainer.py:561-563
-torch._foreach_div_(grads, float(self._world_size))
-for g in grads:
-    dist.all_reduce(g, op=dist.ReduceOp.SUM)
-数学正确（先除后加，fp16 scale 不受影响），但一个 UNet encoder+decoder 有数百个参数张量 → 数百次小 all-reduce，每次都吃一遍延迟，且发生在边界的"串行窗口"里（前向后向已结束，无可重叠计算）。DDP wrapper 的核心优势（25MB bucket + 反传重叠）在此全丢。低成本改法：_flatten_dense_tensors 打平成一两个大 buffer 做单次 all-reduce 再 unflatten（~10 行），或用 dist.all_reduce_coalesced。注释里"代价是无反传-通信重叠（可接受）"低估了实际代价——丢的不止是重叠，还有分桶。
-
-J11 · 公共 pretrain 无 0 命中报错、无 ckpt-config 交叉校验（C27 结案）
-_load_pretrain_weights 对 missing/unexpected 各发一条 warning 后照常训练（@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:677-686）。把一个 cls ckpt 喂给 seg、或前缀写错，日志里只有两行 warning，训练从随机初始开始、指标"看起来正常"（这与步骤 5 的 I9 是同一处，本轮确认它在 engine 层的落点）。更可惜的是：_save_best/_save_latest 都把 "config": self.cfg 写进了 ckpt（base_trainer.py:552,590），做 C27 要求的 patch_mode/spatial_dims/in_channels 交叉校验所需的信息已经在文件里，只是没人读。建议 _load_pretrain_weights 统一：①统计命中数，0 命中 raise；②若 ckpt 带 config，比对三元组不一致即 raise（附"如确需跨几何迁移请设 pretrain_allow_geometry_mismatch"）。这一步同时把 cls/det factory 里两份重复的 0 命中逻辑收编。
-
-J12 · resume 的"位精确"名不副实
-_restore_train_state 恢复 model/EMA/optimizer/scheduler/scaler/SWA/best/RNG，覆盖面确实是五任务里最全的，但三处缺口应在文档中如实标注：①dataloader worker RNG 不可恢复（worker 进程在 epoch 开始时按 base_seed 派生，ckpt 里没有、也无处注入）；②只能 epoch 边界恢复，epoch 中途崩溃会整轮重跑（大 epoch 场景代价显著）；③不校验 ckpt config 与当前 config 的兼容性——步骤 2 的 F3（老 pickle 绕过 __init__ 导致 property 抛 AttributeError）正是在这条路径上被触发的。C20 的表述宜下调为"epoch 边界精确 + 主进程 RNG 精确"。
-
-J13 · EMA × BatchNorm：best 权重的 running stats 是"被平滑过的"，且无重估
-ModelEMA 对全部浮点 buffer 一视同仁地按 decay 平滑，docstring 自己承认了这一点并建议"若引入 BN backbone，以 EMA 权重评估前重估 BN 统计"（@d:\codes\work-projects\SegTask\taskcore\utils\common.py:45-47）——但没有任何代码这么做：SWA 收尾有 _swa_recalibrate_bn，EMA 侧一条都没有，而 EMA 才是 best/部署槽位（C21）。结合步骤 5 的 I4 已证明"BN 触发面有两条且都不需要用户主动选 BN"（norm_type='batch'、mednext.dilated_reparam=True），这不是纯理论风险。最小修法：_save_best / EMA 验证前若 collect_bn_modules() 非空则告警（一行），完整修法是复用 _swa_recalibrate_bn 的机制给 EMA 加同款开关。
-
-J14 · EMA offload 的隐藏常数：每次验证 2× 参数量的 PCIe 往返
-ema_device="cpu" 的宣传是"省 1× 参数量 GPU 显存，数学等价"，未提的是：apply_shadow 逐张量 GPU→CPU（存 backup）+ CPU→GPU（换入 shadow），restore 再反向一遍（@d:\codes\work-projects\SegTask\taskcore\utils\common.py:130-154），且这些 copy 没有 pinned staging、没有 non_blocking（与 update 热路径的精心优化形成对比）。每次验证 4 次全模型跨设备拷贝；_save_best 里还要再来
-
-步骤 6 — engine 层审查结果
-范围：taskcore/engine/ 全 11 文件通读 + 五任务 trainer 的 AMP/累积/边界/EMA/ckpt/resume 段落。未改动任何代码/文档。
-
-一、结论摘要
-本层正确性设计密度全仓最高：OptimStepResult ack 协议 + _check_boundary_scheduler_clock 把时钟漂移变成即时 RuntimeError（@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:433-459）；非有限守护 fp16/bf16 两条语义 + all_reduce_flag_any；pending 延迟 D2H。C17/C18 真守约。
-系统性病灶与前五层相反：能力倒挂——ZeRO consolidate、状态指纹、resume 后 rank reseed、0 命中报错，四项都只在某一两个任务层副本里，公共 BaseTrainer 反而最弱。公共化按"逐字重复"抽取、未按"能力并集"抽取。
-1 处特定配置必崩（J1）；C16 在 ssl 上实质违约（J2）；C27 结案：不成立（J11）。
-二、契约核销
-契约	结论	依据
-C16 损失 fp32	部分违约。seg/cls 标准范式；gen 靠 loss 内 .float()；det 在 autocast 内算；ssl 全程 autocast 内	@d:\codes\work-projects\SegTask\taskcore\engine\amp.py:76-97、@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:668-670
-C17 优化步时钟	属实	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:142-165,251-259
-C18 非有限守护	属实且优雅	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:360-431
-C19 EMA	属实，BN buffer 有洞（J13）	@d:\codes\work-projects\SegTask\taskcore\utils\common.py:105-154
-C20 ckpt	部分。原子写全覆盖；指纹只有 ssl；"位精确"实为"epoch 边界+主进程 RNG"	@d:\codes\work-projects\SegTask\taskcore\engine\checkpoint.py:27-44
-C21 best 槽位	属实	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:527-571
-C22 val_base_loss	属实	@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:408-411
-C23 DDP	属实但缺护栏/实测（J9、J10）	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:811-856
-C27 交叉校验	不成立（J11）	@d:\codes\work-projects\SegTask\taskcore\engine\base_trainer.py:668-686
-三、缺陷清单
-P0
-J1 · _save_latest 缺 ZeRO consolidate 且先按 rank 早退 → 多卡+ZeRO 必崩 base_trainer.py:577-583 先 if not self._is_main: return 再调 optimizer.state_dict()。ZeRO 要求全 rank 先 consolidate_state_dict(to=0)。seg（@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:740-746）与 ssl（@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:365-372）都有守卫，公共版没有。触发真实：det 在 encoder_lr_mult==1 时走 build_optimizer，_save_latest 每 epoch 调用（@d:\codes\work-projects\SegTask\dettask\trainer\det_trainer.py:404、@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:494）。三行可修。
-
-J2 · SSL 损失在 autocast 内，方法里的 .float() 被击穿 autocast 按 op 决策，fp32 输入的 matmul 仍降精度：dino_gram 的 Gram（@d:\codes\work-projects\SegTask\ssltask\methods\dino_gram.py:98-120）、jepa（@d:\codes\work-projects\SegTask\ssltask\methods\jepa.py:135-138）"写了 float 实际没生效"；moco 的 InfoNCE 连 .float() 都没有（@d:\codes\work-projects\SegTask\ssltask\methods\moco.py:176-179）。Gram/协方差正是 O(N²) 求和最怕低精度的形态。架构问题：靠每个方法作者自觉。
-
-J3 · _boundary_grad_norm 忽略传入 parameters _global_grad_norm 硬编码 self.model.parameters()（base_trainer.py:298,471），无视入参。当前恰好等价（SSLMethod.parameters() 即 module.parameters()），但该范数是 bf16 路径跳步的唯一判据，而 clip 用的是入参集合——两条路径定义不一致。方法一旦引入 module 外可训练参数即静默漏检。一行可修。
-
-J4 · cls/det/gen resume 后不做 rank RNG 重分流 seg/ssl 有 reseed_rank_rng，cls（@d:\codes\work-projects\SegTask\clstask\trainer\cls_trainer.py:434-452）/det/gen 无 → resume 后全 rank 共用 rank0 随机流。建议收进 _restore_train_state 末尾，一次修三个任务。
-
-P1
-J5 · state_to_cpu 先 GPU clone 再 .cpu()（@d:\codes\work-projects\SegTask\taskcore\engine\checkpoint.py:162-163）→ 保存瞬间 GPU 多出一整份 model+optimizer。应 .detach().to("cpu", copy=True)。且 _save_best 已手工 clone 过，再 state_to_cpu 又克隆一次。
-
-J6 · "异步 ckpt"只异步写盘，深拷仍在主线程（O(3×参数量)/epoch）。对标 torch.distributed.checkpoint.async_save 的 pinned staging。
-
-J7 · 跳步致 scheduler 走不完 horizon 且零观测：cosine 到不了 eta_min、poly 末端非 0。_collect_health_metrics 已有 opt_steps，补 planned/actual + scheduler.current_step 几乎零成本。
-
-J8 · CudaPrefetcher 在 yield 前 next(it)（@d:\codes\work-projects\SegTask\taskcore\engine\prefetch.py:83-91）→ dataloader 阻塞发生在当前 batch 计算 enqueue 之前，只隐藏了 H2D、没隐藏 dataloader 延迟（而步骤 3/4 已证明 dataloader 才是热点）。把取数挪到 yield 之后即可。流同步/record_stream 本身写得比多数开源实现严谨。
-
-J9 · static_graph × no_sync × 梯度检查点零测试零护栏：三开关全暴露，只对 static_graph×find_unused 有一条 warning（base_trainer.py:836-840）。tests 无任何 DDP 训练用例。C23 里风险最高的一格。
-
-J10 · SSL 手动同步逐张量 all-reduce（@d:\codes\work-projects\SegTask\ssltask\trainer\ssl_trainer.py:561-563）：数百次小通信、无分桶、发生在无可重叠的串行窗口。_flatten_dense_tensors 打平约 10 行。
-
-J11 · 公共 pretrain 无 0 命中报错、不读 ckpt 里的 config：config 已写入 ckpt（base_trainer.py:552,590），做 C27 交叉校验的信息就在文件里却无人消费；cls/det factory 的两份 0 命中逻辑应上提收编。
-
-J12 · resume "位精确"名不副实：worker RNG 不可恢复、只能 epoch 边界恢复、不校验 ckpt config（步骤 2 F3 正是在此触发）。
-
-J13 · EMA × BN：EMA 平滑所有浮点 buffer 且无收尾重估（SWA 有、EMA 没有），而 EMA 才是 best/部署槽位。结合步骤 5 I4（BN 有两条非自愿触发路径），非理论风险。
-
-J14 · EMA offload 隐藏常数：apply_shadow/restore 逐张量跨设备 copy、无 pinned、无 non_blocking（与 update 热路径的精心优化反差明显），每次验证 4 次全模型往返。
-
-J15 · build_optimizer_with_lr_mult 不支持 ZeRO（@d:\codes\form...\taskcore\engine\optim.py:131-142），且 encoder_lr_mult==1 与 ≠1 的 param_groups 数不同（2 vs 4）→ 两条路径的 optimizer state 不可互换 resume。
-
-J16 · launch.install_term_handlers 用 os._exit（@d:\codes\work-projects\SegTask\taskcore\engine\launch.py:71-83）：绕过 finally/atexit → 异步 ckpt 队列丢失、.tmp 残留。J17 · find_free_port TOCTOU（同文件 39-45）：bind→close→NCCL 再 bind，单机并发训练偶发 rendezvous 失败。J18 · memory.estimate_train_memory 不计 EMA backup（验证换入时的 1× 参数量）。
-
-四、值得肯定
-OptimStepResult.acknowledge + _check_boundary_scheduler_clock：把最难发现的时钟漂移变成即时异常，全仓最好的防御式设计，建议推广到 EMA/method 时钟。
-relocate_optimizer_state + _iter_leaf_optimizers（checkpoint.py:108-153）：踩过 fused Adam×ZeRO×map_location 的坑才写得出。
-all_reduce_bn_running_stats_ 以 num_batches_tracked 加权（dist_utils.py:88-114），与单进程累积平均严格相等，比常见的直接平均正确。
-pending 延迟 D2H 机制（四任务同源）与非有限守护的耦合分析。
-launch 的 PR_SET_PDEATHSIG 竞态自杀分支；bn_stats 的 momentum=None 累积平均 + 上下文恢复。
-五、架构评估
-BaseTrainer 边界画对了，但五份 _train_epoch 仍高度同构：pending/边界/健康计数/prefetch 四段在 seg/cls/det/gen/ssl 逐字重复。这是 D3（predictor 薄）的训练侧对应物。收敛方向：基类提供 micro-step 骨架模板，任务只实现 forward + loss。
-checkpoint 布局三套（seg keep-last-k、cls/det best+latest、ssl 指纹双文件），能力互不相交 → 建议统一 CheckpointManager（槽位+保留策略+指纹+ZeRO consolidate+异步）。J1/J11/J12 都消灭在这一步里。
-能力倒挂是本层唯一的架构性结论，与 config/data/models 三层"公共层强、副本弱"正好相反，修法明确：按能力并集重抽。
-六、2026 对标
-torch.distributed.checkpoint.async_save + pinned staging → J5/J6。
-Selective Activation Checkpointing / apply_activation_checkpointing → 与步骤 5 I2/I3 联动。
-EDM2 post-hoc EMA（Karras 2024）：训练后合成任意 EMA 长度，与 J13/J14 同一处改动。
-schedule-free AdamW（2024）：无需 total_steps，根治 J7 的 horizon 漂移，对"改 epochs 后 resume"的科研流特别友好，P3。
-FSDP2 结论建议是不做：3D UNet 瓶颈在激活不在参数，ZeRO-1 已够。
-torch.compile + CUDA Graphs（reduce-overhead）需实测（步骤 5 已提缺基线）。
-七、建议路线（本轮不实施）
-P0：J1 consolidate 提到早退前；J2 ssl 损失移出 autocast；J3 _global_grad_norm(parameters)；J4 reseed 收进 _restore_train_state。四项均 ≤5 行。
-P1：J5 .to("cpu", copy=True)；J8 prefetcher 取数后移；J11 0 命中报错 + ckpt-config 交叉校验上提；J7 时钟指标进 monitor；J10 梯度打平分桶；J13 EMA×BN 告警。
-P2：CheckpointManager 统一三套布局；micro-step 骨架模板收敛五份训练循环；J9 补 2-rank DDP 组合测试或配置层拦截。
-P3：async_save/SAC/post-hoc EMA/schedule-free 试点。
-八、如何验证
-现有覆盖：test_checkpoint_resume.py、test_review_r7_optimizations.py、test_todo_p_regressions.py、test_ddp_metric_all_reduce.py。建议补：
-
-ZeRO + 2-rank gloo，调 _save_latest 应成功落盘（J1，本层最该补的一条）；
-ssl 在 bf16 下 dino_gram 的 Gram 矩阵 dtype 应为 fp32（J2）；
-构造 module 外可训练参数，其非有限梯度应触发跳步（J3）；
-resume 后两 rank 的 torch.randn(1) 应不相等（J4）；
-state_to_cpu 期间 max_memory_allocated 增量应 ≈0（J5）；
-人为跳步 N 次后 scheduler.current_step 应等于 opt_steps_actual（J7）。
-命令：D:\miniconda\envs\torch27_env\python.exe -m pytest tests/test_checkpoint_resume.py tests/test_review_r7_optimizations.py tests/test_todo_p_regressions.py -q
-
-步骤 7 — metrics / utils / monitor：指标可加性与 DDP 归约正确性、边界情形（空前景/单类）、日志与随机种子、监控面板的成本与信息密度。
-步骤 8 — 全局串联与跨层契约审查：把步骤 2–7 的结论与步骤 1 的契约表对齐，检查五任务共享层的抽象边界是否合理（是否过度共享 / 共享不足）、shim 债务、扩展一个新任务的成本。
-步骤 9 — 业界对标与升级路线：按 2026 年视角给出可借鉴、可适配、可新增的清单（跨自然图像/NLP/LLM/VLM），并输出按优先级与投入产出排序的改进路线图（P0 修复 → P1 加速 → P2 架构演进 → P3 前沿实验），标明与现有设计的兼容性。
-
-
-
-
-──────────────────────────────────────────────
-核验记录（2026-07-25，对步骤 0–6 全部进展逐条比对当前代码；静态比对，未运行测试）：
-
-总体结论：审查记录整体定位准确，但与当前代码已脱节——约 15 个 P0/P1 项在记录写成后已被修复但仍挂账；其余多数发现仍成立；另发现 3 条新问题与若干记录偏差。
-
-一、已修复、应核销的项（当前代码已含修复，勿重复开工）
-- config：F1（gen sync 已有 stretch→edge_pad 自动升级，@gentask/config/validation.py）；F2（core validate 已按 section 拆分、skip 真实生效，@taskcore/config/core.py validate()）；F3（_ensure_model_geometry_backing 已补齐 _spatial_dims/_in_channels，@taskcore/config/model_migration.py）；F4（gen resenc_preset 已 .lower()，@gentask/config/validation.py:377-380）。
-- data-A：G1（auto-build 已 rank0 构建 + broadcast 成败标志 + barrier，@taskcore/data/loader.py:643-718，set_device 先于 init_process_group，实现正确）；G2（tmp 带 pid + os.replace 原子写，@taskcore/data/make_data.py:401-427）；G3（skip 校验含 has_rw/src_bbox 等 meta 完整性检查）；G4（配对缺失聚合报 FileNotFoundError + allow_unpaired 开关，@taskcore/data/loader.py:165-219）；G5（ensure_train_batch_capacity 已存在并在两处调用，@taskcore/data/loader.py:769,810,1065）。
-- data-B：H1（patch_extract.py 已统一四模式抽取原语，whole 路径含防缓存污染 copy）；H3（grid_dropout 已移到 intensity_clamp 之后，@taskcore/data/augment.py:159-163）；H4（test_z_boundary_mode.py main() 引用已修正，:461）。
-- models：I4（checkpoint_if 已带 _freeze_bn_running_stats context_fn，@taskcore/models/blocks.py:52-105）；I6（spark_encode 已按 _stage_ckpt 走 checkpoint_if，@ssltask/models/spark_modules.py:176-188）。
-- engine：J1（_save_latest 的 ZeRO consolidate 已提到 rank 早退之前，@taskcore/engine/base_trainer.py:580-584）；J2（ssl compute_loss 已移出 autocast，@ssltask/trainer/ssl_trainer.py:667-671）；J3（_global_grad_norm 已支持自定义参数集合并与 clip 同集合）；J4（resume 已在 _restore_train_state 内 reseed_rank_rng，:655，四任务共用）；J14 子项（EMA update 已加 pinned staging，@taskcore/utils/common.py:89-121）。
-
-二、复核后仍成立的项（维持原挂账）
-- config：F5（整除性校验仍未上提配置层，core 仅 lift_2_5d_to_3d 与 hierarchical stem 有整除检查；unet/unetpp/adm/edm2 常规路径仍靠模型层兜底）；F6（coerce_override_value：int/float 抛 ValueError 非 ConfigError，标量→list 联合类型不支持，@taskcore/config/task_io.py:30）；F7（registry 通用路径缺 hoist_legacy_seg_sections，见新增 N1）；F10（core.__getattr__ 告警文案仍写 segtask_v1.config.%s，@taskcore/config/core.py 末尾）。
-- data-A：G6、G7、G9（group_id_regex 仍仅 taskcore loader 支持）、G10、G12、G13、G14/H10（SeedSequence vs seed*1000003+idx 双口径，@taskcore/data/sampling.py:72-74）、G15、G17（loader 回写 dc.label_values 再 cfg.sync()，@taskcore/data/loader.py:1016-1018）。
-- data-B：H2（训练 z 采样兜底仍 rng.integers(0, D_vol) 无 safe range，@taskcore/data/dataset.py:1010，cubic 有 clamp 而 z 无）、H5、H6、H7（@taskcore/data/augment.py:514 硬编码 5D）、H8、H9、H11、H12。
-- models：I1（adm/edm2 尺寸不匹配仍静默 interpolate 无 warn，@taskcore/models/adm_unet.py:545-549、@taskcore/models/edm2_unet.py:461-465）、I2（stem/downsamples 未纳入检查点，@taskcore/models/unet.py:194,203）、I3、I5（SparK 门控仍 stage 边界级；bool(mask_full.any()) D2H 同步仍在 :167）、I7、I8、I10、I11（decoder_blocks_per_stage 仅取 [0] 广播，@taskcore/models/factory.py:357,578）、I13。
-- engine：J5（state_to_cpu 无条件 clone().cpu()；_save_best EMA 路径二次 clone，@taskcore/engine/base_trainer.py:538-566）、J7、J8（见偏差 P2）、J10（ssl 逐张量 all_reduce 未桶化，@ssltask/trainer/ssl_trainer.py:560-562）、J11、J13（EMA 无 BN 重校准；SWA 有 _swa_recalibrate_bn）、J14 余项（apply_shadow/restore 仍逐张量同步 copy 无 pinned/non_blocking，@taskcore/utils/common.py:142-153）、J15、J16、J17、J18（见偏差 P4/新增 N2）。
-- 文档：D1 仍成立（seg WORKFLOW:165"唯一例外"与 cls WORKFLOW:148 / 顶层 README:38 不一致），"文档错、代码对"定案维持。D2/D5/D7/D8/D9 定案抽查与现状一致。
-
-三、记录本身的偏差（需修正）
-- P1 体量数据全面过期：taskcore 现为 56 py / 20,473 行；core.py 2472（记录内部还有 2168 与 2464 两个数字自相矛盾）、blocks.py 1541、dataset.py 1351、loader.py 1172、base_trainer.py 1045、adm_unet.py 1050、edm2_unet.py 923、make_data.py 758。多处 @path:line 引用已漂移。
-- P2 J8"这段 CPU 等待与 GPU 计算完全不重叠"表述过强：GPU kernel 异步 enqueue 下，next(it) 阻塞可与上一 batch 的 GPU 残余计算重叠；但 fetch 在 yield 之前、无法与当前 batch 计算重叠的结论方向正确。
-- P3 F9 的 mednext 子项失效：gen _validate_model 的 backbone 白名单只允许 resnet/convnext，mednext 路径已被挡住；selfattn/multirf 无校验的子项仍成立。
-- P4 J18 部分缓解：offload 模式下 EMA backup 现已落 CPU（@taskcore/utils/common.py:137-141）；非 offload 情形仍占 1× GPU 显存且 memory.py 不计。
-- P5 J15 引用路径笔误 d:\codes\form...（应为 work-projects）。
-
-四、新增发现
-- N1（低，F7 精确化）：seg 配置两条加载路径对 legacy 顶层 loss:/predict: 段容忍度不一致——taskcore/config/registry.py 的 load_task_config(path,"seg") 走 load_core_and_task_config，不做 hoist_legacy_seg_sections；segtask_v1/seg_config.py 的 _load_raw 有 hoist。同一份旧 YAML 走前者会因 unknown key 报错、走后者正常。建议在 TaskSectionSpec 加可选 preprocess_raw 钩子统一。
-- N2（低）：ModelEMA.apply_shadow 非 offload 时 _backup 在 GPU 上占 1× 参数显存且 memory.py 不计入（J18 的补充精确化）。
-- N3（信息）：_save_best 仅 rank0 早退且不保存 optimizer，无 ZeRO consolidate 需求——J1 只改 _save_latest 的修复范围正确、无遗漏。
-
-五、核验后的建议
-1) 仍成立项按原优先级推进，建议首批：F5+I1（整除性校验上提配置层、adm/edm2 加 warn/报错）、H2（z 采样 safe range）、F7/N1（registry hoist 统一）、J10（梯度桶化）。
-2) 涉及运行时行为的项（DDP 挂死、prefetch 重叠度、EMA 换入耗时）建议在 torch27_env 以针对性小实验验证后再定案。
-3) 步骤 7–9 尚未开始，按原计划继续。
-──────────────────────────────────────────────
 
 
 2 分割项目代码审查（需结合对应 readme/design/workflow 一起理解）：需认真、仔细、严谨的理解、分析、思考和调研。为保证高质量完成，本轮不动任何代码/文档：
@@ -929,6 +60,866 @@ state_to_cpu 期间 max_memory_allocated 增量应 ≈0（J5）；
 是否正确、合理；是否有优化空间；是否有训练加速/GPU优化空间；是否有更好的高质量内容（算法/模块/设计/架构/损失等等）可以借鉴、适配或新增。现在是2026年7月，不局限医学图像领域，可能自然图像的分类/分割/检测/生成等、NLP、LLM、VLM等有更好、更先进的想法。
 
 进展：  
+
+代码量与分布（已统计，排除 __pycache__）：taskcore + segtask_v1 约 30k 行 Python / 105 个文件。热点文件：
+
+领域	主要文件（行数）
+配置真相源	taskcore/config/core.py (2523)、seg_task.py (225)、seg_bundle.py (107)、task_io.py (211)、registry.py (120)、model_migration.py (343)、geometry.py (71)、seg_config.py (119)
+数据读取	taskcore/data/dataset.py (1403)、loader.py (1311)、make_data.py (767)、specs.py (280)、mixed_sampler.py (201)、sampling.py (158)、patch_dataset_base.py / patch_ops.py / patch_extract.py
+增强	taskcore/data/augment.py (632)
+模型	models/blocks.py (1541)、adm_unet.py (996)、edm2_unet.py (938)、unet.py (620)、factory.py (600)、mednext.py (553)、resnet.py (505)、convnext.py (173)、unet3p.py / unetpp.py / stem.py (337)、topology.py (169)、arch_compat.py
+训练	engine/base_trainer.py (1125)、optim.py (331)、checkpoint.py (356)、amp.py / prefetch.py / bn_stats.py / dist_utils.py / launch.py / memory.py / views.py；segtask_v1/trainer/trainer.py (758)、validation.py (618)、pipelines/*（slab25d 367 / lift25d 207 / patch3d 121 / vanilla3d 70 / base 150 / factory 81）、views.py (232)、breakdown.py
+损失/指标	losses.py (1081)、topo_aux.py (146)、metrics.py (303)
+推理	engine/base_predictor.py (64)、segtask_v1/predictor/predictor.py (596)、sliding.py (496)、forwards.py (365)、inputs.py (276)、io.py (257)、blending.py (153)
+周边	monitor/*、launcher/*、visualization/*（TODO 4 已单列，本次仅在与主流程耦合处顺带看）
+已读文档并抽出的核心契约（后续审查将逐条对代码验真）：
+
+几何单一真相源：taskcore.models.topology.build_topology；配置层 SegBundle（core + seg: 段，旧顶层 loss/predict 经 hoist 兼容）。
+四种 patch_mode（whole/cubic/z_axis/2_5d）+ 「dataset 只出单分辨率最大 FOV cube，多视图/多分辨率推迟到 trainer」原则。
+2.5D 折叠时机契约：dataset 恒发未折叠 3D → GPU 3D 增强 → 裁余量/视图拆分 → 送模型前折叠（det 例外）。
+训练-推理镜像契约：patch_size/patch_mode/multi_res_scales/keep_native_view_depth/keep_native_multi_res/z_boundary_mode/归一化/spacing_normalization 必须一致。
+legacy 兼容开关族：elastic_field_mode、split_rounding_mode、resize_antialias、init_strategy、z_sampling_mode 等默认保旧行为（潜在"默认值即次优"的审查点）。
+checkpoint 槽位约定：_save_best 存 EMA 为 primary、model_online_state_dict/ema_state_dict 并存，统一经 extract_model_state_dict 读取。
+现有回归测试 67+ 个 位于 tests/（pipelines、topology、keep_native_*、checkpoint_resume、augment、losses 等），可作为"审查结论是否与既有行为冲突"的对照物。
+范围边界与难点：
+
+TODO 1（公共框架整体审查）尚未开工且与本任务在 taskcore 上重叠——本轮按 TODO 2 口径处理：只审分割链路实际经过的 taskcore 代码，cls/det/gen/ssl 专属分支仅在"公共抽象是否被其他任务扭曲"这一角度点到为止，不展开。
+难点：core.py/blocks.py/base_trainer.py/losses.py 均为千行级，需分块精读；跨层契约（config→topology→dataset→pipeline→model→loss→predictor）必须端到端对齐才能判断正确性，因此必须留一轮做全局串联。
+2026 前沿对标需要联网检索（分割 SOTA、训练加速、数据管线、损失/评测），会在对应步骤内执行并标注来源与适配代价。
+建议的执行计划（每步一轮，可独立执行）
+统一产出格式（每步）：① 事实梳理（该模块真实做了什么，带 文件:行号 引用）→ ② 正确性问题（Bug / 契约违背 / 边界未处理，按 严重/中等/轻微 分级）→ ③ 合理性与设计评价 → ④ 优化空间（含 GPU/吞吐/显存，标注预估收益与风险）→ ⑤ 2026 可借鉴项（方案、来源、适配代价、优先级）→ ⑥ 与既有测试/契约的冲突检查。 统一验收标准：结论均可溯源到具体代码行；不含"凭记忆臆断"的 API/版本断言（涉及库用法时查最新官方文档）；不提出破坏既有契约而未说明代价的建议；不产生任何代码/文档改动。
+
+步	内容	主要对象	依赖
+S1	配置与几何真相源（前置基座，非 5 部分之一但被全部依赖）	taskcore/config/*、models/topology.py、seg_config.py	无
+S1 审查报告：配置与几何真相源
+本轮范围：taskcore/config/*（core.py / geometry.py / section_validators.py / seg_task.py / seg_bundle.py / registry.py / task_io.py / model_migration.py）、topology.py、seg_config.py，以及它们在训练/推理入口的实际调用点。 本轮遵守：不改任何代码/文档；结论均给 文件:行号；关键判断用本地环境（D:\miniconda\envs\torch27_env\python.exe）实测复现；不臆断库用法（外部对标已附来源）。
+
+① 事实梳理：这一层真实做了什么
+加载链路（分割）：@d:/codes/work-projects/SegTask/segtask_v1/seg_config.py:47-58 → hoist_legacy_seg_sections（旧顶层 loss/predict 迁入 seg:，新旧同设即报错，@d:/codes/work-projects/SegTask/taskcore/config/seg_task.py:197-218）→ dataclass_from_dict（旧扁平 model 键路由 + 别名/派生键/未知键硬拒绝，@d:/codes/work-projects/SegTask/taskcore/config/core.py:2374-2448）→ SegBundle.sync() → SegBundle.validate()。
+
+四个"单一真相源"：
+
+几何/通道派生：build_topology(cfg) 一次算齐 in_channels / spatial_dims / out_classes / per_view_depths / num_stem_fusion_views / aux_head_out_channels（@d:/codes/work-projects/SegTask/taskcore/models/topology.py:75-166），sync() 只写两个私有 backing 字段，对外只读 property（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1358-1363、626-640）。
+下采样 stride：显式 downsample_strides > anisotropic_pooling 自动调度 > 历史各向同性 ×2（@d:/codes/work-projects/SegTask/taskcore/config/geometry.py:47-81）。
+选模标准：save_best_criterion → (metric, mode) 单表派生（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1079-1089、991-1002）。
+旧扁平 model 接口：FLAT_TO_NESTED 一张表同时驱动 YAML 路由、转发 property、老 ckpt __setstate__（@d:/codes/work-projects/SegTask/taskcore/config/model_migration.py:150-154、349-373）。
+校验编排：Config.validate() 六个段校验器 + 可 skip（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1432-1453）；SegBundle.validate() 把 loss/predict 从 core 摘出交给 seg 段（@d:/codes/work-projects/SegTask/taskcore/config/seg_bundle.py:52-66）。数据探测回写走 finalize_from_data 并重跑 sync()（@d:/codes/work-projects/SegTask/taskcore/data/loader.py:418-436），调用点在建模型之前（@d:/codes/work-projects/SegTask/segtask_v1/train.py:59-63），顺序正确。
+
+② 正确性问题
+严重
+[S1-A] train.reparam_deploy 字段归属错位，导致独立推理 CLI 必然崩溃 字段定义在 TrainConfig（@d:/codes/work-projects/SegTask/taskcore/config/core.py:987-989），消费点却读 cfg.model.reparam_deploy（@d:/codes/work-projects/SegTask/segtask_v1/predictor/io.py:160）。ModelConfig 无该字段、也不在 FLAT_TO_NESTED 转发表内。实测：
+
+
+
+Config().model 上 hasattr('reparam_deploy') = False
+即 run_inference 在 load_state_dict 之后、.to(device) 之前 无条件抛 AttributeError，python -m segtask_v1.predict 全路径不可用（与 backbone 无关）。为何未被测试发现：@d:/codes/work-projects/SegTask/tests/test_dilated_reparam.py:255 用 cfg.model.reparam_deploy = True 先行 setattr，恰好把缺失字段补上了，掩盖了默认路径。 根因属配置层：字段归属（train vs model）与消费方不一致，且没有"配置字段必须有消费者/消费者路径必须存在"的契约测试。
+
+中等
+[S1-B] save_best_preset 在 sync() 中反复覆盖用户 override，静默丢失 _apply_save_best_preset 无条件覆盖三个字段（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1370-1394），而入口在 override 之后又调一次 cfg.sync()（@d:/codes/work-projects/SegTask/segtask_v1/train.py:129-132）。实测：
+
+
+
+yaml 里 save_best_preset=vessel → criterion=balanced
+--override train.save_best_criterion=iou 后再 sync → criterion 仍是 balanced
+用户以为在换选模标准，实际整轮训练选模口径没变，只有一条 INFO 日志。
+
+[S1-C] sync() 非幂等：resenc_preset 展开后无法再跟随 encoder_channels 变化 _apply_resenc_preset 只在 *_blocks_per_stage 为空时填（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1396-1430）。实测：
+
+
+
+preset=M → [1,3,4,6,6]；再 override encoder_channels 为 6 级 → 二次 sync 不重填
+→ REJECTED: encoder_blocks_per_stage must have 6 entries; got 5
+结果是"配了 preset 就不能用 --override 改深度"，报错信息还指向一个用户从没写过的字段。B 与 C 同源：sync() 把派生（可重复执行）与一次性预设展开（不可重复执行）混在一个方法里。
+
+[S1-D] lift 分支的 D 整除检查是第二个几何真相源，且与 geometry.py 冲突 @d:/codes/work-projects/SegTask/taskcore/config/core.py:2085-2093 硬编码 D % 2**(n_levels-1)，既不看 downsample_strides，也不看 stem stride。实测（lift + downsample_strides=[[1,2,2],[1,2,2],[2,2,2],[2,2,2]]，z 实际只降 4 倍，D=8 合法）：
+
+
+
+REJECTED: lift_2_5d_to_3d=True with 5 encoder stages requires patch_size[0] (D=8) divisible by 16
+误拒合法配置。同时它忽略 stem_mode=patch2/patch4（漏检部分幸被 validate_patch_geometry 兜住，@d:/codes/work-projects/SegTask/taskcore/config/section_validators.py:101）。正解是复用 effective_patch_divisors。
+
+[S1-E] _validate_augment 里混进了 data / model 段的校验 data.split_rounding_mode、data.z_sampling_mode、model.init_strategy 三项枚举校验写在 augment 校验器内（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1873-1885）。validate(skip={"augment"}) 会连带跳过它们——与 validate() 文档承诺的"按 section 拆分"契约不符（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1432-1438）。
+
+[S1-F] skip 未知段名静默忽略 @d:/codes/work-projects/SegTask/taskcore/config/core.py:1448-1450 只做 name not in skip，拼错（如 "2.5d"、"Model"）不报错，静默变成"全量校验"或"漏跳"。文档把静默忽略当特性（给组合式任务传 loss/predict），但代价是所有拼写错误都不可见；更稳的做法是白名单 + 显式允许集。
+
+[S1-G] unet3p 提前 return，跳过 divisor 校验 @d:/codes/work-projects/SegTask/taskcore/config/section_validators.py:80-94 对 decoder_type=='unet3p' 只检查"每级尺寸 ≥ stride"就 return，不做整除检查。UNet3+ 的全尺度 skip 需要各级尺寸严格对齐，非整除时问题会推迟到运行期 shape mismatch。此条标注为待验真：需 S4/S5 核对 unet3p.py 内部是否用插值自适应对齐；若自适应，则本条降为"注释未说明豁免理由"。
+
+轻微
+问题	位置	说明
+ModelTopology.num_fg_classes 在 lift 路径算错	topology.py:62-69 + 130	lift 下 slab_depth 仍= D，num_fg//1//D → 0 → max(...,1)=1。当前无生产消费者（各处用 cfg.num_fg_classes），属埋雷
+patch_size 无正性校验	core.py:1925-1927	只校验长度 3；[0,128,128] 能通过（0 % divisor == 0），错误延到 dataset
+num_classes 与 label_values 不一致不报错	core.py:1323-1324	只在 num_classes==0 时推断，两者同设且矛盾时静默采信 num_classes
+amp_dtype / compile_mode 配置期无枚举校验	core.py:834-839	amp_dtype 拖到 _setup_amp 才 ValueError（base_trainer.py:201-204）；compile_mode 全无校验。二者都发生在数据扫描/npz 构建之后，浪费启动时间
+z_boundary_mode 白名单仍含已废弃的 "stretch"	core.py:1937-1940	依赖 sync() 升级；手工构造后只 validate() 的路径能带着 stretch 通过
+Optional 字段无法 override 回 None	task_io.py:80-81	--override predict.hw_overlap=null → float(None) → ConfigError
+推理侧无训推镜像契约校验	predict.py:62-66、io.py:131-143	只有 state_dict 形状兜底；patch_mode / normalize / spacing_normalization / multi_res_scales 不一致时静默产出错误结果——这是 S10/S11 的核心风险，根因在配置层没有落盘指纹
+seg 未走注册表加载，三份近重复加载逻辑	seg_config.py:47-74（load_task_config 导入后未用，第 20 行）、core.py:2456-2474、task_io.py:169-195	registry 里注册的 preprocess_raw 在 seg 实际路径上形同虚设（seg 自己又调了一遍 hoist），未来改 registry 不会同步到 seg
+死代码 / 导出不全	registry.py:32（_COMPOSITE_SKIP_CORE=()）、section_validators.py:140-143（__all__ 漏 validate_patch_geometry，但它被 core 按名 import）	
+③ 合理性与设计评价
+做得好的（应保留为契约）：
+
+派生量只读化 + 旧键硬拒绝：in_channels/spatial_dims/save_best_metric/mode 全部 property 化，旧写法在加载期给出迁移指引式报错（core.py:2312-2333、2420-2441），彻底消灭"设了却被静默重写"，是本层最有价值的设计。
+build_topology 单入口：12 种 mode 组合有等价性回归（tests/test_model_topology.py:55-80），新增 patch_mode 只改一处决策树。
+model_migration 双向映射：一张表驱动 YAML 路由 / property / pickle 迁移，且新旧同设 fail-fast（model_migration.py:254-257），比"静默优先级"稳妥得多。
+结构性问题：
+
+sync() 职责过载——它同时承担 ①纯派生（幂等）②语义自动升级（幂等）③一次性预设展开（非幂等）。S1-B/S1-C 都是这个混合的直接后果。建议拆为 derive()（每次都跑）/ normalize()（每次都跑）/ expand_presets()（加载期只跑一次，或改为"preset 只填未显式设置的字段"）。
+几何真相源仍有 3 份 stem-stride 副本：geometry.stem_stride_of:12-14、core._est_stage_tokens:1634-1636、core._validate_2_5d:2149-2153。加一个 stem 模式就要改三处——这正是 R5 引入 build_topology 想消灭的那类问题，只是这次漏在了 stride 侧。
+校验按段划分与实际字段归属脱节（S1-E），且跨段耦合校验散落在 _validate_model / _validate_2_5d / seg_task._validate_cross 三处，"哪些约束在什么时候跑"需要读三个文件才能拼出来。
+SegBundle 是 duck-typed 门面（seg_bundle.py:68-86），但下游签名普遍写 cfg: Config（如 io.py:96），静态检查与 isinstance 全部失真；__getattr__ 还要手工防递归。收益（cfg.loss 同址访问）与代价（类型系统失效）值得在 S11 重估。
+2.5D / 3D 的 keep_native_* 双胞胎门控写了三遍：sync（core.py:1338-1356）、build_topology（topology.py:97-103）、_validate_data（core.py:1981-2013）。三处条件必须同步修改，是新增 mode 时最易漏的地方。
+cross-task 泄漏：build_topology 里为 gen 任务的 cond_dirs 做 getattr 兜底（topology.py:90-93）。按 TODO 2 口径只做记录：公共抽象已被非分割任务轻度扭曲，属 TODO 1 的处理对象。
+
+S2	数据读取（一）公共层	data/specs.py、loader.py、dataset.py（含 npz IO / LRU / 前景索引 / 采样中心）	S1
+审查报告：数据读取（一）公共层
+本轮遵守：只审不改（未产生任何代码/文档改动）；结论均给 文件:行号；关键判断用 D:\miniconda\envs\torch27_env\python.exe 实测复现；不臆断库用法（未联网核实的对标项已显式标注）。
+
+本轮范围：specs.py、dataset.py、以及其叶子依赖 sampling.py / patch_ops.py；loader.py 的发现/划分/装配主链路。make_data.py、mixed_sampler.py、patch_dataset_base.py 与任务层 segtask_v1/data/* 按计划留给 S3；augment 留给 S6。
+
+① 事实梳理
+装配链路（seg 训练）：build_dataloaders (@d:/codes/work-projects/SegTask/taskcore/data/loader.py:1058-1311) → _resolve_npz_paths（扫描 + 可选 rank0 内联 auto-build + exclude 过滤，:744-835）→ detect_label_values（优先读 meta.label_counts 免解码，:357-415）→ finalize_from_data（唯一写配置入口，:418-436）→ 划分（group > stratified > random，:1150-1176）→ DatasetCommonCfg.from_cfg + _split_paths_from（:1188-1190）→ build_data_spec（唯一 patch_mode 分支点，@d:/codes/work-projects/SegTask/taskcore/data/specs.py:260-270）→ spec.make_split → DataLoader/Sampler 装配（:1206-1295）。
+
+四个真实契约：
+
+npz-only：SegDatasetNpzBase.__init__ 强制 npz_paths 与 image_paths 等长（@d:/codes/work-projects/SegTask/taskcore/data/dataset.py:696-699）；_split_paths_from 让 image/label/npz 三者同源（loader.py:838-846），image/label 路径退化为"计数 + 缓存键"别名。
+单分辨率最大 FOV：三个 dataset 恒发单 cube，多视图推迟到 trainer（dataset.py:948-951、1189-1191）。
+split-dependent 参数只在 spec 内切换：_aug_oversample / _samples_per_volume（val 减半）/ _fg_ratio（val=0）（specs.py:130-143）。
+验证确定性：训练用逐 worker 流式 RNG，验证用 (VAL_SAMPLING_SEED, sample_idx) 派生（sampling.py:63-72、dataset.py:738-746），val_grid_coverage 时改走 z-bin / Halton 铺点（dataset.py:748-756、sampling.py:111-132）。
+I/O 层：未压缩 npz 走 _open_npy_member_mmap 零拷贝 memmap 快路径（dataset.py:257-296），preprocess_image 单次分配 + in-place（:478-511），load_nifti* 有限重试且 OOM 折为 MemoryError（:67-89）。三份独立 LRU（img/lbl/rw）在 pickle 时清空（:612-656）。
+
+② 正确性问题
+严重
+[S2-A] 异构 npz（部分含 rw）会让 default_collate 直接 KeyError weight_map 是逐卷条件性写入的：有 rw 文件 → 写；无 rw 且 region_weights 为空 → 不写（dataset.py:994-1004、1233-1241、1382-1394）。同一 batch 内混入"有 rw / 无 rw"两类样本时 collate 崩溃。实测：
+
+
+
+KeyError 'weight_map'   # torch.utils.data._utils.collate.default_collate
+单一 npz_dir 内部因 match_region_weight_paths 强制 1:1（loader.py:341-349）通常同质，但双源混采必然踩中：npz_dir（金标，带 rw）与 npz_dir_secondary（粗标，离线单独构建、通常无 rw）经 ConcatDataset 混进同一 batch（loader.py:1215-1245）。根因是"样本 schema 随卷可变"，不是 collate 的问题；正解是 dataset 层把 weight_map 恒定输出（无 rw 时填全 1），或在 build_dataloaders 里对两源 rw 存在性做一致性 fail-fast。
+
+[S2-B] 划分不可复现：manifest 只写不读，数据集增删即静默换 val 集 train_val_split 对位置索引做 RandomState(seed).permutation(n)（loader.py:501-512），而 primary_paths 是排序后的目录扫描结果。新增/删除一个 npz 会同时改变 n 与后续文件的位置。实测（20 个样本，插入 1 个 p04b.npz）：
+
+
+
+val before ['p00', 'p01', 'p15', 'p17']
+val after  ['p00', 'p01', 'p14', 'p16']
+leaked (was val, now train): ['p15', 'p17']
+而 split_manifest_path 只有写入路径（loader.py:1177-1185、468-498），全仓无任何读取点（grep 仅命中定义、写入与两个写入侧单测）。后果：① 补数据后 resume/续训，原 val 样本进入训练集，历史 best 指标口径失效；② 跨运行指标不可比。正解是 manifest 可回读并按文件名哈希（而非位置）划分。
+
+中等
+[S2-C] safe_center_range（cubic）与 safe_z_center_range（z）上界差 1，cubic 永远采不到每轴最后一个体素 实测（vol=100、patch=64）：
+
+
+
+cubic ((32, 68), ...)   # max center 67 → 覆盖 [35, 99)，索引 99 永不入 patch
+z     (32, 69)          # max center 68 → 覆盖 [36, 100)，边界可达
+_axis_center_range 的 hi = size - (patch - half) 是半开上界（patch_ops.py:81-89），而 safe_z_center_range 多 +1（sampling.py:107-108）。数学上 z 侧才是正确的（c = D-(p-half) 恰好贴边、无 padding）。影响：cubic/whole-cube 模式下每轴最外层 1 个体素永远不参与训练与 val-grid 覆盖；同时这是"同一语义两份实现"的漂移点，cls/det 也共用 patch_ops。注意此条与既有测试冲突，见 ⑥。
+
+[S2-D] z 路径多分辨率的安全中心域按 eD 而非 eD_max 计算 _sample_z 用 D_patch = self.extract_size[0]（dataset.py:1025），但实际抽取深度是 eD_max = round(eD * max_scale)（:978）；cubic 侧则显式乘了 _max_scale（:1260-1264）。scales=[1.0, 2.0] 时最粗视图最多可有 ~50% 深度来自 edge 复制，且分布随卷厚度变化。行内注释（:1023-1024）表明这是"保持采样域跨视图不变"的有意选择，但它与 cubic 的口径不一致、也未在 DESIGN 中作为契约声明；至少应统一并写明代价。
+
+[S2-E] log_volume_cache_estimate 为读一个 shape 解压整卷，且泄漏文件句柄 _f["image"].shape（loader.py:994-995）会把整卷 int16 从 zip 解出——本模块自己的文档明确警告过这一点（dataset.py:299-303 的 _read_npz_image_shape：「仅为读形状时应避免」）。且 _f = open_npz(...) 未用 with，句柄直到 GC 才释放。纯诊断代码为此付出一次整卷解码的启动开销，正解是复用 _read_npz_image_shape。同一函数内日志自相矛盾：total_gb 已把 index_bytes 乘上了 workers（:1016-1017），随后却打印「shared per dataset process; not multiplied」（:1035-1038）——按 fork/spawn 实际语义，乘是对的、日志是错的。
+
+[S2-F] region_weights 长度无校验，zip 静默截断/错位 compute_region_weight_map 直接 zip(label_values, region_weights)（dataset.py:524-525）。配置语义是"按 label_values 全长（含 bg）"（core.py:668-671 及各 YAML 注释），但 taskcore/config 内没有任何长度校验（grep 仅命中字段定义）。长度写短 → 尾部类静默失权；写成"仅前景"长度 → 权重整体错位一格（bg 拿到 fg1 的权重）。这与 S1-「num_classes 与 label_values 矛盾不报错」同属一类缺口。
+
+[S2-G] cache_mode / cache_dtype / normalize 的字符串比较即"枚举"，拼错静默降级 cache_enabled = (str(dc.cache_mode) == "memory")、cache_int16 = (str(dc.cache_dtype) == "int16")（specs.py:79-81）：写成 "Memory" → 缓存静默关闭，只表现为变慢。normalize 未知值则拖到 worker 内每样本抛 ValueError（dataset.py:509-510）——发生在 npz 扫描/构建之后，浪费启动时间。同 S1-「amp_dtype/compile_mode 配置期无枚举校验」。
+
+[S2-H] world_size > val_batch 数 时部分 rank 拿到 0 个 val batch ValBatchShardSampler._blocks = range(rank, n_batches, world_size)（loader.py:57-58）无下界保护。指标 all-reduce 本身能容忍（各 rank 计数不等长是设计内的），但验证阶段任何逐 batch 的集合通信（SyncBN / DDP forward）都会因步数不等而挂死。属需在 S9/S10 端到端核对的风险点，根因在本层缺守卫。 （正面结论：块划分与 DataLoader 的 batch 边界是对齐的——块按升序产出、只有全局最后一块可能不足 batch_size 且必落在其所有者的末尾，因此不会出现跨块拼批。这点写得正确。）
+
+轻微
+问题	位置	说明
+Config 是未定义名	specs.py:119、260	无 import、无 TYPE_CHECKING；靠 from __future__ import annotations 在运行期不炸，但类型检查全失效
+resize_antialias 绕道传参	specs.py:58/85-89/145-150	先作为 dataclass 字段、to_kwargs() 又 pop 掉、再用 inspect.signature 探测补回；三个 dataset 全都有该形参，探测恒真，是纯复杂度
+_filter_by_exclude 返回值半废弃	loader.py:831-834	kept 变量未使用，随后又用 keep_idx 重算一遍
+取整逻辑 4 份且互不一致	loader.py:439-465、547、738	grouped_train_val_split 与 stratified_split_by_key 完全无视 split_rounding_mode
+_current_vol_idx 未在 __init__ 声明	dataset.py:954、1194 vs 704-732	只在 __getitem__ 里首次赋值；直接调用 _getitem_max_fov 的测试/子类路径会 AttributeError
+_sample_idx 实例态	dataset.py:732/952/1192	所有调用点都显式传 sample_idx，该字段是可被并发写坏的冗余状态
+三份 LRU 各自持 cache_max_volumes	dataset.py:720-722	配 N 实际最多常驻 3N 个卷；且容量按"卷数"而非字节，卷尺寸差异大时预算失真
+whole 模式 label 未做 antialias 讨论	dataset.py:1370-1371	label order=0 正确，但 image 的 resize_antialias 默认 false（legacy），整卷 4× 下采样会明显混叠
+逐类均衡是"卷内"而非"全局"	dataset.py:1036-1038、1283-1285	rng.integers(len(per_cls)) 在该卷出现的类里均匀选；某类只在少数卷出现时，全局仍然欠采
+③ 合理性与设计评价
+做得好的（建议固化为契约）：
+
+_open_npy_member_mmap 零拷贝快路径（dataset.py:257-296）：正确识别 ZIP_STORED + 解析 npy 头 + object dtype 拒绝 + 异常兜底回退，语义与 zipfile 路径逐位一致；页缓存跨 worker 共享，是本层收益最高的工程设计。
+验证采样确定性化（sampling.py:63-72）：把 save_best / early-stop / plateau 从采样噪声里摘出来，是很多同类框架都没做对的事。
+DatasetSpec 策略化（specs.py）：patch_mode 分支收敛到一处，且 split 差异封在 spec 内，loader.py 不再感知 train/val 差异。
+ValBatchShardSampler：与"逐 rank 全量迭代 + 跳批"严格同构，但 CPU 开销不随卡数翻倍；无 padding 无重复，指标可与单进程严格相等。
+结构性问题：
+
+build_dataloaders 未复用同文件的 assemble_train_val_loaders：loader.py:889-970 已把"workers 平摊 + loader kwargs + 零批次拦截 + sampler 选择"收敛成公共函数，但 seg 主链路在 :1206-1295 又把同样的逻辑内联写了一遍（loader_kwargs 手搓、DistributedSampler/ValBatchShardSampler 手搓）。两份实现已经出现分化（内联版没有 collate_fn / train_drop_last 参数），是下一次改 DDP 行为时的漏改点。
+前景索引在内存里存了两份：_vol_fg_coords 保存全量 coords，_vol_fg_coords_by_cls 用布尔掩码切片再存一份（dataset.py:1181-1183；实测 coords[cls==v] 不共享内存）。fg 上限 50000/类/卷时，1000 卷 × 3 类 ≈ 1.8 GB → 实际 3.6 GB，且每个 worker 一份。按类排序后存视图（或存 offset 边界）即可归零这份冗余。
+启动期同一个 npz 被打开 2–4 次：detect_label_values（meta）→ 可能的 load_npz_label_counts（loader.py:1163，meta 第二次）→ train split _build_index（dataset.py:928-946）→ val split _build_index。每次都是一次 zip 目录解析。合并为"一次 meta 扫描 + 缓存"是纯收益。
+Windows spawn 下索引会被 pickle 进每个 worker：VolumeCache 专门写了 __getstate__ 丢弃缓存（dataset.py:646-656），但 GB 级的 _vol_fg_coords* 没有同等待遇；persistent_workers=False 时每 epoch 重传一次。
+"安全中心域"两份实现（S2-C）与 "z 多分辨率域"两套口径（S2-D）：与 S1 的「几何真相源仍有 3 份 stem-stride 副本」是同型问题——patch_ops 已被立为单点，z 轴却另起炉灶。
+样本 schema 不稳定（S2-A 根因）：weight_map 的有无由数据决定而非配置决定，违反"dataset 输出结构对 batch 内所有样本一致"这一隐含契约。
+npz 之外的路径已死但代码仍在：load_nifti_cropped / load_region_weight_volume / compute_bbox_from_volume / resample_to_spacing（dataset.py:163-230、529-535、591-606）在训练链路上已被 npz-only 契约旁路，实际消费者在 make_data / predictor。放在 dataset.py 里会让读者误以为训练期还有 NIfTI 路径，建议 S11 一并评估是否下沉到 volume_io.py。
+④ 优化空间（含 GPU/吞吐/显存）
+按「收益 / 风险」排序：
+
+#	优化	预估收益	风险
+1	fg 索引按类排序后存视图，取消 _by_cls 拷贝	索引 RAM 减半（大数据集 GB 级/worker），spawn pickle 量同步减半	低；采样语义不变
+2	启动期一次 meta 扫描共享给 detect_label_values / 分层划分 / 两个 split 的 _build_index	启动 zip 打开次数 4→1；千卷量级可省数十秒到分钟	低
+3	log_volume_cache_estimate 改用 _read_npz_image_shape + with	省一次整卷解码 + 消除句柄泄漏	极低
+4	三份 LRU 合并为单缓存、按字节计费（cache_max_bytes）	内存预算可预测（当前配 N 实占 3N 卷）；避免 OOM 靠告警兜底	中；cache_max_volumes 需保留兼容
+5	cache_int16 路径每次取用都重跑 preprocess_image（dataset.py:768-776），可改为在 GPU 上做窗宽/归一化	CPU worker 从 O(卷) 浮点运算降为 memcpy；与 augment.py 的 GPU 3D 增强天然同址	中；需与 S6 的 GPU 增强入口统一，且要保证与 CPU 路径数值一致
+6	面内 resize_3d 用 scipy.zoom（单线程 CPU）；大 FOV cubic 下这是 worker 主要热点	改为 GPU 上 F.interpolate（随 batch 一起做）可显著降 worker 占用	中高；会改变数值（zoom order=1 vs grid_sample），需回归比对
+7	pin_memory 已开，但未设 pin_memory_device；DDP 下可省一次隐式设备查询	小	极低
+8	_build_index 串行读 npz meta，可用线程池（纯 I/O + zip 目录解析，GIL 友好）	启动期线性→并行	低
+⑤ 2026 可借鉴项
+说明：本轮未联网核实以下方案的最新版本与 API 细节（连接不稳定）。这些条目是方向性建议，若进入落地阶段，我会先查各自最新官方文档再给具体接口，不凭记忆写实现。
+
+方案	借鉴点	适配代价	优先级
+nnU-Net v2 的前景过采样策略	当前是逐样本伯努利（fg_ratio 概率，dataset.py:1033），batch 内前景样本数方差大、小 batch 时可能整批无前景。nnU-Net 的做法是按 batch 内位置强制后 1/3 样本为前景样本，方差为 0	需在 sampler 层（而非 dataset 层）表达"batch 内配额"，与 MixedBatchSampler 有交互	高（直接影响小 batch 3D 训练稳定性）
+nnU-Net v2 的 blosc2 分块存储（近两年替代 npz 的方向）	支持分块随机读：只解压 patch 所在的 chunk，而非整卷。当前 memmap 快路径已能零拷贝，但 --compress 产物会退回整卷解包，且缓存必须按整卷计费	需改 make_data 落盘格式 + 新增 reader；_open_npy_member_mmap 可保留为旧格式路径	中（大卷 + 内存受限场景收益大）；需核实当前稳定版是否已默认
+按内容哈希划分 train/val（sha1(basename) % 100 < val_ratio*100）	直接消除 S2-B：增删样本不影响既有成员归属，manifest 退化为审计产物	低；但会一次性改变所有历史划分，需作为 split_mode 新枚举、默认保旧	高
+per-case 归一化（nnU-Net 的 MRI 方案）	当前只有全局 zscore（global_mean/std）与 minmax（dataset.py:496-508），CT 够用，MRI/多中心数据缺 per-case（含 nonzero-mask）归一化	低（加一个 normalize 枚举值）；但必须同步进训推镜像契约（S1-「推理侧无镜像校验」）	中
+MONAI SmartCacheDataset 式的缓存置换	当前 LRU 按访问置换，在"每卷采 S 个 patch、卷序被 shuffle 打散"的访问模式下命中率差；SmartCache 用"每 epoch 替换固定比例"匹配这种模式	中；或更简单——用卷块化 sampler（同卷的 S 个样本尽量同 epoch 邻近）把命中率拉起来，改动只在 sampler	中（cache_mode=memory 且卷数 >> 缓存容量时收益明显）
+DataLoader(in_order=False)（PyTorch 新增的乱序返回）	卷尺寸差异大时 worker 之间耗时不均，当前严格按序返回会被最慢 worker 拖住	低；但训练确定性会改变，验证侧必须保持 in_order=True	低-中；需核实本仓 torch 版本是否支持
+WebDataset / 顺序分片读	网盘/机械盘上随机小文件读是瓶颈（本仓已为此加了 NIfTI 读重试，dataset.py:47-89，说明确有不稳定存储场景）	高（改数据组织 + 采样语义）	低（仅当确认 I/O 为瓶颈）
+⑥ 与既有测试/契约的冲突检查
+S2-C 与既有测试直接冲突：@d:/codes/work-projects/SegTask/tests/test_patch_ops.py:42-46 断言 safe_center_range((5,20,20),(32,8,8))[1] == (4,16)（即 hi = 20-(8-4)），把当前的半开上界固化成了契约；:49-63 还断言 cls/det/seg-cubic 共用同一实现。修正上界需同步改这两处断言，并接受 cubic 采样分布发生可观测变化（cls/det 的 patch 分布也会变）——因此这不是一个"顺手修"的 bug，建议在 S12 里作为独立批次评估，或先只统一文档口径。
+S2-D 与 tests/test_keep_native_multi_res.py:454-460 相邻：该测试特意把体积放大到"最大 cube 能完整落入"以避开退化分支，说明现有测试刻意回避了多分辨率 + 边界的组合，本条无现成对照物，需 S8 端到端验真后再定性。
+S2-B 修正会改变所有历史划分，与 README.md:39-45 / DESIGN.md:25-31 声明的"legacy 默认保旧行为"原则冲突 → 必须以新枚举 + 默认 legacy 落地。
+S2-A、S2-E、S2-F、S2-G 无既有测试覆盖，修正不破坏任何现有断言（S2-A 需新增"异构 rw 源"回归用例）。
+tests/test_todo1_batch5_fixes.py:54-65 只覆盖 manifest 的写入（rank 过滤 + 原子替换），不覆盖回读——与 S2-B 的判断一致，非冲突。
+tests/test_todo1_batch1_fixes.py:111-117 固化了 safe_z_center_range 的薄卷退化行为，与本轮结论不冲突。
+
+S3	数据读取（二）预打包与混采 + 任务层	make_data.py、mixed_sampler.py、sampling.py、patch_*、segtask_v1/data/*	S2
+审查报告：数据读取（二）预打包与混采 + 任务层
+本轮遵守：只审不改（未产生任何代码/文档改动）；结论均给 文件:行号；关键判断用 D:\miniconda\envs\torch27_env\python.exe 实测复现（脚本写在系统临时目录，未落工作区）；外部对标已附来源。
+
+本轮范围：make_data.py、mixed_sampler.py、sampling.py、patch_ops.py、patch_extract.py、patch_dataset_base.py、segtask_v1/data/*，以及它们在 loader.py 的装配调用点（_resolve_npz_paths 内联 auto-build、混采装配段）。loader.py 的发现/划分主链路属 S2，不重复。
+
+① 事实梳理
+预打包链路：CLI python -m taskcore.data.make_data --config --out [--workers/--fg-subsample/--compress/--overwrite/--limit]（@d:/codes/work-projects/SegTask/taskcore/data/make_data.py:712-763）；@d:/codes/work-projects/SegTask/segtask_v1/data/make_data.py:13 是 sys.modules 替换式 shim。 prepare_dataset（:521-667）= _build_sample_table（discover→exclude→match bbox/rw，:452-483）→ _resolve_label_values（:486-494）→ _resolve_target_spacing（nnU-Net 式头信息中位数指纹，:497-518）→ 逐样本 prepare_one → _failures.txt + _manifest.json。 prepare_one（:234-449）九步：skip 幂等判定 → 物理几何 fail-fast（:198-220）→ bbox → 流式裁剪读 image/label → rw（+1 偏移、int16/fp32 自适应，:299-321）→ cond（gen）→ 可选 spacing 重采样（:336-361）→ 逐类 fg 索引 + label_counts（:363-372）→ meta → tmp(带 pid)+os.replace 原子写（:410-439）。 skip 契约 _npz_meta_allows_skip（:67-123）：必需键 label_counts/image_shape/fg_per_class + 比对 spacing_normalized/target_spacing/label_values/fg_subsample/has_rw/src_bbox。内联 auto-build 由 rank0 独占 + barrier（@d:/codes/work-projects/SegTask/taskcore/data/loader.py:776-790）。
+
+混采链路：loader.py:1113-1253 —— secondary 不划分、整批入训练；SourceTaggedDataset 打 source 标；ConcatDataset([primary|secondary])；MixedBatchSampler 作 batch_sampler；val 恒取金标。sampler 契约：coarse 每 epoch 顺序消费一遍、gold 循环过采样，epoch 长度 n_secondary // coarse_per_batch // world_size（@d:/codes/work-projects/SegTask/taskcore/data/mixed_sampler.py:157-160）；DDP 下各 rank 同 seed+epoch 生成同一全局序列再按 b % world_size 取切片（:225-239）。set_epoch 经 @d:/codes/work-projects/SegTask/taskcore/engine/base_trainer.py:953-962 鸭子识别、@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:420-421 每 epoch 调用 —— 该链路正确闭合。
+
+叶子层三件套：sampling.py（worker RNG / val 确定性 RNG / z-grid / Halton / 中心钳制）、patch_ops.py（cube 抽取 + 安全中心域）、patch_extract.py（VALID_PATCH_MODES 单点 + extract_patch_by_mode + resolve_patch_center）。patch_dataset_base.py 是 cls/det 专用模板基类，seg 走 SegDatasetNpzBase。
+
+任务层事实：segtask_v1/data/ 只有空 __init__.py 与 shim —— 分割项目的数据读取任务层是空的，已 100% 下沉 taskcore。计划里 S3 的"任务层"部分在 seg 上无实体。
+
+② 正确性问题
+严重
+[S3-A] skip 判据单向（只查"缺"不查"多"），关掉 region_weight_dir/bbox_dir 后重跑必然静默复用陈旧包 expect_rw/expect_bbox 只在"要求有而 on-disk 无"时拒绝（:119-122），反向不查。实测：
+
+
+
+on-disk has_rw=True, src_bbox='F:/roi/p0.nii.gz'；请求 expect_rw=False, expect_bbox=False
+→ (True, '')          # 允许 skip
+两个后果：① 训练实际吃的是按旧 bbox 裁剪、且带 rw 的体积，与当前配置不符，image_shape 也不是未裁剪尺寸；② 若中途改配置（打了一半 → 去掉 region_weight_dir → 继续打），同一个 npz_dir 内部就会混合"有 rw / 无 rw"两类包 —— 这直接触发 S2-A 的 default_collate KeyError: 'weight_map'。即 S2-A 不是双源混采专属，单源同样能踩，根因在这里的 skip 契约，而不在 collate。
+
+[S3-B] _failures.txt 与 data.exclude_list 不兼容（模块 docstring 与日志的承诺为假） 写出格式为 pid\terror（:633-635），而 _load_exclude_pids 整行 strip() 后只剥 .nii/.nii.gz（loader.py:84-93）。实测：
+
+
+
+parsed exclude pids -> {'p0007\tValueError: image shape (10,) != label shape (11,)'}
+用户照 :636-639 的日志提示把 _failures.txt 配成 exclude_list，实际零排除，训练会在同一批坏样本上再次失败。文件头部注释（:1）、汇总日志、CLI 帮助三处都在宣称兼容。
+
+中等
+[S3-C] 混采无跨源 pid 重叠检查 → 病例级数据泄漏 secondary 整批入训练（loader.py:1215-1226），primary 才走 train/val 划分（:1149-1176）。若同一病例既有金标又有粗标——这正是"金少粗多"的典型来源（同一批数据先粗标、抽一部分精标）——该病例的粗标版进训练、金标版可能进 val，val 指标虚高。group_id_regex 的防泄漏（:1150-1158）只作用于 primary 内部。全链路无任何跨源检查。
+
+[S3-D] fg_subsample 不在必需键，存量包改 --fg-subsample 静默无效 _REQUIRED_SKIP_META_KEYS（:45-49）含 fg_per_class 但不含 fg_subsample，比对处又是 if fg_subsample is not None and "fg_subsample" in meta（:111）。实测 on-disk 缺该键、请求 1000 → (True, '')。影响面是 make_data<1.8 的存量包 —— 而这正是最需要重建的一批。
+
+[S3-E] 内联 auto-build 借用 dc.num_workers 当打包并发度，是 host OOM 高风险路径 loader.py:785 传 workers=max(dc.num_workers, 1)。CLI 侧特意警告"每 worker 峰值 ≈ 一个裁剪样本的 RAM，按主机内存调"（:723-726），但 DataLoader 的 num_workers 常配 8–16，且 bbox_dir 未配时每个 make_data worker 的峰值是整卷 NIfTI而非裁剪后。缺独立旋钮。
+
+[S3-F] 自动 target_spacing 依赖当前样本集合，--limit 冒烟会污染目录口径 中位数在 samples 上取（:497-518），--limit/exclude 变化即改变结果。skip 会因 target_spacing mismatch 触发重建（这点是对的），但中间态目录里两种 spacing 并存；没有任何"目录内 spacing 必须一致"的启动期校验，build_dataloaders 也不查。
+
+[S3-G] extract_patch_by_mode 不透传 anti_alias，cls/det/predictor 口径恒无抗混叠 patch_extract.py:48/54 调 resize_3d 未传该形参（默认 False，dataset.py:552）。seg 有 data.resize_antialias 配置走 dataset 自己的 resize；共用这条口径的 predictor 则永远关闭。z_axis/whole 面内大比例下采样时训推频域不一致 —— 属训推镜像契约的一个未登记缺口（S10 需复核 predictor 是否确实经此路径）。
+
+[S3-H] pid 无唯一性校验，重名样本互相覆盖 _stem（:129-136）+ out_path = out_p / f"{pid}.npz"（:553）。image_suffix 支持候选列表（loader._normalize_suffixes），a.nii 与 a.nii.gz 并存即产出同一 pid；tmp 名带 os.getpid() 不冲突，但 os.replace 相互覆盖，静默丢样本且 counters 显示两条 written。
+
+轻微
+问题	位置	说明
+DDP 下"粗标整轮恰好覆盖一遍"的 docstring 契约不成立	mixed_sampler.py:102 vs :157-160	实测 ws=3 / 50 coarse / cpb=2：global 25 batch → 每 rank 8、总 24，covered 48/50。尾部丢弃是设计内的（drop_last 同构），但文档没说
+timings/sizes 把 skipped 的 0 计入	:589/605 → :616-623	"mean compute"/"mean per sample size" 被 skip 稀释成无意义值
+counters[status] 用返回值当 key	:677 vs :617-623	新增 status 不会出现在硬编码的汇总日志里
+meta 的 origin/bbox 与落盘卷坐标系不一致	:382、:396	origin 取原图头值、未按 bbox 起点平移；bbox 记的是原生 spacing 坐标系而卷可能已重采样。目前全仓无消费者（predictor 从源图直接复制几何，predictor.py:567），属埋雷型审计元数据
+spacing_zyx 用 requested 而非 achieved	:400-402、dataset.py:461-462	小卷 round 后偏差 ~0.5%，会传到推理 z-interleave 因子选择
+halton_center 轴数 >3 时静默截断	sampling.py:122-132	实测 4 个 range → 返回 (5, 3, 2)（3 元组）。bases[:len(ranges)] + zip 双重截断
+_THIN_Z_WARNED key 恒为 "thin_volume"	sampling.py:100-104	只告警一次且不带 pid，无法定位是哪些卷薄
+采样复现性隐式依赖 persistent_workers	sampling.py:48-55	True 时同一 worker 跨 epoch 不重建 RNG（继续推进），False 时每 epoch 由新 info.seed 重建 → 同 seed 不同序列，未文档化
+函数体内 import	patch_dataset_base.py:116-120	同一模块的 WorkerNumpyRng 已在顶部 import，无循环依赖，纯不一致
+cube 抽取两份近重复实现	patch_ops.py:25-78	前者可由后者一行导出；tests/test_patch_ops.py:15-22 专门断言二者一致，说明漂移风险已被感知
+resolve_per_batch_counts 是第二份校验真相源	mixed_sampler.py:76 自述与 Config._validate_data 一致	同 S1「几何真相源 3 份」型
+SourceTaggedDataset 就地改 base 返回的 dict	mixed_sampler.py:55	依赖"底层每次新建 dict"这一未声明契约；将来若做样本级缓存即静默污染
+注释乱码"夹匯"	dataset.py:201、sampling.py:147	应为"钳制/夹取"
+③ 合理性与设计评价
+做得好的（建议固化为契约）
+
+原子写（:410-439）：tmp 名带 os.getpid() 避免多 rank/多 worker 交错，os.replace 而非 unlink→rename（注释明确写了 Windows MoveFileEx 语义）。配合 rank0-only auto-build + barrier，DDP 下不会写坏包。这是本层最扎实的工程点。
+物理几何 fail-fast（:198-220）：用只读头的零成本，堵住"shape 相等 ≠ 共坐标系"这一业界高频静默错误，且级别定在与 shape 校验同级，是对的。
+逐类 fg cap（:167-179，seed=42）：稀有小结构不被大器官淹没，且打包可复现。
+label_counts 落 meta（:370-372）：S2 里"启动期免全量 label 解码"的能力就来自这里。
+MixedBatchSampler 的 DDP 方案：所有 rank 生成同一全局序列后取模切片、RNG 消费严格对齐（:225-239），等长、无 padding、无重复。实测 3 rank 各 8 batch、24 个 batch 两两不重叠。比"各 rank 独立 sampler"稳。
+gold 覆盖率三分支日志（:167-197）：把"金标其实在欠采样而非过采样"这一反直觉情形显式化，很多同类实现会漏。
+结构性问题
+
+公共层/任务层边界是按文件位置划的，不是按依赖方向。 segtask_v1/data/ 为空是好事（无重复实现），但代价是 taskcore.data 里堆了大量单任务代码：cond_paths → 仅 gen、NpzPatchDatasetBase → 仅 cls/det、MixedBatchSampler → 仅 seg。
+两套并行的 patch dataset 基础设施。 NpzPatchDatasetBase（cls/det）与 SegDatasetNpzBase（seg）各自实现 LRU、worker RNG、val 网格、z_sampling_mode 校验、__len__。三
+S3 审查报告（续）：③–⑥
+①②已在上文给出。以下续完，均为只审不改。
+
+③ 合理性与设计评价（续）
+结构性问题（接前 1、2 条）
+
+make_data 的幂等判据是"字段 allowlist 比对"而非"输入指纹"（:80-122）：每加一个打包参数要同步改三处（字段、比对分支、_TOOL_VERSION），且天然只能查"想到的字段"—— S3-A/S3-D 就是漏项。
+混采只做了一半：source 标签全仓无消费者（grep SOURCE_SECONDARY/SourceTaggedDataset 仅命中 mixed_sampler.py、loader.py、tests/）。注释自称"为 loss 对粗标降权预留接口"（mixed_sampler.py:37-38），现状是粗标与金标等权进 loss。在"金少粗多 + epoch 长度由粗标决定"下，模型主要在粗标上收敛，而 save_best 用金标 val —— 这是会实际压低指标的缺口，不是纯 TODO。
+epoch 语义被粗标绑架（:157）：加粗标数据 → epoch 变长 → 相同 max_epochs 下总步数、LR 调度、early-stop patience、EMA 半衰期全部隐式改变。粗标量应只决定"每 batch 配比"，不应同时决定"epoch 多长"。
+cache 估计只看 primary（loader.py:1212-1213）：混采下常驻卷数是两源之和，内存告警低估约一倍。
+cross-task 泄漏（记录不展开，属 TODO 1）：prepare_one 的 cond 分支（:247/323-334）只服务 gentask，而 prepare_dataset._kwargs（:567-580）根本不传 cond —— 公共实现里有一条本 CLI 永远走不到的分支。
+④ 优化空间
+#	优化	预估收益	风险
+1	skip 改为输入指纹（影响产物的全部参数 + 源文件 mtime/size 哈希）落 meta	根治 S3-A/S3-D 及未来漏项	中；旧包一律不匹配→首次全量重建，需 --accept-legacy-meta 逃生门
+2	合并 _resolve_label_values(:493 全量 NIfTI 解码) 与 prepare_one 的第二次读	未配 label_values 时启动 I/O 减半	低
+3	打包期设 sitk 全局线程数=1	进程池 × sitk 内部线程的超订消除（重采样阶段明显）	极低
+4	_compute_fg_indices 超 cap 时改 flatnonzero+choice+unravel_index，不先物化 argwhere	大器官峰值内存从 O(全部前景) 降到 O(cap)，数量级	低；需固定 RNG 消费顺序保可复现
+5	prepare_dataset 改 chunked submit + 增量落 _failures.txt	万级任务下可中断续跑，future 开销降低	低
+6	n_train_vols/cache 估计纳入 secondary	内存告警不再低估一半	极低
+7	extract_cubic_patch 由 ..._with_origin 导出	消除两份实现	极低（已有等价性测试）
+⑤ 2026 可借鉴项
+方案	借鉴点	适配代价	优先级
+nnU-Net blosc2 .b2nd（nnunetv2/training/dataloading/nnunet_dataset.py，comp_blosc2_params 按 patch_size 反推 chunk/block 命中 L3/L1，set_nthreads(1) 防超订）	只解压 patch 所在 chunk。重要修正 S2 的建议：nnU-Net 在 Windows 上显式禁用 mmap（os.name == "nt"，issue #2723），而本仓是 Windows 主力环境、当前最大收益点恰是 _open_npy_member_mmap 的零拷贝页缓存共享 → Windows 上会退化为整块解压且无跨 worker 共享	高	中偏低（由 S2 的"中"下调）；仅作 Linux 训练机可选后端，须先实测
+产物目录名带参数标识（nnU-Net data_identifier：改预处理必须换标识，explanation_plans_files.md）	比指纹更简单的落地形态，天然杜绝"同目录混口径"（S3-A/S3-F 共同根因）	低	高
+多数据集/部分标注训练（MultiTalent arXiv:2303.14444；DoDNet CVPR2021 / TPAMI2023；2024-25 mutual-learning、GAMOS）	补齐结构性问题 4。三路线：(a) 把 source 接进 loss 做常数降权；(b) 按 source 分离 Norm 统计或加 dataset-embedding；(c) MultiTalent 式独立输出通道 + 缺席类不计损失（同时解决金/粗类定义冲突）	(a) 低 / (b)(c) 高	(a) 高
+batch 内前景配额（nnU-Net oversample_foreground_percent 按 batch 内位置强制）	S2 已提，S3 补落点：本仓已有 MixedBatchSampler 这层 batch_sampler 抽象，配额语义应并入同一个 QuotaBatchSampler（同时表达金/粗配比与前景配比），而非再造机制	中	高
+划分写进 _manifest.json	manifest 已有"Predictor 回读 target_spacing"的现成契约（:641-665），把 split 纳入同一机制即可解 S2-B	低	高
+打包期数据集指纹（nnU-Net fingerprint_extractor）	已在算 median spacing（:497-518），可顺带落 intensity 分位数、per-case 前景强度统计，为 per-case 归一化与窗宽自动化供数	低（同一遍扫描内）	中
+⑥ 与既有测试/契约的冲突检查
+S3-A 修正无冲突：tests/test_r2_review_hotfixes.py:116-130、tests/test_gen_make_data_core.py:40-48、tests/test_review_batch2_fixes.py:265-303 只覆盖"缺键/参数变化→不 skip"与"完全一致→skip"，无"on-disk 多出 rw/bbox"用例。但会让存量"带 rw 而配置已关 rw"的包重建一次，需 CHANGELOG 明示。
+S3-D：加入必需键不破坏断言，但会让 make_data<1.8 存量包全部重建；按"legacy 默认保旧"原则宜先降为 WARNING，下版本再强制。
+S3-B：两种修法——改写为"注释行 + 纯 pid"，或让 _load_exclude_pids 取首列（tab 前）。后者更优且不破坏现有 exclude_list（无 tab 时行为不变）。两侧均无测试覆盖。
+S3-C：纯新增 fail-fast/warning；test_mixed_sampler.py 全在 sampler 层，不涉 loader 装配，无冲突。
+S3-G：tests/test_patch_extract.py:38-43 断言 extract_patch_by_mode(z_axis) 与 resize_3d(extract_z_patch_padded(...)) 逐值相同 —— 默认仍 False 则不冲突；一旦跟随 data.resize_antialias，该测试需带同一开关。
+S3-H：无测试覆盖；需先确认多后缀路径有无生产用法，建议先 WARNING 再升级为报错。
+与 S1/S2 的一致性：S3-A 是 S2-A（KeyError: 'weight_map'）的上游根因之一，两者应合并为一个批次（dataset 恒定输出 weight_map + make_data skip 双向判据）；S3-D/S3-F 与 S1-「amp_dtype/compile_mode 配置期无枚举校验」、S2-G 同属"启动期缺前置校验、代价推迟到长耗时之后"这一族。
+
+S4	模型构建（一）装配层	models/factory.py、topology.py、stem.py、unet.py/unetpp.py/unet3p.py、arch_compat.py、pretrain.py	S1
+① 事实梳理：这一层真实做了什么
+装配主链路（seg）：segtask_v1/train.py:63 → build_model(cfg)（@d:/codes/work-projects/SegTask/taskcore/models/factory.py:523-600）→ 按 model.arch 三分派（unet / adm / edm2，:533-543）→ _build_unet_encoder_decoder（:303-497）→ Encoder/Decoder|UNetPPDecoder|UNet3PDecoder → UNet3D（@d:/codes/work-projects/SegTask/taskcore/models/unet.py:417-613）→ _apply_init_strategy（:29-51）→ 一行汇总日志（:580-598）。推理侧同一入口（@d:/codes/work-projects/SegTask/segtask_v1/predictor/io.py:114-125）。
+
+五个装配期真相源：
+
+几何/通道：全部读 build_topology(cfg)，装配层不自算（factory.py:322-327、548-558）。四种 patch_mode 的决策树集中在 @d:/codes/work-projects/SegTask/taskcore/models/topology.py:108-148。
+逐级 block 数：_resolve_blocks_per_stage（enc，:54-65）/ _resolve_decoder_block_counts（dec，:78-84），后者按 _decoder_call_count 决定"decoder 到底要建几个 stage"（unet=n-1、unetpp=n(n-1)/2、其他=0，:68-75）。
+stage 索引单计数器：_StatefulStageBuilder（:93-112）——把 stage_idx 从闭包里收回到一处，drop_path 切片与 multirf/selfattn 掩码都用它索引，杜绝双计数器漂移。
+各向异性 stride：compute_downsample_strides（@d:/codes/work-projects/SegTask/taskcore/config/geometry.py:47-68）+ 装配期兼容矩阵 fail-fast（factory.py:395-426：禁 ConvNeXt LN-first 下采、禁非 unet decoder、禁 hierarchical stem、限定 down/up mode）。
+stem 拓扑：build_context_stem 三分支（@d:/codes/work-projects/SegTask/taskcore/models/stem.py:278-337）；hierarchical 的 aux stride 契约 s0·2^k、out_ch=stage_channels[k-1]（:243-255），由 Encoder.aux_fuse 逐级 1×1 cat 融合（unet.py:172-183、209-219）。
+尺寸契约三档：Decoder/UNet++ 上采样后与 skip 必须严格相等，否则显式 RuntimeError（unet.py:275-279、unetpp.py:103-108）；UNet3+ 分支自适应重采样（adaptive_max_pool / interpolate，unet3p.py:83-94）；UNet3D 主头仅在 stem_stride>1 时插值补回输入分辨率，其余不匹配即报错（unet.py:566-574）。
+
+其他事实：build_backbone（:500-520）是 cls/det/ssl 共用的骨干入口，与 build_model 同源；arch_compat.warn_ignored_model_fields 确有生产消费者（adm_unet.py:758、edm2_unet.py:667 等 4 处）；pretrain.py 不在 seg 链路上（seg 走 BaseTrainer._load_pretrain_weights + _pretrain_transform_state_dict，@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:802-831），只被 clstask/dettask 消费。
+
+② 正确性问题
+严重
+[S4-A] 各向异性 stride 调度随 data.patch_size 变化，而在 maxpool/avgpool + trilinear/nearest 下权重形状完全不变 → 训推几何漂移静默通过
+compute_downsample_strides 在 anisotropic_pooling=True 时按 当前 cfg.data.patch_size 现算 schedule（geometry.py:62-68），而 predictor 的滑窗尺寸也直接取 cfg.data.patch_size（@d:/codes/work-projects/SegTask/segtask_v1/predictor/predictor.py:188）。问题在于：Downsample(maxpool/avgpool) 是"池化 + 1×1 conv"（@d:/codes/work-projects/SegTask/taskcore/models/blocks.py:1253-1260），Upsample(trilinear/nearest) 是"interpolate + 3×3 conv"（:1477-1479）——stride 只进池化/插值，不进任何权重形状。而这两组恰恰就是各向异性唯一被允许的模式（factory.py:294-295）。实测（同一 ckpt，推理侧把 patch 从 [16,64,64] 改成 [8,128,128]）：
+
+
+
+modes=(maxpool,trilinear)
+  train strides: [(1,2,2), (1,2,2), (2,2,2)]
+  infer strides: [(1,2,2), (1,2,2), (1,2,2)]
+  strict load_state_dict: SUCCEEDED (mismatch invisible)
+  same-input output maxdiff: 0.3866
+modes=(conv,transpose)
+  strict load_state_dict FAILED: size mismatch for encoder.downsamples.2.op.weight
+即 io.py:131-143 的形状预校验（S1 已指出它是唯一的兜底）在这条路径上结构性失效：网络实际下采样倍率变了、感受野变了、输出数值变了，却没有任何报错。conv/transpose 因 kernel_size==stride（blocks.py:1252、1476）侥幸能被形状查出来——这说明"能不能发现"取决于用户选了哪个 up/down mode，而不是取决于契约。根因在装配层没有落盘架构指纹，与 S1-「推理侧无训推镜像契约校验」同源，但这里给出了它最危险的具体形态。
+
+[S4-B] init_strategy != 'legacy' 无差别覆盖，抹掉所有零初始化 / ICNR 初始化契约
+_apply_init_strategy 在模型建完后遍历 modules()，对每一个 Conv/Linear 重新 kaiming_normal_ 或 trunc_normal_（factory.py:34-42）。被它覆盖的既有契约至少有三处：SelfAttentionBlock.proj / ffn_out 的零初始化（残差分支初始恒等，blocks.py:1022-1024、1031-1032）、DySample3d.offset/scope（近零偏移 ≈ 双线性，:1364-1370）、icnr_init_ 的子像素同源复制（:1490）。实测：
+
+
+
+init_strategy=legacy       selfattn.proj.weight absmax=0.00000
+init_strategy=trunc_normal selfattn.proj.weight absmax=0.06565
+init_strategy=kaiming      selfattn.proj.weight absmax=0.67313
+init_strategy=legacy       ICNR sub-filter replication preserved=True
+init_strategy=trunc_normal ICNR sub-filter replication preserved=False
+后果：开 selfattn + 非 legacy 初始化时，注意力残差分支在第 0 步就有 O(0.7) 量级输出（kaiming），训练早期不稳定，且没有任何提示。附带两个次级问题：kaiming_normal_(nonlinearity="relu") 与默认激活 leakyrelu 不匹配（增益偏小）；分割主头 1×1 也被 kaiming 重初始化（nnU-Net 对输出头保留默认小方差初始化）。缓解因素：init_strategy 默认 legacy（S1 列为 legacy 开关族），且 resume/pretrain 会覆盖权重——仅影响 opt-in + from-scratch，故未被任何测试发现（现有测试只用 Conv2d+GroupNorm 验证 legacy no-op，@d:/codes/work-projects/SegTask/tests/test_todo1_batch3_fixes.py:106-115）。
+
+[S4-C] resenc_preset + decoder_type='unet3p' 必然崩溃：同一"decoder 节点数"有三份真相源且其中一份漏了 unet3p
+_apply_resenc_preset 只对 unetpp 做了三角形节点特判，其余一律填 [1]*(n_levels-1)（@d:/codes/work-projects/SegTask/taskcore/config/core.py:1424-1430）；validate_encoder_decoder_stage_lengths 认为 unet3p 期望 n_levels-1（@d:/codes/work-projects/SegTask/taskcore/config/section_validators.py:38-46）；而 factory 的 _decoder_call_count 对 unet3p 返回 0（factory.py:75）。实测：
+
+
+
+unet    dec_bps=[1,1,1,1] | validate OK | build OK
+unetpp  dec_bps=[1]       | validate OK | build OK
+unet3p  dec_bps=[1,1,1,1] | validate OK | build ValueError: Per-stage block list length 4 != expected 0
+用户从未写过 decoder_blocks_per_stage，只配了 resenc_preset=M + decoder_type=unet3p，就得到一条指向该字段的报错——与 S1-C（preset 展开后无法改深度）是同一病：预设展开、配置校验、工厂三处各自编码同一几何常量。且崩溃点在 build_model，即 npz 扫描 / dataloader 装配之后，属 S1/S2/S3 反复出现的"启动期缺前置校验、代价推迟到长耗时之后"族。
+
+中等
+[S4-D] unet3p 分支绕过 divisor 校验：不崩，但同一 patch 在不同 decoder 下几何契约不一致
+S1-G 待验真项现已定性：UNet3+ 的分支重采样确为自适应（adaptive_max_pool3d / interpolate，unet3p.py:87-94），因此非整除不会 shape mismatch。实测 3 级 encoder + patch_size=[16,30,30]：
+
+
+
+decoder=unet3p : validate PASSED，前向输出 (1,1,16,30,30) == 输入
+decoder=unet   : validate REJECTED: axis 1 size 30 needs divisible by 4 ...
+所以 S1-G 应从"运行期 shape mismatch 风险"降级为：① 注释未说明豁免理由；② 同一份 patch_size 在 unet 下被拒、在 unet3p 下静默接受，且此时 encoder 走 floor 下采（30→15→7），adaptive_max_pool 用非均匀核回到 15，各级 skip 与 label 网格存在亚体素级不对齐。建议要么统一按 divisor 拒绝，要么在文档里把"unet3p 容忍非整除但存在重采样近似"写成显式契约。
+
+[S4-E] unet3p decoder 静默吞掉整个 backbone 旋钮族，且 ConvNeXt/MedNeXt 的忽略告警重复两次
+UNet3+ decoder 内部恒为朴素 3×3 ConvNormAct（unet3p.py:48-52、68、79），完全不消费 backbone / block_type / attention_type / se_reduction / drop_path_rate / decoder_blocks_per_stage。也就是说 backbone=mednext + decoder_type=unet3p 实际得到的是"MedNeXt encoder + 朴素 decoder"，无任何提示——对照 arch_compat 给 adm/edm2 做的忽略清单告警（arch_compat.py:57-84），这里是一个可发现性缺口。附带：factory 无条件构建 dec_builder（:380-389）即使 unet3p 根本不用，导致 _make_convnext_stage_builder 的"块内 norm/act 被忽略"告警打印两遍，实测 warnings emitted: 2。
+
+[S4-F] decoder 的 stochastic depth 独立重启 0→max，且最大丢弃率落在紧邻 seg head 的最高分辨率层
+_make_drop_path_rates 对 enc / dec 各跑一次 linspace(0, dpr, n)（factory.py:87-90，两次调用于 :132、:266、:211）。而 Decoder 的 level 构造顺序是深→浅（unet.py:330-347），_StatefulStageBuilder 的 idx 随之递增 → 最大 rate 落在最后一个（最高分辨率）decoder level。实测 drop_path_rate=0.2、blocks_per_level=2、3 级：
+
+
+
+encoder: [0.04, 0.08, 0.12, 0.16, 0.2]     # 首块 0.0 被建成 Identity
+decoder: [0.0667, 0.1333, 0.2]             # 0.2 = 紧邻 seg_head 的那一级
+ConvNeXt / nnU-Net ResEnc 的惯例是全网一条单调 schedule、最深处最大；此处不仅重启，方向还相当于"越靠近输出丢得越狠"。这不是 bug（数值可训），但属"默认值即次优"，且与 encoder 的语义不自洽。
+
+[S4-G] 3D 多分辨率下 model.aux_seg_supervision=True 被静默忽略
+aux_seg_active 只在 is_2_5d and n_views>1 时为真（topology.py:104-105）。实测 patch_mode=cubic + multi_res_scales=[1.0,2.0] + aux_seg_supervision=True：in_channels=2, aux_heads=0, model.aux_seg_supervision=False，无 warning。对照 selfattn_enabled / multirf_enabled 在"全 no-op"时都有明确告警（core.py:1740-1744、1813-1818），此处口径不一致；用户会以为多分辨率辅助监督已生效。
+
+[S4-H] unet3p 的 skip_attention 存在自门控分支，且 gate 数量是 O(n²)
+每个节点 i 对全部 n 个分支各建一个 AttentionGate3D（unet3p.py:69-75），共 n(n-1) 个 gate；其中 j == i 的分支满足 src is encoder_features[i]、gate_signal is encoder_features[i]（:104、:110、:116-119），即 x * σ(f(x, x)) 的自门控——与 Oktay 2018"用更粗的解码信号门控 skip"的语义不符。且 gate 施加在重采样后、branch conv 之前的全分支宽度上，是本 decoder 显存的主要放大项之一。
+
+[S4-I] UNet++ 的深监督取对角线而非论文的 X[0,j]，且 decoder_blocks_per_stage 的节点顺序不可用
+UNetPPDecoder 返回对角线 X[i, n-1-i]（unetpp.py:124），因而 DS 头监督的是"浅列 + 低分辨率"节点；UNet++ 原文的深监督是 X[0,1..n-1]（全部全分辨率），这也是其推理期剪枝能力的前提——当前实现把剪枝语义丢掉了，同时保留了全部 n(n-1)/2 个节点的计算与显存。另外 decoder_blocks_per_stage 长度须为 n(n-1)/2，但元素与节点的对应是构造顺序（i 外 j 内，:59-75），既未文档化也无法从配置侧表达意图；实测 decoder 参数 unetpp 2.94M vs unet 2.13M vs unet3p 8.57M（4 级 [32,64,128,256]）。
+
+轻微
+问题	位置	说明
+unet3p 的 fused_channels 未经配置暴露	unet3p.py:41 vs factory.py:455-465	恒为 cat_channels × n；4 级默认即 256 通道 @ 全分辨率（实测 decoder 8.57M 参数），DS 头也挂在 256ch 上，显存不可调
+build_topology 每次 build_model 跑两遍	factory.py:322 与 :548	顺带 _resolve_blocks_per_stage / _resolve_decoder_block_counts 也各算两遍（:329/554、:336/556）；纯冗余，无正确性影响
+_build_unet_encoder_decoder 内三个死变量	factory.py:319、324、327	num_fg / out_classes / aux_head_out_channels 取出后未使用（真正使用在 build_model 内重取）
+hierarchical stem 不受 grad_ckpt_stem_downsample 保护	unet.py:191-198	非 hierarchical 走 checkpoint_if，hierarchical 分支直接调用；而 hierarchical 恰是最高分辨率、最多 stem的路径，显存最需要它
+grad_ckpt_decoder_branches 对 decoder_type='unet' 无效	factory.py:482-495 vs :465/:480	只透传给 unetpp/unet3p；unet decoder 配了不报也不生效
+"n_views 与层数"的阈值有三份	stem.py:208-212（n_levels > n_views-1）、unet.py:529-533（n_dec >= n_views）、core.py（n_views < n_levels，实测报错文案）	实测配置层先拦（aux_seg_supervision + hierarchical requires n_views < n_levels），后两处成为不可达冗余，但三者阈值并不严格等价
+PatchEmbedStem 静默把 leakyrelu 换成 GELU	stem.py:109-115、:253-254	与 build_model 日志里打印的 activation 不一致，用户无从知晓 stem 用的是 GELU
+aux_head_out_channels 长度报错文案误导	unet.py:508-512	aux 关闭时 n_aux_expected=0，报错却写 "must equal n_views - 1"
+_resolve_blocks_per_stage 报错不带字段名	factory.py:61-63	即 S4-C 里那条 Per-stage block list length 4 != expected 0，用户无法判断是 encoder 还是 decoder 侧
+兼容别名已无生产消费者	factory.py:299-300（_stem_stride_of / _auto_anisotropic_strides）	只服务存量测试
+UNet3D(num_fg_classes=...) 弃用形参仍在	unet.py:440-455	全仓无生产调用点，只剩 deprecation 分支
+param_count 不含 DS / aux / topo 头分项	unet.py:615-620	日志里 total - enc - dec - seg_head 的差额无处归因
+ModelTopology.num_fg_classes 在 lift 路径算错	topology.py:62-69	S1 已记；S4 复核确认装配层无任何消费者（factory 一律传 out_classes），维持"埋雷"定性
+arch_compat 忽略清单未覆盖新增嵌套段	arch_compat.py:28-54	grad_ckpt_decoder_branches、multirf.* / selfattn.* 的非 gate 子字段未列（gate 本身已被 validate 拒绝，故不致误导，但清单口径需随字段增长维护）
+③ 合理性与设计评价
+做得好的（建议固化为契约）
+
+build_topology 单入口真正被遵守：装配层没有一处自行推导 in_channels/out_classes/spatial_dims（factory.py:322-327），这是 R5 的核心收益，S4 逐行核对通过。
+_StatefulStageBuilder 的单计数器（factory.py:93-112）：drop_path 切片、multirf 掩码、selfattn 类型三套逐 stage 参数共用同一 idx，杜绝了"三份计数器"这一典型漂移源；且越界即 RuntimeError，不会静默少建。
+各向异性兼容矩阵在构造期 fail-fast（factory.py:395-425）：把"blurpool/pixelunshuffle 只支持各向同性""hierarchical aux 假定 ×2""unetpp/unet3p 只支持各向同性"这些隐含假设全部前移到装配期报错，实测 blurpool+aniso → ValueError。这是本层质量最高的一段。
+checkpoint_if 的数值等价保证（blocks.py:81-104）：use_reentrant=False + preserve_rng_state=True + 重算路径冻结 BN running buffer（_freeze_bn_running_stats，:51-78）。"开检查点与不开数值严格一致"这条在同类框架里经常被做错，此处做对了并写了理由。
+build_backbone 与 build_model 同源（factory.py:500-520）：cls/det/ssl 与 seg 的 encoder.* / decoder.* 同名同形，是 ssl→seg 权重迁移能 strict=False 直接对上的结构基础（tests/test_ssltask.py:425-430 已固化）。
+结构性问题
+
+"谁负责几何校验"分散在四层：配置校验器（validate_patch_geometry）→ 工厂兼容矩阵（factory.py:395-425）→ 模块构造期长度校验（unet.py:137-140、321-324；stem.py:142-146、208-212）→ forward 期 shape 断言（unet.py:275-279、211-218；unetpp.py:103-108）。四层各有价值，但没有一层是权威的，S4-C/S4-D 都是层间口径不一致的产物。建议把"decoder 节点数""每轴总 divisor""aux 层数下限"三个量做成 topology 侧的单一派生函数，四层一律引用。
+忽略字段的可发现性只对 adm/edm2 做了机制化：arch_compat 是好设计，但 unet 内部的四处忽略（unet3p decoder 吞 backbone 族、3D 下 aux_seg 失效、convnext/mednext 块内 norm/act、unet decoder 不接 grad_ckpt_decoder_branches）各自 ad-hoc 或干脆无声。建议把 warn_ignored_model_fields 泛化成"装配期忽略清单"通用机制，由各 builder 声明自己消费了哪些字段，工厂做差集告警。
+初始化策略是"事后遍历"，与模块自带初始化契约天然冲突（S4-B 根因）：只要模块层有零初始化/结构化初始化，事后遍历就一定会破坏它，且随着 S5 引入更多现代块（LayerScale、zero-init residual）冲突面只会扩大。业界做法是模块级声明（timm 的 init_weights / MMEngine 的 init_cfg，或给参数打 _no_reinit 标记后在遍历里跳过）。
+patchN stem 的分辨率恢复靠对 logits 做 trilinear 上采（unet.py:566-569）：patch4 时主头输出是 4× 插值的产物，边界精度受限；nnU-Net / Primus 的做法是让 decoder 一路上采回原分辨率再出 logits。当前设计等于把"能否用大 stride tokenizer"这个选项的上限压死了。
+装配层没有架构指纹（S4-A 根因）：模型结构实际由 {arch, encoder_channels, blocks, stem_mode, decoder_type, downsample_strides(可能由 patch_size 现算), spatial_dims, out_classes} 共同决定，但落盘的只有权重 + 一份可被手工编辑的 YAML。既然已经有 resolved_config.yaml（train.py:76）与 checkpoint，把这组量算成指纹存进 ckpt、推理期比对，是本层能给 S10/S11 提供的最直接保障。
+三种 decoder 的"接口相同、语义分层不同"未被写成契约：三者都暴露 out_channels（深→浅）供 UNet3D 挂 DS/aux 头，但 unet 是"镜像 encoder 分辨率"、unetpp 是"对角线"、unet3p 是"统一 fused 宽度"。DS 头与 aux 头对 decoder.out_channels[-1-k] 的语义假设（unet.py:534-545）只在 unet 上严格成立。
+④ 优化空间（含 GPU / 吞吐 / 显存）
+#	优化	预估收益	风险
+1	hierarchical stem 纳入 grad_ckpt_stem_downsample（unet.py:191-198）	2.5D 多 FOV 下最高分辨率 stem 的激活可省，是该路径显存峰值所在	低；checkpoint_if 已保证数值一致
+2	unet3p 暴露 fused_channels 并允许"只在低分辨率做全尺度融合"	当前 4 级默认 256ch@全分辨率、decoder 参数 8.57M（实测）；可降数倍激活显存	中；改默认会变权重形状，需作为新字段默认保旧
+3	unet3p 的 gate 移到 branch conv 之后（cat_channels 宽度）并去掉 j==i 自门控	gate 显存/算力从 O(src_ch) 降到 O(64)，去掉 n 个无意义模块	中；改变权重布局与数值
+4	UNet++ 支持"只算对角线所需节点 / 推理期列剪枝"	推理显存与时延显著下降（论文本就以此为卖点）	中；训练需保持全节点，推理路径要单独测
+5	build_topology / block counts 在 build_model 内复用一次结果	纯清理，启动期微秒级	极低
+6	主头分辨率恢复改为 decoder 末级增加一次可学上采（替代 logits 插值）	patch2/patch4 stem 的边界质量；打开"大 stride tokenizer"的设计空间	中高；改变参数量与 ckpt 兼容性
+7	drop_path 改为全网单调一条 schedule（enc+dec 连续）	与 ConvNeXt/ResEnc 惯例对齐，去掉"输出端丢最狠"	低；数值会变，需作为开关默认保旧
+8	UNet3D.forward 的 self.training 分支（DS/aux/topo）会让 torch.compile 产生两张图	现状可接受；若 S7 发现 recompile 抖动，可拆成 forward_train / forward_eval	低
+⑤ 2026 可借鉴项
+方案	借鉴点	适配代价	优先级
+nnU-Net Revisited + ResEnc 预设（arXiv:2404.09556；documentation/resenc_presets.md，官方将 ResEnc-L 定为新默认）	结论支持本仓路线（CNN U-Net + 规模化仍是 SOTA）。可借鉴的是预设按 VRAM 分档（M/L/XL）而非只给 block 数模板：当前 resenc_preset 只填 *_blocks_per_stage（core.py:1406-1430），不联动 encoder_channels / patch_size / batch_size，用户拿到的"M"与 nnU-Net 的 M 并不等价	中（需引入显存预算估算）	高
+Primus / PrimusV2（arXiv:2503.01835；nnU-Net documentation/primus.md：PrimusV2 与 ResEnc-L / MedNeXt 打平，且证明多数"Transformer 分割网"去掉 Transformer 后性能几乎不掉）	本仓已具备零件：patch stem（stem.py:47-73）、3D 轴向 RoPE + window/grid 自注意力（blocks.py:975-1035）。缺的是组合入口：selfattn 被限定 backbone='resnet'（core.py:1658-1661）、stem 最大 patch4、没有 LayerScale/SwiGLU 的统一开关、也没有"轻解码器"档位	中（多为装配层配置打通，非新算子）	中高（作为消融档位，先小规模验证）
+模块级初始化契约（timm / MMEngine init_cfg 惯例）	直接解 S4-B：由模块声明"我已自行初始化"，工厂遍历时跳过，而非事后无差别覆盖	低	高
+nnU-Net plans/data_identifier 式指纹（同 S3-⑤ 已提的目录标识思想）	解 S4-A：把架构决定量算成指纹落进 ckpt，推理期比对不一致即 fail-fast；这是唯一能覆盖"stride 变了但形状没变"的手段	低（纯新增）	最高
+UNet++ 原始深监督 + 剪枝推理（Zhou 2020）	解 S4-I：全分辨率 X[0,j] 深监督 + 推理期只算前 j 列，速度/显存可按精度需求档位化	中	中
+全网单调 stochastic depth（ConvNeXt / ResEnc 实践）	解 S4-E	低	中
+（说明：以上均为方向性对标，已核对来源页面；若进入落地阶段，涉及具体 API 时会再查各自最新官方文档，不凭记忆写实现。）
+
+⑥ 与既有测试 / 契约的冲突检查
+S4-A（架构指纹）：纯新增校验。test_anisotropic_downsample.py 只在同一 cfg 内构建+前向，不涉及跨 cfg 加载，无冲突；但新增的推理期 fail-fast 会让"训练后手工改 patch_size 再推理"的既有用法报错，需 CHANGELOG 明示并提供 --allow-geometry-drift 逃生门（可复用已有的 pretrain_allow_geometry_mismatch 命名风格，core.py:985）。
+S4-B（初始化契约）：tests/test_todo1_batch3_fixes.py:106-115 只断言"legacy 是 no-op""kaiming 改 Conv 权重、norm 权重置 1"，用的是裸 Conv2d+GroupNorm；加入"跳过已声明自初始化的模块"不破坏该断言。tests/test_todo1_batch5_fixes.py:255-288 只覆盖 adm/edm2 的 ConfigError 与 legacy 路径，同样无冲突。需新增回归：selfattn + init_strategy=kaiming 后 proj.weight 仍为零。
+S4-C（unet3p 的 decoder 节点数）：两种修法——① 让 _apply_resenc_preset 与 validate_encoder_decoder_stage_lengths 统一引用 factory 的 _decoder_call_count（unet3p→0/1）；② 让 factory 对 unet3p 忽略该字段并告警。tests/test_resenc.py:112 断言 decoder_blocks_per_stage == [1,1,1,1]，但该用例用的是默认 decoder_type='unet'，两种修法都不触发；tests/test_todo1_batch1_fixes.py:93-99 固化的是 unetpp 的 "10 entries" 报错，亦不受影响。修法 ① 更彻底（消灭第三份真相源）。
+S4-D（unet3p divisor）：test_stem_and_unet3p.py 全部用整除 patch，无用例固化"非整除被接受"这一行为；若改为统一拒绝，无断言冲突，但会拒掉历史上能跑的配置 → 按"legacy 默认保旧"原则宜先 WARNING。
+S4-E（drop_path schedule）：会改变数值，tests/test_resenc.py:186-192 只断言参数量、不断言 drop rate，无断言冲突；仍建议以新开关落地、默认保旧。
+S4-F / S4-G / S4-H / S4-I：均无既有测试覆盖。S4-F 只加 warning，零风险；S4-H/S4-I 会改权重布局，属"独立批次评估"级别，不适合顺手改。
+与 S1–S3 的一致性：S4-A 是 S1-「推理侧无训推镜像契约校验」的最危险实例化（形状兜底在此结构性失效），二者应合并为一个批次（架构指纹落盘 + 推理期比对）；S4-C 与 S1-B/S1-C 同属 sync() 预设展开与下游期望脱节；S4-C/S4-B 又与 S2-G、S3-D 同属"启动期缺前置校验、代价推迟到长耗时之后"这一族。
+
+S5	模型构建（二）算子与骨干	models/blocks.py(1541)、mednext.py、resnet.py、convnext.py；adm_unet.py/edm2_unet.py 仅看分割入口	S4
+
+模型构建（二）算子与骨干
+本轮范围：blocks.py(1541)、resnet.py(505)、convnext.py(173)、mednext.py(553)，以及 adm_unet.py/edm2_unet.py 的分割入口（build_adm_seg_model / build_edm2_seg_model）。装配逻辑属 S4，不重复；unet*.py 只在算子契约验真处引用。
+
+① 事实梳理
+算子层的真实分工（自下而上）：
+
+nD 分派基座：_CONV/_BN/_IN/_DROP/_MAXPOOL/_AVGPOOL/_AAVGPOOL/_AMAXPOOL 八张 2/3D 表 + _check_dims（@d:/codes/work-projects/SegTask/taskcore/models/blocks.py:23-48）。所有块都以 spatial_dims 参数化，2.5D（=2）与 3D 共用一套实现，*3D 类名仅为 API 兼容。
+工程件：checkpoint_if（:81-104）+ _freeze_bn_running_stats（:51-78）；DropPath（:107-122，fp32 采样后转 dtype）。
+块内注意力（通道/空间门控）：make_attention 单入口（:476-507），七种 none|se|eca|cbam|coord|lka|msca。由 ResNetBlock/PreAct/Bottleneck/R2Plus1D/MultiRF/ConvNeXtBlock/MedNeXtBlock 在 pwconv2/conv2 之后、残差相加之前统一调用。
+token 级自注意力：SelfAttentionBlock（:959-1053）= PreNorm(GN) → Conv1d-QKV → {softmax|linear|window|grid} → Conv1d-proj(zero-init) → 残差，可选 nD-RoPE（:593-645，有界 LRU 缓存 + torch.compiler.is_compiling() 旁路）与 GEGLU FFN。由 factory 逐 stage 追加（factory.py:175-187），仅 backbone='resnet'。
+skip 门控：AttentionGate3D（:1056-1089），三个 decoder（unet.py:264-269、unetpp.py:78-84、unet3p.py:70-75）共用，norm_type 由 factory.py:449-451 的 attn_gate_norm=='auto' → mc.unet.norm_type 解析（默认 instance）。
+重采样：Downsample（:1219-1284，5 模式）/ Upsample（:1422-1533，6 模式），per-axis stride 支持与各向异性 fail-fast 均下沉到算子构造期（:1262-1279、:1481-1506）。
+骨干块三族：resnet.py 的 basic/preact/bottleneck/r2plus1d + MultiRFBlock（多膨胀并行分支）；convnext.py 的 dwconv7+LN+GELU+LayerScale(+GRN)；mednext.py 的 dwconv-k + 通道级 GroupNorm + 倒瓶颈(+GRN)，并额外提供 DilatedReparamBlock（UniRepLKNet 式训练多分支、推理折叠）与 upkern_remap_state_dict。
+ADM/EDM2 分割入口：二者均硬性要求 patch_mode=='2_5d'（adm_unet.py:766-769、edm2_unet.py:675-678）、拒绝 hierarchical stem（:810-814 / :716-719）、忽略 decoder_blocks_per_stage 并告警（:784-791 / :692-699）、几何量一律读 build_topology。二者都以 num_fg_classes=out_classes 传参（adm_unet.py:880、edm2_unet.py:761）——口径一致，形参名误导（传的是含背景的 out_classes）。
+② 正确性问题
+严重
+[S5-A] upsample_mode='carafe' 在生产 patch 尺寸下必然 OOM——中间张量是输入的 216 倍，且无任何守卫
+
+CARAFE3d.forward（:1315-1340）先 unfold×3 + .contiguous() 物化 (B, C·k³, D,H,W)，再对它整体 F.interpolate(scale_factor=2)（:1336），得到 (B, C·27, 2D,2H,2W) = 216× 输入元素数。实测（CPU 前向 + CUDA 峰值，输入 (1,64,8,32,32)）：
+
+
+
+input numel=0.52M ; x_up intermediate numel=113.2M (216x input)
+carafe 1194 ms vs trilinear 36 ms  (x33.4)      # CPU
+carafe peak=964.1 MiB  |  trilinear peak=68.9 MiB   # CUDA, no_grad
+推理态即 14× 峰值；训练态该张量还要留给反向。按分割 decoder 最高分辨率级推算（C=32、上采到 32×256×256、bf16）：32×27×2.1M×2B ≈ 3.6 GB / 样本 / 层。也就是说这个配置项存在但不可用，而配置层（core.py 的 upsample_mode 白名单）与装配层（factory.py:395-425 的兼容矩阵）都不区分"生产级/实验级"，用户只会看到一个 OOM。正解：改写为"低分辨率加权 + shuffle"形式（不物化高分辨率 k³ 张量），或至少加显存估算 fail-fast 并在文档标注实验性。
+
+[S5-B] AttentionGate3D 的 psi 归一化让门控对输入幅度完全不敏感，默认路径（auto→instance）把弱信号放大到满量程
+
+psi = Conv(inter→1) → get_norm(norm_type, 1) → Sigmoid（:1075-1079）。norm_type 默认经 factory.py:449-451 取全局 norm_type（默认 instance）→ InstanceNorm3d(1, affine=True)；取 group 时 get_norm 静默回退到 1 组（同样是逐样本逐图归一化）。二者都会把单通道门控图强制为零均值单位方差，门控只取决于图的"形状"而与幅度无关。实测（同一模块，输入幅度差 1000 倍）：
+
+
+
+norm=batch     input_scale=1.0    gate min=0.2911 max=0.6802 std=0.0669
+norm=batch     input_scale=0.001  gate min=0.4997 max=0.5002 std=0.0001
+norm=instance  input_scale=1.0    gate min=0.0279 max=0.9608 std=0.2030
+norm=instance  input_scale=0.001  gate min=0.0327 max=0.9742 std=0.2037   ← 幅度降 1000× 而门控不变
+norm=group     input_scale=0.001  gate min=0.0346 max=0.9229 std=0.2052
+后果：一个整体响应微弱（本应被大体量抑制）的 skip，和一个强响应 skip 得到统计上完全相同的门控分布；深层小特征图上噪声被放大到 [0.03, 0.97] 全量程。Oktay 2018 原文用 BatchNorm（跨 batch+空间统计，保留单样本间的幅度差异），这也是实测里唯一在弱信号下退化为 ≈0.5 恒等直通的分支。影响面为全部三种 decoder 的 skip_attention=True 路径（unet3p 的 skip_attention 还是 O(n²) 个 gate，见 S4-H）。缓解因素：skip_attention 默认 False。
+
+中等
+[S5-C] 特征图缩到 1³ 时归一化层直接 ValueError，配置层不拦
+
+MedNeXt 的通道级 GroupNorm(C, C)（mednext.py:31-34）与 get_norm('instance')（默认 backbone 的块内 norm）在单元素空间上都会抛异常，且 F.group_norm 的检查与 train/eval 无关（实测已 .eval()）：
+
+
+
+spatial=(4,4,4)  norm_out absmax=3.211179          | instancenorm OK
+spatial=(1,2,2)  norm_out absmax=1.731346          | instancenorm OK
+spatial=(1,1,1)  ValueError: Expected more than 1 value per channel ...
+                 instancenorm -> ValueError: Expected more than 1 spatial element ...
+validate_patch_geometry 只检查整除性（section_validators.py:101），patch_size=[32,32,32] + 6 级 encoder（bottleneck 1³）是合法配置，崩溃点却在第一个 batch 的前向。属 S1/S2/S3/S4 反复出现的「启动期缺前置校验」族，建议在几何校验里加"最深级每轴 ≥ 2"。
+
+[S5-D] window/grid 注意力恒物化 attn_mask，即使没有 padding
+
+_WindowQKVAttention.forward:887-891（grid 同 :924-928）无条件构造 attn_mask 并传入 SDPA。实测尺寸整除时 mask 全 True、是纯 no-op，却仍然传入：
+
+
+
+spatial=(4,14,14) window=7 -> padded=(7,14,14) mask.all()=False   # 需要 mask
+spatial=(7,14,14) window=7 -> padded=(7,14,14) mask.all()=True    # 不需要，仍然传
+SDPA 64×4×343×32 bf16: no mask 0.305 ms | w/ mask 0.435 ms   (+43%)
+本机 Windows 轮子未编译 flash（实测 SDPBackend.FLASH_ATTENTION 恒 "No available kernel"），所以上面 43% 是 mem-efficient 后端内的开销；在 Linux flash 可用的机器上，任意浮点 attn_mask 会直接把 flash 后端排除，代价更大。正解：padded == orig 时传 attn_mask=None。附带同源浪费：q/k/v 各调用一次 _window_partition_tokens（:884-886、:921-923），mask 与 meta 被算三遍丢弃两遍；offsets 的 product() 列表（:694-697、:711-714）每次前向重建，而 RoPE 分支只用它做非空断言（:892-895）——窗口内 RoPE 本就是相对的，offsets 在数学上不需要。
+
+[S5-E] 大核/条形核注意力全是各向同性硬编码，薄 z 轴上大部分抽头落在 padding 里
+
+LKA3D 默认 k1=5, k2=7, dilation=3（:421-432），MSCA3D 默认 scales=(7,11,21) 逐轴条形核（:450-467），都不看 spacing/patch_size 的各向异性。实测：
+
+
+
+LKA dw_dilated: k=(7,7,7) dil=(3,3,3) pad=(9,9,9) -> z taps at [-9,-6,-3,0,3,6,9]
+D=8: taps inside volume for a center voxel: 3/7
+params: MSCA=4304  ResNetBlock=13888   |  fwd: MSCA 14 ms vs ResNetBlock 7 ms
+即在 z_axis/薄 slab 上，LKA 的 z 向膨胀分支 7 个抽头只有 3 个能取到真实体素，其余是 replicate/zero padding；MSCA 的 21 长条形核在 z 上几乎全是 padding。同时 MSCA 参数只占普通残差块的 31%，前向却是它的 2 倍（9 条深度卷积 + local + 1×1，全在 stage 分辨率上，且每个 block 都挂一份）。既有测试 tests/test_swa_lka.py:51-56 只断言"小空间尺寸合法"（不崩），未涉及有效性。建议：核长按轴可配，或按 spacing_normalization 自动推导 z 向核长。
+
+[S5-F] 插值上采样强制 fp32 往返，torch 2.7 已原生支持 bf16
+
+Upsample.forward:1511-1529 对 trilinear/nearest 在 bf16/fp16 下先 .float() 再插值再转回。实测本环境：
+
+
+
+in torch.bfloat16 -> out torch.bfloat16; fp32 intermediate 1.05 MB vs bf16 0.52 MB
+native bf16 trilinear dtype: torch.bfloat16      # 原生支持，无需上采
+代价发生在 decoder 最高分辨率级——正是激活峰值处，多一份 2 倍大小的 fp32 临时张量 + 两次 cast 的带宽。注释在 adm_unet.py:63 里说明了历史原因（"旧 PyTorch (<2.1) 上 upsample_nearest2d 缺 bf16/fp16 kernel"），该前提在本仓 torch 2.7 上已不成立。
+
+[S5-G] Downsample('conv') 的 kernel_size == stride（非重叠 tile），且池化模式下 stride 完全不进权重形状
+
+:1252 显式令 kernel_size=st；maxpool/avgpool 则是 Pool(st) → 1×1 conv（:1253-1260）。实测：
+
+
+
+stride=2       -> conv kernel=(2,2,2)
+stride=(1,2,2) -> conv kernel=(1,2,2)
+两个后果：① 与 nnU-Net/ResEnc 的 3×3 stride-2 相比，tile 之间无重叠、下采样处感受野被压到最小，且 stride=1 的轴上核长为 1（该轴在下采样层完全没有空间混合）；② maxpool/avgpool + 1×1 时 stride 不进任何权重形状——这正是 S4-A（推理期改 patch_size 导致 stride schedule 漂移却能 strict-load 成功）的算子级根因，本轮从算子侧确认：形状兜底在这条路径上结构性失效，只有 conv/transpose（kernel==stride）能被形状查出来。
+
+[S5-H] 多膨胀分支有两套实现，只有一套能在推理期折叠
+
+MultiRFBlock（resnet.py:277-424）与 DilatedReparamBlock（mednext.py:145-254）是同一思想的两份代码。后者实现了正确的推理期折叠（实测折叠等价性 maxdiff=2.6e-06 / rel=6.7e-07，且 switch_to_deploy 幂等），前者在默认 branch_norm_act=False 下整条分支路径（多分支 conv → concat → 1×1 fuse）是纯线性（代码注释 :345-347 已承认），因此本可折叠为单个等效卷积却一直按 N 分支计算——训练与推理都付 N 倍代价。二者的分支校验、膨胀-padding 推导、通道分配也各写一遍。
+
+轻微
+问题	位置	说明
+BlurPool 的 filt_size=2 输出尺寸 +1	blocks.py:1095-1099、:1110	pad = 2//2 = 1 与偶数核不匹配。实测 filt_size=2 -> (1,4,9,9,9)（应为 8³）。当前 Downsample 硬编码 filt_size=3 故不可达，但 _BINOMIAL 表把它当成合法档位暴露着
+各 Stage 对空 drop_path_rates 列表 IndexError	convnext.py:143、resnet.py:497、mednext.py:522	实测 ConvNeXtStage(..., drop_path_rates=[]) -> IndexError: list index out of range；后续 block 有 i < len(...) 保护，唯独首块 [0] 无
+ECA3D 在函数体内 import math	blocks.py:279	模块顶部已 import math（:7）；纯不一致
+GroupNorm 组数回退有三种口径	get_norm:189-199（静默折半+一次性告警）/ SelfAttentionBlock:1003-1006（静默折半，无告警）/ MultiRF:355-366（显式报错）	同一语义三份实现三种行为
+_LinearQKVAttention 多乘 head_dim**-0.5	blocks.py:953	Shen 2021 的 ρ(Q)(ρ(K)ᵀV) 无此缩放；输出被额外缩小 1/√d（zero-init proj 可吸收，但与 docstring 声称的"Shen 2021"不符）
+DySample3d 偏移单位与 align_corners 偏离原作	blocks.py:1403-1416、:1376-1384	归一化用低分辨率尺寸 2/(W-1)（原作用高分辨率 2/W），且 align_corners=True，与框架其余插值一律 align_corners=False 不一致
+CARAFE3d 硬编码 3D	blocks.py:1307-1327	nn.Conv3d / F.pad([pad]*6) / unfold×3，破坏本文件的 nD 契约（Upsample:1455-1459 已 fail-fast，故不致误用）
+Upsample('transpose') 带 bias	blocks.py:1476	框架其余 conv 一律 bias=False + 后接 norm；此处 ConvTranspose 默认 bias=True 且无 norm
+icnr_init_ 的 init 形参未使用	blocks.py:1204	死参数（内部恒用 kaiming_normal_）
+get_conv3d() 兼容别名无生产消费者	blocks.py:168-170	死代码
+SE/CBAM/Coord 的 mid 下限不一致（4/4/8）	:252、:301、:360	无理由的三个魔数
+PreActResNetBlock 的投影捷径作用于原始 x	resnet.py:96-98	He 2016 v2 的投影捷径作用于预激活后的张量；注释自称"标准 pre-act"，实际不是
+BottleneckBlock.expansion 语义反转	resnet.py:127	mid = out_ch // expansion 是"内部压缩比"，而 ResNet 的 expansion 是"输出扩张比"；同名反义
+MedNeXt expand_ratio 全网恒定	factory.py:277	原论文按 stage 变化（如 2/3/4 金字塔）
+upkern 用 align_corners=True	mednext.py:329	与 MedNeXt 官方默认 False 不同（docstring 已声明，属已知偏差）
+reparameterize_model 无日志/计数	mednext.py:257-263	对任何带 switch_to_deploy 的模块生效，折叠了几个块用户无从得知
+checkpoint_if 的 BN 冻结只在 fn 是 nn.Module 时生效	blocks.py:95-104	全仓唯一的非 Module 调用点是 _ADMMiddle（adm_unet.py:443 传 bound method）；ADM 全用 GroupNorm 故当前无实际影响，但这是一条隐式约定
+ADM/EDM2 的 num_fg_classes 形参名误导	adm_unet.py:880、edm2_unet.py:761	两处都传 out_classes（含背景/多分辨率组），口径一致但名字反义
+③ 合理性与设计评价
+做得好的（建议固化为契约）
+
+checkpoint_if 的 BN 双更新修复（:51-104）：context_fn 在重算前快照、退出时恢复 running buffers，语义上恰好抵消第二次前向的 momentum；配合 use_reentrant=False + preserve_rng_state=True，"开检查点与不开数值严格一致"这条在同类框架里经常被做错。S5 复核算子侧：mednext 的 DilatedReparamBlock 内部 BN 也落在 fn.modules() 覆盖范围内（stage 才是被 checkpoint 的 Module）。
+AMP 数值细节的系统性处理：DropPath 先 fp32 采样再转 dtype（:119-121，规避 bernoulli 后端差异）、GlobalResponseNorm 与 LayerNorm3d 的统计量 fp32 累加（:137-142、convnext.py:26-32）。这类"只在 fp16 大空间求和时才暴露"的坑被提前堵住了。
+nD 单实现：八张分派表 + _check_dims 让 2.5D（spatial_dims=2）与 3D 共用全部块，唯一显式拒绝的是 R2Plus1DBlock（resnet.py:181-188，且报错文案给出了替代方案）与 carafe/dysample（:1455-1459）。这是 2.5D/3D 双模态框架能维持单份代码的基础。
+RoPE 实现的两个非平凡决策（:570-590、:623-645）：torch.compiler.is_compiling() 时旁路 Python dict LRU（避免 graph break），以及"逐轴旋转块收集后一次 cat"而非 clone+切片写回（对 compile 友好且省一张全量拷贝）。
+各向异性 fail-fast 下沉到算子构造期（:1262-1279、:1481-1506）：blurpool/pixelunshuffle/carafe/dysample 在拿到非各向同性 stride 时直接报错并给出可用替代，而不是静默产出错误几何。
+DilatedReparamBlock 的折叠正确（实测 rel 误差 6.7e-7）：_fold_conv_bn + _expand_dilated_kernel 的稀疏展开、幂等 switch_to_deploy、以及 upkern_remap_state_dict 里对 plain↔reparam 前缀不匹配的显式告警（:353-372），完成度明显高于其余实验性算子。
+MultiRF 的两个防御：强制存在 dilation=1 守门支路（resnet.py:309-311，抗网格效应）、branch_norm_act 下对 GroupNorm 不整除显式报错而非自适配（:355-366，并在报错里列出四种修法）。
+结构性问题
+
+归一化选型没有单一真相源，且"不整除"有三种行为：get_norm 静默折半+一次性告警、SelfAttentionBlock 静默折半无告警、MultiRF 显式报错；此外 MedNeXt 固定通道级 GN、ConvNeXt 固定 LN、AttentionGate 对单通道图做 norm（S5-B 的根因）。六处口径分散，新增 backbone 必然再加一处。
+注意力有三套互不相通的抽象：make_attention（块内通道/空间门控，配置来自 se_reduction）、SelfAttentionBlock（stage 尾 token 注意力，配置来自 selfattn.*）、AttentionGate3D（skip 门控，配置来自 attn_gate_norm）。三者可同时开启且互不感知，配置层也没有"总注意力预算/显存"视图；lka/msca 的核参数甚至无法从配置到达（make_attention:498-501 不透传 kwargs）。
+算子成熟度差异巨大却同级暴露：transpose/trilinear/nearest 是生产级，pixelshuffle 次之，carafe（S5-A：不可用）与 dysample（偏移语义偏离原作）是实验级；upsample_mode 白名单一视同仁，没有实验性标注、没有显存守卫、日志里也看不出差别。同样的问题在 attention_type 上（lka/msca vs se/eca）。
+各向异性只贯彻到了"重采样算子"，没贯彻到"感受野算子"：Downsample/Upsample 支持 per-axis stride，但 LKA(k=5/7,dil=3)、MSCA(7,11,21)、MedNeXt kernel_size、ConvNeXt dwconv7、selfattn window_size/grid_size 全是各向同性标量（_normalize_spatial_sizes:648-661 支持序列，但配置层只给 int）。对层厚 5mm 的 CT，这是系统性错配（S5-E 是它最可测量的形态）。
+同一思想两份实现（S5-H）：MultiRF 与 DilatedReparamBlock；以及 Downsample('conv') 与 ConvNeXtDownsample（convnext.py:163-173，硬编码 k=2/s=2/bias=True、norm 在前、不跟随 norm_type）。
+私有名跨模块依赖：resnet.py:10-12、convnext.py:13、mednext.py:26 都从 blocks import _CONV/_BN/_DROP 等下划线名。blocks.py 1541 行里混装了工具函数 / 通道注意力 / token 注意力 / 重采样 / 初始化五类内容，"论文模块"（LKA/MSCA/CARAFE/DySample）更适合独立文件，否则这三个骨干文件会一直依赖它的私有约定。
+④ 优化空间（含 GPU / 吞吐 / 显存）
+#	优化	预估收益	风险
+1	padded == orig 时不传 attn_mask（S5-D）；q/k/v 合并为一次 partition，去掉未使用的 offsets 列表	实测 SDPA +43% 时延可去；flash 可用的机器上收益更大；partition 拷贝 3→1	极低；数值不变（mask 全 True 时是 no-op）
+2	去掉 trilinear/nearest 的 fp32 往返（S5-F），torch≥2.1 原生支持	decoder 最高分辨率处少一份 2× 大小的 fp32 临时张量 + 两次 cast	低；bf16 插值与 fp32 插值有末位差异，需回归比对
+3	插值上采样改为「先 1×1 降通道 → 插值 → 3×3 精修」而非「插值 → 3×3(in→out)」（:1477-1479）	精修卷积在高分辨率上跑，当前 FLOPs ≈ 8×；重排后主成本降到低分辨率	中；改权重布局，需作为新开关默认保旧
+4	CARAFE3d 重写为低分辨率加权形式 / 或加显存 fail-fast（S5-A）	从"必 OOM"变为可用；实测峰值 964→约 70 MiB 量级	中；数值等价需逐值验证
+5	MultiRF 增加推理期折叠（复用 DilatedReparamBlock 的 _fold_conv_bn/_expand_dilated_kernel），并合并两套膨胀分支实现（S5-H）	推理少 N-1 条分支；同时消灭一份重复实现	中；3D 下折叠后的稠密核可能比稀疏分支更贵，需按 max(dilation) 判断是否折叠
+6	DropPath 改 x.new_empty(shape).bernoulli_(keep)（:118-122）	每个残差块省一次 fp32 全量 torch.full + 一次 dtype cast；深网络里块数以百计	低；需保持 fp32 采样语义以维持 AMP 一致性
+7	RoPE 缓存扩展到 flat_coords（当前只缓存 cos/sin，:616-621 的 meshgrid 每次前向重建）	省一次 meshgrid + reshape；token 数大时非平凡	极低
+8	深度卷积骨干（MedNeXt/ConvNeXt）走 channels_last_3d	torch 2.7 的 dw-conv 在 channels_last 下 kernel 更优	中；需与 S7 的 AMP/torch.compile 协同，且要全网统一否则反复转置
+9	MSCA/LKA 的核长按轴可配（S5-E）	薄 z 上去掉 4/7 的无效抽头计算；实测 MSCA 前向是普通残差块的 2×	低（纯新增字段）；改默认会变数值
+⑤ 2026 可借鉴项
+方案	借鉴点	适配代价	优先级
+PyTorch flex_attention（2.5+ torch.nn.attention.flex_attention，本环境 2.7.1 已具备）	用 mask_mod/score_mod 表达窗口/网格，不物化 mask、不做 partition/unpartition 的 rearrange，且能编译成融合 kernel。直接解掉 S5-D 与 _window/_grid_partition_tokens 的全部拷贝；本仓的窗口/网格语义正好是它的典型用例	中（需核实其 3D flatten 语义与本仓 spatial_shape 的对应，落地前查最新官方文档）	高
+QK-Norm（Dehghani 2023, ViT-22B；已成为 2024+ 大模型标配）	SelfAttentionBlock 目前只有 PreNorm + zero-init proj，缺 QK-Norm；3D token 数大、softmax logits 易发散，这是 5 行改动换训练稳定性	低	高
+UniRepLKNet / RepLKNet 的结构重参数化（本仓 mednext.py 已落地一半）	把 DilatedReparamBlock 提升为公共 primitive，MultiRF、ConvNeXt dwconv7、MedNeXt 共用一套「训练多分支 / 推理单核」机制（解 S5-H）	中	高
+各向异性大核 / 逐轴 spacing 感知核（SegNeXt 条形核思想 + nnU-Net 的 spacing 驱动几何）	MSCA 已有逐轴条形核的骨架（:458-467），只差"轴长随 spacing 变化"；对 CT 大层厚是直接收益（解 S5-E）	低	高
+MedNeXt 原论文的 per-stage expand_ratio + UpKern 分阶段迁移	当前 expand_ratio 全网恒定（factory.py:277）；论文用金字塔式 R，且 UpKern 是"小核训练→大核微调"的两阶段流程，本仓只实现了权重重映射，没有流程	低	中
+SSM / Mamba 类线性全局建模（SegMamba、U-Mamba、nnMamba，2024）	作为 _LinearQKVAttention 的替代：同为 O(N)，但在 3D 长序列上的表现明显更好；本仓已有"stage 尾插入全局块"的插槽（factory.py:175-187），接入面很小	中高（新依赖 / 自实现扫描算子，需评估必要性）	中（先做消融档位）
+上采样算子选型的近年结论（DySample ICCV2023 vs CARAFE vs FADE/SAPA）	共识是 DySample 性价比最高、CARAFE 在 3D 下代价不可接受。建议把 carafe 标为实验性，并把 dysample 的偏移归一化对齐官方实现	低	中
+LayerScale / zero-init residual 的统一声明机制（timm init_weights / MMEngine init_cfg）	与 S4-B 同一条：ConvNeXt 有 LayerScale、MedNeXt 没有；SelfAttentionBlock/DySample/ICNR 有零初始化契约却会被 init_strategy 抹掉。模块级声明可一并解决	低	高（与 S4-B 合并落地）
+⑥ 与既有测试 / 契约的冲突检查
+S5-A（CARAFE）：test_blocks_sampling.py 只做形状/梯度冒烟，无显存断言 → 改写实现需新增数值等价用例；加 fail-fast 会拒掉当前能"小尺寸跑通"的测试配置，需把守卫阈值设在实际显存估算上而非固定尺寸。
+S5-B（AttentionGate 归一化）：tests/test_a5_blocks.py:213-228 固化的是 attn_gate_norm ∈ {batch, instance, group} 到具体 norm 类的映射，不覆盖 auto 分支；把 auto 的默认目标改为 batch（或改 psi 为无 norm + bias）不破坏该断言，但会改变所有 skip_attention=True 历史配置的数值 → 按"legacy 默认保旧"原则宜作为新枚举值落地并在 CHANGELOG 明示。
+S5-D（attn_mask）：tests/test_selfattn.py:245-273 的参考实现逐行复制了"恒建 mask 并传入 SDPA"这一写法。改为"无 padding 时不传 mask"后数值应严格相同（mask 全零 bias），allclose 断言不会失败，但该测试的参考路径会与实现分歧 → 建议同步更新参考实现，否则它不再是有效对照物。
+S5-E（各向异性核）：tests/test_swa_lka.py:36-70 断言形状、梯度、小空间合法性与分支数（len(b) == 3 逐轴条形核）。新增逐轴核长字段属纯新增，默认保旧则无冲突；test_msca_branch_count_matches_scales_and_dims 依赖"每分支恰好 spatial_dims 条 strip"，改结构时需同步。
+S5-F（fp32 上采）：无测试断言中间 dtype；输出 dtype 契约不变。仅需一次数值回归比对。
+S5-G（Downsample kernel）：test_anisotropic_downsample.py 在同一 cfg 内构建+前向，不跨 cfg 加载 → 与 S4-A 的架构指纹方案同一批次处理最合适；改 kernel_size 会改权重形状，属独立批次。
+S5-H（MultiRF 折叠）：test_dilated_reparam.py 已固化 mednext 侧的 deploy 等价性（本轮实测 rel 6.7e-7 通过）；给 MultiRF 加折叠属纯新增推理路径，需照搬同款等价性用例。注意 test_dilated_reparam.py:255 仍是 S1-A 里那条"预先 setattr cfg.model.reparam_deploy 掩盖字段缺失"的用例——S5 复核确认该问题在配置层，与算子层无关。
+S5-C（1³ 特征图）：无既有用例覆盖；修正为几何校验期 fail-fast 属纯新增，会拒掉理论上可写但一定崩溃的配置，无断言冲突。
+轻微项：BlurPool filt_size=2、空 drop_path_rates、icnr_init_ 死参数、get_conv3d 均无测试覆盖，修正不破坏任何现有断言。
+与 S1–S4 的一致性：S5-G 从算子侧确认了 S4-A 的根因（池化+1×1 路径下 stride 不进权重形状，形状兜底结构性失效），二者应合并为同一批次（架构指纹落盘 + 推理期比对）；S5-B/S5-E/S5-F 与 S4-F（drop_path schedule 方向）同属"默认值即次优"族；S5-C 与 S1-「amp_dtype/compile_mode 配置期无枚举校验」、S2-G、S3-D、S4-C 同属"启动期缺前置校验、代价推迟到长耗时之后"族——这已是连续五轮出现的最高频结构性问题，建议 S12 单列为一个落地批次。
+
+S6	数据增强/处理	data/augment.py（GPU 同步 3D 增强、Companion）+ dataset 内归一化/resize/pad 预处理路径 + augment.* 配置语义	S2
+
+审查报告：数据增强 / 处理
+本轮遵守：只审不改（未产生任何代码/文档改动）；结论均给 文件:行号；关键判断用 D:\miniconda\envs\torch27_env\python.exe 实测复现（脚本写在系统临时目录 %TEMP%\s6_probe，未落工作区）；不臆断库用法。
+
+本轮范围：augment.py（GPU 同步 3D 增强 + Companion）、dataset 内的归一化 / resize / edge-pad 预处理路径（dataset.py 的 preprocess_image / preprocess_label / resize_3d / extract_z_patch_padded / 三个 _getitem_max_fov）、augment.* 与 data.aug_oversample_ratio 的配置语义（core.py::AugConfig / _validate_augment）、以及增强在训练链路上的实际调用点与前后契约（trainer.py:461-479、views.center_crop）。视图拆分/折叠本身属 S8，本轮只在"增强的输入输出契约"处引用。
+
+① 事实梳理
+调用链（seg 训练）：dataset.__getitem__ 发单 max-FOV cube（未折叠 rank-5、单通道）→ trainer._train_epoch H2D（@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:462-468）→ self.augmentor(image, label, wmap)（:471）→ views.center_crop 去 oversample 余量（:472-474）→ pipeline.prepare_batch 拆视图/折叠（:477）→ AMP forward。验证侧无增强、无裁剪（validation.py:397-400），因为 val 的 aug_oversample_ratio 被 spec 强制为 1.0（specs.py:130-134）。WORKFLOW.md:165 的"dataset 恒发未折叠 3D → GPU 3D 增强 → 裁余量/视图拆分 → 送模型前折叠"契约，在 seg 主链路上逐行核对通过。
+
+增强器构造：GPUAugmentor(cfg.augment, max_scale=max(scales), label_fill=label_values[0], seed=train.seed+7919*(rank+1), inplace=True)（trainer.py:140-149）。三个非默认入参各有明确用途：max_scale 只用于缩小 elastic_deform_alpha（augment.py:123）、label_fill 作 label 越界填充、inplace=True 跳过入口 clone。
+
+管线顺序（augment.py:113-166）：记录 clamp 基准 → flip → affine⊕elastic（融合为单次 grid_sample）→ brightness → contrast → gamma → noise → blur → lowres → intensity_clamp → grid_dropout。注释明确解释了两个非平凡的排序决策（clamp 基准取增强前、dropout 必须在 clamp 之后）。
+
+四个真实契约：
+
+Companion 同步：空间变换由同一份 grid 消化，label nearest+oob_fill=bg、wmap 按 wmap_interp_mode+oob_fill=1.0、gen 的 cond/wmap oob_fill=None 保 border（:399-405、:175-183）。
+仿射⊕弹性单次重采样：同时选中的样本合成 G(x)=Θ(x+d(x))=affine_grid + M·d（:381-392），只插值一遍。
+CPU 采样选样掩码：_bernoulli_mask 在 CPU 上采样，声称"后续 any/sum/nonzero 均零同步"（:27-31、模块 docstring:9-11）。
+强度变换只作用 image；grid_dropout 也只挖 image，label/wmap 原样（:453）。
+预处理侧：preprocess_image 单次分配 + in-place clip/normalize（dataset.py:478-511）；preprocess_label 向量化 one-hot（:538-544）；resize_3d 图像 order=1 / label order=0 + mode='nearest' 防边界注 0 + 形状防御性校正（:550-581）；extract_z_patch_padded 越界 mode='edge' 复制保物理 FOV（:1076-1093）。aug_oversample_ratio 的落点分两种：z_axis/2_5d 只放大 z（:898-900），cubic/whole 三轴同比（:1149-1150、:1350-1351）。
+
+② 正确性问题
+严重
+[S6-A] 2.5D / z_axis 下"出面旋转 + aspect_correct"把两成以上的监督标签抹成背景
+random_rotate_range 默认对三轴共用（core.py:241、random_rotate_range_per_axis=None），random_affine_aspect_correct 默认 True（core.py:250，实现在 augment.py:258-260：R←diag(1/a)·R·diag(a)，a=(W,H,D)）。aspect 校正把旋转搬到 voxel-count 各向同性坐标里做——这对立方 patch 是正确的，但对 D≪H 的薄 slab 意味着：一个面内偏移 u 的体素在出面旋转 θ 后 z 位移 u·sinθ，而 slab 只有 D 深。同时 z_axis/2_5d 的 oversample 只在 z 有余量，面内没有任何余量可裁（core.py:254-255 已承认这一固有限制，但只提到平移）。越界体素的 label 被 oob_fill=背景 覆写（augment.py:403-404），image 却是 border 复制的"看起来合理"的内容 → 系统性假阴性监督。
+
+实测（B=2，全前景 label，affine_prob=1.0；第二组是中心裁剪之后、即真正进损失的比例）：
+
+
+
+裁剪前（B,1,36,256,256）label 被抹成背景的比例
+  aspect_correct=True , rot=±15 三轴 : 0.2896
+  aspect_correct=False, rot=±15 三轴 : 0.1083
+  aspect_correct=True , rot=±30 三轴 : 0.4983
+  aspect_correct=True , 仅面内(绕 D) : 0.0266
+  各向同性 cube 128³, aspect=True, ±15 : 0.1087
+ 
+裁剪后（损失真正看到的）
+  seg2_5d.yaml [12,256,256] r=1.5 s=2.0 rot±15 → eD36→crop24 : 0.2216
+  seg3d.yaml   [16,128,128] r=1.5 s=2.0 rot±30 → eD48→crop32 : 0.1670
+  cubic 三轴余量 [64,128,128] r=1.5 rot±15（三轴都裁）      : 0.0000
+三点结论：① 这是生产默认配置（configs/seg2_5d.yaml:78 rot ±15、configs/seg3d.yaml:80 rot ±30、两者 aspect_correct: true）下的行为，仿射触发概率 0.3 时，平均每个 batch 约 5–7% 的体素带着错误的"背景"标签进损失，且空间上高度集中在面内边缘（模型会学到"靠边=背景"）；② aspect_correct=True 把 10.8% 放大到 29%，即这个"消除剪切"的改良项在薄 slab 上反而是放大器；③ cubic 模式完全没有这个问题（三轴都有余量，裁剪后 0.0%）——所以问题的根因不是仿射本身，而是"无面内余量的模式 + 各向同性角度范围"这一组合无人校验。_validate_augment 只对 random_translate_range 做了余量对比警告（core.py:1837-1853），对旋转引入的边缘带完全不检查。正解：出面角度上界按 arcsin(D_eff / max(H,W)) 自动收敛（或强制 rotate_range_per_axis），并把 oob 体素通过 wmap=0 排除出损失（见 ④-1、⑤）。
+
+[S6-B] whole 模式下 aug_oversample_ratio>1 造成训练/验证 FOV 与体素尺度双重错位
+SegDataset3DWhole 把整卷 resize 到 extract_size = round(patch_size × oversample)（dataset.py:1350-1351、1367-1371），trainer 增强后中心裁回 patch_size。cubic/z_axis 的 oversample 是"多抽一点原始体素、裁回来"（分辨率不变），whole 的 oversample 是"整卷放大 r 倍再裁中心"——分辨率和 FOV 同时变了。而 val 的 oversample 被强制 1.0（specs.py:130-134），整卷 resize 到 patch_size、不裁。实测：
+
+
+
+volume=(80,300,300) patch=(64,128,128) r=1.5
+  TRAIN: 整卷→(96,192,192) → 增强 → 中心裁→(64,128,128)
+         = 只看每轴中间 67%，体素尺度比 val 细 1.50×
+  VAL  : 整卷→(64,128,128) = 看 100%，1.00×
+  实测源坐标覆盖跨度: train=199 vs val=299 (比值 0.67)
+后果：① 训练分布与验证/推理分布在尺度上系统性错位（同一解剖结构在训练时大 1.5 倍）；② 整卷模式常用于"看全局"，而 r>1 恰好把边缘 33% 永久排除出训练；③ 与 S2-「whole 模式 label 未做 antialias 讨论」叠加，whole 路径是三种模式里 legacy 假设最多的一条。WORKFLOW.md:36-43 把这套流程当正常流程描述，没有任何提示；Config.validate 也不拦（whole 只强制 multi_res_scales=[1.0]）。正解：whole 模式下 oversample 应改为"resize 到 patch_size 后 pad 出余量"或直接禁用（fail-fast + 提示改用 cubic）。
+
+中等
+[S6-C] 增强私有 RNG 不进 checkpoint → 违反"resume 位精确恢复（含 RNG）"契约
+GPUAugmentor 刻意用私有 _gen_cpu / _gen_dev 与全局 RNG 解耦（augment.py:65-92，注释称这是"固定 seed 等价性验证的前置"），而 snapshot_rng_state 只快照 torch CPU/CUDA + numpy + python 四路全局状态（checkpoint.py:332-340）。Trainer 每次构造都用同一个 seed = train.seed + 7919*(rank+1)（trainer.py:146，不含 epoch/step）。实测（同 seed 新建实例，连续三步的 brightness 偏移）：
+
+
+
+run1: [[-0.08487,-0.06067], [-0.04449,0.07146], [-0.01867,-0.05364]]
+run2 (fresh instance, same seed): 完全相同 -> identical: True
+即每次 resume 都从头重放同一条增强序列：一个训练到 60 epoch 后中断三次的任务，会在三段续训里反复看到 epoch 0 的那批增强参数，等效增强多样性被压缩。segtask_v1/docs/WORKFLOW.md:215 明确承诺"resume 位精确恢复（含 RNG）"——该承诺在增强这一路上不成立。正解：把两个 Generator 的 get_state() 纳入 checkpoint（或把 seed 派生为 f(seed, rank, epoch)）。
+
+[S6-D] "零 device→host 同步"契约只兑现了一半：10 个算子里 6 个触发同步
+模块 docstring:9-11 声称掩码与逐样本标量在 CPU 采样"避免对 CUDA RNG 结果的隐式 device→host 同步打断流水"。但采样完还要把索引/参数搬上卡，而空间与噪声类算子用的是不带 non_blocking 的 .to(image.device)（:199、:344、:590、:613、:481），强度类算子则正确地传了 non_blocking=True（:528、:547、:571）。另外 _grid_dropout_companions 把 CPU 掩码搬上卡后在设备上做 nonzero（:481-482），这是真正的 D2H 同步（同文件其它算子都是在 CPU 上 nonzero 再搬）。实测（torch.cuda.set_sync_debug_mode("error")，逐算子）：
+
+
+
+flip            : SYNC       brightness      : no sync
+affine          : SYNC       contrast        : no sync
+elastic         : SYNC       gamma           : no sync
+noise           : SYNC       intensity_clamp : no sync
+blur            : SYNC
+lowres          : SYNC
+grid_dropout    : SYNC
+对照关系一一对应（传 non_blocking=True 的三个 + 纯设备端的 clamp 全部干净），说明这是可低成本消除的实现疏漏，不是原理限制。开 prefetch_to_gpu 时这些同步会直接抵消预取带来的重叠收益。
+
+[S6-E] elastic_field_mode='gaussian' 是"叠加平滑"而非"改用高斯场"，幅度被二次衰减；控制网格下限使薄 z 的实际平滑尺度 ≠ sigma
+_elastic_grid_disp（augment.py:272-309）无论哪种 mode 都先做"粗网格 randn → trilinear 上采"，gaussian 只是在其后再串三次可分离高斯卷积（:284-298）。配置注释（core.py:264-266）写的是"legacy 保持粗网格 randn 上采样；gaussian 使用高斯核平滑位移场"，读起来是二选一。实测（D=36,H=W=256, sigma=5, alpha=7，换算回体素）：
+
+
+
+legacy    rms voxel disp (W,H,D) = [3.982, 4.000, 3.979]  max=28.61
+gaussian  rms voxel disp (W,H,D) = [1.623, 1.648, 1.621]  max= 8.39
+同一个 alpha 在两种 mode 下实际位移差 2.45 倍——切换 mode 等于同时改了幅度，用户无从预期（elastic_normalize_displacement 能把幅度拉回，但它默认 False 且是另一个开关）。附带同源问题：控制网格 max(round(D/sigma), 4) 的下限 4 让薄 z 的平滑尺度脱离 sigma：
+
+
+
+D=36 sigma=5 -> 控制网格 z=7 -> 实际平滑长度 5.14 vox（≈ 请求值）
+D=12 sigma=5 -> 控制网格 z=4 -> 实际平滑长度 3.00 vox
+D=8  sigma=5 -> 控制网格 z=4 -> 实际平滑长度 2.00 vox
+即 2.5D 生产配置（D=12）上 z 向弹性形变比配置声明的粗糙 40%，且 sigma 在 z 上事实上失效。这与 S5-E「大核/条形核全各向同性」、S1-「几何真相源副本」同属"各向异性只贯彻到了部分模块"。
+
+[S6-F] augment.* 几乎没有区间/枚举校验，非法值静默生效或静默失效
+_validate_augment（core.py:1820-1921）覆盖了 wmap_interp_mode / rotate_range_per_axis 形状 / translate_range 长度 / blur sigma / elastic sigma·alpha·mode / noise std / lowres zoom / gamma range，但所有概率字段、flip 轴、scale range、brightness/contrast range 的顺序、grid_dropout 的 ratio 与 holes 全部无校验。实测 8/8 条非法配置被 sync()+validate() 接受：
+
+
+
+ACCEPTED : random_flip_axes=[0,1]（batch / 通道轴！）
+ACCEPTED : random_flip_prob=1.7
+ACCEPTED : random_affine_prob=-3
+ACCEPTED : random_scale_range=[0.0,0.0]（退化，网格塌成一点）
+ACCEPTED : random_scale_range=[1.2,0.8]（lo>hi，uniform_ 语义未定义）
+ACCEPTED : random_rotate_range=[10.0]（长度 1，运行期 IndexError 才暴露）
+ACCEPTED : random_brightness_range=[0.5,-0.5]（lo>hi）
+ACCEPTED : grid_dropout_ratio=5.0, holes=0
+其中两条有可观测的破坏性后果（实测）：grid_dropout_ratio=5.0 → 整幅图像 100% 置零而 label 不动，模型被要求在纯零输入上分割；grid_dropout_holes=0 → range(0) 空循环，静默 no-op（用户以为开了强正则）。random_flip_axes 无白名单：对 seg 主链路 C=1 时轴 1 无害，但 gen/ssl/cls 的多通道输入上轴 0/1 语义完全错误。这与 S1-「amp_dtype/compile_mode 配置期无枚举校验」、S2-G、S3-D、S4-C、S5-C 是连续第六轮出现的同一族问题。
+
+[S6-G] max_scale / oversample 的幅度校正只做了 elastic alpha 一处
+增强作用在 max-FOV cube 上（尺寸 = patch × oversample × max_scale），但配置里的几何幅度是用户按"主视图 patch"直觉写的。代码只对 elastic_deform_alpha 除了 max_scale（augment.py:123，且没有除 oversample）。其余全部未校正：
+
+random_translate_range 是 cube 归一化坐标：seg2_5d 生产配置（pD=12, r=1.5, s=2.0 → eD_max=36）下 0.1 的平移 = 1.8 体素 = 主视图深度的 0.30，即实际幅度是配置值的 3 倍；
+_validate_augment:1844-1853 的"边缘复制带 vs 中心裁剪余量"警告公式 margin=(r-1)/(2r) 同时忽略了 max_scale 和"z_axis 只有 z 有余量"——对 2.5D 它在面内给出的余量估计恒为虚假的正值；
+grid_dropout 的洞尺寸按 cube 边长比例算（augment.py:465-468），裁剪后占最终 patch 的比例被放大 r·s 倍；
+elastic_deform_sigma 同理（见 S6-E）。
+[S6-H] normalize='zscore' 配默认 global_mean/std = 直接把裁剪后的 HU 送进网络，无任何校验
+preprocess_image 的 zscore 分支用配置里的 global_mean=0.0 / global_std=1.0（core.py:144-145、dataset.py:503-506），全仓没有任何从数据自动估计这两个量的代码（finalize_from_data 只回写 label_values/num_classes，loader.py:418-436），配置层也不校验"选了 zscore 却没给统计量"。实测：
+
+
+
+输入 HU [-3000,-500,0,500,3000] , normalize=zscore, mean=0/std=1
+输出 [-1024.0, -500.0, 0.0, 500.0, 1024.0]   # 只做了 clip，归一化是恒等
+Config.validate(): ACCEPTED（无 error，也无提示）
+有意思的是同一个校验器已经为 zscore 写了一条"增强幅值量纲不匹配"的警告（core.py:1904-1921，实测会打印），却没检查更根本的"std=1 意味着根本没归一化"。后果是网络输入量级 1000×、第一层激活爆炸，症状表现为"zscore 训不动"，用户很难定位到配置。这与 S2-⑤「per-case 归一化缺失」是同一条线上的两级缺口（先补 dataset-level 统计，再谈 per-case）。
+
+轻微
+问题	位置	说明
+inplace=True 的收益远小于宣称	augment.py:104-107 vs :477、:528、:547、:576	实测：grid_dropout 恒 image.clone()、brightness 返回 image+shift 新张量（out.data_ptr()!=img.data_ptr() 均为 True）。inplace 只省了入口那一份，管线内部仍有多份全量分配
+flip 无 prob<=0 早退	:187-203	其余算子都有 if prob <= 0: return；flip 每轴都要采一次 CPU 掩码 + 一次同步 H2D（见 S6-D），random_flip_prob=0 时纯浪费
+oob 判据略欠采	:394	align_corners=False 下最外半个体素的 `
+blur 核长由 sigma 上界决定	:618	实测 sigma=[0.5,5.0] → ks=31 对所有被选样本（含 sigma=0.5 的）；注释称"归一化后等价"数值上成立，但算力按最坏情况付
+simulate_lowres 三轴同 zoom	:641-668	实测 D=12, zoom=0.5 → z 深度 6。nnU-Net 的 SimulateLowResolution 对各向异性数据有 ignore_axes；此处在薄 slab 上模拟的是"层厚翻倍"而非"面内低清"
+grid_dropout 挖 image 不挖 label	:453、:492	语义是 Cutout；但对分割而言等于要求模型在"信息被删除"的洞里给出正确前景，与 oob_fill=背景 的取向自相矛盾（一个填背景、一个要求照常预测）。默认 prob=0，属设计取向问题
+三个"旧签名包装"已无生产消费者	:206-219、:410-443、:496-511	grep 确认 _random_flip / _random_affine_elastic / _grid_dropout 只被 tests 引用（6 个测试文件）；与 S3「同一思想两份实现」同型，且它们与 companion 版的默认 oob_fill 不一致（包装版 flip/dropout 传 None，_random_affine_elastic 传 0.0/1.0）
+Companion.oob_fill 对 wmap 恒填 1.0	:179	与 make_data 的"+1 偏移，1.0=中性"口径一致（make_data.py:299-321），但该耦合没有写成契约；gen 路径又用 None（test_companion_augment.py:96-116 固化），三种任务三种语义散在调用点
+intensity_clamp 每 batch 两次全量 reduce	:115-118	默认 True，amin/amax 各扫一遍；实测该项本身不引入同步，但对大 cube 是可省的带宽（可与 gamma 的 min/max 复用，gamma 也在算同样的量，:563-564）
+resize_3d 在 label 上恒 order=0，image 侧 antialias 默认关	dataset.py:566-570、specs.py:58	S2 已记；S6 复核确认 z_axis 面内 resize（:985-989）与 whole 全卷 resize（:1367-1371）都走这条路径，是"CPU worker 上的 scipy.zoom + GPU 上的 grid_sample"两次插值串联（见 ④-5）
+注释乱码"动态阐"	:572、losses.py:78	应为"动态展开/构造"；与 S3 的"夹匯"同批
+③ 合理性与设计评价
+做得好的（建议固化为契约）
+
+仿射⊕弹性融合为单次 grid_sample（:381-392）：同时选中的样本只插值一遍，G=Θ(x+d) 的合成用 theta 的线性部分左乘位移，数学上正确且省一次全量重采样。多数同类框架（含早期 MONAI）在这里做两次串行 warp。
+Companion 抽象（:34-44、:399-405）：把"谁跟着一起变、用什么插值、越界填什么"变成数据声明而不是 if 分支，seg/gen/ssl/cls 四个任务共用同一份 warp 代码而语义各自正确，是本层最有价值的设计。
+CPU 侧采样选样掩码的思路正确（:27-31）：any/sum/nonzero 全在 CPU 上完成，避免了"CUDA 上采样 → 取回判断"的经典同步陷阱——只是搬运环节没贯彻到底（S6-D）。
+增强随机流与全局 RNG 解耦 + 逐 rank 分流（:65-92、trainer.py:146）：DDP 下各 rank 增强不同、同 seed 可复现（tests/test_augment_gpu_r5.py:45-57 已固化 bit-identical）。这是很多框架直接用全局 RNG 而在 DDP 下退化为"各卡同一批增强"的地方。
+两个排序决策有据且写了理由：clamp 基准取增强前（避免 border 复制/dropout 污染基准，:113-118）、grid_dropout 必须在 clamp 之后（否则洞被 clamp 抬回 clamp_lo、dropout 静默失效，:161-162）。后者是只有踩过才会知道的坑。
+gamma 只在空间轴 reduce、通道独立（:561-566）：为多分辨率/多模态通道留了正确语义，虽然 seg 在增强时恒为 C=1。
+resize_3d 的两个防御（dataset.py:571-580）：mode='nearest' 防止 zoom 在边界注 0、输出形状对目标做防御性校正，堵住了 scipy zoom 的两个已知行为。
+结构性问题
+
+"几何幅度"没有单一真相源（S6-A/S6-G 的共同根因）。决定"一次增强会把内容推出边界多远"的量分散在四处：augment.* 的角度/平移/弹性幅度、data.aug_oversample_ratio、multi_res_scales 的 max_scale、以及 patch 的各向异性比 D:H:W。代码里只有 elastic_alpha /= max_scale 一条校正，校验器里只有 translate 一条（还算错了）。应当有一个 augment_geometry_budget(cfg) 派生函数，统一算出"各轴可用余量 / 各轴最大允许角度与平移"，供校验器与运行期共用——这与 S1 建议的 build_topology 单入口、S4 建议的"三个几何量做成 topology 侧派生函数"是同一手法。
+越界（oob）语义选错了工具。当前是"label 填背景"（:403-404），等于把"我不知道这里是什么"编码成"这里是背景"。而框架已经有一个天然的忽略机制：weight_map 在 Dice 里是求和权重、在 BCE/Focal 里是归一化加权均值的权重（losses.py:124-130、:67-82），填 0 即精确排除。把 oob 掩码乘进 wmap（而不是改 label）是 5 行改动、语义严格、且与 nnU-Net 的 ignore-label 思路一致。当前实现之所以选了填背景，是因为 tests/test_review_batch4_fixes.py:117-131 把它固化成了契约——那批修复解决的是"越界处 border 复制出假前景"这个更糟的旧行为，方向对但停在了半路。
+增强的成本模型不透明。整条管线在训练循环主流上同步执行（trainer.py:471），且作用于未裁剪、未拆视图的 max-FOV cube（体积 = 最终 patch 的 r³ 或 r·s³ 倍）。实测（B=2, (1,36,256,256), 输入 18 MiB）：
+
+
+seg2_5d 默认(aff .3/flip .2)  10.94 ms   峰值 +306.0 MiB  (17× 输入)
+affine only p=1.0              7.31 ms   峰值 +162.0 MiB  ( 9× 输入)
+elastic only p=1.0             9.05 ms   峰值 +306.0 MiB
+blur only p=1.0                2.16 ms   峰值 + 76.0 MiB
+lowres only p=1.0              0.84 ms   峰值 + 55.5 MiB
+峰值的主要来源是 grid（(n,D,H,W,3) fp32 = 输入的 3 倍）+ oob 掩码 + image[idx] 高级索引的 gather/scatter 各一份拷贝。日志里对此零披露，用户在 OOM 时不会想到是增强而不是模型。
+"legacy 包装 + companion 实现"双份（轻微表最后第三条）与 S3-「cube 抽取两份近重复」、S5-H「多膨胀分支两套实现」同型：包装层已无生产消费者，却仍在维护且默认值已与主实现漂移。
+augment 与 dataset 预处理的职责切分是历史形成的，不是设计的。归一化/面内 resize 在 CPU worker（scipy，单线程）、空间/强度增强在 GPU；结果是 z_axis 路径上同一份数据被插值两次（scipy zoom order=1 → grid_sample bilinear），既多一次数值损失也多一次算力。nnU-Net 的做法是把"抽取+缩放+仿射"合成一次重采样。本仓已经把 affine⊕elastic 合并了，只剩这一处没合。
+配置注释质量远高于配置校验质量。AugConfig 的注释把 scale 的反向语义（core.py:242-244）、brightness/noise 隐含 [0,1] 量纲（:276-277）、z_axis 无面内余量（:254-255）、per-axis 旋转的 CT 惯例（:245-246）都写清楚了——然后默认值全都不遵守这些注释（默认三轴同角、默认 zscore 下用 minmax 量纲的幅值）。注释在这里承担了本该由默认值和校验器承担的职责。
+④ 优化空间（含 GPU / 吞吐 / 显存）
+#	优化	预估收益	风险
+1	oob 掩码乘进 weight_map（而非改 label），并对无 wmap 的样本恒定输出全 1 wmap	直接消除 S6-A 的假阴性监督；顺带解掉 S2-A 的 KeyError: 'weight_map'（样本 schema 恒定）	中；改变损失分母，需与 S9 的 _weighted_voxel_mean 口径联合验证
+2	6 个算子的索引/参数搬运统一加 non_blocking=True；grid_dropout 改在 CPU 上 nonzero	实测 6/10 个算子的隐式同步归零；开 prefetch_to_gpu 时预取收益才真正兑现	极低；数值完全不变
+3	出面角度上界按几何自动收敛（asin(D_eff/max(H,W))），并让 _validate_augment 用统一的余量预算函数（含 max_scale 与"仅 z 有余量"）	解 S6-A / S6-G 的配置侧；把"默认值即次优"变成"默认值即几何合法"	中；会改变既有训练分布 → 需按"legacy 默认保旧"作新开关落地
+4	仿射/弹性改为全 batch 一次 grid_sample（未选中样本用单位 theta），去掉 image[idx] 的 gather/scatter	省两份被选子集的拷贝；实测 affine 峰值 162 MiB 中约 1/3 属此	低；prob 很小时反而更贵，需按 n/B 阈值切换
+5	z_axis 的面内 resize 从 CPU scipy 移到 GPU，与 affine 合成同一次 grid_sample	消除双重插值 + worker 主热点（S2-⑥ 已列为 #6）；数值更准	中高；改变数值，需回归比对（与 S2-优化 6 是同一件事，应同批做）
+6	intensity_clamp 与 gamma 复用同一次 amin/amax	每 batch 省两次全量 reduce	极低
+7	grid 与 oob 用 bf16/半精度存储（grid_sample 支持），或按需分块	峰值 306 MiB → 约 200 MiB 量级；大 patch 下更明显	中；grid_sample 在低精度下的坐标精度需实测（256 体素轴上 bf16 尾数不足，可能要 fp16 或分块 fp32）
+8	blur 核长按逐样本 sigma 分组（而非统一取上界）	sigma=[0.5,5] 时小 sigma 样本从 ks=31 降到 ks=5，算力降一个量级	低；分组会引入若干次小 conv，需按组数权衡
+9	flip 加 prob<=0 早退；三个 legacy 包装下沉到 tests 或删除	纯清理；顺带消除 3 次无谓的同步 H2D	极低
+⑤ 2026 可借鉴项
+方案	借鉴点	适配代价	优先级
+nnU-Net v2 / batchgeneratorsv2 的 SpatialTransform（p_rotation / p_scaling 独立概率 + 逐轴旋转角 + 从更大的源区域一次重采样到目标 patch）	三点直击本轮问题：① 旋转角本来就是逐轴配置，不存在"三轴同角撞薄 slab"；② 抽取+缩放+仿射合成一次重采样（解 ④-5 的双重插值）；③ 越界用 padding + ignore 语义而非"填背景"（解 S6-A）	中（本仓已有 companion/单次 warp 的骨架，主要是把"抽取"也并进 warp）	最高
+ignore-label / 有效性掩码作为一等公民（nnU-Net 的 ignore_label、MONAI 的 RandAffine + mask 传播）	本仓已具备 weight_map 这一通道（losses.py:67-82 确认它在 Dice/BCE/Focal 上都是精确的求和权重），把 oob 写进 wmap 即可，无需新机制	低	高
+MONAI 1.x 的 Compose(lazy=True) 延迟重采样（多个空间变换先合成一个仿射/DDF，最后只 resample 一次）	本仓在 affine⊕elastic 上已经手工做到了；MONAI 的思路是把 flip / crop / resize 也一并纳入同一次重采样。本仓的 flip（torch.flip）+ center_crop（切片）+ 视图 resize（F.interpolate）目前是三次独立的内存搬运	中	中
+torch.nn.functional.grid_sample 之外：torchvision.transforms.v2 / Kornia 的 batched 3D 仿射（本环境 torch 2.7.1 已具备 SDPA/flex 等新算子，但 3D 增强仍以自实现为主流）	主要借鉴其"变换参数逐样本 batched 化"的接口设计；本仓已是 batched，无需引入新依赖。结论：不建议引入第三方增强库（会破坏 Companion 抽象与零同步设计）	—	低（记录为"已评估、不采纳"）
+per-case / 数据集指纹驱动的归一化（nnU-Net fingerprint_extractor 的前景强度分位数 + per-case zscore）	解 S6-H：make_data 已经在扫 median spacing（S3-⑤ 已提），顺带落 intensity 统计即可自动填 global_mean/std，并为 normalize=per_case_zscore 新枚举供数	低（同一遍扫描内）	高
+BigAug / MedNeXt 的"强增强用于跨中心泛化"消融结论（2024–25 多中心分割共识：几何增强收益 > 强度增强，但强度增强对跨设备泛化不可省）	本仓强度增强齐全但幅度默认按 minmax 量纲写死（S6-H 关联），缺"按 σ 自动换算"的一层；可加 intensity_scale='auto' 让幅值随 normalize 模式自动折算	低	中
+CopyPaste / CarveMix / 前景导向的 mix 类增强（医学分割 2022–25 的稳定增益方向，尤其小结构）	本仓完全没有样本间混合类增强；MixedBatchSampler 那层已有"batch 内配比"的抽象位置，CarveMix 需要 label 连通域信息，可由 make_data 的逐类 fg 索引供数（已有）	中高	中（血管/小结构任务上值得做消融）
+各向异性感知的增强参数自动推导（nnU-Net 按 spacing 决定是否做 3D 旋转 / 是否 ignore_axes）	与 S5-E（各向异性核）、S6-A/E 是同一条主线：patch 的 D:H:W 与 spacing 应当驱动角度上界、弹性 sigma、lowres 轴选择三处	低（都是纯派生）	高
+（说明：上述为方向性对标，若进入落地阶段涉及具体 API 时会再查各自最新官方文档，不凭记忆写实现。torch 2.7.1 / cuda 可用 为本机实测环境。）
+
+⑥ 与既有测试 / 契约的冲突检查
+S6-A（oob 语义）与既有测试直接冲突：tests/test_review_batch4_fixes.py:117-131 把"越界 label 必须是背景 / 自定义 label_fill"固化成了断言。改为"oob 写进 wmap、label 保 border 复制"会让这三个用例失效 → 必须作为独立批次评估：要么保留 oob_fill 同时新增 oob-wmap（两者并存、旧断言不破），要么以新开关切换并同步改断言。仅收紧角度上界（④-3）不触碰这些断言，可先行落地。
+S6-C（RNG 入 checkpoint）：tests/test_augment_gpu_r5.py:45-57 只断言"同 seed 两个实例逐位一致"，tests/test_round2_fixes.py:887 (test_d3_rng_state_roundtrip) 覆盖的是全局 RNG 快照。把私有 Generator 状态加入 checkpoint 属纯新增，两者都不受影响；需新增"resume 后增强序列继续而非重放"的回归。
+S6-D（non_blocking / CPU nonzero）：数值完全不变，test_companion_augment.py 的全部 legacy↔companion 等价性断言与 test_augment_gpu_r5.py 的 bit-identical 断言都不会失败。tests/test_todo1_batch2_fixes.py:134-144 断言 _grid_dropout_companions 用"输出 clone"而非全量掩码——把设备端 nonzero 改到 CPU 不触碰该断言。
+S6-E（elastic gaussian 语义）：全仓无用例断言两种 field_mode 的幅度关系（grep 仅命中配置校验与字段定义）。若把 gaussian 改为"替换而非叠加"，会改变所有 elastic_field_mode=gaussian 历史配置的数值 → 按"legacy 默认保旧"原则，宜先只修文档口径 + 加一行"幅度会额外衰减约 2.4×"的说明，实现修正作为新枚举值。
+S6-F（配置校验补全）：纯新增 fail-fast。风险点是 tests/test_review_batch1_fixes.py:196-199 特意用 ratio=8.0 断言"hd == 轴长时起点只能是 0 且不越界"——如果给 grid_dropout_ratio 加上界校验（≤1），该用例会被拒。两种解法：校验只在 Config 层做（函数层仍容忍），或同步放宽该用例。tests/test_segtask_v1.py:530-537 的 _grid_dropout 形状断言不受影响。
+S6-B（whole 模式）：test_data_specs.py 覆盖的是 spec 选择与 split-dependent 参数切换，不涉及 whole 的 FOV 语义；无断言冲突。但改动会改变所有 whole + r>1 历史配置的训练分布 → 建议先加启动期 WARNING（"whole 模式的 oversample 会同时改变 FOV 与体素尺度，与 val 不一致"），下一版再改语义。
+S6-G / S6-H：无既有测试覆盖，均为纯新增校验/警告。S6-H 若从 WARNING 升为 ERROR，会拒掉"显式想用未归一化 HU"的边缘用法，宜先 WARNING。
+与 S1–S5 的一致性：
+S6-F/S6-H 与 S1-「amp_dtype/compile_mode 配置期无枚举校验」、S2-G、S3-D、S4-C、S5-C 同属**"启动期缺前置校验、代价推迟到长耗时之后"族——这已是连续六轮**出现的最高频结构性问题，S12 应把它单列为一个跨模块落地批次（一次性补齐所有段的枚举/区间校验 + 一条"每个配置字段必须有校验器与消费者"的元测试）。
+S6-A/S6-E/S6-G 与 S5-E（各向异性大核）、S1-「几何真相源 3 份 stem-stride 副本」同属**"各向异性只贯彻了一半 / 几何量多份真相源"**族，建议与 ④-3 的 augment_geometry_budget 一起并入"几何单一真相源"批次。
+S6-C 与 S1-「推理侧无训推镜像契约校验」、S4-A（架构指纹）同属**"落盘状态不完整导致契约在跨运行边界失效"**族，可与架构指纹同批落地（都是往 ckpt 里补元数据）。
+S6-A 的正解（oob → wmap=0）依赖 S2-A 的修法（dataset 恒定输出 wmap），两者必须同批，否则会在"部分样本有 wmap"的数据上触发 default_collate 的 KeyError。
+
+S7	训练（一）引擎与工程件	engine/base_trainer.py、optim.py、amp.py、checkpoint.py、prefetch.py、dist_utils.py、memory.py、launch.py	S1
+S8	训练（二）任务层编排	segtask_v1/trainer/trainer.py、pipelines/*、views.py、breakdown.py（含 2.5D 折叠时机契约验真）	S7、S4
+S9	训练（三）损失 / 指标 / 验证与选模	losses.py、topo_aux.py、metrics.py、trainer/validation.py、_save_best 口径	S8
+S10	推理全流程	engine/base_predictor.py、bn_stats.py；predictor/{predictor,sliding,forwards,inputs,io,blending}.py（滑窗/blend/TTA/AdaBN/z-interleave/写出）	S2、S6、S8
+S11	全局串联	训练↔推理镜像契约端到端核对、配置→topology→数据→模型→损失→推理的一致性、性能瓶颈全局画像（数据/显存/通信/编译）、legacy 默认值清单再评估	S1–S10
+S12	总结与优先级排序	汇总全部问题 + 2026 借鉴清单，按「正确性风险 / 收益-成本比 / 改造范围」排序，给出建议的落地批次（仅建议，不改代码）	S11
+说明：S5、S7、S9 是最重的三块（各 2k–3k 行），如单轮内容过多我会主动拆成 a/b 两轮而非降低深度；计划需要调整时先说明原因。
 
 
 
@@ -949,130 +940,3 @@ state_to_cpu 期间 max_memory_allocated 增量应 ≈0（J5）；
 - 其它的我暂时没有想到，请你根据我的喜好推荐。总之：层次化/结构化/位置即计算次序、走线可溯源不交叉、方案通用无架构特判、讨厌"自动布局默认输出"式的无设计感结果。
 
 进展：
-
-──────────────────────────────────────────────────────────────
-批 4 进展记录（架构收敛与文档，2026-07-26；实现后核验）
-
-一、已修复
-- G9：组级划分提升为 taskcore 公共入口，五任务按“group_id_regex 非空 → grouped，其次 stratified，再次 random”选择；空 regex 保持原分支。
-- G17：新增显式 `finalize_from_data`，数据探测结果统一经该入口进入配置，loader 不再直接回写 `dc.label_values` / `dc.num_classes`。
-- G6：npz metadata 增加 `achieved_spacing`、`pre_resample_shape`、`origin`、`direction`，保留历史 spacing 键；旧 npz 读取继续走原 fallback。
-- G16：mixed sampler 增加 coarse-bound epoch、gold coverage、gold under-covered/cycled 的诊断；默认 batch 生成和随机流未改。
-- H11：seg 采样 RNG 与验证 coverage 位置改为显式传递 sample index，避免依赖样本实例临时字段。
-- H12：缓存估算日志明确按 image/label/region-weight 三个独立 cache 统计；默认 eviction 行为未改。
-- D1：README、taskcore README、各任务 WORKFLOW/DESIGN 补充公共划分、批 1–3 开关、几何校验、pretrain 几何校验和 checkpoint 开关说明。
-
-二、判定不成立或已失效
-- G15：现有 global replay 的默认 batch 顺序与随机流契约无法在本轮以低风险方式证明逐位等价，因此未做 replay 优化，仅保留 G16 诊断。
-- I14：未发现可以在不触及 checkpoint key、migration alias 或 pickle 兼容的前提下安全删除的清理项，因此未做激进清理。
-
-三、仍推迟
-- J8：真正的预取重叠需要后台取数线程或迭代器重构，可能改变 worker/RNG 时序。
-- J16：现有终止与 cleanup 契约已能工作，本轮没有足够低风险的独立改进。
-- I5：SparK 门控下沉会改变 block 内中间特征与归一化统计，需独立实验开关和数值评估。
-- ADM 非标准 attention：legacy Q/K 分别 softmax，不满足标准 SDPA 等价契约。
-- G13/G14/H9：RNG 派生与 Halton 去相关涉及跨五任务随机流统一，不能在本轮局部改动后声称默认逐位兼容。
-- G7/H5 的 GPU 化部分：CPU 抗混叠已完成；in-plane resize GPU 化仍需 CPU/GPU 插值等价性和设备路径设计，避免改变默认数值。
-
-──────────────────────────────────────────────────────────────
-TODO 1 修复核验（2026-07-25，对批 1–4 修复逐条比对新旧代码 + 本机全量测试）
-
-## 测试结果
-- 4 个新增测试文件 32 项全部通过。
-- 全仓测试：1528 passed / 6 skipped / 11 failed；11 个失败全部在 tests/test_model_flow.py，且在修复前的旧代码上以完全相同方式失败（本机缺 torchlens 可选依赖），与本次修复无关。
-
-## 一、确认修复正确且质量良好
-- F7/N1：TaskSectionSpec 新增 preprocess_raw 钩子，seg 注册传入 hoist_legacy_seg_sections（seg_config.py:112），registry 与直连两条加载路径对 legacy 顶层 loss/predict 行为一致；有等价性测试。实现正确（hoist 原地改 raw，钩子返回 None 也兜住了）。
-- F5+I1：新建 taskcore/config/geometry.py 作为 stride 推导单一事实源，factory.py 改为引用同一实现（旧私有名保留别名，兼容既有测试）；validate_patch_geometry 在配置期硬报错并给出"nearest legal"建议值；adm/edm2/unetpp 运行期静默 interpolate 兜底改为 RuntimeError。方向正确、实现与模型层逐位一致。
-- F6：override 按字段声明类型（get_type_hints）转型，支持 Optional[List[float]] 等联合类型；未知路径/转型失败统一抛 ConfigError。质量好。
-- F10：__getattr__ 告警文案已改为 taskcore.config.core.%s。
-- H2：seg/cls/det 三处 z 采样统一走 safe_z_center_range/safe_z_grid_center。边界数学核对正确：half-open 区间 [D_patch//2, D_vol-(D_patch-half)+1) 与 extract_z_patch_padded 的 lo=z-half 约定精确匹配；薄卷回退中心+单次告警；fg 切片 clip 后 patch 仍覆盖该切片。
-- H8：grid_dropout 从"全尺寸 hole_mask 乘法"改为 clone+索引置零；RNG 消耗序列逐位不变（d0/h0/w0 仍按全 batch 采样），有逐位等价测试。
-- J10：ssl 梯度同步按 (device,dtype) 桶化 flatten→单次 all_reduce→unflatten，正确。
-- J5/J14/J18/N2：state_to_cpu 去掉 GPU 侧 clone（CUDA 直接 .to("cpu")）；_save_best 非 EMA 路径异步保存前才做 CPU 快照、EMA 路径不再二次 clone；EMA backup 走 pinned+non_blocking+stream sync（同步时机正确，empty_like 的 pin_memory 参数在 torch 2.x 合法，已实测）；memory.py 预算计入 ema_backup（未分配时按模型 CUDA 参数估计）。
-- G6：npz meta 增 achieved_spacing/pre_resample_shape/origin/direction，公式核对正确（src×前/后形状比），旧键保留。
-- G9：group_aware_train_val_split 公共入口，cls/det/gen loader 均接入，空 regex 分支逐位保留（有测试）。
-- G16/G17：mixed sampler 覆盖率诊断只加日志；finalize_from_data 统一数据探测回写入口（gen/taskcore loader 均改）。
-- EDM2 attention：SDPA 与 legacy einsum 数学等价（scale=1/sqrt(head_dim) 一致），CPU/旧后端回退保留，token 上限守卫合理；ADM 非标准 attention 正确地未动。
-- ZeRO：adam/sgd/adamw 及 lr_mult 路径全部支持 ZeroRedundancyOptimizer（原来漏分支）。
-- gentask attn_gate_target 按 decoder_type 选择 + 经典 UNet 传非 skips 时 factory 硬报错（I10）。
-- 各"默认 legacy 开关"（resize_antialias、elastic_field_mode、split_rounding_mode、init_strategy、pretrain_upkern_normalize）默认值确实逐位保持旧行为，且都有 legacy 等价测试。
-- 批 4 中"判定不成立/推迟"的项（G15、I14、J8、J16、I5、ADM attention、G13/G14/H9）理由核对成立，未强行改动是对的。
-
-## 二、发现的问题（按严重度）
-1. **P0（必修）pretrain 几何校验对本框架自产 checkpoint 必崩**：base_trainer.py:721-737 `ckpt_cfg = ckpt.get("config")` 后直接 `ckpt_cfg.get("data", {})`。但本框架 _save_best/_save_latest 存的是 `"config": self.cfg`（Config dataclass，无 .get）。已在本机复现：AttributeError: 'Config' object has no attribute 'get'。即任何 train.pretrain_ckpt 指向 best/latest checkpoint 的迁移训练都会在几何校验处崩溃（而不是执行校验）。需按 isinstance(dict) / dataclass 两种形态分别取值；当前 4 个新测试文件均未覆盖该路径。
-2. **P1 upkern normalize 语义可疑**：mednext.py normalize_spatial 把插值后核除以自身空间和（|sum| 归一到 1），而非"保持源核空间和不变"（UpKern 常规做法是 rescale 使插值核 sum == 源核 sum）。源核 sum≠1 时开启该开关会整体改变响应幅度。默认关不影响现状，但该选项按现语义开启大概率有害。附带测试缺陷：test_upkern_normalization_is_opt_in 中 `torch.equal(legacy, legacy)` 是恒真式，应比较 legacy 与旧函数输出。
-3. **P1 init_strategy 非 legacy 时是"地毯式覆盖"**：_apply_init_strategy 会覆盖所有 Conv/Linear，包括 ADM/EDM2 精心设计的零初始化输出投影、EDM2 magnitude-preserving 权重、attention gate 等；对 adm/edm2 开启 kaiming/trunc_normal 会破坏其初始化契约。建议限制 arch=='unet' 或排除零初始化层，至少在文档标注。
-4. **P2 validate_patch_geometry 的适用边界**：(a) 对 arch=adm/edm2 也读取 unet.anisotropic_pooling/stem_mode（这两个 arch 并不消费），配置了 anisotropic_pooling 的 adm 会用错误的 divisor 校验；(b) unet3p decoder 本身支持任意尺寸全尺度重采样，现在也被一刀切拒绝；(c) 这是破坏性契约变更——原本能跑（靠 interpolate 兜底）的 YAML 现在配置期报错，configs/test_e2e.yaml 已被迫从 [12,256,256] 改为 [16,256,256]，用户存量配置需同样迁移。建议在 changelog/文档明示。
-5. **P2 H2 是无开关的默认行为变更**：z 采样域收窄+val 覆盖 bin 变化会改变训练分布与验证指标口径（同一模型两版代码 val 指标不可比）。与本轮其它改动"默认 legacy"的一致性原则相悖；作为 bug 修复可接受，但建议在文档标注跨版本指标不可比。
-6. **P3 split_manifest 并发写**：build_dataloaders 在所有 DDP rank 上执行，manifest 同名文件被多 rank 同时 write_text（非原子）。内容相同通常无害，建议 rank0-only 或原子写。
-7. **P3 override int 语义微变**：`data.foo=3.7`（声明 int）旧代码 int("3.7") 抛错，现 yaml 解析成 3.7 后 int() 静默截断为 3。
-8. **P4 风格**：unetpp.py:109-113 skips 分支多缩进 8 空格（合法但不一致）。
-
-## 三、结论
-批 1–4 修复整体质量高：几何单一事实源、逐位兼容开关、等价性测试的做法都很规范；32 项新测试有效覆盖了大多数修复的真实失效模式。必须处理的只有问题 1（pretrain 几何校验 AttributeError）；问题 2/3 建议在开启前修正语义/加防护；4/5 需要文档与迁移说明。
-──────────────────────────────────────────────────────────────
-
-进展：
-
-批 5 实施进展（2026-07-26；已完成 review 并写回用户本地）
-
-一、已实现
-- P0：pretrain 几何元数据同时支持 dict 与 Config/dataclass；缺字段时跳过比较。新增自产 checkpoint 回归测试。
-- P3：整数 override 接受 `3.0`、拒绝 `3.7`；split manifest 改为 rank0-only、同目录临时文件加 `os.replace` 原子写；修正 UNet++ 缩进。
-- UpKern：可选 normalize 改为保持源核空间和；批 3 恒真断言改为独立插值 reference。
-- init_strategy：ADM/EDM2 的非 legacy 策略在配置与 factory 入口显式拒绝，保留经典 UNet 的 kaiming/trunc_normal。
-- geometry：ADM/EDM2 使用各自实际 stem/downsample 几何；UNet3P 放宽整除要求但保留 encoder 尺寸不足硬错误；经典 UNet 仍严格整除。
-- H2：新增 `data.z_sampling_mode`，默认 `safe`（保持当前行为）；`legacy` 复刻批 1 之前 seg/cls/det 的全域 z 中心与旧验证 z-grid。文档已说明跨版本验证指标不可直接比较。
-
-二、测试
-- 新增 `tests/test_todo1_batch5_fixes.py`，覆盖上述修复及三任务 z sampling 开关；gentask 兼容入口保留。
-- 定向回归：56 passed（批 1/3、配置 IO、cls/det smoke）；批 5 新测试 13 passed；
-- 全量回归：1541 passed, 11 failed, 6 skipped, 145 warnings；11 个失败仍为既有 `tests/test_model_flow.py` / torchlens 缺失相关失败，未新增失败。
-- py_compile：通过。
-
-三、状态
-- 镜像 TODO 已先同步用户最新版本，本节追加在用户审查记录之后。
-- `/home/ubuntu/seg/batch5.diff` 已由用户 review 通过；批 5 实现与 TODO 追加已写回用户本地，未 commit/push，未修改 `.git`。
-
-──────────────────────────────────────────────────────────────
-批 5 修复复核（2026-07-25，逐文件比对 + 本机全量测试）
-
-## 测试
-- 批 1/3/5 定向测试 30 项全部通过；全仓 1541 passed / 6 skipped / 11 failed——11 个失败仍为 test_model_flow.py / 本机缺 torchlens 的既有失败，与批 5 无关，数字与用户记录一致。
-
-## 逐条确认（对应上轮 8 个问题）
-1. P0 pretrain 几何校验：已修复且正确。_checkpoint_config_value/_checkpoint_geometry 同时支持 Mapping 与 dataclass（getattr 走 Config.model 只读 property 也正常）；ckpt 非 Mapping 时跳过；缺字段返回 None 不参与比较。新增自产 dataclass checkpoint 回归测试直接调 _load_pretrain_weights，覆盖了真实失效路径。✔
-2. upkern normalize：语义已改为"保持源核空间和"（source_sum/denom 缩放，denom<1e-8 回退 1），float32 中间精度处理正确；批 3 恒真断言改为独立 F.interpolate reference 并断言 sums==source_sums。✔
-3. init_strategy：配置层（_validate_model）与 factory 双重拒绝 adm/edm2 + 非 legacy，经典 UNet 保留；有参数化测试并验证 legacy 下 adm/edm2 零初始化不被覆盖。✔
-4. 几何校验边界：adm 用 stem×2^(n-1)（adm 确实消费 stem_mode，已核对 build_context_stem）、edm2 用 2^(n-1)（不吃 stem/anisotropic）、unet3p 放宽为"逐级特征尺寸不归零"检查、经典 UNet 维持严格整除；有 monkeypatch 测试证明 adm 路径不再误用 unet divisor 推导。✔
-5. H2 行为开关：新增 data.z_sampling_mode（safe|legacy），贯通 seg/cls/det/gen 四任务（patch_dataset_base、specs、各 loader 均传参），legacy 路径复刻批 1 前的全域采样与旧 z_grid_center；枚举在 config 层与 dataset 层双重校验；测试覆盖三任务。✔（默认 safe = 保持批 1 后行为，属明示决策）
-6. split manifest：rank0-only + 同目录 pid 临时文件 + os.replace 原子替换，异常时清理 tmp；有 rank!=0 不落盘 + 无残留 tmp 的测试。✔
-7. int override：接受 3.0、拒绝 3.7 与 bool（yaml "true" 解析为 bool 被显式拒绝），抛 ConfigError。✔
-8. UNet++ 缩进已修正。✔
-
-## 遗留小项（不阻塞，记录备查）
-- P4：det 的 legacy z 采样 fg 分支丢了原实现的 np.clip(z, 0, D_vol-1)——原批 1 前代码对 box 中心有全域 clip，现 legacy 直接返回 round((b0+b3)/2)。仅当 box 顶到卷 z 上界且坐标为排他上界时 z 可能等于 D_vol（越界 1），下游 edge-pad 抽取不会崩，但与"复刻旧行为"有一处极小偏差。
-- P4：z_sampling_mode 默认 safe 意味着从批 1 前版本直接升级的用户默认仍会经历采样分布/验证口径变化；文档已声明，无需改代码。
-
-## 结论
-上轮 8 个问题全部得到正确、高质量的处理；P0 修复经真实路径回归测试验证；其余修复的开关语义、原子性与测试覆盖均到位。仅剩上述两条 P4 级备查项，可不处理。
-──────────────────────────────────────────────────────────────
-
-
-
-批 6 进展记录（2026-07-25；det legacy clip、三任务逐位回归与文档口径）
-
-一、已修复
-- H2/P4：det 的 `z_sampling_mode=legacy` 前景框中心恢复批 1 之前的 `np.clip(z, 0, D_vol - 1)` 语义；仅影响显式 legacy，safe 路径和默认随机流不变。
-- H2：补充 seg/cls/det 三任务 ordinary、foreground、validation 三条 legacy 分支的固定 seed reference 对照，并检查调用后的 RNG 消耗顺序一致；同时覆盖 safe 分支与当前实现的结果对照。
-- B：文档明确 `model.init_strategy` 对 ADM/EDM2 的 non-legacy 拒绝仅属于 taskcore 通用分割 `Config` / `factory.build_model` 路径，不泛化到仓库所有 ADM/EDM2 构建入口。
-
-二、测试
-- 批 6 定向测试：24 passed。
-- 全量测试：1543 passed / 6 skipped / 11 failed；相对批 5 的 1541 passed / 6 skipped / 11 failed，新增通过项来自批 6 测试，无新增失败。
-- 11 个失败仍为 `tests/test_model_flow.py` 在本机缺少 `torchlens` 的既有失败。
-
-三、兼容性说明
-- det legacy clip 修复不改变默认 `data.z_sampling_mode=safe` 的数值、采样分布或随机流。
-- geometry validator 与 init_strategy 实现保持不变。

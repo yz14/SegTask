@@ -108,18 +108,26 @@ def _npz_meta_allows_skip(
             return False, (
                 f"label_values mismatch: on-disk={on_disk_lv} "
                 f"!= requested={req_lv}")
-    if fg_subsample is not None and "fg_subsample" in meta:
+    if fg_subsample is not None:
+        if "fg_subsample" not in meta:
+            # 旧包无法证明前景索引与当前参数一致，不得静默复用。
+            return False, "missing meta key 'fg_subsample' (stale package)"
         on_disk_fg = int(meta["fg_subsample"])
         if on_disk_fg != int(fg_subsample):
             return False, (
                 f"fg_subsample mismatch: on-disk={on_disk_fg} "
                 f"!= requested={int(fg_subsample)}")
-    # 与 has_cond 同构：事后打开 region_weight_dir / bbox_dir 时不得静默
-    # 复用无 rw / 未裁剪的旧包。
-    if expect_rw and not bool(meta.get("has_rw")):
-        return False, "missing rw (stale package; region_weight_dir now set)"
-    if expect_bbox and not bool(meta.get("src_bbox")):
-        return False, "missing bbox (stale package; bbox_dir now set)"
+    # 双向比对：事后打开 region_weight_dir / bbox_dir 时不得复用无 rw /
+    # 未裁剪的旧包；反过来关掉后也不得复用含 rw / 已裁剪的旧包
+    # （runtime 会无条件消费包内 rw；裁剪几何也与当前配置不符）。
+    if expect_rw != bool(meta.get("has_rw")):
+        return False, (
+            "rw presence mismatch: on-disk has_rw="
+            f"{bool(meta.get('has_rw'))} != requested={expect_rw}")
+    if expect_bbox != bool(meta.get("src_bbox")):
+        return False, (
+            "bbox presence mismatch: on-disk src_bbox="
+            f"{bool(meta.get('src_bbox'))} != requested={expect_bbox}")
     return True, ""
 
 
@@ -264,8 +272,11 @@ def prepare_one(
             fg_subsample=fg_subsample,
             expect_rw=expect_rw,
             expect_bbox=expect_bbox)
-        if ok and expect_cond and not bool((meta or {}).get("has_cond")):
-            ok, reason = False, "missing cond (stale package)"
+        if ok and expect_cond != bool((meta or {}).get("has_cond")):
+            ok, reason = False, (
+                "cond presence mismatch: on-disk has_cond="
+                f"{bool((meta or {}).get('has_cond'))} != "
+                f"requested={expect_cond}")
         if ok:
             return {"pid": pid, "status": "skipped",
                     "size_bytes": out_p.stat().st_size, "elapsed_s": 0.0}
@@ -480,6 +491,21 @@ def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
             "label": lbl,
             "bbox" : bbox_paths_all[i] if bbox_paths_all else None,
             "rw"   : rw_paths_all[i] if rw_paths_all else None})
+    # pid 唯一性：重复 pid 会写同一 <pid>.npz，后写静默覆盖先写。
+    seen: Dict[str, str] = {}
+    dups: List[str] = []
+    for s in samples:
+        pid = s["pid"]
+        if pid in seen:
+            dups.append(f"{pid} ({seen[pid]} vs {s['image']})")
+        else:
+            seen[pid] = s["image"]
+    if dups:
+        raise ValueError(
+            f"{len(dups)} duplicate pid(s) resolve to the same output npz "
+            f"(later ones would silently overwrite earlier ones); first 5: "
+            f"{dups[:5]}. Rename the source files or adjust "
+            "data.image_suffix so stems are unique.")
     return samples
 
 

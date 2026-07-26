@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import SimpleITK as sitk
 import torch
+import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter, zoom
 from torch.utils.data import Dataset
 
@@ -1002,6 +1003,11 @@ class SegDataset3D(SegDatasetNpzBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        else:
+            # 样本 schema 恒定（default_collate 要求同构）；全 1 为中性权重，
+            # 增强期越界体素由 oob→wmap=0 精确排除。
+            result["weight_map"] = torch.ones(
+                (1,) + lbl_s.shape, dtype=torch.float32)
         self._pack_extra_sample_tensors(
             result,
             vol_idx=self._current_vol_idx,
@@ -1239,6 +1245,10 @@ class SegDataset3DCubic(SegDatasetNpzBase):
                 lbl_s, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(
                 rw_s.astype(np.float32, copy=False))
+        else:
+            # 样本 schema 恒定；全 1 中性权重，越界由 oob→wmap=0 排除。
+            result["weight_map"] = torch.ones(
+                (1,) + lbl_s.shape, dtype=torch.float32)
         self._pack_extra_sample_tensors(
             result,
             vol_idx=self._current_vol_idx,
@@ -1326,7 +1336,8 @@ class SegDataset3DWhole(SegDatasetNpzBase):
         cache_int16         : bool = False,
         region_weights      : Optional[List[float]] = None,
         resize_antialias    : bool = False,
-        npz_paths           : Optional[List[str]] = None):
+        npz_paths           : Optional[List[str]] = None,
+        oversample_mode     : str = "legacy"):
         super().__init__(
             image_paths          = image_paths,
             label_paths          = label_paths,
@@ -1347,19 +1358,31 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             region_weights       = region_weights,
             resize_antialias     = resize_antialias)
         # 3 轴同步过采样：与 cubic 一致，给增强（旋转/弹性）留中心裁余量。
+        # 'legacy'：整卷 resize 到 extract_size（FOV/体素尺度随 oversample 漂移）；
+        # 'pad'：整卷 resize 到 patch_size 后边缘复制 pad 到 extract_size（裁回后
+        # 几何与 val 一致，pad 区 weight_map=0 从损失排除）。
+        if oversample_mode not in ("legacy", "pad"):
+            raise ValueError(
+                f"oversample_mode must be 'legacy' or 'pad'; got "
+                f"{oversample_mode!r}.")
+        self.oversample_mode = oversample_mode
         self.extract_size = tuple(
             int(round(p * self.oversample)) for p in self.patch_size)
 
         logger.info(
             "Whole-volume dataset: %d volumes, extract_size=%s, "
-            "samples_per_volume=%d [npz mode]",
-            len(self.image_paths), self.extract_size, self.samples_per_volume)
+            "samples_per_volume=%d, oversample_mode=%s [npz mode]",
+            len(self.image_paths), self.extract_size, self.samples_per_volume,
+            self.oversample_mode)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         self._sample_idx = idx
         vol_idx    = idx % len(self.image_paths)
         img, lbl   = self._load_image(vol_idx), self._load_label(vol_idx)
-        eD, eH, eW = self.extract_size
+        pad_mode   = self.oversample_mode == "pad"
+        # pad 语义：先把整卷 resize 到 patch_size（与 val 同几何），末尾再 pad
+        # 到 extract_size 供增强裁回；legacy 直接 resize 到 extract_size。
+        eD, eH, eW = self.patch_size if pad_mode else self.extract_size
 
         # 全卷单次 3D zoom。resize 恒等（形状已匹配）时 resize_3d 直接返回
         # 入参——即 worker LRU 缓存卷本身；copy 断开别名，防下游 in-place
@@ -1392,6 +1415,26 @@ class SegDataset3DWhole(SegDatasetNpzBase):
             rw_vol = compute_region_weight_map(
                 lbl_r, self.label_values, self.region_weights)
             result["weight_map"] = torch.from_numpy(rw_vol).float()
+        else:
+            # 样本 schema 恒定；全 1 中性权重，越界由 oob→wmap=0 排除。
+            result["weight_map"] = torch.ones(
+                (1,) + lbl_r.shape, dtype=torch.float32)
+        if pad_mode and tuple(self.extract_size) != tuple(self.patch_size):
+            pads = []
+            for tgt, cur in zip(reversed(self.extract_size), (eD, eH, eW)[::-1]):
+                total = int(tgt) - int(cur)
+                pads.extend([total // 2, total - total // 2])
+            # image/label 边缘复制（与 z_boundary_mode='edge_pad' 同构）；
+            # weight_map pad 区置 0：复制体素不参与损失。
+            result["image"] = F.pad(
+                result["image"].unsqueeze(0), pads, mode="replicate").squeeze(0)
+            result["label"] = F.pad(
+                result["label"].unsqueeze(0).float(), pads,
+                mode="replicate").squeeze(0).to(result["label"].dtype)
+            result["weight_map"] = F.pad(
+                result["weight_map"].unsqueeze(0), pads,
+                mode="constant", value=0.0).squeeze(0)
+            eD, eH, eW = self.extract_size
         self._pack_extra_sample_tensors(
             result,
             vol_idx=vol_idx,

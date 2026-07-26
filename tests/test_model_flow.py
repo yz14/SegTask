@@ -213,7 +213,9 @@ def test_unet_skip_count_matches_topology():
 
 
 def test_unetpp_skip_count_matches_topology():
-    g = _build("seg2_5d.yaml", decoder_type="unetpp")
+    # 基线配置的 4 项逐级列表是 unet 口径；切 unetpp 后改为单值广播。
+    g = _build("seg2_5d.yaml", decoder_type="unetpp",
+               decoder_blocks_per_stage=[2])
     cfg = _load("seg2_5d.yaml")
     L = len(cfg.model.encoder_channels) - 1  # 嵌套深度
     # UNet++ 节点 X_{i,j}（j≥1）的 cat 汇入 j 条同层稠密前驱 X_{i,0..j-1}
@@ -224,7 +226,9 @@ def test_unetpp_skip_count_matches_topology():
 
 
 def test_unet3p_skip_count_matches_topology():
-    g = _build("seg2_5d.yaml", decoder_type="unet3p")
+    # unet3p 不消费逐级 block 数；清空基线配置的 unet 口径列表。
+    g = _build("seg2_5d.yaml", decoder_type="unet3p",
+               decoder_blocks_per_stage=[])
     cfg = _load("seg2_5d.yaml")
     L = len(cfg.model.encoder_channels) - 1
     # UNet3+ 每个解码 level 聚合全尺度 L+1 路输入，其中 2 路为相邻主干边

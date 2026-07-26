@@ -136,7 +136,8 @@ class ConvNeXtStage(nn.Module):
         attn_reduction        : int = 16):
         super().__init__()
         d = spatial_dims
-        if drop_path_rates is None:
+        if not drop_path_rates:
+            # None 与空列表同判：空列表下 [0] 取值会 IndexError。
             drop_path_rates = [0.0] * num_blocks
         blocks = [ConvNeXtAdaptBlock(
             in_ch, out_ch, expand_ratio,

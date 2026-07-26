@@ -252,7 +252,7 @@ def test_run_inference_reparam_deploy_toggle(monkeypatch, tmp_path):
     # 与闭包中的 CPU fp32 输入/参考输出不兼容。
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     cfg = _make_cfg(patch_mode="z_axis", deep_supervision=False, dilated_reparam=True)
-    cfg.model.reparam_deploy = True
+    cfg.train.reparam_deploy = True
     cfg.predict.output_dir = str(tmp_path / "predictions")
     model = build_model(cfg).eval()
     x = torch.randn(1, cfg.model.in_channels, 16, 64, 64)

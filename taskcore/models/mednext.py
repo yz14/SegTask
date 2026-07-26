@@ -515,7 +515,8 @@ class MedNeXtStage(nn.Module):
         attn_reduction: int = 16):
         super().__init__()
         d = spatial_dims
-        if drop_path_rates is None:
+        if not drop_path_rates:
+            # None 与空列表同判：空列表下 [0] 取值会 IndexError。
             drop_path_rates = [0.0] * num_blocks
         blocks = [MedNeXtAdaptBlock(
             in_ch, out_ch, expand_ratio=expand_ratio, kernel_size=kernel_size,

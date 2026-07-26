@@ -56,6 +56,14 @@ class SegTaskConfig:
             loss.slice_loss_reduction in ("per_slice", "per_volume"),
             f"Invalid slice_loss_reduction: {loss.slice_loss_reduction!r}; "
             "expected 'per_slice' or 'per_volume'.")
+        # region_weights 与 label_values 逐值对应（含 bg）；长度不符时
+        # 运行期 zip 会静默截断，这里 fail-fast。
+        if loss.region_weights and core.data.label_values:
+            _require(
+                len(loss.region_weights) == len(core.data.label_values),
+                f"loss.region_weights must have one entry per label value "
+                f"(incl. background): got {len(loss.region_weights)} "
+                f"weights for {len(core.data.label_values)} label values.")
         if core.model.deep_supervision:
             _require(
                 bool(loss.deep_supervision_weights),

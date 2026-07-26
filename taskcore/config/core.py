@@ -120,6 +120,12 @@ class DataConfig:
     # 增强过采样比：先抽 round(patch_size*ratio)，增强后中心裁回。1.0=禁用；affine/elastic 建议 1.4–1.5。
     aug_oversample_ratio: float = 1.0
 
+    # whole 模式下 oversample 语义：'legacy' 整卷 resize 到 patch*ratio 后中心裁回
+    # （训练 patch 的 FOV/体素尺度随 ratio 漂移，与 val 不一致）；'pad' 整卷 resize
+    # 到 patch 后边缘复制 pad 到 patch*ratio（裁回后 FOV/尺度与 val 一致，pad 区
+    # weight_map=0 从损失排除）。仅 patch_mode='whole' 且 ratio>1 时有区别。
+    whole_oversample_mode: str = "legacy"
+
     # 2.5D 多视图保持原生深度。True 时 dataset 抽最大 FOV cube，trainer 按 D_k 中心裁；强制 edge_pad。
     # 仅在 patch_mode='2_5d' + len(scales)>1 + aux_seg_supervision=True 生效。
     keep_native_view_depth: bool = False
@@ -430,6 +436,10 @@ class UNetConfig:
     # 分支成为真正的非线性特征变换（否则 interpolate→conv 两层连续线性，直到下游 stage
     # 才有非线性）。默认关、向后兼容；其余上采样模式忽略该选项。
     upsample_norm_act: bool = False
+    # 仅插值上采样（trilinear/nearest）：'legacy' AMP 半精度下先转 fp32 插值
+    # 再转回；'native' 直接在输入 dtype 插值（插值后紧跟 conv，误差可忽，
+    # 省两次全尺寸 cast）。默认 legacy 保旧。
+    upsample_interp_dtype: str = "legacy"
 
     # 各向异性下采样。True 时按 patch_size 自动推导逐级 per-axis stride：薄轴（如 z）
     # 分辨率落后才不降采样，避免深层被压成 1（nnU-Net 思路，保持各轴分辨率 2× 以内）。
@@ -451,13 +461,15 @@ class UNetConfig:
     # lka = 大核注意力（VAN，DW5+DW7@dil3+1×1，等效感受野≈21³）；
     # msca = 多尺度条形核注意力（SegNeXt，逐轴 7/11/21 条形 DW 核，适合
     # 各向异性体数据与细长结构）。两者均纯卷积、无归一化层。
+    # "lka_aniso" / "msca_aniso"（仅 3D）：z 轴小核/条形核封顶 7，适配大层厚。
     attention_type: str = "none"
 
     se_reduction: int = 16
 
     # skip 连接上的 AttentionGate3D（Oktay 2018）；attn_gate_norm 控制其归一化。
     # "auto"（默认）跟随全局 norm_type（3D 小 batch 下避免 BatchNorm 统计噪）；
-    # 也可显式指定 batch/instance/group。
+    # 也可显式指定 batch/instance/group；"none" 去掉门控内全部归一化
+    # （尤其 psi 单通道 norm 会抹平逐体素门控幅度信息）。
     skip_attention: bool = False
     attn_gate_norm: str = "auto"
 
@@ -1422,12 +1434,13 @@ class Config:
         if not mc.encoder_blocks_per_stage:
             mc.encoder_blocks_per_stage = enc_blocks
         if not mc.decoder_blocks_per_stage:
-            if str(mc.unet.decoder_type).lower() == "unetpp":
-                # UNet++ has triangular nested nodes; one value is an
-                # explicit broadcast across all nodes.
-                mc.decoder_blocks_per_stage = [1]
-            else:
+            dtype = str(mc.unet.decoder_type).lower()
+            if dtype == "unet":
                 mc.decoder_blocks_per_stage = [1] * (n_levels - 1)
+            else:
+                # UNet++ has triangular nested nodes and UNet3+ ignores the
+                # per-stage list; one value is an explicit broadcast.
+                mc.decoder_blocks_per_stage = [1]
 
     def validate(self, *, skip: "Optional[Set[str]]" = None) -> None:
         """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。
@@ -1471,8 +1484,13 @@ class Config:
             ),
                 f"Invalid activation: {self.model.unet.activation}")
             _require(
-                self.model.unet.attn_gate_norm in ("auto", "batch", "instance", "group"),
+                self.model.unet.attn_gate_norm in (
+                    "auto", "batch", "instance", "group", "none"),
                 f"Invalid attn_gate_norm: {self.model.unet.attn_gate_norm}")
+            _require(
+                self.model.unet.upsample_interp_dtype in ("legacy", "native"),
+                "model.unet.upsample_interp_dtype must be 'legacy' or "
+                f"'native'; got {self.model.unet.upsample_interp_dtype!r}.")
             _require(
                 self.model.unet.downsample_mode in (
                 "conv", "maxpool", "avgpool", "blurpool", "pixelunshuffle",
@@ -1498,6 +1516,11 @@ class Config:
             ),
                 f"model.arch={arch!r} only supports stem_fusion_mode in "
                 f"('shared_stem','multi_stem_proj'); got {self.model.stem_fusion_mode!r}.")
+        _require(
+            str(self.model.init_strategy).lower()
+            in ("legacy", "kaiming", "trunc_normal"),
+            "model.init_strategy must be 'legacy', 'kaiming' or "
+            f"'trunc_normal'; got {self.model.init_strategy!r}.")
         if str(self.model.init_strategy).lower() != "legacy":
             _require(
                 arch == "unet",
@@ -1526,7 +1549,8 @@ class Config:
         if arch == "unet":
             _require(
                 self.model.unet.attention_type in (
-                "none", "se", "eca", "cbam", "coord", "lka", "msca",
+                "none", "se", "eca", "cbam", "coord", "lka", "lka_aniso",
+                "msca", "msca_aniso",
             ),
                 f"Invalid attention_type: {self.model.unet.attention_type}")
             _require(
@@ -1838,18 +1862,23 @@ class Config:
         # （增强后中心裁回）可把伪影裁掉。translate 幅度超出余量时仅警告。
         tr = self.augment.random_translate_range
         max_tr = max(abs(float(tr[0])), abs(float(tr[1])))
-        if max_tr > 0.0:
-            # 归一化坐标 [-1,1] 跨整轴：平移 t 卷入约 t/2 轴长的边缘复制带；
-            # oversample 余量约 (ratio-1)/(2*ratio) 轴长。
+        sc = self.augment.random_scale_range
+        sc_hi = max(float(sc[0]), float(sc[1])) if len(sc) == 2 else 1.0
+        # 归一化坐标 [-1,1]：grid = scale·x + t，越界幅度 ≈ (scale_hi−1) + t，
+        # 折合 ((scale_hi−1)+t)/2 轴长的边缘复制带；oversample 余量约
+        # (ratio-1)/(2*ratio) 轴长。
+        overreach = max(sc_hi - 1.0, 0.0) + max_tr
+        if overreach > 0.0 and float(self.augment.random_affine_prob) > 0.0:
             margin = ((self.data.aug_oversample_ratio - 1.0)
                       / (2.0 * self.data.aug_oversample_ratio))
-            if max_tr / 2.0 > margin:
+            if overreach / 2.0 > margin:
                 logger.warning(
-                    "augment.random_translate_range=%s 引入的边缘复制带（约 "
-                    "%.1f%% 轴长）超过 data.aug_oversample_ratio=%.2f 的中心裁剪"
-                    "余量（约 %.1f%% 轴长），border 复制伪影会留在训练 patch 内。"
-                    "建议增大 aug_oversample_ratio 或减小平移幅度。",
-                    tr, max_tr / 2.0 * 100.0,
+                    "augment.random_translate_range=%s + random_scale_range=%s "
+                    "引入的边缘复制带（约 %.1f%% 轴长）超过 "
+                    "data.aug_oversample_ratio=%.2f 的中心裁剪余量（约 %.1f%% "
+                    "轴长），border 复制伪影会留在训练 patch 内。建议增大 "
+                    "aug_oversample_ratio 或减小平移/放大幅度。",
+                    tr, sc, overreach / 2.0 * 100.0,
                     self.data.aug_oversample_ratio, margin * 100.0)
         # 数值正性/区间校验：非法配置在 augment 运行期会产生 div-by-zero /
         # NaN 核或空尺寸，这里 fail-fast。
@@ -1871,19 +1900,6 @@ class Config:
             "augment.elastic_field_mode must be 'legacy' or 'gaussian'; "
             f"got {self.augment.elastic_field_mode!r}.")
         _require(
-            str(self.data.split_rounding_mode).lower() in ("legacy", "unified"),
-            "data.split_rounding_mode must be 'legacy' or 'unified'; "
-            f"got {self.data.split_rounding_mode!r}.")
-        _require(
-            str(self.data.z_sampling_mode).lower() in ("safe", "legacy"),
-            "data.z_sampling_mode must be 'safe' or 'legacy'; "
-            f"got {self.data.z_sampling_mode!r}.")
-        _require(
-            str(self.model.init_strategy).lower()
-            in ("legacy", "kaiming", "trunc_normal"),
-            "model.init_strategy must be 'legacy', 'kaiming' or "
-            f"'trunc_normal'; got {self.model.init_strategy!r}.")
-        _require(
             float(self.augment.gaussian_noise_std) >= 0.0,
             "augment.gaussian_noise_std must be >= 0; "
             f"got {self.augment.gaussian_noise_std}.")
@@ -1898,6 +1914,63 @@ class Config:
             len(gamma_r) == 2 and 0.0 < float(gamma_r[0]) <= float(gamma_r[1]),
             "augment.random_gamma_range must be [lo, hi] with 0 < lo <= hi; "
             f"got {gamma_r!r}.")
+        # 概率字段区间校验：>1 会静默等价于恒选中、<0 等价于关闭，均属配置错误。
+        for _name in ("random_flip_prob", "random_affine_prob",
+                      "elastic_deform_prob", "grid_dropout_prob",
+                      "random_brightness_prob", "random_contrast_prob",
+                      "random_gamma_prob", "gaussian_noise_prob",
+                      "gaussian_blur_prob", "simulate_lowres_prob"):
+            _v = float(getattr(self.augment, _name))
+            _require(
+                0.0 <= _v <= 1.0,
+                f"augment.{_name} must be in [0, 1]; got {_v}.")
+        # flip 轴为 NCDHW 张量的空间轴索引；轴 0/1（batch/channel）语义错误。
+        _require(
+            all(int(a) in (2, 3, 4) for a in self.augment.random_flip_axes),
+            "augment.random_flip_axes entries must be spatial axes of the "
+            f"NCDHW tensor (2=D, 3=H, 4=W); got {self.augment.random_flip_axes!r}.")
+        rot_r = self.augment.random_rotate_range
+        _require(
+            len(rot_r) == 2 and float(rot_r[0]) <= float(rot_r[1]),
+            "augment.random_rotate_range must be [lo, hi] with lo <= hi; "
+            f"got {rot_r!r}.")
+        per_axis_r = self.augment.random_rotate_range_per_axis
+        if per_axis_r is not None:
+            _require(
+                all(float(r[0]) <= float(r[1]) for r in per_axis_r),
+                "augment.random_rotate_range_per_axis pairs must satisfy "
+                f"lo <= hi; got {per_axis_r!r}.")
+        sc_r = self.augment.random_scale_range
+        _require(
+            len(sc_r) == 2 and 0.0 < float(sc_r[0]) <= float(sc_r[1]),
+            "augment.random_scale_range must be [lo, hi] with 0 < lo <= hi; "
+            f"got {sc_r!r}.")
+        br_r = self.augment.random_brightness_range
+        _require(
+            len(br_r) == 2 and float(br_r[0]) <= float(br_r[1]),
+            "augment.random_brightness_range must be [lo, hi] with lo <= hi; "
+            f"got {br_r!r}.")
+        ct_r = self.augment.random_contrast_range
+        _require(
+            len(ct_r) == 2 and 0.0 < float(ct_r[0]) <= float(ct_r[1]),
+            "augment.random_contrast_range must be [lo, hi] with 0 < lo <= hi; "
+            f"got {ct_r!r}.")
+        tr_r = self.augment.random_translate_range
+        _require(
+            float(tr_r[0]) <= float(tr_r[1]),
+            "augment.random_translate_range must satisfy lo <= hi; "
+            f"got {tr_r!r}.")
+        # grid_dropout：ratio>1 会整幅置零、holes=0 静默 no-op；仅在启用时拒绝。
+        if float(self.augment.grid_dropout_prob) > 0.0:
+            _require(
+                0.0 < float(self.augment.grid_dropout_ratio) <= 1.0,
+                "augment.grid_dropout_ratio must be in (0, 1] when "
+                f"grid_dropout_prob > 0; got {self.augment.grid_dropout_ratio}.")
+            _require(
+                int(self.augment.grid_dropout_holes) >= 1,
+                "augment.grid_dropout_holes must be >= 1 when "
+                f"grid_dropout_prob > 0 (0 is a silent no-op); "
+                f"got {self.augment.grid_dropout_holes}.")
         # brightness/noise 幅值为绝对量、隐含 image≈[0,1]（minmax）。zscore
         # （std≈1）下沿用 minmax 默认幅值时扰动相对偏弱且量纲不符，提示改配
         # （以 σ 为单位，典型 brightness±0.5σ、noise 0.1σ 量级）。
@@ -1922,6 +1995,16 @@ class Config:
 
     def _validate_data(self) -> None:
         """data.* patch/multi-res/keep_native 校验。"""
+        # zscore 统计量缺配告警：默认 mean=0/std=1 使 (x-mean)/std 恒等，
+        # 实际只剩 intensity 裁剪、无归一化（易被误认为已标准化）。
+        if (self.data.normalize == "zscore"
+                and float(self.data.global_mean) == 0.0
+                and float(self.data.global_std) == 1.0):
+            logger.warning(
+                "data.normalize='zscore' 但 global_mean=0.0、global_std=1.0 "
+                "（默认值）：(x-mean)/std 为恒等变换，实际只做了 intensity 窗"
+                "裁剪、没有任何标准化。请配置数据集级统计量 "
+                "data.global_mean / data.global_std。")
         _require(
             len(self.data.patch_size) == 3,
             "patch_size must be [D, H, W]")
@@ -1953,6 +2036,15 @@ class Config:
             self.data.cache_mode in ("none", "memory"),
             f"Invalid data.cache_mode: {self.data.cache_mode!r}; "
             "expected 'none' or 'memory'.")
+        _require(
+            str(self.data.split_rounding_mode).lower() in ("legacy", "unified"),
+            "data.split_rounding_mode must be 'legacy' or 'unified'; "
+            f"got {self.data.split_rounding_mode!r}.")
+        _require(
+            str(self.data.z_sampling_mode).lower() in ("safe", "legacy"),
+            "data.z_sampling_mode must be 'safe' or 'legacy'; "
+            f"got {self.data.z_sampling_mode!r}.")
+
         # val_ratio=0 并不产生"无验证集"（split 侧钳到至少 1 个 val 样本），
         # 语义上无效，直接拒绝。
         _require(
@@ -1978,6 +2070,10 @@ class Config:
                 len(self.data.multi_res_scales) == 1 \
                 and self.data.multi_res_scales[0] == 1.0,
                 f"whole-volume mode requires multi_res_scales=[1.0]; got {self.data.multi_res_scales}.")
+        _require(
+            self.data.whole_oversample_mode in ("legacy", "pad"),
+            "data.whole_oversample_mode must be 'legacy' or 'pad'; got "
+            f"{self.data.whole_oversample_mode!r}.")
         # keep_native_view_depth：仅 2.5D + 多视图有意义。
         if self.data.keep_native_view_depth:
             _require(

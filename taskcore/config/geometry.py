@@ -14,6 +14,22 @@ def stem_stride_of(stem_mode: str) -> int:
     return {"patch2": 2, "patch4": 4}.get(str(stem_mode), 1)
 
 
+def decoder_stage_count(decoder_type: Any, n_levels: int) -> int:
+    """decoder 实际构造的 stage/node 数（decoder_blocks_per_stage 的唯一口径）。
+
+    * ``unet``   — 逐级解码 ``n_levels - 1``；
+    * ``unetpp`` — 三角嵌套节点 ``n(n-1)/2``；
+    * 其它（``unet3p`` 等）— 0：decoder 不消费逐级 block 数。
+    """
+    dtype = str(decoder_type).lower()
+    n = int(n_levels)
+    if dtype == "unet":
+        return max(n - 1, 0)
+    if dtype == "unetpp":
+        return n * (n - 1) // 2
+    return 0
+
+
 def auto_anisotropic_strides(
     spatial_sizes: List[int],
     num_down: int,

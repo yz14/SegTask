@@ -240,7 +240,8 @@ class DecoderLevel(nn.Module):
         upsample_norm_act: bool = False,
         norm_type        : str = "instance",
         norm_groups      : int = 8,
-        activation       : str = "leakyrelu"):
+        activation       : str = "leakyrelu",
+        upsample_interp_dtype: str = "legacy"):
         super().__init__()
 
         self.skip_mode    = skip_mode
@@ -251,7 +252,8 @@ class DecoderLevel(nn.Module):
                                      norm_act=upsample_norm_act,
                                      norm_type=norm_type,
                                      norm_groups=norm_groups,
-                                     activation=activation)
+                                     activation=activation,
+                                     interp_dtype=upsample_interp_dtype)
 
         if skip_mode == "cat":
             fused_ch = out_ch + skip_ch
@@ -307,7 +309,8 @@ class Decoder(nn.Module):
         norm_type         : str = "instance",
         norm_groups       : int = 8,
         activation        : str = "leakyrelu",
-        grad_checkpointing: bool = False):
+        grad_checkpointing: bool = False,
+        upsample_interp_dtype: str = "legacy"):
         super().__init__()
 
         self.levels            = nn.ModuleList()
@@ -344,7 +347,8 @@ class Decoder(nn.Module):
                 upsample_norm_act = upsample_norm_act,
                 norm_type      = norm_type,
                 norm_groups    = norm_groups,
-                activation     = activation))
+                activation     = activation,
+                upsample_interp_dtype = upsample_interp_dtype))
 
         # 各 decoder 层的输出通道（low-res → high-res）。
         self.out_channels = [encoder_channels[n - 2 - i] for i in range(n - 1)]

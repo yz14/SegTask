@@ -420,16 +420,26 @@ class LKA3D(nn.Module):
 
     def __init__(self, channels: int, spatial_dims: int = 3,
                  kernel_size: int = 5, dilated_kernel_size: int = 7,
-                 dilation: int = 3):
+                 dilation: int = 3, aniso_z: bool = False):
         super().__init__()
         d = _check_dims(spatial_dims)
         conv = _CONV[d]
-        self.dw = conv(channels, channels, kernel_size,
-                       padding=kernel_size // 2, groups=channels)
+        # aniso_z（仅 3D）：首轴（z）改用小核/不膨胀，适配大层厚体数据
+        # （z 向物理感受野与面内对齐，避免跨过多解剖层鼓包）。
+        if aniso_z and d == 3:
+            k1 = (3, kernel_size, kernel_size)
+            k2 = (3, dilated_kernel_size, dilated_kernel_size)
+            dil = (1, dilation, dilation)
+        else:
+            k1 = (kernel_size,) * d
+            k2 = (dilated_kernel_size,) * d
+            dil = (dilation,) * d
+        self.dw = conv(channels, channels, k1,
+                       padding=tuple(k // 2 for k in k1), groups=channels)
         self.dw_dilated = conv(
-            channels, channels, dilated_kernel_size,
-            padding=(dilated_kernel_size // 2) * dilation,
-            dilation=dilation, groups=channels)
+            channels, channels, k2,
+            padding=tuple((k // 2) * dl for k, dl in zip(k2, dil)),
+            dilation=dil, groups=channels)
         self.pw = conv(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -449,19 +459,23 @@ class MSCA3D(nn.Module):
 
     def __init__(self, channels: int, spatial_dims: int = 3,
                  local_kernel_size: int = 5,
-                 scales: Tuple[int, ...] = (7, 11, 21)):
+                 scales: Tuple[int, ...] = (7, 11, 21),
+                 aniso_z: bool = False):
         super().__init__()
         d = _check_dims(spatial_dims)
         conv = _CONV[d]
         self.local = conv(channels, channels, local_kernel_size,
                           padding=local_kernel_size // 2, groups=channels)
         # 每尺度一个分支：逐轴条形 DW 核串接（轴 axis 上长 k，其余轴 1）。
+        # aniso_z（仅 3D）：首轴（z）条形核长度封顶 7，适配大层厚体数据。
         self.branches = nn.ModuleList()
         for k in scales:
             strips = []
             for axis in range(d):
-                size = tuple(k if i == axis else 1 for i in range(d))
-                pad  = tuple(k // 2 if i == axis else 0 for i in range(d))
+                ka = (min(k, 7) if (aniso_z and d == 3 and axis == 0)
+                      else k)
+                size = tuple(ka if i == axis else 1 for i in range(d))
+                pad  = tuple(ka // 2 if i == axis else 0 for i in range(d))
                 strips.append(conv(channels, channels, size,
                                    padding=pad, groups=channels))
             self.branches.append(nn.Sequential(*strips))
@@ -475,7 +489,8 @@ class MSCA3D(nn.Module):
 
 def make_attention(name: str, channels: int,
                    spatial_dims: int = 3, **kwargs) -> nn.Module:
-    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'/'lka'/'msca'。
+    """Attention 工厂：'none'/'se'/'eca'/'cbam'/'coord'/'lka'/'msca'，及
+    各向异性变体 'lka_aniso'/'msca_aniso'（z 轴小核，适配大层厚）。
 
     kwargs：``reduction``；``norm_type``/``norm_groups`` 仅 'coord' 使用
     （其余类型无归一化层）。"""
@@ -497,14 +512,19 @@ def make_attention(name: str, channels: int,
                                 norm_groups=kwargs.get("norm_groups", 8))
     if name == "lka":
         return LKA3D(channels, spatial_dims=spatial_dims)
+    if name == "lka_aniso":
+        return LKA3D(channels, spatial_dims=spatial_dims, aniso_z=True)
+    if name == "msca_aniso":
+        return MSCA3D(channels, spatial_dims=spatial_dims, aniso_z=True)
     if name == "msca":
         return MSCA3D(channels, spatial_dims=spatial_dims)
     raise ValueError(
         f"Unknown attention type: {name!r}. "
-        f"Valid: none|se|eca|cbam|coord|lka|msca")
+        f"Valid: none|se|eca|cbam|coord|lka|lka_aniso|msca|msca_aniso")
 
 
-ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord", "lka", "msca")
+ATTENTION_TYPES = ("none", "se", "eca", "cbam", "coord", "lka", "lka_aniso",
+                   "msca", "msca_aniso")
 
 
 # ---------------------------------------------------------------------------
@@ -884,11 +904,15 @@ class _WindowQKVAttention(nn.Module):
         q, mask, meta = _window_partition_tokens(q, spatial_shape, self.window_size)
         k, _, _ = _window_partition_tokens(k, spatial_shape, self.window_size)
         v, _, _ = _window_partition_tokens(v, spatial_shape, self.window_size)
-        attn_mask = torch.zeros(
-            (mask.shape[0], 1, 1, mask.shape[1]),
-            device=q.device, dtype=q.dtype)
-        attn_mask = attn_mask.masked_fill(~mask[:, None, None, :],
-                                          torch.finfo(q.dtype).min)
+        if meta["padded_shape"] == meta["orig_shape"]:
+            # 无 padding 时全 token 有效：不传 mask，保留 SDPA 快速后端。
+            attn_mask = None
+        else:
+            attn_mask = torch.zeros(
+                (mask.shape[0], 1, 1, mask.shape[1]),
+                device=q.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(~mask[:, None, None, :],
+                                              torch.finfo(q.dtype).min)
         if self.use_rope:
             if not meta["offsets"]:
                 raise ValueError("RoPE requires spatial offsets.")
@@ -921,11 +945,15 @@ class _GridQKVAttention(nn.Module):
         q, mask, meta = _grid_partition_tokens(q, spatial_shape, self.grid_size)
         k, _, _ = _grid_partition_tokens(k, spatial_shape, self.grid_size)
         v, _, _ = _grid_partition_tokens(v, spatial_shape, self.grid_size)
-        attn_mask = torch.zeros(
-            (mask.shape[0], 1, 1, mask.shape[1]),
-            device=q.device, dtype=q.dtype)
-        attn_mask = attn_mask.masked_fill(~mask[:, None, None, :],
-                                          torch.finfo(q.dtype).min)
+        if meta["padded_shape"] == meta["orig_shape"]:
+            # 无 padding 时全 token 有效：不传 mask，保留 SDPA 快速后端。
+            attn_mask = None
+        else:
+            attn_mask = torch.zeros(
+                (mask.shape[0], 1, 1, mask.shape[1]),
+                device=q.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(~mask[:, None, None, :],
+                                              torch.finfo(q.dtype).min)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         out = _grid_unpartition_tokens(out, meta)
         return rearrange(out, "b h c ... -> b (h c) ...").flatten(2)
@@ -1064,17 +1092,23 @@ class AttentionGate3D(nn.Module):
         self.spatial_dims = d
         if inter <= 0:
             inter = max(x_ch // 2, 1)
+        # norm_type='none'：无归一化门控。尤其 psi 的单通道 norm 会把逐体素
+        # 门控 logits 拉到零均值/单位方差，丢失全局幅度信息。
+        def _norm(ch: int) -> nn.Module:
+            if norm_type == "none":
+                return nn.Identity()
+            return get_norm(norm_type, ch, norm_groups, spatial_dims=d)
         self.W_x = nn.Sequential(
             _CONV[d](x_ch, inter, kernel_size=1, bias=False),
-            get_norm(norm_type, inter, norm_groups, spatial_dims=d),
+            _norm(inter),
         )
         self.W_g = nn.Sequential(
             _CONV[d](g_ch, inter, kernel_size=1, bias=False),
-            get_norm(norm_type, inter, norm_groups, spatial_dims=d),
+            _norm(inter),
         )
         self.psi = nn.Sequential(
             _CONV[d](inter, 1, kernel_size=1, bias=False),
-            get_norm(norm_type, 1, norm_groups, spatial_dims=d),
+            _norm(1),
             nn.Sigmoid(),
         )
         self.relu = nn.ReLU(inplace=True)
@@ -1323,20 +1357,26 @@ class CARAFE3d(nn.Module):
         w = self.shuffle(w)                        # (B, k^3, sD, sH, sW)
         w = F.softmax(w, dim=1)
 
-        # 2) 取 k^3 邻域 patch。
+        # 2) 取 k^3 邻域 patch（保持在低分辨率：峰值 k^3·C，而非旧实现
+        #    “nearest 上采 patch 再加权”的 s^3·k^3·C）。
         x_pad = F.pad(x, [self.pad] * 6, mode="replicate")
         x_unf = (x_pad
                  .unfold(2, k, 1).unfold(3, k, 1).unfold(4, k, 1)
                  .contiguous())
-        # unfold 输出末尾为 3 个 k 轴；将其捏入 (C,k^3) 通道。
+        # unfold 输出末尾为 3 个 k 轴；捏成独立 k^3 轴。
         x_unf = rearrange(
-            x_unf, 'b c d h w k1 k2 k3 -> b (c k1 k2 k3) d h w')
+            x_unf, 'b c d h w k1 k2 k3 -> b c (k1 k2 k3) d h w')
 
-        # 3) 最近邻上采 patch，4) 沿 k^3 轴加权求和。
-        x_up = F.interpolate(x_unf, scale_factor=s, mode="nearest")
-        x_up = rearrange(
-            x_up, 'b (c kk) d h w -> b c kk d h w', c=C)
-        out = (x_up * w.unsqueeze(1)).sum(dim=2)
+        # 3-4) 核折回低分辨率 (k^3, s^3) 视图后就地加权求和，再 depth-to-space
+        # 到高分辨率。与旧实现逐点等价：高分辨率体素 (d·s+s1, h·s+s2, w·s+s3)
+        # 恰好消费源体素 (d,h,w) 的邻域 patch 与自身位置的核。
+        w = rearrange(
+            w, 'b kk (d s1) (h s2) (w s3) -> b kk (s1 s2 s3) d h w',
+            s1=s, s2=s, s3=s)
+        out = torch.einsum('bckdhw,bksdhw->bcsdhw', x_unf, w)
+        out = rearrange(
+            out, 'b c (s1 s2 s3) d h w -> b c (d s1) (h s2) (w s3)',
+            s1=s, s2=s, s3=s)
         return self.proj(out)
 
 
@@ -1446,12 +1486,21 @@ class Upsample(nn.Module):
         norm_type: str = "instance",
         norm_groups: int = 8,
         activation: str = "leakyrelu",
+        interp_dtype: str = "legacy",
     ):
         super().__init__()
         d = _check_dims(spatial_dims)
         if mode not in self.VALID_MODES:
             raise ValueError(
                 f"Unknown upsample mode: {mode}. Valid: {self.VALID_MODES}")
+        # 仅插值模式：'legacy' 在 AMP 半精度下先转 fp32 插值再转回（两次
+        # dtype 往返）；'native' 直接在输入 dtype 上插值（插值后紧跟 conv，
+        # 半精度插值误差可忽，省两次全尺寸 cast）。
+        if interp_dtype not in ("legacy", "native"):
+            raise ValueError(
+                f"interp_dtype must be 'legacy' or 'native'; got "
+                f"{interp_dtype!r}.")
+        self.interp_fp32 = interp_dtype == "legacy"
         if d == 2 and mode in self._MODES_3D_ONLY:
             raise ValueError(
                 f"Upsample mode {mode!r} is only supported for spatial_dims=3."
@@ -1510,7 +1559,8 @@ class Upsample(nn.Module):
             return self.up(x)
         if self.mode == "trilinear":
             orig_dtype = x.dtype
-            if orig_dtype in (torch.bfloat16, torch.float16):
+            if self.interp_fp32 and orig_dtype in (
+                    torch.bfloat16, torch.float16):
                 x = x.float()
             x = F.interpolate(
                 x, scale_factor=self.stride,
@@ -1521,7 +1571,8 @@ class Upsample(nn.Module):
             return self.post(self.up(x))
         if self.mode == "nearest":
             orig_dtype = x.dtype
-            if orig_dtype in (torch.bfloat16, torch.float16):
+            if self.interp_fp32 and orig_dtype in (
+                    torch.bfloat16, torch.float16):
                 x = x.float()
             x = F.interpolate(x, scale_factor=self.stride, mode="nearest")
             if x.dtype != orig_dtype:

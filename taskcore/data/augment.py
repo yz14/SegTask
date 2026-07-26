@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -69,6 +69,8 @@ class GPUAugmentor:
         self._seed: Optional[int] = None if seed is None else int(seed)
         self._gen_cpu: Optional[torch.Generator] = None
         self._gen_dev: Optional[torch.Generator] = None
+        # resume 时设备端 Generator 尚未惰性创建，状态先挂起。
+        self._gen_dev_pending_state: Optional[torch.Tensor] = None
         if self._seed is not None:
             self._gen_cpu = torch.Generator().manual_seed(self._seed)
         # wmap interp：'nearest' 保留离散权重（默认）；'bilinear' 适连续。
@@ -89,7 +91,38 @@ class GPUAugmentor:
         if self._gen_dev is None or self._gen_dev.device != device:
             self._gen_dev = torch.Generator(device=device)
             self._gen_dev.manual_seed(self._seed + 1)
+            if self._gen_dev_pending_state is not None:
+                self._gen_dev.set_state(self._gen_dev_pending_state)
+                self._gen_dev_pending_state = None
         return self._gen_dev
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """私有增强 RNG 状态快照（入 checkpoint 支持位精确 resume）。
+
+        ``seed=None``（沿用全局 RNG）时返回空 dict：全局 RNG 状态由训练循环
+        自己快照。"""
+        if self._seed is None or self._gen_cpu is None:
+            return {}
+        state: Dict[str, torch.Tensor] = {
+            "gen_cpu": self._gen_cpu.get_state()}
+        if self._gen_dev is not None:
+            state["gen_dev"] = self._gen_dev.get_state()
+        elif self._gen_dev_pending_state is not None:
+            state["gen_dev"] = self._gen_dev_pending_state
+        return state
+
+    def load_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        """恢复私有增强 RNG 状态；设备端 Generator 惰性创建，状态先挂起，
+        首次拿到实际设备时再灌入。空 dict（旧 ckpt / 全局 RNG 模式）为 no-op。"""
+        if not state or self._seed is None or self._gen_cpu is None:
+            return
+        self._gen_cpu.set_state(state["gen_cpu"])
+        if "gen_dev" in state:
+            # get_state/set_state 均以 CPU ByteTensor 交互，无需跨设备搬运。
+            if self._gen_dev is not None:
+                self._gen_dev.set_state(state["gen_dev"])
+            else:
+                self._gen_dev_pending_state = state["gen_dev"]
 
     def apply(
         self,
@@ -171,12 +204,19 @@ class GPUAugmentor:
         self, image: torch.Tensor, label: torch.Tensor,
         weight_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """分割/分类入口：``(image, label[, weight_map])`` → 同结构。"""
-        comps: List[Companion] = [
-            Companion(label, mode="nearest", oob_fill=self.label_fill)]
+        """分割/分类入口：``(image, label[, weight_map])`` → 同结构。
+
+        提供 weight_map 时越界语义为「label 保 border 复制 + wmap 置 0 精确
+        排除」——把"不知道这里是什么"编码进损失权重而非伪造背景标签；无
+        weight_map 时（cls 等）沿用 label 填 ``label_fill`` 的旧语义。"""
         if weight_map is not None:
-            comps.append(Companion(
-                weight_map, mode=self.wmap_interp_mode, oob_fill=1.0))
+            comps: List[Companion] = [
+                Companion(label, mode="nearest", oob_fill=None),
+                Companion(weight_map, mode=self.wmap_interp_mode,
+                          oob_fill=0.0)]
+        else:
+            comps = [
+                Companion(label, mode="nearest", oob_fill=self.label_fill)]
         image, comps = self.apply(image, comps)
         label_out = comps[0].tensor
         wmap_out = comps[1].tensor if len(comps) > 1 else None
@@ -192,11 +232,14 @@ def _random_flip_companions(
 ) -> Tuple[torch.Tensor, List[Companion]]:
     """逐样本随机翻转；image 与全部 companions 同步。"""
     comps = list(companions or [])
+    if prob <= 0 or not axes:
+        return image, comps
     B = image.shape[0]
     for axis in axes:
         mask = _bernoulli_mask(B, prob, gen_cpu)
         if mask.any():
-            idx = mask.nonzero(as_tuple=True)[0].to(image.device)
+            idx = mask.nonzero(as_tuple=True)[0].to(
+                image.device, non_blocking=True)
             image[idx] = torch.flip(image[idx], [axis])
             for c in comps:
                 c.tensor[idx] = torch.flip(c.tensor[idx], [axis])
@@ -209,7 +252,7 @@ def _random_flip(
     weight_map: Optional[torch.Tensor] = None,
     gen_cpu: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """逐样本随机翻转（分割旧签名包装）。"""
+    """逐样本随机翻转（分割旧签名包装；仅测试消费，生产路径走 *_companions）。"""
     comps: List[Companion] = [Companion(label, "nearest", None)]
     if weight_map is not None:
         comps.append(Companion(weight_map, "nearest", None))
@@ -341,7 +384,7 @@ def _random_affine_elastic_companions(
         return image, comps
 
     idx_cpu = mask.nonzero(as_tuple=True)[0]
-    idx = idx_cpu.to(device)
+    idx = idx_cpu.to(device, non_blocking=True)
     n = idx_cpu.shape[0]
     sel_a = mask_a[idx_cpu]
     sel_e = mask_e[idx_cpu]
@@ -375,14 +418,14 @@ def _random_affine_elastic_companions(
             aspect = torch.tensor(
                 [float(W), float(H), float(D)],
                 device=device, dtype=torch.float32)
-        theta[sel_a.to(device)] = _build_rotation_matrices(
+        theta[sel_a.to(device, non_blocking=True)] = _build_rotation_matrices(
             angles, scales, translations, aspect)
 
     grid = F.affine_grid(theta, [n, 1, D, H, W], align_corners=False)
 
     ne = int(sel_e.sum())
     if ne:
-        sel_e_dev = sel_e.to(device)
+        sel_e_dev = sel_e.to(device, non_blocking=True)
         disp = _elastic_grid_disp(
             ne, D, H, W, sigma, alpha, device, gen_dev,
             field_mode=elastic_field_mode,
@@ -422,7 +465,8 @@ def _random_affine_elastic(
     elastic_field_mode: str = "legacy",
     elastic_normalize_displacement: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """仿射+弹性（分割旧签名包装）：label nearest+oob_fill，wmap 填 1.0。"""
+    """仿射+弹性（分割旧签名包装；仅测试消费，生产路径走 *_companions）：
+    label nearest+oob_fill，wmap 填 1.0。"""
     comps: List[Companion] = [
         Companion(label, mode="nearest", oob_fill=float(label_fill))]
     if weight_map is not None:
@@ -478,8 +522,9 @@ def _grid_dropout_companions(
     d_off = torch.arange(hd, device=device)
     h_off = torch.arange(hh, device=device)
     w_off = torch.arange(hw, device=device)
-    selected_dev = selected.to(device)
-    b_selected = selected_dev.nonzero(as_tuple=True)[0]
+    # nonzero 在 CPU 掌握的选样掩码上完成，避免设备端 nonzero 的 D2H 同步。
+    b_selected = selected.nonzero(as_tuple=True)[0].to(
+        device, non_blocking=True)
     for k in range(num_holes):
         ds = d0[b_selected, k, None] + d_off[None, :]
         hs = h0[b_selected, k, None] + h_off[None, :]
@@ -500,7 +545,8 @@ def _grid_dropout(
     gen_cpu: Optional[torch.Generator] = None,
     gen_dev: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """随机零掩（分割旧签名包装）；label/weight_map 不被掩。"""
+    """随机零掩（分割旧签名包装；仅测试消费，生产路径走 *_companions）；
+    label/weight_map 不被掩。"""
     comps: List[Companion] = [Companion(label, "nearest", None)]
     if weight_map is not None:
         comps.append(Companion(weight_map, "nearest", None))
@@ -587,7 +633,7 @@ def _gaussian_noise(
     mask = _bernoulli_mask(B, prob, gen_cpu)
     if not mask.any():
         return image
-    idx = mask.nonzero(as_tuple=True)[0].to(image.device)
+    idx = mask.nonzero(as_tuple=True)[0].to(image.device, non_blocking=True)
     sub = image[idx]
     noise = torch.randn(sub.shape, dtype=sub.dtype, device=sub.device,
                         generator=gen_dev)
@@ -610,7 +656,7 @@ def _gaussian_blur_3d(
     if not mask.any():
         return image
 
-    idx = mask.nonzero(as_tuple=True)[0].to(device)
+    idx = mask.nonzero(as_tuple=True)[0].to(device, non_blocking=True)
     n = idx.numel()
     sigmas = torch.empty(n, dtype=image.dtype).uniform_(
         sigma_range[0], sigma_range[1],

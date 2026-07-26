@@ -173,6 +173,11 @@ class WholeSpec(DatasetSpec):
         # whole 在 Config.validate 中已强制 multi_res_scales=[1.0]、忽略 fg 过采样。
         # val 无增强、整卷输入确定：spv>1 只是等比重复同一样本（pooled Dice
         # 数值不变，纯白算），固定 1。
+        extra: dict = {}
+        if "oversample_mode" in inspect.signature(
+                type(self).dataset_cls.__init__).parameters:
+            extra["oversample_mode"] = str(
+                self.cfg.data.whole_oversample_mode)
         return type(self).dataset_cls(
             **paths.to_kwargs(),
             **common.to_kwargs(),
@@ -180,6 +185,7 @@ class WholeSpec(DatasetSpec):
             samples_per_volume   = (self._samples_per_volume(True)
                                     if is_train else 1),
             **self._resize_kwargs(),
+            **extra,
             is_train=is_train)
 
 

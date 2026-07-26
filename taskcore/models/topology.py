@@ -22,6 +22,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
+from taskcore.config.geometry import compute_downsample_strides
+
 if TYPE_CHECKING:  # pragma: no cover
     from taskcore.config import Config
 
@@ -72,6 +74,29 @@ class ModelTopology:
 # ---------------------------------------------------------------------------
 # Single derivation entry point
 # ---------------------------------------------------------------------------
+def arch_fingerprint(cfg: "Config") -> dict:
+    """训练/推理共用的结构指纹。
+
+    捕捉 strict ``load_state_dict`` 察觉不到的几何漂移（典型：patch_size 改变
+    使 anisotropic stride 调度不同，权重形状不变但下采样计划已漂移）。
+    ``downsample_strides``/``stem_mode`` 等结构键不一致时推理侧应拒绝加载；
+    ``patch_size``/``patch_mode`` 仅记录供诊断。"""
+    topo = build_topology(cfg)
+    n_levels = len(cfg.model.encoder_channels)
+    strides = compute_downsample_strides(cfg, topo.spatial_dims, n_levels)
+    if strides is None:
+        strides = [(2,) * topo.spatial_dims] * max(n_levels - 1, 0)
+    return {
+        "spatial_dims": int(topo.spatial_dims),
+        "n_levels": int(n_levels),
+        "stem_mode": str(cfg.model.stem_mode),
+        "downsample_strides": [[int(x) for x in s] for s in strides],
+        "decoder_type": str(cfg.model.unet.decoder_type).lower(),
+        "patch_size": [int(x) for x in cfg.data.patch_size],
+        "patch_mode": str(cfg.data.patch_mode),
+    }
+
+
 def build_topology(cfg: "Config") -> ModelTopology:
     """从 ``cfg`` 一次性派生全部模型/训练几何字段。
 
@@ -103,6 +128,11 @@ def build_topology(cfg: "Config") -> ModelTopology:
                       and pm in ("z_axis", "cubic") and n_views > 1)  # 3D多分辨率输入保持原尺寸（3D只能全部尺寸一致）
     aux_seg_active = (bool(mc.aux_seg_supervision)
                       and is_2_5d and n_views > 1)
+    if bool(mc.aux_seg_supervision) and not aux_seg_active:
+        logger.warning(
+            "model.aux_seg_supervision=True 仅在 2.5D 多视图（patch_mode='2_5d' "
+            "且 len(multi_res_scales)>1）下生效；当前 patch_mode=%r、n_views=%d，"
+            "辅助分割监督不会启用。", pm, n_views)
 
     # ---- 通道 / 输出几何 -------------------------------------------------
     if is_2_5d and not lift:

@@ -12,9 +12,10 @@ from ..config.core import Config, ConfigError, resolve_selfattn_stage
 from ..config.geometry import (
     auto_anisotropic_strides,
     compute_downsample_strides,
+    decoder_stage_count,
     stem_stride_of,
 )
-from .blocks import SelfAttentionBlock
+from .blocks import DySample3d, SelfAttentionBlock, Upsample
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .mednext import MedNeXtStage
 from .resnet import MultiRFStage, ResNetStage
@@ -26,12 +27,29 @@ from .unetpp import UNetPPDecoder
 logger = logging.getLogger(__name__)
 
 
+def _custom_init_param_ids(model: nn.Module) -> set:
+    """收集带自定义初始化契约的参数 id：SelfAttentionBlock（zero-init 残差出口）、
+    DySample3d（offset/scope 近零）、pixelshuffle Upsample 的 ICNR expand 卷积。
+    非 legacy 策略不得覆盖这些初始化，否则破坏其设计意图。"""
+    ids: set = set()
+    for module in model.modules():
+        if isinstance(module, (SelfAttentionBlock, DySample3d)):
+            ids.update(id(p) for p in module.parameters())
+        elif isinstance(module, Upsample) and module.mode == "pixelshuffle":
+            ids.update(id(p) for p in module.expand.parameters())
+    return ids
+
+
 def _apply_init_strategy(model: nn.Module, strategy: str) -> nn.Module:
     """按显式策略覆盖模型初始化；legacy 保留各模块既有初始化。"""
     strategy = str(strategy).lower()
     if strategy == "legacy":
         return model
+    protected = _custom_init_param_ids(model)
     for module in model.modules():
+        if any(id(p) in protected
+               for p in module.parameters(recurse=False)):
+            continue
         if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d,
                                nn.Linear)):
             if strategy == "kaiming":
@@ -66,18 +84,19 @@ def _resolve_blocks_per_stage(
 
 
 def _decoder_call_count(decoder_type: str, n_levels: int) -> int:
-    """返回 decoder 实际构造的 stage/node 数。"""
-    dtype = str(decoder_type).lower()
-    if dtype == "unet":
-        return max(int(n_levels) - 1, 0)
-    if dtype == "unetpp":
-        return int(n_levels) * (int(n_levels) - 1) // 2
-    return 0
+    """返回 decoder 实际构造的 stage/node 数（委托 config.geometry 单一口径）。"""
+    return decoder_stage_count(decoder_type, n_levels)
 
 
 def _resolve_decoder_block_counts(mc, n_levels: int) -> List[int]:
     expected = _decoder_call_count(mc.unet.decoder_type, n_levels)
     values = list(mc.decoder_blocks_per_stage or [])
+    if expected == 0 and len(values) > 1:
+        # unet3p 等 decoder 不消费逐级 block 数；显式列表仅告警后忽略。
+        logger.warning(
+            "decoder_blocks_per_stage=%s is not consumed by "
+            "decoder_type=%r; ignored.", values, mc.unet.decoder_type)
+        values = []
     if not values or len(values) == 1:
         value = values[0] if values else mc.blocks_per_level
         return [int(value)] * max(expected, 1)
@@ -477,7 +496,8 @@ def _build_unet_encoder_decoder(
             norm_groups=mc.unet.norm_groups,
             activation=mc.unet.activation,
             grad_checkpointing=mc.grad_checkpointing,
-            grad_ckpt_decoder_branches=mc.grad_ckpt_decoder_branches)
+            grad_ckpt_decoder_branches=mc.grad_ckpt_decoder_branches,
+            upsample_interp_dtype=mc.unet.upsample_interp_dtype)
     else:
         decoder = Decoder(
             encoder_channels   = enc_channels,
@@ -492,7 +512,8 @@ def _build_unet_encoder_decoder(
             norm_type          = mc.unet.norm_type,
             norm_groups        = mc.unet.norm_groups,
             activation         = mc.unet.activation,
-            grad_checkpointing = mc.grad_checkpointing)
+            grad_checkpointing = mc.grad_checkpointing,
+            upsample_interp_dtype = mc.unet.upsample_interp_dtype)
 
     return encoder, decoder
 

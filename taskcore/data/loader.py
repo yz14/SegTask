@@ -72,7 +72,9 @@ class ValBatchShardSampler(Sampler):
 
 
 def _load_exclude_pids(exclude_list: str) -> set:
-    """从文本读排除 pid 列表（每行一个，'#' 为注释）；可含 .nii(.gz) 后缀。路径为空或不存在返回空集。"""
+    """从文本读排除 pid 列表（每行一个，'#' 为注释）；可含 .nii(.gz) 后缀，
+    也兼容 make_data 的 ``_failures.txt``（``pid\t<error>``，取首列）。
+    路径为空或不存在返回空集。"""
     if not exclude_list:
         return set()
     p = Path(exclude_list)
@@ -85,6 +87,9 @@ def _load_exclude_pids(exclude_list: str) -> set:
         for raw in f:
             s = raw.strip()
             if not s or s.startswith("#"):
+                continue
+            s = s.split("\t", 1)[0].strip()
+            if not s:
                 continue
             for suf in (".nii.gz", ".nii"):
                 if s.endswith(suf):
@@ -463,6 +468,38 @@ def _fallback_split_val_count(
     """空 label fallback：legacy round()，不做上下界修正。"""
     return (int(round(n * val_ratio)) if rounding_mode == "legacy"
             else _half_up_count(n, val_ratio))
+
+
+def _check_split_manifest_drift(
+    path: Path,
+    *,
+    train: Sequence[str],
+    val: Sequence[str],
+) -> None:
+    """读回既有 manifest 与本次划分比对：val 集变化时高声告警。
+
+    样本增删会改变随机划分的排列结果：旧 val 样本可能进入新 train 集，
+    选模指标被污染。manifest 损坏/不可读时跳过（随后会被重写）。"""
+    if not path.is_file():
+        return
+    try:
+        prev = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("Split manifest %s unreadable (%s); rewriting.", path, e)
+        return
+    prev_val = set(prev.get("val", []))
+    prev_train = set(prev.get("train", []))
+    cur_val, cur_train = set(val), set(train)
+    if prev_val == cur_val and prev_train == cur_train:
+        return
+    leaked = sorted(prev_val & cur_train)
+    logger.warning(
+        "Train/val split drifted from manifest %s: val %d->%d, train %d->%d "
+        "sample(s).%s Check data roster / split_seed if this resume was "
+        "expected to reuse the previous split.",
+        path, len(prev_val), len(cur_val), len(prev_train), len(cur_train),
+        (f" {len(leaked)} previous val sample(s) moved into train "
+         f"(metric leakage risk), first 3: {leaked[:3]}.") if leaked else "")
 
 
 def _write_split_manifest(
@@ -990,10 +1027,13 @@ def log_volume_cache_estimate(
     try:
         if open_npz is None:
             from .dataset import open_npz
+        from .dataset import _read_npz_image_shape
         npz_paths_train = train_ds._npz_paths
-        _f = open_npz(npz_paths_train[0])
-        sample_voxels = int(np.prod(_f["image"].shape))
-        has_rw_runtime = "rw" in _f.files
+        # 免整卷解码读形状；with 确保句柄及时释放。
+        with open_npz(npz_paths_train[0]) as _f:
+            sample_voxels = int(np.prod(
+                _read_npz_image_shape(_f, npz_paths_train[0])))
+            has_rw_runtime = "rw" in _f.files
         img_b = 2 if str(dc.cache_dtype) == "int16" else 4
         bytes_per_img = sample_voxels * img_b
         bytes_per_lbl = sample_voxels * 2
@@ -1033,8 +1073,8 @@ def log_volume_cache_estimate(
             sample_voxels * 4 / (1024 ** 2), agg_note)
         if index_bytes:
             logger.info(
-                "Foreground index footprint: %.2f MiB (shared per dataset "
-                "process; not multiplied by cache_max_volumes).",
+                "Foreground index footprint: %.2f MiB (one copy per dataset "
+                "worker process; not multiplied by cache_max_volumes).",
                 index_bytes / (1024 ** 2))
         agg_workers = workers * max(world_size, 1)
         if cap == 0 and n_train_vols * agg_workers >= 16:
@@ -1120,6 +1160,19 @@ def build_dataloaders(
             "Secondary (coarse) training source: %d npz package(s) under %s "
             "(train-only; validation always uses gold only).",
             len(secondary_paths), dc.npz_dir_secondary)
+        # 主/副源 pid 重叠即 fail-fast：同一病例的粗标副本全量进 train，
+        # 若其金标进 val，验证指标被同病例训练数据污染。
+        primary_pids = {Path(p).stem for p in primary_paths}
+        overlap = sorted(
+            Path(p).stem for p in secondary_paths
+            if Path(p).stem in primary_pids)
+        if overlap:
+            raise ValueError(
+                f"{len(overlap)} pid(s) appear in BOTH the primary and "
+                f"secondary npz sources (first 5: {overlap[:5]}). The "
+                "secondary (coarse) copies always train while their gold "
+                "twins may fall into validation — remove the duplicates "
+                "from one source.")
 
     label_loader_fn = load_npz_label_for_split
 
@@ -1175,6 +1228,11 @@ def build_dataloaders(
         logger.info("Split (random): %d train, %d val",
                     len(train_idx), len(val_idx))
     if dc.split_manifest_path:
+        if rank == 0:
+            _check_split_manifest_drift(
+                Path(dc.split_manifest_path),
+                train=[primary_paths[i] for i in train_idx],
+                val=[primary_paths[i] for i in val_idx])
         _write_split_manifest(
             Path(dc.split_manifest_path),
             seed=dc.split_seed,

@@ -34,6 +34,7 @@ class UNetPPDecoder(nn.Module):
         activation: str = "leakyrelu",
         grad_checkpointing: bool = False,
         grad_ckpt_decoder_branches: bool = False,
+        upsample_interp_dtype: str = "legacy",
     ):
         super().__init__()
         n = len(encoder_channels)
@@ -69,6 +70,7 @@ class UNetPPDecoder(nn.Module):
                     norm_type=norm_type,
                     norm_groups=norm_groups,
                     activation=activation,
+                    interp_dtype=upsample_interp_dtype,
                 )
                 # 融合：j 个同深度节点 + 1 上采样 = (j+1)*enc[i]。
                 fused_ch = (j + 1) * encoder_channels[i]

@@ -448,7 +448,8 @@ class MultiRFStage(nn.Module):
         super().__init__()
         if num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
-        if drop_path_rates is None:
+        if not drop_path_rates:
+            # None 与空列表同判：空列表下 [0] 取值会 IndexError。
             drop_path_rates = [0.0] * num_blocks
         kwargs = dict(
             dilations=dilations, mode=mode, fusion=fusion, axes=axes,
@@ -488,7 +489,8 @@ class ResNetStage(nn.Module):
         super().__init__()
         if num_blocks < 1:
             raise ValueError(f"num_blocks must be >= 1, got {num_blocks}")
-        if drop_path_rates is None:
+        if not drop_path_rates:
+            # None 与空列表同判：空列表下 [0] 取值会 IndexError。
             drop_path_rates = [0.0] * num_blocks
         kwargs = dict(
             norm_type=norm_type, norm_groups=norm_groups, activation=activation,

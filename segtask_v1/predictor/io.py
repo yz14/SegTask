@@ -14,6 +14,7 @@ import torch
 
 from taskcore.config.core import Config
 from taskcore.models.mednext import reparameterize_model
+from taskcore.models.topology import arch_fingerprint
 from .predictor import Predictor
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,36 @@ def _select_state_dict(
     if has_ema:
         return _unwrap_ema_state(ckpt["ema_state_dict"]), "ema"
     return primary, "online"
+
+
+# 结构键：不一致则模型的下采样计划/拓扑与训练时不同，strict load 也拦不住。
+_FINGERPRINT_STRUCT_KEYS = (
+    "spatial_dims", "n_levels", "stem_mode",
+    "downsample_strides", "decoder_type")
+
+
+def _check_arch_fingerprint(ckpt: Dict, cfg: Config, path: str) -> None:
+    """比对 ckpt 内的结构指纹与当前配置，结构键不一致直接拒绝推理。
+
+    旧 ckpt 无指纹时跳过（兼容）。``patch_size``/``patch_mode`` 仅诊断用，
+    不参与硬比对（推理换 patch 尺寸在 stride 计划一致时是合法的）。"""
+    fp_ckpt = ckpt.get("arch_fingerprint")
+    if not isinstance(fp_ckpt, dict):
+        return
+    fp_now = arch_fingerprint(cfg)
+    diffs = [
+        f"{k}: ckpt={fp_ckpt[k]!r} vs current={fp_now[k]!r}"
+        for k in _FINGERPRINT_STRUCT_KEYS
+        if k in fp_ckpt and fp_ckpt[k] != fp_now[k]]
+    if diffs:
+        raise RuntimeError(
+            f"Architecture fingerprint mismatch between checkpoint {path!r} "
+            f"and current config: {'; '.join(diffs)}. "
+            f"Training-time patch_size={fp_ckpt.get('patch_size')!r} "
+            f"patch_mode={fp_ckpt.get('patch_mode')!r}; align "
+            "data.patch_size / model.unet.downsample_strides with the "
+            "training config (weights would load but produce wrong "
+            "predictions under a drifted downsampling plan).")
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +156,7 @@ def run_inference(
     model = build_model(cfg)
     # weights_only=False：本 trainer ckpt 含 Config / numpy RNG，PyTorch 2.6+ 默认安全模式会拒。
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    _check_arch_fingerprint(ckpt, cfg, checkpoint_path)
     sd, label = _select_state_dict(ckpt, weight_variant)
     sd = _strip_compile_prefix(sd)
 
@@ -157,7 +189,7 @@ def run_inference(
             f"layout does not match the model — refusing to predict with "
             f"random weights. Unexpected keys: {unexpected[:8]}")
 
-    if cfg.model.reparam_deploy:
+    if cfg.train.reparam_deploy:
         logger.info(
             "Applying MedNeXt deploy reparameterization before device transfer.")
         model = reparameterize_model(model)

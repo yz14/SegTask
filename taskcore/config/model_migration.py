@@ -72,6 +72,7 @@ UNET_FIELD_MAP: Dict[str, str] = {
     "downsample_mode":             "downsample_mode",
     "upsample_mode":               "upsample_mode",
     "upsample_norm_act":           "upsample_norm_act",
+    "upsample_interp_dtype":       "upsample_interp_dtype",
     "anisotropic_pooling":         "anisotropic_pooling",
     "downsample_strides":          "downsample_strides",
     "skip_mode":                   "skip_mode",

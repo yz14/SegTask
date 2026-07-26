@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader
 from taskcore.config.core import Config
 from taskcore.data.augment import GPUAugmentor
 from ..losses.losses import build_loss
+from taskcore.models.topology import arch_fingerprint
 from taskcore.models.unet import UNet3D
 from taskcore.models.mednext import upkern_remap_state_dict
 from taskcore.utils.common import (
@@ -708,6 +709,10 @@ class Trainer(BaseTrainer):
             "patience_counter": self.patience_counter,
             "rng_state": rng_state,
             "config": self.cfg,
+            # 结构指纹：推理侧比对拦截 strict load 察觉不到的 stride 漂移。
+            "arch_fingerprint": arch_fingerprint(self.cfg),
+            # 私有增强 RNG 流：resume 后继续而非从头重放增强序列。
+            "augment_rng_state": self.augmentor.state_dict(),
         }
 
         if self.swa is not None:
@@ -785,6 +790,10 @@ class Trainer(BaseTrainer):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         # 公共段（model/EMA/optim/sched/scaler/SWA/best/RNG）见 BaseTrainer。
         self.start_epoch = self._restore_train_state(ckpt)
+        aug_rng = ckpt.get("augment_rng_state")
+        if aug_rng:
+            self.augmentor.load_state_dict(aug_rng)
+            logger.info("Restored augmentation RNG state from checkpoint.")
         if self._is_dist and self._rank > 0:
             reseed_rank_rng(
                 self.cfg.train.seed, self._rank, self.start_epoch,
