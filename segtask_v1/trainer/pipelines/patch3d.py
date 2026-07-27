@@ -14,7 +14,7 @@ from taskcore.config.core import Config
 from ...losses.losses import DeepSupervisionLoss, MultiResolutionLoss
 from .. import views
 from taskcore.engine.amp import compute_loss_fp32
-from .base import SupervisionPack, ViewPipeline
+from .base import SupervisionPack, ViewPipeline, max_fov_target_size
 
 
 class Patch3DNativeMultiResPipeline(ViewPipeline):
@@ -68,14 +68,7 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
         self._patch_size = (pD, pH, pW)
 
         # 增强后 max-FOV target
-        max_scale = max(cfg.data.multi_res_scales)
-        if cfg.data.patch_mode == "z_axis":
-            self.target_patch_size = (int(round(pD * max_scale)), pH, pW)
-        else:
-            self.target_patch_size = (
-                int(round(pD * max_scale)),
-                int(round(pH * max_scale)),
-                int(round(pW * max_scale)))
+        self.target_patch_size = max_fov_target_size(cfg)
         # 交叉检查：逐视图原生尺寸不得超 max-FOV 目标。
         for k, (D_k, H_k, W_k) in enumerate(sizes):
             tD, tH, tW = self.target_patch_size

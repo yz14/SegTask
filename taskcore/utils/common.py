@@ -48,12 +48,18 @@ class ModelEMA:
 
     def __init__(self, model: nn.Module, decay: float = 0.999,
                  warmup: bool = True,
-                 offload_device: Optional[str] = None):
+                 offload_device: Optional[str] = None,
+                 update_every: int = 1):
         self.decay = decay
         # decay warmup（timm 式）：有效 decay = min(decay, (1+n)/(10+n))，
         # 避免从零训练时 shadow 被随机初始权重长时间拖累。
         self.warmup = warmup
         self.num_updates = 0
+        # 隔步更新（timm 式）：每 update_every 次 update() 才真正平滑一次，
+        # 并用 decay**k 补偿跳过的 k-1 步，保持时间常数不变。对 CPU
+        # offload 模式可把每步全量 D2H+流同步的开销降为 1/update_every。
+        self.update_every = max(int(update_every), 1)
+        self._skip_counter = 0
         # shadow 存放设备：None = 跟随模型（现状）；"cpu" = 常驻 CPU，省 1×
         # 参数量 GPU 显存（update 时经 pinned staging 异步 D2H + 一次流同步，
         # 数学与跟随模型严格等价）。
@@ -104,12 +110,20 @@ class ModelEMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
+        if self.update_every > 1:
+            self._skip_counter += 1
+            if self._skip_counter < self.update_every:
+                return
+            self._skip_counter = 0
         if self._float_groups is None or self._pairs_model_id != id(model):
             self._build_pairs(model)
         self.num_updates += 1
         decay = self.decay
         if self.warmup:
             decay = min(decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        if self.update_every > 1:
+            # 隔步补偿：一次平滑等效于连续 update_every 步的行为。
+            decay = decay ** self.update_every
         # 先集中发起全部异步 D2H，再一次同步，避免逐组同步的开销。
         any_staged = False
         for _, live_list, staging in self._float_groups:
@@ -179,17 +193,22 @@ class ModelEMA:
             for k, v in loaded.items():
                 self.shadow[k].copy_(v)
         else:
-            # key 不一致：从零重建 shadow。
+            # key 不一致：shadow 的 key 集必须与当前模型保持一致（update /
+            # apply_shadow 都按模型 state_dict 索引 shadow），因此只拷交集；
+            # 模型独有的键保留其当前值（通常为初始权重）。
+            common = [
+                k for k in self.shadow
+                if k in loaded
+                and tuple(loaded[k].shape) == tuple(self.shadow[k].shape)]
             logger.warning(
                 "ModelEMA.load_state_dict: shadow keys mismatch current "
-                "model (loaded=%d, current=%d) — rebuilding shadow from "
-                "checkpoint. EMA history continuity is preserved only if "
-                "the checkpoint matches the intended architecture.",
-                len(loaded), len(self.shadow))
-            self.shadow = {
-                k: (v.detach().to(self.offload_device, copy=True)
-                    if self.offload_device is not None else v.detach().clone())
-                for k, v in loaded.items()}
+                "model (loaded=%d, current=%d, usable overlap=%d) — copying "
+                "the overlap only; model-only keys keep their current "
+                "values. EMA history continuity is preserved only if the "
+                "checkpoint matches the intended architecture.",
+                len(loaded), len(self.shadow), len(common))
+            for k in common:
+                self.shadow[k].copy_(loaded[k])
             self._backup = {}
             self._swapped = False
         self._float_groups = None

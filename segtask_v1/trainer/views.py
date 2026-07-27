@@ -146,9 +146,12 @@ def split_views_native_d(
             f"max(per_view_depths)={max(depths)} exceeds eD_max={eD_max}; "
             "this indicates a multi_res_scales / patch_size mismatch.")
 
+    # 注意：切片保持 view 不做 contiguous —— 图像路随后的 cat 本身就产出
+    # 连续新张量，逐视图先拷一次纯属多余；label/wmap 路生命周期与源 cube
+    # 相同（同一 step 内消费），非连续 view 对损失计算无影响。
     def _slab(t: torch.Tensor, d_k: int) -> torch.Tensor:
         d0 = (eD_max - d_k) // 2
-        return t[:, 0, d0:d0 + d_k].contiguous()  # (B, d_k, H, W)
+        return t[:, 0, d0:d0 + d_k]  # (B, d_k, H, W) view
 
     image_main = _slab(image, D)
     label_main = _slab(label, D)

@@ -882,6 +882,10 @@ class TrainConfig:
     # 多一次 GPU→CPU 参数拷贝（异步 + 一次流同步），数学与 "" 严格等价；验证换入 /
     # checkpoint 保存均自动跨设备拷贝。仅在显存吃紧时建议开启。
     ema_device: str = ""
+    # EMA 隔步更新：每 N 个优化步才平滑一次（decay**N 补偿，时间常数不变）。
+    # 1 = 每步更新（行为不变）；ema_device="cpu" 时建议 4～8，可把每步
+    # 全量 D2H 拷贝+流同步的开销降为 1/N。
+    ema_update_every: int = 1
 
     # SWA 尾段等权权重平均（Izmailov 2018，opt-in，与 EMA 正交可叠加）。
     # True 时从 swa_start_ratio*epochs 起每 epoch 将在线权重纳入等权平均
@@ -1334,6 +1338,19 @@ class Config:
         """
         if self.data.label_values and self.data.num_classes == 0:
             self.data.num_classes = len(self.data.label_values)
+
+        # warmup >= epochs 会使 post-warmup horizon 退化（旧行为被
+        # max(...,1) 静默吞掉，LR 永不进入配置的衰减段）。短轮次 smoke
+        # 跑常见“小 epochs + 默认 warmup”，故自动钳住并告警而非报错。
+        if (int(self.train.warmup_epochs) >= int(self.train.epochs)
+                and int(self.train.epochs) >= 1):
+            clamped = max(int(self.train.epochs) - 1, 0)
+            logger.warning(
+                "train.warmup_epochs=%d >= train.epochs=%d leaves zero "
+                "post-warmup steps (the LR would never follow the "
+                "configured schedule); clamping warmup_epochs to %d.",
+                self.train.warmup_epochs, self.train.epochs, clamped)
+            self.train.warmup_epochs = clamped
 
         # z_boundary_mode='stretch' 已废弃：训练侧 dataset 恒走 edge-pad 几何
         # （stretch 在训练抽取中无分支），而推理侧会生效，薄卷（D <
@@ -2107,6 +2124,11 @@ class Config:
                     self.data.z_boundary_mode == "edge_pad",
                     "keep_native_multi_res=True (z_axis) requires z_boundary_mode='edge_pad' "
                     f"(auto-set by sync()); got {self.data.z_boundary_mode!r}.")
+        # 注：3D 多视图 + keep_native_multi_res=False 在 *seg 训练* 侧无可用
+        # 路径（dataset 恒发单 cube，旧 eager 通道堆叠已移除），由
+        # Vanilla3DPipeline 构造期报错拦截；此处不做全局 hard error——
+        # 推理侧（predictor 自行构建多分辨率窗口）与其他任务仍合法使用
+        # 该组合。
 
         # spacing 归一化：target_spacing 若显式给出须为 3 个正数（(D,H,W) mm）。
         if self.data.spacing_normalization and self.data.target_spacing is not None:
@@ -2268,6 +2290,63 @@ class Config:
 
     def _validate_train(self) -> None:
         """train.* 优化器/调度器/选模标准校验。"""
+        tc = self.train
+        # ---- 基本区间：拦掉会在训练途中才爆（或静默产生病态调度）的取值 ----
+        _require(int(tc.epochs) >= 1,
+                 f"train.epochs must be >= 1; got {tc.epochs}")
+        _require(
+            0 <= int(tc.warmup_epochs) < max(int(tc.epochs), 1),
+            f"train.warmup_epochs must satisfy 0 <= warmup_epochs < epochs; "
+            f"got warmup_epochs={tc.warmup_epochs}, epochs={tc.epochs} "
+            "(warmup >= epochs leaves zero post-warmup steps: the base "
+            "scheduler horizon silently degenerates and the LR never "
+            "follows the configured schedule). Note: Config.sync() "
+            "auto-clamps this; seeing this error means sync() was skipped.")
+        _require(float(tc.lr) > 0, f"train.lr must be > 0; got {tc.lr}")
+        _require(float(tc.warmup_lr) >= 0,
+                 f"train.warmup_lr must be >= 0; got {tc.warmup_lr}")
+        _require(float(tc.weight_decay) >= 0,
+                 f"train.weight_decay must be >= 0; got {tc.weight_decay}")
+        _require(float(tc.grad_clip_norm) >= 0,
+                 f"train.grad_clip_norm must be >= 0 (0 disables); "
+                 f"got {tc.grad_clip_norm}")
+        _require(int(tc.grad_accum_steps) >= 1,
+                 f"train.grad_accum_steps must be >= 1; "
+                 f"got {tc.grad_accum_steps}")
+        _require(int(tc.save_every) >= 1,
+                 f"train.save_every must be >= 1; got {tc.save_every}")
+        _require(int(tc.val_every) >= 1,
+                 f"train.val_every must be >= 1; got {tc.val_every}")
+        _require(int(tc.early_stopping) >= 0,
+                 f"train.early_stopping must be >= 0 (0 disables); "
+                 f"got {tc.early_stopping}")
+        if tc.use_ema:
+            _require(0.0 < float(tc.ema_decay) < 1.0,
+                     f"train.ema_decay must be in (0, 1); got {tc.ema_decay}")
+            _require(int(tc.ema_update_every) >= 1,
+                     f"train.ema_update_every must be >= 1; "
+                     f"got {tc.ema_update_every}")
+        # 调度器专属超参
+        _require(int(tc.step_size) >= 1,
+                 f"train.step_size must be >= 1; got {tc.step_size}")
+        _require(float(tc.poly_power) > 0,
+                 f"train.poly_power must be > 0; got {tc.poly_power}")
+        _require(0.0 < float(tc.step_gamma) <= 1.0,
+                 f"train.step_gamma must be in (0, 1]; got {tc.step_gamma}")
+        _require(int(tc.plateau_patience) >= 1,
+                 f"train.plateau_patience must be >= 1; "
+                 f"got {tc.plateau_patience}")
+        _require(0.0 < float(tc.plateau_factor) < 1.0,
+                 f"train.plateau_factor must be in (0, 1); "
+                 f"got {tc.plateau_factor}")
+        _require(int(tc.cosine_restart_period) >= 1,
+                 f"train.cosine_restart_period must be >= 1; "
+                 f"got {tc.cosine_restart_period}")
+        _require(int(tc.cosine_restart_mult) >= 1,
+                 f"train.cosine_restart_mult must be >= 1; "
+                 f"got {tc.cosine_restart_mult}")
+        _require(float(tc.cosine_min_lr) >= 0,
+                 f"train.cosine_min_lr must be >= 0; got {tc.cosine_min_lr}")
         _require(
             self.train.optimizer in ("adam", "adamw", "sgd"),
             f"Invalid optimizer: {self.train.optimizer}")

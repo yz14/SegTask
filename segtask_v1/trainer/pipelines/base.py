@@ -28,7 +28,44 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from taskcore.config.core import Config
 from taskcore.engine.amp import compute_loss_fp32
+
+
+def resolve_aux_weights(cfg: Config, n_aux: int) -> List[float]:
+    """aux 监督权重：用户显式配置优先，否则几何衰减 0.5^(k+1)。"""
+    user_w = list(cfg.loss.aux_supervision_weights)
+    if not user_w:
+        # 几何衰减：越宽 FOV 对齐越差，权重越小。
+        user_w = [0.5 ** (k + 1) for k in range(n_aux)]
+    elif len(user_w) != n_aux:
+        raise ValueError(
+            f"loss.aux_supervision_weights length ({len(user_w)}) "
+            f"must equal n_views-1 ({n_aux}); got {user_w}.")
+    return [float(w) for w in user_w]
+
+
+def accumulate_main(criterion, pred_main, sup, breakdown):
+    """主路 fp32 损失 + breakdown ``L_main`` 标量。"""
+    main_l = compute_loss_fp32(
+        criterion, pred_main, sup.label_main, weight_map=sup.wmap_main)
+    if breakdown is not None:
+        breakdown["L_main"] = float(main_l.detach().item())
+    return main_l
+
+
+def max_fov_target_size(cfg: Config) -> Tuple[int, int, int]:
+    """增强后中心裁回的 max-FOV 目标尺寸。
+
+    z 向恒取 round(D*max_scale)；仅各向同性 ``patch_mode="cubic"`` 时 H/W 同步
+    放大（z_axis / 2_5d 的多分辨率只作用于 z 向）。"""
+    pD, pH, pW = (int(v) for v in cfg.data.patch_size)
+    max_scale = max(cfg.data.multi_res_scales)
+    if cfg.data.patch_mode == "cubic":
+        return (int(round(pD * max_scale)),
+                int(round(pH * max_scale)),
+                int(round(pW * max_scale)))
+    return (int(round(pD * max_scale)), pH, pW)
 
 
 @dataclass
@@ -66,9 +103,9 @@ class ViewPipeline(ABC):
     num_res_groups: int    # 损失内部"通道分组数"；2.5D folded=1, lift=1, 3D=n_views
     slab_depth: int = 0    # 仅 2.5D：D = patch_size[0]
 
-    # 可选：仅特定 pipeline 用
-    mr_native_sizes: List[Tuple[int, int, int]] = []
-    per_view_depths: List[int] = []
+    # 可选：仅特定 pipeline 用（各子类均在 __init__ 赋值，不设可变类默认）
+    mr_native_sizes: List[Tuple[int, int, int]]
+    per_view_depths: List[int]
 
     # 中心线/距离场辅助头（由 build_pipeline 注入；None 表示未启用）。与多 FOV aux 独立。
     aux_topo_loss_fn: Optional[nn.Module] = None
@@ -121,6 +158,10 @@ class ViewPipeline(ABC):
         与历史 ``dict→main`` 行为一致。
         """
         if isinstance(pred, dict):
+            if "main" not in pred:
+                raise KeyError(
+                    "Model returned a dict output without the required "
+                    f"'main' key; got keys={sorted(pred)}.")
             return pred["main"], (pred.get("aux") or []), pred.get("topo")
         return pred, [], None
 
@@ -147,4 +188,5 @@ class ViewPipeline(ABC):
         return self.main_loss_fn.split_for_metrics(pred, label_main)
 
 
-__all__ = ["ViewPipeline", "SupervisionPack"]
+__all__ = ["ViewPipeline", "SupervisionPack", "resolve_aux_weights",
+           "accumulate_main", "max_fov_target_size"]

@@ -87,11 +87,14 @@ def compute_loss_fp32(
     c = _LOGIT_CLAMP
     if isinstance(pred, list):  # deep supervision
         pred_fp32 = [p.float().clamp(-c, c) for p in pred]
+        device_type = pred[0].device.type
     else:
         pred_fp32 = pred.float().clamp(-c, c)
+        device_type = pred.device.type
     target_fp32 = target.float() if target.is_floating_point() else target
     wmap_fp32   = weight_map.float() if weight_map is not None else None
-    with autocast(device_type="cuda", enabled=False):
+    # device_type 跟随 pred 所在设备，确保 CPU autocast 下同样被禁用。
+    with autocast(device_type=device_type, enabled=False):
         if wmap_fp32 is None:
             return loss_fn(pred_fp32, target_fp32)
         return loss_fn(pred_fp32, target_fp32, weight_map=wmap_fp32)

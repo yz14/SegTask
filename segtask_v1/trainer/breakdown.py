@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional
 
-from ..losses.losses import MultiResolutionLoss
+from ..losses.losses import DeepSupervisionLoss, MultiResolutionLoss
 
 
 def collect_multi_res_breakdown(
@@ -21,8 +21,12 @@ def collect_multi_res_breakdown(
     breakdown: Dict[str, float],
 ) -> None:
     """从主/aux 损失里抽 per-res 诊断到 ``breakdown``；非 MR 安静跳过。"""
-    # 主路：DS 包过 → criterion.base_loss；否则即 criterion 本身。
-    main_inner = getattr(criterion, "base_loss", criterion)
+    # 主路：仅当确实被 DS 包过才取内层；MultiResolutionLoss 自身也有
+    # .base_loss（指向内层 base 损失），盲用 getattr 会多解一层导致无 DS
+    # 时诊断丢失且 _per_res_history 永不清空。
+    main_inner = (criterion.base_loss
+                  if isinstance(criterion, DeepSupervisionLoss)
+                  else criterion)
     if isinstance(main_inner, MultiResolutionLoss):
         diag = main_inner.pop_per_res_diag()
         if diag is not None:
@@ -70,6 +74,14 @@ def format_breakdown(breakdown: Optional[Dict[str, float]]) -> str:
             key=lambda k, p=prefix: int(k[len(p):]))
         for k in res_keys:
             parts.append(f"{k}={breakdown[k]:.4f}")
+    # 拓扑辅助头（中心线/距离场）损失。
+    if "L_topo" in breakdown:
+        if "w_topo" in breakdown:
+            parts.append(
+                f"L_topo={breakdown['L_topo']:.4f}"
+                f"(w={breakdown['w_topo']:.3g})")
+        else:
+            parts.append(f"L_topo={breakdown['L_topo']:.4f}")
     return " | " + " ".join(parts)
 
 

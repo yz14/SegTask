@@ -22,33 +22,12 @@ from ...losses.losses import (
 )
 from .. import views
 from taskcore.engine.amp import compute_loss_fp32
-from .base import SupervisionPack, ViewPipeline
+from .base import (
+    SupervisionPack, ViewPipeline, accumulate_main, max_fov_target_size,
+    resolve_aux_weights,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Common helpers
-# ---------------------------------------------------------------------------
-def _resolve_aux_weights(cfg: Config, n_aux: int) -> List[float]:
-    user_w = list(cfg.loss.aux_supervision_weights)
-    if not user_w:
-        # 几何衰减：越宽 FOV 对齐越差，权重越小。
-        user_w = [0.5 ** (k + 1) for k in range(n_aux)]
-    elif len(user_w) != n_aux:
-        raise ValueError(
-            f"loss.aux_supervision_weights length ({len(user_w)}) "
-            f"must equal n_views-1 ({n_aux}); got {user_w}.")
-    return [float(w) for w in user_w]
-
-
-def _accumulate_main(criterion, pred_main, sup, breakdown):
-    """主路 fp32 损失 + breakdown ``L_main`` 标量。"""
-    main_l = compute_loss_fp32(
-        criterion, pred_main, sup.label_main, weight_map=sup.wmap_main)
-    if breakdown is not None:
-        breakdown["L_main"] = float(main_l.detach().item())
-    return main_l
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +65,7 @@ class Slab2_5DPipeline(ViewPipeline):
         self.mr_native_sizes = []
         self.per_view_depths = list(cfg.per_view_depths)
         # 数据集发单 max-FOV z-cube；多 FOV 时增强后 target 深度 = eD_max。
-        max_scale = max(cfg.data.multi_res_scales)
-        self.target_patch_size = (
-            int(round(D * max_scale)),
-            int(cfg.data.patch_size[1]),
-            int(cfg.data.patch_size[2]))
+        self.target_patch_size = max_fov_target_size(cfg)
         logger.info(
             "Loss: %s [2.5D, reduction=%s], num_slices=%d, fg_classes=%d",
             cfg.loss.name, cfg.loss.slice_loss_reduction,
@@ -115,7 +90,7 @@ class Slab2_5DPipeline(ViewPipeline):
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, _aux, topo_pred = self.split_pred(pred)
-        loss = _accumulate_main(self.criterion, main_pred, sup, breakdown)
+        loss = accumulate_main(self.criterion, main_pred, sup, breakdown)
         loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
         if breakdown is not None:
             breakdown["L_total"] = float(loss.detach().item())
@@ -164,15 +139,11 @@ class Slab2_5DAuxPipeline(ViewPipeline):
             label_values   = cfg.data.label_values,
             reduction      = cfg.loss.slice_loss_reduction)
         self.aux_loss_fns = None
-        self.aux_weights  = _resolve_aux_weights(cfg, n_aux)  # 确认aux监督权重
+        self.aux_weights  = resolve_aux_weights(cfg, n_aux)  # 确认aux监督权重
         self.mr_native_sizes = []
         self.per_view_depths = list(cfg.per_view_depths)
         # 数据集发单 max-FOV z-cube；增强后 target 深度 = eD_max。
-        max_scale = max(cfg.data.multi_res_scales)
-        self.target_patch_size = (
-            int(round(D * max_scale)),
-            int(cfg.data.patch_size[1]),
-            int(cfg.data.patch_size[2]))
+        self.target_patch_size = max_fov_target_size(cfg)
         logger.info(
             "Aux seg supervision: ENABLED, n_aux_views=%d, weights=%s, "
             "fusion=%s",
@@ -205,7 +176,7 @@ class Slab2_5DAuxPipeline(ViewPipeline):
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, aux_preds, topo_pred = self.split_pred(pred)
 
-        total = _accumulate_main(self.criterion, main_pred, sup, breakdown)  # 主路损失，包含deep supervision
+        total = accumulate_main(self.criterion, main_pred, sup, breakdown)  # 主路损失，包含deep supervision
         if not aux_preds or self.aux_loss_fn is None:
             total = self.add_topo_loss(total, topo_pred, sup, breakdown)
             if breakdown is not None:
@@ -253,12 +224,16 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
         D = int(cfg.data.patch_size[0])
 
         depths = list(cfg.per_view_depths)
-        assert depths and depths[0] == D, (
-            "per_view_depths[0] must equal patch_size[0]; "
-            f"got {depths[0] if depths else None} vs {D}.")
-        assert sum(depths) == int(cfg.model.in_channels), (
-            f"sum(per_view_depths)={sum(depths)} must equal "
-            f"model.in_channels={cfg.model.in_channels}.")
+        # 配置契约用显式异常而非 assert：python -O 下 assert 会被剥掉，
+        # 错误配置将带病进入训练。
+        if not depths or depths[0] != D:
+            raise ValueError(
+                "per_view_depths[0] must equal patch_size[0]; "
+                f"got {depths[0] if depths else None} vs {D}.")
+        if sum(depths) != int(cfg.model.in_channels):
+            raise ValueError(
+                f"sum(per_view_depths)={sum(depths)} must equal "
+                f"model.in_channels={cfg.model.in_channels}.")
 
         self.n_views         = n_views
         self.n_aux_views     = n_aux
@@ -287,16 +262,11 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
                 label_values   = cfg.data.label_values,
                 reduction      = cfg.loss.slice_loss_reduction)
             for d_k in depths[1:]]
-        self.aux_weights = _resolve_aux_weights(cfg, n_aux)
+        self.aux_weights = resolve_aux_weights(cfg, n_aux)
         self.mr_native_sizes = []
 
         # 增强后的 max-FOV target（按 D 维 max_scale）
-        max_scale = max(cfg.data.multi_res_scales)
-        target_d_native = int(round(D * max_scale))
-        self.target_patch_size = (
-            target_d_native,
-            int(cfg.data.patch_size[1]),
-            int(cfg.data.patch_size[2]))
+        self.target_patch_size = max_fov_target_size(cfg)
         logger.info(
             "Aux seg supervision: ENABLED (native depth), "
             "n_aux_views=%d, per-view depths=%s, weights=%s, "
@@ -305,7 +275,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
         logger.info(
             "Trainer keep_native_view_depth=True: max-FOV crop D=%d, "
             "per-view depths=%s, channel layout sum=%d.",
-            target_d_native, depths, int(cfg.model.in_channels))
+            self.target_patch_size[0], depths, int(cfg.model.in_channels))
 
     def prepare_batch(self, image, label, wmap):
         image, label_main, wmap_main, aux_labels, aux_wmaps = (
@@ -328,7 +298,7 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, aux_preds, topo_pred = self.split_pred(pred)
 
-        total = _accumulate_main(self.criterion, main_pred, sup, breakdown)
+        total = accumulate_main(self.criterion, main_pred, sup, breakdown)
         if not aux_preds or not self.aux_loss_fns:
             total = self.add_topo_loss(total, topo_pred, sup, breakdown)
             if breakdown is not None:

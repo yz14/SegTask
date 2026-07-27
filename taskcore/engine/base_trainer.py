@@ -213,7 +213,8 @@ class BaseTrainer:
         GPU 显存，数学等价）；默认 "" 跟随模型设备。"""
         tc = self.cfg.train
         self.ema = (ModelEMA(self.model, tc.ema_decay, warmup=tc.ema_warmup,
-                             offload_device=(tc.ema_device or None))
+                             offload_device=(tc.ema_device or None),
+                             update_every=tc.ema_update_every)
                     if tc.use_ema else None)
 
     def _maybe_compile(
@@ -583,12 +584,10 @@ class BaseTrainer:
         if self.ema is not None:
             online_sd = {k: v.detach().cpu().clone()
                          for k, v in bare.state_dict().items()}
-            self.ema.apply_shadow(bare)
-            try:
-                primary_sd = {k: v.detach().cpu().clone()
-                              for k, v in bare.state_dict().items()}
-            finally:
-                self.ema.restore(bare)
+            # EMA 主权重直接从 shadow 拷出（key/形状与 model state_dict 一致），
+            # 免去 apply/restore 两次全量 swap。
+            primary_sd = {k: v.detach().to("cpu", copy=True)
+                          for k, v in self.ema.shadow.items()}
         else:
             online_sd = None
             primary_sd = None
@@ -678,6 +677,19 @@ class BaseTrainer:
         bare.load_state_dict(model_sd)
         if self.ema is not None and "ema_state_dict" in ckpt:
             self.ema.load_state_dict(ckpt["ema_state_dict"])
+        missing_state = [
+            key for key in ("optimizer_state_dict", "scheduler_state_dict",
+                            "scaler_state_dict", "rng_state")
+            if key not in ckpt]
+        if missing_state:
+            logger.warning(
+                "Resume checkpoint is missing %s - the corresponding state "
+                "starts fresh (LR schedule restarts, optimizer moments are "
+                "lost, RNG is not bit-exact). This usually means resuming "
+                "from a best/deploy checkpoint; use train.pretrain for "
+                "weights-only initialisation, or resume from "
+                "latest_model.pth / checkpoint_epoch_*.pth for a full-state "
+                "resume.", ", ".join(missing_state))
         for key, obj in (("optimizer_state_dict", self.optimizer),
                          ("scheduler_state_dict", self.scheduler),
                          ("scaler_state_dict", self.scaler)):
@@ -730,7 +742,8 @@ class BaseTrainer:
         logger.info(
             "Loading pretrain weights: %s (strict=%s, load_ema=%s)",
             path, strict, load_ema)
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # 权重只作拷贝源，落 CPU 加载，免瞬时多占 1× 参数量显存。
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         sd, source = extract_model_state_dict(ckpt, prefer_ema=load_ema)
         sd = strip_common_prefixes(sd)
         bare = unwrap_compile(self.model)
@@ -760,9 +773,29 @@ class BaseTrainer:
                     f"current={current}. Set "
                     "train.pretrain_allow_geometry_mismatch=true only for "
                     "intentional cross-geometry transfer.")
-        result = bare.load_state_dict(sd, strict=strict)
+        if strict:
+            result = bare.load_state_dict(sd, strict=True)
+        else:
+            # 非 strict：只加载形状匹配子集。torch 的 strict=False 仅容忍键差异，
+            # 形状不同（典型：源任务 num_classes 不同→输出头尺寸变）仍会抛
+            # size-mismatch；迁移初始化的语义是跳过这些张量并明确告知。
+            shape_skipped = sorted(
+                k for k in sd
+                if k in own and getattr(sd[k], "shape", None) != own[k].shape)
+            if shape_skipped:
+                logger.warning(
+                    "Pretrain: %d key(s) skipped due to shape mismatch [%s]. "
+                    "These params keep their random init.",
+                    len(shape_skipped),
+                    ", ".join(shape_skipped[:8]) + (
+                        f", ... (+{len(shape_skipped) - 8} more)"
+                        if len(shape_skipped) > 8 else ""))
+            result = bare.load_state_dict(matched, strict=False)
         missing = list(getattr(result, "missing_keys", []) or [])
         unexpected = list(getattr(result, "unexpected_keys", []) or [])
+        if not strict:
+            # matched 已去掉 unexpected 键；补回真实的 unexpected 供日志。
+            unexpected = sorted(k for k in sd if k not in own)
 
         def _preview(keys, n=8):
             head = ", ".join(keys[:n])

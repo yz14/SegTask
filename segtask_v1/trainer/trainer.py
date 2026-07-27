@@ -321,7 +321,8 @@ class Trainer(BaseTrainer):
                 k: v for k, v in train_metrics.items()
                 if k.startswith("L_main") or k.startswith("L_aux_")
                 or k.startswith("w_aux_")
-                or k.startswith("L_res_") or k.startswith("L_aux_res_")}
+                or k.startswith("L_res_") or k.startswith("L_aux_res_")
+                or k in ("L_topo", "w_topo")}
             aux_msg = format_breakdown(aux_summary_dict)
             logger.info(
                 "Epoch %d/%d | LR=%.2e | loss=%.4f | val_dice=%.4f | "
@@ -612,6 +613,12 @@ class Trainer(BaseTrainer):
         out = {"loss": loss_meter.avg, "dice": dice_meter.avg}
         for name, meter in component_meters.items():
             out[name] = meter.avg
+        if nonfinite_steps > 0:
+            # 与 health monitor 是否开启无关都提示：跳过的步不进任何 meter。
+            logger.warning(
+                "Epoch %d: %d optimizer step(s) skipped due to non-finite "
+                "loss/grads (excluded from all meters).",
+                epoch + 1, nonfinite_steps)
         if self._health_monitor:
             try:
                 self._collect_health_metrics(
@@ -682,6 +689,19 @@ class Trainer(BaseTrainer):
     # ------------------------------------------------------------------
     # Checkpointing (kept on Trainer for inspect.getsource compatibility)
     # ------------------------------------------------------------------
+    def _ckpt_extra_state(self) -> Dict:
+        """随基类 ``_save_best`` / ``_save_latest`` 一并落盘的任务字段。
+
+        结构指纹使推理侧 ``_check_arch_fingerprint`` 对生产 best 路径生效
+        （此前仅周期 checkpoint 含指纹，默认推理用的 best_model.pth 无守卫）；
+        增强 RNG / best 追踪字段使从 latest resume 时状态完整。"""
+        return {
+            "arch_fingerprint": arch_fingerprint(self.cfg),
+            "augment_rng_state": self.augmentor.state_dict(),
+            "has_best": self.has_best,
+            "patience_counter": self.patience_counter,
+        }
+
     def _build_state_dict(self, ema_as_primary: bool) -> Dict:
         """打包训练状态。``ema_as_primary=True`` 时 ``model_state_dict`` 为 EMA，
         在线权重放到 ``model_online_state_dict``；反之方向。"""
@@ -794,11 +814,7 @@ class Trainer(BaseTrainer):
         if aug_rng:
             self.augmentor.load_state_dict(aug_rng)
             logger.info("Restored augmentation RNG state from checkpoint.")
-        if self._is_dist and self._rank > 0:
-            reseed_rank_rng(
-                self.cfg.train.seed, self._rank, self.start_epoch,
-                self.cfg.train.deterministic)
-
+        # rank>0 的 RNG 重分流已在 _restore_train_state 内完成，此处不重复。
         logger.info(
             "Resumed from epoch %d, best=%s=%s (patience=%d)",
             self.start_epoch, self.cfg.train.save_best_metric,

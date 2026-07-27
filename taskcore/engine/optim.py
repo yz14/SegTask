@@ -161,9 +161,16 @@ def build_scheduler(
     steps_per_epoch: int,
     post_warmup_steps: int,
 ):
-    """构造 warmup 之后的 base scheduler；horizon 按 ``post_warmup_steps`` 对齐。"""
+    """构造 warmup 之后的 base scheduler；horizon 按 ``post_warmup_steps`` 对齐。
+
+    时间轴约定：base scheduler 只在 warmup 结束后开始计步（见
+    :class:`WarmupScheduler`）。以"绝对轮数"表达的超参（``step_size``、
+    ``cosine_restart_period``）需扣除 warmup 偏移量换算到 base 时钟，否则
+    首次衰减/重启会整体后移 ``warmup_epochs`` 轮。cosine/poly 的 horizon
+    本就按 post-warmup 对齐（正好在训练末尾退火到底），无需换算。"""
     tc = cfg.train
     horizon = max(post_warmup_steps, 1)
+    warmup_steps = max(int(tc.warmup_epochs) * steps_per_epoch, 0)
 
     if tc.scheduler == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -173,9 +180,13 @@ def build_scheduler(
             optimizer,
             lr_lambda=lambda step: max(1 - step / horizon, 0.0) ** tc.poly_power)
     elif tc.scheduler == "step":
-        milestones = list(range(
-            tc.step_size * steps_per_epoch, horizon,
-            tc.step_size * steps_per_epoch))
+        # 里程碑按绝对轮数（k*step_size）生成，再换算到 base 时钟，
+        # 使首次衰减恰好落在配置的第 step_size 轮（而非 +warmup 轮）。
+        period = tc.step_size * steps_per_epoch
+        milestones = [
+            m - warmup_steps
+            for m in range(period, warmup_steps + horizon, period)
+            if m - warmup_steps >= 1]
         return torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=milestones, gamma=tc.step_gamma)
     elif tc.scheduler == "plateau":
@@ -185,7 +196,10 @@ def build_scheduler(
             optimizer, mode=plateau_mode, patience=tc.plateau_patience,
             factor=tc.plateau_factor)
     elif tc.scheduler == "cosine_warm_restarts":
-        T_0 = tc.cosine_restart_period * steps_per_epoch
+        # 首个重启对齐绝对第 cosine_restart_period 轮（扣除 warmup）；后续
+        # 周期沿用 T_0*T_mult^k 的 torch 语义（首周期缩短带来的整体前移
+        # ≤ warmup_epochs 轮，可接受）。
+        T_0 = tc.cosine_restart_period * steps_per_epoch - warmup_steps
         return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=max(T_0, 1), T_mult=tc.cosine_restart_mult,
             eta_min=tc.cosine_min_lr)
@@ -284,8 +298,41 @@ class WarmupScheduler:
         self.current_step = int(state.get("current_step", 0))
         base_state = state.get("base_scheduler", None)
         if base_state is not None and self.scheduler is not None:
-            base_state = self._reconcile_one_cycle_horizon(base_state)
+            if isinstance(self.scheduler,
+                          torch.optim.lr_scheduler.OneCycleLR):
+                base_state = self._reconcile_one_cycle_horizon(base_state)
+            else:
+                base_state = self._reconcile_base_hyperparams(base_state)
             self.scheduler.load_state_dict(base_state)
+
+    # base scheduler state 里属"训练进度"的键：resume 时从 ckpt 迁移；
+    # 其余键（T_max/eta_min/milestones/gamma/T_0 等超参）一律以新构建的
+    # scheduler（即当前配置）为准，防止旧 horizon 覆盖新配置（典型：加大
+    # epochs 续训后 cosine 已耗尽旧 T_max、LR 永久贴地）。
+    _BASE_PROGRESS_KEYS = frozenset({
+        "last_epoch", "_step_count", "_last_lr", "_is_initial",
+        "T_cur",                                   # CosineAnnealingWarmRestarts
+        "num_bad_epochs", "cooldown_counter", "best",  # ReduceLROnPlateau
+    })
+
+    def _reconcile_base_hyperparams(self, base_state: Dict) -> Dict:
+        """resume 语义：进度键从 ckpt 迁移，超参键取当前配置；有漂移则告警。"""
+        fresh = self.scheduler.state_dict()
+        merged = dict(base_state)
+        drifted = []
+        for k, fresh_v in fresh.items():
+            if k in self._BASE_PROGRESS_KEYS:
+                continue
+            if k in merged and merged[k] != fresh_v:
+                drifted.append(f"{k}: ckpt={merged[k]!r} -> cfg={fresh_v!r}")
+            merged[k] = fresh_v
+        if drifted:
+            logger.warning(
+                "Base scheduler hyperparameter drift on resume (%s). "
+                "Keeping the freshly built values from the current config; "
+                "only training progress (last_epoch etc.) is restored from "
+                "the checkpoint.", "; ".join(drifted))
+        return merged
 
     def _reconcile_one_cycle_horizon(self, base_state: Dict) -> Dict:
         """OneCycleLR 的 total_steps 在构建时定死；resume 时若 epochs/累积/数据量

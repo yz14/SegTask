@@ -30,7 +30,8 @@
 - **完成后**:总结本轮成果与后续计划。
 
 
-本地测试环境为: **D:\miniconda\envs\torch27_env\python.exe**。  
+本机环境为: **D:\miniconda\envs\torch27_env\python.exe**  
+本机账户为: **yz-laptop\yzzz**  
 
 
 内容（**注意**：需查看各自对应readme/design/workflow文档理解设计）：  
@@ -914,7 +915,362 @@ S6-C 与 S1-「推理侧无训推镜像契约校验」、S4-A（架构指纹）�
 S6-A 的正解（oob → wmap=0）依赖 S2-A 的修法（dataset 恒定输出 wmap），两者必须同批，否则会在"部分样本有 wmap"的数据上触发 default_collate 的 KeyError。
 
 S7	训练（一）引擎与工程件	engine/base_trainer.py、optim.py、amp.py、checkpoint.py、prefetch.py、dist_utils.py、memory.py、launch.py	S1
+审查报告：训练（一）引擎与工程件
+本轮遵守：只审不改（未产生任何代码/文档改动）；结论均给 文件:行号；关键判断用 D:\miniconda\envs\torch27_env\python.exe（torch 2.7.1+cu126 / RTX 3080 Ti Laptop）实测复现，脚本写在 %TEMP%\s7_probe，未落工作区；库用法只写本机实测可验证的部分，未联网核实项已显式标注。
+
+本轮范围：base_trainer.py(1126)、optim.py(350)、amp.py(110)、checkpoint.py(357)、prefetch.py(92)、dist_utils.py(155)、memory.py(88)、launch.py(150)，以及它们在 trainer.py / train.py / io.py 上的真实调用点。任务层编排（pipelines/views/breakdown）属 S8、损失/验证/选模口径属 S9、bn_stats.py 的推理侧用法属 S10，本轮只在契约交界处引用。
+
+① 事实梳理
+装配顺序（seg 实际调用链）：Trainer.__init__ → model.to(device) → _setup_channels_last(@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:89-90) → pipeline/loss → _setup_optim_sched / _setup_amp / _setup_ema / _setup_swa(:118-123) → _maybe_compile(:127) → _setup_ddp / _setup_train_sampler(:134-135) → augmentor → _setup_best_tracking → _setup_output_dir → AsyncCheckpointSaver(:171-172) → resume/pretrain(:177-195) → _setup_monitor。顺序契约（compile 必须在 optimizer/EMA 之后、DDP 在 compile 之后）在基类 docstring 里写明（@d:/codes/work-projects/SegTask/taskcore/engine/base_trainer.py:1-22、219-225、906-913），seg 逐行遵守。
+
+四个真实契约：
+
+优化步时钟单一化：_optimizer_step_boundary(base_trainer.py:337-466) 是全部五任务唯一的边界实现，返回 OptimStepResult 且强制 acknowledge()（:79-122、:366-373）；_check_boundary_scheduler_clock(:478-504) 在运行期断言"scheduler 每边界推进次数 = 语义期望"，漂移即 RuntimeError。
+跳步语义按 amp_dtype 分叉：fp16 交给 GradScaler 内部跳步；bf16/fp32 用 all_reduce_flag_any(dist_utils.py:73-85) 统一各 rank（base_trainer.py:397-402）。
+checkpoint 槽位：_save_best(:575-629) EMA 为 primary + model_online_state_dict；_save_latest(:631-662) 全状态；_restore_train_state(:667-713) 统一读回并按 (seed, epoch, rank) 重分流 RNG(:706-712)。ZeRO 的 consolidate_state_dict 一律放在 rank 早退之前（:635-640、trainer.py:745-751）。
+单卡零变化：dist_utils 全部查询在未 init PG 时退化为 rank=0/world=1（:31-58），CudaPrefetcher 非 CUDA 直接透传（prefetch.py:57-60）。
+梯度累积：_effective_accum(:277-285) 给尾组用真实尾长作分母。实测（accum=4）：total=13 → [4×12, 1]、total=14 → [4×12, 2, 2]，每组 Σ1/eff 恒为 1.000，口径正确。
+
+② 正确性问题
+严重
+[S7-A] best_model.pth 不含 arch_fingerprint —— S4-A/S5-G 的唯一守卫在默认推理路径上恒失效
+
+seg 的周期 ckpt 已经写了指纹与增强 RNG（trainer.py:712-715），但落盘 best 的是基类 _save_best(base_trainer.py:596-607)，state 里没有这两项；_save_latest(:642-655，cls/det 用）同样没有。而推理 CLI 默认就取 best_model.pth（@d:/codes/work-projects/SegTask/segtask_v1/predict.py:68-74），_check_arch_fingerprint 在缺指纹时静默 return（@d:/codes/work-projects/SegTask/segtask_v1/predictor/io.py:81-83）。实测：
+
+
+
+best keys   : ['best_epoch','best_metric','config','ema_state_dict','epoch',
+               'metrics','model_online_state_dict','model_state_dict']
+latest keys : [... 'optimizer_state_dict','rng_state','scaler_state_dict','scheduler_state_dict']
+best has arch_fingerprint  : False        latest has arch_fingerprint: False
+_check_arch_fingerprint(best_model.pth, 改过 decoder_type 的 cfg) -> PASSED（无守卫）
+_check_arch_fingerprint({'arch_fingerprint': fp}, 同一 cfg)      -> 正确拒绝
+即守卫本身写对了、也确实能拦（正控通过），但它唯一能生效的载体是"周期 checkpoint"，而生产推理用的是 best。结论：S4-A 描述的"maxpool/avgpool + 1×1 下 stride 漂移能 strict-load 成功、输出 maxdiff 0.39"这一场景，在默认工作流下至今没有任何拦截。根因是保存路径有两份实现（基类 _save_best/_save_latest 与 seg 的 _build_state_dict），指纹只补进了后者。
+
+[S7-B] resume 时 base scheduler 的超参被 ckpt 覆盖新配置：改 epochs 续训会让 LR 立刻并永久停在 cosine_min_lr
+
+WarmupScheduler.load_state_dict(optim.py:263-288) 只对 warmup 三参数做漂移告警，随后把 ckpt 的 base state 整体灌回；而 PyTorch 的 CosineAnnealingLR.state_dict() 包含 T_max/eta_min、MultiStepLR 包含 milestones/gamma。作者显然知道 horizon 漂移问题——但只给 OneCycle 写了 _reconcile_one_cycle_horizon(:290-314)。实测（100 epoch 训练到 30 epoch，改配置为 epochs=300, cosine_min_lr=1e-8 续训）：
+
+
+
+ckpt   base: T_max=9500  eta_min=1e-06  last_epoch=2500
+fresh  base: T_max=29500 eta_min=1e-08          （新配置）
+load 后    : T_max=9500  eta_min=1e-06          <-- ckpt 覆盖新配置
+续训 1 epoch 后 lr = 1.000e-06                   <-- 已耗尽旧 horizon，剩余 270 epoch 全程贴地
+--- 同一操作在 poly 下 ---   lr = 9.203e-04      （horizon 在闭包里，跟随新配置）
+--- 同一操作在 step 下 ---   milestones {5000:1}/gamma 0.1 覆盖掉新配置的 {1000..9000}/0.5
+后果："训练不够 → 加大 epochs 后 resume"这一最常见操作，在默认 scheduler=cosine 下等于用 1e-6 的学习率白跑 270 个 epoch，且只字不提示。同一语义在 poly / cosine / step / one_cycle 上有三种不同行为，是"同一契约四份实现"的典型。
+
+中等
+[S7-C] 允许从 best_model.pth resume，但 optimizer/scheduler/scaler/RNG 全部静默缺失
+
+_restore_train_state 用 if key in ckpt 逐项跳过缺失状态（:681-685），start_epoch 照常取 epoch+1（:705），全程无告警。实测（从上面那份 best ckpt 恢复）：
+
+
+
+start_epoch=4  best_metric=0.8  has_best=True
+scheduler.load_state_dict called: False   (ckpt has scheduler? False)
+optimizer state entries after restore: 2  (旧 optimizer 状态残留，未重置)
+-> 没有任何关于缺失 optimizer/scheduler/scaler/RNG 的告警
+用户会得到"从第 5 epoch 继续"的假象，实际是：LR 回到 warmup 起点、Adam 动量丢失、RNG 不连续。train.resume 的语义（"全状态恢复"，trainer.py:175-176）在这条路径上不成立，且缺一条"ckpt 必须含 optimizer_state_dict 否则告警/拒绝"的判据。
+
+[S7-D] pretrain_strict=False 仍会因形状不匹配硬失败；代码算出的 matched 只用于 0-match 判定
+
+base_trainer.py:739-746 精心算出了形状匹配子集 matched，但 :763 加载的是完整 sd。实测（torch 原生语义）：
+
+
+
+b.load_state_dict(sd, strict=False) -> RuntimeError: size mismatch for 1.weight ...
+即 strict=False 只容忍"键缺失/多余"，不容忍形状不同。用户最常见的迁移需求（源任务 num_classes 不同 → 头形状不同）会直接崩，而报错是底层 size-mismatch，不是本层的迁移指引式报错。这与同一函数里 _preview 精心打印 missing/unexpected 的用心（:767-781）自相矛盾。
+
+[S7-E] warmup 与 base scheduler 的时间轴错位：step / cosine_warm_restarts 的里程碑整体后移，且数量少一次
+
+WarmupScheduler.step(:232-240) 在 warmup 段完全不推进 base scheduler，因此 build_scheduler 里按 steps_per_epoch 算的绝对里程碑（optim.py:176-180、:188）实际以"warmup 结束"为原点；同时 range(step, horizon, step) 的上界是 horizon（已扣掉 warmup）。实测（epochs=100, spe=100, warmup=5, step_size=50）：
+
+
+
+step   lr@ep49=1.0e-03  lr@ep50=1.0e-03  lr@ep55=1.0e-04   # 声明第 50 衰减，实际第 55；100 epoch 内只衰减 1 次
+cosine_warm_restarts  lr@ep50=2.5e-05  lr@ep55=1.0e-03     # 声明周期 50，实际第 55 才重启
+配置注释写的是 "step_size: 衰减间隔（epoch）"（configs/seg2_5d.yaml:325），与实际语义不符。cosine/poly 因 horizon 就定义为 post-warmup 而不受影响——即同一个 warmup_epochs 对不同 scheduler 含义不同。
+
+[S7-F] warmup_epochs >= epochs 无任何校验，max(post_warmup, 1) 把负 horizon 静默吞掉
+
+optim.py:166 的 horizon = max(post_warmup_steps, 1)。实测（epochs=10, warmup_epochs=20, spe=5）：
+
+
+
+post_warmup_steps = -50  ->  T_max = 1
+整个训练结束时 lr = 5.005e-04（只爬到 base_lr 的一半，warmup 永远没走完，退火段从未存在）
+配置层对 warmup_epochs 与 epochs 的关系零校验（见 S7-I）。
+
+[S7-G] Windows（本仓主力环境）上多卡 DDP 不可用：backend 硬编码 nccl
+
+init_ddp_worker 无条件 backend="nccl"（@d:/codes/work-projects/SegTask/taskcore/engine/launch.py:131-133），入口只判 cuda_ok and len(gpus) >= 2（@d:/codes/work-projects/SegTask/segtask_v1/train.py:139）。本机实测：
+
+
+
+nccl_available= False   gloo= True   mpi= False
+即在 Windows 上配 train.gpus: [0,1] 会 spawn 后在 init_process_group 崩溃，而不是给出"该平台请用 gloo / 单卡"的前置提示。附带：install_parent_death_signal 在非 Linux 直接 no-op（launch.py:63-64），install_term_handlers(:77-89) 在 Windows 上对 taskkill 无效——即孤儿进程/占卡兜底这一整套工程件在主力平台上是空的。
+
+[S7-H] "异常隔离"与集合通信冲突：单 rank 异常会把整作业挂到 NCCL 超时
+
+三处：① fit 用 try/except 包住 _finalize_swa（trainer.py:379-388），而 _finalize_swa 内部的 validate_fn 与 _swa_recalibrate_bn→all_reduce_bn_running_stats_（base_trainer.py:846-847）都是集合通信；② _finalize_swa 自身又对 validate_fn 再包一层 except Exception（:878-884）；③ self._ckpt_saver.close() 抛出会直接跳过收尾 barrier()（trainer.py:390-395）。任一 rank 走进 except 而其它 rank 仍在集合调用里，就是死等。实测 saver 侧的失败语义：
+
+
+
+wait() raised: RuntimeError -> RuntimeError('Parent directory ... does not exist')
+close() on failed queue raised: RuntimeError
+worker thread still alive after failed close(): True     # sentinel 未入队，后台线程泄漏
+close()(checkpoint.py:223-227) 先 wait() 再放 sentinel，wait() 抛出后线程永不退出（daemon 兜底但语义已破）。
+
+[S7-I] train 段的引擎旋钮零区间校验（连续第七轮的同族问题）
+
+实测 21/21 非法值全部被 sync()+validate() 接受：
+
+
+
+ACCEPTED: epochs=0 / epochs=-5 / warmup_epochs=1000 / warmup_epochs=-3
+ACCEPTED: lr=-1.0 / lr=0.0 / weight_decay=-1.0 / momentum=5.0 / grad_clip_norm=-3.0
+ACCEPTED: ema_decay=1.5 / ema_decay=-0.2 / grad_accum_steps=0 / grad_accum_steps=-4
+ACCEPTED: poly_power=-2.0 / step_size=0 / plateau_factor=2.0 / cosine_min_lr=1.0(>lr)
+ACCEPTED: save_every=0 / val_every=0 / swa_bn_update_steps=-1 / early_stopping=-5
+可观测后果（实测）：epochs=0 + one_cycle → ValueError: Expected positive integer total_steps 于 build_scheduler（发生在 npz 扫描/dataloader 装配之后）；val_every=0 / save_every=0 → trainer.py:277 / :359 的 (epoch+1) % 0 ZeroDivisionError（第一个 epoch 末）；ema_decay=1.5 → 5 步后 shadow 从 1.0 发散到 -5.594，而 EMA 权重正是 best/部署槽位。对照：ema_device/swa_start_ratio 已有校验（core.py:2344-2351）并有专门回归（tests/test_todo_p_regressions.py:237-255），说明位置和手法都是现成的，只是覆盖面停在了两条。
+
+[S7-J] ema_device="cpu" 的代价比配置注释暗示的高一个量级
+
+core.py:881-884 写"每步多一次 GPU→CPU 参数拷贝（异步 + 一次流同步），数学与 '' 严格等价"，未给量级。实测（47.22M 参数模型 / patch [16,128,128] / B=2 / bf16）：
+
+
+
+fwd+bwd                        : 101.64 ms
+ema.update (same-device)       :   3.52 ms
+ema.update (offload cpu)       :  57.13 ms      <-- 16.2× ，相当于 fwd+bwd 的 56%
+optimizer.step (fused adamw)   :   6.02 ms
+_global_grad_norm / clip+float :   6.31 / 7.56 ms
+_global_weight_norm (每 epoch) :   3.80 ms
+_param_snapshot (health, 每 epoch): 15.36 ms
+根因在 ModelEMA.update 的 staging 路径每步一次全量 D2H + torch.cuda.current_stream().synchronize()（@d:/codes/work-projects/SegTask/taskcore/utils/common.py:113-121）。省 1× 参数显存（47M×4B≈180 MiB）换 55% 的步时开销，这个折衷应该写进注释并给出"每 k 步 offload 一次"的替代。
+
+轻微
+问题	位置	说明
+grad_norm_lazy_sync 只覆盖实际不用的路径	base_trainer.py:317-322 + core.py:838-843	实测矩阵：fp16+clip+lazy → no-sync；bf16 四种组合全部 SYNC（含 clip=0）。配置默认 amp_dtype: auto → Ampere+ 解析为 bf16，故该开关在生产路径上恒无效。文档口径诚实，但等于给了一个用不上的旋钮
+bf16 下 clip=0 仍每步算全局范数	:323-324	是非有限守护所需（不是浪费），但没有"我信任数据、关掉守护"的档位；成本实测 6.31 ms/步
+DDP 下 rank0 与其它 rank 的边界控制流不同	:325-334 vs _setup_monitor:1026-1028	_health_monitor 仅 rank0 为 True → 只有 rank0 会在 fp16+无 clip 时 scaler.unscale_。当前数值一致，但"rank 间不同分支"是危险模式
+_save_best EMA 分支做两份全量 CPU clone	:584-591	online + primary 各一份；47M 模型即 2×180 MiB CPU 峰值 + 两次全量 D2H，同步写盘路径其实只需要一份
+ckpt 里存的是 CUDA 张量（同步写盘路径）	:624-626、:642-655	只有 async 路径走 state_to_cpu；无 GPU / 少卡机器上 torch.load 不带 map_location 会失败（本仓调用点都带，属对外契约缺口）
+reseed_rank_rng 在 resume 时被调用两次	:709-712 与 trainer.py:797-800	参数完全相同，幂等但重复；说明基类与任务层职责边界没划清
+_load_pretrain_weights 直接 map_location=self.device	:733	大 ckpt 全量落 GPU，瞬时 +1× 参数显存；map_location="cpu" 即可
+_param_groups 只在构造期过滤 requires_grad	optim.py:30-33	后续解冻的参数永远不进优化器（seg 无冻结策略，cls/det 有渐进解冻风险）
+betas/eps/dampening 不可配	optim.py:84-101	AdamW 的 betas 在大 batch / 长训练上是常调项
+nesterov=True + momentum=0 运行期崩	optim.py:97-98，core.py:812-813	实测 ValueError: Nesterov momentum requires a momentum and zero dampening；配置层不拦
+plateau 的 mode 从 save_best_mode 推导但 metric 由调用方给	optim.py:181-186 vs trainer.py:286-288	混合 evaluator 的 medium 轮次传 None 跳过，语义对；但 plateau_patience 的单位是"验证次数"而非 epoch，只写在 YAML 注释里
+one_cycle 的 step 预算零余量	optim.py:192-201	实测 30/30 正好用完，第 31 次即 ValueError: Tried to step 31 times；且 YAML 注释说"one_cycle 下 warmup_epochs 必须 0"，而实现恰恰用它映射 pct_start（设 0 → pct_start=2/total，实测 lr@ep1 已是 9.998e-4，等于没有 warmup）
+GroupWarmupScheduler 无生产消费者	optim.py:317-345	grep 仅 cls/det 侧引用差分学习率路径；seg 恒用父类
+estimate_train_memory 漏项	memory.py:73-84	不含 DDP 通信 bucket（gradient_as_bucket_view=False 时约 +1× 梯度）、不含 fused AdamW 的 per-param step 张量、不含 _param_snapshot 的健康监测峰值
+find_free_port 存在 TOCTOU	launch.py:39-51	bind→close→返回端口号，8 次重试也不能消除竞态；ddp_master_port 显式配时才确定
+AsyncCheckpointSaver._error 只保留最后一个	checkpoint.py:204-208	多次失败只抛一次；submit 在错误后照常入队
+_prune_old_checkpoints 在后台线程里执行	trainer.py:756-761	与主线程的下一次写盘并发；当前按 epoch 号排序删除，暂无竞态后果，但没写成契约
+_strip_compile_prefix / strip_common_prefixes 两份	checkpoint.py:273-290 与 :293-299	前者是后者的子集；与 S3「cube 抽取两份实现」、S5-H 同型
+compute_loss_fp32 恒用 device_type="cuda"	amp.py:94	CPU-only 运行时构造 CUDA autocast 上下文（enabled=False 故无害），但语义上应跟随实际 device
+③ 合理性与设计评价
+做得好的（建议固化为契约）
+优化步边界的"单一实现 + 运行期护栏"（base_trainer.py:337-504）：OptimStepResult 的强制 acknowledge 把"调用方必须看见跳步结果"变成了可执行约束，_check_boundary_scheduler_clock 把"scheduler 时钟语义"变成了每步自检。配套元测试（tests/test_todo_p_regressions.py:340-362）用 AST 断言五个 Trainer 的 _train_epoch 必须调用该边界并 ack —— 这是本轮见到的最成熟的一处设计，明显强于 S1–S6 中那些"同一语义三份副本"的模块。
+bf16/fp32 的跨 rank 跳步一致性（:397-402 + dist_utils.py:73-85）：显式指出"fp16 由 scaler 内部保证一致、bf16 必须 all-reduce(any)"，并把理由写在注释里。DDP 副本一致性这条不变量，很多同类框架是靠运气维持的。
+原子写 + RNG bytes 打包 + 优化器状态回迁（checkpoint.py:27-44、49-105、127-153）：state_to_cpu 专门识别 RNG 字典走 bytes 路径以免 clone() 破坏 ByteTensor 语义（:47-56、:156-175），relocate_optimizer_state 处理 fused Adam 在 resume 后状态分裂在 CPU/GPU 的问题。这三点都是"踩过才知道"的坑。
+ZeRO consolidate 的调用位置（:635-640、trainer.py:745-751）：注释明确写了"必须在 rank 早退之前，否则 rank0 崩溃 / 其它 rank 挂死"。集合通信与早退的顺序陷阱被显式处理。
+dist_utils 的"单卡零分支"设计（:31-58）：调用方无需写 if dist:，all_reduce_bn_running_stats_(:88-114) 还按 num_batches_tracked 加权、all_reduce_meters_(:130-142) 一次打包 reduce，都取了正确的可加量。
+CudaPrefetcher 的流语义（prefetch.py:74-91）：wait_stream + 逐张量 record_stream 的组合是 PyTorch 官方推荐的跨流生命周期写法。实测完整性/顺序/非张量透传/空 loader/CPU 透传均正确：n_yielded=5 values=[0,1,2,3,4] pids=[p0..p4] devices={cuda:0}。
+_effective_accum 的尾组分母（:277-285）：实测每组 Σ1/eff=1.000，避免尾组样本权重被系统性压低——这是一个大多数实现直接忽略的细节。
+结构性问题
+checkpoint 保存有两份真相源，且已经分化（S7-A 的根因）：基类 _save_best/_save_latest(:575-662) 与 seg 的 _build_state_dict(trainer.py:685-732) 并存，后者独有 arch_fingerprint / augment_rng_state / has_best / patience_counter。也就是说 S4-A（架构指纹）与 S6-C（增强 RNG）的修法都只落在了任务层的那一份上；cls/det 走 _save_latest 则两项都没有。checkpoint.py:1-8 的模块 docstring 声称"公共保存/恢复主流程已下沉 BaseTrainer，任务侧只是薄封装"——事实是任务侧那份才是最完整的。
+scheduler 的"时间轴"没有单一定义：steps_per_epoch/warmup_steps/horizon 三个量在 _setup_optim_sched(:168-191) 算一次、build_scheduler(:158-202) 里各分支各自解释一次、_optimizer_step_boundary(:380-383) 又算一次 _planned_optimizer_steps，load_state_dict 再来一次 reconcile（且只对 one_cycle）。S7-B/S7-E/S7-F 全是同一根因。与 S1「几何真相源 3 份 stem-stride 副本」、S4「decoder 节点数三份」同型——本轮是时间轴维度的同一病。
+"跨运行边界"的状态完整性没有统一清单：ckpt 里到底必须有什么、缺了怎么办，散在 _restore_train_state 的四个 if key in ckpt(:679-697)、WarmupScheduler.load_state_dict 的三条漂移告警(:264-282)、ModelEMA.load_state_dict 的 key 不匹配重建(utils/common.py:176-197)。缺任何一项都不报错（S7-C）。应当有一个 REQUIRED_RESUME_KEYS + 一个"resume 前比对 ckpt 指纹与当前 config"的统一入口，与 S7-A 同批。
+异常隔离策略与分布式语义没有分层：_setup_monitor / _monitor_* 的隔离是对的（纯 rank0 副作用，:967-1087），但同样的 except Exception 手法被套用到了含集合通信的 _finalize_swa / 健康监测上（S7-H）。规则应该是："隔离只能用于 rank-local 且无集合通信的代码；含集合通信的失败必须全 rank 一致地传播"。
+配置层与引擎层的校验责任真空：引擎侧的 _setup_amp(:201-204)、build_optimizer(:102)、build_scheduler(:202) 都有兜底 ValueError，但都发生在数据扫描/npz 构建/模型装配之后；配置层则完全不管数值区间（S7-I）。这已经是 S1-「amp_dtype/compile_mode 无枚举校验」、S2-G、S3-D、S4-C、S5-C、S6-F 之后的第七轮。
+健康监测的成本模型与开关粒度不匹配：health_monitor 默认 True（core.py:1301），它同时控制"是否算 grad_norm"（每步）、"是否算 weight_norm"（每 epoch 3.8 ms）、"是否做 _param_snapshot"（每 epoch 15.4 ms + 瞬时 1× 参数显存）。三者成本差两个量级却共用一个总开关（health_update_ratio 只额外细分了一项）。
+torch.compile 与 DDP 的包装顺序被写死为 DDP(compile(model))（:243 → :925-930）：这样 self.model 保持裸/已编译模块、optimizer/EMA/ckpt 全部作用其上（这个理由充分且注释写清了），代价是 dynamo 的 DDPOptimizer（本环境 torch._dynamo.config.optimize_ddp=True 为默认）只在编译 DDP 模块的布局下生效，当前布局拿不到按 bucket 切图带来的 allreduce/计算重叠。此条落地前需查 torch 2.7 最新官方文档确认语义，本轮只做记录。
+④ 优化空间（含 GPU / 吞吐 / 显存）
+基准：47.22M 参数 UNet、patch [16,128,128]、B=2、bf16、单卡 3080 Ti Laptop，fwd+bwd = 101.6 ms/步。
+
+#	优化	预估收益	风险
+1	把"非有限守护"改成设备端标志：gn 不 .item()，用 torch.isfinite(gn) 与跳步 flag 拼成一个张量做一次 all-reduce，仅在真正跳步时同步	消除 bf16 路径每边界的 D2H（实测 6.3 ms/步 ≈ fwd+bwd 的 6.2%）与一次独立 all_reduce_flag_any；让 grad_norm_lazy_sync 对 bf16 真正生效	低；数值不变，但 grad_norm 日志值需改为异步回取
+2	_save_best 同步写盘路径去掉两次全量 CPU clone（:584-591），只在 _ckpt_saver is not None 时深拷	每次 best 少 2×180 MiB CPU 峰值 + 两次全量 D2H	低；async 路径行为不变
+3	ModelEMA CPU offload 改为"每 k 步 offload / 用独立 copy stream + 事件而非 current_stream().synchronize()"	实测 57.1 → 目标 ≈5 ms/步（当前占 fwd+bwd 的 56%）	中；每 k 步会改变 EMA 数学（需作为新枚举 ema_offload_every，默认 1 保旧）
+4	ModelEMA.update 用 torch._foreach_lerp_(shadow, live, 1-decay) 替代 mul_ + add_（utils/common.py:124-125）	每步少一遍全量读写（同设备路径实测 3.5 ms 里约一半是带宽）	低；lerp 与 mul+add 有末位差异，需回归比对
+5	_param_snapshot(:539-541) 改为对分层抽样参数计算 update_ratio	每 epoch 省 15.4 ms 与瞬时 1× 参数显存（大模型上是 OOM 边缘的最后一根稻草）	低；比值口径变为抽样估计，需在日志标注
+6	DDP 通信压缩：ddp_comm_hooks.default_hooks.bf16_compress_hook（本环境实测可导入）	fp32 梯度 all-reduce 通信量减半，多卡带宽受限时收益直接	中；改变梯度数值（bf16 舍入），需与 grad_clip 口径联合验证
+7	estimate_train_memory 补 DDP bucket 项与 activation 提示	启动期预算不再系统性低估（当前多卡下少算约 1× 梯度）	极低
+8	_load_pretrain_weights 改 map_location="cpu" + 只加载 matched（配合 S7-D 的新档位）	迁移时少一份 GPU 峰值；跨 num_classes 迁移可用	低
+9	用 torch.distributed.checkpoint.async_save（本环境实测存在）替代自研 AsyncCheckpointSaver	少一份自研并发代码（S7-H 的线程泄漏、错误语义都随之消失），且天然支持分片保存	中；ckpt 布局会变，需保留旧格式读路径
+⑤ 2026 可借鉴项
+说明：下表中标注"本机实测存在"的 API 已在 torch 2.7.1+cu126 上验证可导入；其余为方向性对标，本轮未联网核实，落地前会先查各自最新官方文档，不凭记忆写实现。
+
+方案	借鉴点	适配代价	优先级
+WSD / warmup-stable-decay 与 schedule-free 优化（Defazio 2024 及 LLM 侧 2024–25 共识）	直击 S7-B：这类调度没有"固定 horizon"，续训/延长训练不需要 reconcile；stable 段可任意延长，只在末段退火。本仓的 _reconcile_one_cycle_horizon 是在给固定 horizon 打补丁	中（新 scheduler 枚举 + resume 语义定义）	高
+torch.optim.swa_utils.AveragedModel + get_ema_multi_avg_fn（本机实测存在）	替代自研 ModelEMA/ModelSWA：官方实现已有 use_buffers、multi_avg_fn（foreach）、device 参数，且与 AveragedModel.update_parameters 的 BN 重估工具链（update_bn）配套	中（需保留现有 ckpt 的 {shadow, decay, num_updates} 布局兼容）	中高
+torch.distributed.checkpoint + async_save（本机实测存在）	替代 AsyncCheckpointSaver（S7-H）；分片保存/加载对 ZeRO/FSDP 是必需的，且社区已把"训练状态完整性"标准化	中	中
+架构+训练状态指纹作为 ckpt 一等公民（nnU-Net plans/data_identifier 思想，S3-⑤/S4-⑤ 已提）	解 S7-A/S7-C：把 arch_fingerprint 从任务层上提到 _save_best/_save_latest，并加 REQUIRED_RESUME_KEYS；这是唯一能覆盖"stride 漂移形状查不出"的手段	低（纯新增，seg 已有现成 arch_fingerprint(cfg)）	最高
+nnU-Net Revisited（arXiv:2404.09556）的优化基线：SGD+Nesterov(0.99) + poly(0.9) + 无 warmup	本仓默认 AdamW+cosine+5 epoch warmup；nnU-Net 在同规模 3D 分割上长期以 SGD-poly 为最强基线。建议把两者做成可切换的"优化预设"，并把 S7-E 的里程碑错位一并消除（poly 不受 warmup 错位影响）	低（字段已全有）	中高
+bf16_compress_hook / PowerSGD 等 DDP 通信钩子（本机实测存在）	本仓 DDP 装配（:920-930）完全没有暴露 comm hook 接口，多卡带宽是分割任务的常见瓶颈	低（fwd_model.register_comm_hook 一行）	中
+CUDA Graphs / torch.cuda.make_graphed_callables（本机实测存在）	小 patch、高步频（2.5D slab）场景下，本轮实测 optimizer.step 6.0 ms + EMA 3.5 ms + grad-norm 6.3 ms ≈ 16 ms/步的"非计算开销"，graph capture 可大幅压缩	高（需固定形状 + 与 AMP/DDP 协同）	低-中
+FSDP2 / DTensor 替代 ZeRO-1	当前 ZeroRedundancyOptimizer（optim.py:54-77）只分片优化器状态；3D 分割的瓶颈通常是激活而非参数，故优先级不高，但 ModelEMA docstring 已声明"不兼容 FSDP"（utils/common.py:41），若将来上 FSDP 这条要一起改	高	低
+⑥ 与既有测试 / 契约的冲突检查
+S7-A（best 加指纹）：纯新增字段。tests/test_todo1_batch2_fixes.py:57-63 只断言 model_state_dict 全部在 CPU，不检查 key 集合；全仓无用例断言 best 的 key 集合（grep arch_fingerprint 在 tests 下零命中）→ 无冲突。副作用：历史 best（无指纹）仍走 io.py:81-83 的兼容分支，不受影响；新 best 会让"训练后手工改 downsample_strides/decoder_type 再推理"从静默变报错，需 CHANGELOG 明示，逃生门沿用 S4-⑥ 建议的 --allow-geometry-drift 命名风格。
+S7-B（scheduler horizon）：全仓无用例断言 base scheduler 的 T_max/milestones（grep 仅命中 WarmupScheduler 的构造与 ack 协议测试 tests/test_todo_p_regressions.py:411-471，只看 current_step 与推进次数）→ 无断言冲突。修法建议泛化现成的 _reconcile_one_cycle_horizon：只从 ckpt 迁移"已走进度"，超参一律用新构建的 scheduler；这会改变所有"改配置后 resume"的 LR 轨迹，需 CHANGELOG，且按"legacy 默认保旧"原则可先出 WARNING（列出 ckpt vs cfg 的差异项），下一版再切默认。
+S7-C（resume 完整性）：纯新增告警/fail-fast。tests/test_round2_fixes.py:813-822 只断言 rng_state 出现在保存与恢复路径的源码里，tests/test_swa_lka.py:237-240 只断言 swa_state_dict 随行 → 无冲突。若升级为"缺 optimizer_state_dict 即拒绝 resume"，会拒掉"拿 best 当 pretrain 用但填进了 train.resume"的既有用法，宜先 WARNING 并提示改用 train.pretrain。
+S7-D（pretrain 形状容忍）：tests/test_todo1_batch5_fixes.py:26-32 用 strict=True，不受影响。改成"只加载 matched"会改变 strict=False 的语义（从报错变为静默跳过），建议作为第三档 pretrain_strict: "shape_tolerant" 落地并强制打印被跳过的键，而不是改现有两档的行为。
+S7-E / S7-F（warmup 时间轴）：tests/test_review_batch1_fixes.py:61-68 只对 _optimizer_step_boundary 的源码做 token 断言；无用例断言 LR 数值轨迹 → 无断言冲突。但修正 step/cosine_warm_restarts 的里程碑原点会改变既有训练曲线，按"legacy 默认保旧"应作为新开关（如 scheduler_milestone_origin: legacy|absolute）。S7-F 属纯新增校验，零风险。
+S7-G（Windows/nccl）：无测试覆盖（CI 未跑多卡）。建议 train.py:139 加平台/后端可用性前置判定并给出明确指引，属纯新增 fail-fast。
+S7-H（异常隔离 vs 集合通信）：tests/test_review_batch1_fixes.py:159-167 只断言 AsyncCheckpointSaver 用原子写；tests/test_swa_lka.py:167-240 的 SWA 端到端跑在单进程 CPU 上，不涉及集合通信 → 修正（把 _finalize_swa 的异常改为全 rank 一致传播 / close() 失败后仍放 sentinel）不破坏任何现有断言。
+S7-I（train 段校验）：纯新增 fail-fast。tests/test_todo_p_regressions.py:237-255 已确立"train 段校验必须写在 _validate_train 内，不得随 skip={'loss','predict'} 被跳过"的先例，新增校验应放同一处，否则会重演 S1-E。风险点：epochs=0 目前被若干冒烟脚本用作"只建不跑"的捷径（需 grep 确认后再定是否拒绝）。
+S7-J（EMA offload 代价）：纯文档/新开关，tests/test_round2_fixes.py:261-298 只断言 apply/restore 原地换入的幂等性 → 无冲突。
+与 S1–S6 的一致性：
+
+S
+与 S1–S6 的一致性（承上，⑥ 收尾）：
+
+S7-A 与 S4-A / S5-G 同批：三者是同一条链——算子侧 stride 不进权重形状（S5-G）→ 装配侧无指纹（S4-A）→ 保存侧 best 不落指纹（S7-A）。前两轮的结论在本轮被证实为"守卫已写好但没装在生产路径上"，应作为一个批次落地（_save_best/_save_latest 补 arch_fingerprint）。
+S7-B / S7-C 与 S6-C、S1-「推理侧无镜像校验」同族："落盘状态不完整 / 跨运行边界失效"。三者都是往 ckpt 补元数据 + 加回读校验，可同批。
+S7-I 是"启动期缺前置校验"族的第七轮（S1-amp_dtype、S2-G、S3-D、S4-C、S5-C、S6-F、S7-I）。S12 应把它单列为一个跨模块批次：一次性补齐所有段的枚举/区间校验，并加一条元测试"每个配置字段必须有校验器与消费者"。
+S7-E/S7-F/S7-B 与 S1「几何真相源三份」、S4「decoder 节点数三份」同型，只是维度从"几何"换成"时间轴"：建议引入 training_schedule(cfg, len(loader)) 单一派生函数，输出 steps_per_epoch / warmup_steps / horizon / planned_steps，供 _setup_optim_sched、build_scheduler、边界计数、resume reconcile 四处共用。
+
 S8	训练（二）任务层编排	segtask_v1/trainer/trainer.py、pipelines/*、views.py、breakdown.py（含 2.5D 折叠时机契约验真）	S7、S4
+审查报告：训练（二）任务层编排
+本轮范围：segtask_v1/trainer/trainer.py(844)、pipelines/{base,factory,slab25d,lift25d,patch3d,vanilla3d}.py、views.py(249)、breakdown.py(77)，以及 2.5D 折叠时机契约的端到端验真。引擎工程件属 S7、损失/验证口径属 S9、推理镜像属 S10，仅在契约交界处引用。
+
+① 事实梳理
+调用链（seg 训练单 step）：dataset 发单通道 max-FOV cube → H2D（@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:462-469）→ augmentor（:472）→ views.center_crop 去过采样余量（:473-475）→ pipeline.prepare_batch 拆视图/折叠（:478）→ channels_last（:479-480）→ AMP forward（:493-495）→ pipeline.compute_loss（fp32，autocast 外，:496-497）→ scaler.scale(loss).backward()（:501）。
+
+策略对象分工：build_pipeline 是 trainer 侧唯一允许的 if/elif，且判定量全部来自 build_topology（@d:/codes/work-projects/SegTask/segtask_v1/trainer/pipelines/factory.py:44-64），六个 pipeline 各自持 criterion / main_loss_fn / aux_loss_fn(s) / aux_weights / target_patch_size；SupervisionPack（pipelines/base.py:34-49）让 _train_epoch 对模式零感知。
+
+折叠时机契约验真（实测 7 组配置，均按 dataset 公式复刻 cube 尺寸）：
+
+配置	pipeline	dataset cube	crop target	模型输入	结果
+seg3d.yaml	Patch3DNativeMultiRes	(48,128,128)	(32,128,128)	(B,3,16,128,128)	前向+损失 OK
+seg2_5d.yaml	Slab2_5DNativeD	(36,256,256)	(24,256,256)	(B,54,256,256)	OK，aux0=(B,18,256,256)
+2.5D folded+aux	Slab2_5DAux	(36,256,256)	(24,256,256)	(B,36,256,256)	OK
+2.5D 单分辨率	Slab2_5D	(18,256,256)	(12,256,256)	(B,12,256,256)	OK
+2.5D 多视图无 aux	Slab2_5D	(36,256,256)	(24,256,256)	(B,36,256,256)	OK
+seg2_5d_planA.yaml	Lift2_5D	(48,256,256)	(32,256,256)	(B,3,16,256,256) rank-5 未折叠	OK
+whole	Vanilla3D	(16,128,128)	同	(B,1,16,128,128)	OK
+即 WORKFLOW.md 的「dataset 恒发未折叠 3D → GPU 3D 增强 → 裁余量/视图拆分 → 送模型前折叠」在 seg 主链路上逐条成立，lift 例外（不折叠）也符合契约。折叠原语已上提 taskcore/engine/views.py:26-82，训练与推理共用同一份。
+
+几何一致性：per_view_depths[k]=round(D·s_k)（topology.py:163-166）与各 pipeline 的 target=round(D·max_scale)（如 slab25d.py:89-93）同式派生，max(depths)==target 恒成立；split_views_* 在入口对「深度轴 ≠ target」fail-fast 且报错文案直指 center crop（views.py:138-147、:205-214）。
+
+② 正确性问题
+严重
+[S8-A] 3D「dataset 端 eager 多分辨率」路径已不存在，但配置层仍放行 → 首个 batch 必崩
+
+vanilla3d.py:3-4 docstring 宣称覆盖「dataset 端 eager 多分辨率（len(multi_res_scales)>1 但按通道直接堆好）」。事实是：三个 dataset 在单 cube 重构后恒发 1 通道（taskcore/data/dataset.py:1236-1238、:976-978），build_data_spec 每个 mode 只有一个 dataset 类（taskcore/data/specs.py:266-276），没有任何 eager 堆叠实现。而 keep_native_multi_res 未开时 build_topology 仍按 in_channels=n_views 派生（topology.py:153-157），factory.py:63-64 落到 Vanilla3DPipeline 直通。实测（seg3d.yaml 仅改 keep_native_multi_res=False）：
+
+
+
+Config.validate PASSED
+pipe=Vanilla3DPipeline dataset_cube=(48,128,128) target=(16,128,128)
+  -> model_in=(1,1,16,128,128)   (cfg.model.in_channels=3)
+RuntimeError: Given groups=1, weight of size [32,3,3,3,3], expected input[1,1,16,128,128] to have 3 channels, but got 1
+两重后果：① 崩溃点在 npz 扫描 / dataloader 装配 / 模型构建之后的第一个 batch；② 即便通道数对得上，center_crop 已按 Vanilla3D.target_patch_size = patch_size（vanilla3d.py:50）把 48 裁到 16，宽 FOV 数据在拆视图前就被丢弃。根因在任务层与配置层未随数据层重构同步：core.py:2088-2109 只在 keep_native_multi_res=True 时校验，反向（3D + n_views>1 却未开）无任何约束。
+
+[S8-B] collect_multi_res_breakdown 多解一层包 → 非 DS 路径永远拿不到 L_res_*，且诊断 history 无上界增长
+
+breakdown.py:25 用 main_inner = getattr(criterion, "base_loss", criterion) 表达「若被 DS 包过则取内层」。但 MultiResolutionLoss 自己也有 .base_loss（losses/losses.py:738），因此当 criterion 就是 MR（无 DS）时，解包直接跳到裸 BinaryDiceLoss，isinstance(..., MultiResolutionLoss) 恒 False。实测：
+
+
+
+no-DS: breakdown keys after 50 steps = []        history len after collect = 50
+       getattr(criterion,'base_loss') -> BinaryDiceLoss
+DS   : breakdown keys = ['L_res_0','L_res_1','L_res_2']   history len = 0
+1000 un-popped steps -> history len = 1000 rows (3 elems each)
+_per_res_history 只在 pop_per_res_diag 里清空（losses.py:751-759），forward 每次无条件 append（:782）。所以非 DS 路径不仅诊断静默丢失，还每步泄漏一个 detached CUDA 张量，整轮训练无上界（注释 losses.py:748 写的「history 长度上限 ≈ log_every×DS 尺度数」在此路径上不成立）。命中的是 shipped 配置，实测：
+
+
+
+seg2_5d_planA.yaml  DS=False criterion=MultiResolutionLoss
+   breakdown: []  | leftover history rows: 10   (10 步后)
+seg3d.yaml          DS=True  criterion=DeepSupervisionLoss
+   breakdown: ['L_res_0','L_res_1','L_res_2'] | leftover rows: 0
+（seg2_5d_adm.yaml / seg2_5d_edm2.yaml 亦为 deep_supervision: false。）
+
+中等
+[S8-C] Trainer 用 isinstance 再推一遍 mode 标志，成为第四份真相源，且这些属性无生产消费者
+
+trainer.py:104-112 以 isinstance(self.pipeline, Patch3DNativeMultiResPipeline / Slab2_5DNativeDPipeline) 反推 keep_native_multi_res / keep_native_view_depth，又拷了一份 _mr_native_sizes / per_view_depths。同一信息的正确读法就在隔壁：predictor 直接 topo.keep_native_*（segtask_v1/predictor/predictor.py:213-214）。全仓 grep 显示这四个 Trainer 属性在 trainer.py / validation.py 内没有任何读取点，唯一"消费者"是测试里的同名 stub（tests/test_keep_native_multi_res_trainer.py:113、197-209）。即：新增一个 pipeline 类，这两个标志会静默变 False 而没有任何测试会红。
+
+[S8-D] keep_native_view_depth 的输入布局有 56% 是重复切片
+
+native_d 的各视图是同一原生分辨率下的嵌套 slab（只是更深），逐视图中心抽片后按通道 cat（views.py:149-168）。实测（seg2_5d.yaml，depths=[12,18,24]，用 z 索引作像素值追踪）：
+
+
+
+in_channels=54  distinct z-slices=24  duplicated=30 (56%)
+per-view 起始切片 id: view0=[6,7,8...] view1=[3,4,5...] view2=[0,1,2...]
+也就是 stem 有 56% 的输入通道在处理已经存在的切片；信息量等于单独喂最深的 24 层 slab。这与 folded 模式（宽视图 z 向 resize，确有尺度多样性）性质不同。当前设计的收益只剩「给 stem 融合提供显式的视图分组」，代价是 stem 输入 FLOPs 2.25×，且推理侧要跟着构造同样冗余的 z 窗口。
+
+[S8-E] split_views_native_d 逐视图 .contiguous() 后再 cat，是纯多余的一次全量拷贝
+
+views.py:151 每个视图先 .contiguous()，:166 再 torch.cat(...).contiguous()。cat 本就产出连续新张量。实测（B=2, eD=24, 256², depths=[12,18,24]，CUDA）：
+
+
+
+with_contig   : 0.215 ms | transient 71.0 MiB | contiguous_out=True
+without_contig: 0.131 ms | transient 28.0 MiB | contiguous_out=True
+torch.equal(with, without) = True
+即 −39% 时延、−60% 瞬时显存，数值逐位相同。
+
+[S8-F] 配置契约用 assert 表达
+
+slab25d.py:256-261 用两条 assert 校验 per_view_depths[0]==D 与 sum(depths)==in_channels。python -O 下静默失效；且这两条本属配置层（core.py:2196-2211 已有同族校验），在 pipeline 构造期重复第三遍。
+
+[S8-G] 拓扑辅助头的损失分量写进了 breakdown 却永远不会被打印
+
+base.py:140-142 写入 L_topo / w_topo，但 format_breakdown 只输出 L_main / L_aux_{digit} / L_res_* / L_aux_res_*（breakdown.py:49-72），fit() 的 epoch 汇总过滤器同样不含它（trainer.py:320-324）。结果：开了 aux_topo_head 的训练，其辅助损失在 step 日志与 epoch 日志里都不可见，只能靠 L_total − L_main 反推。
+
+轻微
+问题	位置	说明
+日志步 4–6 次独立 .item() D2H	slab25d.py:50、229、233、base.py:141	主损失已用「GPU 缓存 + 单次 stack().tolist()」消除同步（trainer.py:427-454），breakdown 未沿用同一手法；默认 2.5D 三视图为 L_main+L_aux_1+L_aux_2+L_total=4 次
+跳步时丢一整步的监控	trainer.py:552-555	非有限跳步 continue 会跳过该 step 的 dice 采样、debug 日志与首步显存日志
+跨模块引用私有名	lift25d.py:20 从 slab25d import _accumulate_main / _resolve_aux_weights	二者其实是通用件，应在 base.py
+同一段逻辑两份	lift25d.py:87-90 手写了 _accumulate_main 的内容而不调用它	同文件另一个类（:177）就是调用的
+基类可变类属性	base.py:70-71（mr_native_sizes: List = []、per_view_depths: List = []）	类级可变默认；当前六个子类都在 __init__ 赋值，属埋雷
+target_patch_size 的 round(D*max_scale) 复制 5 份	slab25d.py:89-93、171-175、294-299、lift25d.py:58-62、143-147	与 patch3d.py:71-78 的三轴版并列，共 6 处
+split_pred 对缺 main 键的 dict 直接 KeyError	base.py:124	无诊断信息
+aux 权重不归一化	slab25d.py:36-37 默认 0.5^(k+1)	n_views=3 时总损失量纲 ≈1.75×L_main，换 n_views 等于隐式改 LR
+_swa_bn_forward 走 self.model 而非 fwd_model、且不 set_epoch	trainer.py:663-680	BN 重估靠事后 all_reduce_bn_running_stats_（S7 已述）；样本子集每次相同
+③ 合理性与设计评价
+做得好的（建议固化为契约）
+
+策略对象彻底消灭了 trainer 内的 mode 分支：_train_epoch（trainer.py:462-505）通篇不出现 patch_mode / 2_5d / lift 任何字样，SupervisionPack 让调用方一目了然。这是 S1–S7 反复出现的「同一语义多份副本」问题在本层被解决得最好的一处。
+唯一 if/elif 且不自行派生：factory.py:44-64 全部读 ModelTopology，注释里写明了「唯一允许大段分支的地方」及优先级顺序，与 models.factory.build_model 共用同一真相源。
+views 是无状态纯函数且训练/推理共用：折叠原语上提到 views.py 并把契约写进模块 docstring（:1-16），训练侧与 predictor 的 z 窗口构建引用同一份，是 2.5D 口径能保持一致的根本原因。
+拆视图入口的 fail-fast 质量高：views.py:138-147 不只报「形状不符」，而是直接指出「center crop 应已去掉过采样余量」，把错误定位到上游正确的一步。
+损失 fp32 与 autocast 边界划得干净：trainer.py:493-501 前向在 autocast 内、compute_loss 在外，所有 pipeline 统一走 compute_loss_fp32，无一例外。
+结构性问题
+
+mode 真相源第四份（S8-C）：config 字段 → build_topology → pipeline 类 → Trainer 的 isinstance 反推。前三层是单向派生，第四层是反向猜测，且无消费者。
+keep_native_view_depth 的信息论设计值得重估（S8-D）：付出 2.25× 的 stem 输入代价换取的是切片重复，而非新信息。折叠模式（z-resize）才真正提供多尺度。
+prepare_batch / prepare_val_batch 逐类各写一遍：六个类共 12 个方法，其中拆视图部分完全相同（如 slab25d.py:106-114 vs :111-114），差异只在「是否保留 aux 监督」。可归约为基类模板方法 + 一个 with_aux 标志。
+视图拆分的拷贝次数没有预算视图：folded 路径实测 prepare_batch 瞬时峰值 144 MiB，而输入 cube 只有 12 MiB（12×）。来源是逐视图 interpolate → stack().contiguous() → fold 的 rearrange(...).contiguous()，每一步都物化全量。当前 patch 尺寸下可接受，但这是激活峰值之外的一份额外预算，estimate_train_memory（S7 已述其漏项）也没算它。
+诊断路径无测试（S8-B 的根因）：全仓无一个用例调用 collect_multi_res_breakdown（grep 仅命中 tests/test_monitor.py:218 的硬编码字典），因此「解包多一层」这种错误没有对照物能发现。
+④ 优化空间（含 GPU / 吞吐 / 显存）
+实测基准：seg2_5d.yaml（B=2，target=(24,256,256)），prepare_batch = 0.50 ms（native_d）/ 0.75 ms（folded），瞬时峰值 131 / 144 MiB；seg3d.yaml = 0.49 ms / 48 MiB。
+
+#	优化	预估收益	风险
+1	去掉 split_views_native_d 的逐视图 .contiguous()（S8-E）	实测 0.215→0.131 ms、71→28 MiB 瞬时	极低；实测逐位相同
+2	breakdown 标量沿用主损失的「GPU 缓存 + 单次 stack().tolist()」	日志步 4–6 次 D2H → 1 次	极低；数值不变
+3	stack + contiguous 改为预分配 out= 张量逐视图写入	folded 路径少一份全量拷贝（当前 12× 输入的瞬时峰值）	低；需保证 interpolate(out=) 语义（落地前查 torch 2.7 文档）
+4	native_d 输入去冗余（只喂最深 slab + 视图索引/位置编码）	in_channels 54→24，stem 输入 FLOPs −56%	中高；改权重布局 + core.py:2196-2211 校验 + predictor z 窗口，属独立批次
+5	用 torch.compile 区域编译 center_crop + prepare_batch（固定形状纯张量算子）	3 次全量拷贝有望融合	中；需与 S7 的 compile/DDP 包装顺序协同
+6	folded 拆视图改「z-only 1D 插值」替代三维 trilinear	实测否定：CUDA 上 z-only 12.92 ms vs 现有 full-3D trilinear 0.11 ms（reshape/permute 代价远超收益，数值相同）。现有写法已是最优，不建议改	—
+⑤ 2026 可借鉴项
+（方向性对标，落地涉及具体 API 时会再查各自最新官方文档；torch 2.7.1 / CUDA 可用为本机实测环境。）
+
+方案	借鉴点	适配代价	优先级
+多视图沿 batch 维打包而非通道维（DINO/SwAV 的 multi-crop 处理范式）	直接解 S8-D 的通道冗余：aux 视图当作额外样本走同一主头，不需要独立 aux head，也不需要 aux_head_out_channels 这条派生链；显存换算更透明	中高（改模型 I/O 契约与 stem 融合语义）	中
+多任务权重自适应（Kendall 2018 uncertainty weighting / GradNorm）	当前 aux_weights=0.5^k 固定且总损失量纲随 n_views 漂移；先做 Σw 归一化（零成本），再评估自适应	低（归一化）/ 中（自适应）	中高
+跨视图一致性正则（SSL 侧成熟做法）	多 FOV 天然成对，现在只做「各自独立监督」，没利用视图间一致性这一免费监督信号	中	中
+「诊断即契约」的元测试（本仓 tests/test_todo_p_regressions.py:340-362 已有 AST 元测试先例）	S8-B 这类「解包写错导致诊断静默失效」只能靠元测试发现：断言每个 pipeline 的 criterion 都能被 collect_multi_res_breakdown 正确解包且 history 归零	低	高
+TensorDict / torch.nested 承载 SupervisionPack	aux_labels 现在是 list[Tensor]（深度可异），无法统一 to(device) / pin / collate；TensorDict 生态已标准化	中（新依赖，需评估必要性）	低
+
 S9	训练（三）损失 / 指标 / 验证与选模	losses.py、topo_aux.py、metrics.py、trainer/validation.py、_save_best 口径	S8
 S10	推理全流程	engine/base_predictor.py、bn_stats.py；predictor/{predictor,sliding,forwards,inputs,io,blending}.py（滑窗/blend/TTA/AdaBN/z-interleave/写出）	S2、S6、S8
 S11	全局串联	训练↔推理镜像契约端到端核对、配置→topology→数据→模型→损失→推理的一致性、性能瓶颈全局画像（数据/显存/通信/编译）、legacy 默认值清单再评估	S1–S10

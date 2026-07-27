@@ -16,8 +16,10 @@ from taskcore.config.core import Config
 from ...losses.losses import DeepSupervisionLoss, MultiResolutionLoss
 from .. import views
 from taskcore.engine.amp import compute_loss_fp32
-from .base import SupervisionPack, ViewPipeline
-from .slab25d import _accumulate_main, _resolve_aux_weights
+from .base import (
+    SupervisionPack, ViewPipeline, accumulate_main, max_fov_target_size,
+    resolve_aux_weights,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +56,7 @@ class Lift2_5DPipeline(ViewPipeline):
         self.mr_native_sizes = []
         self.per_view_depths = list(cfg.per_view_depths)
         # 数据集发单 max-FOV z-cube；增强后 target 深度 = eD_max。
-        D = int(cfg.data.patch_size[0])
-        max_scale = max(cfg.data.multi_res_scales)
-        self.target_patch_size = (
-            int(round(D * max_scale)),
-            int(cfg.data.patch_size[1]),
-            int(cfg.data.patch_size[2]))
+        self.target_patch_size = max_fov_target_size(cfg)
         logger.info(
             "Loss: %s, scales=%d, fg_classes=%d [2.5D LIFTED to 3D]",
             cfg.loss.name, 1, cfg.num_fg_classes)
@@ -84,10 +81,7 @@ class Lift2_5DPipeline(ViewPipeline):
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, _aux, topo_pred = self.split_pred(pred)
-        loss = compute_loss_fp32(
-            self.criterion, main_pred, sup.label_main, weight_map=sup.wmap_main)
-        if breakdown is not None:
-            breakdown["L_main"] = float(loss.detach().item())
+        loss = accumulate_main(self.criterion, main_pred, sup, breakdown)
         loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
         if breakdown is not None:
             breakdown["L_total"] = float(loss.detach().item())
@@ -136,15 +130,11 @@ class Lift2_5DAuxPipeline(ViewPipeline):
             label_values=cfg.data.label_values,
         )
         self.aux_loss_fns = None
-        self.aux_weights = _resolve_aux_weights(cfg, n_aux)
+        self.aux_weights = resolve_aux_weights(cfg, n_aux)
         self.mr_native_sizes = []
         self.per_view_depths = list(cfg.per_view_depths)
         # 数据集发单 max-FOV z-cube；增强后 target 深度 = eD_max。
-        max_scale = max(cfg.data.multi_res_scales)
-        self.target_patch_size = (
-            int(round(D * max_scale)),
-            int(cfg.data.patch_size[1]),
-            int(cfg.data.patch_size[2]))
+        self.target_patch_size = max_fov_target_size(cfg)
         logger.info(
             "Aux seg supervision: ENABLED [LIFT], n_aux_views=%d, "
             "weights=%s, fusion=%s",
@@ -174,7 +164,7 @@ class Lift2_5DAuxPipeline(ViewPipeline):
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, aux_preds, topo_pred = self.split_pred(pred)
 
-        total = _accumulate_main(self.criterion, main_pred, sup, breakdown)
+        total = accumulate_main(self.criterion, main_pred, sup, breakdown)
         if not aux_preds or self.aux_loss_fn is None:
             total = self.add_topo_loss(total, topo_pred, sup, breakdown)
             if breakdown is not None:

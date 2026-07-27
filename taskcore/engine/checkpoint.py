@@ -202,7 +202,8 @@ class AsyncCheckpointSaver:
                     if on_done is not None:
                         on_done()
                 except BaseException as exc:  # noqa: BLE001 — 记录后转交 wait()
-                    self._error = exc
+                    if self._error is None:  # 保留首个异常（根因），后续的仅进日志
+                        self._error = exc
                     logger.error(
                         "Async checkpoint save failed for %s", path,
                         exc_info=True)
@@ -221,10 +222,15 @@ class AsyncCheckpointSaver:
             raise RuntimeError("Async checkpoint save failed") from err
 
     def close(self) -> None:
-        """排空队列并结束后台线程（幂等性不保证，只在收尾调用一次）。"""
-        self.wait()
-        self._queue.put(None)
-        self._worker.join()
+        """排空队列并结束后台线程（幂等性不保证，只在收尾调用一次）。
+
+        ``wait()`` 抛出（有写盘失败）时仍投递结束哨兵并回收线程，避免
+        worker 线程泄漏；异常在线程回收后原样上抛。"""
+        try:
+            self.wait()
+        finally:
+            self._queue.put(None)
+            self._worker.join()
 
 
 def unwrap_compile(m: nn.Module) -> nn.Module:

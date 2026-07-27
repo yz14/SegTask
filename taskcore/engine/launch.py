@@ -127,6 +127,16 @@ def init_ddp_worker(
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ["MASTER_PORT"] = str(master_port)
 
+    # DDP 后端固定 NCCL（CUDA 集合通信仅 NCCL 高效可靠）；NCCL 仅支持
+    # Linux，其他平台在进坑前显式报错，而不是留给 init 深处的晦涩崩溃。
+    if not dist.is_nccl_available():
+        raise RuntimeError(
+            "Multi-GPU DDP training requires the NCCL backend, which is "
+            "only available on Linux (this PyTorch build reports NCCL "
+            f"unavailable; platform={sys.platform!r}). On Windows, run "
+            "single-GPU training (train.gpus with one entry), or use "
+            "WSL2/Linux for multi-GPU.")
+
     torch.cuda.set_device(physical_gpu)
     dist.init_process_group(
         backend="nccl", world_size=world_size, rank=local_rank,
