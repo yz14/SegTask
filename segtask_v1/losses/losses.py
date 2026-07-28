@@ -107,6 +107,12 @@ class BinaryDiceLoss(nn.Module):
         self.squared = squared
         self.batch_dice = batch_dice
         # ignore_empty only meaningful in per-sample mode
+        if ignore_empty and batch_dice:
+            logger.warning(
+                "loss.ignore_empty=True is a no-op with batch_dice=True "
+                "(batch dice pools all samples before the ratio); set "
+                "loss.batch_dice=False for per-sample empty-class "
+                "exclusion.")
         self.ignore_empty = ignore_empty and not batch_dice
         _register_class_weights(self, class_weights)
 
@@ -534,7 +540,12 @@ class LovaszHingeLoss(nn.Module):
 # Soft clDice  (Shit et al., CVPR 2021) — topology-preserving
 # ---------------------------------------------------------------------------
 def _soft_erode(x: torch.Tensor, spatial_ndim: int) -> torch.Tensor:
-    """可微形态学腐蚀（-max_pool，kernel=3）。"""
+    """可微形态学腐蚀（-max_pool，kernel=3）。
+
+    边界语义：maxpool 零填充在取负后等效 -inf，图像边缘不被腐蚀（贴边前景
+    保留）；与 ``taskcore.metrics._binary_erosion_pool`` 的 zero-pad
+    （边界外视为背景、贴边前景被腐蚀）约定不同——损失与指标的"边界"
+    定义有意各自独立，勿混用。"""
     if spatial_ndim == 3:
         return -F.max_pool3d(-x, kernel_size=3, stride=1, padding=1)
     if spatial_ndim == 2:
@@ -717,6 +728,10 @@ _COMPOUND_BUILDERS = {
 
 def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
     ws = list(cfg.compound_weights or [])
+    if len(ws) > n:
+        logger.warning(
+            "compound_weights has %d entries, need %d; extra entries "
+            "ignored: %s", len(ws), n, ws[n:])
     if len(ws) >= n:
         return ws[:n]  # 自动适配长度
     logger.warning(
@@ -740,6 +755,17 @@ class MultiResolutionLoss(nn.Module):
         self.num_res      = num_res
         self.label_values = label_values
         self.fg_values    = label_values[1:]  # exclude background
+
+        # 构造时验长（与 SliceChannelLoss 对称）：长度不符时 3D 路径会
+        # 静默广播（K=1）或在首个 step 报晦涩 RuntimeError。
+        cw_buf = getattr(base_loss, "class_weights", None)
+        if cw_buf is not None and cw_buf.numel() != num_fg_classes:
+            raise ValueError(
+                f"MultiResolutionLoss: base_loss.class_weights has "
+                f"{cw_buf.numel()} entries but num_fg_classes="
+                f"{num_fg_classes}. Provide ``cfg.loss.class_weights`` "
+                f"with exactly num_fg_classes entries (one per foreground "
+                f"class).")
 
         # 诊断：每次 forward 把每个分辨率的损失以 detached tensor 追加到 history
         # （不在热路径上 .item() 同步）。被 DeepSupervisionLoss 多次调用时，

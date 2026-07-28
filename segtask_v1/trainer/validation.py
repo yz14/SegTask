@@ -31,9 +31,18 @@ from taskcore.utils.common import (
     harmonic_mean_metrics,
     surface_dice_batch_stats,
 )
+from taskcore.metrics import (
+    PerCaseAggregator,
+    ThresholdSweep,
+    per_case_cldice,
+    per_case_hausdorff,
+    per_case_overlap,
+)
 from taskcore.engine.amp import autocast, compute_loss_fp32
 from taskcore.engine.dist_utils import (
+    all_gather_objects,
     all_reduce_sum_,
+    get_rank,
     get_world_size,
     is_main_process,
     shard_for_rank,
@@ -66,6 +75,13 @@ class MetricAccumulator:
         threshold: Union[float, Sequence[float]] = 0.5,
         surface_dice_tolerance_mm: float = 0.0,
         spacing: Optional[Sequence[float]] = None,
+        num_fg: int = 0,
+        per_case: bool = False,
+        per_case_worst_k: int = 5,
+        compute_hd95: bool = False,
+        compute_cldice: bool = False,
+        cldice_iter: int = 3,
+        calibrate_grid: Optional[Sequence[float]] = None,
     ):
         crit = str(criterion).lower().strip()
         self._crit = crit
@@ -94,6 +110,22 @@ class MetricAccumulator:
         self._sd_num = None
         self._sd_denom = None
         self.n_samples = 0
+
+        # ---- per-case 聚合（1-1 / 1-2 HD95 / 2-8 clDice）：仅整卷（high）模式
+        # 逐病例累加，medium patch 模式不启用（一个 update 是多 patch，非病例）。
+        self._num_fg = int(num_fg)
+        self.compute_hd95 = bool(compute_hd95)
+        self.compute_cldice = bool(compute_cldice)
+        self.cldice_iter = int(cldice_iter)
+        self._per_case = (
+            PerCaseAggregator(int(num_fg), worst_k=int(per_case_worst_k))
+            if per_case and num_fg > 0 else None)
+
+        # ---- 阈值标定（3-7）：验证集逐类扫描最优 sigmoid 阈值。
+        self._sweep = (
+            ThresholdSweep(list(calibrate_grid), int(num_fg))
+            if calibrate_grid is not None and num_fg > 0 else None)
+        self.calibrated_thresholds: Optional[list] = None
 
     @torch.no_grad()
     def update(
@@ -164,6 +196,33 @@ class MetricAccumulator:
         self.n_samples += int(pred_logits.shape[0])
 
     @torch.no_grad()
+    def update_case(
+        self, pred_bin: torch.Tensor, target: torch.Tensor) -> None:
+        """逐病例累加 per-case 指标（dice/iou，及可选 HD95 / clDice）。
+
+        ``pred_bin`` / ``target``：单卷 ``(C, *spatial)`` {0,1}（无 batch 维）。
+        仅在 per-case 启用（整卷 high 模式）时有效。HD95/clDice 为按病例逐类
+        计算的昂贵指标（scipy EDT / 形态学细化），由 config 分别开关。"""
+        if self._per_case is None:
+            return
+        row = per_case_overlap(pred_bin, target)
+        if self.compute_hd95:
+            # spacing 可解析时 HD95 为物理 mm，否则 voxel 单位（日志会注明）。
+            row["hd95"] = per_case_hausdorff(
+                pred_bin, target, spacing=self.sd_spacing, percentile=95.0)
+        if self.compute_cldice:
+            row["cldice"] = per_case_cldice(
+                pred_bin, target, n_iter=self.cldice_iter)
+        self._per_case.update(row)
+
+    @torch.no_grad()
+    def update_sweep(
+        self, prob: torch.Tensor, target: torch.Tensor) -> None:
+        """喂入 sigmoid 概率给阈值标定扫描器。``prob``/``target``：``(B, C, *spatial)``。"""
+        if self._sweep is not None:
+            self._sweep.update(prob, target)
+
+    @torch.no_grad()
     def all_reduce(self, num_fg: int, device: torch.device) -> None:
         """多卡：将各 rank 累加的可加混淆量 all-reduce(SUM) 汇总。
 
@@ -211,6 +270,22 @@ class MetricAccumulator:
         self.n_samples = int(round(agg[0].item()))
         self.loss_meter.sum = float(agg[1].item())
         self.loss_meter.count = int(round(agg[2].item()))
+
+        # per-case 行：各 rank 病例不相交，all_gather 后合并为全集分布（与单卡
+        # 等价）。行是小 numpy 向量（每卷 C 个 float），对象 gather 成本可忽略。
+        if self._per_case is not None:
+            gathered = all_gather_objects(self._per_case.raw_rows)
+            rank = get_rank()
+            for i, rows in enumerate(gathered):
+                if i != rank:
+                    self._per_case.merge_rows(rows)
+
+        # 阈值扫描统计（T×C 可加）：all-reduce SUM 后与单进程严格等价。
+        if self._sweep is not None:
+            for t in self._sweep.state_tensors():
+                dev_t = t.to(device)
+                all_reduce_sum_(dev_t)
+                t.copy_(dev_t.cpu())
 
     @torch.no_grad()
     def compute(self, log_prefix: str = "Val", *, log: bool = True) -> Dict[str, float]:
@@ -296,6 +371,36 @@ class MetricAccumulator:
                 torch.tensor(mcc01)])
             metrics["mean_balanced"] = float(hm.item())
 
+        # ---- per-case 聚合（mean±std / p5 / 最差 k 例） ----
+        pc_msg = ""
+        if self._per_case is not None:
+            pc = self._per_case.compute()
+            metrics.update(pc)
+            if "case_mean_dice" in pc:
+                pc_msg = (
+                    f", case_dice={pc['case_mean_dice']:.4f}"
+                    f"±{pc.get('case_std_dice', 0.0):.4f}"
+                    f" (p5={pc.get('case_p5_dice', float('nan')):.4f}, "
+                    f"worst{self._per_case.worst_k}="
+                    f"{pc.get('case_worstk_dice', float('nan')):.4f})")
+            if "case_mean_hd95" in pc:
+                unit = "mm" if self.sd_spacing is not None else "vox"
+                pc_msg += (
+                    f", case_hd95={pc['case_mean_hd95']:.2f}{unit}"
+                    f" (p95={pc.get('case_p95_hd95', float('nan')):.2f})")
+            if "case_mean_cldice" in pc:
+                pc_msg += f", case_clDice={pc['case_mean_cldice']:.4f}"
+                metrics["mean_cldice"] = pc["case_mean_cldice"]
+
+        # ---- 阈值标定导出 ----
+        if self._sweep is not None:
+            self.calibrated_thresholds = self._sweep.best_thresholds()
+            if log:
+                logger.info(
+                    "  %s: calibrated per-class thresholds (max pooled "
+                    "dice over grid): %s", log_prefix,
+                    [f"{t:.2f}" for t in self.calibrated_thresholds])
+
         cov = self._cov.cpu().tolist()
         if log:
             loss_str = (
@@ -312,7 +417,7 @@ class MetricAccumulator:
                 metrics["mean_mcc"], metrics["min_class_dice"],
                 [int(c) for c in cov], self.n_samples, sd_msg,
                 (f", balanced={metrics['mean_balanced']:.4f}"
-                 if "mean_balanced" in metrics else ""))
+                 if "mean_balanced" in metrics else "") + pc_msg)
         return metrics
 
 
@@ -330,14 +435,19 @@ class ValEvaluator(ABC):
 
     def __init__(self, trainer: "Trainer"):
         self.trainer = trainer
+        # 最近一次选模评估产出的逐类标定阈值（仅整卷 high 评估 +
+        # train.calibrate_threshold=True 时非 None）。
+        self.last_calibrated_thresholds: Optional[list] = None
 
     def _resolve_sd_spacing(self) -> Optional[list]:
-        """物理 NSD 所需的每轴 mm spacing：仅当 surface_dice_tolerance_mm>0 时解析。
+        """物理 NSD / HD95 所需的每轴 mm spacing：surface_dice_tolerance_mm>0 或
+        compute_hd95=True 时解析。
         取 data.target_spacing（未显式配置则从 npz_dir/_manifest.json 回读）；
         无法解析（如未开启 spacing_normalization）时返回 None 并告警一次，
-        由 MetricAccumulator 回退 voxel-Chebyshev 容差。"""
+        由 MetricAccumulator 回退 voxel-Chebyshev 容差 / voxel 单位 HD95。"""
         tc = self.trainer.cfg.train
-        if float(tc.surface_dice_tolerance_mm) <= 0.0:
+        if (float(tc.surface_dice_tolerance_mm) <= 0.0
+                and not bool(getattr(tc, "compute_hd95", False))):
             return None
         dc = self.trainer.cfg.data
         ts = dc.target_spacing
@@ -359,15 +469,27 @@ class ValEvaluator(ABC):
             return None
         return [float(s) for s in ts]
 
-    def _new_accumulator(self) -> MetricAccumulator:
+    def _new_accumulator(self, for_volume: bool = False) -> MetricAccumulator:
         tc = self.trainer.cfg.train
+        # per-case / HD95 / clDice / 阈值标定只在整卷（high）评估上有定义
+        # （一次 update = 一个病例，且概率来自与部署一致的滑窗）。
+        per_case = for_volume and bool(tc.per_case_metrics)
+        grid = (list(tc.calibrate_threshold_grid)
+                if for_volume and bool(tc.calibrate_threshold) else None)
         return MetricAccumulator(
             criterion=str(tc.save_best_criterion),
             surface_dice_tolerance=int(tc.surface_dice_tolerance),
             surface_dice_weight=float(tc.surface_dice_weight),
             threshold=self.trainer.cfg.predict.threshold,
             surface_dice_tolerance_mm=float(tc.surface_dice_tolerance_mm),
-            spacing=self._resolve_sd_spacing())
+            spacing=self._resolve_sd_spacing(),
+            num_fg=int(self.trainer.num_fg),
+            per_case=per_case,
+            per_case_worst_k=int(tc.per_case_worst_k),
+            compute_hd95=per_case and bool(tc.compute_hd95),
+            compute_cldice=per_case and bool(tc.compute_cldice),
+            cldice_iter=int(tc.cldice_metric_iter),
+            calibrate_grid=grid)
 
     @abstractmethod
     def evaluate(self, epoch: int) -> Dict[str, float]:
@@ -454,8 +576,11 @@ class VolumeValEvaluator(ValEvaluator):
         super().__init__(trainer)
         self._predictor = None  # 懒构建，复用同一 Predictor（引用 trainer.model）
         # val_volume_cache：逐卷 (预处理 image fp32, 原始 label int16, z_spacing)
-        # 常驻缓存；只存本 rank 分片，容量随首轮填满后不再增长。
+        # 常驻缓存；只存本 rank 分片，容量随首轮填满后不再增长；总字节数受
+        # train.val_volume_cache_max_gb 预算约束（超限后新卷现读现算）。
         self._vol_cache: "Dict[str, tuple]" = {}
+        self._vol_cache_bytes = 0
+        self._vol_cache_budget_warned = False
 
     def _get_predictor(self):
         if self._predictor is None:
@@ -486,7 +611,7 @@ class VolumeValEvaluator(ValEvaluator):
 
         predictor = self._get_predictor()
         predictor.model.eval()
-        acc = self._new_accumulator()
+        acc = self._new_accumulator(for_volume=True)
         label_values = list(dc.label_values)
 
         use_cache = bool(t.cfg.train.val_volume_cache)
@@ -508,7 +633,25 @@ class VolumeValEvaluator(ValEvaluator):
                 zs = (load_npz_z_spacing(path)
                       if predictor.z_interleave_enabled else None)
                 if use_cache:
-                    self._vol_cache[path] = (vol, label, zs)
+                    budget_gb = float(
+                        t.cfg.train.val_volume_cache_max_gb)
+                    entry_bytes = int(vol.nbytes) + int(label.nbytes)
+                    if (budget_gb > 0 and self._vol_cache_bytes
+                            + entry_bytes > budget_gb * (1024 ** 3)):
+                        if not self._vol_cache_budget_warned:
+                            logger.warning(
+                                "val_volume_cache: byte budget "
+                                "%.1f GiB reached (%d volume(s) cached, "
+                                "%.2f GiB); further volumes will be "
+                                "re-read each round. Raise "
+                                "train.val_volume_cache_max_gb to cache "
+                                "all shard volumes.",
+                                budget_gb, len(self._vol_cache),
+                                self._vol_cache_bytes / (1024 ** 3))
+                            self._vol_cache_budget_warned = True
+                    else:
+                        self._vol_cache[path] = (vol, label, zs)
+                        self._vol_cache_bytes += entry_bytes
             z_spacing = zs
             # (num_fg, D, H, W) 概率体（已 sigmoid，跨窗 blended）。
             prob = predictor.predict_preprocessed_array(
@@ -530,6 +673,11 @@ class VolumeValEvaluator(ValEvaluator):
             if thr_t.ndim == 1:
                 thr_t = thr_t.view(-1, 1, 1, 1)
             pred_bin = (prob_t > thr_t).float()
+
+            # 阈值标定（需未二值化的概率）与 per-case 指标（需完整卷，在 bbox
+            # 裁剪前喂入：HD95/clDice 对裁剪边界敏感）。
+            acc.update_sweep(prob_t.unsqueeze(0), target_t.unsqueeze(0))
+            acc.update_case(pred_bin, target_t)
 
             # 可选：按 pred∪GT 并集 bbox 裁剪后再算指标（严格等价，见 config）。
             # 边距取 surface_dice 容差+1，保证腔蚀/膨胀在裁剪窗内结果不变；
@@ -556,7 +704,11 @@ class VolumeValEvaluator(ValEvaluator):
                 loss_value=None, voxels_override=voxels_override,
                 pred_is_binary=True)
         acc.all_reduce(t.num_fg, t.device)
-        return acc.compute(log_prefix=self.log_prefix, log=is_main_process())
+        metrics = acc.compute(log_prefix=self.log_prefix,
+                              log=is_main_process())
+        # 阈值标定结果侧信道：trainer 在 best 轮把它写进 checkpoint。
+        self.last_calibrated_thresholds = acc.calibrated_thresholds
+        return metrics
 
 
 class HybridValEvaluator(ValEvaluator):
@@ -587,7 +739,11 @@ class HybridValEvaluator(ValEvaluator):
     def evaluate(self, epoch: int) -> Dict[str, float]:
         self._last_was_high = self._is_high_epoch(epoch)
         if self._last_was_high:
-            return self._volume.evaluate(epoch)
+            metrics = self._volume.evaluate(epoch)
+            self.last_calibrated_thresholds = (
+                self._volume.last_calibrated_thresholds)
+            return metrics
+        self.last_calibrated_thresholds = None
         return self._patch.evaluate(epoch)
 
     def selects_model(self) -> bool:

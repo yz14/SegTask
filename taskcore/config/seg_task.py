@@ -56,6 +56,16 @@ class SegTaskConfig:
             loss.slice_loss_reduction in ("per_slice", "per_volume"),
             f"Invalid slice_loss_reduction: {loss.slice_loss_reduction!r}; "
             "expected 'per_slice' or 'per_volume'.")
+        # class_weights 与前景类逐一对应；长度不符时 3D 路径会广播/报晦涩
+        # RuntimeError（K=1 时甚至静默退化为 Σdice、可产负损失），
+        # 这里 fail-fast。
+        if loss.class_weights:
+            n_fg = core.num_fg_classes
+            _require(
+                len(loss.class_weights) == n_fg,
+                f"loss.class_weights must have exactly one entry per "
+                f"foreground class: got {len(loss.class_weights)} weights "
+                f"for {n_fg} foreground class(es).")
         # region_weights 与 label_values 逐值对应（含 bg）；长度不符时
         # 运行期 zip 会静默截断，这里 fail-fast。
         if loss.region_weights and core.data.label_values:
@@ -195,6 +205,29 @@ class SegTaskConfig:
                 _require(
                     all(w >= 0 for w in aw),
                     f"aux_supervision_weights must be non-negative; got {aw}.")
+        # 监督头均衡（1-6）
+        _require(
+            loss.gradnorm_alpha >= 0.0,
+            f"loss.gradnorm_alpha must be >= 0; got {loss.gradnorm_alpha}.")
+        _require(
+            loss.gradnorm_lr > 0.0,
+            f"loss.gradnorm_lr must be > 0; got {loss.gradnorm_lr}.")
+        _require(
+            loss.gradnorm_update_every >= 1,
+            "loss.gradnorm_update_every must be >= 1; "
+            f"got {loss.gradnorm_update_every}.")
+        if loss.gradnorm_enabled:
+            multi_head = (
+                core.model.unet.aux_topo_head
+                or (core.data.patch_mode == "2_5d"
+                    and core.model.aux_seg_supervision
+                    and len(core.data.multi_res_scales) > 1))
+            _require(
+                multi_head,
+                "loss.gradnorm_enabled=True requires >= 2 supervision heads "
+                "(enable model.aux_seg_supervision with n_views>1 and/or "
+                "model.unet.aux_topo_head); single-head configs have nothing "
+                "to balance.")
 
 
 def validate_seg_task(seg: SegTaskConfig, core: "Config") -> None:

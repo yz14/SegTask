@@ -122,8 +122,8 @@ seg:
   loss:
     name: "dice_focal"
     compound_weights: [1.0, 1.0]
-    class_weights: [1.0, 1.0]
-    region_weights: [1.0, 4.0, 2.0]
+    class_weights: [1.0]        # 长度 = 前景类数（label_values=[0,1] → 1 类）
+    region_weights: [1.0, 4.0]  # 按 label_values 全长（含 bg）
     dice_smooth : 1.0e-5
     dice_squared: false
     focal_alpha: 0.5

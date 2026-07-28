@@ -29,9 +29,9 @@
 - **进行中**:如需拆分,明确告知本轮要完成什么。
 - **完成后**:总结本轮成果与后续计划。
 
-
+## 说明  
 本机环境为: **D:\miniconda\envs\torch27_env\python.exe**  
-本机账户为: **yz-laptop\yzzz**  
+本机账户为: **yz-laptop\yzzz**，不要臆想为admin  
 
 
 内容（**注意**：需查看各自对应readme/design/workflow文档理解设计）：  
@@ -1272,8 +1272,381 @@ prepare_batch / prepare_val_batch 逐类各写一遍：六个类共 12 个方法
 TensorDict / torch.nested 承载 SupervisionPack	aux_labels 现在是 list[Tensor]（深度可异），无法统一 to(device) / pin / collate；TensorDict 生态已标准化	中（新依赖，需评估必要性）	低
 
 S9	训练（三）损失 / 指标 / 验证与选模	losses.py、topo_aux.py、metrics.py、trainer/validation.py、_save_best 口径	S8
+审计：损失 / 指标 / 验证 / 选模
+审计范围：losses.py、topo_aux.py、metrics.py、validation.py、_save_best 与 criterion 派生链。所有"已验证"条目均在 torch 2.7.1 下实测复现，探针脚本已删除。
+
+一、已验证缺陷
+S9-A（高）loss.class_weights 长度在 3D 路径完全无校验 → 静默错值，甚至负损失
+_weighted_mean_over_classes 用广播实现加权均值：
+
+
+
+losses.py:58-64
+def _weighted_mean_over_classes(
+    per_class: torch.Tensor, class_weights: Optional[torch.Tensor]) -> torch.Tensor:
+    """最后一维（类别）加权均值：(..., C) → (...,)。"""
+    if class_weights is None:
+        return per_class.mean(dim=-1)
+    w = class_weights.to(per_class.device).to(per_class.dtype)
+    return (per_class * w).sum(dim=-1) / w.sum().clamp(min=EPS)
+per_class 形状 (C,)（batch_dice）或 (B,C)，w 形状 (K,)。K==1 时广播成立且不报错，结果退化为 Σ_c per_class[c]（求和，非均值）。
+
+实测（num_fg=2，其余相同输入）：
+
+class_weights	dice 损失	说明
+None	0.5818	正确的 1 - mean(dice)
+[2.0]	0.1636	实为 1 - Σdice，静默错误
+[2.0, 1.0, 3.0]	RuntimeError	首个 step 才崩，报错信息为裸广播错误
+num_fg=4 + class_weights=[1.0] 实测损失 -0.1153（负值）——1 - Σ_{c=1..4} dice_c。Dice 系损失变负后与 BCE 复合、与 DS 加权求和，梯度方向仍大致可用但幅值与早停/日志全乱，且不会触发任何非有限守护。
+
+关键在于同样的配置在 2.5D 路径会 fail-fast：
+
+
+
+losses.py:857-865
+# 构造时验长：forward 重读 base_loss.class_weights（跟随 device 定位，不复制 buffer）。
+cw_buf = getattr(base_loss, "class_weights", None)
+if cw_buf is not None and cw_buf.numel() != num_fg_classes:
+    raise ValueError(
+        f"SliceChannelLoss: base_loss.class_weights has "
+        f"{cw_buf.numel()} entries but num_fg_classes="
+        f"{num_fg_classes}. Provide ``cfg.loss.class_weights`` "
+        f"with exactly num_fg_classes entries (one per foreground "
+        f"class).")
+实测 2.5D 抛 ValueError，3D 静默算错。而 SegTaskConfig._validate_loss 校验了 region_weights / deep_supervision_weights 长度，唯独漏了 class_weights（@d:\codes\work-projects\SegTask\taskcore\config\seg_task.py:59-86），尽管字段注释明写"长度 = num_fg_classes"。
+
+修复：在 _validate_loss 加一条 len(loss.class_weights) == core.num_fg_classes（空列表除外），并在 MultiResolutionLoss.__init__ 补与 SliceChannelLoss 对称的构造期检查。
+
+S9-B（高）2.5D + 物理 NSD → 首次验证必崩
+_nsd_stats_spacing_aware 按 spatial rank 严格校验 spacing 长度：
+
+
+
+metrics.py:210-215
+ndim = pred_bin.ndim - 2
+sp = ([float(spacing)] * ndim if isinstance(spacing, (int, float))
+      else [float(s) for s in spacing])
+if len(sp) != ndim:
+    raise ValueError(
+        f"spacing length {len(sp)} != spatial rank {ndim}")
+而 _resolve_sd_spacing 恒返回 3 元 target_spacing（@d:\codes\work-projects\SegTask\segtask_v1\trainer\validation.py:334-360），SliceChannelLoss.split_for_metrics 在 per_slice 下返回 rank-4 (B*D, num_fg, H, W) → ndim=2。
+
+实测：surface_dice_batch_stats(rank4, tolerance_mm=1.5, spacing=[1.0,0.7,0.7]) → ValueError: spacing length 3 != spatial rank 2。
+
+触发条件：patch_mode=2_5d + slice_loss_reduction=per_slice（默认）+ criterion ∈ {balanced, dice+surface_dice} + surface_dice_tolerance_mm > 0。前三项正是 vessel/airway 预设的推荐组合，第四项一旦开启，训练跑到第一次 val 直接崩。配置校验层没有任何拦截。
+
+修复：_resolve_sd_spacing 感知 metrics 张量的 spatial rank——2.5D per_slice 下取平面内两轴 spacing（丢弃 z），或直接告警回退 voxel 容差；同时在 Config.validate() 加交叉约束。
+
+S9-C（中）ignore_empty 被默认 batch_dice=True 静默吞掉
+
+
+losses.py:109-110
+# ignore_empty only meaningful in per-sample mode
+self.ignore_empty = ignore_empty and not batch_dice
+LossConfig.batch_dice 默认 True。用户显式写 ignore_empty: true 时实测 BinaryDiceLoss.ignore_empty == False，无任何 warning。与 S1 的"配置项静默无效"同族。建议在 _build_dice 里检出 cfg.ignore_empty and cfg.batch_dice 并 logger.warning 一次。
+
+S9-D（中）选模指标缺失时"既不存 best 也不早停"，且完全静默
+
+
+trainer.py:292-315
+if val_selects and tc.save_best_metric in val_metrics:
+    tracked = val_metrics[tc.save_best_metric]
+patience_counter += 1 在同一个 if 内。若 save_best_metric 不在 val_metrics（累加器无样本时只返回 {"val_base_loss", "mean_dice"}；DDP 下某 rank 分不到 val 卷；mean_balanced 在 _sd_num is None 时缺席），则：best 永不落盘 → 训练结束只剩 latest_model.pth；同时 early_stopping 永不触发 → 白跑满 epochs。整个过程只有一条 accumulator 的 warning。
+
+修复：else 分支打 logger.warning（首次），并把 patience_counter += 1 移出 in val_metrics 判定。
+
+S9-E（中）空类的 overlap 指标返回 1.0，与 docstring 相反
+
+
+metrics.py:116
+所有除法平滑过；分母全 0 的类（既无 GT 又无 pred）返回 0 而非 NaN。
+实测 inter=pred_sum=target_sum=0 → {'dice': 1.0, 'iou': 1.0, 'recall': 1.0, 'precision': 1.0, 'vol_sim': 1.0, 'mcc': 0.0}。
+
+mean_* / min_* 被 _cov > 0 掩码保护，所以选模不受影响；但逐类上报值 dice_class_c = 1.0 会进 metrics dict、进 monitor 曲线、进 best_model.pth["metrics"]，看板上一个从未出现过的类显示满分。同时 dice=1.0 与 mcc=0.0 自相矛盾。属文档与实现不一致 + 上报误导。
+
+二、设计与性能风险
+S9-F（中）物理 NSD 是 CPU / scipy / 逐 (b,c) 双 EDT
+_nsd_stats_spacing_aware 对每个 (b, c) 做两次 distance_transform_edt（全卷欧氏 EDT），且强制 .cpu().numpy() 同步（@d:\codes\work-projects\SegTask\taskcore\metrics.py:219-250）。medium 模式下每个 val batch 都走一遍；high 模式下每个整卷 × num_fg 两次全卷 EDT。这是 val 墙钟的头号风险点，且没有任何采样/降频开关。建议：仅在 high 轮次启用物理 NSD，或提供 surface_dice_every_n_val。
+
+S9-G（中）val_volume_cache 无容量上限
+
+
+validation.py:456-458
+# val_volume_cache：逐卷 (预处理 image fp32, 原始 label int16, z_spacing)
+# 常驻缓存；只存本 rank 分片，容量随首轮填满后不再增长。
+self._vol_cache: "Dict[str, tuple]" = {}
+"不再增长"成立，但上限就是本 rank 全部 val 卷的 fp32 体积。50 卷 × 512×512×400 fp32 ≈ 21 GB RAM。与 S2 指出的"按条数而非字节数限容"是同一类问题：应给字节预算 + LRU，或至少在首轮填满后 log 实际占用。
+
+S9-H（低）compound_weights 多余项静默截断
+
+
+losses.py:718-725
+def _compound_weights(cfg: LossConfig, n: int) -> List[float]:
+    ws = list(cfg.compound_weights or [])
+    if len(ws) >= n:
+        return ws[:n]  # 自动适配长度
+实测 dice_bce + compound_weights=[1,1,1] → 静默取 [1,1]（无 warning），而条目不足时反而有 warning。不对称。
+
+S9-I（低）两套腐蚀边界约定并存
+实测 ones(5,5)：losses._soft_erode 求和 = 25（边界不腐蚀，跟随官方 clDice），metrics._binary_erosion_pool 求和 = 9（先 zero-pad，边界计入表面）。两者各自正确，但意味着 clDice 损失把 patch 边界处的结构当作内部，2.5D 薄 slab 下骨架被系统性高估。至少应在 _soft_erode docstring 注明该约定与 metrics 侧不同。
+
+S9-J（低）2.5D 下 n_samples 与 val loss 权重按切片计
+acc.update(...) 用 pred_logits.shape[0] 作为样本数，per_slice 下等于 B*D。日志里的 coverage=[...]/N samples 语义在 2.5D 与 3D 之间不可比。
+
+三、2026 最佳实践缺口
+只有 pooled（全局）指标，没有 per-case 聚合。MetricAccumulator 把所有样本的 TP/FP/FN 汇总后一次除，得到 nnU-Net 风格 global dice。但 MSD / KiTS / AMOS / BraTS 的标准报告口径是 per-case dice 的均值 ± 标准差 + 最差 k 例——pooled 指标会被大器官主导，掩盖个别病例的灾难性失败。建议 high 模式下顺带累加逐卷 dice 列表（成本近乎为零，整卷已在手），上报 mean_case_dice / std / p5。
+缺 HD95。已有 NSD 是好事（比 HD95 稳健），但 HD95 仍是绝大多数医学分割 benchmark 的必报项，且对"孤立假阳"的惩罚与 NSD 互补。物理 EDT 基础设施已就绪，加 HD95 几乎零边际成本。
+有拓扑损失，无拓扑指标。仓库同时提供 SoftCLDiceLoss 与 AuxTopoLoss（中心线/距离场辅助头），目标明确是血管/气道；但验证侧完全没有 clDice 指标或 Betti error。优化拓扑却用重叠指标选模，会选出"dice 高但断裂"的模型——这正是 clDice 论文要解决的问题。建议至少把 clDice 作为可选 criterion 接入 _CRITERION_TO_METRIC。
+无阈值标定。predict.threshold 是固定超参，验证与部署都用它。2026 常规做法是在 val 上做逐类阈值扫描（或 Youden/F1 最优），把标定后的阈值写进 checkpoint。当前训练期 dice 用硬编码 0.5（compute_dice_per_class 默认，@d:\codes\work-projects\SegTask\segtask_v1\trainer\trainer.py:598），验证期用 predict.threshold，两条曲线口径不一致。
+val_base_loss 在 high 模式恒为 NaN 并写入 history/monitor。已被 criterion='loss' 与 high 互斥的校验挡住选模路径，但曲线上的 NaN 列仍会流入看板。
+四、建议修复顺序
+优先级	条目	改动量
+P0	S9-A class_weights 长度校验（config + MultiResolutionLoss 构造期）	~10 行
+P0	S9-B 2.5D 物理 NSD spacing rank 适配 / 拦截	~15 行
+P1	S9-D 选模指标缺失告警 + patience 计数移出条件	~5 行
+P1	S9-C / S9-H 静默配置降级补 warning	~6 行
+P2	S9-E 空类指标改返 0 或修正 docstring	~5 行
+P2	S9-G val_volume_cache 字节预算	~20 行
+P3	per-case 指标聚合 + HD95 + clDice criterion	中等
+需要我直接实施 P0/P1 这批最小上游修复吗？S9-A 与 S9-B 都是"配置合法但结果错误/崩溃"，且各自只需一处校验即可根治。
+
 S10	推理全流程	engine/base_predictor.py、bn_stats.py；predictor/{predictor,sliding,forwards,inputs,io,blending}.py（滑窗/blend/TTA/AdaBN/z-interleave/写出）	S2、S6、S8
+审查报告：推理全流程
+本轮范围：base_predictor.py、bn_stats.py、predictor/{predictor,sliding,forwards,inputs,io,blending}.py、CLI predict.py，以及推理与训练的镜像契约核对点（views.py、dataset.py、make_data.py 仅作对照读）。 本轮遵守：不改任何代码/文档；结论均给 文件:行号；关键判断用 D:\miniconda\envs\torch27_env\python.exe 实测复现（探针为一次性 -c 命令，未落盘）。
+
+① 事实梳理
+入口链路（CLI）：predict.main 解析 ckpt/input/output/bbox（@d:/codes/work-projects/SegTask/segtask_v1/predict.py:62-123）→ run_inference：build_model → torch.load(weights_only=False) → _check_arch_fingerprint → _select_state_dict（auto 优先 EMA）→ 剥 _orig_mod. → 形状预校验 → load_state_dict(strict=False) + "加载 < 半参数即硬错" → 可选 reparam → .to(device).eval() → precision 解析 → Predictor → 可选 global AdaBN 预热 → 逐卷 predict_volume（@d:/codes/work-projects/SegTask/segtask_v1/predictor/io.py:145-279）。
+
+单卷链路：predict_volume（predictor.py:378-506）= 读 NIfTI(±z spacing) → bbox 裁 → spacing 归一化 → preprocess_image → 归一化统计诊断 → 可选 per-volume AdaBN → predict_preprocessed_array → 概率诊断 → spacing 回采 → 拼回原画布 → prob_to_label → 落盘。
+
+mode 派发（predictor.py:523-533）：whole→whole_volume_forward；cubic→sliding_window_cubic；2_5d+z-interleave→sliding_window_z_interleaved；其余→sliding_window_z。
+
+五个真实契约：
+
+几何派生单一真相源：build_topology(cfg) 供 lift_2_5d_to_3d / keep_native_view_depth / keep_native_multi_res（predictor.py:210-214），predictor 不再自行重算 mode 判定；但 per-view 空间尺寸（_mr_native_sizes / _mr_target_shape）仍由 predictor 自算（predictor.py:250-280），与 trainer/views.py:75-95 的同名几何是两份实现。
+窗口 builder 五分派（sliding.py:133-162）：2.5D-ON rank-3 / 3D-ON rank-4 / 单分辨率 GPU / 多分辨率 CPU 退化；cubic 侧两分派（sliding.py:363-374）。
+blending：z 轴按 (1,D,1,1) 权重累加、cubic 用可分离 3D 高斯（blending.py:49-71），末尾 acc_pred /= clamp(acc_weight)，fp16 累加器改用 6.1e-5 下界（sliding.py:475-487）。
+TTA：3D 7 组 flip / 2.5D 仅 H+W 3 组（forwards.py:63-74），按 tta_batch_size 沿 batch 轴 cat 批量化，AdaBN 估计期强制串行（forwards.py:77-113）。
+结构指纹硬闸：仅 spatial_dims / n_levels / stem_mode / downsample_strides / decoder_type 五键（io.py:71-97，来源 topology.py:89-97），patch_size/patch_mode 仅诊断。
+S1 遗留项复核：S1-A（reparam_deploy 字段归属错位）已修复——消费点现为 cfg.train.reparam_deploy（io.py:192），与定义端 core.py:987-989 一致，python -m segtask_v1.predict 不再必崩。
+
+② 正确性问题
+严重
+[S10-A] adabn_mode='per_volume' 必然 ModuleNotFoundError——该模块根本不存在 predictor.py:457 执行 from . import adabn as _adabn，随后调 _adabn.estimate_bn_stats（:465）。但 segtask_v1/predictor/ 下只有 __init__ / blending / forwards / inputs / io / predictor / sliding 七个文件（实测 importlib.util.find_spec('segtask_v1.predictor.adabn') → None）。同文件 :146 已从 taskcore.engine.bn_stats 正确导入 collect_bn_modules，说明这是 AdaBN 上提到 bn_stats.py 后漏改的第二个引用点（io.py:223 的 global 路径就改对了）。 后果：配 predict.adabn_enabled=true + adabn_mode=per_volume 且模型含 BN 时，每一卷在 predict_volume 里抛异常；CLI 侧被 io.py:277-279 的 except Exception 吞成 "Failed to process ..." 后 continue，即全部样本静默无输出；训练内整卷验证（VolumeValEvaluator）没有这层兜底，会直接中断训练。 未被测试发现的原因：tests/test_review_r8_optimizations.py:33-58 只用桩对象测 _adabn_keep_window 判据，从不进入 predict_volume 的 per_volume 分支；bn_stats.py 的单测也只测公共件。 根因分类：模块搬迁未做"引用点全覆盖"，且配置枚举值 per_volume 没有任何端到端冒烟。
+
+[S10-B] keep_native 路径的短窗口预测整体偏移 1 个体素（ON/OFF 两条路互不等价） 所有 keep_native builder 用 z_center=(z0+z1)//2 居中抽取（inputs.py:141/166/229-231），而 blending 侧按 pad_before=(pD-ad)//2 的居中填充语义回贴（sliding.py:211-213、sliding.py:382-384）。两者仅在 ad 与 pD 同奇偶时相等。实测（vol D=5、pD=8，体素值=z 索引）：
+
+
+
+OFF single_res : [0, 0, 1, 2, 3, 4, 4, 4]     # blend 取 idx1..6 → [0,1,2,3,4] 正确
+ON  native_d   : [0, 0, 0, 1, 2, 3, 4, 4]     # blend 取 idx1..6 → [0,0,1,2,3] 偏移 1
+ON  native_3d  : [0, 0, 0, 1, 2, 3, 4, 4]
+cubic ON 同源（三轴各自可中招），实测 build_cubic_batch_native_multi_res 在 centers=[(2,4,4)]、轴长 5 / pD=8 时 trim 段为 [0,0,1,2,3]。 触发面：compute_1d_positions（blending.py:34-43）对 length > patch 会把尾窗反锚到 (length-patch, length)，故 ad<pD 只在某轴整卷短于 patch 时出现——但这正是 3D cubic/z_axis 在薄层 CT、小 FOV 器官上的常见情形，且此时整卷只有一个窗，即整卷输出沿该轴错位 1 体素。OFF 路径正确、ON 路径错误，两者本应逐位等价。 正解是让 builder 的 pad 记账与 blend 共用同一函数（把 pad_before 从 builder 返回，而非在 blend 端二次推导）。
+
+[S10-C] z_boundary_mode='stretch' + keep_native 时，blend 与 builder 语义相反 builder（inputs.py:70-94/128-174）完全不看 z_boundary_mode，恒走 edge-pad 居中抽取；而 _blend_z_batch 按 p.z_boundary_mode 选分支（sliding.py:211-221）：stretch 下走 F.interpolate(pD→ad)，把一个"物理跨度 pD"的预测压缩到 ad 层，几何完全对不上。 缓解事实：sync() 会把已废弃的 stretch 升级为 edge_pad（tests/test_z_boundary_mode.py:394-395 断言），所以正常加载路径踩不到；但 Predictor.__init__:200-203 仍显式接受 'stretch'，手工构造 cfg 只 validate() 的路径（含 S1-「白名单仍含 stretch」）可以带进来。属"两个真相源 + 废弃值未彻底删除"的合流风险。
+
+中等
+[S10-D] 训推重采样算子不同：训练 scipy.zoom(order=1) vs 推理 F.interpolate(align_corners=False)，半像素错位 训练侧面内 resize 走 resize_3d→scipy.ndimage.zoom（dataset.py:551-571，z_axis 在 :986-990、whole 在 :1390-1394）；推理侧 GPU builder 全部用 F.interpolate(..., align_corners=False)（inputs.py:91-93/122-124/150-152/253-255）。实测（8→16 线性上采样，值=索引）：
+
+
+
+scipy.zoom   : [0, 0.467, 0.933, 1.400, ...]   ≡ align_corners=True
+align_corners=False : [0, 0.25, 0.75, 1.25, ...]
+即 scipy 的 grid_mode=False 等价于 align_corners=True，两者相差半像素（本例峰值偏差 ≈0.22 体素）。面内缩放比越大偏差越大。 注意区分：keep_native 的视图内 resize 在训练侧也是 F.interpolate(align_corners=False)（trainer/views.py:91-92/223-226），这部分是镜像的；不镜像的是**"整卷面内 → (pH,pW)"这一步**（训练在 dataset CPU 侧、推理在 GPU 侧），以及 whole 模式的整卷 resize。
+
+[S10-E] data.resize_antialias=True 在推理侧无对应实现 训练图像 resize 传 anti_alias=self.resize_antialias（dataset.py:987-988、:1391-1392）；推理侧 resize_3d 全部使用默认 anti_alias=False（sliding.py:46/53、inputs.py:204/286），GPU 的 F.interpolate 更无抗混叠。whole 模式整卷 4× 下采样时训练有低通、推理没有，属频域层面的训推不一致。与 S3-G（extract_patch_by_mode 不透传 anti_alias）同根。
+
+[S10-F] 训推镜像契约仍无落盘指纹（S1 遗留项在推理侧确认未闭环） _FINGERPRINT_STRUCT_KEYS（io.py:71-73）只硬比五个结构键。normalize / intensity_min/max / global_mean/std / spacing_normalization / target_spacing / z_boundary_mode / resize_antialias / skip_empty_* 全部不参与比对，且都不改变权重形状——配错只会静默产出错误结果。multi_res_scales / keep_native_view_depth 侥幸被 in_channels 形状校验（io.py:166-175、predictor.py:231-237）兜住，但那是副作用而非契约。 --override data.normalize=... 在推理 CLI 里是完全合法且无告警的（predict.py:63-66）。
+
+[S10-G] skip_empty_windows 判据与 keep_native 的实际窗口内容不一致 判据取 vol[z0:z1].max()（sliding.py:120-121）/ patch.max()（sliding.py:410-411），但 keep_native builder 实际喂给模型的是以窗心为中心、深度 eD_max（= pD × max_scale） 的更大 slab。multi_res_scales=[1.0, 2.0] 时窗外 50% 的内容不参与跳窗判据，可能跳掉一个"自身为空、但大 FOV 视图里含前景边缘"的窗。_SKIP_RATIO_WARN=0.5 的兜底告警（sliding.py:451-472）设计是好的，但拦不住这类局部漏检。
+
+[S10-H] 诊断分位数在整卷上算，是可观的额外开销 _log_normalized_input_stats 对整卷 np.quantile（predictor.py:337），_log_inroi_prob_stats 对 (num_fg,D,H,W) 概率体 np.quantile（predictor.py:356）。np.quantile 会做一次完整副本 + partition：3 类 × 512³ fp32 ≈ 1.6 GB 临时内存 + 秒级 CPU 时间，每卷两次。同文件 forwards.py:154-164 的 _q3 已经做对了（>1e6 元素按 stride 抽样），两套诊断口径不一致。
+
+轻微
+问题	位置	说明
+coords 类型注解与实际元素长度不符	sliding.py:354 vs :433-434/378-379	声明 9-tuple，实存 12-tuple；静态检查失真
+cubic ON 路径仍做无用的 CPU 取窗 + np.pad	sliding.py:405-430 vs :363-368	ON 分支只消费 centers，patches 仅用于计数与跳窗判据；大 patch 下白付一次整窗 CPU 拷贝
+输出文件名只取 basename	predictor.py:571	--input 递归扫描（predict.py:24）时不同子目录同名文件互相覆盖，无告警
+torch.load(weights_only=False)	io.py:158	已注释说明必要性，但对外部 ckpt 是任意代码执行面；可考虑 safe_globals 白名单
+choose_interleave_factor 静默容忍长度不齐	sliding.py:246-251	zip 截断；虽然 seg_task.py:131-134 已校验 len(fac)==len(thr)+1，但直接构造 Predictor 的路径（整卷验证）不经该校验
+channels_last=True 会就地改训练模型排布	predictor.py:105-110 + validation.py:464-465	数值等价，core.py:1185-1189 已明写此副作用；但优化器/EMA buffer 仍是 contiguous，属"已知但未闭环"
+whole 模式 + oversample_mode='legacy' 存在 FOV 漂移	dataset.py:1360-1385 vs sliding.py:46	训练整卷 resize 到 extract_size 后中心裁 → 实际 FOV 收窄；推理恒用全卷。oversample_mode='pad' 是既有正解，但无任何校验/告警把两者绑定
+CPU 设备上仍构造 autocast(device_type="cuda")	forwards.py:227/254/273/299	enabled=False 时可用，但与 BasePredictor._autocast（base_predictor.py:45-48，按 self.device.type 取）不一致——基类的正确实现被完全绕过
+③ 合理性与设计评价
+做得好的（建议固化为契约）：
+
+加载期的三道闸：结构指纹（io.py:76-97）→ 共有键形状预校验（io.py:165-175）→ "加载 < 半参数即硬错"（io.py:182-190）。第三条尤其少见，直接消灭"随机权重静默推理"这类最贵的假阴。
+NaN 全链路可观测：diag_log_first_batch（forwards.py:142-203）+ prob_to_label 的 NaN→背景 + logger.error（blending.py:100-112）+ 归一化/概率两级统计，且日志文案直接指向"这是训练侧问题"还是"fp16 溢出"。这套诊断的信噪比明显高于同类框架。
+TTA 批量化的等价性论证（forwards.py:90-113）：显式说明"eval 下 BN 用 running stats、变体间无 batch 耦合"，并在 AdaBN 估计期强制退回串行（forwards.py:84-85）——把"批量化何时不等价"这个隐含前提写成了代码。
+逐类阈值的 eligible-mask 语义（blending.py:127-133）：避免"先 argmax 再门控"丢掉本可接受的次高类，且与验证侧 prob > thr 严格同口径（validation.py:528-532）。
+显存逃生门成体系：acc_dtype / accumulate_on_cpu / vol_dtype 三个正交开关，且 fp16 累加器的 eps 按 dtype 调整（sliding.py:482）——这个细节很多实现会漏。
+结构性问题：
+
+BasePredictor 形同虚设：Predictor 继承了它（predictor.py:59），却自己重写了一套 _AMP_DTYPES（predictor.py:34-36）、自己解析 amp（:284-291）、自己写 flip 组合表（forwards.py:63-74），_setup_infer_amp / _autocast / flip_tta_combos 三个 helper 一个都没用。基类的 _autocast 恰好还是更正确的那版（按设备类型取）。这是 R6 抽包时"抽了基类但没接线"的半成品。
+推理几何是训练几何的第二实现：_mr_native_sizes/_mr_target_shape（predictor.py:250-280）与 views.split_views_native_3d（trainer/views.py:75-95）、_extract_z_slab_resized（inputs.py:70-94）与 dataset._getitem_max_fov（dataset.py:968-1000）两两同构却各写一遍。S10-B/C/D/E 四条全部落在这些"孪生实现"的缝隙里——与 S1「stem-stride 三份副本」、S2「安全中心域两份实现」是同型问题，且推理侧是最难被测试发现的那一份（没有 label 做交叉验证）。
+Predictor.__init__ 承担了配置校验职责（:191-195/200-203/231-237/322-326）：五处 raise ValueError 本质是 config 层的跨段约束，放在这里意味着"只有真跑推理才会发现配错"，且训练内整卷验证要到第一次 val 才炸。
+p: "Predictor" 反向依赖：sliding/forwards/inputs 三个模块声称是"模块级纯函数"（inputs.py:3-6），但 sliding 与 forwards 全都以 p 读取 ~25 个属性，实际是把 God Class 换成了 God Parameter。只有 inputs.py 与 blending.py 做到了真正的参数化——这两个文件也确实是唯一能被直接单测的（test_keep_native_multi_res_predictor.py 印证）。
+异常吞噬边界过宽：io.py:277-279 对整卷 except Exception: continue。它把 S10-A 这种"每卷必崩"的结构性错误降级为逐卷 warning，最终 CLI 退出码仍是 0。至少应统计失败卷数并在收尾非零退出。
+④ 优化空间（含 GPU / 吞吐 / 显存）
+按「收益 / 风险」排序：
+
+#	优化	预估收益	风险
+1	诊断分位数改用 forwards._q3 的抽样版（S10-H）	每卷省 ~1.6 GB 临时内存 + 秒级 CPU；大卷批量推理直观提速	极低（诊断精度无实质损失）
+2	cubic ON 分支跳过 CPU 取窗/np.pad，跳窗判据改用 vol_t 上的 amax（或预算一次整卷 3D max-pool）	省一次逐窗整窗 CPU 拷贝；max 上 GPU 后跳窗判据也不再需要 CPU 侧整窗切片	低；需注意 GPU max 会引入同步点，宜按 batch 批量算
+3	run_inference 支持多进程/多卡分片（按 image_paths 切分）	批量推理近线性加速；当前是严格串行单卡	中（需处理日志与输出目录竞争）
+4	TTA 用 torch.flip 的输出端合并：把 8 个变体一次 cat 后单次前向（显存允许时），或改用 vmap	前向次数 8→1~2，小 patch 下 kernel launch 开销占比高时收益明显	低；tta_batch_size 已提供该能力，缺的是按可用显存自动选值而非默认退化为 batch_size
+5	概率累加器改为"按 z 分块 flush"（当前 acc_pred 恒为整卷 num_fg×D×H×W）	多类大卷显存从 O(全卷) 降到 O(块)；比 accumulate_on_cpu 的 D2H 逃生门更省时间	中（需重排窗口遍历顺序，z 轴天然可分块，cubic 需按 d 分组）
+6	cudnn_benchmark 默认开启（滑窗窗口形状固定，正是它的最佳场景）	首卷一次 autotune 换全程最优 kernel	低；但短任务（1~2 卷）可能负收益，故宜按 len(image_paths) 自适应
+7	_save_predictions 的 sitk.ReadImage 只为拿元数据却解码整卷像素（predictor.py:574）	用 ImageFileReader.ReadImageInformation() 可省一次整卷解码	极低（与 S2-E 同型问题）
+8	whole 模式的整卷 resize 上 GPU（当前 resize_3d 走 scipy 单线程，sliding.py:46/53）	大卷下这是 whole 模式的主要耗时	中；会改变数值 → 与 S10-D 应一并处理
+⑤ 2026 可借鉴项
+说明：以下为方向性建议；进入落地阶段前会先核对各自最新官方文档的 API，不凭记忆写实现。
+
+方案	借鉴点	适配代价	优先级
+nnU-Net v2 的 compute_gaussian + 权重下限钳位	当前高斯 σ=n/4 且无下限（blending.py:55-60）。nnU-Net 用 σ=n/8 并把权重钳到 max*0.1，避免窗口边缘权重过小导致的数值放大；同时权重图只算一次并缓存复用	低	中（数值稳定性 + 与社区口径对齐）
+MONAI sliding_window_inference 的 roi_weight_map + buffer_steps 分块累加	正是上面优化 #5 的成熟实现（沿某一空间轴分块 flush 累加器），且支持 sw_device != device（累加器与计算分离），比当前 accumulate_on_cpu 的粗粒度逃生门更细	中（需重排窗口遍历）	高（显存是当前推理的主要天花板）
+训推镜像指纹落盘（业界通行的 "preprocessing fingerprint"）	把 normalize/intensity/spacing/target_spacing/z_boundary_mode/resize_antialias/multi_res_scales 一并写进 ckpt，推理时默认硬比对、需显式 --allow-preproc-drift 才放行。直接根治 S10-F 与 S1 遗留项	低（arch_fingerprint 已有骨架，扩键即可）	最高（唯一能系统性防住"静默错误结果"的机制）
+重采样算子统一为单一后端	S10-D/E 的根治方案：训练与推理共用同一 resize 抽象（GPU F.interpolate 为主、align_corners 与 antialias 显式入参）。PyTorch 的 F.interpolate(antialias=True) 已覆盖 bilinear/bicubic（3D trilinear 仍需自行高斯预滤波，与 resize_3d 现有实现一致）	中（会改变历史数值 → 需作为新枚举、默认保旧）	高
+测试时增强的加权聚合（而非等权平均）	当前 TTA 是 8 个变体算术平均（forwards.py:99-113）。近两年分割侧更常用"按变体可靠性/熵加权"或直接在 logit 域平均（而非 sigmoid 后平均，后者对饱和输出有偏）	低（改一行聚合式，但需回归 Dice）	中（logit 域平均这一条尤其值得实测）
+AdaBN 的替代：TENT / 熵最小化式 TTA	当前 AdaBN 只重估 BN 统计（bn_stats.py），对 norm_type != 'batch' 的模型直接 no-op（predictor.py:148-152，本仓 InstanceNorm/GroupNorm 是常见配置）。熵最小化式 TTA 可作用于任意归一化层	高（需反传，与 inference_mode 冲突）	低（先修 S10-A 让现有 AdaBN 可用更要紧）
+概率图落盘改用分块压缩格式	save_probabilities 逐类写 gzip NIfTI（predictor.py:582-590），多类大卷极慢。分块格式（blosc2/zarr）在写入吞吐上有数量级差距，与 S2「nnU-Net blosc2」一条同源	中（新依赖 + 下游读取方需适配）	低
+⑥ 与既有测试 / 契约的冲突检查
+S10-A 无任何测试覆盖：tests/test_review_r8_optimizations.py:33-58 只测判据函数，per_volume 分支从未被执行。修复（把 _adabn.estimate_bn_stats 改为 bn_stats.estimate_bn_stats）不破坏任何现有断言，但必须补一个"per_volume 端到端冒烟"用例，否则同类漏改会再次发生。
+S10-B 与既有测试不冲突，但现有测试恰好绕开了它：tests/test_keep_native_multi_res_predictor.py:21-24 断言"view 0 与 _extract_cubic_patch 在同一 center 下逐位相等"——它验证的是 builder 内部自洽（center 语义），而 bug 在 sliding.py 的 coords/trim 用了 d0 语义。修复需新增"ON 与 OFF 两条路径对同一短轴体积输出逐位相等"的对拍用例，这也是本条最合适的回归形态。
+S10-C 与 tests/test_z_boundary_mode.py:394-395 一致：该测试断言 sync() 会把 stretch 升级为 edge_pad，即现有测试已经默认 stretch 不可达。据此，从 Predictor.__init__:200-203 的白名单里删掉 'stretch' 不会破坏任何断言，反而与 S1-「白名单仍含已废弃的 stretch」形成同一批修复。
+S10-D / S10-E 修正会改变所有历史推理数值，与 README.md / DESIGN.md 声明的"legacy 默认保旧行为"冲突 → 必须以新枚举（如 resize_backend）+ 默认 legacy 落地，且 tests/test_z_boundary_mode.py:449-455（比较不同 mode 输出）与 test_keep_native_multi_res_predictor.py 的数值参考需同步分叉。
+S10-F 的指纹扩键是纯新增：_check_arch_fingerprint 对无指纹的旧 ckpt 直接 return（io.py:81-83），扩键天然向后兼容；但新增键的硬比对会让"训练后改归一化再推理"的既有工作流直接报错——需以 warn-only 一个版本、再升级为 error。
+S10-G / S10-H 无既有测试覆盖，修正不破坏任何断言。
+
 S11	全局串联	训练↔推理镜像契约端到端核对、配置→topology→数据→模型→损失→推理的一致性、性能瓶颈全局画像（数据/显存/通信/编译）、legacy 默认值清单再评估	S1–S10
+审查报告：全局串联
+本轮遵守：只审不改（未产生任何代码/文档改动）；结论均给 文件:行号；本轮新结论均在当前工作区代码上重新核对，未直接沿用 S1–S10 的历史断言。
+
+本轮范围：① 对 S1–S10 全部「严重/中等」结论做当前状态复核（因为期间代码已被修复，历史报告已部分过期）；② 训练↔推理镜像契约的端到端矩阵；③ 配置→topology→数据→模型→损失→推理的跨层一致性；④ 性能瓶颈全局画像；⑤ legacy 默认值清单再评估。
+
+① 事实梳理：S1–S10 结论的当前有效性（本轮实地复核）
+这是 S11 最重要的一条前置结论：S1–S10 的报告已经不能直接作为 S12 的输入。抽查 12 条「严重/中等」项，7 条已在代码里闭环。
+
+已修复（本轮逐条核对）
+原结论	当前代码	证据
+S2-A 异构 rw → default_collate KeyError	三个 dataset 均在无 rw 时补全 1 wmap，样本 schema 恒定	@d:/codes/work-projects/SegTask/taskcore/data/dataset.py:1006-1010、:1248-1251、:1418-1421
+S3-A skip 判据单向	已改为双向比对 rw / bbox 存在性	@d:/codes/work-projects/SegTask/taskcore/data/make_data.py:120-130
+S3-D fg_subsample 不在必需键	缺键即拒绝复用（"stale package"）	@d:/codes/work-projects/SegTask/taskcore/data/make_data.py:111-119
+S6-D 6/10 算子隐式同步	全部搬运点已加 non_blocking=True	@d:/codes/work-projects/SegTask/taskcore/data/augment.py:241-242、:387、:526-527、:636、:659
+S7-A best 不含 arch_fingerprint	新增 _ckpt_extra_state() 钩子，基类 _save_best/_save_latest 统一注入	@d:/codes/work-projects/SegTask/segtask_v1/trainer/trainer.py:692-703 + @d:/codes/work-projects/SegTask/taskcore/engine/base_trainer.py:601、:653
+S7-B/S7-E scheduler horizon 被 ckpt 覆盖、里程碑后移	引入 _BASE_PROGRESS_KEYS + _reconcile_base_hyperparams（进度取 ckpt、超参取新配置）；step 里程碑已换算到 base 时钟	@d:/codes/work-projects/SegTask/taskcore/engine/optim.py:308-335、:182-191
+S8-B breakdown 多解一层包	改为 isinstance(criterion, DeepSupervisionLoss) 才解包	@d:/codes/work-projects/SegTask/segtask_v1/trainer/breakdown.py:24-30
+部分修复（这是最危险的一类，比"未修"更需要 S12 关注）
+S10-B 只修了一半：cubic 路径已把 pad_before 从 builder 传出（12-tuple pb_d/pb_h/pb_w，@d:/codes/work-projects/SegTask/segtask_v1/predictor/sliding.py:378-383），z 路径仍在 blend 端二次推导 pad_before=(pD-ad)//2（@d:/codes/work-projects/SegTask/segtask_v1/predictor/sliding.py:211-213），而 keep_native builder 用的是 z_center=(z0+z1)//2 语义（@d:/codes/work-projects/SegTask/segtask_v1/predictor/inputs.py:141、:166 → :77-82）。详见 S11-A。
+S2-B：manifest 已可回读并做泄漏漂移检测（@d:/codes/work-projects/SegTask/taskcore/data/loader.py:473-502、:1230-1240），但划分仍是位置索引 permutation，未落地内容哈希划分——即"能发现泄漏"但"仍会产生泄漏"。
+S6-B：新增 whole_oversample_mode: 'legacy'|'pad'（@d:/codes/work-projects/SegTask/taskcore/config/core.py:123-127），pad 区 weight_map=0（dataset.py:1434-1436）——默认仍是 legacy，即生产默认路径的 FOV/尺度错位未变。
+S5-F：新增 upsample_interp_dtype: 'legacy'|'native'（core.py:439-442），默认仍 legacy。
+复核后确认仍开放
+S10-A：from . import adabn as _adabn 仍在（@d:/codes/work-projects/SegTask/segtask_v1/predictor/predictor.py:457、:465），adabn.py 不存在 → adabn_mode='per_volume' 仍必崩。
+S10-F / S1 遗留：_FINGERPRINT_STRUCT_KEYS 仍只有 5 个结构键（@d:/codes/work-projects/SegTask/segtask_v1/predictor/io.py:71-73），预处理字段一个都不参与。
+S9-A：loss.class_weights 在 taskcore/config/ 全目录 grep 仅命中字段定义（core.py:678），仍无长度校验。
+对 S12 的直接影响：S12 若按 S1–S10 原文汇总排序，会把已闭环项重复列为待办，并遗漏"半修"这一最高风险类别。建议 S12 以本节的三态（已闭环 / 半修 / 开放）为输入，且把「半修」单列最高优先级——半修意味着两条路径行为分叉，比统一的旧行为更难发现。
+
+② 正确性问题（跨层，只有串联才能看到）
+严重
+[S11-A] keep_native 的 z 路径 pad 记账仍与 blend 相反，且与已修好的 cubic 路径行为不一致
+同一份 sliding_window_z，OFF / ON 两条路的居中语义现在是分裂的：
+
+
+
+OFF（single_res builder）:  pad_before = (pD - ad) // 2          inputs.py:115
+ON （native builder）    :  zlo = z_center - eD//2, z_center=(z0+z1)//2
+                            ⇒ pad_before = pD//2 - ad//2         inputs.py:77 + :141/:166
+blend（两者共用）        :  pad_before = (pD - ad) // 2          sliding.py:212
+pD=8, ad=5：OFF 与 blend 都取 1（一致，正确）；ON 取 2（与 blend 差 1）→ 整卷沿 z 错位 1 个体素，且 ON/OFF 两条本应逐位等价的路径输出不同。触发条件与 S10-B 相同（某轴整卷短于 patch，薄层 CT / 小 FOV 器官的常见情形）。
+
+严重性判定高于 S10-B 原文：cubic 侧修复已经确立了"builder 返回 pad_before、blend 不再推导"这一正确模式（sliding.py:378-379），z 侧却没跟上——现在同一文件里两种记账方式并存，下一个改动者会以为整个文件已统一。
+
+正解：让三个 z builder 与 cubic 一样返回 pb_d，_blend_z_batch 一律消费传入值，删除 sliding.py:212 的本地推导。
+
+[S11-B] 训推镜像的守卫强度取决于用户选了哪个算子，且 ckpt 里已有的完整 config 从未被用于比对
+推理 CLI 用的是用户给的 YAML，不是 ckpt 里的 config：cfg = load_config(args.config)（@d:/codes/work-projects/SegTask/segtask_v1/predict.py:62-66），而 ckpt["config"] = self.cfg 在 best/latest 两处都已落盘（base_trainer.py:600、:651），torch.load(..., weights_only=False) 也确实把它读了进来（io.py:158）——然后被完全丢弃。
+
+当前三道闸的实际覆盖面（本轮按代码逐条推演）：
+
+漂移项	指纹（5 键）	形状预校验	结果
+decoder_type / stem_mode / n_levels / spatial_dims / downsample_strides（显式）	✅ 拒绝	—	已闭环
+patch_size 改动 → aniso stride 漂移 + downsample_mode=maxpool/avgpool	✅ 拒绝（strides 进指纹）	❌ 形状不变	已被指纹兜住（S4-A/S5-G 已闭环）
+num_classes / label_values	❌	✅ head 形状	闭环
+multi_res_scales / keep_native_view_depth	❌	⚠️ 仅靠 in_channels 副作用	侥幸，非契约
+**normalize / `intensity_min	max/global_mean	std`**	❌
+spacing_normalization / target_spacing	❌	❌	静默错误结果
+resize_antialias / whole_oversample_mode / z_boundary_mode	❌	❌	静默错误结果
+关键观察（S11 才看得到）：这三个"新增的 legacy 开关"本身就在扩大镜像缺口。resize_antialias 训练侧生效、推理侧无实现（S10-E，inputs.py/sliding.py 全部 anti_alias=False）；whole_oversample_mode='pad' 只改训练侧；upsample_interp_dtype 是模型内算子（推理共用 build_model，安全）。也就是说：每按"legacy 默认保旧"原则加一个数据侧开关，就新增一格未被指纹覆盖的镜像面，而这个原则本身是 S2/S3/S5/S6 各轮反复建议的落地方式——两条建议线互相冲突，S12 必须显式解这个冲突。
+
+正解（成本极低，因为素材已全在 ckpt 里）：把 _check_arch_fingerprint 泛化为 _check_train_infer_mirror(ckpt, cfg)，对一张显式 MIRROR_KEYS 清单逐字段比对 ckpt["config"] 与当前 cfg；缺 config 的旧 ckpt 走兼容 return（与现有 io.py:81-83 同型）。约 30 行，且不依赖任何新落盘格式。配套一条规则：新增任何影响数值的 data/augment 字段，必须同时进入 MIRROR_KEYS 并在推理侧有实现，否则不得合入。
+
+中等
+[S11-C] "启动期缺前置校验"族已连续七轮出现，且修复是逐条打补丁而非机制化
+S1(amp_dtype/compile_mode) → S2-G → S3-D → S4-C → S5-C → S6-F → S7-I → S9-A（本轮复核确认 class_weights 仍无校验）。本轮观察到的新事实：core.py 里已经补了一批 _require（如 upsample_interp_dtype:1507-1510、whole_oversample_mode:2090-2093、z_sampling_mode:2060-2063），说明修法是"每加一个新字段顺手加一条校验"，而老字段的空白仍在。这是典型的补丁式收敛，永远追不平。
+
+正解不是再补 N 条 _require，而是一条元测试：遍历所有 @dataclass 段的字段，断言每个字段 ∈（有校验分支 ∪ 显式豁免清单）。本仓已有 AST 元测试先例（tests/test_todo_p_regressions.py:340-362），手法现成。
+
+[S11-D] 诊断/守卫代码本身无测试，是本项目缺陷的主要藏身处
+S8-B（breakdown 解包写错）、S10-A（AdaBN 模块名写错）、S7-A（指纹没落到 best）三条的共同形态是：守卫/诊断写对了，但装错了位置，且没有任何测试执行过那条路径。这三条分别落在三个不同层，却是同一个工程习惯问题。
+
+配套证据：tests/ 67+ 用例几乎全部覆盖"正常路径的数值/形状"，而 _adabn 分支、collect_multi_res_breakdown、best 的 key 集合三处在全仓测试中零执行。
+
+正解：为"守卫类代码"单列一条契约——凡是 raise / warning / 诊断输出，必须有一个用例真正触发它。
+
+③ 合理性与设计评价（全局）
+全局最强的三条设计（跨层验证后确认）
+build_topology 单一派生入口：S1/S4/S8/S10 四轮分别从配置层、装配层、pipeline 层、推理层核对，四层全部只读 topo、无一处自算 in_channels/out_classes/spatial_dims。这是全仓唯一做到"四层零副本"的量。
+优化步边界单一实现 + 运行期时钟自检（base_trainer.py:337-504）+ AST 元测试：唯一一处把"契约"变成了"可执行约束"的地方。上面 S11-D 建议的守卫测试规则，就是把这套手法推广到其它层。
+策略对象消灭 mode 分支（pipelines/factory.py:44-64）：_train_epoch 通篇无 patch_mode 字样，是"同一语义多份副本"这一全仓通病被解决得最彻底的一处。
+全局最深的结构性问题：三条"同型病"贯穿十轮
+病型	各层实例	当前收敛度
+同一语义多份真相源	几何：stem-stride ×3（S1）、安全中心域 ×2（S2-C）、decoder 节点数 ×3（S4-C）、z 多分辨率域 ×2（S2-D）、推理几何 vs views.py（S10）、pad 记账 ×2（S11-A）；时间轴：steps/warmup/horizon ×4（S7）；mode 标志 ×4（S8-C）	时间轴已收敛（S7-B/E 修复），几何维度基本未收敛
+跨运行边界状态不完整	指纹（S4-A/S7-A）、增强 RNG（S6-C）、resume 必需键（S7-C）、预处理镜像（S10-F/S11-B）	前两条已闭环，后两条仍开放；且 ckpt["config"] 已在手却没用
+启动期缺前置校验	连续七轮（S11-C）	逐条打补丁，未机制化
+一条 S11 特有的判断：第一类病在"读侧"已经解决（build_topology），但在"写侧/边界侧"没有解决。凡是"从几何量派生出一个偏移量/边界量"的地方（pad 记账、安全中心域、余量预算、divisor），都还是各写各的。建议 S12 立一个 geometry_budget(cfg) 派生函数族，与 build_topology 同级，输出：每轴 divisor、安全中心域、pad_before 记账、增强余量预算、各轴最大允许角度/平移。S2-C、S4-D、S6-A/G、S11-A 会一次性同源解决。
+
+④ 性能全局画像
+把 S2–S10 各轮的实测数字放到同一条时间轴上（47.2M UNet、[16,128,128]、B=2、bf16、3080 Ti Laptop）：
+
+训练单步预算（约 130 ms/步，fwd+bwd 占 101.6 ms ≈ 78%）
+
+环节	实测	占比	状态
+fwd + bwd	101.6 ms	78%	基线
+GPU 增强（seg2_5d 默认）	10.9 ms（峰值 +306 MiB）	8.4%	同步已消除（S6-D 已修），显存峰值未优化
+grad-norm D2H（bf16 路径）	6.3 ms	4.9%	开放：grad_norm_lazy_sync 对 bf16 恒无效
+optimizer.step（fused AdamW）	6.0 ms	4.6%	—
+EMA update（同设备）	3.5 ms	2.7%	—
+EMA update（ema_device=cpu）	57.1 ms	+42%	开放：注释未披露量级
+prepare_batch / center_crop	0.5–0.75 ms	<1%	S8-E 的 .contiguous() 冗余（−39%）状态未复核
+结论：训练侧非计算开销约 16 ms/步（12%），其中唯一有数量级空间的是 EMA CPU offload（57 ms，换 180 MiB 显存）；其次是 bf16 的 grad-norm 同步（6.3 ms，可改设备端标志消除）。其余优化项收益都在 1% 量级——不建议 S12 把它们混在同一批次里，性价比差两个数量级。
+
+数据侧（worker）：真正的瓶颈不在单步预算里，而在 ① CPU scipy.zoom 面内 resize（z_axis/whole 主热点）；② 前景索引双份内存（1000 卷 ×3 类 ≈ 3.6 GB/worker）；③ 三份 LRU 按卷数而非字节计费。这三条与训练步预算正交，且在 Windows spawn 下被 pickle 放大。
+
+推理侧：天花板是显存而非时延——acc_pred 恒为整卷 num_fg×D×H×W；其次是诊断分位数每卷两次全卷 np.quantile（3 类 512³ ≈ 1.6 GB 临时内存），而同仓 forwards._q3 已有抽样版实现。
+
+跨层的一条新观察：prefetch_to_gpu 的收益链现在才真正闭合——S6-D 修好同步后，预取与增强才能重叠；但 augment 仍在训练主流上同步执行（trainer.py:471），且作用于未裁剪的 max-FOV cube（体积是最终 patch 的 r·s³ 倍）。"预取 → 增强 → 裁剪"的顺序决定了增强永远在最大体积上做，这是设计层面的成本，不是实现层面的。
+
+⑤ legacy 默认值清单再评估
+开关	当前默认	代价	建议
+data.z_sampling_mode	safe（已翻转）	—	✅ 已完成的正确样板
+data.resize_antialias	false	whole 4× 下采样明显混叠；且推理侧无实现（镜像缺口）	先补推理实现，再考虑翻转；未补齐前应在配置层拒绝 true（否则是保证的训推不一致）
+data.whole_oversample_mode	legacy	训练 FOV 只看中间 67%、体素尺度比 val 细 1.5×	翻 pad；至少 ratio>1 时启动期 WARNING
+data.split_rounding_mode	legacy	四份取整实现互不一致	翻 unified（数值影响仅 ±1 样本）
+augment.elastic_field_mode	legacy	gaussian 语义是"叠加平滑"、幅度额外衰减 2.45×	先修文档口径，实现修正走新枚举
+model.init_strategy	legacy	非 legacy 会抹掉 zero-init/ICNR 契约（S4-B）	保持 legacy，但应在选非 legacy 时对已声明自初始化模块跳过
+model.unet.upsample_interp_dtype	legacy	decoder 最高分辨率处多一份 2× fp32 临时张量	翻 native（torch 2.7 原生支持，前提已不成立）
+data.z_boundary_mode='stretch'	已废弃但白名单仍收	与 keep_native builder 语义相反	直接删（Predictor.__init__ 白名单 + core 白名单），既有测试已断言 sync 会升级
+loss.batch_dice	true（默认吞掉 ignore_empty）	用户显式配置静默失效	不改默认，加一次 warning
+元规则建议（S11 认为这比逐条翻转更重要）：legacy 开关只应用于"改变数值但两侧都实现了"的情形。若一个开关只在训练侧有实现（resize_antialias），它就不是 legacy 开关，而是已知的训推不一致，应当在配置层直接拒绝或强制同步。当前把这两类混在一起，是 S10-E / S11-B 的制度性根因。
+
+⑥ 与既有测试 / 契约的冲突检查
+S11-A（z 路径 pad）：与既有断言不冲突。tests/test_keep_native_multi_res_predictor.py:21-24 验证的是 builder 内部自洽（center 语义），不涉及 blend。修复需新增"ON / OFF 两条路径对同一短轴体积逐位相等"的对拍用例——这正是 S10-B 建议过、但 cubic 修复时只补了 cubic 侧的那条用例形态。
+S11-B（镜像清单）：_check_train_infer_mirror 属纯新增，旧 ckpt 走兼容分支。风险点：ckpt["config"] 是 pickle 的 Config 对象，跨版本字段增删依赖 model_migration 的 __setstate__（model_migration.py:349-373）——比对前需 try/except 兜底，反序列化失败时降级为 warning 而非崩溃。这一点必须写进实现契约，否则会把"配置漂移告警"变成"旧 ckpt 一律不可用"。
+S11-C（元测试）：新增元测试会立刻标红一批现存字段（class_weights、region_weights 长度、compile_mode 等）。建议首版带显式豁免清单落地，清单只减不增。
+S11-D（守卫测试）：新增用例，不破坏任何现有断言；test_review_r8_optimizations.py:33-58 需从"测判据函数"升级为"跑通 per_volume 分支"。
+legacy 翻转：whole_oversample_mode / split_rounding_mode / upsample_interp_dtype 三项翻默认都会改变历史数值。test_data_specs.py、test_z_boundary_mode.py:449-455 的数值参考需分叉。三者互相独立，可拆三个小批次，不必同批。
+
 S12	总结与优先级排序	汇总全部问题 + 2026 借鉴清单，按「正确性风险 / 收益-成本比 / 改造范围」排序，给出建议的落地批次（仅建议，不改代码）	S11
 说明：S5、S7、S9 是最重的三块（各 2k–3k 行），如单轮内容过多我会主动拆成 a/b 两轮而非降低深度；计划需要调整时先说明原因。
 

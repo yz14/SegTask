@@ -49,7 +49,8 @@ class Group:
 # 枚举（来自 config.py 注释 + validate() 白名单，单一真相源的人工固化）。
 # ---------------------------------------------------------------------------
 ENUMS: Dict[str, List[str]] = {
-    "data.normalize":              ["minmax", "zscore"],
+    "data.normalize":              ["minmax", "zscore", "ct_fingerprint",
+                                    "zscore_volume"],
     "data.cache_mode":             ["none", "memory"],
     "data.cache_dtype":            ["fp32", "int16"],
     "data.z_boundary_mode":        ["stretch", "edge_pad"],

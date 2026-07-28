@@ -31,6 +31,122 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Sliding-window accumulators — dense (全量) / streaming (2-5 流式分块)
+# ---------------------------------------------------------------------------
+def _acc_eps(dtype: torch.dtype) -> float:
+    """权重归一 clamp 下界：fp16 下 1e-8 会下溢为 0，改用其最小正规数量级。"""
+    return 6.1e-5 if dtype == torch.float16 else 1e-8
+
+
+class _DenseZAccumulator:
+    """全量累加器：``(num_fg, D, H, W)`` 常驻 ``acc_device``（旧行为）。
+
+    ``weight_hw=False``（z 路径）时权重仅沿 z 广播 ``(1, D, 1, 1)``；
+    ``weight_hw=True``（cubic 路径）时权重全空间 ``(1, D, H, W)``。
+    """
+
+    def __init__(self, num_fg: int, D: int, H: int, W: int,
+                 dtype: torch.dtype, device: torch.device,
+                 weight_hw: bool):
+        self.pred = torch.zeros((num_fg, D, H, W), dtype=dtype, device=device)
+        wH, wW = (H, W) if weight_hw else (1, 1)
+        self.weight = torch.zeros((1, D, wH, wW), dtype=dtype, device=device)
+
+    def add(self, sub: torch.Tensor, w: torch.Tensor, zs: int, ze: int,
+            h0: int = 0, h1: Optional[int] = None,
+            w0: int = 0, w1: Optional[int] = None) -> None:
+        # in-place fused mul-add。
+        self.pred[:, zs:ze, h0:h1, w0:w1].addcmul_(sub, w, value=1.0)
+        self.weight[:, zs:ze, h0:h1 if self.weight.shape[2] > 1 else None,
+                    w0:w1 if self.weight.shape[3] > 1 else None].add_(w)
+
+    def flush_below(self, z: int) -> None:
+        """全量模式无需提前写出；no-op。"""
+
+    def finalize(self) -> np.ndarray:
+        return _finalize_accumulators(self.pred, self.weight)
+
+
+class _StreamZAccumulator:
+    """流式分块累加器（2-5）：device 侧只保留“后续窗口仍可能写到”的活跃
+    z 段（~patch_D 层）；调用方按 z 序递交窗口并在确定不再被写的层上调
+    ``flush_below``，该段立即归一化写入 host 侧 fp32 输出体并释放。
+
+    数值与全量累加逐位一致：同 dtype 累加、同 eps clamp、同“除法在累加器
+    dtype 上完成后转 fp32”顺序。未被任何窗口覆盖的层（skip_empty_windows
+    跳窗）输出保持 0，与全量模式的 0/eps=0 一致。
+    """
+
+    def __init__(self, num_fg: int, D: int, H: int, W: int,
+                 dtype: torch.dtype, device: torch.device,
+                 weight_hw: bool):
+        self.num_fg, self.D, self.H, self.W = num_fg, D, H, W
+        self.dtype, self.device = dtype, device
+        self.wH, self.wW = (H, W) if weight_hw else (1, 1)
+        self.out = np.zeros((num_fg, D, H, W), dtype=np.float32)
+        self.lo = 0     # 首个未写出层；band 覆盖 [lo, lo+band_len)
+        self.pred = torch.zeros((num_fg, 0, H, W), dtype=dtype, device=device)
+        self.weight = torch.zeros((1, 0, self.wH, self.wW),
+                                  dtype=dtype, device=device)
+
+    def _ensure(self, ze: int) -> None:
+        cur_end = self.lo + self.pred.shape[1]
+        if ze <= cur_end:
+            return
+        grow = ze - cur_end
+        self.pred = torch.cat([
+            self.pred,
+            torch.zeros((self.num_fg, grow, self.H, self.W),
+                        dtype=self.dtype, device=self.device)], dim=1)
+        self.weight = torch.cat([
+            self.weight,
+            torch.zeros((1, grow, self.wH, self.wW),
+                        dtype=self.dtype, device=self.device)], dim=1)
+
+    def add(self, sub: torch.Tensor, w: torch.Tensor, zs: int, ze: int,
+            h0: int = 0, h1: Optional[int] = None,
+            w0: int = 0, w1: Optional[int] = None) -> None:
+        if zs < self.lo:
+            raise RuntimeError(
+                f"stream accumulator: window z-start {zs} precedes already "
+                f"flushed boundary {self.lo}; windows must arrive in "
+                "ascending z order.")
+        self._ensure(ze)
+        zs_b, ze_b = zs - self.lo, ze - self.lo
+        self.pred[:, zs_b:ze_b, h0:h1, w0:w1].addcmul_(sub, w, value=1.0)
+        self.weight[:, zs_b:ze_b, h0:h1 if self.wH > 1 else None,
+                    w0:w1 if self.wW > 1 else None].add_(w)
+
+    def flush_below(self, z: int) -> None:
+        """层 ``[lo, z)`` 已确定不再被后续窗口写到：归一化写出并释放。"""
+        z = min(int(z), self.D)
+        if z <= self.lo:
+            return
+        n = min(z - self.lo, self.pred.shape[1])
+        if n > 0:
+            pred_f = self.pred[:, :n]
+            w_f = self.weight[:, :n].clamp(min=_acc_eps(self.dtype))
+            self.out[:, self.lo:self.lo + n] = (
+                (pred_f / w_f).cpu().float().numpy())
+            # clone 后释放已写出段的 device 存储（切片仅是 view）。
+            self.pred = self.pred[:, n:].clone()
+            self.weight = self.weight[:, n:].clone()
+        # 跳窗导致的空隙层（band 未覆盖）输出保持 0，直接推进 lo。
+        self.lo = z
+
+    def finalize(self) -> np.ndarray:
+        self.flush_below(self.D)
+        return self.out
+
+
+def _make_z_accumulator(p: "Predictor", D: int, H: int, W: int,
+                        weight_hw: bool):
+    cls = _StreamZAccumulator if p.stream_accumulate else _DenseZAccumulator
+    return cls(p.num_fg, D, H, W, p.acc_dtype, p.acc_device,
+               weight_hw=weight_hw)
+
+
+# ---------------------------------------------------------------------------
 # Whole-volume (single forward, no sliding)
 # ---------------------------------------------------------------------------
 def whole_volume_forward(p: "Predictor", vol: np.ndarray) -> np.ndarray:
@@ -43,7 +159,8 @@ def whole_volume_forward(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             "Whole-volume inference: orig=(%d,%d,%d) → model=(%d,%d,%d)",
             D_orig, H_orig, W_orig, pD, pH, pW)
 
-    vol_resized = resize_3d(vol, pD, pH, pW, is_label=False)
+    vol_resized = resize_3d(vol, pD, pH, pW, is_label=False,
+                            anti_alias=p.resize_antialias)
     batch = torch.from_numpy(vol_resized[np.newaxis, np.newaxis]) \
         .float().to(p.device, non_blocking=True)
     probs = _forwards.forward_batch_numpy(p, batch)   # (1, num_fg, pD, pH, pW)
@@ -91,11 +208,7 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         _blending.build_1d_weight(pD, p.blend_mode)).to(
         device=p.acc_device, dtype=p.acc_dtype)       # (pD,)
 
-    acc_pred = torch.zeros(
-        (p.num_fg, D_orig, H_orig, W_orig),
-        dtype=p.acc_dtype, device=p.acc_device)
-    acc_weight = torch.zeros(
-        (1, D_orig, 1, 1), dtype=p.acc_dtype, device=p.acc_device)
+    acc = _make_z_accumulator(p, D_orig, H_orig, W_orig, weight_hw=False)
 
     # 多分辨率 z 轴实践上少见（2.5D 强制 [1.0]）；单分辨率走 GPU 抽取路径。
     single_res = (len(p.multi_res_scales) == 1
@@ -125,7 +238,7 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             if is_last and window_inputs:
                 batch = torch.stack(window_inputs, dim=0).float()
                 probs = _forwards.forward_batch_gpu(p, batch)
-                _blend_z_batch(p, probs, patch_metas, acc_pred, acc_weight,
+                _blend_z_batch(p, probs, patch_metas, acc,
                                z_weight_t, pD, pH, pW, H_orig, W_orig)
                 window_inputs.clear()
                 patch_metas.clear()
@@ -136,7 +249,8 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 _inputs.build_z_window_native_d_gpu(
                     vol_t, z0, z1,
                     pH=pH, pW=pW,
-                    eD_max=p._eD_max, view_depths=p.per_view_depths))
+                    eD_max=p._eD_max, view_depths=p.per_view_depths,
+                    antialias=p.resize_antialias))
         elif keep_native_3d:
             # 3D ON: rank-4 (C_res, pD, pH, pW)。
             window_inputs.append(
@@ -144,20 +258,23 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     vol_t, z0, z1,
                     pD=pD, pH=pH, pW=pW,
                     target_shape=p._mr_target_shape,
-                    native_sizes=p._mr_native_sizes))
+                    native_sizes=p._mr_native_sizes,
+                    antialias=p.resize_antialias))
         elif single_res:
             window_inputs.append(
                 _inputs.build_z_window_single_res_gpu(
                     vol_t, z0, z1,
                     pD=pD, pH=pH, pW=pW,
-                    z_boundary_mode=p.z_boundary_mode))
+                    z_boundary_mode=p.z_boundary_mode,
+                    antialias=p.resize_antialias))
         else:
             # 多分辨率退化：CPU builder 后一次上 GPU。
             wi_np = _inputs.build_z_window_cpu_multi_res(
                 vol, z0, z1,
                 pD=pD, pH=pH, pW=pW,
                 multi_res_scales=p.multi_res_scales,
-                z_boundary_mode=p.z_boundary_mode)
+                z_boundary_mode=p.z_boundary_mode,
+                antialias=p.resize_antialias)
             window_inputs.append(
                 torch.from_numpy(wi_np).to(p.device, non_blocking=True))
         patch_metas.append((z0, z1, actual_d))
@@ -170,23 +287,28 @@ def sliding_window_z(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             batch = torch.stack(window_inputs, dim=0).float()
             # (B, num_fg, pD, pH, pW) on GPU
             probs = _forwards.forward_batch_gpu(p, batch)
-            _blend_z_batch(p, probs, patch_metas, acc_pred, acc_weight,
+            _blend_z_batch(p, probs, patch_metas, acc,
                            z_weight_t, pD, pH, pW, H_orig, W_orig)
 
             window_inputs.clear()
             patch_metas.clear()
+
+            # 流式分块：后续窗口 z0 单调递增，低于下一窗 z0 的层已定，
+            # 即时归一化写出并释放（全量模式 no-op）。
+            acc.flush_below(
+                z_positions[idx + 1][0] if not is_last else D_orig)
 
             if p.log_progress and (
                     (idx + 1) % max(1, 10 * p.batch_size) == 0 or is_last):
                 logger.info("  z-window %d/%d", idx + 1, n_windows)
 
     _log_skip_stats(p, n_skipped, n_windows, "z")
-    return _finalize_accumulators(acc_pred, acc_weight)
+    return acc.finalize()
 
 
 def _blend_z_batch(p: "Predictor", probs: torch.Tensor,
                    patch_metas: List[Tuple[int, int, int]],
-                   acc_pred: torch.Tensor, acc_weight: torch.Tensor,
+                   acc,
                    z_weight_t: torch.Tensor,
                    pD: int, pH: int, pW: int,
                    H_orig: int, W_orig: int) -> None:
@@ -209,16 +331,14 @@ def _blend_z_batch(p: "Predictor", probs: torch.Tensor,
         # 倒 resize 回原几何：edge_pad+ad<pD 时仅取中心 ad 切片不插值 z（H/W 可 resize）；
         # 其余走一次性 trilinear resize 到 (ad, H_orig, W_orig)。
         if p.z_boundary_mode == "edge_pad" and ad < pD:
-            pad_before = (pD - ad) // 2
+            pad_before = _inputs.content_pad_before(pD, ad)
             sub = sub[:, :, pad_before:pad_before + ad, :, :]
             if (H_orig != pH) or (W_orig != pW):
-                sub = F.interpolate(
-                    sub, size=(ad, H_orig, W_orig),
-                    mode="trilinear", align_corners=False)
+                # 倒 resize 与 forward builder 同采样网格（align_corners=True，
+                # 镜像 resize_3d）；概率体回贴不做抗混叠。
+                sub = _inputs.resize_trilinear(sub, (ad, H_orig, W_orig))
         elif (ad != pD) or (H_orig != pH) or (W_orig != pW):
-            sub = F.interpolate(
-                sub, size=(ad, H_orig, W_orig),
-                mode="trilinear", align_corners=False)
+            sub = _inputs.resize_trilinear(sub, (ad, H_orig, W_orig))
         # 逐 ad 对称 blending 权重（与累加器同 dtype/device）。
         if ad == pD:
             w = z_weight_t
@@ -232,10 +352,7 @@ def _blend_z_batch(p: "Predictor", probs: torch.Tensor,
         sub = sub.to(device=p.acc_device, dtype=p.acc_dtype)
         for j, i in enumerate(idxs):
             zs, ze, _ = patch_metas[i]
-            # in-place fused mul-add。
-            acc_pred[:, zs:ze, :, :].addcmul_(
-                sub[j], w_4d, value=1.0)
-            acc_weight[:, zs:ze, :, :].add_(w_4d)
+            acc.add(sub[j], w_4d, zs, ze)
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +448,7 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         _blending.build_3d_weight(pD, pH, pW, p.blend_mode)).to(
             device=p.acc_device, dtype=p.acc_dtype)
 
-    acc_pred = torch.zeros(
-        (p.num_fg, D_orig, H_orig, W_orig),
-        dtype=p.acc_dtype, device=p.acc_device)
-    acc_weight = torch.zeros(
-        (1, D_orig, H_orig, W_orig), dtype=p.acc_dtype, device=p.acc_device)
+    acc = _make_z_accumulator(p, D_orig, H_orig, W_orig, weight_hw=True)
 
     # 3D cubic ON 路径：体积一次上 GPU，builder 全程 on-device（逐视图一次 F.interpolate，
     # 零 scipy.ndimage.zoom）。OFF 路径保旧 CPU pipeline。
@@ -351,18 +464,20 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         if keep_native_3d else None)
 
     patches: List[np.ndarray] = []
-    coords: List[Tuple[int, int, int, int, int, int, int, int, int]] = []
+    coords: List[Tuple[int, int, int, int, int, int,
+                       int, int, int, int, int, int]] = []
     centers: List[Tuple[int, int, int]] = []
+    windows: List[Tuple[int, int, int, int, int, int]] = []
     processed = 0
     n_skipped = 0
 
     def _flush() -> None:
         nonlocal processed
-        if not patches:
+        if not coords:
             return
         if keep_native_3d:
             batch = _inputs.build_cubic_batch_native_multi_res(
-                centers, vol_t,
+                windows, vol_t,
                 pD=pD, pH=pH, pW=pW,
                 target_shape=p._mr_target_shape,
                 native_sizes=p._mr_native_sizes)
@@ -371,7 +486,8 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                 patches, centers, vol,
                 pD=pD, pH=pH, pW=pW,
                 multi_res_scales=p.multi_res_scales,
-                device=p.device)
+                device=p.device,
+                antialias=p.resize_antialias)
         probs = _forwards.forward_batch_gpu(p, batch)   # (B, num_fg, pD, pH, pW) on GPU
         # 一次性转到累加器 dtype/device（CPU 逃生门时为 GPU→CPU 拷贝）。
         probs = probs.to(device=p.acc_device, dtype=p.acc_dtype)
@@ -382,10 +498,12 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
             pred_trim = pred[:, pb_d:pb_d + ad, pb_h:pb_h + ah, pb_w:pb_w + aw]
             w_trim = weight_3d[pb_d:pb_d + ad, pb_h:pb_h + ah,
                                pb_w:pb_w + aw].unsqueeze(0)   # (1, ad, ah, aw)
-            acc_pred[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw].addcmul_(
-                pred_trim, w_trim, value=1.0)
-            acc_weight[:, d0:d0 + ad, h0:h0 + ah, w0:w0 + aw].add_(w_trim)
-        processed += len(patches)
+            acc.add(pred_trim, w_trim, d0, d0 + ad,
+                    h0, h0 + ah, w0, w0 + aw)
+        # 流式分块：外层循环沿 d0 单调递增，后续窗口 d0 >= 本批末窗 d0，
+        # 低于它的层已定（全量模式 no-op）。
+        acc.flush_below(coords[-1][0])
+        processed += len(coords)
         if p.log_progress and (
                 processed % max(1, 10 * p.batch_size) == 0
                 or processed == total_windows):
@@ -393,6 +511,7 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
         patches.clear()
         coords.clear()
         centers.clear()
+        windows.clear()
 
     widx = -1
     for d0, d1 in pos_d:
@@ -412,36 +531,41 @@ def sliding_window_cubic(p: "Predictor", vol: np.ndarray) -> np.ndarray:
                     n_skipped += 1
                     continue
 
-                # 填短尾窗口到 (pD,pH,pW)：居中 edge-pad（默认复制边界，归一化后
-                # 0 不是空气），与训练侧 extract_cubic_patch / keep_native
-                # builder 的居中几何一致。
-                pb_d = pb_h = pb_w = 0
-                if ad < pD or ah < pH or aw < pW:
-                    pb_d, pb_h, pb_w = (
-                        (pD - ad) // 2, (pH - ah) // 2, (pW - aw) // 2)
-                    pad_width = ((pb_d, pD - ad - pb_d),
-                                 (pb_h, pH - ah - pb_h),
-                                 (pb_w, pW - aw - pb_w))
-                    if p.pad_value is None:
-                        patch = np.pad(patch, pad_width, mode="edge")
-                    else:
-                        patch = np.pad(
-                            patch, pad_width, mode="constant",
-                            constant_values=p.pad_value)
+                # 短窗内容在 patch 坐标中的居中前置量（builder/blend 共用
+                # 同一记账，见 inputs.content_pad_before）。
+                pb_d = _inputs.content_pad_before(pD, ad)
+                pb_h = _inputs.content_pad_before(pH, ah)
+                pb_w = _inputs.content_pad_before(pW, aw)
 
-                patches.append(patch)
+                if keep_native_3d:
+                    # ON 路径：builder 全程 on-device，无需 CPU pad/拷贝。
+                    windows.append((d0, h0, w0, ad, ah, aw))
+                else:
+                    # OFF 路径：填短尾窗口到 (pD,pH,pW)：居中 edge-pad
+                    # （默认复制边界，归一化后 0 不是空气）。
+                    if ad < pD or ah < pH or aw < pW:
+                        pad_width = ((pb_d, pD - ad - pb_d),
+                                     (pb_h, pH - ah - pb_h),
+                                     (pb_w, pW - aw - pb_w))
+                        if p.pad_value is None:
+                            patch = np.pad(patch, pad_width, mode="edge")
+                        else:
+                            patch = np.pad(
+                                patch, pad_width, mode="constant",
+                                constant_values=p.pad_value)
+                    patches.append(patch)
+                    centers.append(
+                        ((d0 + d1) // 2, (h0 + h1) // 2, (w0 + w1) // 2))
                 coords.append(
                     (d0, d1, h0, h1, w0, w1, ad, ah, aw, pb_d, pb_h, pb_w))
-                centers.append(
-                    ((d0 + d1) // 2, (h0 + h1) // 2, (w0 + w1) // 2))
 
-                if len(patches) >= p.batch_size:
+                if len(coords) >= p.batch_size:
                     _flush()
 
     _flush()
 
     _log_skip_stats(p, n_skipped, total_windows, "cubic")
-    return _finalize_accumulators(acc_pred, acc_weight)
+    return acc.finalize()
 
 
 # skip_empty_windows 安全上限：单卷跳窗比例超过此值时无条件 warning（不受

@@ -70,7 +70,8 @@ class _Stub:
     """仅持有 TTA 函数读取的属性。"""
 
     def __init__(self, model, *, num_fg, patch_D, tta_batch_size,
-                 batch_size=2, adabn_estimating=False):
+                 batch_size=2, adabn_estimating=False,
+                 tta_logit_average=False):
         self.model = model
         self.model_dtype = torch.float32
         self.channels_last = False
@@ -79,6 +80,9 @@ class _Stub:
         self.batch_size = batch_size
         self.tta_batch_size = tta_batch_size
         self._adabn_estimating = adabn_estimating
+        # 本文件验批量化等价性，默认用旧概率域（与串行参考实现同域）；
+        # logit 域的行为回归见 test_upgrade_b3_inference.py。
+        self.tta_logit_average = tta_logit_average
 
 
 def _randomize_bn(module: nn.Module, seed: int) -> None:
@@ -135,14 +139,14 @@ def test_tta_3d_batched_matches_serial():
     net.eval()
 
     x = torch.randn(B, 1, pD, 8, 8)
-    base = torch.sigmoid(net(x).float())[:, :num_fg]
+    base_logits = net(x).float()[:, :num_fg]
     ref = _serial_3d(_Stub(net, num_fg=num_fg, patch_D=pD,
-                           tta_batch_size=1), x, base)
+                           tta_batch_size=1), x, torch.sigmoid(base_logits))
 
     for tbs in (2, 3, 8):
         counter = _CallCounter(net).eval()
         s = _Stub(counter, num_fg=num_fg, patch_D=pD, tta_batch_size=tbs)
-        got = F_.tta_flip_ensemble(s, x, base)
+        got = F_.tta_flip_ensemble(s, x, base_logits)
         d = _maxdiff(got, ref)
         if d >= 1e-5:
             raise AssertionError(
@@ -162,14 +166,14 @@ def test_tta_3d_none_falls_back_to_batch_size():
     net.eval()
 
     x = torch.randn(B, 1, pD, 8, 8)
-    base = torch.sigmoid(net(x).float())[:, :num_fg]
+    base_logits = net(x).float()[:, :num_fg]
     ref = _serial_3d(_Stub(net, num_fg=num_fg, patch_D=pD,
-                           tta_batch_size=1), x, base)
+                           tta_batch_size=1), x, torch.sigmoid(base_logits))
 
     counter = _CallCounter(net).eval()
     s = _Stub(counter, num_fg=num_fg, patch_D=pD,
               tta_batch_size=None, batch_size=4)
-    got = F_.tta_flip_ensemble(s, x, base)
+    got = F_.tta_flip_ensemble(s, x, base_logits)
     assert _maxdiff(got, ref) < 1e-5
     # None → batch_size=4 → ceil(7/4)=2 forwards
     assert counter.calls == 2, counter.calls
@@ -189,16 +193,16 @@ def test_tta_2_5d_batched_matches_serial():
 
     x2d = torch.randn(B, cin, 8, 8)
     pred = net(x2d)
-    base = torch.sigmoid(
-        rearrange(pred.float(), 'b (c d) h w -> b c d h w',
-                  c=num_fg, d=pD))
+    base_logits = rearrange(pred.float(), 'b (c d) h w -> b c d h w',
+                            c=num_fg, d=pD)
     ref = _serial_2_5d(_Stub(net, num_fg=num_fg, patch_D=pD,
-                             tta_batch_size=1), x2d, base)
+                             tta_batch_size=1), x2d,
+                       torch.sigmoid(base_logits))
 
     for tbs in (2, 3):
         counter = _CallCounter(net).eval()
         s = _Stub(counter, num_fg=num_fg, patch_D=pD, tta_batch_size=tbs)
-        got = F_.tta_flip_ensemble_2_5d(s, x2d, base)
+        got = F_.tta_flip_ensemble_2_5d(s, x2d, base_logits)
         d = _maxdiff(got, ref)
         if d >= 1e-5:
             raise AssertionError(
@@ -232,14 +236,14 @@ def test_adabn_estimating_still_equivalent():
     net.eval()
 
     x = torch.randn(B, 1, pD, 8, 8)
-    base = torch.sigmoid(net(x).float())[:, :num_fg]
+    base_logits = net(x).float()[:, :num_fg]
     ref = _serial_3d(_Stub(net, num_fg=num_fg, patch_D=pD,
-                           tta_batch_size=1), x, base)
+                           tta_batch_size=1), x, torch.sigmoid(base_logits))
 
     counter = _CallCounter(net).eval()
     s = _Stub(counter, num_fg=num_fg, patch_D=pD, tta_batch_size=8,
               adabn_estimating=True)
-    got = F_.tta_flip_ensemble(s, x, base)
+    got = F_.tta_flip_ensemble(s, x, base_logits)
     assert _maxdiff(got, ref) < 1e-5
     assert counter.calls == 7, counter.calls  # chunk=1 → 7 serial forwards
 

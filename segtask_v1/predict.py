@@ -111,9 +111,9 @@ def main():
     if not image_paths:
         logger.error("No images left to predict after bbox matching. "
                      "Exiting without running inference.")
-        return
+        sys.exit(1)
 
-    run_inference(
+    n_failed = run_inference(
         cfg=cfg,
         checkpoint_path=checkpoint_path,
         image_paths=image_paths,
@@ -121,6 +121,9 @@ def main():
         bbox_paths=bbox_paths,
         precision=args.precision,
     )
+    if n_failed:
+        # 失败卷非零退出码，供批处理/流水线感知部分失败。
+        sys.exit(1)
 
 
 def _resolve_bbox_paths(

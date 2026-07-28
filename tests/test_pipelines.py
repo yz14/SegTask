@@ -227,7 +227,9 @@ class TestComputeLossEquivalence:
         l_p = p.compute_loss(pred, sup)
         l_main = compute_loss_fp32(p.criterion, pred_main, lbl_all[:, 0])
         l_aux = compute_loss_fp32(p.aux_loss_fn, pred_aux, lbl_all[:, 1])
-        l_h = l_main + p.aux_weights[0] * l_aux
+        # 监督头权重默认归一化（loss.normalize_supervision_weights）。
+        l_h = (p.balancer.weight("main") * l_main
+               + p.balancer.weight("aux_1") * l_aux)
         assert (l_p - l_h).abs().max() < TOL
 
     def test_lift_aux(self):
@@ -248,7 +250,8 @@ class TestComputeLossEquivalence:
         l_p = p.compute_loss(pred, sup)
         l_main = compute_loss_fp32(p.criterion, pred_main, lbl_all[:, :1])
         l_aux = compute_loss_fp32(p.aux_loss_fn, pred_aux, lbl_all[:, 1:2])
-        l_h = l_main + p.aux_weights[0] * l_aux
+        l_h = (p.balancer.weight("main") * l_main
+               + p.balancer.weight("aux_1") * l_aux)
         assert (l_p - l_h).abs().max() < TOL
 
     def test_native_d_aux(self):
@@ -270,7 +273,8 @@ class TestComputeLossEquivalence:
         l_p = p.compute_loss(pred, sup)
         l_main = compute_loss_fp32(p.criterion, pred_main, lbl_main)
         l_aux = compute_loss_fp32(p.aux_loss_fns[0], pred_aux, lbl_aux)
-        l_h = l_main + p.aux_weights[0] * l_aux
+        l_h = (p.balancer.weight("main") * l_main
+               + p.balancer.weight("aux_1") * l_aux)
         assert (l_p - l_h).abs().max() < TOL
 
 
@@ -322,7 +326,7 @@ class TestBreakdown:
         p.compute_loss(pred, sup, breakdown=bd)
         assert "L_main" in bd
         assert "L_aux_1" in bd and "w_aux_1" in bd
-        assert "L_total" in bd
-        # L_total ≈ L_main + w_aux_1 * L_aux_1
-        approx = bd["L_main"] + bd["w_aux_1"] * bd["L_aux_1"]
+        assert "L_total" in bd and "w_main" in bd
+        # L_total ≈ w_main * L_main + w_aux_1 * L_aux_1（权重默认归一化）
+        approx = bd["w_main"] * bd["L_main"] + bd["w_aux_1"] * bd["L_aux_1"]
         assert abs(bd["L_total"] - approx) < 1e-5

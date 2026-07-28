@@ -207,7 +207,7 @@ seg:
   loss:
     name                    : "dice_focal"              # 损失函数；单项 'dice'|'bce'|'focal'|'tversky'|'gdl'|'focal_tversky'|'lovasz'|'cldice'，或下划线复合如 'dice_bce'/'dice_focal'
     compound_weights        : [1.0, 1.0]                # 仅复合损失；两项权重 [loss1_w, loss2_w]
-    class_weights           : [1.0, 1.0]                # 逐前景类损失权重；长度=前景类数；空=均匀
+    class_weights           : [1.0]                     # 逐前景类损失权重；长度=前景类数；空=均匀
     region_weights          : [1.0, 2.0]                # 按 label 取值的空间权重（含 bg，最终权重=配置值+1）；空=禁用；data.region_weight_dir 优先
     deep_supervision_weights: [1.0, 0.5, 0.25, 0.125]   # 仅 model.deep_supervision=true；逐级权重（高→低分辨率）
 

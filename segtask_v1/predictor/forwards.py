@@ -88,15 +88,16 @@ def _tta_chunk_size(p: "Predictor") -> int:
 
 
 def _flip_tta_batched(p: "Predictor", x: torch.Tensor,
-                      base_prob: torch.Tensor, flip_specs, post_fn):
-    """通用 flip-TTA：``base_prob`` 为原图概率，``flip_specs`` 中各 flip 变体按
-    ``_tta_chunk_size`` 分块——每块沿 batch 轴 ``torch.cat`` 成 ``(B*g, ...)`` 一次
-    前向、``post_fn`` 转概率、逐变体反 flip 后累加，最后除以 ``1+len(flip_specs)``。
+                      base_val: torch.Tensor, flip_specs, extract_fn):
+    """通用 flip-TTA 均值：``base_val`` 为原图量（logit 或概率，由调用方选域），
+    ``flip_specs`` 中各 flip 变体按 ``_tta_chunk_size`` 分块——每块沿 batch 轴
+    ``torch.cat`` 成 ``(B*g, ...)`` 一次前向、``extract_fn`` 取同域量、逐变体反
+    flip 后累加，最后除以 ``1+len(flip_specs)``。
 
     与逐变体串行实现严格等价（eval 下 BN 用 running stats、变体间无 batch 耦合；仅前向
     顺序/批大小改变）；累加顺序也保持原图→变体序，浮点结果同序。
     """
-    total = base_prob.clone()
+    total = base_val.clone()
     count = float(1 + len(flip_specs))
     B = x.shape[0]
     chunk = _tta_chunk_size(p)
@@ -106,34 +107,58 @@ def _flip_tta_batched(p: "Predictor", x: torch.Tensor,
         pred = p.model(_to_channels_last(p, x_cat.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
-        prob_cat = post_fn(pred)                  # (B*g, num_fg, ...)
+        val_cat = extract_fn(pred)                # (B*g, num_fg, ...)
         for j, (_, fprob) in enumerate(specs):
-            prob_j = torch.flip(prob_cat[j * B:(j + 1) * B], fprob)
-            total = total + prob_j
+            val_j = torch.flip(val_cat[j * B:(j + 1) * B], fprob)
+            total = total + val_j
     return total / count
 
 
 def tta_flip_ensemble(p: "Predictor", x: torch.Tensor,
-                      base_prob: torch.Tensor) -> torch.Tensor:
-    """3D TTA：原始 + 7 种轴 flip 组合取均；变体按 ``tta_batch_size`` 批量化前向。"""
-    def _post(pred: torch.Tensor) -> torch.Tensor:
+                      base_logits: torch.Tensor) -> torch.Tensor:
+    """3D TTA → 概率：原始 + 7 种轴 flip 组合取均；变体按 ``tta_batch_size`` 批量化前向。
+
+    ``base_logits`` 为原图 logits ``(B, num_fg, D, H, W)``（fp32）。融合域由
+    ``predict.tta_logit_average`` 选：logit 域均值后 sigmoid（默认，避免概率域
+    均值的饱和偏差），或旧行为 sigmoid 概率域均值。两域均返概率体。
+    """
+    if p.tta_logit_average:
+        def _extract(pred: torch.Tensor) -> torch.Tensor:
+            return pred.float()[:, :p.num_fg]
+
+        return torch.sigmoid(_flip_tta_batched(
+            p, x, base_logits, _FLIP_SPECS_3D, _extract))
+
+    def _extract_prob(pred: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(pred.float())[:, :p.num_fg]
 
-    return _flip_tta_batched(p, x, base_prob, _FLIP_SPECS_3D, _post)
+    return _flip_tta_batched(
+        p, x, torch.sigmoid(base_logits), _FLIP_SPECS_3D, _extract_prob)
 
 
 def tta_flip_ensemble_2_5d(p: "Predictor", x_2d: torch.Tensor,
-                           base_prob: torch.Tensor) -> torch.Tensor:
-    """2.5D TTA：仅 H/W flip；变体按 ``tta_batch_size`` 批量化前向。"""
+                           base_logits: torch.Tensor) -> torch.Tensor:
+    """2.5D TTA → 概率：仅 H/W flip；变体按 ``tta_batch_size`` 批量化前向。
+
+    ``base_logits`` 为原图 logits ``(B, num_fg, D, H, W)``（fp32，已 rearrange）；
+    融合域同 ``tta_flip_ensemble``。
+    """
     D = p.patch_D
 
-    def _post(pred: torch.Tensor) -> torch.Tensor:
+    def _to_5d(pred: torch.Tensor) -> torch.Tensor:
         # (B*g, num_fg*D, H, W) → (B*g, num_fg, D, H, W)
-        pred_5d = rearrange(
-            pred, 'b (c d) h w -> b c d h w', c=p.num_fg, d=D)
-        return torch.sigmoid(pred_5d.float())
+        return rearrange(
+            pred, 'b (c d) h w -> b c d h w', c=p.num_fg, d=D).float()
 
-    return _flip_tta_batched(p, x_2d, base_prob, _FLIP_SPECS_2_5D, _post)
+    if p.tta_logit_average:
+        return torch.sigmoid(_flip_tta_batched(
+            p, x_2d, base_logits, _FLIP_SPECS_2_5D, _to_5d))
+
+    def _extract_prob(pred: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(_to_5d(pred))
+
+    return _flip_tta_batched(
+        p, x_2d, torch.sigmoid(base_logits), _FLIP_SPECS_2_5D, _extract_prob)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +249,7 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
                 raise ValueError(
                     "lift_2_5d_to_3d=True expects rank-5 input "
                     f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
-            with autocast(device_type="cuda", enabled=p.use_amp,
+            with autocast(device_type=p.device.type, enabled=p.use_amp,
                           dtype=p.amp_dtype):
                 pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
                 if isinstance(pred, list):
@@ -234,10 +259,11 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
                         f"Lift-mode model output has {pred.shape[1]} "
                         f"channels at dim 1; expected at least "
                         f"num_fg={p.num_fg}.")
-                prob = torch.sigmoid(pred.float())[:, :p.num_fg]
+                base_logits = pred.float()[:, :p.num_fg]
+                prob = torch.sigmoid(base_logits)
                 diag_log_first_batch(p, "2.5D lift", x, pred[:, :p.num_fg], prob)
                 if p.tta_flip:
-                    prob = tta_flip_ensemble(p, x, prob)
+                    prob = tta_flip_ensemble(p, x, base_logits)
             return prob
 
         # 两种输入：OFF rank-5 (B,C_res,pD,pH,pW) 需折 C_res*D；
@@ -251,7 +277,7 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
                 f"2.5D forward expects rank-4 or rank-5 input; "
                 f"got x.shape={tuple(x.shape)}")
         D = p.patch_D
-        with autocast(device_type="cuda", enabled=p.use_amp,
+        with autocast(device_type=p.device.type, enabled=p.use_amp,
                       dtype=p.amp_dtype):
             pred = p.model(_to_channels_last(p, x_2d.to(p.model_dtype)))
             if isinstance(pred, list):
@@ -266,11 +292,11 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
             prob = torch.sigmoid(pred_5d.float())
             diag_log_first_batch(p, "2.5D folded", x_2d, pred_5d, prob)
             if p.tta_flip:
-                prob = tta_flip_ensemble_2_5d(p, x_2d, prob)
+                prob = tta_flip_ensemble_2_5d(p, x_2d, pred_5d.float())
         return prob
 
     # 3D
-    with autocast(device_type="cuda", enabled=p.use_amp,
+    with autocast(device_type=p.device.type, enabled=p.use_amp,
                   dtype=p.amp_dtype):
         pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
         if isinstance(pred, list):
@@ -278,10 +304,11 @@ def forward_batch_gpu(p: "Predictor", x: torch.Tensor) -> torch.Tensor:
         assert pred.shape[1] >= p.num_fg, (
             f"Model output has {pred.shape[1]} channels; "
             f"expected at least num_fg={p.num_fg} at 1x resolution.")
-        prob = torch.sigmoid(pred.float())[:, :p.num_fg]
+        base_logits = pred.float()[:, :p.num_fg]
+        prob = torch.sigmoid(base_logits)
         diag_log_first_batch(p, "3D", x, pred[:, :p.num_fg], prob)
         if p.tta_flip:
-            prob = tta_flip_ensemble(p, x, prob)
+            prob = tta_flip_ensemble(p, x, base_logits)
     return prob
 
 
@@ -296,17 +323,18 @@ def forward_batch_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
     if p.patch_mode == "2_5d":
         return forward_batch_2_5d_numpy(p, x)
 
-    with autocast(device_type="cuda", enabled=p.use_amp, dtype=p.amp_dtype):
+    with autocast(device_type=p.device.type, enabled=p.use_amp, dtype=p.amp_dtype):
         pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
         assert pred.shape[1] >= p.num_fg, (
             f"Model output has {pred.shape[1]} channels; "
             f"expected at least num_fg={p.num_fg} at 1x resolution.")
-        prob = torch.sigmoid(pred.float())[:, :p.num_fg]
+        base_logits = pred.float()[:, :p.num_fg]
+        prob = torch.sigmoid(base_logits)
         diag_log_first_batch(p, "3D numpy", x, pred[:, :p.num_fg], prob)
         if p.tta_flip:
-            prob = tta_flip_ensemble(p, x, prob)
+            prob = tta_flip_ensemble(p, x, base_logits)
     return prob.float().cpu().numpy()
 
 
@@ -317,7 +345,7 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
             raise ValueError(
                 "lift_2_5d_to_3d=True expects rank-5 input "
                 f"(B, n_views, D, H, W); got x.shape={tuple(x.shape)}")
-        with autocast(device_type="cuda", enabled=p.use_amp,
+        with autocast(device_type=p.device.type, enabled=p.use_amp,
                       dtype=p.amp_dtype):
             pred = p.model(_to_channels_last(p, x.to(p.model_dtype)))
             if isinstance(pred, list):
@@ -327,16 +355,17 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
                     f"Lift-mode model output has {pred.shape[1]} "
                     f"channels at dim 1; expected at least "
                     f"num_fg={p.num_fg}.")
-            prob = torch.sigmoid(pred.float())[:, :p.num_fg]
+            base_logits = pred.float()[:, :p.num_fg]
+            prob = torch.sigmoid(base_logits)
             diag_log_first_batch(
                 p, "2.5D lift numpy", x, pred[:, :p.num_fg], prob)
             if p.tta_flip:
-                prob = tta_flip_ensemble(p, x, prob)
+                prob = tta_flip_ensemble(p, x, base_logits)
         return prob.float().cpu().numpy()
 
     x_2d = reshape_2_5d_input(p, x)                # (B, C_res*D, H, W)
     D = p.patch_D
-    with autocast(device_type="cuda", enabled=p.use_amp, dtype=p.amp_dtype):
+    with autocast(device_type=p.device.type, enabled=p.use_amp, dtype=p.amp_dtype):
         pred = p.model(_to_channels_last(p, x_2d.to(p.model_dtype)))
         if isinstance(pred, list):
             pred = pred[0]
@@ -350,7 +379,7 @@ def forward_batch_2_5d_numpy(p: "Predictor", x: torch.Tensor) -> np.ndarray:
         prob = torch.sigmoid(pred_5d.float())
         diag_log_first_batch(p, "2.5D folded numpy", x_2d, pred_5d, prob)
         if p.tta_flip:
-            prob = tta_flip_ensemble_2_5d(p, x_2d, prob)
+            prob = tta_flip_ensemble_2_5d(p, x_2d, pred_5d.float())
     return prob.float().cpu().numpy()
 
 

@@ -36,6 +36,18 @@ _AMP_DTYPES = {
     "bfloat16": torch.bfloat16, "bf16": torch.bfloat16}
 
 
+def _sampled_quantile(arr: np.ndarray, qs: List[float],
+                      cap: int = 1_000_000) -> np.ndarray:
+    """采样式分位数（仅诊断日志用）：整卷 ``np.quantile`` 会做全量拷贝+排序
+    （大 CT 数百 MB~GB 临时内存）；超过 ``cap`` 元素时按整数 stride 抽样，
+    量级判断足够（与 forwards._q3 的 GPU 版口径一致）。"""
+    flat = arr.reshape(-1)
+    n = flat.size
+    if n > cap:
+        flat = flat[::max(1, n // cap)]
+    return np.quantile(flat, qs)
+
+
 def _manifest_target_spacing(npz_dir: str) -> Optional[List[float]]:
     """从 make_data 写入的 ``npz_dir/_manifest.json`` 回读解析后的
     target_spacing（(D,H,W) mm）；目录/文件/字段缺失或非法时返 None。"""
@@ -82,6 +94,8 @@ class Predictor(BasePredictor):
         self.tta_flip = pc.tta_flip
         # TTA flip 变体批量化块大小（None → 退化为 batch_size）；见 forwards._tta_chunk_size。
         self.tta_batch_size: Optional[int] = pc.tta_batch_size
+        # TTA 融合域：logit 域平均后 sigmoid（默认）| sigmoid 概率域平均（旧行为）。
+        self.tta_logit_average = bool(pc.tta_logit_average)
         # 标量（全类共享）或逐前景类列表；长度校验在 num_fg 确定后（见下方）。
         self.threshold = (
             [float(t) for t in pc.threshold]
@@ -94,6 +108,8 @@ class Predictor(BasePredictor):
                           else torch.float32)
         self.acc_device = (torch.device("cpu") if pc.accumulate_on_cpu
                            else device)
+        # 流式分块累加（2-5）：滑窗累加器只覆盖活跃 z 段，已定层即时写出并释放。
+        self.stream_accumulate = bool(pc.stream_accumulate)
         # 推理前向用 inference_mode 替代 no_grad（数值等价，免 version-counter
         # 簿记）；AdaBN per_volume 估计期自动回退 no_grad，见 _forward_grad_ctx。
         self.use_inference_mode = bool(pc.use_inference_mode)
@@ -130,6 +146,17 @@ class Predictor(BasePredictor):
         self.z_interleave_factors: List[int] = [
             int(f) for f in pc.z_interleave_factors]
         if self.z_interleave_enabled:
+            # thresholds/factors 逐位配对（zip 会静默截断多余项）；另需
+            # 非空 factors 兜底 choose_interleave_factor 的 factors[-1]。
+            if (not self.z_interleave_factors
+                    or len(self.z_interleave_thresholds)
+                    != len(self.z_interleave_factors)):
+                raise ValueError(
+                    f"predict.z_interleave_thresholds "
+                    f"({self.z_interleave_thresholds}) and "
+                    f"z_interleave_factors ({self.z_interleave_factors}) "
+                    "must be non-empty and of equal length (paired "
+                    "element-wise).")
             logger.info(
                 "Predictor z_interleave_enabled=True (2.5D only): "
                 "thresholds=%s mm, factors=%s",
@@ -193,14 +220,22 @@ class Predictor(BasePredictor):
             raise ValueError(
                 f"predict.threshold list length {len(self.threshold)} != "
                 f"num_fg {self.num_fg} (must map 1:1 to label_values[1:]).")
+
+        # 阈值标定（3-7）消费侧标记：apply_calibrated_thresholds 成功后置 True。
+        self.threshold_calibrated = False
         # 默认单分辨率，避免下游 np.stack 报错。
         self.multi_res_scales = cfg.data.multi_res_scales or [1.0]
+        # 与训练侧 dataset resize 抗混叠语义镜像（builders/whole 路径消费）。
+        self.resize_antialias = bool(cfg.data.resize_antialias)
         # 与 DataConfig.z_boundary_mode 同步，使训/用边界处理几何一致。
         self.z_boundary_mode = cfg.data.z_boundary_mode
-        if self.z_boundary_mode not in ("stretch", "edge_pad"):
+        # 'stretch' 已废弃（Config.sync() 会告警并升级为 edge_pad）；不再收，
+        # 避免绕过 sync 的手工配置以相反语义静默生效。
+        if self.z_boundary_mode != "edge_pad":
             raise ValueError(
                 f"Unknown z_boundary_mode {self.z_boundary_mode!r}; "
-                "expected 'stretch' or 'edge_pad'.")
+                "expected 'edge_pad' ('stretch' is deprecated and "
+                "auto-upgraded by Config.sync()).")
 
         # ---- R6：所有 mode 派生量来自 ModelTopology ----------------------
         # 重构前本 ``__init__`` 自行重算 ``lift_2_5d_to_3d`` / ``keep_native_view_depth``
@@ -328,13 +363,44 @@ class Predictor(BasePredictor):
     # ==================================================================
     # Public API
     # ==================================================================
+    def apply_calibrated_thresholds(self, ckpt: dict) -> None:
+        """阈值标定（3-7）消费侧：checkpoint 含训练期验证集标定的逐类阈值
+        （``'calibrated_thresholds'``，见 train.calibrate_threshold）且
+        ``predict.use_calibrated_threshold=True`` 时，用其替换配置阈值。
+
+        旧 checkpoint 无该字段、或显式置 ``use_calibrated_threshold=False``
+        时为 no-op（沿用 ``predict.threshold``）。"""
+        cal = ckpt.get("calibrated_thresholds")
+        if cal is None:
+            return
+        if not bool(self.cfg.predict.use_calibrated_threshold):
+            logger.info(
+                "Checkpoint carries calibrated per-class thresholds %s but "
+                "predict.use_calibrated_threshold=False; using configured "
+                "predict.threshold=%s instead.", cal, self.threshold)
+            return
+        cal = [float(t) for t in cal]
+        if len(cal) != self.num_fg:
+            raise ValueError(
+                f"Checkpoint calibrated_thresholds length {len(cal)} != "
+                f"num_fg {self.num_fg} (must map 1:1 to label_values[1:]). "
+                "The checkpoint was calibrated for a different class layout.")
+        logger.info(
+            "Using checkpoint-calibrated per-class thresholds %s "
+            "(overriding predict.threshold=%s; set "
+            "predict.use_calibrated_threshold=False to keep the configured "
+            "value).", cal, self.threshold)
+        self.threshold = cal
+        self.threshold_min = float(np.min(cal))
+        self.threshold_calibrated = True
+
     def _log_normalized_input_stats(self, vol: np.ndarray) -> None:
         """诊断：归一化后输入统计（与训练不一致时 range/分位数会明显偏差）。"""
         dc = self.cfg.data
         try:
             vmin = float(vol.min()); vmax = float(vol.max())
             vmean = float(vol.mean()); vstd = float(vol.std())
-            q = np.quantile(vol, [0.01, 0.5, 0.99])
+            q = _sampled_quantile(vol, [0.01, 0.5, 0.99])
             logger.info(
                 "[diag] normalized input: shape=%s, min=%.4f, max=%.4f, "
                 "mean=%.4f, std=%.4f, q1=%.4f, q50=%.4f, q99=%.4f "
@@ -353,7 +419,7 @@ class Predictor(BasePredictor):
         try:
             max_per_vox = prob_volume.max(axis=0)
             frac_gt_thr = float((max_per_vox >= self.threshold_min).mean())
-            q = np.quantile(prob_volume, [0.5, 0.9, 0.99, 0.999])
+            q = _sampled_quantile(prob_volume, [0.5, 0.9, 0.99, 0.999])
             logger.info(
                 "[diag] in-ROI prob volume: shape=%s, min=%.4f, max=%.4f, "
                 "mean=%.4f, q50=%.4f, q90=%.4f, q99=%.4f, q999=%.4f, "
@@ -381,11 +447,14 @@ class Predictor(BasePredictor):
         image_path: str,
         output_dir: Optional[str] = None,
         bbox_path: Optional[str] = None,
+        output_stem: Optional[str] = None,
     ) -> Dict[str, np.ndarray]:
         """对单卷 NIfTI 推理。返回 {label_map (D,H,W) int, probabilities (num_fg,D,H,W) fp32}。
 
         patch_mode 调度：whole 全卷/cubic 3 轴滑窗/z_axis z 轴滑窗/2_5d 同 z_axis 几何但 forward 是 2D。
         bbox_path 可选：在 bbox 内推理后拼回原尺寸画布，外部为背景。
+        output_stem 可选：输出文件名前缀（默认取图像 basename；递归输入下
+        同名文件由调用方传入去重后的唯一 stem，避免互覆）。
         """
         dc = self.cfg.data
         # 仅 z-interleave 需物理 z spacing；其余走 load_nifti 以保旧数值。
@@ -454,7 +523,7 @@ class Predictor(BasePredictor):
         # 估计期暂时抑制 forward 诊断（置护孔为已记录），随后再重置以让真实预测发一次。
         if (self.adabn_enabled and self.adabn_mode == "per_volume"
                 and self._adabn_bn_modules):
-            from . import adabn as _adabn
+            from taskcore.engine.bn_stats import estimate_bn_stats
             logger.info(
                 "[AdaBN] per_volume: re-estimating BN stats from this "
                 "volume before prediction.")
@@ -462,7 +531,7 @@ class Predictor(BasePredictor):
             # 估计期强制 TTA 串行（见 self._adabn_estimating 注释）。
             self._adabn_estimating = True
             try:
-                _adabn.estimate_bn_stats(
+                estimate_bn_stats(
                     self._adabn_bn_modules,
                     lambda: self.predict_preprocessed_array(
                         vol, z_spacing=z_spacing))
@@ -502,7 +571,7 @@ class Predictor(BasePredictor):
 
         if output_dir:
             self._save_predictions(image_path, label_map, prob_volume,
-                                   output_dir)
+                                   output_dir, output_stem=output_stem)
         return result
 
     @torch.no_grad()
@@ -563,12 +632,14 @@ class Predictor(BasePredictor):
         label_map: np.ndarray,
         prob_volume: np.ndarray,
         output_dir: str,
+        output_stem: Optional[str] = None,
     ) -> None:
         """以 SimpleITK 写 NIfTI：origin/spacing/direction 从源图复制；
         输入数组顺序 (D,H,W) == (Z,Y,X)，无需转置；输出 gzip 压缩。。"""
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        stem = Path(image_path).name.replace(".nii.gz", "").replace(".nii", "")
+        stem = output_stem or Path(image_path).name.replace(
+            ".nii.gz", "").replace(".nii", "")
 
         # ReadImage 读完整图获元数据（像素解码成本远小于推理）。
         ref_img = sitk.ReadImage(str(image_path))

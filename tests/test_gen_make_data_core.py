@@ -44,9 +44,18 @@ def test_npz_meta_skip_requires_fg_per_class_keys():
         target_spacing=None)
     assert not ok and "fg_per_class" in reason
 
+    # 缺 intensity_stats（make_data<1.9 陈旧包）不得静默 skip（2-3）。
     ok, reason = core_md._npz_meta_allows_skip(
         {"label_counts": {0: 1}, "image_shape": [1, 2, 3],
          "fg_per_class": True, "spacing_normalized": False},
+        spacing_normalization=False,
+        target_spacing=None)
+    assert not ok and "intensity_stats" in reason
+
+    ok, reason = core_md._npz_meta_allows_skip(
+        {"label_counts": {0: 1}, "image_shape": [1, 2, 3],
+         "fg_per_class": True, "spacing_normalized": False,
+         "intensity_stats": {"mean": 0.0}},
         spacing_normalization=False,
         target_spacing=None)
     assert ok, reason

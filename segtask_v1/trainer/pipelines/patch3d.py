@@ -101,14 +101,13 @@ class Patch3DNativeMultiResPipeline(ViewPipeline):
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, _aux, topo_pred = self.split_pred(pred)
-        loss = compute_loss_fp32(
+        main_l = compute_loss_fp32(
             self.criterion, main_pred, sup.label_main, weight_map=sup.wmap_main)
-        if breakdown is not None:
-            breakdown["L_main"] = float(loss.detach().item())
-        loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
-        if breakdown is not None:
-            breakdown["L_total"] = float(loss.detach().item())
-        return loss
+        heads = [("main", main_l)]
+        topo_l = self.compute_topo_loss(topo_pred, sup)
+        if topo_l is not None:
+            heads.append(("topo", topo_l))
+        return self.combine_heads(heads, breakdown)
 
 
 __all__ = ["Patch3DNativeMultiResPipeline"]

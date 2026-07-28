@@ -115,6 +115,7 @@ def test_npz_meta_skip_checks_label_values_and_fg_subsample():
         "spacing_normalized": False,
         "label_values": [0, 1, 2],
         "fg_subsample": 1000,
+        "intensity_stats": {"mean": 0.0},  # make_data>=1.9 skip 必备键
     }
     ok, _ = _npz_meta_allows_skip(
         meta, spacing_normalization=False, target_spacing=None,

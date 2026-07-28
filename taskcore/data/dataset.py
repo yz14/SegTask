@@ -501,10 +501,21 @@ def preprocess_image(
             vol /= denom
         else:
             vol.fill(0.0)
-    elif normalize == "zscore":
+    elif normalize in ("zscore", "ct_fingerprint"):
+        # ct_fingerprint 与 zscore 同一算式：clip 窗与 mean/std 已由 loader
+        # 从数据集指纹解析回写（intensity 窗 = 前景 p0.5/p99.5）。
         if global_std > 0:
             vol -= float(global_mean)
             vol /= float(global_std)
+        else:
+            vol.fill(0.0)
+    elif normalize == "zscore_volume":
+        # 逐病例 z-score：clip 后用该卷自身 mean/std（近常数卷 std→0 时置 0）。
+        mean = float(vol.mean())
+        std = float(vol.std())
+        if std > 1e-8:
+            vol -= mean
+            vol /= std
         else:
             vol.fill(0.0)
     else:

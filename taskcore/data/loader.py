@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from .dataset import (
     load_npz_label_counts,
     load_npz_label_for_split,
 )
+from .identity import fingerprint_normalization_params
 from .mixed_sampler import (
     SOURCE_PRIMARY,
     SOURCE_SECONDARY,
@@ -511,6 +513,7 @@ def _write_split_manifest(
     train: Sequence[str],
     val: Sequence[str],
     rank: int,
+    split_method: str = "random",
 ) -> None:
     """rank0 原子写入 split manifest，避免 DDP 并发覆盖。"""
     if int(rank) != 0:
@@ -520,6 +523,7 @@ def _write_split_manifest(
         "seed": int(seed),
         "val_ratio": float(val_ratio),
         "rounding_mode": str(rounding_mode),
+        "split_method": str(split_method),
         "train": list(train),
         "val": list(val),
     }, ensure_ascii=False, indent=2)
@@ -533,6 +537,71 @@ def _write_split_manifest(
         except OSError:
             pass
         raise
+
+
+def _hash_fraction(key: str, seed: int) -> float:
+    """key+seed 的稳定哈希映射到 [0,1)（blake2b，与进程/平台无关）。"""
+    h = hashlib.blake2b(
+        f"{int(seed)}:{key}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "big") / 2.0 ** 64
+
+
+def hash_train_val_split(
+    keys: Sequence[str], val_ratio: float, seed: int
+) -> Tuple[List[int], List[int]]:
+    """逐样本稳定哈希划分（1-4）：hash(seed:key) < val_ratio → val。
+
+    每个样本的归组只由自身 key + seed 决定：增删其他样本不会重排既有
+    样本（无旧 val 样本漏进 train 的指标污染）。两侧为空时确定性兑底：
+    val 空且 n>1 时把哈希值最小的样本划入 val；train 空时把哈希值最大的
+    样本划回 train（兑底后仍保持其余样本归组稳定）。"""
+    fracs = [_hash_fraction(str(k), seed) for k in keys]
+    val_idx = [i for i, f in enumerate(fracs) if f < float(val_ratio)]
+    train_idx = [i for i, f in enumerate(fracs) if f >= float(val_ratio)]
+    if not val_idx and len(fracs) > 1:
+        move = int(np.argmin(fracs))
+        train_idx.remove(move)
+        val_idx.append(move)
+        logger.warning(
+            "hash_train_val_split: no sample hashed below val_ratio=%.3f; "
+            "deterministically moving the lowest-hash sample into val.",
+            float(val_ratio))
+    if not train_idx and val_idx:
+        move_pos = int(np.argmax([fracs[i] for i in val_idx]))
+        move = val_idx.pop(move_pos)
+        train_idx.append(move)
+        logger.warning(
+            "hash_train_val_split: every sample hashed below val_ratio=%.3f; "
+            "deterministically moving the highest-hash sample into train.",
+            float(val_ratio))
+    if not val_idx:
+        logger.warning(
+            "hash_train_val_split: only %d sample(s); validation set is "
+            "empty.", len(fracs))
+    return train_idx, val_idx
+
+
+def grouped_hash_train_val_split(
+    paths: Sequence[str], group_id_regex: str,
+    val_ratio: float, seed: int) -> Tuple[List[int], List[int]]:
+    """组级（患者级）稳定哈希划分：同 group id 整体进 train 或 val，
+    归组只由 group id + seed 决定（增删其他组不重排既有组）。"""
+    gids = extract_group_ids(paths, group_id_regex)
+    groups = sorted(set(gids))
+    g_train, g_val = hash_train_val_split(groups, val_ratio, seed)
+    val_groups = {groups[i] for i in g_val}
+    train_idx = [i for i, g in enumerate(gids) if g not in val_groups]
+    val_idx = [i for i, g in enumerate(gids) if g in val_groups]
+    if {gids[i] for i in train_idx} & {gids[i] for i in val_idx}:
+        raise RuntimeError(
+            "grouped_hash_train_val_split invariant broken: train/val "
+            "groups overlap")
+    logger.info(
+        "Split (group-aware hash, regex=%r): %d train / %d val samples "
+        "from %d / %d groups (%d groups total).",
+        group_id_regex, len(train_idx), len(val_idx),
+        len(groups) - len(val_groups), len(val_groups), len(groups))
+    return train_idx, val_idx
 
 
 def train_val_split(
@@ -1095,6 +1164,106 @@ def log_volume_cache_estimate(
         logger.debug("Could not estimate volume cache size: %s", exc)
 
 
+def _read_npz_manifest(npz_dir: str) -> Optional[dict]:
+    """读 ``npz_dir/_manifest.json``（make_data 写入）；缺失/损坏返 None。"""
+    p = Path(npz_dir) / "_manifest.json"
+    if not p.is_file():
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to read %s: %s", p, exc)
+        return None
+
+
+def _consume_npz_manifest(cfg: Config, npz_dir: str) -> None:
+    """消费 make_data manifest：口径拦截（1-3）+ 指纹归一化解析（2-3）。
+
+    - 打包口径校验：manifest 记录的 spacing_normalization / 显式配置的
+      target_spacing / label_values 与当前 cfg 不一致时 fail-fast（不同
+      预处理口径的产物不得静默混用）；旧 manifest 缺字段时跳过对应项。
+    - data_identifier 回写 cfg.data.data_identifier（随 checkpoint 落盘，
+      供事后追溯训练用的是哪个口径的产物）。
+    - normalize='ct_fingerprint' 时从 dataset_fingerprint 解析归一化参数
+      并回写 intensity_min/max + global_mean/std（下游统一消费；缺指纹
+      时 fail-fast，提示重新烘包）。
+    """
+    dc = cfg.data
+    manifest = _read_npz_manifest(npz_dir)
+    if manifest is None:
+        if dc.normalize == "ct_fingerprint":
+            raise ValueError(
+                f"data.normalize='ct_fingerprint' requires {npz_dir}/"
+                "_manifest.json with a dataset_fingerprint (make_data >= "
+                "1.9). Re-run make_data (with --overwrite for pre-1.9 "
+                "packages) to bake intensity statistics.")
+        logger.warning(
+            "No _manifest.json under %s (pre-1.5 package or hand-built "
+            "directory); packing-parameter consistency cannot be verified.",
+            npz_dir)
+        return
+
+    diffs: List[str] = []
+    if "spacing_normalization" in manifest and bool(
+            manifest["spacing_normalization"]) != bool(
+            dc.spacing_normalization):
+        diffs.append(
+            f"spacing_normalization: baked="
+            f"{bool(manifest['spacing_normalization'])} vs "
+            f"config={bool(dc.spacing_normalization)}")
+    if (dc.target_spacing is not None
+            and manifest.get("target_spacing") is not None):
+        baked_ts = [float(s) for s in manifest["target_spacing"]]
+        cfg_ts = [float(s) for s in dc.target_spacing]
+        if (len(baked_ts) != len(cfg_ts)
+                or not np.allclose(baked_ts, cfg_ts, rtol=0.0, atol=1e-3)):
+            diffs.append(
+                f"target_spacing: baked={baked_ts} vs config={cfg_ts}")
+    if dc.label_values and manifest.get("label_values"):
+        baked_lv = [int(v) for v in manifest["label_values"]]
+        cfg_lv = [int(v) for v in dc.label_values]
+        if baked_lv != cfg_lv:
+            diffs.append(
+                f"label_values: baked={baked_lv} vs config={cfg_lv}")
+    if diffs:
+        raise ValueError(
+            f"npz package directory {npz_dir} was baked with different "
+            f"preprocessing parameters than the current config: "
+            f"{'; '.join(diffs)}. Packages from different preprocessing "
+            "configurations must not be mixed — point data.npz_dir at a "
+            "directory baked with the current parameters, or re-run "
+            "make_data with --overwrite.")
+
+    identifier = manifest.get("data_identifier")
+    if isinstance(identifier, str) and identifier:
+        dc.data_identifier = identifier
+        logger.info("npz package data_identifier: %s (recorded into config "
+                    "-> checkpoint for provenance).", identifier)
+
+    if dc.normalize == "ct_fingerprint":
+        fp = manifest.get("dataset_fingerprint")
+        if not isinstance(fp, dict):
+            raise ValueError(
+                f"data.normalize='ct_fingerprint' but {npz_dir}/"
+                "_manifest.json has no dataset_fingerprint (pre-1.9 "
+                "package). Re-run make_data with --overwrite to bake "
+                "intensity statistics.")
+        params = fingerprint_normalization_params(fp)
+        dc.intensity_min = params["intensity_min"]
+        dc.intensity_max = params["intensity_max"]
+        dc.global_mean = params["global_mean"]
+        dc.global_std = params["global_std"]
+        logger.info(
+            "normalize='ct_fingerprint': resolved from dataset_fingerprint "
+            "(n_cases=%s, n_samples=%s) -> clip=[%.2f, %.2f], mean=%.3f, "
+            "std=%.3f (written back to data.intensity_min/max + "
+            "global_mean/std; stored in checkpoints for inference mirror).",
+            fp.get("n_cases"), fp.get("n_samples"),
+            dc.intensity_min, dc.intensity_max,
+            dc.global_mean, dc.global_std)
+
+
 def build_dataloaders(
     cfg: Config,
     rank: int = 0,
@@ -1150,6 +1319,9 @@ def build_dataloaders(
     primary_paths = _resolve_npz_paths(
         cfg, npz_dir, allow_auto_build=True, rank=rank, world_size=world_size)
 
+    # 打包口径拦截（1-3）+ ct_fingerprint 归一化参数解析（2-3）。
+    _consume_npz_manifest(cfg, npz_dir)
+
     use_mixed       = bool(dc.npz_dir_secondary)
     secondary_paths : List[str] = []
     if use_mixed:
@@ -1200,6 +1372,7 @@ def build_dataloaders(
                 dc.label_values, dc.num_classes, cfg.num_fg_classes)
 
     # 主源 train/val 划分（粗标不参与划分，整批用于训练）。
+    split_method = str(dc.split_method).lower()
     if dc.group_id_regex:
         # 患者/组级划分优先：同组样本不得跨 train/val（防泄漏）。
         if dc.stratified_split:
@@ -1207,8 +1380,28 @@ def build_dataloaders(
                 "data.group_id_regex is set; group-aware split overrides "
                 "stratified_split (stratification within group constraints "
                 "is not supported).")
-        train_idx, val_idx = grouped_train_val_split(
-            primary_paths, dc.group_id_regex, dc.val_ratio, dc.split_seed)
+        if split_method == "hash":
+            train_idx, val_idx = grouped_hash_train_val_split(
+                primary_paths, dc.group_id_regex, dc.val_ratio,
+                dc.split_seed)
+        else:
+            train_idx, val_idx = grouped_train_val_split(
+                primary_paths, dc.group_id_regex, dc.val_ratio, dc.split_seed)
+    elif split_method == "hash":
+        # 稳定哈希划分（1-4）：逐样本归组只由自身文件名 stem + seed 决定；
+        # stratified_split 在此模式下不参与分组（稳定性优先）。
+        if dc.stratified_split and dc.num_classes >= 2:
+            logger.info(
+                "data.split_method='hash': stratified_split is bypassed "
+                "(per-sample membership is decided solely by its own stem "
+                "hash; per-stratum ratios approximate val_ratio only in "
+                "expectation). Set data.split_method='random' to restore "
+                "exact stratified splitting.")
+        train_idx, val_idx = hash_train_val_split(
+            [Path(p).stem for p in primary_paths],
+            dc.val_ratio, dc.split_seed)
+        logger.info("Split (stable hash): %d train, %d val",
+                    len(train_idx), len(val_idx))
     elif dc.stratified_split and dc.num_classes >= 2:
         if per_sample_counts is None:
             # label_values 显式配置时未走探测；尝试从 npz meta 取计数，
@@ -1227,20 +1420,25 @@ def build_dataloaders(
             rounding_mode=dc.split_rounding_mode)
         logger.info("Split (random): %d train, %d val",
                     len(train_idx), len(val_idx))
-    if dc.split_manifest_path:
-        if rank == 0:
-            _check_split_manifest_drift(
-                Path(dc.split_manifest_path),
-                train=[primary_paths[i] for i in train_idx],
-                val=[primary_paths[i] for i in val_idx])
-        _write_split_manifest(
-            Path(dc.split_manifest_path),
-            seed=dc.split_seed,
-            val_ratio=dc.val_ratio,
-            rounding_mode=dc.split_rounding_mode,
+    # 划分 manifest（1-4）：未显式配置路径时默认落在 npz_dir 下，始终可
+    # 审计/可复现；既有 manifest 漂移时高声告警（val → train 泄漏风险）。
+    manifest_path = Path(
+        dc.split_manifest_path
+        or (Path(npz_dir) / "_split_manifest.json"))
+    if rank == 0:
+        _check_split_manifest_drift(
+            manifest_path,
             train=[primary_paths[i] for i in train_idx],
-            val=[primary_paths[i] for i in val_idx],
-            rank=rank)
+            val=[primary_paths[i] for i in val_idx])
+    _write_split_manifest(
+        manifest_path,
+        seed=dc.split_seed,
+        val_ratio=dc.val_ratio,
+        rounding_mode=dc.split_rounding_mode,
+        train=[primary_paths[i] for i in train_idx],
+        val=[primary_paths[i] for i in val_idx],
+        rank=rank,
+        split_method=split_method)
 
     # 模式无关的公共构造参数 + 单 split 路径包装。
     common_cfg          = DatasetCommonCfg.from_cfg(cfg)

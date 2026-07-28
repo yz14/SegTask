@@ -154,6 +154,8 @@ class Trainer(BaseTrainer):
         self._setup_best_tracking(mode=tc.save_best_mode)  # "max" or "min"
         self.best_key = tc.save_best_metric
         self._ckpt_task_label = "seg"
+        # 阈值标定（3-7）：最近一次选模验证产出的逐类标定阈值，随 checkpoint 落盘。
+        self.calibrated_thresholds = None
 
         # --- Validation / model-selection evaluator -------------------
         # medium（随机 patch 指标）/ high（整卷滑窗指标）由 val_metric_mode 决定；
@@ -281,6 +283,12 @@ class Trainer(BaseTrainer):
                 # 混合调度的 medium 监控轮次不参与选模/早停/plateau（口径
                 # 与 high 不同）；非混合 evaluator 恒 True，行为不变。
                 val_selects = self.evaluator.selects_model()
+                # 阈值标定：选模轮（整卷 high）产出逐类标定阈值时更新，供
+                # _ckpt_extra_state 写入随后保存的 best/latest checkpoint。
+                if val_selects:
+                    cal = self.evaluator.last_calibrated_thresholds
+                    if cal is not None:
+                        self.calibrated_thresholds = list(cal)
 
             # 仅 plateau 逐 epoch 驱动。
             plateau_metric = (val_metrics.get(tc.save_best_metric, None)
@@ -313,6 +321,19 @@ class Trainer(BaseTrainer):
                         extra={"msg_color": Fore.YELLOW + Style.BRIGHT})
                 else:
                     self.patience_counter += 1
+            elif val_selects and val_metrics:
+                # 选模验证跑了但指标缺失：不能静默——既存不了 best 也永不
+                # 触发早停。醒目告警并照常累计耐心，使异常配置在 patience
+                # 轮内停下。
+                logger.warning(
+                    "save_best_metric=%r missing from val metrics (keys=%s): "
+                    "no best checkpoint can be saved this epoch. Check "
+                    "train.save_best_metric / save_best_criterion. Patience "
+                    "counter still advances (%d/%s).",
+                    tc.save_best_metric, sorted(val_metrics.keys()),
+                    self.patience_counter + 1,
+                    tc.early_stopping if tc.early_stopping > 0 else "inf")
+                self.patience_counter += 1
 
             # --- Epoch summary ----------------------------------------
             best_str = (f"{self.best_metric:.4f} (ep{self.best_epoch + 1})"
@@ -320,7 +341,7 @@ class Trainer(BaseTrainer):
             aux_summary_dict = {
                 k: v for k, v in train_metrics.items()
                 if k.startswith("L_main") or k.startswith("L_aux_")
-                or k.startswith("w_aux_")
+                or k.startswith("w_aux_") or k == "w_main"
                 or k.startswith("L_res_") or k.startswith("L_aux_res_")
                 or k in ("L_topo", "w_topo")}
             aux_msg = format_breakdown(aux_summary_dict)
@@ -491,11 +512,30 @@ class Trainer(BaseTrainer):
             breakdown: Dict[str, float] = {}
 
             # Forward AMP / Loss fp32（Dice/BCE 在 fp16 下汇总易溢出 → NaN）
+            # GradNorm（1-6）：优化步边界按节奏更新头权重。先 arm 让 combine
+            # 暂存逐头 loss（含图），主 backward 前消费（图未释放）。
+            bal = self.pipeline.balancer
+            gradnorm_due = (is_step_boundary and bal.wants_update()
+                            and bal.tick_boundary())
+            if gradnorm_due:
+                bal.arm_stash()
+
             with sync_ctx:
                 with autocast(device_type="cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                     pred = self.fwd_model(image)
                 loss = self.pipeline.compute_loss(
                     pred, sup, breakdown=breakdown if is_log_step else None)
+
+                # autograd.grad 不累加 .grad、不触发 DDP reducer；g_i/L_i 跨
+                # rank 均值同步，各 rank 权重更新一致。
+                if gradnorm_due:
+                    bal.update(
+                        [p for p in self.model.parameters()
+                         if p.requires_grad],
+                        self.device,
+                        amp_scale=(self.scaler.get_scale()
+                                   if self._scaler_active else 1.0))
+
                 if effective_accum > 1:
                     loss = loss / effective_accum
 
@@ -695,12 +735,21 @@ class Trainer(BaseTrainer):
         结构指纹使推理侧 ``_check_arch_fingerprint`` 对生产 best 路径生效
         （此前仅周期 checkpoint 含指纹，默认推理用的 best_model.pth 无守卫）；
         增强 RNG / best 追踪字段使从 latest resume 时状态完整。"""
-        return {
+        extra = {
             "arch_fingerprint": arch_fingerprint(self.cfg),
             "augment_rng_state": self.augmentor.state_dict(),
             "has_best": self.has_best,
             "patience_counter": self.patience_counter,
         }
+        # 阈值标定（3-7）：验证集逐类标定阈值随 best/latest 落盘，推理默认读取
+        # （predict.use_calibrated_threshold）。未启用标定时为 None，不写。
+        if self.calibrated_thresholds is not None:
+            extra["calibrated_thresholds"] = list(self.calibrated_thresholds)
+        # GradNorm（1-6）：头权重及其优化器状态随 checkpoint 落盘，resume 后续接。
+        bal = self.pipeline.balancer
+        if bal.wants_update():
+            extra["loss_balancer"] = bal.state_dict()
+        return extra
 
     def _build_state_dict(self, ema_as_primary: bool) -> Dict:
         """打包训练状态。``ema_as_primary=True`` 时 ``model_state_dict`` 为 EMA，
@@ -814,6 +863,16 @@ class Trainer(BaseTrainer):
         if aug_rng:
             self.augmentor.load_state_dict(aug_rng)
             logger.info("Restored augmentation RNG state from checkpoint.")
+        bal = self.pipeline.balancer
+        if bal.wants_update():
+            bal_state = ckpt.get("loss_balancer")
+            if bal_state:
+                bal.load_state_dict(bal_state)
+                logger.info("Restored GradNorm balancer state from checkpoint.")
+            else:
+                logger.warning(
+                    "loss.gradnorm_enabled=True but checkpoint has no "
+                    "'loss_balancer' state; GradNorm weights start fresh.")
         # rank>0 的 RNG 重分流已在 _restore_train_state 内完成，此处不重复。
         logger.info(
             "Resumed from epoch %d, best=%s=%s (patience=%d)",

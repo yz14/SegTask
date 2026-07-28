@@ -123,8 +123,8 @@ def _make_predictor_stub(
             target_shape=stub._mr_target_shape,
             native_sizes=stub._mr_native_sizes))
     stub._build_batch_native_multi_res_cubic_gpu = (
-        lambda centers, vol_t: _inputs.build_cubic_batch_native_multi_res(
-            centers, vol_t,
+        lambda windows, vol_t: _inputs.build_cubic_batch_native_multi_res(
+            windows, vol_t,
             pD=stub.patch_D, pH=stub.patch_H, pW=stub.patch_W,
             target_shape=stub._mr_target_shape,
             native_sizes=stub._mr_native_sizes))
@@ -298,8 +298,10 @@ def test_cubic_on_shape_and_view0_matches_extract_cubic_patch():
 
     centers = [(Dv // 2, Hv // 2, Wv // 2),  # well inside
                (3, 4, 5)]                     # near boundary (edge-pad)
+    windows = [(cd - pD // 2, ch - pH // 2, cw - pW // 2, pD, pH, pW)
+               for (cd, ch, cw) in centers]
 
-    batch = stub._build_batch_native_multi_res_cubic_gpu(centers, vol_t)
+    batch = stub._build_batch_native_multi_res_cubic_gpu(windows, vol_t)
     assert tuple(batch.shape) == (2, 3, pD, pH, pW), (
         f"cubic ON batch shape {tuple(batch.shape)}")
 
@@ -328,8 +330,10 @@ def test_cubic_on_aux_view_matches_explicit_reference():
     Dv, Hv, Wv = 32, 48, 48
     vol_t, vol_np = _make_vol_t_3d(D=Dv, H=Hv, W=Wv, seed=4)
     center = (Dv // 2, Hv // 2, Wv // 2)
+    window = (center[0] - pD // 2, center[1] - pH // 2,
+              center[2] - pW // 2, pD, pH, pW)
 
-    batch = stub._build_batch_native_multi_res_cubic_gpu([center], vol_t)
+    batch = stub._build_batch_native_multi_res_cubic_gpu([window], vol_t)
     for k, s in enumerate(multi_res_scales):
         D_k = int(round(pD * s))
         H_k = int(round(pH * s))
@@ -362,7 +366,9 @@ def test_cubic_on_boundary_centre_edge_pad_three_axes():
     vol_t, _ = _make_vol_t_3d(D=Dv, H=Hv, W=Wv, seed=5)
     # Corner centre → max-FOV (16, 32, 32) won't fit; edge-pad on D/H/W.
     center = (0, 0, 0)
-    batch = stub._build_batch_native_multi_res_cubic_gpu([center], vol_t)
+    window = (center[0] - pD // 2, center[1] - pH // 2,
+              center[2] - pW // 2, pD, pH, pW)
+    batch = stub._build_batch_native_multi_res_cubic_gpu([window], vol_t)
     assert tuple(batch.shape) == (1, 2, pD, pH, pW)
     assert torch.isfinite(batch).all()
 

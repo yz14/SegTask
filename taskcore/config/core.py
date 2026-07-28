@@ -145,7 +145,12 @@ class DataConfig:
     # 强度窗（CT HU）。
     intensity_min: float = -1024.0
     intensity_max: float = 1024.0
-    # 归一化："minmax"→[0,1]；"zscore"→零均值单位方差。
+    # 归一化："minmax"→clip 强度窗后 [0,1]；"zscore"→clip 后 (x-global_mean)/global_std
+    # （统计量手配）；"ct_fingerprint"→clip 到数据集前景 p0.5/p99.5 后用数据集
+    # 前景 mean/std 做 z-score（nnU-Net CT 同款；参数由 loader 从 npz_dir/
+    # _manifest.json 的 dataset_fingerprint 自动解析并回写本段 4 个字段，需
+    # make_data≥1.9 烘包）；"zscore_volume"→clip 强度窗后逐病例自身 mean/std
+    # z-score（per-case，无需全局统计量，MRI 惯例）。
     normalize  : str = "minmax"
     global_mean: float = 0.0
     global_std : float = 1.0
@@ -157,6 +162,11 @@ class DataConfig:
     # 目标 spacing [sz, sy, sx]（numpy 轴序 (D,H,W)，单位 mm）。仅 spacing_normalization=True 时用。
     # None=make_data 扫描全数据集头信息取逐轴中位数（nnU-Net 式指纹）后自动落定。
     target_spacing: Optional[List[float]] = None
+
+    # 打包口径标识（1-3，只读运行期字段）：loader 从 npz_dir/_manifest.json
+    # 回读（make_data≥1.9 写入 dsid-<hash>），随 checkpoint 内的 config 落盘，
+    # 供事后追溯训练消费的是哪个预处理口径的产物。请勿手配。
+    data_identifier: str = ""
 
     # 样本排除清单路径（每行一个 pid）。空=不过滤。
     exclude_list: str = ""
@@ -176,6 +186,13 @@ class DataConfig:
     # 用 r'^(P\d+)' 归组为 'P0123'。启用时组级随机划分（stratified_split 被
     # 覆盖并告警）；空字符串 = 关闭（默认，保持"一文件一样本"划分）。
     group_id_regex: str = ""
+    # 划分方法（1-4）："hash"（默认）逐样本稳定哈希归组 —— 样本的 train/val
+    # 归属只由自身文件名（或 group id）+ split_seed 决定，增删其他样本不会
+    # 重排既有样本的归组（根治样本增删后 val 样本漏进 train 的指标污染）；
+    # "random" 保留旧行为（seed 排列，样本集合变化会整体重排）。hash 模式
+    # 下 stratified_split 不再参与分组（稳定性优先，逐层比例只在期望意义上
+    # 近似 val_ratio）；仅 seg 训练 loader 消费。
+    split_method: str = "hash"
 
     # ---- DataLoader ----
     batch_size        : int = 2
@@ -702,6 +719,17 @@ class LossConfig:
     # 损失类型："auto"（centerline→soft-dice，distance→smooth_l1）| "dice" | "bce" | "smooth_l1" | "mse"。
     aux_topo_loss: str = "auto"
 
+    # ---- 监督头权重归一化 / GradNorm（1-6）----
+    # True：main + aux_k + topo 全部头权重缩放到 Σw=1，消除"头越多总损失量纲
+    # 越大"的隐患（lr / grad_clip 阈值在不同头数配置间可比）。单头配置不受影响。
+    normalize_supervision_weights: bool = True
+    # GradNorm（Chen+ ICML 2018）：头权重可学习，按各头相对训练速率自适应再平衡。
+    # 初始权重取上面的（归一化后）静态权重；权重与其优化器状态随 checkpoint 保存。
+    gradnorm_enabled: bool = False
+    gradnorm_alpha: float = 1.5        # 训练速率不对称度指数（论文 α）
+    gradnorm_lr: float = 0.025         # 头权重 Adam 学习率
+    gradnorm_update_every: int = 25    # 每 N 个优化步做一次权重更新（每次多一遍逐头 backward）
+
     # ---- 逐损失参数 ----
     # Dice 参数。
     dice_smooth: float = 1e-5
@@ -933,6 +961,10 @@ class TrainConfig:
     # （逐 rank，不随 epoch 增长），需按数据规模评估。默认关，行为与现状一致。
     val_volume_cache: bool = False
 
+    # 整卷验证缓存字节预算（GiB，逐 rank）：缓存总字节数达上限后新卷不再
+    # 入缓存（现读现算）并告警一次；<=0 表示不限（仅记录实际占用）。
+    val_volume_cache_max_gb: float = 8.0
+
     # 选模标准（互斥）：
     #   * "loss"              → val_base_loss ↓
     #   * "dice"              → mean_dice ↑
@@ -963,6 +995,35 @@ class TrainConfig:
     # 提前停止（0=禁用）。单位是“验证次数”而非 epoch：val_every>1 时
     # N 次无提升 ≈ N*val_every 个 epoch（plateau_patience 同理）。
     early_stopping: int = 0
+
+    # ---- Per-case 指标聚合（1-1 / 1-2 HD95 / 2-8 clDice）----
+    # 仅整卷（val_metric_mode='high'）评估上逐病例累加 dice/iou（并可选 HD95 /
+    # clDice），导出 case_mean_* / case_std_* / case_p5_* / case_worstk_*，
+    # 与 pooled 指标口径互补（后者被大器官主导、掩盖个别病例灾难性失败）。
+    # 医学分割 benchmark（KiTS/AMOS/BraTS）均以 per-case 均值±标准差为报告口径。
+    per_case_metrics: bool = True
+    # 最差 k 例：case_worstk_* 取分布最差 k 例的均值（距离类指标取最大 k）。
+    per_case_worst_k: int = 5
+    # HD95（95 百分位对称 Hausdorff 表面距离，benchmark 必报）：逐病例逐类计算，
+    # 复用 scipy EDT。spacing 可解析时为物理 mm，否则 voxel。CPU EDT 每卷有成本，
+    # 故默认关；开启后 case_mean_hd95 / case_p95_hd95 进入 metrics。
+    compute_hd95: bool = False
+    # clDice 拓扑指标（中心线 Dice）：逐病例逐类硬骨架化，血管/气道等拓扑敏感
+    # 任务用。开启后 mean_cldice 进入 metrics，可作 save_best_criterion='cldice'
+    # 选模。默认关（骨架化有成本）。
+    compute_cldice: bool = False
+    # clDice 指标骨架化迭代数（与损失 cldice_iter 独立；越大骨架越细）。
+    cldice_metric_iter: int = 3
+
+    # ---- 阈值标定（3-7）----
+    # 验证集（整卷 high 评估）上逐类扫描 sigmoid 阈值取最大 pooled Dice，写入
+    # best checkpoint 的 'calibrated_thresholds'。推理默认读取（见
+    # predict.use_calibrated_threshold），统一训练/验证/部署的二值化口径。
+    # 默认关；开启需 val_metric_mode='high'（medium patch 口径不适合标定部署阈值）。
+    calibrate_threshold: bool = False
+    # 阈值候选网格（升序，(0,1) 内）。默认 0.05..0.95 步长 0.05。
+    calibrate_threshold_grid: List[float] = field(
+        default_factory=lambda: [round(0.05 * i, 2) for i in range(1, 20)])
 
     # ---- checkpoint 保存 ----
     save_every      : int = 10
@@ -1100,6 +1161,7 @@ _CRITERION_TO_METRIC: Dict[str, Tuple[str, str]] = {
     "mcc":               ("mean_mcc",        "max"),
     "min_dice":          ("min_class_dice",  "max"),
     "balanced":          ("mean_balanced",   "max"),
+    "cldice":            ("mean_cldice",     "max"),
 }
 # 未知 criterion 的兜底（validate() 会另行报错），保证 property 不抛异常。
 _DEFAULT_CRIT_METRIC: Tuple[str, str] = ("mean_dice", "max")
@@ -1149,10 +1211,21 @@ class PredictConfig:
     #   显存吃紧时调小（如 2）。AdaBN per_volume 估计阶段会自动退回串行以保 BN 统计一致。
     tta_batch_size: Optional[int] = None
 
+    # TTA 融合域（1-7）：True（默认）= logit 域平均后再 sigmoid（nnU-Net 同款，
+    # 避免概率域平均的饱和偏差：一个变体饱和到 1.0 会不对称地拖不动均值）；
+    # False = 旧行为（sigmoid 概率域平均）。仅 tta_flip=True 时生效。
+    tta_logit_average: bool = True
+
     # sigmoid 二值化阈值：标量（全类共享）或逐前景类列表（长度 = num_fg，与
     # label_values[1:] 一一对应）。one-vs-rest sigmoid 下不同类的最优操作点常差异
     # 很大（小结构类宜偏低阈值）。
     threshold: Union[float, List[float]] = 0.5
+
+    # 阈值标定（3-7）：checkpoint 内含训练期验证集标定的逐类阈值
+    # （'calibrated_thresholds'，见 train.calibrate_threshold）时，推理默认改用
+    # 它们二值化，统一训练/验证/部署口径。旧 checkpoint 无该字段时无操作（沿用
+    # 上面的 threshold）。置 False 强制使用上面显式配置的 threshold（忽略 ckpt 标定）。
+    use_calibrated_threshold: bool = True
 
     # ---- 精度 / 显存 ----
     # 滑窗概率累加器 dtype："fp32"（默认）| "fp16"。大卷 × 多类时 fp16 使
@@ -1169,12 +1242,28 @@ class PredictConfig:
     # GPU→CPU 拷贝，用速度换显存）。
     accumulate_on_cpu: bool = False
 
+    # 流式分块累加（2-5，MONAI buffer_steps 同源思路）：滑窗沿 z 轴顺序遍历，
+    # 累加器只覆盖“后续窗口仍可能写到”的活跃 z 段（~patch_D 层），已定层
+    # 立即归一化写出并释放——device 侧累加器峰值从 num_fg×D×H×W 降到
+    # num_fg×~patch_D×H×W，解大卷×多类推理的显存天花板；数值与全量累加
+    # 逐位一致。适用 z_axis / 2_5d / cubic 滑窗；whole 无累加器不受影响。
+    # 比 accumulate_on_cpu（整卷累加器搬 CPU）更细、更快，两者可叠加。
+    stream_accumulate: bool = True
+
     # ---- 提速开关 ----
     # 独立 CLI 推理（predictor.io.run_inference）开启 cudnn.benchmark：滑窗窗口
     # 形状固定，让 cuDNN 首个 batch 自动选最优卷积算法（训练入口经
     # seed_everything 已默认开启，仅独立推理入口缺此设置）。默认关，行为与现状
     # 一致；开启后首卷首个 batch 有一次性 autotune 开销。
     cudnn_benchmark: bool = False
+
+    # 预处理镜像守卫：checkpoint 内保存的训练配置与当前推理配置在预处理/
+    # 几何关键字段（normalize / intensity 窗 / spacing_normalization /
+    # target_spacing / patch_mode / multi_res_scales / keep_native_* /
+    # z_boundary_mode / label_values / resize_antialias）不一致时默认直接
+    # 报错拒绝推理（不一致 = 静默错误输出）。置 True 降级为告警放行
+    # （明知故犯的实验性场景用）。
+    allow_preprocess_mismatch: bool = False
 
     # 推理前向用 torch.inference_mode() 替代 torch.no_grad()：在免记梯度之上
     # 进一步免除 autograd 的 version-counter/view 追踪簿记，纯速度收益、
@@ -1991,7 +2080,9 @@ class Config:
         # brightness/noise 幅值为绝对量、隐含 image≈[0,1]（minmax）。zscore
         # （std≈1）下沿用 minmax 默认幅值时扰动相对偏弱且量纲不符，提示改配
         # （以 σ 为单位，典型 brightness±0.5σ、noise 0.1σ 量级）。
-        if self.data.normalize == "zscore" and self.augment.enabled:
+        if (self.data.normalize in ("zscore", "ct_fingerprint",
+                                    "zscore_volume")
+                and self.augment.enabled):
             b_r = [float(v) for v in self.augment.random_brightness_range]
             n_std = float(self.augment.gaussian_noise_std)
             defaults = AugConfig()
@@ -2005,10 +2096,11 @@ class Config:
                 hints.append(f"gaussian_noise_std={n_std}")
             if hints:
                 logger.warning(
-                    "data.normalize='zscore' 下 %s 仍为 minmax 量纲的默认绝对"
-                    "幅值：zscore（std≈1）上同数值扰动约弱一个量级。建议按 σ "
-                    "为单位改配（如 brightness ±0.3~0.5、noise std 0.1）。",
-                    "、".join(hints))
+                    "data.normalize=%r 下 %s 仍为 minmax 量纲的默认绝对"
+                    "幅值：z-score 类归一化（std≈1）上同数值扰动约弱一个量级。"
+                    "建议按 σ 为单位改配（如 brightness ±0.3~0.5、noise std "
+                    "0.1）。",
+                    self.data.normalize, "、".join(hints))
 
     def _validate_data(self) -> None:
         """data.* patch/multi-res/keep_native 校验。"""
@@ -2034,10 +2126,12 @@ class Config:
         _require(
             self.data.patch_mode in ("z_axis", "cubic", "whole", "2_5d"),
             f"Invalid patch_mode: {self.data.patch_mode}")
+        # 'stretch' 已废弃（sync() 会告警并升级为 edge_pad），白名单不再收。
         _require(
-            self.data.z_boundary_mode in ("stretch", "edge_pad"),
+            self.data.z_boundary_mode == "edge_pad",
             f"Invalid z_boundary_mode: {self.data.z_boundary_mode!r}; "
-            "expected 'stretch' or 'edge_pad'.")
+            "expected 'edge_pad' ('stretch' is deprecated and auto-upgraded "
+            "by sync()).")
         _require(
             self.data.cache_dtype in ("fp32", "int16"),
             f"Invalid data.cache_dtype: {self.data.cache_dtype!r}; "
@@ -2046,9 +2140,14 @@ class Config:
         # 分支（直接违反训推一致性契约 C8）；cache_mode 非法会被消费点
         # `== "memory"` 静默当作 none。
         _require(
-            self.data.normalize in ("minmax", "zscore"),
-            f"Invalid data.normalize: {self.data.normalize!r}; "
-            "expected 'minmax' or 'zscore'.")
+            self.data.normalize in ("minmax", "zscore", "ct_fingerprint",
+                                    "zscore_volume"),
+            f"Invalid data.normalize: {self.data.normalize!r}; expected "
+            "'minmax' / 'zscore' / 'ct_fingerprint' / 'zscore_volume'.")
+        _require(
+            str(self.data.split_method).lower() in ("hash", "random"),
+            "data.split_method must be 'hash' or 'random'; "
+            f"got {self.data.split_method!r}.")
         _require(
             self.data.cache_mode in ("none", "memory"),
             f"Invalid data.cache_mode: {self.data.cache_mode!r}; "
@@ -2398,6 +2497,44 @@ class Config:
             float(self.train.surface_dice_tolerance_mm) >= 0.0,
             f"surface_dice_tolerance_mm must be >= 0; got "
             f"{self.train.surface_dice_tolerance_mm}")
+        # per-case / 阈值标定 / clDice 选模校验（1-1 / 1-2 / 2-8 / 3-7）。
+        _high = str(self.train.val_metric_mode).lower().strip() == "high"
+        _require(
+            int(self.train.per_case_worst_k) >= 1,
+            f"per_case_worst_k must be >= 1; got {self.train.per_case_worst_k}")
+        _require(
+            int(self.train.cldice_metric_iter) >= 1,
+            f"cldice_metric_iter must be >= 1; got "
+            f"{self.train.cldice_metric_iter}")
+        grid = list(self.train.calibrate_threshold_grid)
+        _require(
+            len(grid) >= 1 and all(0.0 < float(g) < 1.0 for g in grid),
+            "calibrate_threshold_grid must be a non-empty list of floats in "
+            f"(0, 1); got {grid}")
+        if bool(self.train.calibrate_threshold) and not _high:
+            raise ConfigError(
+                "train.calibrate_threshold=True requires "
+                "train.val_metric_mode='high' (per-class threshold "
+                "calibration must run on full-volume probabilities that "
+                "mirror deployment; random-patch 'medium' probabilities are "
+                "not a valid operating-point proxy).")
+        if _norm_crit(self.train.save_best_criterion) == "cldice":
+            _require(
+                bool(self.train.compute_cldice) and _high,
+                "save_best_criterion='cldice' requires "
+                "train.compute_cldice=True and val_metric_mode='high' "
+                "(mean_cldice is only produced by full-volume per-case "
+                "evaluation).")
+        if bool(self.train.compute_cldice) and not _high:
+            logger.warning(
+                "train.compute_cldice=True has no effect with "
+                "val_metric_mode='medium' (clDice is a per-case full-volume "
+                "metric); set val_metric_mode='high' to compute it.")
+        if bool(self.train.compute_hd95) and not _high:
+            logger.warning(
+                "train.compute_hd95=True has no effect with "
+                "val_metric_mode='medium' (HD95 is a per-case full-volume "
+                "metric); set val_metric_mode='high' to compute it.")
         # prefetch_to_gpu 依赖 pinned host 内存才能真正异步（否则正确但无收益）。
         if self.train.prefetch_to_gpu and not self.data.pin_memory:
             logger.warning(

@@ -27,6 +27,11 @@ from .dataset import (
     read_nifti_spacing,
     resample_to_spacing,
 )
+from .identity import (
+    aggregate_dataset_fingerprint,
+    compute_case_intensity_stats,
+    compute_data_identifier,
+)
 from .loader import (
     _filter_by_exclude,
     _load_exclude_pids,
@@ -39,13 +44,14 @@ from .loader import (
 logger = logging.getLogger(__name__)
 
 
-_TOOL_VERSION = "make_data/1.8"  # 1.8: spacing_zyx=stored spacing; skip checks label_values/fg_subsample
+_TOOL_VERSION = "make_data/1.9"  # 1.9: per-case intensity stats + dataset fingerprint + data_identifier
 
 # skip 幂等时要求 on-disk meta 至少具备这些键（旧包缺键则触发重生成）。
 _REQUIRED_SKIP_META_KEYS = (
     "label_counts",
     "image_shape",
     "fg_per_class",
+    "intensity_stats",
 )
 
 # 同 _GEOM_SPACING_ATOL：target_spacing 比对容差 (mm)。
@@ -278,8 +284,14 @@ def prepare_one(
                 f"{bool((meta or {}).get('has_cond'))} != "
                 f"requested={expect_cond}")
         if ok:
+            # skip 路径也要向汇总侧提供前景强度采样（数据集指纹需覆盖全部
+            # 病例，而不只覆盖本次新写的病例）。
+            sample = np.asarray(
+                (meta or {}).get("fg_intensity_sample", []),
+                dtype=np.float32)
             return {"pid": pid, "status": "skipped",
-                    "size_bytes": out_p.stat().st_size, "elapsed_s": 0.0}
+                    "size_bytes": out_p.stat().st_size, "elapsed_s": 0.0,
+                    "fg_sample": sample}
         logger.warning(
             "pid=%s: existing npz at %s does not match current packing "
             "parameters (%s); regenerating.",
@@ -382,6 +394,12 @@ def prepare_one(
         label.astype(np.int32, copy=False), return_counts=True)
     label_counts = {int(v): int(c) for v, c in zip(uniq_vals, uniq_counts)}
 
+    # 5.6 逐病例前景强度统计（落盘坐标系，即 spacing 归一化后的 image）：
+    #     标量入 meta.intensity_stats；采样值入 meta.fg_intensity_sample，
+    #     供 prepare_dataset 池化数据集级指纹（含 skip 幂等路径）。
+    case_stats = dict(compute_case_intensity_stats(image, label))
+    fg_sample = np.asarray(case_stats.pop("fg_sample"), dtype=np.float32)
+
     # 6. 谱系 meta（自描述）。
     meta = {
         "pid"         : pid,
@@ -414,6 +432,8 @@ def prepare_one(
         "target_spacing": ([float(s) for s in target_spacing]
                            if spacing_normalized else None),
         "fg_subsample": int(fg_subsample),
+        "intensity_stats": case_stats,  # 逐病例前景强度标量（make_data≥1.9）
+        "fg_intensity_sample": fg_sample.tolist(),  # 指纹池化用采样值
         "made_at"     : datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "tool_version": _TOOL_VERSION}
     meta_arr = np.array(meta, dtype=object)
@@ -457,7 +477,8 @@ def prepare_one(
         "elapsed_s"   : elapsed,
         "shape"       : tuple(image.shape),
         "n_fg_slices" : int(fg_slices.size),
-        "n_fg_coords" : int(fg_coords.shape[0])}
+        "n_fg_coords" : int(fg_coords.shape[0]),
+        "fg_sample"   : fg_sample}
 
 
 def _build_sample_table(cfg: Config) -> List[Dict[str, Optional[str]]]:
@@ -584,6 +605,7 @@ def prepare_dataset(
     failures : List[Tuple[str, str]] = []   # (pid, err)
     timings  : List[float] = []
     sizes    : List[int] = []
+    fg_samples: List[np.ndarray] = []       # 逐病例前景强度采样（指纹池化）
 
     logger.info(
         "Preparing %d samples → %s (workers=%d, compress=%s, "
@@ -612,7 +634,7 @@ def prepare_dataset(
         for i, (s, out_path) in enumerate(tasks):
             try:
                 res = prepare_one(**_kwargs(s, out_path))
-                _record(res, counters, timings, sizes)
+                _record(res, counters, timings, sizes, fg_samples)
                 _log_progress(i + 1, n_total, res, t0)
             except Exception as exc:
                 counters["failed"] += 1
@@ -628,7 +650,7 @@ def prepare_dataset(
                 pid = future_to_pid[fut]
                 try:
                     res = fut.result()
-                    _record(res, counters, timings, sizes)
+                    _record(res, counters, timings, sizes, fg_samples)
                     _log_progress(i + 1, n_total, res, t0)
                 except Exception as exc:
                     counters["failed"] += 1
@@ -664,9 +686,36 @@ def prepare_dataset(
             "either re-run with --overwrite for the affected files OR add "
             "them to data.exclude_list.", len(failures), fail_path)
 
+    # 数据集级前景强度指纹（2-3）：逐病例采样池化；失败样本缺席时指纹
+    # 仅覆盖成功样本（failures 已另行警告）。
+    fingerprint = aggregate_dataset_fingerprint(
+        fg_samples, n_cases=counters["written"] + counters["skipped"])
+    if fingerprint is None:
+        logger.warning(
+            "No foreground intensity samples collected — "
+            "dataset_fingerprint is unavailable (all-empty labels?). "
+            "data.normalize='ct_fingerprint' will not be usable with this "
+            "package directory.")
+
+    # 打包口径稳定标识（1-3）：预处理参数变 → 标识变；training 侧比对拦截。
+    data_identifier = compute_data_identifier(
+        spacing_normalization=spacing_norm,
+        target_spacing=target_spacing,
+        label_values=label_values,
+        fg_subsample=fg_subsample,
+        has_bbox=bool(cfg.data.bbox_dir),
+        has_rw=bool(cfg.data.region_weight_dir))
+    logger.info(
+        "Data identifier: %s (recommended output naming: <dataset>_%s). "
+        "Changing preprocessing parameters changes this identifier; keep "
+        "one directory per identifier to avoid mixing incompatible "
+        "packages.", data_identifier, data_identifier)
+
     # 供下游追溯的 manifest。
     manifest = {
         "tool_version": _TOOL_VERSION,
+        "data_identifier": data_identifier,
+        "dataset_fingerprint": fingerprint,
         "made_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config_paths": {
             "image_dir": cfg.data.image_dir,
@@ -697,12 +746,15 @@ def _record(
     res: Dict[str, object],
     counters: Dict[str, int],
     timings: List[float],
-    sizes: List[int]) -> None:
+    sizes: List[int],
+    fg_samples: Optional[List[np.ndarray]] = None) -> None:
     """内联/池两路共用的计数。"""
     status = res.get("status", "written")
     counters[status] = counters.get(status, 0) + 1
     timings.append(float(res.get("elapsed_s", 0.0)))
     sizes.append(int(res.get("size_bytes", 0)))
+    if fg_samples is not None and res.get("fg_sample") is not None:
+        fg_samples.append(np.asarray(res["fg_sample"], dtype=np.float32))
 
 
 def _log_progress(

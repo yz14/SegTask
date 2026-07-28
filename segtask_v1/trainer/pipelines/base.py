@@ -31,6 +31,8 @@ import torch.nn as nn
 from taskcore.config.core import Config
 from taskcore.engine.amp import compute_loss_fp32
 
+from ...losses.balancer import build_balancer
+
 
 def resolve_aux_weights(cfg: Config, n_aux: int) -> List[float]:
     """aux 监督权重：用户显式配置优先，否则几何衰减 0.5^(k+1)。"""
@@ -45,13 +47,10 @@ def resolve_aux_weights(cfg: Config, n_aux: int) -> List[float]:
     return [float(w) for w in user_w]
 
 
-def accumulate_main(criterion, pred_main, sup, breakdown):
-    """主路 fp32 损失 + breakdown ``L_main`` 标量。"""
-    main_l = compute_loss_fp32(
+def accumulate_main(criterion, pred_main, sup, breakdown=None):
+    """主路 fp32 损失（未加权）。breakdown 的 ``L_main`` 由 balancer.combine 统一写。"""
+    return compute_loss_fp32(
         criterion, pred_main, sup.label_main, weight_map=sup.wmap_main)
-    if breakdown is not None:
-        breakdown["L_main"] = float(main_l.detach().item())
-    return main_l
 
 
 def max_fov_target_size(cfg: Config) -> Tuple[int, int, int]:
@@ -111,6 +110,23 @@ class ViewPipeline(ABC):
     aux_topo_loss_fn: Optional[nn.Module] = None
     aux_topo_weight: float = 0.0
 
+    # 监督头损失均衡器（1-6）：静态归一化 / GradNorm。由 build_pipeline 在 topo
+    # 注入后统一装配；直接构造的 pipeline（测试）首次取用时懒建静态均衡器。
+    _balancer = None
+
+    @property
+    def balancer(self):
+        if self._balancer is None:
+            self._balancer = build_balancer(
+                self.cfg, self.aux_weights,
+                self.aux_topo_weight if self.aux_topo_loss_fn is not None
+                else None)
+        return self._balancer
+
+    @balancer.setter
+    def balancer(self, value) -> None:
+        self._balancer = value
+
     @abstractmethod
     def prepare_batch(
         self,
@@ -165,23 +181,22 @@ class ViewPipeline(ABC):
             return pred["main"], (pred.get("aux") or []), pred.get("topo")
         return pred, [], None
 
-    def add_topo_loss(self, total, topo_pred, sup, breakdown):
-        """若启用中心线/距离场辅助头：``total += w_topo * topo_loss``，并写 breakdown。
+    def compute_topo_loss(self, topo_pred, sup) -> Optional[torch.Tensor]:
+        """中心线/距离场辅助头损失（未加权）；未启用时返 ``None``。
 
         辅助头输出与主头同形；整数 ``label_main`` 经 ``main_loss_fn.binarize_full``
         转为同形二值前景图（layout 与主头一致），再由 ``AuxTopoLoss`` 即时派生
-        软骨架 / 距离场目标。
+        软骨架 / 距离场目标。加权与 breakdown 由 balancer.combine 统一处理。
         """
         if self.aux_topo_loss_fn is None or topo_pred is None:
-            return total
+            return None
         with torch.no_grad():
             topo_target = self.main_loss_fn.binarize_full(sup.label_main)
-        topo_l = compute_loss_fp32(self.aux_topo_loss_fn, topo_pred, topo_target)
-        total = total + float(self.aux_topo_weight) * topo_l
-        if breakdown is not None:
-            breakdown["L_topo"] = float(topo_l.detach().item())
-            breakdown["w_topo"] = float(self.aux_topo_weight)
-        return total
+        return compute_loss_fp32(self.aux_topo_loss_fn, topo_pred, topo_target)
+
+    def combine_heads(self, heads, breakdown=None) -> torch.Tensor:
+        """把 ``[(name, loss)]`` 交给 balancer 组合为总损失并写 breakdown。"""
+        return self.balancer.combine(heads, breakdown)
 
     def split_for_metrics(self, pred, label_main):
         """与模式无关的 metrics reshape；委托给 ``main_loss_fn.split_for_metrics``。"""

@@ -161,7 +161,12 @@ def _run_pipeline_case(cfg, *, expect_aux):
     loss = pipeline.compute_loss(out, sup, breakdown=breakdown)
     assert torch.isfinite(loss)
     assert "L_topo" in breakdown and "w_topo" in breakdown
-    assert breakdown["w_topo"] == pytest.approx(cfg.loss.aux_topo_weight)
+    # 监督头权重默认归一化（loss.normalize_supervision_weights）：breakdown 里的
+    # w_topo 是归一化后的有效权重，与配置原值成比例。
+    assert breakdown["w_topo"] == pytest.approx(
+        pipeline.balancer.weight("topo"))
+    assert (breakdown["w_topo"] / breakdown["w_main"]
+            == pytest.approx(cfg.loss.aux_topo_weight))
 
     loss.backward()
     grads = [p.grad for p in model.topo_head.parameters() if p.grad is not None]

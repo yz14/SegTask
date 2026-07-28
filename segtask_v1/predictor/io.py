@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -97,6 +98,123 @@ def _check_arch_fingerprint(ckpt: Dict, cfg: Config, path: str) -> None:
             "predictions under a drifted downsampling plan).")
 
 
+# 预处理/几何镜像键（data.*）：训练与推理必须逐一相同，否则模型看到的输入
+# 分布/几何与训练时不同 → 静默错误输出。patch_size 单列为软键（换 patch
+# 尺寸在 stride 计划一致时合法，仅告警）。
+_MIRROR_DATA_KEYS = (
+    "normalize", "global_mean", "global_std",
+    "intensity_min", "intensity_max",
+    "spacing_normalization", "target_spacing",
+    "patch_mode", "multi_res_scales",
+    "keep_native_multi_res", "keep_native_view_depth",
+    "z_boundary_mode", "label_values", "resize_antialias",
+)
+_MIRROR_SOFT_DATA_KEYS = ("patch_size",)
+
+
+def _ckpt_data_dict(ckpt: Dict) -> Optional[Dict]:
+    """从 ckpt 取训练时 data 段字段字典；无 config 时返 None。"""
+    ckpt_cfg = ckpt.get("config")
+    if isinstance(ckpt_cfg, Config):
+        return dict(vars(ckpt_cfg.data))
+    if isinstance(ckpt_cfg, dict) and isinstance(ckpt_cfg.get("data"), dict):
+        return dict(ckpt_cfg["data"])
+    return None
+
+
+def _adopt_fingerprint_normalization(
+    ckpt: Dict, cfg: Config, path: str) -> None:
+    """normalize='ct_fingerprint'（2-3）推理侧参数采纳：训练时 loader 已把
+    数据集指纹解析进 ckpt 内 config 的 intensity_min/max + global_mean/std，
+    推理 YAML 无需（也不应）手抄这 4 个数值 —— 两侧都为 ct_fingerprint 时
+    直接采纳 ckpt 解析值（随后的镜像硬比对自然通过）。"""
+    if cfg.data.normalize != "ct_fingerprint":
+        return
+    ckpt_data = _ckpt_data_dict(ckpt)
+    if ckpt_data is None:
+        raise RuntimeError(
+            f"data.normalize='ct_fingerprint' but checkpoint {path!r} "
+            "carries no training config to adopt the resolved "
+            "normalization parameters from. Use a checkpoint trained with "
+            "this repo (>= fingerprint support), or switch to an explicit "
+            "normalize mode with hand-set parameters.")
+    if ckpt_data.get("normalize") != "ct_fingerprint":
+        # 镜像硬比对会报 normalize 不一致，此处不采纳。
+        return
+    if "intensity_min" in ckpt_data:
+        cfg.data.intensity_min = float(ckpt_data["intensity_min"])
+    if "intensity_max" in ckpt_data:
+        cfg.data.intensity_max = float(ckpt_data["intensity_max"])
+    if "global_mean" in ckpt_data:
+        cfg.data.global_mean = float(ckpt_data["global_mean"])
+    if "global_std" in ckpt_data:
+        cfg.data.global_std = float(ckpt_data["global_std"])
+    logger.info(
+        "normalize='ct_fingerprint': adopted resolved normalization from "
+        "checkpoint training config -> clip=[%.2f, %.2f], mean=%.3f, "
+        "std=%.3f.",
+        cfg.data.intensity_min, cfg.data.intensity_max,
+        cfg.data.global_mean, cfg.data.global_std)
+
+
+def _check_preprocess_mirror(ckpt: Dict, cfg: Config, path: str) -> None:
+    """比对 ckpt 内保存的训练配置与当前推理配置的预处理/几何镜像键。
+
+    硬键不一致默认直接拒绝推理（``predict.allow_preprocess_mismatch=True``
+    降级为告警）；软键（patch_size）仅告警。旧 ckpt 无 ``config`` 时告警
+    跳过（兼容）。"""
+    ckpt_cfg = ckpt.get("config")
+    # 兼容两种存法：pickled Config 对象（本仓）或普通 dict（外部导出）。
+    # vars() 取实例字段字典：旧版 pickled Config 自然缺新字段，下方按缺键跳过。
+    if isinstance(ckpt_cfg, Config):
+        ckpt_data = dict(vars(ckpt_cfg.data))
+    elif isinstance(ckpt_cfg, dict) and isinstance(
+            ckpt_cfg.get("data"), dict):
+        ckpt_data = ckpt_cfg["data"]
+    else:
+        logger.warning(
+            "Checkpoint %r carries no training config; preprocessing "
+            "mirror check skipped (ensure the inference YAML matches the "
+            "training preprocessing manually).", path)
+        return
+    cur_data = dict(vars(cfg.data))
+
+    def _norm(val):
+        return list(val) if isinstance(val, (tuple, list)) else val
+
+    def _diffs(keys) -> List[str]:
+        # 旧 ckpt 的 Config 版本可能缺新字段：缺键跳过（无从比对）。
+        return [
+            f"data.{k}: ckpt={_norm(ckpt_data[k])!r} vs "
+            f"current={_norm(cur_data[k])!r}"
+            for k in keys
+            if k in ckpt_data and k in cur_data
+            and _norm(ckpt_data[k]) != _norm(cur_data[k])]
+
+    hard_diffs = _diffs(_MIRROR_DATA_KEYS)
+    soft_diffs = _diffs(_MIRROR_SOFT_DATA_KEYS)
+
+    if soft_diffs:
+        logger.warning(
+            "Inference config differs from training config on soft mirror "
+            "key(s): %s. Legal when the downsampling plan is unchanged, "
+            "but verify this is intentional.", "; ".join(soft_diffs))
+    if hard_diffs:
+        msg = (
+            f"Preprocessing mirror mismatch between checkpoint {path!r} "
+            f"training config and current inference config: "
+            f"{'; '.join(hard_diffs)}. The model would receive inputs "
+            "with a different distribution/geometry than it was trained "
+            "on (silently wrong predictions). Align the inference YAML "
+            "with the training config, or set "
+            "predict.allow_preprocess_mismatch=true to downgrade this "
+            "error to a warning.")
+        if cfg.predict.allow_preprocess_mismatch:
+            logger.warning("%s (allowed by allow_preprocess_mismatch)", msg)
+        else:
+            raise RuntimeError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Precision resolution
 # ---------------------------------------------------------------------------
@@ -121,6 +239,43 @@ def _resolve_inference_precision(precision: str, cfg: Config) -> str:
     return "bf16"
 
 
+def _unique_output_stems(image_paths: List[str]) -> Dict[str, str]:
+    """逐图像输出 stem：basename 唯一时直接用；递归输入下同名文件自动
+    前缀父目录名（仍冲突则逐级上溯），避免 ``*_pred.nii.gz`` 互覆。"""
+    def _base(p: str) -> str:
+        return Path(p).name.replace(".nii.gz", "").replace(".nii", "")
+
+    stems: Dict[str, str] = {}
+    depth = 0
+    remaining = list(image_paths)
+    while remaining and depth < 16:
+        candidates: Dict[str, str] = {}
+        for p in remaining:
+            parts = Path(p).parent.parts[::-1][:depth]
+            candidates[p] = "__".join(list(parts[::-1]) + [_base(p)])
+        counts: Dict[str, int] = {}
+        for s in candidates.values():
+            counts[s] = counts.get(s, 0) + 1
+        next_remaining: List[str] = []
+        for p, s in candidates.items():
+            if counts[s] == 1:
+                stems[p] = s
+            else:
+                next_remaining.append(p)
+        remaining = next_remaining
+        depth += 1
+    for i, p in enumerate(remaining):  # 完全同路径重复（理论上不会）兜底
+        stems[p] = f"{_base(p)}__{i}"
+    renamed = {p: s for p, s in stems.items() if s != _base(p)}
+    if renamed:
+        logger.warning(
+            "Duplicate output basenames detected under recursive input; "
+            "auto-prefixing %d output(s) with their sub-directory to avoid "
+            "overwrites: %s", len(renamed),
+            list(renamed.values())[:8])
+    return stems
+
+
 # ---------------------------------------------------------------------------
 # Top-level entry: build model + load ckpt + iterate images
 # ---------------------------------------------------------------------------
@@ -131,8 +286,8 @@ def run_inference(
     weight_variant: str = "auto",
     bbox_paths: Optional[List[str]] = None,
     precision: str = "auto",
-) -> None:
-    """对一组图像运行推理。
+) -> int:
+    """对一组图像运行推理。返回失败卷数（CLI 据此返非零退出码）。
 
     * ``weight_variant``：``'auto'`` (优 EMA) | ``'ema'`` | ``'online'``
     * ``bbox_paths``：与 ``image_paths`` 1∶1 的 ROI 掩膜；``None`` 走全卷
@@ -157,6 +312,13 @@ def run_inference(
     # weights_only=False：本 trainer ckpt 含 Config / numpy RNG，PyTorch 2.6+ 默认安全模式会拒。
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     _check_arch_fingerprint(ckpt, cfg, checkpoint_path)
+    _adopt_fingerprint_normalization(ckpt, cfg, checkpoint_path)
+    _check_preprocess_mirror(ckpt, cfg, checkpoint_path)
+    # 打包口径标识（1-3）：训练时 loader 从 npz manifest 回写，供事后追溯。
+    ckpt_data = _ckpt_data_dict(ckpt)
+    if ckpt_data and ckpt_data.get("data_identifier"):
+        logger.info("Training-time npz data_identifier: %s",
+                    ckpt_data["data_identifier"])
     sd, label = _select_state_dict(ckpt, weight_variant)
     sd = _strip_compile_prefix(sd)
 
@@ -215,6 +377,8 @@ def run_inference(
     logger.info("Model loaded from %s (variant=%s)", checkpoint_path, label)
 
     predictor = Predictor(model, cfg, device)
+    # 阈值标定（3-7）：ckpt 含训练期标定的逐类阈值时默认消费（可配置关闭）。
+    predictor.apply_calibrated_thresholds(ckpt)
 
     # 测试时自适应 BatchNorm — global 模式：推理前用少量目标域整卷重估 BN running
     # stats，全程复用。per_volume 模式不在此处理（见 Predictor.predict_volume）。
@@ -263,6 +427,8 @@ def run_inference(
                 "[AdaBN] global: BN running stats updated from target domain.")
 
     n = len(image_paths)
+    output_stems = _unique_output_stems(image_paths)
+    n_failed = 0
     for i, path in enumerate(image_paths, 1):
         bbox_path = bbox_paths[i - 1] if bbox_paths is not None else None
         logger.info("[%d/%d] Processing: %s%s", i, n, path,
@@ -270,13 +436,19 @@ def run_inference(
         try:
             result = predictor.predict_volume(
                 path, output_dir=cfg.predict.output_dir,
-                bbox_path=bbox_path)
+                bbox_path=bbox_path,
+                output_stem=output_stems[path])
             logger.info("  Label map shape: %s, unique labels: %s",
                         result["label_map"].shape,
                         np.unique(result["label_map"]).tolist())
         except Exception as e:
+            n_failed += 1
             logger.exception("Failed to process %s: %s", path, e)
             continue
+    if n_failed:
+        logger.error("Inference finished with %d/%d failed volume(s).",
+                     n_failed, n)
+    return n_failed
 
 
 __all__ = [

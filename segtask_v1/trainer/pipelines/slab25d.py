@@ -90,11 +90,11 @@ class Slab2_5DPipeline(ViewPipeline):
 
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, _aux, topo_pred = self.split_pred(pred)
-        loss = accumulate_main(self.criterion, main_pred, sup, breakdown)
-        loss = self.add_topo_loss(loss, topo_pred, sup, breakdown)
-        if breakdown is not None:
-            breakdown["L_total"] = float(loss.detach().item())
-        return loss
+        heads = [("main", accumulate_main(self.criterion, main_pred, sup))]
+        topo_l = self.compute_topo_loss(topo_pred, sup)
+        if topo_l is not None:
+            heads.append(("topo", topo_l))
+        return self.combine_heads(heads, breakdown)
 
 
 # ---------------------------------------------------------------------------
@@ -176,33 +176,25 @@ class Slab2_5DAuxPipeline(ViewPipeline):
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, aux_preds, topo_pred = self.split_pred(pred)
 
-        total = accumulate_main(self.criterion, main_pred, sup, breakdown)  # 主路损失，包含deep supervision
-        if not aux_preds or self.aux_loss_fn is None:
-            total = self.add_topo_loss(total, topo_pred, sup, breakdown)
-            if breakdown is not None:
-                breakdown["L_total"] = float(total.detach().item())
-            return total
-        if len(aux_preds) != len(self.aux_weights):
-            raise RuntimeError(
-                f"Number of aux predictions ({len(aux_preds)}) does not "
-                f"match number of aux weights ({len(self.aux_weights)}).")
-
-        label_all = sup.label_all_views
-        wmap_all  = sup.wmap_all_views
-        for k_idx, (ap, w_k) in enumerate(zip(aux_preds, self.aux_weights)):
-            view_k = k_idx + 1
-            lbl_k  = label_all[:, view_k]
-            wm_k = wmap_all[:, view_k] if wmap_all is not None else None
-            aux_l = compute_loss_fp32(
-                self.aux_loss_fn, ap, lbl_k, weight_map=wm_k)
-            total = total + w_k * aux_l
-            if breakdown is not None:
-                breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())
-                breakdown[f"w_aux_{view_k}"] = float(w_k)
-        total = self.add_topo_loss(total, topo_pred, sup, breakdown)
-        if breakdown is not None:
-            breakdown["L_total"] = float(total.detach().item())
-        return total
+        heads = [("main", accumulate_main(self.criterion, main_pred, sup))]  # 主路损失，包含deep supervision
+        if aux_preds and self.aux_loss_fn is not None:
+            if len(aux_preds) != len(self.aux_weights):
+                raise RuntimeError(
+                    f"Number of aux predictions ({len(aux_preds)}) does not "
+                    f"match number of aux weights ({len(self.aux_weights)}).")
+            label_all = sup.label_all_views
+            wmap_all  = sup.wmap_all_views
+            for k_idx, ap in enumerate(aux_preds):
+                view_k = k_idx + 1
+                lbl_k  = label_all[:, view_k]
+                wm_k = wmap_all[:, view_k] if wmap_all is not None else None
+                aux_l = compute_loss_fp32(
+                    self.aux_loss_fn, ap, lbl_k, weight_map=wm_k)
+                heads.append((f"aux_{view_k}", aux_l))
+        topo_l = self.compute_topo_loss(topo_pred, sup)
+        if topo_l is not None:
+            heads.append(("topo", topo_l))
+        return self.combine_heads(heads, breakdown)
 
 
 # ---------------------------------------------------------------------------
@@ -298,37 +290,29 @@ class Slab2_5DNativeDPipeline(ViewPipeline):
     def compute_loss(self, pred, sup: SupervisionPack, breakdown=None):
         main_pred, aux_preds, topo_pred = self.split_pred(pred)
 
-        total = accumulate_main(self.criterion, main_pred, sup, breakdown)
-        if not aux_preds or not self.aux_loss_fns:
-            total = self.add_topo_loss(total, topo_pred, sup, breakdown)
-            if breakdown is not None:
-                breakdown["L_total"] = float(total.detach().item())
-            return total
-        if sup.aux_labels is None:
-            raise RuntimeError(
-                "Slab2_5DNativeDPipeline.compute_loss requires sup.aux_labels "
-                "but received None — likely a missing prepare_batch call.")
-        if not (len(aux_preds) == len(self.aux_weights)
-                == len(self.aux_loss_fns) == len(sup.aux_labels)):
-            raise RuntimeError(
-                "keep_native_view_depth arity mismatch: "
-                f"preds={len(aux_preds)}, weights={len(self.aux_weights)}, "
-                f"losses={len(self.aux_loss_fns)}, "
-                f"labels={len(sup.aux_labels)}.")
-
-        for k_idx, (ap, w_k, loss_k, lbl_k) in enumerate(zip(
-                aux_preds, self.aux_weights, self.aux_loss_fns, sup.aux_labels)):
-            view_k = k_idx + 1
-            wm_k  = (sup.aux_wmaps[k_idx] if sup.aux_wmaps is not None else None)
-            aux_l = compute_loss_fp32(loss_k, ap, lbl_k, weight_map=wm_k)
-            total = total + w_k * aux_l
-            if breakdown is not None:
-                breakdown[f"L_aux_{view_k}"] = float(aux_l.detach().item())
-                breakdown[f"w_aux_{view_k}"] = float(w_k)
-        total = self.add_topo_loss(total, topo_pred, sup, breakdown)
-        if breakdown is not None:
-            breakdown["L_total"] = float(total.detach().item())
-        return total
+        heads = [("main", accumulate_main(self.criterion, main_pred, sup))]
+        if aux_preds and self.aux_loss_fns:
+            if sup.aux_labels is None:
+                raise RuntimeError(
+                    "Slab2_5DNativeDPipeline.compute_loss requires sup.aux_labels "
+                    "but received None — likely a missing prepare_batch call.")
+            if not (len(aux_preds) == len(self.aux_weights)
+                    == len(self.aux_loss_fns) == len(sup.aux_labels)):
+                raise RuntimeError(
+                    "keep_native_view_depth arity mismatch: "
+                    f"preds={len(aux_preds)}, weights={len(self.aux_weights)}, "
+                    f"losses={len(self.aux_loss_fns)}, "
+                    f"labels={len(sup.aux_labels)}.")
+            for k_idx, (ap, loss_k, lbl_k) in enumerate(zip(
+                    aux_preds, self.aux_loss_fns, sup.aux_labels)):
+                view_k = k_idx + 1
+                wm_k  = (sup.aux_wmaps[k_idx] if sup.aux_wmaps is not None else None)
+                aux_l = compute_loss_fp32(loss_k, ap, lbl_k, weight_map=wm_k)
+                heads.append((f"aux_{view_k}", aux_l))
+        topo_l = self.compute_topo_loss(topo_pred, sup)
+        if topo_l is not None:
+            heads.append(("topo", topo_l))
+        return self.combine_heads(heads, breakdown)
 
 
 __all__ = [

@@ -273,6 +273,9 @@ def test_run_inference_reparam_deploy_toggle(monkeypatch, tmp_path):
                 out = model(x)
             assert torch.allclose(out, reference, atol=1e-5, rtol=1e-5)
 
+        def apply_calibrated_thresholds(self, ckpt):
+            pass
+
         def predict_volume(self, path, output_dir=None, bbox_path=None):
             return {"label_map": np.zeros((1,), dtype=np.uint8)}
 

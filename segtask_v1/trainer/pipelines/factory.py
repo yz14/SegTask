@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from taskcore.config.core import Config
+from ...losses.balancer import build_balancer
 from ...losses.topo_aux import build_aux_topo_loss
 from taskcore.models.topology import ModelTopology, build_topology
 from .base import ViewPipeline
@@ -75,6 +76,12 @@ def build_pipeline(cfg: Config, base_loss) -> ViewPipeline:
             "Aux topo head: ENABLED (target=%s, loss=%s, iter=%d, weight=%.3f)",
             cfg.model.unet.aux_topo_target, pipeline.aux_topo_loss_fn.loss_name,
             cfg.loss.aux_topo_iter, pipeline.aux_topo_weight)
+
+    # 监督头损失均衡器（1-6）：需在 topo 注入后装配，头全集才完整。
+    pipeline.balancer = build_balancer(
+        cfg, pipeline.aux_weights,
+        pipeline.aux_topo_weight if pipeline.aux_topo_loss_fn is not None
+        else None)
     return pipeline
 
 
