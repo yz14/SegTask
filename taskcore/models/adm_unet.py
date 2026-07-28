@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .blocks import ConvNormAct, checkpoint_if
+from .init_contract import declare_no_reinit
 from .stem import build_context_stem, build_stem
 from .topology import build_topology
 from .unet import SegmentationHead, build_head
@@ -43,9 +44,10 @@ def _conv2d(*args, **kwargs) -> nn.Conv2d:
 
 
 def _zero_(module: nn.Module) -> nn.Module:
-    """ADM zero_module：将所有参数 in-place 零初始化。"""
+    """ADM zero_module：将所有参数 in-place 零初始化（并声明初始化契约）。"""
     for p in module.parameters():
         nn.init.zeros_(p)
+    declare_no_reinit(module)
     return module
 
 

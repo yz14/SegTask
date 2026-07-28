@@ -41,6 +41,8 @@ COMMON_FIELDS: Tuple[str, ...] = (
     "encoder_blocks_per_stage",
     "decoder_blocks_per_stage",
     "resenc_preset",
+    "resenc_vram_budget_gb",
+    "resenc_auto_batch_size",
     "dropout",
     "stem_mode",
     "stem_fusion_mode",

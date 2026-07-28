@@ -25,11 +25,25 @@ from dataclasses import asdict, dataclass
 import inspect
 from typing import Any, List, Optional, Tuple
 
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, default_collate
 
 from .dataset import SegDataset3D, SegDataset3DCubic, SegDataset3DWhole
 
 logger = logging.getLogger(__name__)
+
+
+# fused 模式下逐样本面内分辨率不同、无法 stack 的键。
+_FUSED_LIST_KEYS = ("image", "label", "weight_map")
+
+
+def fused_native_collate(batch: List[dict]) -> dict:
+    """2-1 单次重采样 collate：image/label/weight_map 保持 list[Tensor]
+    （逐样本 native 面内尺寸可不同），其余键 default_collate。"""
+    out: dict = {}
+    for k in batch[0]:
+        vals = [s[k] for s in batch]
+        out[k] = list(vals) if k in _FUSED_LIST_KEYS else default_collate(vals)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +166,10 @@ class DatasetSpec(ABC):
     def log_summary(self) -> None:
         """供 ``build_dataloaders`` 在构造 split 前打印模式概要（默认无操作）。"""
 
+    def train_collate_fn(self):
+        """train loader 专属 collate；None = default_collate（默认）。"""
+        return None
+
     def __repr__(self) -> str:  # pragma: no cover
         return f"<{type(self).__name__}>"
 
@@ -198,6 +216,15 @@ class ZCubeSpec(DatasetSpec):
 
     name = "z_axis|2_5d"
     dataset_cls = SegDataset3D
+    # 2-1 单次重采样开关（子项目如 gentask 的 cond 路径未接 fused warp，
+    # 通过覆盖此类属性禁用）。
+    allow_fused_resize: bool = True
+
+    def _fuse_active(self, is_train: bool) -> bool:
+        return (is_train
+                and type(self).allow_fused_resize
+                and bool(self.cfg.data.fuse_inplane_resize)
+                and bool(self.cfg.augment.enabled))
 
     def log_summary(self) -> None:
         dc        = self.cfg.data
@@ -215,6 +242,10 @@ class ZCubeSpec(DatasetSpec):
         self, paths: SplitPaths, is_train: bool, common: DatasetCommonCfg
         ) -> Dataset:
         dc = self.cfg.data
+        extra: dict = {}
+        if "fuse_inplane_resize" in inspect.signature(
+                type(self).dataset_cls.__init__).parameters:
+            extra["fuse_inplane_resize"] = self._fuse_active(is_train)
         return type(self).dataset_cls(
             **paths.to_kwargs(),
             **common.to_kwargs(),
@@ -226,7 +257,15 @@ class ZCubeSpec(DatasetSpec):
             z_boundary_mode             = dc.z_boundary_mode,
             z_sampling_mode             = dc.z_sampling_mode,
             **self._resize_kwargs(),
+            **extra,
             val_grid_coverage           = dc.val_grid_coverage)
+
+    def train_collate_fn(self):
+        """fused 模式下 native 面内分辨率逐卷不同，image/label/weight_map
+        以 list 交付（其余键 default_collate）。"""
+        if not self._fuse_active(is_train=True):
+            return None
+        return fused_native_collate
 
 
 class CubicSpec(DatasetSpec):
@@ -283,4 +322,5 @@ __all__ = [
     "WholeSpec",
     "ZCubeSpec",
     "CubicSpec",
+    "fused_native_collate",
     "build_data_spec"]

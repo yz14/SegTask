@@ -1464,6 +1464,16 @@ def build_dataloaders(
         loader_kwargs["persistent_workers"] = bool(dc.persistent_workers)
         loader_kwargs["prefetch_factor"] = int(dc.prefetch_factor)
 
+    # 2-1 fused 模式：train 批的 image/label/weight_map 以 list 交付（native
+    # 面内尺寸逐卷不同）；val 保持 default_collate（CPU resize 镜像）。
+    train_loader_kwargs: Dict[str, object] = dict(loader_kwargs)
+    train_collate = spec.train_collate_fn()
+    if train_collate is not None:
+        train_loader_kwargs["collate_fn"] = train_collate
+        logger.info(
+            "Fused in-plane resize active: train batches deliver "
+            "native-resolution lists (single grid_sample resample).")
+
     # 缓存估计与日志用的代表性 train dataset / 体积数。
     train_ds_for_estimate = primary_train_ds
     n_train_vols          = len(train_idx)
@@ -1498,7 +1508,7 @@ def build_dataloaders(
             batch_sampler = sampler,
             num_workers   = eff_num_workers,
             pin_memory    = dc.pin_memory,
-            **loader_kwargs)
+            **train_loader_kwargs)
         n_train_vols = len(train_idx) + len(secondary_paths)
         logger.info(
             "Mixed two-source training enabled: mix_ratio(gold:coarse)=%s -> "
@@ -1520,7 +1530,7 @@ def build_dataloaders(
             num_workers = eff_num_workers,
             pin_memory  = dc.pin_memory,
             drop_last   = True,
-            **loader_kwargs)
+            **train_loader_kwargs)
         logger.info(
             "DDP DistributedSampler: rank=%d/%d, ~%d samples/rank (train).",
             rank, world_size, len(train_sampler))
@@ -1532,7 +1542,7 @@ def build_dataloaders(
             num_workers = eff_num_workers,
             pin_memory  = dc.pin_memory,
             drop_last   = True,
-            **loader_kwargs)
+            **train_loader_kwargs)
 
     # DDP：val 在采样器层按 batch 块切给各 rank，worker 只生产本 rank 的 batch
     # （否则每 rank 完整生产全集、验证 CPU 开销随卡数线性翻倍）。单进程时保持

@@ -11,6 +11,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from .blocks import DropPath, GlobalResponseNorm, _CONV, make_attention
+from .init_contract import declare_no_reinit
 
 
 class LayerNorm3d(nn.Module):
@@ -67,6 +68,8 @@ class ConvNeXtBlock(nn.Module):
         if layer_scale_init_value > 0.0:
             self.gamma = nn.Parameter(
                 layer_scale_init_value * torch.ones(dim), requires_grad=True)
+            # LayerScale 小值初始化契约：全局 init_strategy 不得覆盖（3-2）。
+            declare_no_reinit(self.gamma)
         else:
             self.register_parameter("gamma", None)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

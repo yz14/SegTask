@@ -49,10 +49,15 @@ class CudaPrefetcher:
         return len(self.loader)  # type: ignore[arg-type]
 
     def _to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            k: (v.to(self.device, non_blocking=True)
-                if isinstance(v, torch.Tensor) else v)
-            for k, v in batch.items()}
+        def move(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                return v.to(self.device, non_blocking=True)
+            if isinstance(v, list) and v and all(
+                    isinstance(t, torch.Tensor) for t in v):
+                # fused 模式：native 面内 slab 以 list[Tensor] 交付。
+                return [t.to(self.device, non_blocking=True) for t in v]
+            return v
+        return {k: move(v) for k, v in batch.items()}
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         if not self._use_cuda:
@@ -78,6 +83,11 @@ class CudaPrefetcher:
             for v in batch.values():
                 if isinstance(v, torch.Tensor) and v.is_cuda:
                     v.record_stream(torch.cuda.current_stream(self.device))
+                elif isinstance(v, list):
+                    for t in v:
+                        if isinstance(t, torch.Tensor) and t.is_cuda:
+                            t.record_stream(
+                                torch.cuda.current_stream(self.device))
 
             # 在 copy stream 上发起下一个 batch 的拷贝（与主流计算重叠）。
             try:

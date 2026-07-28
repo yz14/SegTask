@@ -93,42 +93,44 @@ class TestProbToLabelEligibleMask:
 
 
 # ===========================================================================
-# 2. P2-05 — 越界 label→背景、weight_map→中性 1
+# 2. P2-05 / 2-2 — 越界区域：label 保 border（不伪造背景），weight_map→0
+#    （用户批准的最终语义：越界=「不知道这里是什么」，编码进权重而非假背景）
 # ===========================================================================
 class TestAffineOOBFill:
     @staticmethod
-    def _run(label_fill: float):
+    def _run():
         # 纯平移 0.5（归一化坐标）→ 体积约一半采样点越界，确定性触发。
         torch.manual_seed(0)
         B, D, H, W = 1, 8, 16, 16
+        cfg = Config().augment
+        cfg.enabled = True
+        cfg.random_affine_prob = 1.0
+        cfg.random_rotate_range = [0.0, 0.0]
+        cfg.random_scale_range = [1.0, 1.0]
+        cfg.random_translate_range = [0.5, 0.5]
+        cfg.elastic_deform_prob = 0.0
+        cfg.random_flip_prob = 0.0
+        cfg.grid_dropout_prob = 0.0
+        cfg.simulate_lowres_prob = 0.0
+        cfg.anisotropy_aware = False
+        aug = GPUAugmentor(cfg, seed=0)
         img = torch.randn(B, 1, D, H, W)
         lbl = torch.full((B, 1, D, H, W), 3.0)      # 全前景（label 值 3）
         wm = torch.full((B, 1, D, H, W), 2.0)       # 全 2 的权重图
-        img2, lbl2, wm2 = _random_affine_elastic(
-            img.clone(), lbl.clone(),
-            affine_prob=1.0, rotate_range=[0.0, 0.0],
-            scale_range=[1.0, 1.0],
-            elastic_prob=0.0, sigma=5.0, alpha=0.0,
-            weight_map=wm.clone(), wmap_mode="nearest",
-            translate_range=[0.5, 0.5],
-            label_fill=label_fill)
+        _, lbl2, wm2 = aug(img.clone(), lbl.clone(), wm.clone())
         return lbl2, wm2
 
-    def test_oob_label_filled_with_background(self):
-        lbl2, _ = self._run(label_fill=0.0)
-        # 越界区域必须为背景 0，而不是 border 复制的前景 3。
-        assert (lbl2 == 0.0).any(), "no OOB region filled — fix inactive"
-        assert set(lbl2.unique().tolist()) <= {0.0, 3.0}
+    def test_oob_label_keeps_border_not_fake_background(self):
+        lbl2, _ = self._run()
+        # 越界区域 label 由 border 复制保留前景 3，绝不伪造成背景 0
+        # （未知区域的排除交给 weight_map=0，而非污染监督标签）。
+        assert set(lbl2.unique().tolist()) <= {3.0}
 
-    def test_oob_label_fill_respects_custom_background(self):
-        lbl2, _ = self._run(label_fill=7.0)
-        assert (lbl2 == 7.0).any()
-        assert set(lbl2.unique().tolist()) <= {7.0, 3.0}
-
-    def test_oob_wmap_neutral_one(self):
-        _, wm2 = self._run(label_fill=0.0)
-        assert (wm2 == 1.0).any(), "no OOB wmap region neutralized"
-        assert set(wm2.unique().tolist()) <= {1.0, 2.0}
+    def test_oob_wmap_zeroed(self):
+        _, wm2 = self._run()
+        # 越界体素 weight→0 精确排除；界内保持原权重 2。
+        assert (wm2 == 0.0).any(), "no OOB wmap region excluded"
+        assert set(wm2.unique().tolist()) <= {0.0, 2.0}
 
     def test_in_bounds_transform_untouched(self):
         # 无平移/旋转/缩放（恒等变换）→ 无越界，label/wmap 逐位不变。

@@ -875,7 +875,8 @@ class SegDataset3D(SegDatasetNpzBase):
         z_boundary_mode            : str = "edge_pad",
         z_sampling_mode            : str = "safe",
         npz_paths                  : Optional[List[str]] = None,
-        val_grid_coverage          : bool = False):
+        val_grid_coverage          : bool = False,
+        fuse_inplane_resize        : bool = False):
 
         super().__init__(
             image_paths          = image_paths,
@@ -897,6 +898,14 @@ class SegDataset3D(SegDatasetNpzBase):
             region_weights       = region_weights,
             val_grid_coverage    = val_grid_coverage,
             resize_antialias     = resize_antialias)
+        # 2-1 单次重采样：True 时跳过 CPU 面内 resize，发 native 面内分辨率
+        # slab (C, eD_max, H_vol, W_vol)，由 GPUAugmentor.fused_call 把
+        # resize+flip+affine+elastic 合成一次 grid_sample（仅训练侧）。
+        self.fuse_inplane_resize = bool(fuse_inplane_resize)
+        if self.fuse_inplane_resize and not is_train:
+            raise ValueError(
+                "fuse_inplane_resize is train-only (val/predict keep the "
+                "deterministic CPU resize mirror).")
         self.z_sampling_mode = str(z_sampling_mode).lower()
         if self.z_sampling_mode not in ("safe", "legacy"):
             raise ValueError(
@@ -993,20 +1002,22 @@ class SegDataset3D(SegDatasetNpzBase):
         rw_s = (self._extract_z_single(rw_vol, z, eD_max, use_padded=True)
                 if rw_vol is not None else None)
 
-        # 面内 resize 到 (eH,eW)；D 轴保持 eD_max（不重采样）。
-        img_s = resize_3d(
-            img_s, eD_max, eH, eW, is_label=False,
-            anti_alias=self.resize_antialias)
-        lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True,
-                          anti_alias=False)
+        if not self.fuse_inplane_resize:
+            # 面内 resize 到 (eH,eW)；D 轴保持 eD_max（不重采样）。
+            img_s = resize_3d(
+                img_s, eD_max, eH, eW, is_label=False,
+                anti_alias=self.resize_antialias)
+            lbl_s = resize_3d(lbl_s, eD_max, eH, eW, is_label=True,
+                              anti_alias=False)
         result = {
             # 领头 "1" = 压叠 C_res 轴，与旧输出布局一致。
             "image": torch.from_numpy(img_s[None].astype(np.float32, copy=False)),
             "label": torch.from_numpy(np.ascontiguousarray(lbl_s[None]))}
         if rw_s is not None:
-            # rw 是分级序权重（离散值），必须 nearest 避免产生伪连续值；resize_3d(is_label=True) = order=0。
-            rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True,
-                             anti_alias=False)
+            if not self.fuse_inplane_resize:
+                # rw 是分级序权重（离散值），必须 nearest 避免产生伪连续值；resize_3d(is_label=True) = order=0。
+                rw_s = resize_3d(rw_s, eD_max, eH, eW, is_label=True,
+                                 anti_alias=False)
             result["weight_map"] = torch.from_numpy(
                 rw_s[None].astype(np.float32, copy=False))
         elif self.region_weights:

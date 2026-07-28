@@ -113,6 +113,11 @@ class Trainer(BaseTrainer):
         # target_patch_size / needs_crop（增强后中心裁回）
         self.target_patch_size = self.pipeline.target_patch_size  # 模型输入尺寸
         self.needs_crop         = cfg.data.aug_oversample_ratio > 1.0
+        # 2-1 单次重采样：train loader 以 list 交付 native 面内 slab 时，
+        # augmentor.fused_call 在 warp 内完成面内 resize 到 patch H/W。
+        self._fused_out_hw = (int(cfg.data.patch_size[1]),
+                              int(cfg.data.patch_size[2]))
+        self._fused_resize_antialias = bool(cfg.data.resize_antialias)
 
         # --- Optimizer + scheduler / AMP / EMA（共用工程件，见 BaseTrainer）---
         self._setup_optim_sched()
@@ -145,9 +150,15 @@ class Trainer(BaseTrainer):
         # _train_epoch），增强后不再以原值复用，满足 inplace 契约，省一份
         # 过采样 cube 的瞬时显存。
         _aug_seed = (int(cfg.train.seed) + 7919 * (self._rank + 1)) & 0x7FFFFFFF
+        # 各向异性感知派生（2-4）：spacing 归一化时体素间距已知（(D,H,W) mm），
+        # 供出面角上界 / 弹性逐轴缩放 / lowres 粗轴跳过的派生；未归一化时按
+        # 各向同性处理（薄 slab 仍由 patch 几何触发出面角收敛）。
+        _spacing = (tuple(cfg.data.target_spacing)
+                    if (cfg.data.spacing_normalization
+                        and cfg.data.target_spacing) else None)
         self.augmentor = GPUAugmentor(
             cfg.augment, max_scale=max(_scales), label_fill=_bg,
-            seed=_aug_seed, inplace=True)
+            seed=_aug_seed, inplace=True, spacing_zyx=_spacing)
 
         # --- Tracking --------------------------------------------------
         self.num_fg = cfg.num_fg_classes
@@ -482,16 +493,30 @@ class Trainer(BaseTrainer):
             batch_iter = CudaPrefetcher(self.train_loader, self.device)
 
         for step, batch in enumerate(batch_iter):
-            image = batch["image"].to(self.device, non_blocking=True)
-            label = batch["label"].to(self.device, non_blocking=True).float()
-            wmap = batch.get("weight_map")
-            if wmap is not None:
-                wmap = wmap.to(self.device, non_blocking=True)
-                if wmap.numel() == 0 or wmap.shape[1] == 0:
-                    wmap = None
+            if isinstance(batch["image"], list):
+                # 2-1 fused 路径：native 面内 slab list → 单次 grid_sample
+                # 同时完成面内 resize + 全部空间增强（含 oob→wmap=0）。
+                imgs = [t.to(self.device, non_blocking=True).float()
+                        for t in batch["image"]]
+                lbls = [t.to(self.device, non_blocking=True).float()
+                        for t in batch["label"]]
+                wms = [t.to(self.device, non_blocking=True).float()
+                       for t in batch["weight_map"]]
+                image, label, wmap = self.augmentor.fused_call(
+                    imgs, lbls, wms, self._fused_out_hw,
+                    resize_antialias=self._fused_resize_antialias)
+            else:
+                image = batch["image"].to(self.device, non_blocking=True)
+                label = batch["label"].to(
+                    self.device, non_blocking=True).float()
+                wmap = batch.get("weight_map")
+                if wmap is not None:
+                    wmap = wmap.to(self.device, non_blocking=True)
+                    if wmap.numel() == 0 or wmap.shape[1] == 0:
+                        wmap = None
 
-            # 增强 + oversample 中心裁
-            image, label, wmap = self.augmentor(image, label, wmap)
+                # 增强 + oversample 中心裁
+                image, label, wmap = self.augmentor(image, label, wmap)
             if self.needs_crop:
                 image, label, wmap = views.center_crop(
                     image, label, wmap, self.target_patch_size)

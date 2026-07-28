@@ -67,6 +67,8 @@ class WholeSpec(_CoreWholeSpec):
 
 class ZCubeSpec(_CoreZCubeSpec):
     dataset_cls = Volume3D
+    # gentask 的 cond 路径未接 fused warp，禁用 2-1 单次重采样。
+    allow_fused_resize = False
 
 
 class CubicSpec(_CoreCubicSpec):

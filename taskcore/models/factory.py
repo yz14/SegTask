@@ -15,7 +15,8 @@ from ..config.geometry import (
     decoder_stage_count,
     stem_stride_of,
 )
-from .blocks import DySample3d, SelfAttentionBlock, Upsample
+from .blocks import SelfAttentionBlock
+from .init_contract import protected_param_ids
 from .convnext import ConvNeXtDownsample, ConvNeXtStage
 from .mednext import MedNeXtStage
 from .resnet import MultiRFStage, ResNetStage
@@ -28,16 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 def _custom_init_param_ids(model: nn.Module) -> set:
-    """收集带自定义初始化契约的参数 id：SelfAttentionBlock（zero-init 残差出口）、
-    DySample3d（offset/scope 近零）、pixelshuffle Upsample 的 ICNR expand 卷积。
-    非 legacy 策略不得覆盖这些初始化，否则破坏其设计意图。"""
-    ids: set = set()
-    for module in model.modules():
-        if isinstance(module, (SelfAttentionBlock, DySample3d)):
-            ids.update(id(p) for p in module.parameters())
-        elif isinstance(module, Upsample) and module.mode == "pixelshuffle":
-            ids.update(id(p) for p in module.expand.parameters())
-    return ids
+    """收集带自定义初始化契约的参数 id（3-2 模块级声明机制）。
+
+    单一真相源在模块自身：带契约的模块（SelfAttentionBlock zero-init
+    残差出口、DySample3d 近零 offset/scope、ICNR expand、LayerScale、GRN、
+    ADM zero_module 等）在构造期通过 ``declare_no_reinit`` 自声明；本函数
+    仅读注册表，新增自初始化模块无需改工厂。"""
+    return protected_param_ids(model)
 
 
 def _apply_init_strategy(model: nn.Module, strategy: str) -> nn.Module:

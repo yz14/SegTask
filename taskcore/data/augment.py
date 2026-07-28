@@ -32,6 +32,78 @@ def _bernoulli_mask(
 
 
 @dataclass
+class AnisoDerivedParams:
+    """各向异性感知派生参数（2-4，纯几何/spacing 派生）。
+
+    * ``rotate_range_per_axis``：出面旋转角按 asin(P_D/max(P_H,P_W)) 收敛后的
+      逐轴角范围（(x,y,z)=(W,H,D) 三对 [lo,hi]，度）；None=无需收敛。
+    * ``elastic_axis_scale``：弹性位移逐轴缩放（grid 轴序 (W,H,D)，使位移在
+      物理空间各向同性）；None=不缩放。
+    * ``lowres_ignore_axes``：simulate_lowres 跳过的空间轴（0=D,1=H,2=W；
+      本就低分辨的粗轴不再二次降采样）；空元组=三轴都降。
+    """
+
+    rotate_range_per_axis: Optional[List[List[float]]] = None
+    elastic_axis_scale: Optional[Tuple[float, float, float]] = None
+    lowres_ignore_axes: Tuple[int, ...] = ()
+
+
+def derive_aniso_params(
+    shape_dhw: Tuple[int, int, int],
+    spacing_zyx: Optional[Tuple[float, float, float]],
+    *,
+    enabled: bool,
+    threshold: float,
+    rotate_range: Sequence[float],
+) -> AnisoDerivedParams:
+    """从 patch 几何 + spacing 派生各向异性感知增强参数。
+
+    spacing 未知时按各向同性 (1,1,1) 处理——薄 slab（如 2.5D 的 D≪H,W）
+    仍由 patch 物理尺寸比触发出面角收敛。各向同性立方 patch 下三项均为
+    no-op（cap≥90°、scale=1、无 ignore 轴），与历史行为逐位一致。
+    """
+    if not enabled:
+        return AnisoDerivedParams()
+    D, H, W = (int(shape_dhw[0]), int(shape_dhw[1]), int(shape_dhw[2]))
+    sd, sh, sw = (1.0, 1.0, 1.0) if spacing_zyx is None else spacing_zyx
+    pd, ph, pw = D * sd, H * sh, W * sw
+
+    # ① 出面旋转角上界：面内偏移 u 在出面角 θ 下的 z 向位移 u·sinθ 不应
+    # 超出 slab 物理深度，否则监督被大面积推出边界（S6-A）。
+    cap_deg = math.degrees(
+        math.asin(min(1.0, pd / max(ph, pw, 1e-9))))
+    lo, hi = float(rotate_range[0]), float(rotate_range[1])
+    rot_per_axis: Optional[List[List[float]]] = None
+    if cap_deg < max(abs(lo), abs(hi)) - 1e-9:
+        oop = [max(lo, -cap_deg), min(hi, cap_deg)]
+        # (x,y) = 绕 W/H 轴（出面）收敛；z = 绕 D 轴（面内）保留原范围。
+        rot_per_axis = [list(oop), list(oop), [lo, hi]]
+
+    # ② 弹性位移逐轴缩放：粗轴（spacing 大）上同样的体素位移对应更大的物理
+    # 位移，按 min_spacing/spacing 缩回物理各向同性（grid 轴序 (W,H,D)）。
+    elastic_scale: Optional[Tuple[float, float, float]] = None
+    if spacing_zyx is not None:
+        smin = min(sd, sh, sw)
+        scale_whd = (smin / sw, smin / sh, smin / sd)
+        if any(abs(s - 1.0) > 1e-6 for s in scale_whd):
+            elastic_scale = scale_whd
+
+    # ③ simulate_lowres 跳过粗轴：spacing 比超阈值（nnU-Net ignore_axes 口径）
+    # 或 patch 物理尺寸显著偏薄（薄 slab 再降 z 分辨率=模拟层厚翻倍）。
+    spac = (sd, sh, sw)
+    phys = (pd, ph, pw)
+    smin = min(spac)
+    pmax = max(phys)
+    ignore = tuple(
+        ax for ax in range(3)
+        if spac[ax] / smin >= threshold or phys[ax] * 4.0 <= pmax)
+    return AnisoDerivedParams(
+        rotate_range_per_axis=rot_per_axis,
+        elastic_axis_scale=elastic_scale,
+        lowres_ignore_axes=ignore)
+
+
+@dataclass
 class Companion:
     """随 image 同空间变换的伴随张量。
 
@@ -54,11 +126,20 @@ class GPUAugmentor:
     def __init__(self, cfg: AugConfig, max_scale: float = 1.0,
                  label_fill: float = 0.0,
                  seed: Optional[int] = None,
-                 inplace: Optional[bool] = None):
+                 inplace: Optional[bool] = None,
+                 spacing_zyx: Optional[Sequence[float]] = None):
         self.cfg       = cfg
         self.enabled   = cfg.enabled
         self.max_scale = max(float(max_scale), 1.0)
         self.label_fill = float(label_fill)
+        # 各向异性感知（2-4）：(sd,sh,sw) 物理间距；None=按各向同性处理（仍
+        # 保留薄 slab 的 patch 几何派生）。
+        self.spacing_zyx: Optional[Tuple[float, float, float]] = (
+            None if spacing_zyx is None
+            else (float(spacing_zyx[0]), float(spacing_zyx[1]),
+                  float(spacing_zyx[2])))
+        self._aniso_cache: Dict[Tuple[int, int, int],
+                                "AnisoDerivedParams"] = {}
         # inplace 覆写：调用方在自身拥有输入张量所有权时（如训练循环的 H2D
         # 私有拷贝）可显式传 True 跳过入口 clone；None 时沿用 cfg.inplace。
         self.inplace = bool(cfg.inplace if inplace is None else inplace)
@@ -80,6 +161,20 @@ class GPUAugmentor:
                 f"AugConfig.wmap_interp_mode={wmode!r}; expected "
                 "'nearest' or 'bilinear'.")
         self.wmap_interp_mode = wmode
+
+    def _derive_aniso(
+        self, shape_dhw: Sequence[int]) -> "AnisoDerivedParams":
+        """按输入 (D,H,W) + spacing 派生各向异性感知参数（结果按形状缓存）。"""
+        key = (int(shape_dhw[0]), int(shape_dhw[1]), int(shape_dhw[2]))
+        params = self._aniso_cache.get(key)
+        if params is None:
+            params = derive_aniso_params(
+                key, self.spacing_zyx,
+                enabled=self.cfg.anisotropy_aware,
+                threshold=self.cfg.anisotropy_threshold,
+                rotate_range=self.cfg.random_rotate_range)
+            self._aniso_cache[key] = params
+        return params
 
     def _device_generator(
         self, device: torch.device) -> Optional[torch.Generator]:
@@ -150,6 +245,11 @@ class GPUAugmentor:
             clamp_lo = image.amin(dim=reduce_dims, keepdim=True)
             clamp_hi = image.amax(dim=reduce_dims, keepdim=True)
 
+        aniso = self._derive_aniso(image.shape[-3:])
+        rot_per_axis = c.random_rotate_range_per_axis
+        if rot_per_axis is None and aniso.rotate_range_per_axis is not None:
+            rot_per_axis = aniso.rotate_range_per_axis
+
         image, comps = _random_flip_companions(
             image, c.random_flip_prob, c.random_flip_axes,
             companions=comps, gen_cpu=gen_cpu)
@@ -164,10 +264,11 @@ class GPUAugmentor:
             alpha=effective_alpha,
             companions=comps,
             translate_range=c.random_translate_range,
-            rotate_range_per_axis=c.random_rotate_range_per_axis,
+            rotate_range_per_axis=rot_per_axis,
             aspect_correct=c.random_affine_aspect_correct,
             elastic_field_mode=c.elastic_field_mode,
             elastic_normalize_displacement=c.elastic_normalize_displacement,
+            elastic_axis_scale=aniso.elastic_axis_scale,
             gen_cpu=gen_cpu, gen_dev=gen_dev)
 
         # Intensity (image only)。全部强度增强后夹回增强前范围。
@@ -187,7 +288,7 @@ class GPUAugmentor:
             gen_cpu=gen_cpu)
         image = _simulate_lowres(
             image, c.simulate_lowres_prob, c.simulate_lowres_zoom,
-            gen_cpu=gen_cpu)
+            gen_cpu=gen_cpu, ignore_axes=aniso.lowres_ignore_axes)
         if c.intensity_clamp:
             image = torch.maximum(torch.minimum(image, clamp_hi), clamp_lo)
 
@@ -221,6 +322,132 @@ class GPUAugmentor:
         label_out = comps[0].tensor
         wmap_out = comps[1].tensor if len(comps) > 1 else None
         return image, label_out, wmap_out
+
+    # ------------------------------------------------------------------
+    # 2-1 单次重采样（fused resize ⊕ flip ⊕ affine ⊕ elastic）
+    # ------------------------------------------------------------------
+    def fused_call(
+        self,
+        images: Sequence[torch.Tensor],
+        labels: Sequence[torch.Tensor],
+        weight_maps: Sequence[torch.Tensor],
+        out_hw: Tuple[int, int],
+        resize_antialias: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """native 面内分辨率样本列表 → 单次 grid_sample 完成面内 resize 与
+        全部空间增强（nnU-Net/batchgeneratorsv2 SpatialTransform 口径）。
+
+        输入：逐样本 (C, eD, H_i, W_i) 张量（H_i/W_i 可不同，z 已在 dataset
+        侧 edge-pad 到统一 eD）；输出：(B, C, eD, out_h, out_w) 批张量。
+
+        与分批路径的差异（新口径，非镜像契约）：
+        * 采样网格用 ``align_corners=True``（对齐 scipy zoom 的角点映射，
+          identity 变换 ≈ CPU resize，train/val resize 算子近似等价）；
+        * flip 折入网格（坐标取反），不再单独 ``torch.flip``；
+        * 每样本仅 1 次插值（原路径 CPU zoom + GPU warp 共 2 次）。
+        越界语义与 ``__call__`` 一致：label 保 border、wmap 置 0。
+        """
+        B = len(images)
+        if B == 0 or len(labels) != B or len(weight_maps) != B:
+            raise ValueError(
+                f"fused_call requires equal-length non-empty lists; got "
+                f"images={len(images)}, labels={len(labels)}, "
+                f"weight_maps={len(weight_maps)}.")
+        device = images[0].device
+        eD = int(images[0].shape[-3])
+        Ho, Wo = int(out_hw[0]), int(out_hw[1])
+        c = self.cfg
+        gen_cpu = self._gen_cpu
+        gen_dev = self._device_generator(device)
+
+        # 增强前逐样本逐通道 min/max（intensity_clamp 基准，native 分辨率上取）。
+        clamp_lo = clamp_hi = None
+        if c.intensity_clamp:
+            clamp_lo = torch.stack([
+                t.amin(dim=(-3, -2, -1), keepdim=True) for t in images])
+            clamp_hi = torch.stack([
+                t.amax(dim=(-3, -2, -1), keepdim=True) for t in images])
+
+        aniso = self._derive_aniso((eD, Ho, Wo))
+        rot_per_axis = c.random_rotate_range_per_axis
+        if rot_per_axis is None and aniso.rotate_range_per_axis is not None:
+            rot_per_axis = aniso.rotate_range_per_axis
+
+        theta = _fused_sample_thetas(
+            B, (eD, Ho, Wo), c, rot_per_axis, self.enabled, gen_cpu, device)
+
+        grid = F.affine_grid(theta, [B, 1, eD, Ho, Wo], align_corners=True)
+        if self.enabled and c.elastic_deform_prob > 0:
+            mask_e = _bernoulli_mask(B, c.elastic_deform_prob, gen_cpu)
+            ne = int(mask_e.sum())
+            if ne:
+                sel_e = mask_e.to(device, non_blocking=True)
+                disp = _elastic_grid_disp(
+                    ne, eD, Ho, Wo, c.elastic_deform_sigma,
+                    c.elastic_deform_alpha / self.max_scale, device, gen_dev,
+                    field_mode=c.elastic_field_mode,
+                    normalize_displacement=c.elastic_normalize_displacement,
+                    axis_scale=aniso.elastic_axis_scale)
+                m = theta[sel_e][:, :, :3]
+                grid[sel_e] = grid[sel_e] + torch.einsum(
+                    'n r c, n d h w c -> n d h w r', m, disp)
+
+        oob = (grid.abs() > 1.0).any(dim=-1)  # (B, eD, Ho, Wo)
+
+        img_out, lbl_out, wm_out = [], [], []
+        for i in range(B):
+            g = grid[i:i + 1]
+            src = images[i].unsqueeze(0).float()
+            if resize_antialias:
+                src = _gaussian_prefilter_inplane(
+                    src, Ho / src.shape[-2], Wo / src.shape[-1])
+            img_out.append(F.grid_sample(
+                src, g, mode="bilinear", padding_mode="border",
+                align_corners=True))
+            lbl_out.append(F.grid_sample(
+                labels[i].unsqueeze(0).float(), g, mode="nearest",
+                padding_mode="border", align_corners=True))
+            wm = F.grid_sample(
+                weight_maps[i].unsqueeze(0).float(), g,
+                mode=self.wmap_interp_mode, padding_mode="border",
+                align_corners=True)
+            wm[oob[i:i + 1].unsqueeze(1).expand_as(wm)] = 0.0
+            wm_out.append(wm)
+        image = torch.cat(img_out, dim=0)
+        label = torch.cat(lbl_out, dim=0)
+        wmap = torch.cat(wm_out, dim=0)
+
+        if not self.enabled:
+            return image, label, wmap
+
+        # 强度增强（与 apply() 同序；空间部分已由上方单次 warp 消化）。
+        image = _random_brightness(
+            image, c.random_brightness_prob, c.random_brightness_range,
+            gen_cpu=gen_cpu)
+        image = _random_contrast(
+            image, c.random_contrast_prob, c.random_contrast_range,
+            gen_cpu=gen_cpu)
+        image = _random_gamma(
+            image, c.random_gamma_prob, c.random_gamma_range, gen_cpu=gen_cpu)
+        image = _gaussian_noise(
+            image, c.gaussian_noise_prob, c.gaussian_noise_std,
+            gen_cpu=gen_cpu, gen_dev=gen_dev)
+        image = _gaussian_blur_3d(
+            image, c.gaussian_blur_prob, c.gaussian_blur_sigma,
+            gen_cpu=gen_cpu)
+        image = _simulate_lowres(
+            image, c.simulate_lowres_prob, c.simulate_lowres_zoom,
+            gen_cpu=gen_cpu, ignore_axes=aniso.lowres_ignore_axes)
+        if c.intensity_clamp:
+            image = torch.maximum(torch.minimum(image, clamp_hi), clamp_lo)
+
+        comps = [Companion(label, "nearest", None),
+                 Companion(wmap, self.wmap_interp_mode, None)]
+        image, comps = _grid_dropout_companions(
+            image, c.grid_dropout_prob, c.grid_dropout_ratio,
+            c.grid_dropout_holes, companions=comps,
+            gen_cpu=gen_cpu, gen_dev=gen_dev)
+        return image, comps[0].tensor, comps[1].tensor
 
 
 # 空间增强（逐样本独立）。
@@ -317,7 +544,8 @@ def _elastic_grid_disp(
     sigma: float, alpha: float, device: torch.device,
     gen_dev: Optional[torch.Generator] = None,
     field_mode: str = "legacy",
-    normalize_displacement: bool = False) -> torch.Tensor:
+    normalize_displacement: bool = False,
+    axis_scale: Optional[Tuple[float, float, float]] = None) -> torch.Tensor:
     """采样 n 个弹性位移场，返 (n,D,H,W,3) 归一化 grid 坐标位移（轴序 W,H,D）。"""
     cD = max(int(round(D / sigma)), 4)
     cH = max(int(round(H / sigma)), 4)
@@ -349,6 +577,11 @@ def _elastic_grid_disp(
                      dtype=disp.dtype, device=device),
         'c -> 1 c 1 1 1')
     disp = disp * alpha * voxel_to_grid
+    if axis_scale is not None:
+        # 各向异性感知：逐轴（W,H,D）缩放位移，使物理位移各向同性。
+        disp = disp * rearrange(
+            torch.tensor(axis_scale, dtype=disp.dtype, device=device),
+            'c -> 1 c 1 1 1')
     return rearrange(disp, 'b c d h w -> b d h w c')
 
 
@@ -364,6 +597,7 @@ def _random_affine_elastic_companions(
     gen_dev: Optional[torch.Generator] = None,
     elastic_field_mode: str = "legacy",
     elastic_normalize_displacement: bool = False,
+    elastic_axis_scale: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[torch.Tensor, List[Companion]]:
     """仿射与弹性形变融合为单次 grid_sample；companions 共享同一 warp。
 
@@ -429,7 +663,8 @@ def _random_affine_elastic_companions(
         disp = _elastic_grid_disp(
             ne, D, H, W, sigma, alpha, device, gen_dev,
             field_mode=elastic_field_mode,
-            normalize_displacement=elastic_normalize_displacement)
+            normalize_displacement=elastic_normalize_displacement,
+            axis_scale=elastic_axis_scale)
         m = theta[sel_e_dev][:, :, :3]
         grid[sel_e_dev] = grid[sel_e_dev] + torch.einsum(
             'n r c, n d h w c -> n d h w r', m, disp)
@@ -485,6 +720,94 @@ def _random_affine_elastic(
         gen_cpu=gen_cpu, gen_dev=gen_dev)
     wmap = comps[1].tensor if len(comps) > 1 else None
     return image, comps[0].tensor, wmap
+
+
+def _fused_sample_thetas(
+    B: int,
+    out_dhw: Tuple[int, int, int],
+    cfg: AugConfig,
+    rotate_range_per_axis: Optional[list],
+    enabled: bool,
+    gen_cpu: Optional[torch.Generator],
+    device: torch.device,
+) -> torch.Tensor:
+    """采样 fused 路径的逐样本 theta (B,3,4)：affine（旋转/缩放/平移）+ flip
+    折叠（对应输出坐标行取反）。未选中样本为单位阵（网格 = 纯 resize）。"""
+    D, H, W = out_dhw
+    theta = torch.eye(3, 4, device=device).unsqueeze(0).repeat(B, 1, 1)
+    if not enabled:
+        return theta
+
+    mask_a = _bernoulli_mask(B, cfg.random_affine_prob, gen_cpu)
+    na = int(mask_a.sum())
+    if na:
+        if rotate_range_per_axis is not None:
+            angles = torch.empty(na, 3)
+            for ax in range(3):
+                lo = math.radians(rotate_range_per_axis[ax][0])
+                hi = math.radians(rotate_range_per_axis[ax][1])
+                angles[:, ax].uniform_(lo, hi, generator=gen_cpu)
+        else:
+            lo = math.radians(cfg.random_rotate_range[0])
+            hi = math.radians(cfg.random_rotate_range[1])
+            angles = torch.empty(na, 3).uniform_(lo, hi, generator=gen_cpu)
+        angles = angles.to(device, non_blocking=True)
+        scales = torch.empty(na, 1).uniform_(
+            cfg.random_scale_range[0], cfg.random_scale_range[1],
+            generator=gen_cpu).to(device, non_blocking=True)
+        translations = None
+        tr = cfg.random_translate_range
+        if tr is not None and (tr[0] != 0.0 or tr[1] != 0.0):
+            translations = torch.empty(na, 3).uniform_(
+                tr[0], tr[1], generator=gen_cpu).to(
+                    device, non_blocking=True)
+        aspect = None
+        if cfg.random_affine_aspect_correct:
+            aspect = torch.tensor(
+                [float(W), float(H), float(D)],
+                device=device, dtype=torch.float32)
+        theta[mask_a.to(device, non_blocking=True)] = (
+            _build_rotation_matrices(angles, scales, translations, aspect))
+
+    # flip 折叠：翻转张量轴 a ⇔ 该轴归一化坐标取反（align_corners=True 下
+    # 逐位等价于 torch.flip）。轴 2/3/4 (D,H,W) → grid 坐标行 2/1/0 (z,y,x)。
+    if cfg.random_flip_prob > 0 and cfg.random_flip_axes:
+        axis_to_row = {2: 2, 3: 1, 4: 0}
+        for axis in cfg.random_flip_axes:
+            mask_f = _bernoulli_mask(B, cfg.random_flip_prob, gen_cpu)
+            if mask_f.any():
+                sel = mask_f.to(device, non_blocking=True)
+                theta[sel, axis_to_row[int(axis)], :] *= -1.0
+    return theta
+
+
+def _gaussian_prefilter_inplane(
+    image: torch.Tensor, fh: float, fw: float) -> torch.Tensor:
+    """面内下采样抗混叠预滤波（镜像 ``resize_3d`` 的 sigma 口径：
+    sigma = max((1/f - 1) * 0.5, 0)，replicate 边界）。fh/fw >= 1 时为 no-op。"""
+    sig_h = max((1.0 / fh - 1.0) * 0.5, 0.0) if fh < 1.0 else 0.0
+    sig_w = max((1.0 / fw - 1.0) * 0.5, 0.0) if fw < 1.0 else 0.0
+    if sig_h <= 0 and sig_w <= 0:
+        return image
+    B, C = image.shape[:2]
+    out = rearrange(image, 'b c d h w -> (b c) 1 d h w')
+    for sig, axis_pat, pad_arg in (
+        (sig_h, 'k -> 1 1 1 k 1', (0, 0, None, None, 0, 0)),
+        (sig_w, 'k -> 1 1 1 1 k', (None, None, 0, 0, 0, 0)),
+    ):
+        if sig <= 0:
+            continue
+        radius = int(4.0 * sig + 0.5)
+        if radius < 1:
+            continue
+        x = torch.arange(-radius, radius + 1,
+                         dtype=image.dtype, device=image.device)
+        k1d = torch.exp(-0.5 * (x / sig) ** 2)
+        k1d = k1d / k1d.sum()
+        pad = [radius if p is None else p for p in pad_arg]
+        out = F.pad(out, pad, mode="replicate")
+        out = F.conv3d(out, rearrange(k1d, axis_pat))
+    return rearrange(out, '(b c) 1 d h w -> b c d h w', b=B, c=C)
 
 
 def _grid_dropout_companions(
@@ -686,11 +1009,13 @@ def _gaussian_blur_3d(
 
 def _simulate_lowres(
     image: torch.Tensor, prob: float, zoom_range: list,
-    gen_cpu: Optional[torch.Generator] = None) -> torch.Tensor:
+    gen_cpu: Optional[torch.Generator] = None,
+    ignore_axes: Tuple[int, ...] = ()) -> torch.Tensor:
     """trilinear 下采→上采模拟低分辨率；逐样本独立采样 zoom。
 
     zoom 一次性批量采样（单次同步）；目标尺寸相同的样本分组后批量
-    interpolate（不同尺寸无法单次处理，只能逐组）。"""
+    interpolate（不同尺寸无法单次处理，只能逐组）。
+    ``ignore_axes``：不降采样的空间轴（0=D,1=H,2=W；各向异性粗轴）。"""
     if prob <= 0:
         return image
     B = image.shape[0]
@@ -705,7 +1030,12 @@ def _simulate_lowres(
     for i, z in zip(idxs, zooms):
         if z >= 0.99:
             continue
-        size = (max(1, int(D * z)), max(1, int(H * z)), max(1, int(W * z)))
+        full = (D, H, W)
+        size = tuple(
+            full[ax] if ax in ignore_axes else max(1, int(full[ax] * z))
+            for ax in range(3))
+        if size == full:
+            continue
         groups.setdefault(size, []).append(i)
     for size, members in groups.items():
         small = F.interpolate(

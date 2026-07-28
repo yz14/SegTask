@@ -16,6 +16,8 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from einops import rearrange
 
+from .init_contract import declare_no_reinit
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +134,8 @@ class GlobalResponseNorm(nn.Module):
         self.eps = eps
         self.gamma = nn.Parameter(torch.zeros(channels))
         self.beta = nn.Parameter(torch.zeros(channels))
+        # GRN 零初始化契约：全局 init_strategy 不得覆盖（3-2）。
+        declare_no_reinit(self.gamma, self.beta)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 平方和统计 fp32 累加（AMP 下 fp16 大空间求和易溢出/失准），归一
@@ -1062,6 +1066,8 @@ class SelfAttentionBlock(nn.Module):
             self.ffn_norm = None
             self.ffn_in = None
             self.ffn_out = None
+        # zero-init 残差出口契约：全局 init_strategy 不得覆盖（3-2）。
+        declare_no_reinit(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         spatial = x.shape[2:]
@@ -1412,6 +1418,8 @@ class DySample3d(nn.Module):
         self.shuffle = PixelShuffle3d(r=scale)
         self.proj = (nn.Conv3d(in_ch, out_ch, 1, bias=False)
                      if in_ch != out_ch else nn.Identity())
+        # offset/scope 近零初始化契约：全局 init_strategy 不得覆盖（3-2）。
+        declare_no_reinit(self)
 
     @staticmethod
     def _normalised_grid(D: int, H: int, W: int,
@@ -1537,6 +1545,8 @@ class Upsample(nn.Module):
                                    kernel_size=1, bias=False)
             self.shuffle = PixelShuffle3d(r=2, spatial_dims=d)
             icnr_init_(self.expand.weight, upscale=2, spatial_dims=d)
+            # ICNR 初始化契约：全局 init_strategy 不得覆盖（3-2）。
+            declare_no_reinit(self.expand)
         elif mode == "carafe":
             if not isotropic2:
                 raise ValueError(

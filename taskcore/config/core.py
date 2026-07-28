@@ -14,6 +14,9 @@ from .model_migration import install_flat_model_compat, route_legacy_model_dict
 
 logger = logging.getLogger(__name__)
 
+# 2-6 ResEnc 各档默认显存预算（GB，nnU-Net Revisited 口径；s 为本仓补充档）。
+_RESENC_BUDGET_GB = {"s": 6.0, "m": 9.0, "l": 24.0, "xl": 40.0}
+
 
 class ConfigError(AssertionError, ValueError):
     """配置校验错误。
@@ -163,6 +166,14 @@ class DataConfig:
     # None=make_data 扫描全数据集头信息取逐轴中位数（nnU-Net 式指纹）后自动落定。
     target_spacing: Optional[List[float]] = None
 
+    # 2-1 单次重采样（仅 patch_mode∈{z_axis,2_5d} 训练侧）：dataset 发 native
+    # 面内分辨率 slab，GPUAugmentor 把面内 resize + flip + affine + elastic
+    # 合成一次 grid_sample（nnU-Net SpatialTransform 口径），每样本 1 次插值
+    # （旧路径 CPU zoom + GPU warp 共 2 次）。验证/推理保持 CPU resize 镜像
+    # （identity 网格 align_corners=True 与 scipy zoom 角点映射对齐）。
+    # 代价：native 面内 slab 的 H2D 流量增大（如 512²→256² 为 4×）。
+    fuse_inplane_resize: bool = True
+
     # 打包口径标识（1-3，只读运行期字段）：loader 从 npz_dir/_manifest.json
     # 回读（make_data≥1.9 写入 dsid-<hash>），随 checkpoint 内的 config 落盘，
     # 供事后追溯训练消费的是哪个预处理口径的产物。请勿手配。
@@ -271,6 +282,15 @@ class AugConfig:
     # 各向异性长宽比校正：在物理各向同性坐标里做旋转（R←A⁻¹RA，A=diag(W,H,D)），
     # 消除各向异性 patch 上旋转混入的剪切/非均匀缩放。
     random_affine_aspect_correct: bool = True
+    # ---- 各向异性感知参数派生（2-4，nnU-Net 口径）----
+    # 由 patch 几何 + spacing（data.target_spacing，仅 spacing_normalization
+    # 时可用）自动派生：① 出面旋转角上界 asin(P_D/max(P_H,P_W))（仅在未显式
+    # 配 random_rotate_range_per_axis 时生效）；② 弹性位移逐轴按 spacing 缩回
+    # 物理各向同性；③ simulate_lowres 跳过本就低分辨的粗轴。各向同性立方
+    # patch 下三项均为 no-op（与历史行为逐位一致）。
+    anisotropy_aware: bool = True
+    # 粗轴判定阈值：spacing_axis / min_spacing >= threshold 的轴视为粗轴。
+    anisotropy_threshold: float = 3.0
     # 随机平移范围（affine_grid 归一化坐标，[-1,1] 跨整轴）；[0,0]=禁用。
     # 平移/旋转以 padding_mode='border' 复制边缘填充；边缘伪影可由
     # data.aug_oversample_ratio 的中心裁剪余量裁掉（幅度超出余量时启动期警告）。
@@ -609,7 +629,16 @@ class ModelConfig:
     decoder_blocks_per_stage: List[int] = field(default_factory=list)
 
     # nnU-Net ResEnc 预设："none" | "S" | "M" | "L" | "XL"。非 none 且 *_blocks_per_stage 为空时 sync() 自填。
+    # 2-6 显存分档：预设现在是"成套配置"——除逐级 block 数外，还联动设定
+    # nnU-Net ResEnc 通道表（base 32 逐级翻倍、320 封顶，深度=模板长度且受
+    # patch 可减半次数限制）；encoder_channels 保持默认值时才覆盖，显式配置优先。
+    # 并按档位显存预算做静态估算：超预算告警（含建议 batch）；开
+    # resenc_auto_batch_size 时自动选预算内最大 batch_size。
     resenc_preset: str = "none"
+    # 显存预算 GB：0=按档位默认（s=6 m=9 l=24 xl=40，nnU-Net Revisited 口径）；>0 覆盖。
+    resenc_vram_budget_gb: float = 0.0
+    # True 时按预算自动选最大 data.batch_size（覆盖显式值；仅预设非 none 时生效）。
+    resenc_auto_batch_size: bool = False
 
     dropout: float = 0.0
 
@@ -1512,15 +1541,17 @@ class Config:
                 "%s → %s.", name, prev, new)
 
     def _apply_resenc_preset(self) -> None:
-        """将 model.resenc_preset 展开为逐级 block 数；用户显式传入优先。"""
+        """将 model.resenc_preset 展开为成套配置（2-6 显存分档）。
+
+        逐级 block 数 + 通道表（nnU-Net ResEnc 口径）联动设定；用户显式
+        传入优先。随后按档位显存预算静态估算：超预算告警；开
+        ``resenc_auto_batch_size`` 时自动选预算内最大 batch_size。
+        """
         mc     = self.model
         preset = (mc.resenc_preset or "none").lower()
         if preset == "none":
             return
-        if mc.encoder_blocks_per_stage and mc.decoder_blocks_per_stage:
-            return
 
-        n_levels = len(mc.encoder_channels)
         templates = {
             "s":  [1, 2, 2, 2, 2, 2],
             "m":  [1, 3, 4, 6, 6, 6],
@@ -1529,8 +1560,27 @@ class Config:
         }
         if preset not in templates:
             return
-
         tpl = templates[preset]
+
+        # ---- 通道表：encoder_channels 仍为 dataclass 默认值时才覆盖 ----
+        _CHANNELS_FIELD_DEFAULT = [32, 64, 128, 256, 512]
+        if list(mc.encoder_channels) == _CHANNELS_FIELD_DEFAULT:
+            # 深度 = 模板长度，但受 patch 可减半次数限制（最大轴减半到 <8 为止）；
+            # 各向异性 stride 由 geometry 自动调度，此处只限制总深度上限。
+            axis = max(int(x) for x in self.data.patch_size)
+            feasible = 1
+            while axis % 2 == 0 and axis // 2 >= 4:
+                feasible += 1
+                axis //= 2
+            depth = min(len(tpl), feasible)
+            new_channels = [min(32 * (2 ** i), 320) for i in range(depth)]
+            if new_channels != list(mc.encoder_channels):
+                logger.info(
+                    "resenc_preset=%r 联动设定 encoder_channels: %s → %s。",
+                    preset, mc.encoder_channels, new_channels)
+                mc.encoder_channels = new_channels
+
+        n_levels = len(mc.encoder_channels)
         # 裁剪或拓展（重复最深级计数）以匹配 n_levels。
         if n_levels <= len(tpl):
             enc_blocks = tpl[:n_levels]
@@ -1547,6 +1597,53 @@ class Config:
                 # UNet++ has triangular nested nodes and UNet3+ ignores the
                 # per-stage list; one value is an explicit broadcast.
                 mc.decoder_blocks_per_stage = [1]
+
+        self._apply_resenc_budget(preset)
+
+    def _apply_resenc_budget(self, preset: str) -> None:
+        """ResEnc 预设的显存预算估算：超算告警 / 可选自动选 batch_size。"""
+        from ..engine.memory import estimate_resenc_train_memory_gb
+
+        mc = self.model
+        budget = float(mc.resenc_vram_budget_gb)
+        if budget <= 0:
+            budget = _RESENC_BUDGET_GB[preset]
+        amp = bool(self.train.use_amp)
+
+        def _est(bs: int) -> float:
+            return estimate_resenc_train_memory_gb(
+                self.data.patch_size, mc.encoder_channels,
+                mc.encoder_blocks_per_stage, mc.decoder_blocks_per_stage,
+                bs, amp=amp)["total_gb"]
+
+        if mc.resenc_auto_batch_size:
+            best = 1
+            for bs in range(1, 65):
+                if _est(bs) <= budget:
+                    best = bs
+                else:
+                    break
+            if best != int(self.data.batch_size):
+                logger.info(
+                    "resenc_auto_batch_size: 预算 %.1f GB 内自动选 "
+                    "batch_size=%d（原 %d，估算 %.1f GB）。",
+                    budget, best, self.data.batch_size, _est(best))
+                self.data.batch_size = best
+            return
+
+        est = _est(int(self.data.batch_size))
+        if est > budget:
+            fit = 1
+            for bs in range(1, int(self.data.batch_size) + 1):
+                if _est(bs) <= budget:
+                    fit = bs
+            logger.warning(
+                "resenc_preset=%r 估算显存 %.1f GB 超出预算 %.1f GB（"
+                "batch_size=%d）；建议 batch_size<=%d，或设 "
+                "model.resenc_auto_batch_size=true / 调大 "
+                "model.resenc_vram_budget_gb。估算为 ±30%% 量级，实测以 "
+                "torch.cuda.max_memory_allocated 为准。",
+                preset, est, budget, self.data.batch_size, fit)
 
     def validate(self, *, skip: "Optional[Set[str]]" = None) -> None:
         """校验配置一致性（按 section 拆分；非法配置抛 ConfigError）。
@@ -1681,6 +1778,16 @@ class Config:
                 str(self.model.resenc_preset or "none").lower()
                 in ("none", "s", "m", "l", "xl"),
                 f"Invalid resenc_preset: {self.model.resenc_preset}")
+            _require(
+                float(self.model.resenc_vram_budget_gb) >= 0.0,
+                "model.resenc_vram_budget_gb must be >= 0 (0 = per-tier "
+                f"default); got {self.model.resenc_vram_budget_gb!r}.")
+            _require(
+                not (bool(self.model.resenc_auto_batch_size)
+                     and str(self.model.resenc_preset or "none").lower()
+                     == "none"),
+                "model.resenc_auto_batch_size=true requires a non-'none' "
+                "model.resenc_preset (the VRAM budget is tied to the tier).")
             # MedNeXt 块超参（仅 backbone=='mednext' 生效；默认值对其他 backbone 无害）。
             _require(
                 self.model.unet.mednext.kernel_size in (3, 5, 7),
@@ -2046,6 +2153,10 @@ class Config:
                 all(float(r[0]) <= float(r[1]) for r in per_axis_r),
                 "augment.random_rotate_range_per_axis pairs must satisfy "
                 f"lo <= hi; got {per_axis_r!r}.")
+        _require(
+            float(self.augment.anisotropy_threshold) > 1.0,
+            "augment.anisotropy_threshold must be > 1; "
+            f"got {self.augment.anisotropy_threshold}.")
         sc_r = self.augment.random_scale_range
         _require(
             len(sc_r) == 2 and 0.0 < float(sc_r[0]) <= float(sc_r[1]),
